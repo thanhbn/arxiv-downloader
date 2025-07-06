@@ -1,0 +1,1081 @@
+# 2401.06761.pdf
+# Converted from PDF to TXT
+# Source path: /home/admin88/arxiv-downloader/speculative/2401.06761.pdf
+# File size: 2232335 bytes
+
+===============================================
+PDF FILE CONTENT
+===============================================
+
+
+--- PAGE 1 ---
+APAR: LLMs Can Do Auto-Parallel Auto-Regressive Decoding
+Mingdao Liu1,†,∗, Aohan Zeng1,2,∗, Bowen Wang1,†, Peng Zhang2, Jie Tang1, Yuxiao Dong1
+1Tsinghua University2Zhipu AI
+Abstract
+The massive adoption of large language models
+(LLMs) demands efficient deployment strate-
+gies. However, the auto-regressive decod-
+ing process, which is fundamental to how
+most LLMs generate text, poses challenges to
+achieve efficient serving. In this work, we in-
+troduce a parallel auto-regressive generation
+method. By instruct-tuning on general domain
+data that contains hierarchical structures, we
+enable LLMs to independently plan their gen-
+eration process and perform auto-parallel auto-
+regressive (APAR) generation, significantly re-
+ducing the number of generation steps. APAR
+alone can achieve up to 2 ×speed-up, and when
+combined with speculative decoding, the speed-
+up can reach up to 4 ×. In addition, APAR
+reduces the key-value cache consumption and
+attention computation during generation. This
+leads to a throughput increase of 20-70% and a
+latency reduce of 20-35% in high-throughput
+scenarios, compared to state-of-the-art serving
+frameworks.
+1 Introduction
+Large language models (LLMs) (OpenAI, 2023;
+Touvron et al., 2023; Zeng et al., 2022) have in-
+creasingly become foundational to various AI ap-
+plications (Richards, 2023; Nakajima, 2023; Park
+et al., 2023; Zhou et al., 2023). This widespread
+adoption has led to a growing demand for effi-
+cient model deployment, i.e., low latency and high
+throughput (Aminabadi et al., 2022). However, the
+intrinsic auto-regressive (AR) structure of these
+models presents significant challenges in achieving
+more efficient serving (Radford et al., 2018).
+First, each new token is auto-regressively gen-
+erated conditioned on the entire set of previously-
+generated tokens. This incremental decoding pro-
+∗Equal contribution.
+†Work done while these authors interned at Zhipu AI.
+Figure 1: APAR Decoding Overview. Different from
+the original auto-regressive decoding, APAR detects
+potential parts to be generated in parallel and issues
+multiple generation threads.
+cess results in sub-optimal generation speeds, as
+each generation step requires accessing the vast
+number of parameters of a LLM (Aminabadi et al.,
+2022). Consequently, when the generation batch
+size is not sufficiently large, this process becomes
+memory-bound, resulting in an under-utilization of
+the GPU compute.
+Second, the computation of attention over all
+preceding tokens in Transformer (Vaswani et al.,
+2017) also limits the serving throughput. In high-
+throughput scenarios, many sequences are generat-
+ing in parallel and the generation process becomes
+computation-bound. Meanwhile, the computation
+cost of attention scales linearly with the sequence
+length, which hinders further improvements of the
+throughput, especially for long responses. In ad-
+dition, the caching of key and value tensors (KV
+cache) for generated tokens, despite advancements
+in memory-efficient algorithms (Kwon et al., 2023),
+scales linearly with the sequence length, constrain-
+ing the number of concurrent requests that a system
+can handle.
+In light of these challenges, we introduce the
+Auto-Parallel Auto-Regressive (APAR) decoding
+strategy with the goal of improving the inferencearXiv:2401.06761v1  [cs.CL]  12 Jan 2024
+
+--- PAGE 2 ---
+efficiency of LLMs. APAR leverages the inherent
+parallelizable structure in LLM generation, capi-
+talizing on LLMs’ understanding of text structures.
+By fine-tuning LLMs on corpora with hierarchical
+structures, the models can learn to autonomously
+initiate parallel generation threads when encoun-
+tering parallelizable response structures. This ap-
+proach transforms the conventional linear genera-
+tion into a parallelizable paragraph tree structure.
+This not only facilitates greater decoding paral-
+lelism but also reduces attention spans through tree-
+based attention mechanisms, and enables the earlier
+release of consumed KV cache memory.
+We perform experiments on the Vicuna family
+of models. In memory-bound scenarios, APAR
+can help reduce the model latency and achieve an
+average generation speed increase of 2 ×on Vi-
+cuna Bench (Chiang et al., 2023). Furthermore, the
+design of APAR is complementary to most exist-
+ing inference acceleration methods. For example,
+when combined with Medusa (Cai et al., 2023), a
+speculative decoding strategy, APAR-based models
+yield speed improvements of up to 4 ×on Vicuna
+Bench. In certain specific categories, this combina-
+tion even achieves a speed-up of up to 6 ×.
+In high-throughput scenarios, APAR’s compat-
+ibility with vLLM enables early memory release,
+reducing KV cache requirements by up to 50%
+while still maintaining the same level of through-
+put. In addition, APAR reduces the number of
+tokens involved in attention calculation. By using
+the same amount of KV cache memory, it gets a
+20-70% improvement in throughput over the origi-
+nal AR process, and achieves a 20-35% reduction
+in latency while maintaining the same serving con-
+currency.
+Importantly, the quality of generation with
+APAR is not compromised. Evaluations across
+multiple categories on the MT Bench and Vicuna
+Bench (Zheng et al., 2023) demonstrate that the
+response quality remains largely consistent, with
+variations within a ±2% range compared to its AR
+counterparts. This indicates that APAR-based mod-
+els retain the contextual generation capability while
+enhancing the decoding speed and efficiency.
+2Auto-Parallel Auto-Regressive Decoding
+2.1 Overview
+Parallelizable structures are ubiquitous in the re-
+sponse of LLMs. For instance, in the ShareGPT
+dataset, 58% of the dialogues contain at least one re-sponse of ordered or unordered lists from ChatGPT,
+and about 32% of the responses contains listed
+structure. Most listed structures are naturally suit-
+able for paralleled generation, since the details of
+an itemized paragraph is usually conditioned on its
+leading sentence or phrase.
+The key idea of APAR is to make LLMs ex-
+plicitly aware of such parallelizable structures,
+and spawn auto-parallel auto-regressive decoding
+threads accordingly. Specifically, APAR involves
+two key components. First, we post-train the LLMs
+with hierarchical text structures, which we referred
+to as paragraph nodes (Section 2.2). Second, we
+design the decoding algorithm to support parallel
+decoding operations, including maintaining the hi-
+erarchical structure in generation and restoring it
+into a linear sequence (Section 2.3).
+2.2 Input Format
+This section introduce the corpora used to fine-tune
+APAR models, including the tree structure, atten-
+tion mechanism and control tokens. See Section 3.2
+for data pre-processing details.
+Paragraph tree. As illustrated in Fig 2, a para-
+graph tree is used to represent a sequence with
+hierarchical structure. Each node in the tree, which
+is referred to as a paragraph node in the sections
+to follow, denotes a component of the generation
+response. Each paragraph node has 0 or 2 pointers.
+One pointer of the paragraph node is referred to as
+first child (blue arrow in Fig 2), which points to
+the detailed texts (sub-paragraph) of the paragraph;
+the other child pointer is next sibling (red arrow in
+Fig 2), which points to the next paragraph of the
+same hierarchical level.
+Control tokens. To enable the language model to
+spawn a parallel decoding thread, 2 control tokens
+are added to the vocabulary.
+•Fork Identifier. [Fork] is used to indicate a
+parallel-able structure in the response. Models
+are trained to output a [Fork] token when they
+discover that what follows is considered detailed
+information (or a sub-paragraph) and thus can be
+decoded together with the next paragraph of the
+same level. When the inference system detects
+a[Fork] token output by the model, it creates
+a paralleled decoding thread sharing the same
+prefix until that [Fork] token. This token works
+just like the fork() system call used in operating
+systems.
+
+--- PAGE 3 ---
+<User> What if I can’t sleep at night? <Assistant> Here are some advice …1. Establish a Routine: Go to bed and wake up at the same time every day, …2. Manage Stress: Consider relaxation such as breathing exercises and …If your insomnia persists, it’s essential for you to seek professional advice …<User> What if I can’t sleep at night? <Assistant> Here are some advice … 1. Establish a Routine:              Go to bed and wake up at the same time every day, …2. Manage Daily Stress: FORK             Consider relaxation such as breathing exercises and …If your insomnia persists, it’s essential for you to seek professional advice …Paragraph Tree                         Training Attentionp0p0p1p1p2p2p4p4p3p3First ChildNext SiblingControlTokenCHILDCHILDFORKOriginal Sequencep0p0p1p1p2p2p3p3p4p4p0p0p1p1p2p2p3p3p4p4Figure 2: APAR Training Inputs. Based on pre-defined rules, the original sequence is transformed into a paragraph
+tree, which is used to train APAR models. Any token attends only to tokens on its path to root.
+Preﬁx shared NormalToken(s)FBF
+CFirst ChildNext Sibling00t1t1t2t2
+t2+1t2+1t1+1t1+1Position ID(Time Step)CGeneration Thread(Sequence)
+Memory released on ﬁnishp0p0(root)p1p1(root)p1p1(detail)Et1+1t1+1t2+1t2+1F[Fork] tokenC[Child] tokenB[BOS] tokenE[EOS] tokenp0p0(detail)…p2p2(root)…
+Figure 3: APAR Decoding. Suppose we are generating a sequence p0−p1−p2. The decoding of p1(root) and
+p0(detail) are issued in parallel at ( t1+ 1). Similarly, p2(root) and p1(detail) are issued at ( t2+ 1). Prefix tokens are
+shared and forked generation threads can be released once finished.
+•Child Identifier. [Child] always follows a
+[Fork] , and is used to indicate that the following
+content is the beginning of a sub-paragraph lead
+by the previous content, like the zero return value
+offork() in some operating systems. In particu-
+lar,[Child] is attended to but is not taken loss
+in the training process. Thus, the model never
+learns to output this token, but learns to output the
+content of the sub-paragraph when [Child] is
+injected into the context (i.e. a [Fork] [Child]
+sequence appears in the context). On the other
+hand, when [Fork] appears without followed
+by a [Child] , the model will generate the next
+paragraph of the same level.
+Training attention. In order for the paragraphs
+to be generated in a parallel, all nodes only attend
+to their ancestors, and to themselves with a causal
+mask, as shown in Fig 2.2.3 Decoding Procedures
+An overview of the generation process is illustrated
+in Fig. 3 and the algorithm is formulated in Algo-
+rithm 1. We first introduce the concept of sequence
+and sequence groups following the implementation
+in Kwon et al. (2023), then expound the generating
+procedures of APAR decoding algorithm.
+Sequence and sequence group. A sequence is
+defined as an ordered list of tokens. A sequence
+group is the set of all sequences generated for the
+same prompt sequence and is initialized with only
+the prompt sequence. In APAR decoding algorithm,
+each sequence group corresponds to a paragraph
+tree.
+Each sequence, on the other hand, is a generation
+thread and is associated with a leaf node in the
+paragraph tree.
+Decoding. As described in Algorithm 1, we start
+the decoding with the user prompt sequence pand
+
+--- PAGE 4 ---
+Algorithm 1 APAR decoding algorithm. ISFIN-
+ISHED (G) returns True if all sequences in the se-
+quence group Ghave finished. SAMPLE (Θ,s)
+samples the next token for sequence sgiven lan-
+guage model Θ. A paragraph node nassociated
+with sequence spoints to slice s[start:end ](s[start:]
+if end is null).PNODE(s,x) creates a new para-
+graph node associated with sequence s, initializing
+start= x, end= null. The current_node attribute of a
+sequence is used to record the leaf paragraph node
+pointing to the end of the sequence, and is main-
+tained (line 25 ∼29) every time a new sequence is
+forked. RESTORE (r) recursively traverse the para-
+graph tree defined by root rin root - first_child -
+next_sibling order.
+1:Input: A user prompt sequence p, language
+model Θ.
+2:Output: Decoded generation sequence g.
+3:
+4:r←PNODE(p,p.len)
+5:G← {p}
+6:p.current_node ←r
+7:
+8:while not I SFINISHED (G)do
+9: G←APARDECODE (G,Θ)
+10:
+11:g←RESTORE (r)
+12:return g
+13:
+14:function APARDECODE (G,Θ)
+15: foreach sequence sinGdo
+16: ifs.finished = True then
+17: continue
+18: x←SAMPLE (Θ, s)
+19: ifs.last_token = [Fork] then
+20: s′←s
+21: s′.append_token( [Child] )
+22: G←G∪ {s′}
+23: n←PNODE(s,s.len)
+24: n′←PNODE(s′,s′.len)
+25: s.current_node.end ←s.len
+26: s.current_node.next_sibling ←n
+27: s.current_node.first_child ←n′
+28: s.current_node ←n
+29: s′.current_node ←n′
+30: s.append_token( x)
+31: ifx=[EOS] then
+32: s.finish←True
+33: RELEASE CACHE (s)
+34: return Gconstruct a sequence group Ginitialized as { p}.
+We initialize the paragraph tree corresponding to
+Gwith root node rand associate sequence pwith
+r(which is now a leaf node). Then, we iterative
+perform APARDECODE on sequence group Guntil
+all sequences in Ghave finished. In the end, the
+paragraph tree is traversed to restore the sequential
+output g.
+Next, we delve into the details for APARDE-
+CODE , which performs a single decode step for
+sequence group Gwith language model Θ. For
+each unfinished sequence sinG, If the last token
+is[Fork] , it means that the model calls for a new
+generation thread, and now it’s time to fork the
+sequence s′. The forked sequence shares the same
+prefix tokens as the parent sequence. When imple-
+mentation with paged attention (Kwon et al., 2023),
+the fork operation creates a shared memory map-
+ping for the shared prefix (the dotted red box in
+Fig 3), which copies at most 1 KV cache block and
+shares all other blocks. After the fork operation,
+s′is appended a forced [Child] token to identify
+this sequence to the language model as a child se-
+quence. Also, two new leaf nodes are created and
+sands′are set to track the latest leaf nodes.
+Finally, sampled new token xis appended to s.
+If[EOS] token is sampled, the generation of se-
+quence sis considered finished, and the KV cache
+belonging only tosis released (the dotted red box
+in Fig 3).
+2.4 Features
+Based on the aforementioned decoding algorithm
+and the distribution of user queries, we identify
+three key features of APAR decoding that give rise
+to its superior performance in terms of inference
+latency, throughput, and memory consumption.
+1. Paralleled decoding structure reduces latency.
+Through training on paragraph trees, the language
+model becomes an automatic online miner for
+parallel-able structure and concurrent generation
+threads are issued accordingly. The paralleled gen-
+eration reduces generation steps. In memory-bound
+scenarios, the latency in each step remains roughly
+unchanged wrt. different level of decoding paral-
+lelism (i.e. dynamic batch size) and the latency can
+therefore be reduced proportionately (Fig 4).
+2. Early release of child KV cache reduces mem-
+ory consumption. In the auto-regressive gener-
+ation process, the KV cache of all tokens must be
+
+--- PAGE 5 ---
+retained before the sequence is completely gener-
+ated. In APAR, however, once a forked sequence
+(i.e. a generation thread) completes generation, the
+KV cache belonging only to the forked sequence
+can be released immediately, while the remaining
+part of the generation continues. Under the effect
+of early release strategy, as shown in later Fig 5a,
+up to 50% of the generation cache can be saved
+while throughput remains the same.
+3. Reduced attention length saves computation.
+Auto-regressive generation requires a token to at-
+tend to all previously generated tokens. In APAR,
+on the other hand, a new token only attends to to-
+kens along its path to the root of the paragraph tree,
+which reduces attention computation in generation.
+In a heavily-batched generation setting, latency
+incurred by memory access is amortized by the in-
+tense batched computation, make the generation
+process primarily computation-bound. Thus, the
+computation reduction in each token results in an
+improvement in throughput across different mem-
+ory usages (Fig 5a), as well as reduction in latency
+with different extents of concurrency (Fig 5b).
+3 Experiments
+3.1 Data Pre-processing
+We adopt one open-sourced version of ShareGPT
+dataset1as instruction corpora. Fine-tuning data
+are composed as follows.
+Ordered list. Many responses are represented as
+ordered lists with the pattern of root - detail for
+each bullet point, where root is usually an intro-
+duction phrase and detail is the detailed content
+of that specific point. Thus, the root is extracted
+as the content for the root node and detail as the
+content in the detail node, as illustrated in Fig 2.
+Paragraph. Most of LLM’s response paragraphs
+are structured in a root-and-details format, even
+when not presented as an ordered list, where the
+first sentence of the paragraph typically summa-
+rizes the main idea of that paragraph. Therefore,
+we extract the first sentence of the paragraph as the
+root for that section, while the rest of the content
+serves as the detail .
+Unstructured data. To accurately extract the hi-
+erarchical structure, responses with confusing for-
+mats, like code and math data, are excluded in the
+1https://huggingface.co/datasets/anon8231489123/ShareGPT_
+Vicuna_unfilteredaforementioned structure extraction process. How-
+ever, while learning to generate paralleled decoding
+threads, a model must also learn not to generate
+[Fork] in cases where coherent attention is nec-
+essary to accurately predict the next token. There-
+fore, some filtered conversations are added as nega-
+tive examples to prevent the model from excessive
+[Fork] issuing. This portion of data is organized
+as a single paragraph node with no descendants.
+See Appendix B for detailed procedures and
+rules used in data pre-processing.
+3.2 Experimental Setup
+Models. To evaluate the generation speed,
+throughtput and qualities, we apply APAR fine-
+tuning on vicuna-v1.3-{7B,13B} models, produc-
+ing APAR-{7B,13B}. In this section, original
+Vicuna models will be referred to as Original-
+{7B,13B} (O-{7B,13B} as abbreviations) and the
+fine-tuned APAR models will be referred to as
+APAR-{7B,13B} (A-{7B,13B} as abbreviations).
+Implementation. We implement 3 settings for
+evaluation, including
+•Vanilla-APAR . Vanilla-APAR is implemented
+directly with transformers (Wolf et al., 2020),
+which is a widely adopted python deep learning
+platform for transformer-based models.
+•Medusa-APAR . Medusa-APAR is implemented
+with Medusa (Cai et al., 2023), which is an open-
+source speculative decoding algorithm that fol-
+lows the predict - verify paradigm for decoding.
+Medusa adopts a light-weighed extra language
+modeling head to predict the next few tokens and
+verify generation using tree attention. This set-
+ting is used to test the combined effect of APAR
+and speculative decoding algorithm.
+•Batched-APAR . Batched-APAR is implemented
+with vLLM (Kwon et al., 2023), a high-
+throughput and memory-efficient inference en-
+gine using paged-attention mechanism. This set-
+ting is used to test APAR on realistic serving
+situations, where we not only care about the la-
+tency but also throughput and memory efficiency.
+Training setup. During the fine-tuning process,
+we sample from structured (ordered list and para-
+graph mentioned above, 16k samples) and unstruc-
+tured data (9k samples) with sampling ratio 1:1.
+The models are fine-tuned with batch size 128,
+learning rate 2e-5for 2000 steps. After fine-tuning,
+we train 2 medusa heads with learning rate 1 e-3 for
+
+--- PAGE 6 ---
+0 100 200 300CodingCSCFFermiGenericKnowledgeMathRoleplayWritingMean7B Models
+0 100 20013B Models
+Generation Speed (token / s)
+Original
+Vanilla-APARMedusa
+Medusa-APAR(a) Results in Vicuna Bench
+0 100 200CodingExtractionHumanitiesMathReasoningRoleplaySTEMWritingMean7B Models
+0 50 100 15013B Models
+Generation Speed (token / s)
+Original
+Vanilla-APARMedusa
+Medusa-APAR (b) Results in MT Bench
+Figure 4: Generation speed in memory-bound scenario. Models served on one H800-SXM5-80G GPU with
+batch size 1.
+2000 steps using the same data as fine-tuning. See
+Appendix A for detailed hyper-parameter settings.
+Evaluation datasets. Several datasets are used
+to evaluate the generation statistics and quality.
+•Vicuna Bench (Chiang et al., 2023) is a bench-
+mark for evaluating LLMs on language under-
+standing, reasoning and context awareness. It
+covers 9 categories and contains 80 single-
+turn queries. For a clearer layout, we abbre-
+viate 2 long category names in Vicuna Bench
+in the following figures and tables, i.e. Com-
+monsense to CS, Counterfactual to CF.
+•MT Bench (Zheng et al., 2023) is a bench-
+mark consisting of 80 multi-turn questions. It
+covers 8 common categories and can be used
+to evaluate the multi-turn conversation and
+instruction-following ability of LLMs.
+•APAR Test Set consists of 1000 user queries
+sampled from ShareGPT dataset to simulate
+the query distribution in realistic deployment
+scene using the same rule we extract struc-
+tured training data. Because of its large quan-
+tity, it’s would be too expensive to evaluate
+generation quality for all test set queries on
+all models. Thus, APAR test set is only used
+for measurement of generation statistics.3.3 Results in Memory-Bound Scenarios
+We inspect how APAR reduces generation latency
+in a memory-bound (i.e. small batch size) sce-
+nario, as well as its combined acceleration effect
+with speculative decoding. Considering that the the
+model is re-trained and the output length can be
+different on the same prompt, we normalize genera-
+tion latency with generated tokens, adopting tokens
+per second as the metric for generation speed. The
+results are reported with batch size fixed as 1 and
+prefix sharing is not enabled.
+As shown in Fig 4, Vanilla-APAR achieves 2×
+average speed up in Vicuna Bench and 1.4×aver-
+age speed up on MT Bench. APAR models learns
+to spawn parallel generation thread in and only
+in categories that exists a parallel-able structure.
+For instance, APAR-{7B,13B} seldom try to issue
+parallel a generation threads in coding and math re-
+lated queries, which typically requires careful step
+by step reasoning or rigorous formats, resulting in
+no speed up. On the other hand, on categories like
+common-sense, generic and knowledge, the speed
+up is significant. When combined with speculative
+decoding, Medusa-APAR achieves an impressive
+4×average speed up in Vicuna Bench and 2.9×av-
+erage speed up in MT Bench, demonstrating strong
+reduction in generation latency.
+
+--- PAGE 7 ---
+3.4 Results in High-Throughput Scenarios
++23%
++33%
+(a) Throughput wrt. cache memory usage
++28%
+-21%
+(b) End-to-end decode latency wrt. concurrency
+Figure 5: Serving statistics of Batched-APAR. Models
+served on one A100-SXM4-80G GPU. Error bars in (b)
+omitted for a clearer view.
+In high performance serving situations, increas-
+ing throughput and reducing serving memory are
+also important. We use Batched-APAR to serve the
+queries in APAR test set with different amount of
+GPU memory available. An overview of generation
+throughput and per-token latency is summarized in
+Fig 5. The dots in the plot show the mean value and
+error bars represent the 25% and 75% percentile in
+each setting.
+As shown in Fig 5a, the throughput of Batched-
+APAR models surpass the maximum throughput of
+original models with only 20% of the KV Cache
+used, demonstrating memory efficiency. When us-
+ing similar amount of memory, throughput is con-
+sistently increase by 20% ∼70% across different
+cache usages. Batched-APAR models also demon-
+strate remarkable latency reduction in computation
+bound scenarios. As shown in Fig 5b, Batched-
+APAR reduces 20% ∼35% average latency whenTable 1: Average Max Cached Tokens
+Benchmark Model APAR Flatten Saved
+VicunaA-7B 303.2 417.2 27.3%
+A-13B 306.7 419.3 26.8%
+MTA-7B 502.1 571.1 12.1%
+A-13B 513.3 590.6 13.1%
+Table 2: Average Attended Tokens
+Benchmark Model APAR Flatten Saved
+VicunaA-7B 166.2 256.4 35.2%
+A-13B 166.6 255.9 34.9%
+MTA-7B 417.5 496.5 15.9%
+A-13B 428.0 514.2 16.8%
+serving the same amount of concurrent requests.
+The latency of Batched-APAR-13B is even similar
+to the Original-7B model.
+The improvement in latency and throughput can
+be best explained by feature 2 and 3 as described in
+Section 2.4. We quantitatively measure how much
+computation and cache memory can be saved by
+using APAR decoding algorithm. We adopt the
+following metrics.
+•Max cached tokens is defined as the maxi-
+mum number of KV cache slots required for
+generating a response. For auto-regressive
+generation, prompt tokens and all generated
+tokens need to be cached before generating
+[EOS] token.
+•Attended tokens is defined as the number of
+tokens attended to when predicting a specific
+token. For auto-regressive generation, all pre-
+ceding tokens is needed when predicting a
+next token.
+Since the response length is difference between
+APAR models and original models, we flatten the
+paragraph tree generated by APAR models as the
+reference output. When calculating average, we ex-
+clude categories that are not accelerated by APAR,
+i.e. Coding, Extraction and Math.
+As summarized in Table 1 and Table 2, compared
+with flattened results, APAR reduces max cached
+tokens by 12% ∼27% and reduced attended tokens
+by 15% ∼35%. Detailed results for all categories
+are reported in Appendix D.3 and Appendix D.2.
+
+--- PAGE 8 ---
+Table 3: Generation Quality in MT Bench
+Task O-7B A-7B O-13B A-13B
+Coding 2.60 2.60 3.70 3.70
+Extraction 4.90 5.75 5.35 4.85
+Humanities 9.45 9.40 9.45 9.55
+Math 2.70 2.00 2.60 2.65
+Writing 7.90 7.15 8.40 7.88
+Roleplay 6.35 7.25 7.67 7.58
+Reasoning 4.85 5.40 5.95 5.85
+Stem 7.92 7.15 7.67 7.80
+Mean 5.83 5.92 6.35 6.24
+Table 4: Generation Quality in Vicuna Bench
+Task O-7B A-7B O-13B A-13B
+Coding 3.86 3.29 6.14 3.71
+CS 9.40 9.50 9.50 9.60
+CF 8.05 8.00 8.65 9.00
+Fermi 6.80 6.90 7.35 6.60
+Generic 9.45 9.50 9.30 9.50
+Knowledge 9.40 9.30 9.60 9.35
+Math 1.67 2.00 1.67 4.67
+Roleplay 8.80 8.80 8.90 8.75
+Writing 9.50 9.00 9.50 9.00
+Mean 8.08 7.99 8.45 8.29
+3.5 Generation Quality
+To measure the generation quality of APAR mod-
+els compared with original models, we adopt MT
+Bench and Vicuna Bench as evaluation framework.
+For each response, we provide GPT-4 with con-
+versation history, user query and model responses,
+asking GPT-4 to grade the response with a score
+ranging from 1 to 10 and we follow the prompt
+template used by Zheng et al. (2023).
+The quality scores of each category are summa-
+rized in Table 3 and Table 4. Compared with orig-
+inal models, APAR models differs by -2% ∼+2%
+in MT Bench and Vicuna Bench overall scores,
+showing negligible overall quality change.
+4 Related Works
+This section discuss the difference and connection
+of APAR with prior works concerning inference
+acceleration.
+Optimized computation. Optimizations on op-
+erators (Dao et al., 2022) and computationalgraphs (Aminabadi et al., 2022) are active research
+fields. Model compression is widely used in de-
+ployment, like quantization (Dettmers et al., 2022;
+Frantar et al., 2022) and pruning (Frantar and Al-
+istarh, 2023; Ma et al., 2023). Another line of
+works modifies the model architecture, including
+efficient attention (Kitaev et al., 2020) for computa-
+tion complexity and multi-query attention (Shazeer,
+2019) for optimized IO. Different from prior works,
+APAR makes no modification to operators or model
+architecture but reduces computation by adopting
+attention tree structure. APRA is thus orthogonal
+toand can be applied jointly with the aforemen-
+tioned works.
+Improved parallelism. Scheduling strategies,
+including dynamic batching (Yu et al., 2022)
+and paged-attention (Kwon et al., 2023), im-
+prove maximum generation throughput. Another
+stream of works explores speculative decoding
+(SD) (Leviathan et al., 2023; Yang et al., 2023;
+Cai et al., 2023), which verifies multiple specu-
+lated tokens in parallel, reducing generation latency
+in small batch sizes. Non-auto-regressive genera-
+tion (Gu et al., 2018) propose to sample multiple
+generation tokens in parallel, which typically re-
+quires re-training and applies to restricted scenarios.
+APAR can be conveniently combined with efficient
+scheduling and SD methods to achieve augmented
+efficiency as demonstrated by Medusa-APAR and
+Batched-APAR. Different from previous methods,
+APAR propose to exploit the intrinsic organization
+ability of LLMs to automatically issue paralleled
+generation threads, and is applicable to multiple
+scenarios. Notably, SoT (Ning et al., 2023) pro-
+poses to enable parallelism by prompting, which
+generates the skeleton of the response and then
+expands each point in parallel. Different from
+SoT, which entails an external classifier and re-
+computation of KV cache between stages, APAR
+requires negligible extra computation (2 control to-
+kens for a thread) and no re-computation, and thus
+does not compromise generation throughput.
+5 Conclusion
+This paper introduces APAR, a new decoding
+method that allows LLMs to autonomously struc-
+ture the decoding process and dynamically create
+parallel decoding threads, without compromising
+the generation quality. APAR not only enhances
+parallelism in generation, but also reduces the com-
+putation and KV cache memory consumption. Ex-
+
+--- PAGE 9 ---
+periments show that APAR can be seamlessly in-
+tegrated with existing inference frameworks, sig-
+nificantly lowering the generation latency across
+various scenarios while improving serving through-
+put in situations involving extreme batch sizes and
+concurrency levels.
+References
+Reza Yazdani Aminabadi, Samyam Rajbhandari, Minjia
+Zhang, Ammar Ahmad Awan, Cheng Li, Du Li, Elton
+Zheng, Jeff Rasley, Shaden Smith, Olatunji Ruwase,
+and Yuxiong He. 2022. Deepspeed inference: En-
+abling efficient inference of transformer models at
+unprecedented scale.
+Tianle Cai, Yuhong Li, Zhengyang Geng, Hongwu Peng,
+and Tri Dao. 2023. Medusa: Simple framework for
+accelerating llm generation with multiple decoding
+heads. https://github.com/FasterDecoding/
+Medusa .
+Wei-Lin Chiang, Zhuohan Li, Zi Lin, Ying Sheng,
+Zhanghao Wu, Hao Zhang, Lianmin Zheng, Siyuan
+Zhuang, Yonghao Zhuang, Joseph E. Gonzalez, Ion
+Stoica, and Eric P. Xing. 2023. Vicuna: An open-
+source chatbot impressing gpt-4 with 90%* chatgpt
+quality.
+Tri Dao, Daniel Y . Fu, Stefano Ermon, Atri Rudra,
+and Christopher Ré. 2022. Flashattention: Fast and
+memory-efficient exact attention with io-awareness.
+Tim Dettmers, Mike Lewis, Younes Belkada, and Luke
+Zettlemoyer. 2022. Llm.int8(): 8-bit matrix multipli-
+cation for transformers at scale.
+Elias Frantar and Dan Alistarh. 2023. Sparsegpt: Mas-
+sive language models can be accurately pruned in
+one-shot.
+Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and
+Dan Alistarh. 2022. GPTQ: Accurate post-training
+compression for generative pretrained transformers.
+arXiv preprint arXiv:2210.17323 .
+Jiatao Gu, James Bradbury, Caiming Xiong, Victor O.K.
+Li, and Richard Socher. 2018. Non-autoregressive
+neural machine translation. In International Confer-
+ence on Learning Representations .
+Nikita Kitaev, Łukasz Kaiser, and Anselm Levskaya.
+2020. Reformer: The efficient transformer.
+Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying
+Sheng, Lianmin Zheng, Cody Hao Yu, Joseph E.
+Gonzalez, Hao Zhang, and Ion Stoica. 2023. Effi-
+cient memory management for large language model
+serving with pagedattention. In Proceedings of the
+ACM SIGOPS 29th Symposium on Operating Systems
+Principles .Yaniv Leviathan, Matan Kalman, and Yossi Matias.
+2023. Fast inference from transformers via spec-
+ulative decoding. In Proceedings of the 40th Interna-
+tional Conference on Machine Learning , ICML’23.
+JMLR.org.
+Xinyin Ma, Gongfan Fang, and Xinchao Wang. 2023.
+Llm-pruner: On the structural pruning of large lan-
+guage models. In Advances in Neural Information
+Processing Systems .
+Yohei Nakajima. 2023. Babyagi. Python.
+https://github.com/yoheinakajima/babyagi .
+Xuefei Ning, Zinan Lin, Zixuan Zhou, Zifu Wang,
+Huazhong Yang, and Yu Wang. 2023. Skeleton-of-
+thought: Large language models can do parallel de-
+coding.
+OpenAI. 2023. Gpt-4 technical report.
+Joon Sung Park, Joseph C. O’Brien, Carrie J. Cai,
+Meredith Ringel Morris, Percy Liang, and Michael S.
+Bernstein. 2023. Generative agents: Interactive simu-
+lacra of human behavior. In In the 36th Annual ACM
+Symposium on User Interface Software and Technol-
+ogy (UIST ’23) , UIST ’23, New York, NY , USA.
+Association for Computing Machinery.
+Alec Radford, Karthik Narasimhan, Tim Salimans, Ilya
+Sutskever, et al. 2018. Improving language under-
+standing by generative pre-training.
+Toran Bruce Richards. 2023. Auto-gpt: An autonomous
+gpt-4 experiment.
+Noam Shazeer. 2019. Fast transformer decoding: One
+write-head is all you need.
+Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier
+Martinet, Marie-Anne Lachaux, Timothée Lacroix,
+Baptiste Rozière, Naman Goyal, Eric Hambro,
+Faisal Azhar, et al. 2023. Llama: Open and effi-
+cient foundation language models. ArXiv preprint ,
+abs/2302.13971.
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob
+Uszkoreit, Llion Jones, Aidan N Gomez, Ł ukasz
+Kaiser, and Illia Polosukhin. 2017. Attention is all
+you need. In Advances in Neural Information Pro-
+cessing Systems , volume 30. Curran Associates, Inc.
+Thomas Wolf, Lysandre Debut, Victor Sanh, Julien
+Chaumond, Clement Delangue, Anthony Moi, Pier-
+ric Cistac, Tim Rault, Rémi Louf, Morgan Funtowicz,
+Joe Davison, Sam Shleifer, Patrick von Platen, Clara
+Ma, Yacine Jernite, Julien Plu, Canwen Xu, Teven Le
+Scao, Sylvain Gugger, Mariama Drame, Quentin
+Lhoest, and Alexander M. Rush. 2020. Transform-
+ers: State-of-the-art natural language processing. In
+Proceedings of the 2020 Conference on Empirical
+Methods in Natural Language Processing: System
+Demonstrations , pages 38–45, Online. Association
+for Computational Linguistics.
+
+--- PAGE 10 ---
+Nan Yang, Tao Ge, Liang Wang, Binxing Jiao, Daxin
+Jiang, Linjun Yang, Rangan Majumder, and Furu Wei.
+2023. Inference with reference: Lossless accelera-
+tion of large language models.
+Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soo-
+jeong Kim, and Byung-Gon Chun. 2022. Orca: A
+distributed serving system for Transformer-Based
+generative models. In 16th USENIX Symposium
+on Operating Systems Design and Implementation
+(OSDI 22) , pages 521–538, Carlsbad, CA. USENIX
+Association.
+Aohan Zeng, Xiao Liu, Zhengxiao Du, Zihan Wang,
+Hanyu Lai, Ming Ding, Zhuoyi Yang, Yifan Xu,
+Wendi Zheng, Xiao Xia, et al. 2022. Glm-130b:
+An open bilingual pre-trained model. arXiv preprint
+arXiv:2210.02414 .
+Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Siyuan
+Zhuang, Zhanghao Wu, Yonghao Zhuang, Zi Lin,
+Zhuohan Li, Dacheng Li, Eric. P Xing, Hao Zhang,
+Joseph E. Gonzalez, and Ion Stoica. 2023. Judging
+llm-as-a-judge with mt-bench and chatbot arena.
+Shuyan Zhou, Frank F Xu, Hao Zhu, Xuhui Zhou,
+Robert Lo, Abishek Sridhar, Xianyi Cheng, Yonatan
+Bisk, Daniel Fried, Uri Alon, et al. 2023. Webarena:
+A realistic web environment for building autonomous
+agents. arXiv preprint arXiv:2307.13854 .
+
+--- PAGE 11 ---
+A Training Hyper-parameters
+A.1 APAR Models
+Table 5: Training Hyper-parameters for APAR Models
+Hyper-parameter Value
+batch size 128
+data type bf16
+training step 2000
+learning rate 2e-5
+weight decay 0
+warm-up ratio 0.03
+lr decay schedule cosine
+context length 2048
+A.2 Medusa Heads
+The following hyper-parameters are used to train
+the medusa heads for speculative decoding. Only
+medusa heads are trained and the reset of the lan-
+guage model remains frozen.
+Table 6: Training Hyper-parameters for Medusa Heads
+Hyper-parameter Value
+batch size 128
+data type bf16
+training step 2000
+learning rate 1e-3
+weight decay 0
+warm-up ratio 0.1
+lr decay schedule cosine
+context length 2048
+# of Medusa heads 2
+# of layers per Medusa head 2
+B Rules for Extracting Structured Data
+The process and rules to determine and extract the
+structure of each assistant response are outlined as
+follows.
+1. Try to extract the response as ordered list.
+(a) Use regular expression like
+(\d+\.)\s+(.+?):(.+?)
+to extract individual numeric points.
+(b) If
+i.the regular expression does not does
+not match at least 3 numeric points,
+orii.any of the content of the numeric
+points are less then 10 characters
+the response is not consider as a valid
+ordered list.
+2.If the response is not consider as a valid or-
+dered list, try to extract the response as multi-
+ple paragraph.
+(a)Use two consecutive \nto divide the en-
+tire response into paragraphs and extract
+the first sentence of each paragraph. Para-
+graphs with only one sentence is skipped.
+3.If ambiguous patterns, including code blocks,
+math expressions, URLs, etc, exists in the
+response, the, or if the response fails to match
+the above 2 criteria, the response is considered
+unstructured.
+Pre-processing code will be made public in the
+project repository.
+C Generation Speed Evaluation Setup
+C.1 Vanilla-APAR and Medusa-APAR
+Vanilla-APAR and Medusa-APAR are implemen-
+tation directly from transformers package. To
+keep KV cache contiguous, prefix sharing is not
+enabled and the prefix KV caches are copied when
+a new generation thread is forked. The implemen-
+tation of Medusa-APAR is adopt from its official
+repository. When different number of tokens are ac-
+cepted across batches, the longest accepted length
+is adopted and the mis-predicted slots are masked
+out in attention calculation. The evaluation batch-
+size is fixed as 1 and the pre-filling time is not
+measured when calculating generation speed.
+C.2 Batched-APAR
+To measure the maximum throughput of each gen-
+eration method, GPU cache utilization is set to
+0.1,···,0.9for each setting and the system is pro-
+filed every 3 seconds. For a stable performance, we
+ignore the terminal samples when no requests are
+pending and ignore the first1
+3samples as warm-up
+when calculating mean and percentiles.
+All 1k requests are push into waiting queue in
+the beginning of the performance test. We limit
+the max number of concurrent requests to 350 for
+7B models and 180 for 13B models. The reason
+for this limit is that in the beginning, the average
+sequence length is relatively sort and the system
+is prone to excessively accept requests, leading to
+
+--- PAGE 12 ---
+Table 7: Parallel Generation Statistics in Vicuna Bench
+TaskAPAR-7B APAR-13B
+#T %P #T %P
+Coding 1.0 0.0 1.0 0.0
+CS 6.0 1.0 6.5 1.0
+CF 4.1 0.9 5.4 1.0
+Fermi 5.3 0.9 5.5 0.9
+Generic 7.7 1.0 7.7 1.0
+Knowledge 6.8 1.0 5.6 1.0
+Math 1.0 0.0 1.0 0.0
+Roleplay 4.5 0.8 5.1 1.0
+Writing 5.4 0.9 4.6 0.7
+Mean 5.1 0.81 5.2 0.82
+Table 8: Parallel Generation Statistics in MT Bench
+TaskAPAR-7B APAR-13B
+#T %P #T %P
+Coding 1.0 0.0 1.0 0.0
+Extraction 1.0 0.0 1.3 0.1
+Humanities 5.0 0.7 6.1 0.8
+Math 1.1 0.1 1.0 0.0
+Reasoning 2.0 0.3 2.5 0.6
+Roleplay 4.1 0.8 4.0 0.7
+STEM 3.4 0.6 3.6 0.6
+Writing 3.7 0.6 3.4 0.6
+Mean 2.7 0.37 2.9 0.41
+frequent swapping and recompute of KV cache.
+Note that this concurrency limit mainly takes effect
+in warm-up stage, which is ignore in the calculation
+for mean and percentage. The concurrency limit
+is much larger than the maximum in the average
+concurrent request as shown in Fig 5b.
+D Generation Speed Details
+D.1 Parallel Generation Statistics
+We measure how many parallel threads are issued
+in generation across benchmarks and categories.
+Results are reported in Table 7 and Table 8. #T
+stands for average number of generation threads,
+%P stand for ratio of parallel-able response, i.e.
+response that has at least 2 generation threads.
+D.2 Max Cached Tokens
+Detailed results of max cached tokens across bench-
+marks and categories are reported in Table 9, Ta-
+ble 10, 11 and Table 12, . Mean value of all cat-Table 9: Max Cached Tokens (Vanilla-APAR-7B on
+Vicuna Bench)
+Task APAR AR Saved
+Coding 378.0 378.0 0.0%
+CS 296.6 417.7 29.0%
+CF 245.6 312.4 21.4%
+Fermi 365.3 496.8 26.5%
+Generic 251.5 388.8 35.3%
+Knowledge 345.0 489.9 29.6%
+Math 210.7 210.7 0.0%
+Roleplay 292.5 364.1 19.7%
+Writing 325.6 450.4 27.7%
+Mean 306.2 406.0 24.6%
+Mean(>1%) 303.2 417.2 27.3%
+Table 10: Max Cached Tokens (Vanilla-APAR-13B on
+Vicuna Bench)
+Task APAR AR Saved
+Coding 370.0 370.0 0.0%
+CS 287.6 416.9 31.0%
+CF 276.9 383.0 27.7%
+Fermi 401.0 529.7 24.3%
+Generic 260.7 389.2 33.0%
+Knowledge 313.2 419.7 25.4%
+Math 203.3 203.3 0.0%
+Roleplay 254.3 346.5 26.6%
+Writing 353.5 449.8 21.4%
+Mean 308.4 406.9 24.2%
+Mean(>1%) 306.7 419.3 26.8%
+egories and categories accelerated by APAR are
+reported.
+D.3 Attended Tokens
+Detailed results of attend tokens across benchmarks
+and categories are reported in Table 13, Table 14,
+Table 15 and Table 16. Mean value of all categories
+and categories accelerated by APAR are reported.
+D.4 Response Length
+Apart from generation quality, we also analyze the
+response length distribution of model before and
+after fine-tuning in Fig 6. The average length varies
+from -0.3% ∼+4.0% compared with respective orig-
+inal model and the distributions highly overlap.
+This indicate that if fine-tuned with the same mate-
+rial, APAR does not significantly affect the genera-
+tion length distribution.
+
+--- PAGE 13 ---
+Table 11: Max Cached Tokens (Vanilla-APAR-7B on
+MT Bench)
+Task APAR AR Saved
+Coding 744.8 744.8 0.0%
+Extraction 567.2 567.2 0.0%
+Humanities 647.0 757.3 14.6%
+Math 408.5 410.4 0.4%
+Reasoning 314.9 335.4 6.1%
+Roleplay 461.2 533.6 13.6%
+STEM 574.2 641.7 10.5%
+Writing 513.0 587.6 12.7%
+Mean 529.6 573.3 7.6%
+Mean(>1%) 502.1 571.1 12.1%
+Table 12: Max Cached Tokens (Vanilla-APAR-13B on
+MT Bench)
+Task APAR AR Saved
+Coding 589.6 589.6 0.0%
+Extraction 640.3 641.7 0.2%
+Humanities 676.1 822.5 17.8%
+Math 451.9 451.9 0.0%
+Reasoning 318.2 344.8 7.7%
+Roleplay 484.6 548.5 11.7%
+STEM 591.1 677.5 12.8%
+Writing 496.4 559.6 11.3%
+Mean 530.3 579.1 8.4%
+Mean(>1%) 513.3 590.6 13.1%
+Table 13: Attended Tokens (Vanilla-APAR-7B on Vi-
+cuna Bench)
+Task APAR AR Saved
+Coding 221.6 221.6 0.0%
+CS 152.0 244.6 37.9%
+CF 142.0 185.3 23.4%
+Fermi 214.6 309.6 30.7%
+Generic 126.3 222.2 43.2%
+Knowledge 154.7 290.3 46.7%
+Math 139.7 139.7 0.0%
+Roleplay 166.8 229.0 27.2%
+Writing 189.1 270.0 30.0%
+Mean 170.3 251.7 32.4%
+Mean(>1%) 166.2 256.4 35.2%Table 14: Attended Tokens (Vanilla-APAR-13B on Vi-
+cuna Bench)
+Task APAR AR Saved
+Coding 222.0 222.0 0.0%
+CS 151.3 248.7 39.2%
+CF 144.6 224.2 35.5%
+Fermi 204.9 325.7 37.1%
+Generic 125.3 221.8 43.5%
+Knowledge 158.6 248.8 36.3%
+Math 137.3 137.3 0.0%
+Roleplay 150.3 217.1 30.8%
+Writing 209.0 271.8 23.1%
+Mean 170.5 251.4 32.2%
+Mean(>1%) 166.6 255.9 34.9%
+Table 15: Attended Tokens (Vanilla-APAR-7B on MT
+Bench)
+Task APAR AR Saved
+Coding 577.4 577.4 0.0%
+Extraction 570.8 570.8 0.0%
+Humanities 456.5 556.0 17.9%
+Math 616.0 616.9 0.1%
+Reasoning 286.7 322.0 11.0%
+Roleplay 404.3 477.7 15.4%
+STEM 413.0 473.8 12.8%
+Writing 437.9 533.1 17.8%
+Mean 477.0 528.3 9.7%
+Mean(>1%) 417.5 496.5 15.9%
+Table 16: Attended Tokens (Vanilla-APAR-13B on MT
+Bench)
+Task APAR AR Saved
+Coding 449.9 449.9 0.0%
+Extraction 767.8 769.2 0.2%
+Humanities 507.0 636.0 20.3%
+Math 601.3 601.3 0.0%
+Reasoning 314.3 350.1 10.2%
+Roleplay 404.8 464.9 12.9%
+STEM 445.3 521.1 14.6%
+Writing 360.8 442.7 18.5%
+Mean 482.3 539.6 10.6%
+Mean(>1%) 428.0 514.2 16.8%
+
+--- PAGE 14 ---
+200 400 600 800 1000
+Response Length0.0000.0010.0020.0030.0040.005Probability DensityVicuna Bench (7B Models)
+A-7B 
+(mean: 344.5)
+O-7B 
+(mean: 345.5)
+200 400 600 800
+Response Length0.0000.0010.0020.0030.0040.0050.006Probability DensityVicuna Bench (13B Models)
+A-13B 
+(mean: 345.4)
+O-13B 
+(mean: 334.5)
+0 500 1000 1500 2000
+Response Length0.00000.00050.00100.00150.0020Probability DensityMT Bench (7B Models)
+A-7B 
+(mean: 295.1)
+O-7B 
+(mean: 283.6)
+0 500 1000 1500 2000
+Response Length0.00000.00050.00100.00150.00200.0025Probability DensityMT Bench (13B Models)
+A-13B 
+(mean: 301.2)
+O-13B 
+(mean: 291.9)Figure 6: Response Length on Vicuna Bench and MT
+Bench

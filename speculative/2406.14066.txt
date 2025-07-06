@@ -1,0 +1,1462 @@
+# 2406.14066.pdf
+# Converted from PDF to TXT
+# Source path: /home/admin88/arxiv-downloader/speculative/2406.14066.pdf
+# File size: 1567184 bytes
+
+===============================================
+PDF FILE CONTENT
+===============================================
+
+
+--- PAGE 1 ---
+Optimizing Speculative Decoding for Serving Large
+Language Models Using Goodput
+Xiaoxuan Liu1Cade Daniel2Langxiang Hu3Woosuk Kwon1Zhuohan Li1Xiangxi Mo1
+Alvin Cheung1Zhijie Deng4Ion Stoica1Hao Zhang3
+1UC Berkeley2Anyscale Inc.3UCSD4SJTU
+Abstract
+Reducing the inference latency of large language models
+(LLMs) is crucial, and speculative decoding (SD) stands out
+as one of the most effective techniques. Rather than letting
+the LLM generate all tokens directly, speculative decoding
+employs effective proxies to predict potential outputs, which
+the LLM then verifies without compromising the genera-
+tion quality. Yet, deploying SD in real online LLM serving
+systems (with continuous batching) does not always yield
+improvement – under higher request rates or low specula-
+tion accuracy, it paradoxically increases latency. Furthermore,
+there is no best speculation length work for all workloads
+under different system loads. Based on the observations, we
+develop a dynamic framework SmartSpec. SmartSpec dynam-
+ically determines the best speculation length for each request
+(from 0, i.e., no speculation, to many tokens) – hence the
+associated speculative execution costs – based on a new met-
+ric called goodput , which characterizes the current observed
+load of the entire system and the speculation accuracy. We
+show that SmartSpec consistently reduces average request
+latency by up to 3.2 ×compared to non-speculative decoding
+baselines across different sizes of target models, draft mod-
+els, request rates, and datasets. Moreover, SmartSpec can be
+applied to different styles of speculative decoding, including
+traditional, model-based approaches as well as model-free
+methods like prompt lookup and tree-style decoding.
+1 Introduction
+Latency is critical when deploying Large Language Models
+(LLMs) for online services such as search engines [ 25,32],
+chatbots [ 30], and virtual assistants [ 27,38,39]. However,
+LLM generation is inherently slow due to its autoregressive
+nature, where each generated token depends on all preceding
+tokens. This sequential data dependency restricts tokens to
+be generated one by one, resulting in slow generation speeds.
+Speculative decoding aims to solve the problem by employ-
+ing lightweight proxies, such as a small draft model [18, 20,
+24,26,46] or additional model heads [ 4,21,22,43], generat-
+ing multiple tokens which are then verified by the main/target
+LLM in parallel. Speculative Decoding can reduce the gen-
+eration latency mainly for two reasons. First, the efficient
+proxy is much faster to run compared with running a single
+forward pass on the target model and hence it can generate
+tokens much quicker. Moreover, the verification of the draft
+4 8 12 16 20 24 28
+Request rate (req/s)0.00.51.01.52.0Speedupvsd, k=1
+vsd, k=3
+vsd, k=5Figure 1. Speedup of vanilla speculative decoding (VSD)
+with proposed length 𝑘=1,3,5on a LLaMA-7B model with
+fixed input/output length = 128. We also fix the token accep-
+tance rate to 0.7. We use LLaMA-160M as the draft model and
+conduct experiments on a single A100-80G. The red cross
+indicates the setting runs out of GPU memory and triggers
+swapping.
+model is done in a single forward pass. Such verification is
+only marginally slower compared to letting LLM generate
+one new token, but it allows LLM to potentially generate
+multiple new tokens (if the guessed tokens are correct), or at
+least enable LLM to generate one new token (if all guessed
+tokens are incorrect).
+While SD has demonstrated promise in accelerating single-
+request inference (i.e., batch size = 1), integrating it into
+online serving systems poses significant challenges. In real-
+world applications, systems batch multiple tokens to achieve
+high GPU utilization and SD is less efficient or can even
+increases the query latency as shown in Fig. 1. This increase
+is primarily due to the additional computational overhead
+of running the proxy models and verifying tokens that are
+ultimately not accepted. Whether the extra computational
+work translates into actual latency reduction depends on
+two key factors: the speculation accuracy of each request
+and the current load of the serving system.
+First, when the majority of proposed tokens are accepted
+(i.e., there is a high token acceptance rate), speculative de-
+coding can provide significant speedup, provided that the
+proxy model operates efficiently. Conversely, if the token
+acceptance rate is low, speculative decoding can introduce
+additional overhead rather than accelerating the process. In
+such cases, the main model ends up regenerating most of
+the tokens, rendering the proxy model’s computations su-
+perfluous and potentially slowing down the overall system.
+1arXiv:2406.14066v2  [cs.AI]  25 Jun 2024
+
+--- PAGE 2 ---
+Second, due to the inherent imperfection in speculation accu-
+racy, speculative decoding inevitably expends some compu-
+tational resources on tokens that are not ultimately accepted.
+Under low system load, this waste of compute is tolerable.
+However, under high system load conditions—where the sys-
+tem approaches its computational capacity and processes
+large batch sizes—the availability of surplus compute for
+speculation is greatly reduced. In such scenarios, it is more
+effective to allocate the limited computational resources di-
+rectly to normal token generation rather than continuing to
+speculate, thereby minimizing the risk and maximizing the
+use of available compute.
+Ideally, speculative decoding should be performed in an
+adaptive and automatic way, which can be likened to the
+adaptive streaming techniques used in video delivery sys-
+tems. In scenarios with few users, the system can afford
+to engage in “high-resolution" speculative decoding, akin
+to streaming high-resolution video, where it utilizes abun-
+dant computational resources to make more extensive pre-
+dictions per request. Conversely, as user demand increases
+and system resources become strained, the system shifts to
+“low-resolution" speculative decoding. This strategy, much
+like reducing video resolution during peak traffic, involves
+making fewer predictions per request to conserve resources
+while maintaining overall system functionality.
+Despite its widespread recognition, speculative decoding
+has not yet been effectively integrated into production-level
+serving systems. Most prior research has explored specula-
+tive decoding with a batch size of one [ 4,20]. Recent studies
+have extended this investigation to larger batch sizes, but
+these techniques have been tested primarily on relatively
+small LLMs [35] or in offline settings [37].
+In this work, we integrate speculative decoding into a
+production-level serving system vLLM [ 19], marking the
+first such integration to the best of our knowledge. We also
+explore the trade-offs between speculation cost and decoding
+accuracy under varying system loads. A key innovation in
+our system is the introduction of a metric called “goodput,”,
+defined as the rate of generated tokens per second. Unlike
+throughput, goodput in the context of speculative decoding
+measures only those tokens that are both verified and gener-
+ated by the target model. This reflects a crucial distinction –
+not all output tokens qualify as generated tokens.
+Goodput is an essential metric for determining the extent
+of speculation. It is derived from two factors: the token accep-
+tance rate and the batch size, with the latter indicating system
+load. This metric adheres to two core principles. First, it lim-
+its speculation under constrained computational resources
+to maximize system efficiency. For example, under extremely
+high system loads, goodput would automatically turn off
+speculation to avoid wasting any compute resources. Sec-
+ond, this metric increases the proposed length for requests
+that are easy to predict, as indicated by the high token ac-
+ceptance rate in previous generation steps. By leveragingthe predictability of these queries, the system can enhance
+overall performance.
+However, we cannot measure goodput directly because
+the decision needs to be made before knowing the goodput.
+We must determine the proposed length and which requests
+to run (batch size) based on an estimate of goodput, as these
+two factors influence its value. To estimate goodput, we
+predict the accepted token length for all requests within a
+single generation step using the token acceptance rate. A
+simple linear model is then employed to estimate the batch
+execution time. By combining the predicted token length
+and execution time, we can approximate goodput.
+Leveraging goodput, we developed the dynamic specula-
+tive decoding framework SmartSpec. SmartSpec dynamically
+modulates each request’s speculation length – from no spec-
+ulation (i.e., zero) to many tokens – based on the estimated
+goodput , adjusting speculation intensities to ensure consis-
+tent reduction (instead of increase) of the request latency.
+SmartSpec also accommodates various speculative decoding
+methods, including draft model-based approaches and model-
+free techniques such as prompt lookup [ 33] and tree-based
+decoding [ 4]. Accommodating diverse SD methods is crucial
+because different techniques are suited to different work-
+loads. For instance, prompt lookup decoding is more benefi-
+cial for summarization tasks, while tree-based approaches
+like Medusa are more useful for online chatting. For all SD
+methods evaluated across all datasets, SmartSpec guarantees
+improved performance without any degradation, which is a
+crucial feature for making SD useful in a production-ready
+online serving system.
+In summary, the paper makes the following contributions:
+•We perform the first study on speculative decoding within
+a real-world, online serving system with continuous
+batching scheduling (§3).
+•We define the goodput for speculative decoding, which
+takes into account both system throughput and specula-
+tion accuracy (§4).
+•We design and implement a speculative decoding sched-
+uling framework that utilizes goodput as key metrics
+to determine the optimal proposal length for different
+request volumes (§5, §6). Evaluation of SmartSpec on five
+models across different tasks shows that SmartSpec con-
+sistently reduces latency under different system loads,
+bringing up to 3.2×latency reduction compared with
+non-speculative decoding baseline (§7).
+2 Background
+Given a list of tokens (𝑥1,...,𝑥𝑛), a large language model
+(LLM) [ 1,3] is trained to predict the conditional probability
+distribution for the next token: 𝑃(𝑥𝑛+1|𝑥1,...,𝑥𝑛).When
+deployed as a service [ 19,31], the LLM takes in a list of
+2
+
+--- PAGE 3 ---
+Draft Model𝑥!𝑥"𝑥#𝑥$Target Model𝑥!𝑥"𝑥#𝑥$Proposed TokensAccepted TokensBonus TokensRequest PoolR1R3R2R4𝑥$𝑥"𝑥!𝑥#Propose autoregressivelyScoring in a single forward pass𝑥!𝑥"𝑥#𝑥$
+Accept TokensRejection SamplerFigure 2. A single generation step when combining continuous batching with speculative decoding. The draft model runs
+in an autogressive manner. The proposed tokens are sent to the target model for scoring in a single forward pass. A single
+generation step can generate more than one token for each request.
+tokens from the user request and generates an output se-
+quence(𝑥𝑛+1,...,𝑥𝑛+𝑇). The generation process requires se-
+quentially evaluating the probability and samples the token
+at every position for 𝑇times.
+Due to the sequential data dependency, this computation
+often suffers from low device utilization when running on
+GPUs, which leads to high inference latency and low serving
+throughput [ 31]. Therefore, many previous works propose
+different algorithms to decrease the latency or increase the
+throughput when serving LLMs. In this paper, we focus on
+two categories of optimization algorithms, speculative decod-
+ingandcontinuous batching .
+2.1 Speculative Decoding
+Although LLMs can only generate output tokens sequen-
+tially, when facing a list of output tokens (𝑥𝑛+1,...,𝑥𝑛+𝑇),
+LLMs can efficiently evaluate the probabilities for each token
+𝑃(𝑥𝑛+1|𝑥1,...,𝑥𝑛),...,𝑃(𝑥𝑛+𝑇|𝑥1,...,𝑥𝑛+𝑇−1)in parallel.
+Speculative decoding [5,20] utilizes this property to reduce
+the generation latency of LLMs.
+Specifically, in speculative decoding, we turn the target
+LLM into an evaluator. At every step, We use another more
+efficient draft model to propose a list of candidate tokens
+(𝑦𝑛+1,...,𝑦𝑛+𝑘),where𝑘is the number of proposed candi-
+dates. Then, we feed these 𝑘tokens to the target LLM to
+evaluate the probabilities 𝑃(𝑦𝑛+1|𝑥1,...,𝑥𝑛),...,𝑃(𝑦𝑛+𝑘|
+𝑥1,...,𝑥𝑛,𝑦𝑛+1,...,𝑦𝑛+𝑘−1)in parallel. Based on the proba-
+bilities and sampling methods, we will accept a subset of
+tokens𝑦1,...,𝑦𝑚, where𝑚is the number of accepted tokens.
+As an example, for greedy sampling, we check whether each
+𝑦𝑛+𝑖is the token that maximizes the probability distribution
+𝑃(·|𝑥1,...,𝑥𝑛,𝑦𝑛+1,...,𝑦𝑛+𝑖−1)and accept the first 𝑚to-
+kens𝑦1,...,𝑦𝑚that satisfy the condition. Note that for the
+position𝑚+1, we can directly sample 𝑦𝑚+1from the dis-
+tribution𝑃(·|𝑥1,...,𝑥𝑛,𝑦𝑛+1,...,𝑦𝑛+𝑚−1).Finally, we will
+take𝑚+1tokens𝑦1,...,𝑦𝑚+1as LLM outputs for this step.
+Speculative decoding has two core properties: (1) Specu-
+lative decoding does not change the behavior of the LLM
+sampling process, and thus generates exactly the same out-
+put as vanilla decoding algorithms without any accuracy loss.(2) The efficiency and the effective speedup of speculative
+decoding algorithms depend on two factors: the accuracy of
+the draft model matching the outputs of the target model
+and the efficiency of the draft model.
+Many previous work focuses on improving the accuracy
+and efficiency of speculative decoding and can be categorized
+into two parts: (1) Draft LLM-based speculative decoding,
+which uses a small LLM as a draft model to propose candidate
+tokens [ 6,24,26,40,46]. (2) Draft-model free speculative
+decoding, which uses either a branch of the target model or
+uses other sources (e.g., from a external database) to generate
+the candidate tokens [ 4,10,21,22,33]. In this work, we study
+the behavior of both types of speculative decoding method.
+2.2 Continuous Batching
+Due to the sequential dependency, when generating output
+for a single output, LLMs severely under-utilize the GPUs. To
+increase the GPU utilization, one can batch multiple requests
+in one step and process them in parallel. However, batching
+the requests to an LLM is non-trivial: First, the requests may
+arrive at different times. A naive batching strategy would
+either make earlier requests wait for later ones or delay
+the incoming requests until earlier ones finish, leading to
+significant queueing delays. Second, the requests may have
+vastly different input and output lengths. A straightforward
+batching technique would pad the inputs and outputs of the
+requests to equalize their lengths, wasting GPU computation
+and memory.
+Continuous batching [ 11,41] is proposed to address this
+problem. Instead of batching at the request level, continuous
+batching batches at the step level. For each step, completed
+requests from previous step are removed from the batch, and
+newly received requests are added. Therefore, a new request
+can immediately start to be processed after it is received. This
+leads to a larger batch size at every step, which improves
+GPU utilization and thus the serving throughput. Moreover,
+with special GPU kernels, continuous batching can eliminate
+the need to pad requests of different lengths, which further
+improves the serving throughput. The technique has been
+3
+
+--- PAGE 4 ---
+integrated in all popular LLM inference engines, such as
+vLLM [19] and TensorRT-LLM [29].
+3Speculative Decoding with Continuous Batch-
+ing
+Speculative decoding changes continuous batching by allow-
+ing each generation step to produce multiple rather than a
+single token per request. It utilizes a draft model to suggest a
+range of possible tokens for a request at each generation step.
+These proposed tokens for all requests are then collectively
+processed in a batch by the target model for verification.
+Figure 4 illustrates the three phases of speculative decod-
+ing: proposal, scoring, and acceptance. In proposal, the draft
+model examines the request pool and generates tokens in
+an autoregressive manner. During scoring, all the proposed
+tokens are evaluated collectively in a single forward pass.
+After accepting the tokens with rejection sampling, each
+request can yield multiple tokens in a single pass. The gen-
+erated tokens comprise those proposed by the draft model
+and subsequently accepted by the target model, plus a bonus
+token. This bonus token either corrects a prediction made
+by the draft model or is generated by the target model when
+it accepts all proposed tokens.
+3.1 Vanilla Speculative Decoding Latency
+To understand the performance implication of vanilla spec-
+ulative decoding in the context of continuous batching, we
+conduct an analysis shown in Fig. 1, showcasing the speedup
+achieved under varying request rates. In this analysis, to
+mitigate confounding variables, we set the token acceptance
+rate (0.7) and standardize the input and output lengths across
+all requests (input length=output length=128). The results
+show that at a low request rate (specifically, a request rate
+of 4), proposing 3 or 5 tokens results in the most significant
+speedup. However, as the request rate increases, the advan-
+tage of proposing more tokens diminishes rapidly: when the
+request rate exceeds 12, proposing 5 tokens offers no per-
+formance improvements. Likewise, at a request rate greater
+than 16, proposing 3 tokens yields performance degradation.
+Several insights emerged from this experiment. Firstly,
+speculative decoding does not invariably lead to improved
+performance; in fact, it may detrimentally affect performance
+at higher request rates. Secondly, the optimal length for
+speculation varies with the request rate. At lower request
+rates, speculating more is better, but at higher request rates,
+it may not even make sense to speculate at all.
+3.2 Latency Analysis
+To understand the phenomenon, we can approximate the
+request latency as:
+𝑟𝑒𝑞𝑢𝑒𝑠𝑡 𝑙𝑎𝑡𝑒𝑛𝑐𝑦≈𝑏𝑎𝑡𝑐ℎ𝑙𝑎𝑡𝑒𝑛𝑐𝑦×𝑔𝑒𝑛𝑒𝑟𝑎𝑡𝑖𝑜𝑛𝑠𝑡𝑒𝑝𝑠 (1)
+where batch latency refers to the time required to process
+a single batch and generation steps is the average number
+5 10 15 20 25
+Request rate (req/s)0200400600800Average number of batched tokens
+w/o SD
+vsd, k=1
+vsd, k=3
+vsd, k=5(a)Average batch size.
+w/o SD vsd, k=1 vsd, k=3 vsd, k=5
+Method020406080100120Number of generation steps (b)Average number of gen-
+eration steps.
+Figure 3. Latency analysis: batch size and generation step.
+of iterations needed for the target model to complete a re-
+quest. For simplicity, we exclude the latency associated with
+the draft model, assume uniform latency across different
+generation steps, and focus solely on the batch latency per
+generation step incurred by the target model. Fig. 3a illus-
+trates that proposing more tokens at each step leads to a
+greater accumulation of tokens within the same batch and
+hence higher batch latency . On the other hand, as shown
+in Fig. 3b, generating more tokens in a single forward pass
+of the target model reduces the number of generation steps .
+Given the approximation presented in Eq. 1, the feasibility of
+achieving a speedup is determined by the interplay between
+these two factors.
+3.3 Granularity of Proposed Lengths
+Lastly, continuous batching enables flexible scheduling. As
+shown in Fig. 4, there are three levels of granularity for pro-
+posed lengths: (1) Global: This is the simplest way to imple-
+ment speculative decoding with continuous batching, where
+the proposed length for all requests across all generation
+steps is uniform. However, this approach overlooks system
+behavior; as previously mentioned, speculative decoding can
+degrade performance. (2) Step Level: Here all requests within
+the same batch have the same proposed length, although the
+length can vary between steps. This allows proposed lengths
+to adapt to different system loads. For instance, when the
+number of requests is high, the proposed length for a given
+step can be reduced to conserve computational resources. (3)
+Request Level: This is the most fine-grain level of scheduling,
+where each request can have its own proposed length. It al-
+lows for the prioritization of ‘easier’ requests by proposing a
+higher number of tokens for them, based on the assumption
+that it is more likely for more tokens to be generated in a
+single step for these requests.
+In this section, we analyze the performance characteris-
+tics of naive speculative decoding with continuous batch-
+ing across various request rates. We explore the reasons for
+performance degradation and highlight the possibility of
+implementing flexible scheduling. Determining the optimal
+proposed length to achieve minimal latency across diverse
+4
+
+--- PAGE 5 ---
+𝑥!𝑥"𝑥#𝑥$𝑥′!𝑥′"𝑥′#𝑥′$𝑥!𝑥"𝑥#𝑥$𝑥′!𝑥′"𝑥′#𝑥′$𝑥!𝑥"𝑥#𝑥$𝑥′!𝑥′"𝑥′#𝑥′$Step 1Step 2Step 1Step 2Step 1Step 2Global Propose LengthStep-level Propose LengthRequest-level Propose LengthFigure 4. Flexible proposed lengths.
+workloads under different request volumes is a significant
+challenge that we address in the following discussion.
+4 The Goodput of Speculative Decoding
+We now define the goodput of serving LLMs with specula-
+tive decoding and elaborate on how it is connected to the
+overall system efficiency. Then we describe how goodput
+can be estimated given various prediction methods on the
+acceptance of speculated tokens.
+4.1 Defining Goodput
+We define the per-step throughput of serving a request using
+an LLM as:
+𝑇ℎ𝑟𝑜𝑢𝑔ℎ𝑝𝑢𝑡 =𝑁𝑢𝑚𝑏𝑒𝑟𝑜𝑓 Output𝑇𝑜𝑘𝑒𝑛𝑠
+𝐸𝑥𝑒𝑐𝑢𝑡𝑖𝑜𝑛𝑇𝑖𝑚𝑒(2)
+Throughput refers to the output rate of tokens generated
+by the model per unit of time. Existing systems such as
+vLLM [ 19] and Orca [ 41] all aim to maximize the throughput,
+as doing so enhances the overall efficiency of the system.
+Goodput in speculative decoding. In speculative decoding,
+not all tokens output by the target model in the scoring phase
+(Fig. 4) are guaranteed to pass through the rejection sampling
+mechanism. Consequently, these tokens might not represent
+the actual tokens generated in a single step. To address this
+discrepancy, we define goodput as:
+𝐺𝑜𝑜𝑑𝑝𝑢𝑡 =𝑁𝑢𝑚𝑏𝑒𝑟𝑜𝑓 Generated𝑇𝑜𝑘𝑒𝑛𝑠
+𝐸𝑥𝑒𝑐𝑢𝑡𝑖𝑜𝑛𝑇𝑖𝑚𝑒(3)
+Here, the goodput refers to the rate at which tokens are
+generated, measured in tokens per second. This includes
+both the proposed tokens that are subsequently accepted
+and the bonus tokens that the target model produces during
+verification.
+Parameters of Goodput. While the above definition is
+general across different speculative decoding algorithms, we
+focus on three configuration parameters of particular impact
+in the context of speculative decoding scheduling:
+1.Proposed length: the number of tokens proposed by the
+draft model in each step.
+2. Requests to run: which request(s) to run in each step.
+4.2 Understanding Goodput
+Goodput, essentially defined as the ratio of expected gain to
+costs, offers valuable insights into how batch size and pro-
+posed length should interact to optimize system performance.
+0
+2
+4
+6
+8
+10Propose length
+050100150200
+Batch size1000200030004000
+Goodput
+Figure 5. Goodput as a function of proposed length and
+batch size. We calculated the goodput using the coefficients
+from the A100-7B model, as detailed in Sec. 4.3. We assumed
+a uniform token acceptance rate of 0.7 and employed the
+formula described in Section 4.4 to estimate the accepted
+length.
+KV CacheR1 KVR2 KVR3 KVContext token number = 8Batched token number = 3Input tokensR1 R2 R3 
+Figure 6. An example of context token number and batched
+token number used in modeling the forward execution time.
+To demonstrate the intuition behind goodput, Fig. 5 shows
+the goodput values across various batch sizes and proposed
+lengths, assuming a uniform token acceptance rate.
+Propose more for small batches. In Fig. 5, the red line
+indicates the optimal proposed length for each batch size.
+Notably, small batch sizes require proposing more than 4
+tokens per per request to achieve the maximum goodput. As
+batch size increases, the optimal proposal length decreases.
+Propose less for large batches. For large batch sizes, not
+speculate altogether can result in higher goodput. This oc-
+curs as the cost of unsuccessful speculations increases sig-
+nificantly with larger batch sizes, outpacing the potential
+gains.
+Prefer batching over speculating. Consider a scenario
+where the acceptance of tokens is independent, with each
+token having a 0.7 probability of acceptance. In this case,
+the probability of accepting the first token is 0.7, while the
+5
+
+--- PAGE 6 ---
+probability of accepting both the first and second tokens
+is 0.7×0.7 = 0.49. Consequently, increasing the batch size
+tends to produce more tokens at the same cost. Doubling the
+batch size results in twice the number of generated tokens,
+whereas doubling the proposed length does not necessarily
+yield a proportional increase in output.
+Optimizing goodput reduces request latency. Request
+latency consists of the request’s queueing delay and total
+execution time. When the request rate is low, improving
+goodput effectively reduces the overall execution time by
+utilizing speculative decoding with an optimal proposed
+length. On the other hand, at high request rates, optimizing
+goodput helps decrease queueing delays by increasing the
+system’s capacity to process requests through large batch
+sizes and moderate speculative decoding. Overall, strategi-
+cally adjusting batch sizes and proposed lengths based on
+goodput enables managing both high and low demand sce-
+narios effectively.
+4.3 Modeling Batch Execution Time
+The batch execution time is defined as the total time required
+to complete a speculative decoding step, incorporating both
+the draft and target model execution times. This can be math-
+ematically represented as:
+𝑇𝑏𝑎𝑡𝑐ℎ=𝑇𝑑𝑟𝑎𝑓𝑡+𝑇𝑡𝑎𝑟𝑔𝑒𝑡 (4)
+Modeling𝑇𝑑𝑟𝑎𝑓𝑡 and𝑇𝑡𝑎𝑟𝑔𝑒𝑡 .For draft-model-free specu-
+lative decoding, we assign a small constant factor 𝑇𝑑𝑟𝑎𝑓𝑡 =𝐶.
+For draft model-based speculative decoding, the draft model
+operates in an autoregressive manner and supports continu-
+ous batching. Consequently, the total execution time for the
+draft model is the aggregate of the execution times across all
+draft steps. Each step involves a single forward pass of the
+draft model. Given the variability in propose lengths across
+different requests, the execution time per step may differ.
+The draft model execution time is a sum of the execution
+time of each forward pass:
+𝑇𝑑𝑟𝑎𝑓𝑡 =𝑠∑︁
+𝑖=1𝑇𝑓𝑤𝑑(𝑀,𝑁𝑐𝑜𝑛𝑡𝑒𝑥𝑡(𝑠),𝑁𝑏𝑎𝑡𝑐ℎ𝑒𝑑(𝑠)) (5)
+Here,𝑠the number of autogressive steps. Concretely, 𝑠=
+𝑚𝑎𝑥(𝑠1,𝑠2,...𝑠𝑛), where𝑠𝑖is the proposed length of request 𝑖
+in the batch. The forward execution time, 𝑇𝑓𝑤𝑑, varies across
+different steps due to different numbers of context tokens
+(𝑁𝑐𝑜𝑛𝑡𝑒𝑥𝑡 ) and batched tokens ( 𝑁𝑏𝑎𝑡𝑐ℎ𝑒𝑑 ) at each step. It also
+depends on the model 𝑀the forward pass is running on.
+These variations directly influence the duration of the for-
+ward execution time, as outlined in Modeling𝑇𝑓𝑤𝑑.below.
+The target model executes a single forward pass for its
+operation:
+𝑇𝑡𝑎𝑟𝑔𝑒𝑡 =𝑇𝑓𝑤𝑑(𝑁𝑐𝑜𝑛𝑡𝑒𝑥𝑡,𝑁𝑏𝑎𝑡𝑐ℎ𝑒𝑑) (6)
+Modeling𝑇𝑓𝑤𝑑.We then define 𝑇𝑓𝑤𝑑, the time for a for-
+ward pass, which is applicable to both the draft and target
+(a)7B, TP=1.
+ (b)70B, TP=4.
+Figure 7. Predicted versus profiled batch latency. TP: tensor
+parallel. The x-axis represents the profiled time, while the
+y-axis shows the predicted execution time using Formula 7.
+The red line symbolizes perfect prediction, indicating where
+the predicted time matches the profiled time exactly.
+models:
+𝑇𝑓𝑤𝑑(𝑀,𝑁𝑐𝑜𝑛𝑡𝑒𝑥𝑡,𝑁𝑏𝑎𝑡𝑐ℎ𝑒𝑑)=𝛼𝑀·𝑁𝑐𝑜𝑛𝑡𝑒𝑥𝑡+𝛾𝑀·𝑁𝑏𝑎𝑡𝑐ℎ𝑒𝑑+𝛿𝑀
+(7)
+where𝑁𝑐𝑜𝑛𝑡𝑒𝑥𝑡 represents the number of context tokens
+within the batch and 𝑁𝑏𝑎𝑡𝑐ℎ𝑒𝑑 denotes the number of batched
+tokens, as illustrated in Figure 7. The term 𝛼𝑀·𝑁𝑐𝑜𝑛𝑡𝑒𝑥𝑡 re-
+flects the time required to load the key-value cache, scal-
+ing linearly with the number of context tokens. The term
+𝛾𝑀·𝑁𝑏𝑎𝑡𝑐ℎ𝑒𝑑 accounts for the computation time, while 𝛿𝑀
+represents the time to load the model parameters. The coef-
+ficients𝛼𝑀,𝛾𝑀, and𝛿𝑀are contingent upon the model and
+hardware configuration, necessitating distinct sets of ( 𝛼𝑀,
+𝛾𝑀,𝛿𝑀) for various models or hardware environments. In
+practical terms, we systematically profile the batch execu-
+tion time for each specific model and hardware combination,
+and subsequently adjust the values of 𝛼𝑀,𝛾𝑀, and𝛿𝑀to
+accurately reflect these profiles.
+Modeling𝑁𝑏𝑎𝑡𝑐ℎ𝑒𝑑 . If at each position the proposal method
+suggests only one token (top 1 candidate), the number of
+tokens sent for verification is simply the sum of the proposed
+lengths of each request. For top-k tree-style speculative de-
+coding, assuming full tree verification, assume full tree verifi-
+cation, there are 𝐻heads and we propose 𝑘𝑖tokens for head
+𝑖, the number of batched tokens isÍ𝐻
+ℎ=1Îℎ
+𝑖=1𝑘𝑖[4]. Figure 8
+illustrates an example of the number of batched tokens in
+Medusa. As shown, one characteristic of full tree speculative
+decoding is its high cost. In the example, even if a maximum
+of four tokens can be accepted (three proposed tokens plus
+one bonus token), a total of 27 tokens are sent for verification.
+This can be problematic for large batch sizes. Smarter meth-
+ods to construct the tree, such as those proposed by [ 6] and
+SmartSpec, are needed to make topk candidate speculative
+applicable in a real serving system.
+Validating performance model. Figure 7 illustrates the
+application of our 𝑇fwdfunction, designed to estimate batch
+6
+
+--- PAGE 7 ---
+execution times. This is demonstrated under a uniform work-
+load condition, where each request maintains identical in-
+put/output sizes (input length = output length = 128). Fur-
+thermore, we adjust the request rates to evaluate the func-
+tion’s performance across a spectrum of batch sizes, with
+each data point representing an execution step. Our analysis
+encompasses comparisons between models of 7B and 70B
+parameters, employing tensor parallelism settings of 1 and 4,
+respectively. Overall, the results demonstrate that our model
+accurately captures the trends present in the observed data,
+effectively adapting to variations in request rates, model
+sizes, and levels of parallelism.
+4.4 Modeling Generated Length
+To accurately predict goodput, as defined in Equation 3, our
+methodology necessitates modeling the number of tokens
+produced during each generation step. The capability to ac-
+curately predict the length of generated content is crucial
+for minimizing computational waste and enhancing the ef-
+ficiency of scheduling, as the predictions directly influence
+the determination of the proposed length for generation and
+the subsequent scheduling decisions. SmartSpec explores
+three methods to model the accepted length.
+Top1 candidate generated length. SmartSpec employs a
+moving average method to estimate the token acceptance
+rate for specified pairs of draft and target on a given dataset.
+Concretely, SmartSpec records the token acceptance rate
+from previous generation steps. For predicting the rate in
+the current step, it calculates the average from these past
+rates. The moving average method used requires a window
+size; however, we find that the performance is relatively in-
+sensitive to the choice of this window size. This approach
+presupposes uniform token acceptance behavior across di-
+verse requests. The acceptance length is predicted using the
+formula introduced in the original speculative decoding pa-
+per [20].
+𝑙(𝛼,𝑘)=1−𝛼𝑘+1
+1−𝛼(8)
+In this context, 𝑙represents the generated length for each
+request, inclusive of the bonus token. The variable 𝛼de-
+notes the average token acceptance rate observed within
+the calibrated dataset, while 𝑘corresponds to the number of
+tokens proposed. We can then write out the total number of
+generated tokens in a single batch:
+𝑔𝑒𝑛𝑒𝑟𝑎𝑡𝑒𝑑𝑡𝑜𝑘𝑒𝑛𝑠 =∑︁
+𝑖∈𝑅1−𝛼𝑘𝑖+1
+𝑖
+1−𝛼𝑖(9)
+Here, we can have different granularity of token acceptance
+rate. (1) Global token acceptance rate: it is assumed that each
+request exhibits identical acceptance behavior. Consequently,
+different requests within the same batch share the same
+token acceptance rate and proposed length, 𝑘1=𝑘2=....=
+𝑘𝑛,𝛼1=𝛼2=....=𝛼𝑛. (2) Request level token acceptance
+rate: individual requests exhibit distinct acceptance rates ( 𝛼s)
+Prompt: What is your name?LLM Head 1Head 2Head 3MyHiIisnameamareyouis
+Figure 8. An example Medusa-style speculative decoding
+utilizing three distinct heads. Each head is tasked with gen-
+erating proposals for one position. In this scenario, the first
+head proposes the top three most likely tokens, the second
+head selects the top two, and the third head also chooses
+the top three. During this forward run, three tokens [’My’,
+’name’, ’is’] are generated – two from the proposals plus one
+bonus token. Collectively, this setup represents a total of 18
+(3x2x3) possible continuations.
+and proposed lengths ( 𝑘s) due to varying levels of difficulty,
+necessitating the proposal of a differing number of tokens
+for each.
+Topk tree-style generated length. In tree-style speculative
+decoding, we can have multiple candidates for the same
+position. In Medusa, each head is responsible for proposing
+for a position. Figure 8 shows an example, where there are
+three candidates for position 1, two candidates for position
+2, and three candidates for position 3.
+To estimate the accepted length, we make the following
+assumptions: 1. The token acceptance rate for each proposed
+token at head 𝑖is denoted as 𝛼𝑖. All tokens within the top-
+k share the same token acceptance rate. 2. The acceptance
+behavior is independent across different heads; that is, the
+acceptance of a token at head 𝑖does not influence the ac-
+ceptance of a token at head 𝑖+1. Suppose there are ℎheads,
+and we propose 𝑘1,𝑘2,...,𝑘ℎtokens for heads 1,2,...,ℎ , re-
+spectively. The token acceptance rates for these heads are
+𝛼1,𝛼2,...,𝛼ℎ. For simplicity in the formula below, we define
+𝛼ℎ+1=0. The expected accepted length given the structure
+can be formulated as:
+𝑙(𝛼1...𝛼ℎ,𝑘1...𝑘ℎ)=∑︁
+𝑖=1..ℎ(𝑖+1)×(1−𝛼𝑖+1)×Π𝑗=1···𝑖[1−(1−𝛼𝑗)𝑘𝑗]
+(10)
+Here,(1−𝛼𝑖+1)×Î𝑖
+𝑗=1[1−(1−𝛼𝑗)𝑘𝑗]represents the prob-
+ability of accepting (𝑖+1)tokens, where the "+1" accounts
+for the bonus token. To understand this probability, it hinges
+on two conditions: (1) At least one token is accepted from
+heads 1 through 𝑖. (2) None of the proposed tokens at head
+𝑖+1are accepted. Thus, the probability is calculated as the
+product of the probabilities of conditions (1) and (2).
+Since SmartSpec is a versatile speculative decoding frame-
+work, users can integrate various estimation methods, such
+7
+
+--- PAGE 8 ---
+as the confidence-based method discussed in the Appendix.
+Additionally, users may even employ machine learning mod-
+els for predictions. We leave it as future work to develop an
+accurate and efficient predictor for accepted length.
+5 Serving Requests Using SmartSpec
+We now describe the flow of a single decoding step outlined
+in Algorithm 2. Initially, we enumerate potential requests
+for a single batch (line 2). SmartSpec uses a first-come, first-
+served strategy. Assuming 𝑛requests in the pending batch,
+we construct candidate batches by selecting prefixes of in-
+creasing length: batches with 1 request, 2 requests, etc., up
+to𝑛requests. For each potential batch, we use goodput to
+determine the optimal proposed length (line 4). Addition-
+ally, we verify if there is sufficient space in the KV cache
+(lines 5-7). For Top-1 candidate speculative decoding, Smart-
+Spec will determine the optimal proposed length. For Top-k
+tree-style speculative decoding, SmartSpec will identify the
+optimal Top-k value for each proposal head. In both cases,
+the token acceptance rate is factored into Eqn. 8 to calcu-
+late the estimated generation length. SmartSpec then uses
+this estimated length along with Eqn. 3 and a performance
+model (elaborated in Sec. 4.3) to estimate goodput. After
+identifying the optimal proposed lengths or Top-k value,
+SmartSpec executes these steps sequentially. For draft-model
+based speculative decoding, the proposal phase operates
+in an autoregressive manner and incorporates continuous
+batching (line 12). Then SmartSpec verifies the proposed
+tokens and records the token acceptance rate of current step
+(line 13).
+To estimate the current token acceptance rate, SmartSpec
+records the acceptance rate from previous scoring steps (line
+13 in Alg. 2) and computes the moving average of these rates
+(lines 5-8 in Alg. 1). Although moving average is an imperfect
+estimator for token acceptance rate, goodput remains robust
+and results in latency reduction to be discussed in Sec. 7.2.1.
+Prefill disabling. In draft-model based speculative decoding,
+the prefill phase of the running draft model can introduce
+overhead, especially when request rate is high. By default,
+speculative decoding is disabled during the prefill phase.
+However, to synchronize the KV cache between the draft
+and target models, the system still executes the draft model’s
+prefill phase by default, even if no tokens are subsequently
+proposed by SmartSpec. This can lead to the wasteful con-
+sumption of memory and computational resources. To ad-
+dress this issue, we use a feedback-based method that auto-
+matically disables the draft model’s prefill run. For each gen-
+eration step, SmartSpec records the proposed length. During
+each prefill phase, SmartSpec checks the proposed length
+from previous decoding steps. If the percentage of times
+no tokens were proposed exceeds a predefined threshold,
+SmartSpec will disable the draft model’s prefill run for the
+current request and classify the request as non-speculative.
+Since the draft model’s KV cache is not maintained for theseAlgorithm 1 Goodput Estimation for Step-level Proposed
+Length
+Require: Proposed length 𝑘for all requests in the batch for Top-1
+candidate speculative decoding. Number of sampled tokens
+𝑘1...𝑘ℎfor each head for Top-k tree-style speculative de-
+coding. Estimation method 𝑀𝑒𝑡ℎ𝑜𝑑 . Token acceptance rate
+𝑝𝑟𝑒𝑣_𝑎𝑙𝑝ℎ𝑎𝑠 of previous steps. All requests in the batch 𝑅.
+1:𝑛←𝑙𝑒𝑛(𝑅)
+2:if𝑀𝑒𝑡ℎ𝑜𝑑 == Top-1 candidate speculative decoding then
+3:𝛼←𝑀𝑜𝑣𝑖𝑛𝑔𝐴𝑣𝑔(𝑝𝑟𝑒𝑣_𝑎𝑙𝑝ℎ𝑎𝑠)
+4:𝑔𝑒𝑛𝑒𝑟𝑎𝑡𝑒𝑑 _𝑙𝑒𝑛=𝑛×1−𝛼𝑘+1
+(1−𝛼)×𝑛
+5:𝑏𝑎𝑡𝑐ℎ _𝑒𝑥𝑒𝑐𝑢𝑡𝑖𝑜𝑛 _𝑡𝑖𝑚𝑒=𝑇(𝑅,[𝑘])
+6:else if𝑀𝑒𝑡ℎ𝑜𝑑 == Top-k tree-style speculative decoding then
+7:𝛼1,𝛼2...𝛼ℎ←𝑀𝑜𝑣𝑖𝑛𝑔𝐴𝑣𝑔(𝑝𝑟𝑒𝑣_𝑎𝑙𝑝ℎ𝑎𝑠)
+8:𝑔𝑒𝑛𝑒𝑟𝑎𝑡𝑒𝑑 _𝑙𝑒𝑛=𝑛×Í
+𝑖=1..ℎ(𝑖+1)×(1−𝛼𝑖+1)×Π𝑗=1···𝑖[1−
+(1−𝛼𝑗)𝑘𝑗]
+9:𝑏𝑎𝑡𝑐ℎ _𝑒𝑥𝑒𝑐𝑢𝑡𝑖𝑜𝑛 _𝑡𝑖𝑚𝑒=𝑇(𝑅,[𝑘1,𝑘2....𝑘ℎ])
+10:end if
+11:return𝑔𝑒𝑛𝑒𝑟𝑎𝑡𝑒𝑑 _𝑙𝑒𝑛
+𝑏𝑎𝑡𝑐ℎ _𝑒𝑥𝑒𝑐𝑢𝑡𝑖𝑜𝑛 _𝑡𝑖𝑚𝑒
+Algorithm 2 SmartSpec token acceptance rate based pro-
+posal and verification.
+Require: Pending requests 𝑅. Max proposed length 𝑉. Token ac-
+ceptance rates of previous decoding steps 𝑝𝑟𝑒𝑣_𝑎𝑙𝑝ℎ𝑎𝑠 .
+1:𝑏𝑒𝑠𝑡_𝑔𝑜𝑜𝑑𝑝𝑢𝑡,𝑏𝑒𝑠𝑡 _𝑝𝑟𝑜𝑝𝑜𝑠𝑒𝑑 _𝑙𝑒𝑛𝑠←− 1,[]
+2:𝑏𝑎𝑡𝑐ℎ _𝑐𝑎𝑛𝑑𝑖𝑑𝑎𝑡𝑒𝑠←GetBatchCandidates()
+3:for𝑏𝑎𝑡𝑐ℎ in𝑏𝑎𝑡𝑐ℎ _𝑐𝑎𝑛𝑑𝑖𝑑𝑎𝑡𝑒𝑠 do
+4:𝑐𝑢𝑟_𝑔𝑜𝑜𝑑𝑝𝑢𝑡,𝑐𝑢𝑟 _𝑝𝑟𝑜𝑝𝑜𝑠𝑒𝑑 _𝑙𝑒𝑛𝑠 ←
+𝐴𝑟𝑔𝑚𝑎𝑥𝑘1,𝑘2...𝑘𝑛(Goodput(𝑘1,𝑘2...𝑘𝑛,𝑝𝑟𝑒𝑣 _𝑎𝑙𝑝ℎ𝑎𝑠))
+5: ifnot HasSlot( 𝑏𝑎𝑡𝑐ℎ )then
+6: continue.
+7: end if
+8: if𝑐𝑢𝑟_𝑔𝑜𝑜𝑑𝑝𝑢𝑡 >𝑏𝑒𝑠𝑡_𝑔𝑜𝑜𝑑𝑝𝑢𝑡 then
+9:𝑏𝑒𝑠𝑡_𝑔𝑜𝑜𝑑𝑝𝑢𝑡,𝑏𝑒𝑠𝑡 _𝑝𝑟𝑜𝑝𝑜𝑠𝑒𝑑 _𝑙𝑒𝑛𝑠 ←
+𝑐𝑢𝑟_𝑔𝑜𝑜𝑑𝑝𝑢𝑡,𝑐𝑢𝑟 _𝑝𝑟𝑜𝑝𝑜𝑠𝑒𝑑 _𝑙𝑒𝑛𝑠
+10: end if
+11:end for
+12:Propose(𝑅,𝑏𝑒𝑠𝑡 _𝑝𝑟𝑜𝑝𝑜𝑠𝑒𝑑 _𝑙𝑒𝑛𝑠)
+13:𝛼𝑐𝑢𝑟= Score(𝑅,𝑏𝑒𝑠𝑡 _𝑝𝑟𝑜𝑝𝑜𝑠𝑒𝑑 _𝑙𝑒𝑛𝑠)
+14:𝑝𝑟𝑒𝑣_𝑎𝑙𝑝ℎ𝑎𝑠 .append(𝛼𝑐𝑢𝑟)
+requests, speculative decoding is also disabled for all subse-
+quent decoding steps for these requests. The threshold for
+disabling the prefill run is adjustable, allowing users to tailor
+the level of conservative speculative decoding to their needs.
+Empirically, setting this threshold to 0.7 has yielded good
+performance, balancing resource efficiency with decoding
+effectiveness.
+Discussion and Complexity Analysis. For each batch,
+the overhead of SmartSpec consists of three components:
+accepted length estimation, batch execution time modeling,
+and goodput-guided proposal length optimization. Comput-
+ing accepted length and batch execution time are 𝑂(1), as
+8
+
+--- PAGE 9 ---
+they use moving average based token acceptance rate and
+offline profiled model coefficients, as detailed in Secs. 4.4 and
+4.3.
+The complexity of goodput-guided optimization varies
+depending on whether it utilizes request-level or global to-
+ken acceptance rates. In this work, we empirically find that
+both granularities yield similar performance gains. How-
+ever, given that the request-level token acceptance rate in-
+troduces significant engineering complexity, we opt to use
+the global token acceptance rate to estimate the accepted
+length. Since the maximum proposed length 𝑉is typically
+less than 10, we can efficiently enumerate all possible pro-
+posed lengths to find the one that maximizes goodput. This
+is a very small overhead in comparison with LLM forward
+pass: let𝑠be the sequence length, ℓbe number of decoder
+layers in the model, ℎbe the hidden dimension size, 𝑛be the
+batch size, each forward pass’s complexity is at the order of
+𝑂(ℓ𝑛(𝑠ℎ2+𝑠2ℎ))≫𝑂(𝑛𝑉).
+6 System Design and Architecture
+Lookahead SchedulerDraft WorkerSD WorkerDSDOnlineAdaptorTarget WorkerRejection SamplerDraft Model KVTarget Model KV
+ProposeScoreAcceptSmall Draft Model,N-gram
+DSD Offline Profiler
+Figure 9. System architecture of SmartSpec in vLLM.
+We implement SmartSpec within vllm [ 19] and illustrate
+the system architecture in Figure 9. Initially, upon receiving
+a request, the lookahead scheduler takes charge. This sched-
+uler is tasked with dispatching requests for immediate execu-
+tion and managing resource allocation within the key-value
+(KV) cache. It is termed a "lookahead" scheduler because it
+proactively reserves multiple KV cache spots for tokens that
+have yet to be generated. Subsequently, the engine forwards
+these active requests to the speculative decoding worker,
+which, in turn, activates the draft worker. The draft worker
+operates the draft model through several steps, each gen-
+erating a proposed token. It offers a standardized interface
+that supports various speculative decoding approaches, such
+as a small draft model or an n-gram model. Subsequently,
+the target worker utilizes the target model for scoring and
+verification purposes. Note here both the draft and target
+models interact with the KV cache during their forward.
+For effective memory management within speculative de-
+coding, it is essential to maintain the key-value (KV) cache
+for both the draft and target workers. In scenarios where
+draft-model-based speculative decoding is employed, we di-
+vide the total memory allocated for the KV cache into twodistinct segments: one dedicated to the draft model and the
+other to the target model. Our observations have consistently
+shown that the number of required slots for both the draft
+and target models remains constant both before and after
+the execution step. Consequently, we allocate the KV cache
+to provide an equal number of slots for each model, with
+the scheduler assigning the same number of slots to both
+models. This approach not only simplifies the system’s archi-
+tecture but also reduces its complexity. On the other hand,
+when carrying out draft-model free speculative decoding,
+SmartSpec maintains the KV cache as it without speculative
+decoding.
+To dynamically adjust the proposed length, we employ the
+online adaptor in conjunction with the offline profiler. The
+offline profiler is responsible for analyzing both the draft (if
+any) and target models to derive the performance coefficients
+critical for the performance model, as detailed in Section 4.3.
+These coefficients are subsequently utilized by the online
+adaptor, which aggregates batch information. Based on this
+data, the online adaptor adjusts the proposal length for the
+draft worker and the verification length for the target model.
+7 Evaluation
+Model and server configurations. We test on two pop-
+ular open source model families: Llama and Mistral. For
+Llama, we use Vicuna-7B-v1.5, Vicuna-33B-v1.3 [ 44], and
+Llama-2-70b-chat-hf [ 36]. For Mistral, we use Mistral-7B-
+Instruct-v0.1 [ 13] and Mixtral-8x7B-Instruct-v0.1 [ 14]. We
+use a single A100-80G [ 28] GPU for the 7B model, 4 ×A100-
+80G GPUs for the 33B model, and 8 ×A100-80G GPUs for
+the 70B model. For the draft model-based method, the draft
+model operates with tensor parallelism set to 1, and only the
+target model is sharded across multiple GPUs. We provide
+detailed specifications of the setup in Table 1.
+Evaluated methods and baselines. We test the efficiency
+of SmartSpec on both standard speculative decoding, where a
+draft model is used to make the proposal, and prompt lookup
+decoding, where the proposal is made by looking up ngrams
+in the prompt. Both mechanisms are detailed in Sec. 2.1. For
+standard speculative decoding, we fine-tune Llama-160M
+on the shareGPT dataset to improve its general proposal
+capability and use it as the draft model for Vicuna-7B. For
+Llama2-70B model, we use Vicuna-7B as the draft. For all
+the settings, the draft model shares the same tensor parallel
+degree as the target model.
+We compared SmartSpec against two baselines: vanilla
+auto-regressive inference, which does not incorporate specu-
+lative decoding, and using speculative decoding with a fixed
+proposed length of 1, 3, and 5 across all execution steps.
+Workloads. In our study, we focus on four types of work-
+loads, online chatting, text-to-SQL, summarization, and ques-
+tion answering given context. For online chatting, we utilize
+datasets from ShareGPT [ 2], Chatbot Arena [ 44]. For text-to-
+SQL, we use the spider [ 42] dataset. For summarization and
+9
+
+--- PAGE 10 ---
+Task Dataset SD Method Draft Model (TP) Target Model (TP) Hardware (Total Mem.)
+Online ChattingArena[44]
+VSD[20]Llama-160M(1) Vicuna-7B(1) A100 (80G)
+Llama-160M(1) Vicuna-33B(4) 4×A100 (320G)
+TinyLlama-1.1B (1) Llama2-70B (8) 8×A100 (640G)
+ShareGPT[2]Llama-160M(1) Vicuna-7B(1) A100 (80G)
+Llama-160M(1) Vicuna-33B(4) 4×A100 (320G)
+TinyLlama-1.1B (1) Llama2-70B (8) 8×A100 (640G)
+Tex-to-SQL Spider[42]Llama-160M(1) Vicuna-7B(1) A100 (80G)
+Llama-160M(1) Vicuna-33B(4) 4×A100 (320G)
+Summarization CNN/Daily Mail[12, 34]
+PTL[33] NoneMistral-7B (1) A100 (80G)
+Mixture-8×7B (8) 8×A100 (640G)
+Context QA HAGRID[16]Mistral-7B (1) A100 (80G)
+Mixture-8×7B(8) 8×A100 (640G)
+Table 1. Dataset, model and server configuration. VSD: Vanilla speculative decoding. PTL: Prompt lookup decoding.
+0 500 1000 1500 2000 2500 3000
+Input Length104
+103
+102
+DensityDataset
+Arena (Avg=31.34, Std=66.0)
+ShareGPT (Avg=303.48, Std=349.28)
+Spider (Avg=32.86, Std=5.44)
+CNN (Avg=989.5, Std=459.41)
+HAGRID (Avg=481.76, Std=394.16)
+0 100 200 300 400 500
+Output Length103
+102
+101
+DensityDataset
+Arena (Avg=359.34, Std=170.51)
+ShareGPT (Avg=307.29, Std=205.97)
+Spider (Avg=39.91, Std=27.88)
+CNN (Avg=77.15, Std=29.43)
+HAGRID (Avg=128.0, Std=0.0)
+Figure 10. Input/Output length distributions.
+question answering, we use the original dataset CNN/Daily
+Mail [ 34] and HAGRID [ 16] from the prompt lookup decod-
+ing work. We show the workload characteristics (average
+input length and average output length) in Fig. 10. For online
+chatting, the input is of medium length while the output
+length is longer and show higher variance. For summariza-
+tion and question answering, the input length is long and the
+output is short. For the question answering, since we do not
+have the ground truth in the dataset, we set a fixed output
+length 128. For all workloads, we generate request arrival
+times using Poisson distribution with different request rates.
+We use greedy sampling for all served requests.
+7.1 Latency Measurement
+We first evaluate the effectiveness of SmartSpec in reducing
+request latency for both draft model-based and draft model-
+free speculative decoding.
+7.1.1 Draft-model based speculative decoding. We eval-
+uated the average request latency across different datasets,
+focusing on the performance of SmartSpec in comparison to
+baseline strategies in Figs. 11 and 12. In environments with
+a low request rate, SmartSpec demonstrates performance
+similar to that from greedily predicting a higher number of
+tokens (e.g., 𝑘=3or5) to maximize speedup. This similarity
+suggests that SmartSpec predicts just enough tokens under
+light loads to effectively reduce request latency through spec-
+ulative decoding. However, on a few occasions when requestrates are low, there are slight performance differences be-
+tween SmartSpec and standard SD. In those cases, standard
+SD, which predicts a higher number of tokens, marginally
+outperforms SmartSpec with a more pronounced speedup.
+This discrepancy can be attributed to our imperfect accep-
+tance length predictor, resulting in standard SD with a longer
+proposed length performing better as more tokens could po-
+tentially be accepted.
+Conversely, in scenarios with a high request rate, the sys-
+tem’s performance mirrors situations where no tokens are
+predicted, effectively indicating that speculative decoding is
+disabled under conditions of high request volume. It is impor-
+tant to note that in this regime, the latency associated with
+using standard SD and proposing high numbers of tokens
+escalates rapidly, leading to significant performance degra-
+dation. This is exemplified in Fig. 11 (c) when the request
+rate is at 32 and (f) when the request rate exceeds 5.
+In cases such as Fig. 11 (d) and (e), the relative speedup
+for these baselines rebounds after initially dropping when
+the request rate exceeds 2. This rebound occurs because,
+as the request rate continues to increase, it reaches a point
+where even baseline decoding without speculation begins
+to suffer from queuing delays. This phenomenon relatively
+improves the speedup of standard SD baselines, despite them
+experiencing higher overall latencies.
+In general, speculative decoding is most effective when
+the system has sufficient computational resources: the larger
+the model, the smaller the request rate region where we see
+speedup from speculation. This is expected as speculative
+decoding requires additional computational power; when
+the model is large and computational resources do not scale
+proportionally, the system is likely to be compute-bound.
+This underscores the importance of SmartSpec. It is crucial
+for SmartSpec to consistently match or outperform the estab-
+lished baseline across different scenarios. This characteristic
+is vital for implementing speculative decoding techniques
+in real production environments, as it ensures that adopting
+10
+
+--- PAGE 11 ---
+DSDK=1K=3K=5
+2 4 6 8 10
+Request Rate0.00.51.01.52.02.5Speedup(a)Standard SD, Vicuna 7B, Arena
+2 4 6 8 10
+Request Rate0.00.40.81.21.62.0Speedup (b)Standard SD, Vicuna 7B, ShareGPT
+4 8 12 16 20 24 28 32
+Request Rate0.000.250.500.751.001.25Speedup (c)Standard SD, Vicuna 7B, Spider
+0.5 1.0 1.5 2.0 2.5 3.0
+Request Rate0.00.40.81.21.62.0Speedup
+(d)Standard SD, Vicuna 33B, Arena
+0.5 1.0 1.5 2.0 2.5 3.0
+Request Rate0.00.30.60.91.21.5Speedup (e)Standard SD, Vicuna 33B, ShareGPT
+1 2 3 4 5 6
+Request Rate0.00.30.60.91.21.5Speedup (f)Standard SD, Vicuna 33B, Spider
+0.5 1.0 1.5 2.0 2.5 3.0
+Request Rate0.000.250.500.751.001.25Speedup
+(g)Standard SD, Llama2-70B, Arena
+0.5 1.0 1.5 2.0 2.5 3.0
+Request Rate0.00.30.60.91.21.5Speedup (h)Standard SD, Llama2-70B, ShareGPT
+Figure 11. Latency Measurement on standard SD: Speedup across different datasets. X-axis: request rate.
+speculative decoding will not compromise system perfor-
+mance.
+7.1.2 Draft model free speculative decoding. We next
+evaluate the efficiency of SmartSpec with prompt lookup
+decoding. Like our tests with draft-model-based specula-
+tive decoding, we compare SmartSpec using fixed proposal
+lengths of 1, 3, and 5, against the baseline of no specula-
+tive decoding. As shown in Fig. 12, SmartSpec consistently
+achieves the best speedup. Notably, prompt lookup decod-
+ing with Mistral-7B (Fig. 12 (a) and (b)) shows substantial
+speedup even with a relatively low token acceptance rate
+(the measured token acceptance rate on those two settings
+is between 0.3 and 0.4). Unlike scenarios involving a draft
+model, prompt lookup does not incur significant overhead
+for proposing tokens, leading to notable speed gains even
+with lower speculative accuracy.
+Like draft model-based speculative decoding, SmartSpec
+does not compromise performance even when the request
+rate is high. This is because SmartSpec adopts a conservative
+approach under high request rates, minimizing the wasteful
+computation of verifying incorrect tokens. This strategy en-
+sures that SmartSpec maintains its efficiency across varying
+system loads.
+7.2 Simulation Experiments
+We conduct the following experiments using a simulator for
+several reasons. First, efficiently integrating speculative de-
+coding into a real-world system poses a substantial engineer-
+ing challenge. For instance, devising an effective verificationkernel for tree-structured speculative decoding proves diffi-
+cult. The absence of such a kernel negates the advantages of
+speculative decoding. Additionally, we aim to explore how
+the system behaves under various models, workloads, and
+resource configurations. In particular, we are interested in
+assessing how the accuracy of token acceptance prediction
+affects overall performance. Moreover, carrying out com-
+prehensive experiments across all possible configurations
+is both time-consuming and cost-prohibitive. Consequently,
+we utilize a simulator for all subsequent experiments.
+Simulator construction. The design of the simulator is
+closely aligned with the operational flow of vLLM [ 19], ac-
+curately replicating its model scheduling and control logic.
+The primary distinction between the simulator and actual
+hardware lies in its use of an event clock to simulate kernel
+execution times, allowing it to operate efficiently on CPUs
+without the need for real GPU hardware. Essentially, the
+simulator employs an event clock to replace all kernel ex-
+ecution times while preserving all other operational logic.
+To ensure the event clock advances accurately and reflects
+realistic execution times, we have profiled GPU execution
+times across various hardware configurations and model set-
+tings utilized in the experiments. This approach allows us to
+simulate real-world operations with high fidelity.
+Simulator fidelity. The data we have collected for each job
+allows our simulator to accurately model several system ef-
+fects. This includes the performance impact of various sched-
+uling policies and system overheads such as slow sampling
+and Python overhead, identified through profiling. However,
+11
+
+--- PAGE 12 ---
+DSDK=1K=3K=5
+1 2 3 4 5 6 7 8 9 10
+Request Rate0.00.51.01.52.0Speedup(a)PTL, Mistral 7B, CNN Mail
+1 2 3 4 5 6 7 8 9 10
+Request Rate0.00.81.62.43.2Speedup (b)PTL, Mistral 7B, HAGRID
+1 2 3 4 5
+Request Rate0.000.250.500.751.001.25Speedup
+(c)PTL, Mixtral 8X7B, HAGRID
+1 2 3 4 5
+Request Rate0.00.30.60.91.21.5Speedup (d)PTL, Mixtral 8X7B, CNN Mail
+Figure 12. Latency Measurement on PTL: Speedup across different datasets. X-axis: request rate.
+5 10 15 20
+Request Rate246810Average Request Latency (s)
+P-128
+S-128
+P-256
+S-256
+P-512
+S-512
+Figure 13. Simulator Fidelity. This experiment was con-
+ducted on a single Azure NC24ads machine equipped with
+an A100-80G GPU. The labels ‘P’ and ‘S’ indicate profiled
+and simulated data, respectively. The figure demonstrates
+that the simulated average request latency closely mirrors
+the measured latency across various input/output lengths
+and request rates.
+our simulator does not account for network latency. After
+calibration, as shown in Fig. 13, the simulator demonstrates
+an error rate below 10% when the request rate is lower than
+the service rate. This accuracy is consistent across various
+input/output lengths and request rates. It is important to
+note that the simulator tends to under-predict latency when
+the request rate exceeds the service rate due to its limited
+ability to simulate queuing delays. For the subsequent exper-
+iments presented in this paper, we will focus exclusively on
+scenarios where the request rate is less than the service rate.
+Using the simulator, we initially identify the discrepancy
+between the current speedup and the optimal speedup, where
+"optimal" implies foreknowledge of the accepted length. Sub-
+sequently, we implement tree-style speculative decoding
+Medusa with continuous batching to test SmartSpec’s gener-
+ality.
+7.2.1 Accepted Length Prediction and Speedup In this
+section, we explore how the accuracy of acceptance modeling
+Rate = 1 Rate = 6 Rate = 110.00.51.01.52.0SpeedupRandom
+DSD
+OracleFigure 14. Optimal speedup vs SmartSpec speedup. Smart-
+Spec means we use moving average to predict the goodput
+and use goodput to guide the decision. Random all means we
+randomly predict the accepted length without using good-
+put.
+impacts computational speedup. We keep the request rate
+constant to ensure a controlled comparison of different ac-
+ceptance prediction techniques. We assess the effectiveness
+of SmartSpec’s accepted length prediction, which employs a
+moving average based on historical token acceptance rates,
+and compare it to an oracle. This oracle assumes access to a
+perfect predictor and uses the actual accepted lengths to cal-
+culate goodput and determine the optimal proposed length.
+As shown in Figure 14, there is a noticeable performance
+gap between SmartSpec’s speedup and that of the oracle. De-
+veloping a more efficient accepted length predictor remains
+an area for future research. However, it is important to note
+that, even with the moving average approach, the speedup
+achieved by SmartSpec is substantial and represents a sig-
+nificant improvement over strategies that rely on random
+proposals.
+7.2.2 Tree-style Speculative Decoding In this section,
+we evaluate the applicability of SmartSpec to Medusa [ 4],
+a tree-style speculative decoding method. Prior to integrat-
+ing SmartSpec, Medusa could only be implemented with a
+12
+
+--- PAGE 13 ---
+2.5 5.0 7.5 10.0
+Request Rate0246810Average Request Latency (s)
+(a)𝛼=0.6
+2.5 5.0 7.5 10.0
+Request Rate0246810Average Request Latency (s)
+ (b)𝛼=0.8
+Figure 15. Average request latency of Medusa with fixed
+top k values and SmartSpec: Simulating the performance
+of Llama-7B with three fixed heads across 500 randomly
+sampled requests of varying input/output Lengths under
+different request rates. 𝛼: token acceptance rate of candidate
+tokens across all heads.
+batch size of 1. To test the enhanced capabilities, we simulate
+Medusa with continuous batching and assess its performance
+both with and without SmartSpec integration. For our ex-
+periments, we maintain a consistent token acceptance rate
+across all Medusa heads and for all tokens within the top-k
+selection. Additionally, we model Medusa with dense con-
+nectivity, ensuring that each of the top-k nodes is linked to
+the corresponding top-k tokens at the subsequent position.
+We illustrate the average request latency across various
+k-values under differing token acceptance rates in Fig. 16. As
+demonstrated in the figure, the tree-style speculative decod-
+ing method substantially increases request latency at high
+request rates. This outcome aligns with expectations out-
+lined in [ 4], which describes how dense connections among
+different heads greatly increase the the number of batched to-
+kens. As shown in Figs. 16a and 16b, fixed top2/top3 Medusa
+quickly explode the batch size. Specifically, the number of
+batched tokens per request is represented byÍ𝐻
+ℎ=1Πℎ
+𝑖=1𝑠𝑖,
+where𝑠𝑖denotes the number of tokens sampled by head 𝑖.
+For example, selecting 3, 2, and 2 tokens for heads 1, 2, and 3,
+respectively, results in the addition of 21 tokens in the next
+batch for verification (calculated as 3+3×2+3×2×2).
+Conversely, with only three heads corresponding to three
+positions, for each request, a maximum of 4 tokens (3 plus 1
+bonus token) can be processed in a single forward pass. This
+inefficiency underscores the need for future advancements
+such as those proposed by sequoia [ 6], which aims to develop
+a more structured verification tree to effectively prune less
+likely candidates under high request volumes.
+Finally, we show the performance of SmartSpec when
+integrated with Medusa. We model the accepted token length
+as outlined in Section 4.4 and evaluate performance using
+goodput to decide the number of sampled tokens per head.
+0 5 10
+Request Rate102103Average Batch Size
+(a)𝛼=0.8, average
+batch token number.
+0 5 10
+Request Rate101102103Average Batch Size
+(b)𝛼=0.6, average
+batch token number.
+5 10
+Request Rate468101214Average Batch Token
+ Num per Request
+alpha=0.6
+alpha=0.8(c) Average token
+number per request.
+Figure 16. (a), (b) show the average batch token number
+across batches with vanilla Medusa and SmartSpec Medusa.
+(c) shows the average token number across requests with
+SmartSpec.
+As illustrated in Figure 16, SmartSpec effectively maintains
+manageable request latencies even under high request rates.
+Additionally, we depict the average number of tokens per
+request in Figure 16c. In both scenarios ( 𝛼is 0.6 or 0.8),
+SmartSpec quickly reverts to top-1 sampling. It is noteworthy
+that the average number of batched tokens approximates to
+four; this consists of one input token plus one sampled token
+per head. Given that there are three Medusa heads, the total
+number of batched tokens per request remains four when
+employing top-1 sampling for each head.
+8 Related Work
+Aside from speculative decoding (Sec 2.1) and continuous
+batching (Sec 2.2), the system community has proposed many
+orthogonal methods to improve LLM inference performance.
+Quantization Methods . Works like (LLM.int8() [ 7], GPTQ
+[9], Marlin [ 8], AWQ [ 23], SqueezeLLM [ 17]) bring down the
+latency of the LLM inference by using lower precision data
+types such as 2/3/4/6/8 bit integers. GPUs For example, a
+single A100 GPU can support 624 Teraops of INT8 compu-
+tation through its tensor core, while only able to support
+312 TFLOPS for FLOAT16 . However, this class of method
+trade off accuracy for performance and commonly requires
+a calibration step. In the context of SmartSpec, quantization
+optimizations can be applied to both draft and target models
+to further improve our performance.
+Prefix Caching techniques save compute of commonly
+repeated prefixes across requests. Systems like SGLang [ 45],
+Cascade Inference [ 40], and Hydragen [ 15] proposes efficient
+GPU kernels to compute and cache the computation for
+shared prefixes across request and deliver lower inference
+latency. In the context of SmartSpec, prefix caching can be
+applied to both draft and target workers.
+13
+
+--- PAGE 14 ---
+9 Conclusion
+Speculative decoding has recently emerged as a means to
+reduce inference latency at the cost of increased compu-
+tational overhead. To harness the benefits of speculative
+decoding without compromising efficiency, we introduce an
+adaptive decision-making framework SmartSpec guided by
+the concept of goodput. Our evaluation across three distinct
+datasets show that SmartSpec can reduce latency by a factor
+of 1.2×to 3.2×when request rates are low, while sustaining
+performance levels even under high request rates.References
+[1]Josh Achiam, Steven Adler, Sandhini Agarwal, Lama Ahmad, Ilge
+Akkaya, Florencia Leoni Aleman, Diogo Almeida, Janko Altenschmidt,
+Sam Altman, Shyamal Anadkat, et al .2023. Gpt-4 technical report.
+arXiv preprint arXiv:2303.08774 (2023).
+[2]anon8231489123. 2024. ShareGPT dataset .https://huggingface.co/
+datasets/anon8231489123/ShareGPT_Vicuna_unfiltered
+[3]Yoshua Bengio, Réjean Ducharme, and Pascal Vincent. 2000. A neural
+probabilistic language model. Advances in neural information process-
+ing systems 13 (2000).
+[4]Tianle Cai, Yuhong Li, Zhengyang Geng, Hongwu Peng, Jason D Lee,
+Deming Chen, and Tri Dao. 2024. Medusa: Simple llm inference ac-
+celeration framework with multiple decoding heads. arXiv preprint
+arXiv:2401.10774 (2024).
+[5]Charlie Chen, Sebastian Borgeaud, Geoffrey Irving, Jean-Baptiste
+Lespiau, Laurent Sifre, and John Jumper. 2023. Accelerating large
+language model decoding with speculative sampling. arXiv preprint
+arXiv:2302.01318 (2023).
+[6]Zhuoming Chen, Avner May, Ruslan Svirschevski, Yuhsun Huang,
+Max Ryabinin, Zhihao Jia, and Beidi Chen. 2024. Sequoia: Scalable,
+Robust, and Hardware-aware Speculative Decoding. arXiv preprint
+arXiv:2402.12374 (2024).
+[7]Tim Dettmers, Mike Lewis, Younes Belkada, and Luke Zettlemoyer.
+2022. LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale.
+arXiv:2208.07339 [cs.LG]
+[8]Elias Frantar and Dan Alistarh. 2024. Marlin: a fast 4-bit inference
+kernel for medium batchsizes. https://github.com/IST-DASLab/marlin .
+[9]Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and Dan Alistarh.
+2023. GPTQ: Accurate Post-Training Quantization for Generative
+Pre-trained Transformers. arXiv:2210.17323 [cs.LG]
+[10] Yichao Fu, Peter Bailis, Ion Stoica, and Hao Zhang. 2024. Break the
+sequential dependency of llm inference using lookahead decoding.
+arXiv preprint arXiv:2402.02057 (2024).
+[11] Pin Gao, Lingfan Yu, Yongwei Wu, and Jinyang Li. 2018. Low latency
+rnn inference with cellular batching. In Proceedings of the Thirteenth
+EuroSys Conference . 1–15.
+[12] Karl Moritz Hermann, Tomás Kociský, Edward Grefenstette, Lasse Es-
+peholt, Will Kay, Mustafa Suleyman, and Phil Blunsom. 2015. Teaching
+Machines to Read and Comprehend. In NIPS . 1693–1701. http://papers.
+nips.cc/paper/5945-teaching-machines-to-read-and-comprehend
+[13] Albert Q Jiang, Alexandre Sablayrolles, Arthur Mensch, Chris Bamford,
+Devendra Singh Chaplot, Diego de las Casas, Florian Bressand, Gianna
+Lengyel, Guillaume Lample, Lucile Saulnier, et al .2023. Mistral 7B.
+arXiv preprint arXiv:2310.06825 (2023).
+[14] Albert Q Jiang, Alexandre Sablayrolles, Antoine Roux, Arthur Mensch,
+Blanche Savary, Chris Bamford, Devendra Singh Chaplot, Diego de las
+Casas, Emma Bou Hanna, Florian Bressand, et al .2024. Mixtral of
+experts. arXiv preprint arXiv:2401.04088 (2024).
+[15] Jordan Juravsky, Bradley Brown, Ryan Ehrlich, Daniel Y. Fu, Christo-
+pher Ré, and Azalia Mirhoseini. 2024. Hydragen: High-Throughput
+LLM Inference with Shared Prefixes. arXiv:2402.05099 [cs.LG]
+[16] Ehsan Kamalloo, Aref Jafari, Xinyu Zhang, Nandan Thakur, and Jimmy
+Lin. 2023. HAGRID: A Human-LLM Collaborative Dataset for Genera-
+tive Information-Seeking with Attribution. arXiv:2307.16883 (2023).
+[17] Sehoon Kim, Coleman Hooper, Amir Gholami, Zhen Dong,
+Xiuyu Li, Sheng Shen, Michael W. Mahoney, and Kurt
+Keutzer. 2024. SqueezeLLM: Dense-and-Sparse Quantization.
+arXiv:2306.07629 [cs.CL]
+[18] Sehoon Kim, Karttikeya Mangalam, Suhong Moon, Jitendra Malik,
+Michael W Mahoney, Amir Gholami, and Kurt Keutzer. 2024. Specula-
+tive decoding with big little decoder. Advances in Neural Information
+Processing Systems 36 (2024).
+[19] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin
+Zheng, Cody Hao Yu, Joseph Gonzalez, Hao Zhang, and Ion Stoica.
+14
+
+--- PAGE 15 ---
+2023. Efficient memory management for large language model serving
+with pagedattention. In Proceedings of the 29th Symposium on Operating
+Systems Principles . 611–626.
+[20] Yaniv Leviathan, Matan Kalman, and Yossi Matias. 2023. Fast inference
+from transformers via speculative decoding. In International Conference
+on Machine Learning . PMLR, 19274–19286.
+[21] Yuhui Li, Fangyun Wei, Chao Zhang, and Hongyang Zhang. 2024.
+Eagle: Speculative sampling requires rethinking feature uncertainty.
+arXiv preprint arXiv:2401.15077 (2024).
+[22] Feng Lin, Hanling Yi, Hongbin Li, Yifan Yang, Xiaotian Yu, Guangming
+Lu, and Rong Xiao. 2024. BiTA: Bi-Directional Tuning for Lossless Ac-
+celeration in Large Language Models. arXiv preprint arXiv:2401.12522
+(2024).
+[23] Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang, Xingyu Dang, Chuang
+Gan, and Song Han. 2023. AWQ: Activation-aware Weight Quantiza-
+tion for LLM Compression and Acceleration. arXiv:2306.00978 [cs.CL]
+[24] Xiaoxuan Liu, Lanxiang Hu, Peter Bailis, Ion Stoica, Zhijie Deng, Alvin
+Cheung, and Hao Zhang. 2023. Online speculative decoding. arXiv
+preprint arXiv:2310.07177 (2023).
+[25] Yusuf Mehdi. 2023. Reinventing search with a new AI-
+powered Microsoft Bing and Edge, your copilot for the web .
+https://blogs.microsoft.com/blog/2023/02/07/reinventing-search-
+with-a-new-ai-powered-microsoft-bing-and-edge-your-copilot-for-
+the-web/ Accessed: 2024-02-21.
+[26] Xupeng Miao, Gabriele Oliaro, Zhihao Zhang, Xinhao Cheng, Zeyu
+Wang, Rae Ying Yee Wong, Zhuoming Chen, Daiyaan Arfeen, Reyna
+Abhyankar, and Zhihao Jia. 2023. Specinfer: Accelerating generative
+llm serving with speculative inference and token tree verification.
+arXiv preprint arXiv:2305.09781 (2023).
+[27] Microsoft. 2023. Copilot .https://copilot.microsoft.com/ Accessed:
+2024-02-21.
+[28] Nvidia. 2024. A100 GPU Spec. https://www.nvidia.com/en-us/data-
+center/a100/ Accessed: 2024-03-10.
+[29] NVIDIA. 2024. TensorRT-LLM. https://github.com/NVIDIA/TensorRT-
+LLM .
+[30] OpenAI. 2022. ChatGPT .https://chat.openai.com/ Accessed: 2024-02-
+21.
+[31] Reiner Pope, Sholto Douglas, Aakanksha Chowdhery, Jacob Devlin,
+James Bradbury, Jonathan Heek, Kefan Xiao, Shivani Agrawal, and
+Jeff Dean. 2023. Efficiently scaling transformer inference. Proceedings
+of Machine Learning and Systems 5 (2023).
+[32] Elizabeth Reid. 2023. Supercharging Search with generative AI .https:
+//blog.google/products/search/generative-ai-search/ Accessed: 2024-
+02-21.
+[33] Apoorv Saxena. 2023. Prompt Lookup Decoding. https://github.com/
+apoorvumang/prompt-lookup-decoding/
+[34] Abigail See, Peter J. Liu, and Christopher D. Manning. 2017. Get To The
+Point: Summarization with Pointer-Generator Networks. In Proceed-
+ings of the 55th Annual Meeting of the Association for Computational
+Linguistics (Volume 1: Long Papers) . Association for Computational
+Linguistics, Vancouver, Canada, 1073–1083. https://doi.org/10.18653/
+v1/P17-1099
+[35] Qidong Su, Christina Giannoula, and Gennady Pekhimenko. 2023.
+The synergy of speculative decoding and batching in serving large
+language models. arXiv preprint arXiv:2310.18813 (2023).
+[36] Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Alma-
+hairi, Yasmine Babaei, Nikolay Bashlykov, Soumya Batra, Prajjwal
+Bhargava, Shruti Bhosale, et al .2023. Llama 2: Open foundation and
+fine-tuned chat models. arXiv preprint arXiv:2307.09288 (2023).
+[37] Siqi Wang, Hailong Yang, Xuezhu Wang, Tongxuan Liu, Pengbo Wang,
+Xuning Liang, Kejie Ma, Tianyu Feng, Xin You, Yongjun Bao, et al .2024.
+Minions: Accelerating Large Language Model Inference with Adaptive
+and Collective Speculative Decoding. arXiv preprint arXiv:2402.15678
+(2024).[38] Qingyun Wu, Gagan Bansal, Jieyu Zhang, Yiran Wu, Beibin Li, Erkang
+Zhu, Li Jiang, Xiaoyun Zhang, Shaokun Zhang, Jiale Liu, Ahmed Has-
+san Awadallah, Ryen W White, Doug Burger, and Chi Wang. 2023.
+AutoGen: Enabling Next-Gen LLM Applications via Multi-Agent Con-
+versation. arXiv:2308.08155 [cs.AI]
+[39] Yiran Wu, Feiran Jia, Shaokun Zhang, Hangyu Li, Erkang Zhu, Yue
+Wang, Yin Tat Lee, Richard Peng, Qingyun Wu, and Chi Wang. 2023.
+An Empirical Study on Challenging Math Problem Solving with GPT-4.
+InArXiv preprint arXiv:2306.01337 .
+[40] Zihao Ye, Ruihang Lai, Bo-Ru Lu, Chien-Yu Lin, Size Zheng, Lequn
+Chen, Tianqi Chen, and Luis Ceze. 2024. Cascade Inference: Memory
+Bandwidth Efficient Shared Prefix Batch Decoding. https://flashinfer.
+ai/2024/02/02/cascade-inference.html
+[41] Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soojeong Kim, and
+Byung-Gon Chun. 2022. Orca: A distributed serving system for
+{Transformer-Based }generative models. In 16th USENIX Symposium
+on Operating Systems Design and Implementation (OSDI 22) . 521–538.
+[42] Tao Yu, Rui Zhang, Kai Yang, Michihiro Yasunaga, Dongxu Wang,
+Zifan Li, James Ma, Irene Li, Qingning Yao, Shanelle Roman, et al .
+2018. Spider: A large-scale human-labeled dataset for complex and
+cross-domain semantic parsing and text-to-sql task. arXiv preprint
+arXiv:1809.08887 (2018).
+[43] Jun Zhang, Jue Wang, Huan Li, Lidan Shou, Ke Chen, Gang Chen,
+and Sharad Mehrotra. 2023. Draft & verify: Lossless large language
+model acceleration via self-speculative decoding. arXiv preprint
+arXiv:2309.08168 (2023).
+[44] Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Siyuan Zhuang, Zhang-
+hao Wu, Yonghao Zhuang, Zi Lin, Zhuohan Li, Dacheng Li, Eric Xing,
+et al.2024. Judging llm-as-a-judge with mt-bench and chatbot arena.
+Advances in Neural Information Processing Systems 36 (2024).
+[45] Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie, Jeff Huang, Chuyue
+Sun, Cody Hao Yu, Shiyi Cao, Christos Kozyrakis, Ion Stoica, Joseph E.
+Gonzalez, Clark Barrett, and Ying Sheng. 2023. Efficiently Program-
+ming Large Language Models using SGLang. arXiv:2312.07104 [cs.AI]
+[46] Yongchao Zhou, Kaifeng Lyu, Ankit Singh Rawat, Aditya Krishna
+Menon, Afshin Rostamizadeh, Sanjiv Kumar, Jean-François Kagy, and
+Rishabh Agarwal. 2023. Distillspec: Improving speculative decoding
+via knowledge distillation. arXiv preprint arXiv:2310.08461 (2023).
+15
+
+--- PAGE 16 ---
+Algorithm 3 SmartSpec confidence based propose and ver-
+ify.
+Require: Pending requests 𝑅. Confidence threshold 𝑇. Max
+propose length 𝑃.
+1:𝑏𝑒𝑠𝑡_𝑔𝑜𝑜𝑑𝑝𝑢𝑡,𝑏𝑒𝑠𝑡 _𝑣𝑒𝑟𝑖𝑓𝑦 _𝑙𝑒𝑛𝑠←− 1,0
+2:foreach𝑟in𝑅do
+3: // Initialize the confidence before proposing the first
+token for each request
+4:𝑟.𝑐𝑜𝑛𝑓 =1
+5:end for
+6:𝑝𝑟𝑜𝑝𝑜𝑠𝑒 _𝑠𝑡𝑒𝑝𝑠←0
+7:while𝑙𝑒𝑛(𝑅)>0and𝑝𝑟𝑜𝑝𝑜𝑠𝑒 _𝑠𝑡𝑝𝑒𝑠 <=𝑃do
+8:𝑅′={𝑟for𝑟in𝑅if𝑟.𝑐𝑜𝑛𝑓 >𝑇}
+9: // Propose will update the 𝑐𝑜𝑛𝑓 attribute for each
+request𝑟in𝑅′
+10:𝑅=Propose(𝑅′)
+11:𝑝𝑟𝑜𝑝𝑜𝑠𝑒 _𝑠𝑡𝑒𝑝𝑠++
+12:end while
+13:ArgmaxGoodput( 𝑅)
+14:Score(𝑅)
+10 Appendix
+(a)7B, TP=1.
+(b)70B, TP=4.
+Figure 17. Confidence distribution.In this section, we explore the utilization of confidence as
+a criterion for token acceptance. Confidence is defined as the
+output probability of the proposed token generated by the
+draft model As depicted in Figure 17, a discernible distinction
+exists between the confidence distributions of accepted and
+rejected tokens. This distinction intuitively suggests that
+tokens proposed by the draft model, when accompanied by
+high confidence levels, are likely to be accurate. Conversely,
+proposals made with low confidence are less likely to be
+accepted by the target model. In practice, we establish a
+threshold𝑇. Tokens with a confidence level exceeding 𝑇are
+predicted to be accepted, while those below this threshold
+are anticipated to be rejected.
+Initially, SmartSpec sets the confidence level of each re-
+quest to 1, adhering to the definition in Section 4.4 where
+confidence is treated as a probability and thus cannot exceed
+1. This ensures that the draft model will propose at least
+one token, activating the procedure described in lines 7-12
+at least once, provided that 𝑃>0. During each proposal
+step (lines 7-12), SmartSpec selectively processes only those
+requests, denoted as 𝑅′, whose confidence levels surpass
+the specified threshold 𝑇from the preceding proposal step.
+Subsequently, SmartSpec batches these 𝑅′requests for a for-
+ward pass execution. Following the strategy outlined above,
+SmartSpec also explores all potential lengths for verification
+and opts for the length that maximizes goodput.
+16

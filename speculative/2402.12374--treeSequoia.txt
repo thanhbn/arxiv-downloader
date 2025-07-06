@@ -1,0 +1,1421 @@
+# 2402.12374.pdf
+# Converted from PDF to TXT
+# Source path: /home/admin88/arxiv-downloader/speculative/2402.12374.pdf
+# File size: 1005015 bytes
+
+===============================================
+PDF FILE CONTENT
+===============================================
+
+
+--- PAGE 1 ---
+/treeSequoia :
+Scalable, Robust, and Hardware-aware Speculative Decoding
+Zhuoming Chen∗†, Avner May∗‡, Ruslan Svirschevski∗§,
+Yuhsun Huang†, Max Ryabinin‡, Zhihao Jia†, and Beidi Chen†♯
+†Carnegie Mellon University
+‡Together AI
+§Yandex
+♯Meta AI
+{zhuominc,yuhsunh,zhihaoj2,beidic }@andrew.cmu.edu ,
+{avner,mryab }@together.ai ,ruslansv@gmail.com
+March 1, 2024
+Abstract
+As the usage of large language models (LLMs) grows, performing efficient inference with these models
+becomes increasingly important. While speculative decoding has recently emerged as a promising direction
+for speeding up inference, existing methods are limited in their ability to scale to larger speculation budgets,
+and adapt to different hyperparameters and hardware. This paper introduces Sequoia , a scalable, robust,
+and hardware-aware algorithm for speculative decoding. To attain better scalability, Sequoia introduces
+a dynamic programming algorithm to find the optimal tree structure for the speculated tokens. To achieve
+robust speculative performance, Sequoia uses a novel sampling and verification method that outperforms
+prior work across different decoding temperatures. Finally, Sequoia introduces a hardware-aware tree
+optimizer that maximizes speculative performance by automatically selecting the token tree size and
+depth for a given hardware platform. Sequoia improves the decoding speed of Llama2-7B, Llama2-13B,
+and Vicuna-33B on an A100 GPU by up to 4 .04×, 3.73×, and 2 .27×. For offloading setting on L40,
+Sequoia achieves as low as 0.56 s/token for exact Llama2-70B inference latency, which is 9 .96×on our
+optimized offloading system (5.6 s/token), 9 .7×than DeepSpeed-Zero-Inference [ 2], 19.5×than Huggingface
+Accelerate [16, 45]. The code is available at https://github.com/Infini-AI-Lab/Sequoia .
+1 Introduction
+As large language models (LLMs) gain widespread adoption [ 3,7,43], efficiently serving these LLMs becomes
+increasingly important. However, accelerating LLM inference is challenging since generating a single new token
+requires accessing all parameters of the LLM [ 34]. As a result of this I/O bottleneck, the hardware is poorly
+utilized during generation. This problem is exacerbated in both small-batch and offloading-based inference
+settings, where generating one token takes as much time as processing a prompt with hundreds or thousands
+of tokens on modern GPUs.
+To address this challenge, recent work has introduced speculative decoding to accelerate LLM inference
+while preserving the LLM’s output distribution [ 5,25,28,40]. These approaches leverages one or multiple
+draft models to predict the LLM’s output; the predictions are organized in a token tree , whose nodes represent
+different sequences of speculated tokens. The correctness of these speculated tokens are then verified in parallel
+through a single forward pass of the LLM. Using a token tree—instead of sequence—can increase the number
+of tokens accepted by the LLM by providing several options for each token position.
+∗Equal contribution.
+1arXiv:2402.12374v2  [cs.CL]  29 Feb 2024
+
+--- PAGE 2 ---
+Input tokens Speculated tokens
+...
+(b) Single sequence of tokens
+(c) Full k -ary tree of tokens(d) k independent sequences of tokens
+(e) Optimal tree topology (Sequoia)
+ (a) Single sequence of tokens
+L40 A100 H100 Offloading FutureFigure 1: Sequoia is a scalable method for speculative decoding. Left: Sequoia tree construction algorithm is
+able to generate trees whose average number of generated tokens (after verification) continues to grow with
+the tree size, while existing tree structures asymptote. This allows Sequoia to perform much better than
+existing methods in very memory-bound regimes like offloading. Right: A visualization to contrast Sequoia
+tree structure with other common handcrafted ones.
+While there are substantial studies on tree-based speculative decoding methods [ 28,40], we see in our
+experiments that they have important limitations. First, we observe that existing token tree construction
+algorithms perform well for small token trees but are sub-optimal for large tree sizes. For example, SpecInfer
+constructs a token tree using kindependent sequences, a topology which is bounded in the expected number
+of tokens it can accept, regardless of the tree size (Figure 1). Second, we observe that existing token tree
+sampling and verification algorithms are unable to perform well across inference hyperparameter configurations;
+for example, SpecInfer [ 28] and SpecTr [ 40] often perform poorly at low temperature (Figure 3), due to the
+fact that they can repeatedly sample an incorrect token with high draft model probability. Lastly, we observe
+that existing systems are unable to effectively optimize—for any hardware configuration—the size and shape
+of their speculated trees (Table 3). This is because existing models describing the speedup from speculative
+decoding [ 25,40] assume verification time is constant, which does not hold for large speculated trees, thereby
+making these models ineffective for selecting the best tree dimensions.
+In this paper, we aim to answer the following research question: how can we design an optimal tree-based
+speculative decoding method to maximize speedups on modern hardware? Realizing this goal requires addressing
+several technical challenges. First, for any tree size and depth, we must be able to efficiently search the
+exponentially large space of tree topologies to find the one that maximizes the expected number of generated
+tokens. Second, we must design a tree sampling and verification procedure which performs well across inference
+hyperparameters, and avoids repeatedly sampling incorrect tokens, while maintaining the correct output
+distribution. Third, for any hardware, we must be able to choose the tree size and depth that will provide the
+largest speedup, when paired with the optimal tree of those dimensions.
+This paper introduces Sequoia , a scalable, robust, and hardware-aware speculative decoding algorithm. As
+shown in Figure 1, Sequoia can attain up to 10 ×speedups over incremental decoding and introduces several
+key techniques to address the aforementioned challenges.
+•In Section 3.1, to solve the first challenge, we formulate tree construction as a constrained optimization
+problem and employ a dynamic programming algorithm to discover the optimal speculative token tree. We
+demonstrate, theoretically and empirically, that the number of tokens generated with this tree structure is
+unbounded, growing roughly logarithmically with the size of the tree.
+•In Section 3.2, to address the second challenge, we build upon the SpecInfer [ 28] algorithm by performing
+sampling without replacement from the draft model—thereby preventing the draft model from making the
+same mistake twice, while maintaining the target model’s output distribution. We prove that this new
+sampling and verification method is able to attain high acceptance rates at both high and low temperatures,
+and validate this claim empirically.
+2
+
+--- PAGE 3 ---
+•In Section 3.3, to address the final challenge, we propose a hardware-aware tree optimizer, which treats the
+verification time as a hardware-dependent function of the number of tokens being verified, and uses this
+function to solve for the optimal tree shape and depth. We show this approach yields speedups relative to
+hardware-agnostic methods.
+In Section 4, we perform extensive end-to-end experiments and ablation studies to demonstrate the effec-
+tiveness of Sequoia . We implement Sequoia on top of Hugging Face (and Accelerate) [ 16,45] with CUDA
+Graphs [ 31,32]. We show that Sequoia achieves up to 4 .04×speedup for Llama2-7B on a single A100 GPU
+and 9 .96×for Llama2-70B in the offloading setting on an L40 GPU. The latency of Llama2-70B offloading on
+L40 can be reduced to 0.56 s/token with Sequoia while the inference speed of state-of-the-art offloading system
+(DeepSpeed-Zero-Inference [2]) is 5.5 s/token and 11 s/token for Huggingface Accelerate [16, 45] cpu offload
+API . We also present ablation studies to show that: (1) the Sequoia tree structure can generate up to 33%
+more tokens per decoding step compared to kindependent sequences (tree size ≤512), demonstrating better
+scalability; (2) the Sequoia sampling and verification algorithm is robust to the choice of hyperparameters
+(temperature, top- p), providing up to 65% and 27% speedup compared to SpecInfer and top- ksampling and
+verification algorithms, respectively; (3) the Sequoia hardware-aware tree optimizer can automatically select
+the best tree size and depth for different hardware.
+2 Background
+Here, we review tree-based speculative decoding methods. In particular, we discuss the way existing methods
+choose the structure of the speculation tree (Section 2.1), the algorithms they use to sample and verify the token
+trees (Section 2.2), and the way these methods can automatically select the shape of the token tree (Section 2.3).
+2.1 Tree construction
+The primary tree structure used by existing methods is one composed of kindependent sequences of length
+Lthat branch from the tree root (which corresponds to the current prefix [ x1,x2,...,x n−1]). The SpecTr paper
+additionally considers arbitrary branching patterns ( k1,k2,...,k t), but says that this did not perform better in
+their experiments than independent sequences. Medusa constructs a full k-ary tree, which increases the success
+rate at each layer but cannot form a deep tree under moderate token budgets [4].
+2.2 Tree sampling and verification
+We now review how SpecInfer [ 28], SpecTr [ 40], naive sampling [ 28], and top- ksampling1perform token tree
+sampling and verification. With regard to sampling, SpecInfer, SpecTr, and naive sampling all perform i.i.d.
+sampling with replacement from the draft model, while top- ksampling selects the top- khighest probability
+tokens from the draft model. In terms of verification, SpecInfer and SpecTr compare the draft and target model
+probabilities for the sampled tokens to decide which (if any) to accept; naive and top- ksampling, on the other
+hand, sample a token from the target model distribution and accept it if it corresponds to one of the tokens
+from the speculated tree. These methods all verify a speculated token tree in a recursive manner—starting
+at the root of the tree—differing only in the verification algorithm they apply at each node.
+SpecInfer: The SpecInfer method iteratively verifies tokens that were sampled from one or more draft models.
+Like the original speculative decoding method [ 25], it compares the draft model probabilities to those from
+the target model to decide if to accept. Note that while the SpecInfer method allows sampling from kdifferent
+draft models to generate kchildren for a node, in this work we consider the more common setting where only
+one draft model is available. Therefore, we compare with the version of SpecInfer which samples from a single
+draft model ktimes instead. We present pseudocode for SpecInfer in Appendix B.2.
+SpecTr: The SpecTr algorithm is similar in spirit to the SpecInfer algorithm. It iterates through the children
+of a node, and uses a sampling procedure to decide if to accept a child, in such a way that the output distribution
+is unchanged. One important property of this algorithm is that it is within a factor of (1 −1/e) of the best
+possible verification algorithm (meaning, the one with highest possible acceptance rate). For brevity, we refer
+users to Algorithm 3 in the SpecTr paper for the exact pseudocode for this algorithm.
+1Top-ksampling is an improved version of naive sampling which we introduce as a baseline in this work.
+3
+
+--- PAGE 4 ---
+100101102103104
+Tree Size123456# of Generated T okensDraft: Pythia-410m, T arget: Pythia-12b (T emp: 1.0)
+Sequoia (ours)
+Independent Sequences
+Single Sequence
+Binary Tree
+100101102103104
+Tree Size13579# of Generated T okensDraft: Pythia-2.8b, T arget: Pythia-12b (T emp: 1.0)
+Sequoia (ours)
+Independent Sequences
+Single Sequence
+Binary Tree
+100101102103104
+Tree Size13579111315# of Generated T okensDraft: Llama2-7b, T arget: Llama2-70b (T emp: 1.0)
+Sequoia (ours)
+Independent Sequences
+Single Sequence
+Binary TreeFigure 2: Number of generated tokens vs. tree size : We plot the average number of tokens generated for
+different tree structures per decoding step of the target model, as a function of the tree size, for different draft
+and target model pairs. The number of generated tokens for Sequoia trees continues to grow with the tree size,
+while other tree structures asymptote.
+Naive sampling and top- ksampling: Given a node in a token tree, the verification algorithm for naive
+sampling and top- ksampling first samples from the target model’s distribution P(·|x<n) at that node, and then ac-
+cepts this sample if it is equal to one of the children of that node. This verification algorithm trivially maintains the
+target model output distribution—regardless of how the token tree was generated—given that one always samples
+from the target model in this algorithm (as opposed to from the draft model, like in SpecTr and SpecInfer). This ob-
+servation motivates our choice—for the top- ksampling method—to populate the tree by taking the top- kchildren
+of each node, instead of the naive sampling approach of taking ki.i.d. samples (with replacement). We use the top-
+ksampling method in our experiments in Section 3.2, to better understand the limits of this verification algorithm.
+2.3 Tree optimizer
+The original speculative decoding paper [ 25] proposed picking the number of tokens dto speculate by maximizing
+the following expression for speedup: Speedup (n) =G(n)
+1+c·n.Here, G(n) =1−αn+1
+1−αis the expected number of
+generated tokens in one iteration of speculative decoding (if ntokens are speculated), cdenotes the time to
+perform one forward pass of the draft model relative to the target model forward pass, and 1 represents the
+time to verify the token tree. This approach can be easily extended to the tree-based setting, by replacing G(n)
+with G(n,d), the expected number of generated tokens for the best tree of size nand depth d. It’s important
+to note that regardless of the value of n, the verification time is treated as a constant O(1) by prior work (e.g.,
+the computation model in SpecTr [40]).
+3 Sequoia
+We now present Sequoia , a scalable, robust, and hardware-aware speculative decoding algorithm.
+•In Section 3.1, we present our scalable tree construction algorithm, which uses dynamic programming to
+solve for the optimal tree structure. We demonstrate both theoretically and empirically that the number
+of tokens generated by verifying Sequoia trees scales nearly logarithmically in the size of the tree, while
+existing tree structures asymptote in the number of tokens they can generate.
+•In Section 3.2, we present our robust tree verification algorithm, which modifies the SpecInfer algorithm
+by sampling without replacement from the draft model. We show both theoretically and empirically that
+Sequoia is robust, performing well across temperature values, while existing verification methods are not.
+•In Section 3.3, we present how we can make Sequoia hardware-aware by optimizing the size and depth of the
+speculated tree based on the hardware being used. We demonstrate theoretically and empirically that choosing
+these hyperparameters in this manner can yield increases in speed relative to choosing a fixed tree size.
+3.1 Tree construction
+We now present the Sequoia tree construction algorithm, and prove that the expected number of tokens
+generated by verifying these Sequoia trees scales well with the tree size.
+4
+
+--- PAGE 5 ---
+3.1.1 Algorithm
+To derive the Sequoia tree construction algorithm, we first express the tree construction problem as a con-
+strained optimization problem, and then use dynamic programming to solve this problem optimally and
+efficiently. In this optimization problem, we aim to maximize the expected number of tokens F(T) generated by
+verifying a token tree T, under a constraint on the size of T. We begin by presenting a closed form expression
+forF(T) (Proposition 3.4). We then present our tree construction algorithm, which uses dynamic programming
+to find the tree of size nwhich maximizes this expression (for any value of the speculation budget n).
+We first present a number of important definitions:
+Definition 3.1. Under the positional acceptance assumption , the probability of a verification algorithm
+accepting a token twhich is the kthchild of an already accepted token depends only on the value of k.
+Definition 3.2. Theacceptance vector is the vector p=(p1,p2,...,p k,...) containing the probabilities pkthat
+the verification algorithm accepts a token at child position k. Under the positional acceptance assumption,
+the acceptance dynamics of a verification algorithm can be completely described by the acceptance vector.
+Definition 3.3. Given an acceptance vector pand a tree T, we define the score function f(v) for a node v∈T
+asf(v)=Y
+i∈Path(v)pi. where Path(v) is equal to the list of child indices along the path from the root to a node
+v∈T. For example, if vis the 3rdchild of the root’s 2ndchild, then Path(v)=[2,3]. We define f(root)=1.
+We are now ready to present Proposition 3.4 (proof in Appendix C.2), which shows the closed form solution for
+the expected number of tokens generated by verifying a token tree T, under the positional acceptance assumption.
+Proposition 3.4. LetTbe a token tree that is verified with the positional acceptance assumption, and let f(v)
+denote the score function for a node v∈T. Then the the expected number of tokens F(T)generated by verifying
+Tequals
+F(T)=X
+v∈Tf(v).
+TheSequoia tree construction algorithm then simply corresponds to finding the tree Tof size nwhich
+maximizes F(T), using dynamic programming. Letting
+c(n)= max
+T,|T |=nF(T),
+we can express c(n) in terms of c(n′) values for n′<n:
+c(n)= max
+ai,Pn−1
+i=1ai=n−11+n−1X
+i=1pi·c(ai).
+The recursive sub-structure of this optimization problem allows us to solve this problem using dynamic
+programming. We note that because the time to speculate the token tree is proportional to the depth of the
+tree, it is also important to be able to find the tree Tof size n, and depth at most d, that maximizes F(T). In
+Appendix C.2, we provide details on the dynamic programming formulations and solutions for both versions
+of the problem (bounded/unbounded depth).
+3.1.2 Theoretical Results
+We now prove that the Sequoia tree construction algorithm scales well with the size of the speculated tree.
+In particular, we show that under certain assumptions on the acceptance rates of the verification algorithm,
+the number of generated tokens is lower-bounded by a function which is (roughly) logarithmic in the size of the
+tree. This is in contrast to existing tree construction algorithms, which we show (Table 1) are upper bounded
+in the expected number of tokens they generate.
+We first define what it means for a verification algorithm to have a bpower-law acceptance rate , and then
+present our theorem on the scalability of Sequoia trees, under the assumption that the verification algorithm
+has a bpower-law acceptance rate.
+Definition 3.5. We say that a tree verification algorithm has a bpower-law acceptance rate if the chance rk
+of the tree verification algorithm rejecting all kspeculated children of a node in a tree is upper bounded by
+a power-law of kwith exponent b—meaning, rk≤1/kb∀k∈N, forb>0∈R.
+5
+
+--- PAGE 6 ---
+Figure 3: Rejection rate vs. number speculated tokens : We plot the average rejection rate (1 −
+acceptance rate) for the different verification algorithms, as a function of the number of speculated tokens k.
+We can see that across temperature settings ( {0.2,0.6,1.0}, left to right), the Sequoia verification algorithm
+attains the lowest rejection rates, and consistently has a power-law acceptance rate (Definition 3.5).
+Table 1: We present upper bounds on the number of tokens generated in each iteration of a tree-based speculative
+decoding algorithm, assuming that Pkdenotes the probability that if a node has kchildren, that one of those
+children will be accepted.
+Tree structure Upper bound
+Sequence1
+1−P1
+kindependent sequences 1+Pk
+1−P1
+Binary tree1
+1−P2
+k-ary tree1
+1−Pk
+Sequoia (ours) ∞
+The above definition is motivated by our observation (Figure 3) that the Sequoia sampling and verification
+algorithm satisfies power-law acceptance rates in practice. We now state the theorem (proof in Appendix C.4).
+Theorem 3.6. Assume a tree verification algorithm has a bpower-law acceptance rate. Then the expected number
+of tokens G(n)generated by verifying the Sequoia tree of size nwith this algorithm is in Ω 
+b·log(n)/log(log(n)
+.
+3.1.3 Empirical Validation
+In Figure 2, we plot the average number of tokens generated by Sequoia trees relative to the various tree
+structures presented in Table 1, as a function of the number of tokens nin the tree, for several draft and target
+model pairs, using data from WikiText-103. We see that the number of generated tokens for Sequoia trees
+is unbounded—scaling roughly logarithmically with the tree size—whereas the other tree structures asymptote.
+3.2 Tree sampling and verification
+We present our token tree sampling and verification algorithm, and prove that it is the first such algorithm
+to satisfy two important robustness properties, while maintaining the output distribution of the target model.
+3.2.1 Algorithm
+We present the pseudocode for the Sequoia Tree sampling and verification algorithm in Algorithm 1. As
+discussed in Section 2, an important motivation for designing the Sequoia verification algorithm was the
+observation that SpecInfer and SpecTr both perform poorly at low temperatures, due to the fact that they can
+repeatedly sample (and then reject) a low-quality token that the draft model is confident in. Thus, we wanted
+to design an algorithm that would never make the same mistake twice—meaning, once a token was rejected,
+it would never propose that token again. Toward this end, Sequoia introduces two changes to the SpecInfer
+algorithm: First, it performs sampling without replacement using the draft model distribution. Second, if all
+6
+
+--- PAGE 7 ---
+the tokens with non-zero draft model probability have already been sampled and rejected, it uses the uniform
+distribution over all tokens that have not yet been sampled as the new draft model distribution. These changes
+significantly improve the robustness of Sequoia relative to SpecInfer, while maintaining the guarantee that
+the output distribution is identical to that of the target model (proof in Appendix C.1).
+Algorithm 1 Sequoia Sampling and Verification
+1:Input: Prefix [ x1,x2,...,x n−1], target model probabilities P(·|x<n), draft model probabilities Q(·|x<n), and number
+of branches k≤vocab size.
+2:Output: A token xsampled using Sequoia .
+3:Initialize residual RwithP, draft DwithQ, and the set of rejected tokens Swith∅
+4:fori=1→kdo
+5: sample xi∼D,ri∼Uniform(0 ,1)
+6:ifri<R[xi]
+D[xi]then ▷Accept xi
+7: Return xi
+8:else ▷Reject xi
+9: R←norm(max( R−D,0))
+10: D[xi]←0
+11: S.add( xi)
+12: ifsum(D)=0then
+13: # Let Dbe uniform over non-rejected set
+14: D[t]←0 ift∈S, else 1
+15: end if
+16: D←norm( D)
+17: end if
+18:end for
+19:Return x∼R
+3.2.2 Theoretical Results
+We now prove that the Sequoia verification algorithm is robust, in the sense that it satisfies both of the
+properties below, while existing verification algorithms do not.
+•The optimal transport property : When k=1, the acceptance rate is equal to 1 −∥P−Q∥1
+2.2
+•The cover property : If the support of the draft model probability distribution Qis of size kand is a
+superset of the support of the target model probability distribution P, at most kspeculations will be needed
+to attain an acceptance rate of 1. Furthermore, if kis equal to the vocabulary size, the acceptance rate should
+always be 1 as well, regardless of the draft model used.
+Intuitively, satisfying the optimal transport property results in strong performance at high temperatures
+(because PandQwill approach uniform distributions), while satisfying the cover property results in strong
+performance at low temperatures (assuming the top target model token is in the top- kdraft model tokens).
+We now present our main robustness result (proof in Appendix C.4):
+Theorem 3.7. TheSequoia verification algorithm satisfies both the optimal transport and the cover properties,
+while SpecInfer and SpecTr only satisfy the optimal transport property, and top- ksampling only satisfies the
+cover property.
+3.2.3 Empirical Validation
+In Figure 3, we plot the average rejection rates (equal to 1 −acceptance rates ) for the different verification algo-
+rithms, as a function of the number of speculated child tokens for a fixed token prefix, for various temperatures
+(0.2, 0.6, 1.0), measured on WikiText-103. We can see that across all temperature settings, the rejection rates
+forSequoia decay faster than for the other algorithms. In general, we observe that the rejection rates rkfor
+Sequoia follow a power-law, where rk≈1/kbfor some b>0. We can also see that while SpecTr and SpecInfer
+perform relatively well at high temperatures, they struggle at lower temperatures, and that the opposite is
+true for the top- ksampling method.
+2The SpecTr paper [ 40] showed that 1 −∥P−Q∥1
+2is the acceptance rate attained by the optimal verification algorithm for k=1.
+7
+
+--- PAGE 8 ---
+Table 2: The components of the speedup equation (Equation 1) for Sequoia , as well as for prior work.
+Sequoia 1 sequence kind. sequences
+G(n,d)Ω
+blog(n)
+log(log( n))
+1−Pn+1
+1
+1−P1≤1+1
+1−Pk
+t(n) Ω(n) 1 1
+d(n) d n ⌊n/k⌋
+Table 3: Total speedup (number of tokens generated in parentheses) on different hardware. We compare our
+hardware-aware tree optimizer with using fixed tree sizes. Our optimizer can yield up to 38% speedups.
+Hardware Target Draft Hardware-aware nfixed n=128 fixed n=256
+L40 Llama2-13B JF68M 3 .26×(4.40) 3 .16×(4.77) 2 .51×(5.09)
+A100 Vicuna-33B SL1.3B 2 .37×(4.41) 2 .09×(4.99) 1 .72×(5.30)
+3.3 Hardware-aware Tree Optimizer
+We present our proposed method for selecting the Sequoia tree size and depth in a hardware-aware manner to
+optimize the actual speedup attained by Sequoia on different hardware. Theoretically, we show that while prior
+work can get away with optimizing the size of the speculation budget in a hardware-agnostic manner, this is
+not possible in Sequoia , due to the fact that for large trees the verification time can no longer be approximated
+as a constant, independent of the tree size. Empirically, we demonstrate that selecting the tree size and depth
+in this hardware-aware manner yields up to 40% speedups relative to baselines.
+3.3.1 Algorithm
+We now show how we can select the tree size and depth optimally, depending on the hardware being used for
+inference. Letting G(n,d) denote the expected number of tokens generated by verifying the Sequoia tree of size n
+and depth d(computed via dynamic programming), t(n) denote the (hardware-dependent) amount of time it takes
+the target model to verify ntokens divided by the time to verify 1 token, and cdenote the (hardware-dependent)
+time to draft 1 token divided by the time to verify 1 token, the speedup attained by Sequoia can be expressed as:
+Speedup (n,d)=G(n,d)
+t(n)+d·c. (1)
+We propose optimizing this equation by measuring t(n) and cempirically on the inference hardware being
+used, and then doing a grid search over possible values of nanddto find the combination that gives the largest
+speedup. Importantly, for batch size b>1, the denominator can be updated to t(b·n)+d·c, since the verifier
+must verify a tree of size nfor each element of batch.
+3.3.2 Theoretical Results
+1 2 4 816 32 64128 256 512
+Input Length0.0250.0500.0750.1000.1250.1500.1750.2000.225Time (in seconds)
+Forward Pass Time
+Llama2-7b (A100)
+Llama2-7b (L40)
+Llama2-13b (A100)
+Llama2-13b (L40)
+Vicuna-33b (A100)
+Figure 4: Forward pass times for different
+model/hardware combinations as a function of
+the number of tokens nbeing processed. We use
+these values to choose the optimal tree.We now study the properties of the Sequoia speedup
+equation, to better understand the optimal tree size and
+depth that are selected by this equation, and why it is
+critical to choose these parameters in a hardware-aware
+manner.
+In Table 2 we break down the speedup equation in terms
+of its components, for Sequoia and prior work. We first
+observe that for Sequoia , because the numerator for the
+speedup equation grows roughly logarithmically in n, while
+the denominator grows linearly with n, there must exist
+an optimal tree size n <∞that maximizes this speedup
+expression.
+Additionally, we can observe that prior can get away with
+setting t(n)=1, because the optimal choice of ntypically
+8
+
+--- PAGE 9 ---
+occurs well before t(n) starts growing meaningfully larger than 1. However, this assumption is not always true
+withSequoia . InSequoia , the fact that we have improved G(n,d) so that it grows (slight sub-)logarithmically
+inn, necessitates hardware-aware modeling of t(n).
+3.3.3 Empirical Validation
+In Table 3 we show the speedups attained on several types of hardware when we select the tree size and depth
+using the correct t(n) function (estimated empirically, see Figure 4) vs. simply choosing a fixed value of n. We
+can see that using the hardware-aware t(n) function can yield meaningful speedups of up to 40% relative to
+using fixed values of nacross different hardware.
+4 Evaluation
+In this section, we aim to demonstrate that Sequoia can speed up LLM inference by a large margin in wall-clock
+time. We first present our end-to-end system results showing total speedup, followed by validating our three
+claims that Sequoia is scalable, robust, and hardware-aware.
+•In Section 4.1, we demonstrate Sequoia ’s superior end-to-end performance. Specifically, Sequoia achieves
+up-to 4 .04×speed-up for Llama2-7B on A100 and 9 .96×for Llama2-70B on L40 offloading (achieving the
+latency as low as 0.56 s/token).
+•In Section 4.2.1, we show that the Sequoia tree can generate on average 33% more tokens than a tree of 16
+independent sequences (tree size 512).
+•In Section 4.2.2, we present that Sequoia ’s sampling and verification algorithm is robust to temperature and
+top-p, consistently outperforming SpecInfer (by up to 1 .65×) and top- ksampling (by up to 1 .27×).
+•In Section 4.2.3, we show that Sequoia ’s hardware-aware tree optimizer can select the best tree size and
+depth for different hardware settings to maximize speedup.
+4.1 End-to-end Results
+We now demonstrate that Sequoia speeds up LLM decoding in the on-chip setting by up 4 .04×on an A100
+GPU, and up to 9 .96×with offloading on an L40 GPU.
+Setup. Our experiments are based on Llama and Vicuna models. For the on-chip setting, we use JackFram/Llama-
+68m (JF68m) [ 28] and princeton-nlp/Sheared-Llama-1.3B (SL1.3B) [ 46] as the draft models, and Llama2-7B [ 43],
+Llama2-13B, and Vicuna-33B [ 6] as the target models. For the offloading setting, we use Llama2-7B as the
+draft model and Llama2-70B as the target model. We evaluate our results on C4(en) [ 35] validation dataset,
+OpenWebText [ 13] and CNN DailyMail [ 36]. For each experiment, we use 200 examples to measure the
+acceptance rate vector (mentioned in Section 3.1) and sample another 200 examples for evaluation (100 for
+offloading). The prompt length and generation length are both set to 128 tokens. We evaluate Sequoia on
+different hardware including on-chip experiments on L40 and A100 GPUs, as well as offloading experiments on
+an L40 GPU. We also compare Sequoia with SpecInfer [ 28] with 5 ×8 trees (5 independent sequences of length
+8, the tree structure used in [ 28] for batch size 1) and 8 ×8 trees for the on-chip setting, and 16 ×48 trees for the
+offloading setting.
+Implementation Details. We implement the draft and target models using Transformers [ 45]. Because we
+determine the optimal tree structure in advance, we are able to use PyTorch CUDA graphs [ 31,32] to reduce the
+overhead of kernel launching during speculative decoding. To accelerate sampling without replacement—which
+is not efficient in PyTorch 2.1 [ 32]—we use the exponential-sort algorithm [ 44], combined with PyTorch CUDA
+graphs [ 31,32]. For offloading setting, we implemented an offloading system as a baseline, which can also
+support tree verification for speculative decoding. The latency of our offloading system is 5.6 s/token, matching
+the inference speed of the state-of-the-art (DeepSpeed-Zero-Inference [2]), which is 5.5 s/token.
+9
+
+--- PAGE 10 ---
+Table 4: On-chip results (A100) : The optimal tree configuration and speedup for different pairs of draft
+and target models, and different temperatures, for Sequoia vs. SpecInfer. We specify the average number of
+generated tokens per decoding step in parentheses, next to the speedup factor. Sequoia attains up to 4 .04×
+speedup on an A100.
+Target LLM Draft Model T DatasetTree Config.SpeedupSpecInfer SpecInfer
+(size, depth) 5×8 8×8
+Llama2-7B JF68M 0 C4 (128,10) 4.04×(5.08) 3.45×(3.96) 3.70×(4.11)
+Llama2-7B JF68M 0.6 C4 (128,7) 3.18×(3.92) 2.47×(2.97) 2.45×(3.05)
+Llama2-7B JF68M 0OpenWebText (128,7) 3.22×(3.86) 2.79×(3.15) 2.96×(3.24)
+Llama2-7B JF68M 0.6 OpenWebText (128,6) 2.71×(3.33) 2.10×(2.54) 2.08×(2.55)
+Llama2-7B JF68M 0 CNN Daily (128,7) 3.41×(4.05) 2.95×(3.27) 3.10×(3.37)
+Llama2-7B JF68M 0.6 CNN Daily (128,6) 2.83×(3.45) 2.11×(2.58) 2.22×(2.69)
+Llama2-13B JF68M 0 C4 (64,9) 3.73×(4.20) 3.30×(3.64) 3.10×(3.75)
+Llama2-13B JF68M 0.6 C4 (64,7) 3.19×(3.57) 2.48×(2.87) 2.42×(3.00)
+Llama2-13B JF68M 0OpenWebText (64,7) 3.18×(3.49) 2.77×(3.05) 2.59×(3.14)
+Llama2-13B JF68M 0.6 OpenWebText (64,6) 2.77×(3.06) 2.17×(2.49) 2.01×(2.52)
+Llama2-13B JF68M 0 CNN Daily (64,7) 3.33×(3.68) 2.95×(3.22) 2.75×(3.32)
+Llama2-13B JF68M 0.6 CNN Daily (64,6) 2.88×(3.17) 2.17×(2.54) 2.09×(2.60)
+Llama2-13B JF160M 0 C4 (64,7) 3.10×(4.69) 2.74×(4.33) 2.58×(4.42)
+Llama2-13B JF160M 0.6 C4 (64,6) 2.83×(4.06) 2.07×(3.46) 2.02×(3.53)
+Llama2-13B JF160M 0OpenWebText (64,6) 2.72×(3.90) 2.26×(3.58) 2.15×(3.66)
+Llama2-13B JF160M 0.6 OpenWebText (64,5) 2.49×(3.38) 1.80×(2.96) 1.77×(3.07)
+Llama2-13B JF160M 0 CNN Daily (64,6) 2.84×(4.05) 2.36×(3.73) 2.25×(3.83)
+Llama2-13B JF160M 0.6 CNN Daily (64,5) 2.55×(3.47) 1.79×(2.97) 1.74×(3.03)
+Vicuna-33B SL1.3B 0 C4 (64,6) 2.27×(4.28) 1.83×(3.86) 1.73×(3.96)
+Vicuna-33B SL1.3B 0.6 C4 (64,6) 2.19×(4.16) 1.64×(3.53) 1.52×(3.56)
+Vicuna-33B SL1.3B 0OpenWebText (64,5) 2.21×(3.93) 1.75×(3.70) 1.65×(3.79)
+Vicuna-33B SL1.3B 0.6 OpenWebText (64,5) 2.13×(3.82) 1.57×(3.36) 1.47×(3.43)
+Vicuna-33B SL1.3B 0 CNN Daily (64,5) 2.21×(3.93) 1.75×(3.71) 1.65×(3.79)
+Vicuna-33B SL1.3B 0.6 CNN Daily (64,5) 2.16×(3.86) 1.58×(3.40) 1.46×(3.43)
+Table 5: Offloading results (L40) : The optimal tree configuration and speedup for different pairs of draft
+and target models, and different temperatures, for Sequoia vs. SpecInfer. We specify the average number of
+generated tokens per decoding step in parentheses, next to the speedup factor. Sequoia attains up to 9 .96×
+speedup in the offloading setting on an L40.
+Target LLM Draft Model T DatasetTree Config.SpeedupE2E Latency SpecInfer
+(size, depth) s/token 16×48
+Llama2-70B Llama2-7B 0 C4 (768,22) 9.96×(12.18) 0.56 6.46×(8.66)
+Llama2-70B Llama2-7B 0.6 C4 (768,23) 8.26×(10.12) 0.69 5.20×(6.93)
+Llama2-70B Llama2-7B 0OpenWebText (768,18) 8.14×(9.83) 0.69 5.50×(7.36)
+Llama2-70B Llama2-7B 0.6 OpenWebText (768,19) 7.39×(9.05) 0.76 4.64×(6.18)
+Llama2-70B Llama2-7B 0 CNN Daily (768,17) 8.78×(10.46) 0.64 5.91×(7.87)
+Llama2-70B Llama2-7B 0.6 CNN Daily (768,18) 8.03×(9.58) 0.70 4.68×(6.24)
+Main Results. We evaluate Sequoia using different temperatures, draft and target model pairs, and
+hardware configurations. Results are shown in Table 4 (A100 on-chip) and Table 5 (L40 offloading). We observe
+thatSequoia consistently speeds up LLM decoding in a wide range of settings. Sequoia reaches up to 4 .04×
+speedup for the on-chip setting, and up to 9 .96×speedup for the offloading setting, as a result of the huge gap
+between computation capacity and memory bandwidth. Notably, for the offloading setting on L40, Sequoia
+can achieve as low as 0.56 s/token latency. We present additional on-chip results (L40 GPU) in Appendix D.
+Analysis. We made several interesting observations on the interplay between Sequoia tree construction,
+sampling and verification, and hardware-aware optimizer. (1) Sequoia selects much larger trees in the offloading
+10
+
+--- PAGE 11 ---
+4 8 16 32 64 128 256 512
+Tree Size1.52.02.53.03.54.0# of Generated T okensSequoia's Scalability
+Sequoia tree
+4 sequences
+8 sequences
+16 sequences(a)
+0.0 0.2 0.4 0.6 0.8 1.0
+T emperature2.02.252.52.753.0SpeedupSequoia's Robustness
+Sequoia
+SpecInfer
+Top-k sampling (b)
+4 8 16 32 64 128 256 512
+Tree Size1.001.251.501.752.002.252.502.753.00SpeedupSequoia's Hardware Awareness
+Sequoia optimized tree (A100)
+Sequoia w/o tree optimizer (A100)
+Sequoia optimized tree (L40)
+Sequoia w/o tree optimizer (L40) (c)
+Figure 5: Left: We compare the number of tokens generated on average by Sequoia trees vs. kindependent
+sequences, where we use Sequoia sampling and verification for both tree structures. The gap between Sequoia
+trees and the baselines demonstrates the improved scalability of the Sequoia tree construction algorithm.
+Middle : We compare the speedups attained by the Sequoia sampling and verification algorithm relative
+to SpecInfer and top- ksampling, across various temperatures, holding the tree structure fixed. We can see
+Sequoia is robust to the choice of temperature, performing well across the different settings. Right : We
+compare the wall-clock time speedup of Sequoia trees of various sizes (orange lines)—chosen to maximize the
+# generated tokens—with the speedup of the trees selected by the hardware-aware tree optimizer (horizontal
+green lines)—chosen to maximize speedup—on A100 and L40 GPUs. The optimizer can select the optimal tree
+size and depth for each type of hardware; by limiting the depth of the tree it can make speculation faster and
+thus attain larger speedups than the trees with unconstrained depth (orange lines).
+setting (768 tokens) than in the on-chip setting (64 to 128 tokens). (2) In general, the average number of
+generated tokens is close to the wall-clock time speedup (especially when JF68M is used as the draft) as a
+result of the hardware-aware tree optimizer. (3) The optimal trees found by Sequoia for slightly different
+configurations—e.g., different temperatures and model pairs—can be very different from one another. (4)
+Sequoia chooses deeper trees at low temperature than high temperature, due to the acceptance rates being
+higher for low temperature. (5) The optimal tree size for larger models such as 33B or 13B is generally smaller
+than for smaller models because the verification time increases faster with the number of candidate tokens, as
+illustrated in Figure 4.
+4.2 Ablations
+We present our ablation experiments validating the scalability of the Sequoia tree construction algorithm
+(Section 4.2.1), the robustness of Sequoia tree sampling and verification algorithm (Section 4.2.2), and the
+hardware-awareness of the Sequoia tree optimizer (Section 4.2.3). For each of these experiments, we only vary
+one element at a time (e.g., the tree structure for Section 4.2.1) to study the gains attained by each component
+ofSequoia .
+4.2.1 The Scalability of Sequoia
+In this section, we evaluate the scalability of the Sequoia tree construction method in terms of the average
+number of generated tokens at different budget sizes, relative to baselines. In Figure 5a we compare the Sequoia
+tree to kindependent sequences, where we use Sequoia ’s sampling and verification algorithm for both tree
+structures. The Sequoia tree is able to generate up to 33% more tokens per decoding step, demonstrating the
+effectiveness of Sequoia ’s tree construction algorithm. For these experiments, we use JackFram/Llama-68m as
+the draft model, Llama2-13B as the target model, 0 .6 as the temperature, and CNN Daily Mail as the dataset.
+4.2.2 Robustness of Sequoia Sampling Algorithm
+Here, we compare the Sequoia sampling and verification algorithm to SpecInfer and top- ksampling across
+different inference hyperparameters (temperature and top-p [ 20]), holding the tree structure fixed. In Figure 5b
+we present the results for these methods as we vary the temperature (for top- p=1), while in Table 6 we present
+11
+
+--- PAGE 12 ---
+Table 6: We compare the robustness of the Sequoia sampling and verification algorithm to the top- p
+hyperparameter, relative to SpecInfer and top- ksampling. We present total speedups on an A100 GPU for
+the different methods (number of generated tokens in parentheses). We hold the tree structure fixed across
+methods, use JF68M as the draft model, and Llama2-7B as the target model.
+Top- pSequoia (Ours) SpecInfer top- ksampling
+0.8 2 .54×(3.18) 2 .35×(2.93) 2 .43×(2.90)
+0.9 2 .61×(3.27) 2 .42×(3.01) 2 .27×(2.71)
+1.0 2 .69×(3.26) 2 .55×(3.10) 2 .12×(2.44)
+results varying the top- pparameter (for temp=1). We can see that Sequoia achieves the largest speedups
+across all temperature and top-p settings, attaining up to 1 .65×and 1 .27×speedup relative to SpecInfer and
+top-ksampling, respectively. In addition, we can observe that the Sequoia sampling and verification algorithm
+performs well across different temperature and top-p settings, whereas top- ksampling and SpecInfer excel in
+different regimes3. For these experiments, we use JackFram/Llama-68m as the draft model, Llama2-7B as the
+target model, 0 .6 as the temperature, CNN Daily Mail as the dataset, and the corresponding Sequoia tree
+from Table 4 as the tree structure.
+4.2.3 Sequoia on Different Hardware Settings
+In this section, we demonstrate the effectiveness of the Sequoia hardware-aware tree optimizer. In Figure 5c,
+we compare the speedups attained by the Sequoia trees of various sizes from Figure 5a to the trees selected
+by the hardware-aware tree-optimizer. Because the tree optimizer is able to limit the tree depth to make
+speculation faster, it is able to attain larger end-to-end speedups than any of the Sequoia trees from Figure 5a,
+whose structures were chosen to maximize the expected number of generated tokens (not the speedup). The
+optimizer is also able to automatically find the tree size that produces the largest overall speedup.
+5 Conclusion
+We presented Sequoia , a scalable, robust, and hardware-aware speculative decoding method. By improving
+the topology of the token tree, the sampling algorithms, and the choice of tree size, Sequoia is able to speed
+up autoregressive LLM inference up to 4 .04×on GPU and 9 .96×with offloading. In addition to providing
+real speedups, we believe Sequoia also provides insight into both the large potential and fundamental limits
+of speculative decoding systems. We hope that this understanding inspires future work in this area, or even
+informs the design of custom chips for LLM inference.
+References
+[1]Joshua Ainslie, Tao Lei, Michiel de Jong, Santiago Onta˜ n´ on, Siddhartha Brahma, Yury Zemlyanskiy,
+David Uthus, Mandy Guo, James Lee-Thorp, Yi Tay, et al. Colt5: Faster long-range transformers with
+conditional computation. arXiv preprint arXiv:2303.09752 , 2023.
+[2]Reza Yazdani Aminabadi, Samyam Rajbhandari, Minjia Zhang, Ammar Ahmad Awan, Cheng Li, Du Li,
+Elton Zheng, Jeff Rasley, Shaden Smith, Olatunji Ruwase, et al. Deepspeed inference: Enabling efficient
+inference of transformer models at unprecedented scale. arXiv preprint arXiv:2207.00032 , 2022.
+[3]Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal, Arvind
+Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, et al. Language models are few-shot learners.
+Advances in neural information processing systems , 33:1877–1901, 2020.
+[4]Tianle Cai, Yuhong Li, Zhengyang Geng, Hongwu Peng, Jason D. Lee, Deming Chen, and Tri Dao. Medusa:
+Simple llm inference acceleration framework with multiple decoding heads, 2024.
+3Top-p is not efficiently supported in current implementation, which influences the total speedup.
+12
+
+--- PAGE 13 ---
+[5]Charlie Chen, Sebastian Borgeaud, Geoffrey Irving, Jean-Baptiste Lespiau, Laurent Sifre, and John
+Jumper. Accelerating large language model decoding with speculative sampling. CoRR , abs/2302.01318,
+2023. doi: 10.48550/ARXIV.2302.01318. URL https://doi.org/10.48550/arXiv.2302.01318 .
+[6]Wei-Lin Chiang, Zhuohan Li, Zi Lin, Ying Sheng, Zhanghao Wu, Hao Zhang, Lianmin Zheng, Siyuan
+Zhuang, Yonghao Zhuang, Joseph E. Gonzalez, Ion Stoica, and Eric P. Xing. Vicuna: An open-source
+chatbot impressing gpt-4 with 90%* chatgpt quality, March 2023. URL https://lmsys.org/blog/
+2023-03-30-vicuna/ .
+[7]Aakanksha Chowdhery, Sharan Narang, Jacob Devlin, Maarten Bosma, Gaurav Mishra, Adam Roberts,
+Paul Barham, Hyung Won Chung, Charles Sutton, Sebastian Gehrmann, et al. PaLM: Scaling language
+modeling with pathways. arXiv preprint arXiv:2204.02311 , 2022.
+[8]Tri Dao. Flashattention-2: Faster attention with better parallelism and work partitioning. CoRR ,
+abs/2307.08691, 2023. doi: 10.48550/ARXIV.2307.08691. URL https://doi.org/10.48550/arXiv.
+2307.08691 .
+[9]Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, and Christopher R´ e. Flashattention: Fast and
+memory-efficient exact attention with io-awareness. In Sanmi Koyejo, S. Mohamed, A. Agarwal, Danielle
+Belgrave, K. Cho, and A. Oh, editors, Advances in Neural Information Processing Systems 35: Annual
+Conference on Neural Information Processing Systems 2022, NeurIPS 2022, New Orleans, LA, USA,
+November 28 - December 9, 2022 , 2022.
+[10]Tim Dettmers, Mike Lewis, Younes Belkada, and Luke Zettlemoyer. Llm.int8(): 8-bit matrix multiplication
+for transformers at scale. CoRR , abs/2208.07339, 2022. doi: 10.48550/ARXIV.2208.07339. URL
+https://doi.org/10.48550/arXiv.2208.07339 .
+[11]Elias Frantar and Dan Alistarh. Massive language models can be accurately pruned in one-shot. arXiv
+preprint arXiv:2301.00774 , 2023.
+[12]Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and Dan Alistarh. GPTQ: accurate post-training
+quantization for generative pre-trained transformers. CoRR , abs/2210.17323, 2022. doi: 10.48550/ARXIV.
+2210.17323. URL https://doi.org/10.48550/arXiv.2210.17323 .
+[13] Aaron Gokaslan and Vanya Cohen. Openwebtext corpus, 2019.
+[14]Albert Gu and Tri Dao. Mamba: Linear-time sequence modeling with selective state spaces. CoRR ,
+abs/2312.00752, 2023. doi: 10.48550/ARXIV.2312.00752. URL https://doi.org/10.48550/arXiv.
+2312.00752 .
+[15]Albert Gu, Karan Goel, and Christopher R´ e. Efficiently modeling long sequences with structured state
+spaces. In The Tenth International Conference on Learning Representations, ICLR 2022, Virtual Event,
+April 25-29, 2022 . OpenReview.net, 2022. URL https://openreview.net/forum?id=uYLFoz1vlAC .
+[16]Sylvain Gugger, Lysandre Debut, Thomas Wolf, Philipp Schmid, Zachary Mueller, Sourab Mangrulkar,
+Marc Sun, and Benjamin Bossan. Accelerate: Training and inference at scale made simple, efficient and
+adaptable. https://github.com/huggingface/accelerate , 2022.
+[17]Song Han, Huizi Mao, and William J Dally. Deep compression: Compressing deep neural networks with
+pruning, trained quantization and huffman coding. arXiv preprint arXiv:1510.00149 , 2015.
+[18]Geoffrey Hinton, Oriol Vinyals, Jeff Dean, et al. Distilling the knowledge in a neural network. arXiv
+preprint arXiv:1503.02531 , 2(7), 2015.
+[19]Torsten Hoefler, Dan Alistarh, Tal Ben-Nun, Nikoli Dryden, and Alexandra Peste. Sparsity in deep
+learning: Pruning and growth for efficient inference and training in neural networks. J. Mach. Learn. Res. ,
+22(241):1–124, 2021.
+[20]Ari Holtzman, Jan Buys, Li Du, Maxwell Forbes, and Yejin Choi. The curious case of neural text
+degeneration. arXiv preprint arXiv:1904.09751 , 2019.
+13
+
+--- PAGE 14 ---
+[21]Benoit Jacob, Skirmantas Kligys, Bo Chen, Menglong Zhu, Matthew Tang, Andrew Howard, Hartwig Adam,
+and Dmitry Kalenichenko. Quantization and training of neural networks for efficient integer-arithmetic-
+only inference. In Proceedings of the IEEE conference on computer vision and pattern recognition , pages
+2704–2713, 2018.
+[22]Angelos Katharopoulos, Apoorv Vyas, Nikolaos Pappas, and Fran¸ cois Fleuret. Transformers are rnns:
+Fast autoregressive transformers with linear attention. In Proceedings of the 37th International Conference
+on Machine Learning, ICML 2020, 13-18 July 2020, Virtual Event , volume 119 of Proceedings of Ma-
+chine Learning Research , pages 5156–5165. PMLR, 2020. URL http://proceedings.mlr.press/v119/
+katharopoulos20a.html .
+[23]Sehoon Kim, Karttikeya Mangalam, Jitendra Malik, Michael W. Mahoney, Amir Gholami, and Kurt
+Keutzer. Big little transformer decoder. CoRR , abs/2302.07863, 2023. doi: 10.48550/ARXIV.2302.07863.
+URL https://doi.org/10.48550/arXiv.2302.07863 .
+[24]Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph Gonzalez,
+Hao Zhang, and Ion Stoica. Efficient memory management for large language model serving with
+pagedattention. In Jason Flinn, Margo I. Seltzer, Peter Druschel, Antoine Kaufmann, and Jonathan
+Mace, editors, Proceedings of the 29th Symposium on Operating Systems Principles, SOSP 2023, Koblenz,
+Germany, October 23-26, 2023 , pages 611–626. ACM, 2023. doi: 10.1145/3600006.3613165. URL
+https://doi.org/10.1145/3600006.3613165 .
+[25]Yaniv Leviathan, Matan Kalman, and Yossi Matias. Fast inference from transformers via speculative
+decoding. In International Conference on Machine Learning , pages 19274–19286. PMLR, 2023.
+[26]Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang, Xingyu Dang, and Song Han. AWQ: activation-
+aware weight quantization for LLM compression and acceleration. CoRR , abs/2306.00978, 2023. doi:
+10.48550/ARXIV.2306.00978. URL https://doi.org/10.48550/arXiv.2306.00978 .
+[27]Zhuang Liu, Mingjie Sun, Tinghui Zhou, Gao Huang, and Trevor Darrell. Rethinking the value of network
+pruning. arXiv preprint arXiv:1810.05270 , 2018.
+[28]Xupeng Miao, Gabriele Oliaro, Zhihao Zhang, Xinhao Cheng, Zeyu Wang, Rae Ying Yee Wong, Zhuoming
+Chen, Daiyaan Arfeen, Reyna Abhyankar, and Zhihao Jia. Specinfer: Accelerating generative llm serving
+with speculative inference and token tree verification. arXiv preprint arXiv:2305.09781 , 2023.
+[29]Pavlo Molchanov, Stephen Tyree, Tero Karras, Timo Aila, and Jan Kautz. Pruning convolutional neural
+networks for resource efficient inference. arXiv preprint arXiv:1611.06440 , 2016.
+[30]Markus Nagel, Mart van Baalen, Tijmen Blankevoort, and Max Welling. Data-free quantization through
+weight equalization and bias correction. In Proceedings of the IEEE/CVF International Conference on
+Computer Vision , pages 1325–1334, 2019.
+[31]NVIDIA, P´ eter Vingelmann, and Frank H.P. Fitzek. Cuda, release: 10.2.89, 2020. URL https://
+developer.nvidia.com/cuda-toolkit .
+[32]Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory Chanan, Trevor Killeen,
+Zeming Lin, Natalia Gimelshein, Luca Antiga, et al. Pytorch: An imperative style, high-performance deep
+learning library. Advances in neural information processing systems , 32, 2019.
+[33]Reiner Pope, Sholto Douglas, Aakanksha Chowdhery, Jacob Devlin, James Bradbury, Anselm Levskaya,
+Jonathan Heek, Kefan Xiao, Shivani Agrawal, and Jeff Dean. Efficiently scaling transformer inference.
+ArXiv , abs/2211.05102, 2022. URL https://api.semanticscholar.org/CorpusID:253420623 .
+[34]Reiner Pope, Sholto Douglas, Aakanksha Chowdhery, Jacob Devlin, James Bradbury, Anselm Levskaya,
+Jonathan Heek, Kefan Xiao, Shivani Agrawal, and Jeff Dean. Efficiently scaling transformer inference.
+arXiv preprint arXiv:2211.05102 , 2022.
+14
+
+--- PAGE 15 ---
+[35]Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan Narang, Michael Matena, Yanqi Zhou,
+Wei Li, and Peter J. Liu. Exploring the limits of transfer learning with a unified text-to-text transformer.
+arXiv e-prints , 2019.
+[36]Abigail See, Peter J. Liu, and Christopher D. Manning. Get to the point: Summarization with pointer-
+generator networks. In Proceedings of the 55th Annual Meeting of the Association for Computational
+Linguistics (Volume 1: Long Papers) , pages 1073–1083, Vancouver, Canada, July 2017. Association for
+Computational Linguistics. doi: 10.18653/v1/P17-1099. URL https://www.aclweb.org/anthology/
+P17-1099 .
+[37]Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan Li, Max Ryabinin, Beidi Chen, Percy Liang,
+Christopher R´ e, Ion Stoica, and Ce Zhang. Flexgen: High-throughput generative inference of large language
+models with a single GPU. In Andreas Krause, Emma Brunskill, Kyunghyun Cho, Barbara Engelhardt,
+Sivan Sabato, and Jonathan Scarlett, editors, International Conference on Machine Learning, ICML 2023,
+23-29 July 2023, Honolulu, Hawaii, USA , volume 202 of Proceedings of Machine Learning Research , pages
+31094–31116. PMLR, 2023. URL https://proceedings.mlr.press/v202/sheng23a.html .
+[38] Mitchell Stern, Noam Shazeer, and Jakob Uszkoreit. Blockwise parallel decoding for deep autoregressive
+models. Advances in Neural Information Processing Systems , 31, 2018.
+[39]Mingjie Sun, Zhuang Liu, Anna Bair, and J Zico Kolter. A simple and effective pruning approach for large
+language models. arXiv preprint arXiv:2306.11695 , 2023.
+[40]Ziteng Sun, Ananda Theertha Suresh, Jae Hun Ro, Ahmad Beirami, Himanshu Jain, and Felix Yu. Spectr:
+Fast speculative decoding via optimal transport. arXiv preprint arXiv:2310.15141 , 2023.
+[41] Raphael Tang, Yao Lu, Linqing Liu, Lili Mou, Olga Vechtomova, and Jimmy Lin. Distilling task-specific
+knowledge from bert into simple neural networks. arXiv preprint arXiv:1903.12136 , 2019.
+[42]Hugo Touvron, Matthieu Cord, Matthijs Douze, Francisco Massa, Alexandre Sablayrolles, and Herv´ e J´ egou.
+Training data-efficient image transformers & distillation through attention. In International Conference
+on Machine Learning , pages 10347–10357. PMLR, 2021.
+[43]Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei, Nikolay
+Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, Dan Bikel, Lukas Blecher, Cristian Canton
+Ferrer, Moya Chen, Guillem Cucurull, David Esiobu, Jude Fernandes, Jeremy Fu, Wenyin Fu, Brian Fuller,
+Cynthia Gao, Vedanuj Goswami, Naman Goyal, Anthony Hartshorn, Saghar Hosseini, Rui Hou, Hakan
+Inan, Marcin Kardas, Viktor Kerkez, Madian Khabsa, Isabel Kloumann, Artem Korenev, Punit Singh
+Koura, Marie-Anne Lachaux, Thibaut Lavril, Jenya Lee, Diana Liskovich, Yinghai Lu, Yuning Mao, Xavier
+Martinet, Todor Mihaylov, Pushkar Mishra, Igor Molybog, Yixin Nie, Andrew Poulton, Jeremy Reizenstein,
+Rashi Rungta, Kalyan Saladi, Alan Schelten, Ruan Silva, Eric Michael Smith, Ranjan Subramanian,
+Xiaoqing Ellen Tan, Binh Tang, Ross Taylor, Adina Williams, Jian Xiang Kuan, Puxin Xu, Zheng Yan,
+Iliyan Zarov, Yuchen Zhang, Angela Fan, Melanie Kambadur, Sharan Narang, Aurelien Rodriguez, Robert
+Stojnic, Sergey Edunov, and Thomas Scialom. Llama 2: Open foundation and fine-tuned chat models,
+2023.
+[44] Tim Vieira. Gumbel-max trick and weighted reservoir sampling, 2014.
+[45]Thomas Wolf, Lysandre Debut, Victor Sanh, Julien Chaumond, Clement Delangue, Anthony Moi, Pierric
+Cistac, Tim Rault, R´ emi Louf, Morgan Funtowicz, et al. Huggingface’s transformers: State-of-the-art
+natural language processing. arXiv preprint arXiv:1910.03771 , 2019.
+[46]Mengzhou Xia, Tianyu Gao, Zhiyuan Zeng, and Danqi Chen. Sheared llama: Accelerating language model
+pre-training via structured pruning. arXiv preprint arXiv:2310.06694 , 2023.
+[47]Daliang Xu, Wangsong Yin, Xin Jin, Ying Zhang, Shiyun Wei, Mengwei Xu, and Xuanzhe Liu. Llmcad:
+Fast and scalable on-device large language model inference. arXiv preprint arXiv:2309.04255 , 2023.
+15
+
+--- PAGE 16 ---
+[48]Lu Yin, You Wu, Zhenyu Zhang, Cheng-Yu Hsieh, Yaqing Wang, Yiling Jia, Mykola Pechenizkiy, Yi Liang,
+Zhangyang Wang, and Shiwei Liu. Outlier weighed layerwise sparsity (owl): A missing secret sauce for
+pruning llms to high sparsity. arXiv preprint arXiv:2310.05175 , 2023.
+[49]Gyeong-In Yu and Joo Seong Jeong. Orca: A distributed serving system for transformer-based generative
+models. In USENIX Symposium on Operating Systems Design and Implementation , 2022. URL https:
+//api.semanticscholar.org/CorpusID:251734964 .
+[50]Jun Zhang, Jue Wang, Huan Li, Lidan Shou, Ke Chen, Gang Chen, and Sharad Mehrotra. Draft & verify:
+Lossless large language model acceleration via self-speculative decoding. CoRR , abs/2309.08168, 2023.
+doi: 10.48550/ARXIV.2309.08168. URL https://doi.org/10.48550/arXiv.2309.08168 .
+[51]Ritchie Zhao, Yuwei Hu, Jordan Dotzel, Chris De Sa, and Zhiru Zhang. Improving neural network
+quantization without retraining using outlier channel splitting. In International conference on machine
+learning , pages 7543–7552. PMLR, 2019.
+[52]Yongchao Zhou, Kaifeng Lyu, Ankit Singh Rawat, Aditya Krishna Menon, Afshin Rostamizadeh, Sanjiv
+Kumar, Jean-Fran¸ cois Kagy, and Rishabh Agarwal. Distillspec: Improving speculative decoding via
+knowledge distillation. arXiv preprint arXiv:2310.08461 , 2023.
+Acknowledgments
+We thank Xinyu Yang, Harry Dong, Ranajoy Sadhukhan, Hanshi Sun and Silong Yong for their helpful
+discussions and feedback on early drafts of the paper, as well as helping reproduce the empirical results.
+16
+
+--- PAGE 17 ---
+A Related Work
+This work introduces a new algorithm in the family of speculative decoding methods that aims to maintain the
+exact output distribution of the target model by improving the structure and sampling/verification algorithm
+for the speculated token tree. There exist many other directions within this line of work—for example,
+methods which introduce leniency into the speculative decoding algorithm to attain increased speed at the
+cost of accuracy [ 23,38], methods that reuse layers or representations from the target model as the draft
+model [ 4,50], etc. Alternatively, the draft model can be distilled to better approximate the target model;
+DistillSpec [ 18,41,42,52] improves that process by using model-generated data and adjusting the objective
+depending on the task and the decoding strategy. Finally, LLMCad [ 47] proposes an advanced algorithm for
+token tree generation and verification in the context of on-device LLM inference.
+In addition to speculative decoding, there exist many other methods aimed at improving the speed of
+LLM inference. For example, model quantization is another very promising way of dealing with the I/O
+bottleneck during inference, by reducing the number of bits per parameter. However, unlike speculative
+decoding, these methods generally deteriorate the quality of the model to some degree, depending on the amount
+of quantization [10, 12, 17, 21, 26, 30, 51] or sparsity [19, 27, 29].
+Meanwhile, various works [ 1,11,39,48] have studied ways to improve LLM serving throughput. Pope
+et al. [33]investigated the batching effect in scaling up LLM. Orca [ 49] proposed a distributed LLM serving
+system that uses a finegrained scheduling policy to improve GPU utilization under various request lengths.
+vLLM [ 24] used page tables to manage GPU memory to increase memory utilization, which significantly boosts
+inference throughput. FlexGen [ 37] proposed an offloading mechanism to support larger batches to achieve
+high throughput.
+FlashAttention [ 8,9] is another algorithm that aims to improve the speed of LLMs (at both training and
+inference time) by considering the I/O cost of different operations.
+Another promising approaching to speeding up inference is to change the fundamental building blocks of
+the model. Recently, numerous sub-quadratic architectures—including SSMs [ 14,15] and linear attention
+models [22]—have been proposed. These models are particularly beneficial for long inputs.
+B Background
+B.1 Sequence-based speculative decoding
+The original speculative decoding method [ 5,25] proposes using a small “draft model” to speculate γtokens
+into the future, and then using the “target model” to in parallel process these tokens and decide which of the
+tokens to “accept”, in such a way that the output distribution of the target model is unchanged. This algorithm
+is presented in Algorithm 2.
+Leviathan et al. [25]analyze the performance of this algorithm, presenting equations for the expected
+number of accepted tokens from one run of the algorithm, and the expected wall-clock speed up from using
+speculative decoding (relative to standard autoregressive inference with the target model). In this analysis,
+they introduce the acceptance rate α∈[0,1], corresponding to the probability that a token xiis accepted by
+Algorithm 2, under the simplifying assumption that the acceptance decisions are i.i.d.4Under this assumption,
+they show that the expected number of generated tokens in each run of Algorithm 2 is1−αγ+1
+1−α. Additionally,
+letting cdenote the ratio between the time to run the draft model and the time to run the target model, they
+show that the expected wall-clock speed-up from using this algorithm is1−αγ+1
+(1−α)(γc+1).
+B.2 SpecInfer
+Here we present the pseudocode for the SpecInfer algorithm in Algorithm 3.
+4One can think of αas the average acceptance rate over many runs of this algorithm on a representative dataset.
+17
+
+--- PAGE 18 ---
+Algorithm 2 Sequence-based Speculative Decoding
+1:Input: Prefix [ x1,x2,...,x n−1], Target model Mp, draft model Mq, and number of tokens γto speculate.
+2:Output: A sequence of tokens generated using speculative decoding.
+3:fori=n→n+γ- 1do ▷Sample sequence of γtokens from draft model
+4:qi(x)←Mq([x1,...,x i−1])
+5:xi∼qi(x)
+6:end for
+7:fori=n→n+γdo ▷For loop below can be run in parallel with a single forward pass of Mp
+8:pi(x)←Mq([x1,...,x i−1])
+9:end for
+10:s←n−1 ▷Choose how many tokens nto accept
+11:fori=n→n+γ- 1do
+12: ri∼Uniform(0 ,1)
+13: ifri<pi(xi)
+qi(xi)then
+14: s←s+1
+15: else
+16: break
+17: end if
+18:end for
+19:p′(x)←ps+1(x)
+20:ift<n+γ−1then
+21: p′(x)←norm(max(0 ,ps+1(x)−qs+1(x)))
+22:end if
+23:t∼p′(x) ▷Sample a final token from p′(x)
+24:Return x1,...,x s,t
+Algorithm 3 SpecInfer Sampling and Verification
+1:Input: Prefix [ x1,x2,...,x n−1], target model probabilities P(·|x<n), draft model probabilities Q(·|x<n),
+and number of branches k.
+2:Output: A token xsampled using SpecInfer.
+3:Initialize residual RwithPand draft DwithQ
+4:fori=1→kdo
+5: sample xi∼D,ri∼Uniform(0 ,1)
+6:ifri<R[xi]
+D[xi]then ▷Accept xi
+7: Return xi
+8:else ▷Reject xi
+9: R←norm(max( R−D,0))
+10: end if
+11:end for
+12:sample x∼R
+13:Return x
+C Theoretical results
+C.1 Correctness of Sequoia verification algorithm
+We prove now that the Sequoia verification algorithm maintains the output distribution of the target model.
+We assume we have a target model t, and a list of draft models ( d1,...dn,dn+1,...), where diin this case depends
+on the previously rejected samples x1,...,x i−1, and where di(u) and t(u) denote the probabilities of sampling
+token u∈Vfrom diortrespectively (where Vis the token vocabulary). We let tidenote the residual at iteration
+iofSequoia loop, (after i−1 nodes have been rejected (so t1=t, as can be seen in Algorithm 1)
+We will prove by induction on the number of proposed tokens nthat the Sequoia verification algorithm is
+correct.
+18
+
+--- PAGE 19 ---
+Base case ( n=0):Sequoia is trivially correct, as it will simply sample from the residual t1, which is equal to t.
+Recursive case : We assume Sequoia is correct for n−1 proposed samples and prove it is correct for n
+proposed samples.
+We first show that at stage iin the speculative decoding algorithm, the chance of Sequoia choosing to
+reject the proposed sample is equal toP
+xmax
+0,ti(x)−di(x)
+:
+Lemma C.1. P(No token accepted at iteration i) =P
+xmax
+0,ti(x)−di(x)
+.
+Proof.
+P(No token accepted at iteration i)=X
+xP(sample x)·P(reject x|xis sampled)
+=X
+xdi(x)·
+1−minti(x)
+di(x),1
+=X
+xdi(x)−X
+xmin
+ti(x),di(x)
+=X
+xti(x)−X
+xmin
+ti(x),di(x)
+=X
+xti(x)+max
+−ti(x),−di(x)
+=X
+xti(x)−ti(x)+max
+0,ti(x)−di(x)
+=X
+xmax
+0,ti(x)−di(x)
+We are now ready to prove the recursive case of the Sequoia algorithm. By the inductive hypothesis, we
+know that for all u∈V,
+t(u)=P(uaccepted in first n−1 iterations)+ P(No token accepted in first n−1 iterations) ·tn(u)
+What this means is that in the case where we run Sequoia forn−1 iterations (and if no token is accepted we
+sample from the residual tn), this is equivalent to sampling from the target distribution tdirectly. We would like
+to show that this output distribution is equivalent to the one we would get if we run Sequoia forniterations
+(and if no token is accepted we sample from the residual tn+1). The output distribution of this scenario can be
+written as follows:
+P(uaccepted in first n−1 iterations)+ P(No token accepted in first n−1 iterations) ·
+dn(u)·P(uaccepted at iteration n)+P(No token accepted in iteration n)·tn+1(u)
+Thus, all we must show is that
+tn(u)=dn(u)·P(uaccepted at iteration n)+P(No token accepted in iteration n)·tn+1(u)
+We now show this desired result. We will use Lemma C.1, and the fact that by definition of Algorithm B.2, we
+know that tn+1(u)=max 
+0,tn(u)−dn(u)
+P
+xmax 
+0,tn(x)−dn(x).
+19
+
+--- PAGE 20 ---
+dn(u)·P(uaccepted at iteration n)+P(No token accepted in iteration n)·tn+1(u)
+=dn(u)·min
+1,tn(u)
+dn(u)
++ X
+xmax
+0,tn(x)−dn(x)!
+tn+1(u)
+=min
+dn(u),tn(u)
++ X
+xmax
+0,tn(x)−dn(x)!
+· 
+max 
+0,tn(u)−dn(u)
+P
+xmax 
+0,tn(x)−dn(x)!
+=min
+dn(u),tn(u)
++max
+0,tn(u)−dn(u)
+=tn(u)
+To see that this last equality holds, we consider two cases:
+1. Case 1
+tn(u)≥dn(u)
+: min( dn(u),tn(u))+max(0 ,tn(u)−dn(u))=dn(u)+tn(u)−dn(u)=tn(u).
+2. Case 1
+tn(u)<dn(u)
+: min( dn(u),tn(u))+max(0 ,tn(u)−dn(u))=tn(u)+0= tn(u).
+This completes the proof.
+C.2 Sequoia tree construction details
+We now prove Proposition 3.4 by deriving the closed-form expression for F(T) (the expected number of tokens
+generated by verifying tree T), and show how to use dynamic programming to find the optimal tree Tunder a
+tree budget size.
+Proposition C.2. LetTbe a token tree that is verified with the positional acceptance assumption, and let f(v)
+denote the score function for a node v∈T. Then the the expected number of tokens F(T)generated by verifying
+Tis equal to
+F(T)=X
+v∈Tf(v).
+Proof. LetD(T) denote the expected number of tokens generated by verifying tree T. We would like to prove
+thatD(T)=F(T)∀T. We will prove this by induction on the size of T.
+Base case ( n=1):A tree of size 1 is composed solely of the root node. By definition of the score function
+f(v) (Definition 3.3), we know that f(v)=1 for the root node, so F(T)=1. D(T)=1 also, because verifying a
+tree composed of a root node with no children will simply sample from the target model, and generate 1 token.
+Inductive step ( n >1):For|T |=n >1, let vbe a leaf of Tat child index ivof depth dwith parent vp
+and sibling Sv(set of sibling indices). We can then consider the tree T′=T −{ v}. Based on the inductive
+assumption, we know that g(T′)=D(T′). Using this assumption, we can express D(T) in terms of D(T′):
+D(T)=D(T′)−(d−1)·f(vp)·
+1−X
+i∈Svpi
++(d−1)·f(vp)·
+1−X
+i∈Sv∪{iv}pi
++d·f(v)
+=D(T′)−(d−1)f(vp)piv+d·f(v)
+=X
+v′∈T′f(v′)−(d−1)f(v)+d·f(v)
+=F(T′)+f(v)
+=F(T)
+Note that we use the inductive hypothesis, along with the fact the f(vp)·piv=f(v) (by definition of f(v)).
+20
+
+--- PAGE 21 ---
+C.2.1 Dynamic Programming (Unbounded Tree Depth)
+We will now describe our dynamic programming solution to find the tree Tof size nwith the highest value of
+F(T). Recall that we defined
+c(n)= max
+T,|T |=nF(T),
+and that we showed that we can express c(n) in terms of c(n′) values for n′<n:
+c(n)= max
+ai,Pn−1
+i=1ai=n−11+n−1X
+i=1pic(ai).
+Using this recursive sub-structure, we show that c(n) can be calculated by dynamic programming. To make
+problem simple, we suppose that the number of candidates (i.e. the successor set of any vertices) has an upper
+bound k. Then consider the branch in the first layer, we can get
+c(n+1)=max 1+ p1c(a1)+p2c(a2)+...+pkc(ak)s.t.kX
+i=1ai=n,I(ai>0)≥I(ai+1>0)i∈[k−1]
+We assume that p1≥p2≥...≥pk(this is reasonable due to the mechanism of Sequoia and SpecInfer). Then
+we can cancel the last constraints, and the function we are optimizing becomes:
+c(n+1)=max 1+ p1c(a1)+p2c(a2)+...+pkc(ak)s.t.kX
+i=1ai=n
+Based on the assumption that p1≥p2≥...≥pk, we can reach that in optimal solution a1≥a2...≥ak.
+To simplify the optimization objective, we define a new variable for n≥L≥1
+cL(n+1)=max 1+ p1c(a1)+p2c(a2)+...+pkc(ak)s.t.
+kX
+i=1ai=n,a1,a2,...,a L>0,aL+1=aL+2=...=ak=0
+andc0(1)=1. Then apparently,
+c(n)= max
+L∈[n−1]cL(n)
+Then we consider the transfer function,
+cL+1(n)=max 1+ p1c(a1)+p2c(a2)+...+pkc(ak)
+=max 1+ p1c(a1)+p2c(a2)+...+pL+1c(aL+1)
+= max
+x∈{L+1,L+2,...,n−1}cL(x)+pL+1c(n−x)
+c1(n)=1+ p1c(n−1)
+The computing order is visualized in Figure 6.
+1 2 4 7 11 16 22
+3 5 8 12 17 23
+6 9 13 18 24
+10 14 19 25
+15 20 26
+21 27
+28M
+L
+Figure 6: Computing Order
+The complexity can be estimated byX
+1≤l≤kX
+l+1≤m≤n(m−l)=X
+1≤l≤k(n−l+1)(n−l)
+2=O(n2k)
+21
+
+--- PAGE 22 ---
+C.2.2 Dynamic Programming (Bounded Tree Depth)
+We rewrite the dynamic programming below with depth limitation,
+maxF(T) s.t. |T |≤ M,Depth( T)≤L
+To make the problem simplified, we add an extra constraint on the number of branches of the root node
+FirstBranch( T)=B. Actually, we solve the following problem
+T(M,L,B )≡maxF(T) s.t. |T |=M,Depth( T)≤L,FirstBranch( T)=B
+First, we should notice that, not all M,L,B can lead to a feasible solution, let alone an optimal solution. We
+useR(M,L,B )=1 or 0 to denote that, whether there exists at least one tree T, satisfies
+|T |=M
+Depth( T)≤L
+FirstBranch( T)=B
+Suppose MaxBranch (T)=K, for any T, then we can directly write the feasible ( M,L,B ) forL≤2, that is
+(1,1,0),(2,2,1),(3,2,2)...,(K+1,2,K).
+IfR(M,L,B ) = 1 and Tsatisfies the constraints brought by ( M,L,B ), then it must have B≤K. We can
+divide it to three cases.
+Case 1: B=0.In this case, we directly have
+R(M,L, 0)=(
+1, M =1
+0, M > 1.
+Case 2: B=1.This suggests that if we delete the root node of T, the remaining part is still a valid tree which
+satisfies one of the following constraints, ( M−1,L−1,0),(M−1,L−1,1),...,(M−1,L−1,K). On the other hand,
+if there exists a tree satisfies ( M−1,L−1,j),0≤j≤K, we can immediately construct a tree satisfies ( M,L, 1) by
+adding a root node. Then we have
+R(M,L, 1)= max
+0≤j≤KR(M−1,L−1,j)
+Case 3: B≥2.Let’s consider the last branch of the first layer and the remaining part. Apparently, both of them
+are valid tree. The last branch of the first layer, T1satisfies one of ( |T1|,L−1,0),(|T1|,L−1,1),...,(|T1|,L−1,K).
+The remaining part T2satisfies ( |T2|,L,B−1). On the other hand, if we find R(x,L−1,j)=1 and R(y,L,B−1)=1,
+where x+y=M, we can immediately construct a tree satisfies ( M,L,B ) by letting the first tree be the B-th
+branch of the second tree. Then we have
+R(M,L,B )= max
+1≤y≤M−1(R(y,L,B−1)×max
+0≤j≤KR(M−y,L−1,j))
+Besides this, there is another initial condition, based on which we can do dynamic programming to solve F.
+R(M,1,B)=(
+1, M =1,B=0
+0,otherwise .
+The algorithm to solve Fis in Algorithm 4.
+Similarly, we can calculate Tin Algorithm 5. For ( m,l,b ) which satisfies R(m,l,b )=0, we keep T(m,l,b )=−∞.
+C.3 Scalability results for Sequoia trees
+We now prove that, under certain assumptions on the acceptance rates of the tree verification algorithm, the
+expected number of tokens generated by verifying the Sequoia tree is lower bounded by a function which
+is roughly logarithmic in the size of the tree. We will do this by showing that a simpler tree—the k∗(n) tree
+(defined below)—also has this lower bound, and using the fact that the Sequoia tree is by construction the tree
+with the largest expected number of generated tokens.
+We define the k∗(n) tree to be the k-ary tree5with≤nnodes that has the highest expected accepted sequence
+length. Letting G(n) denote the expected accepted sequence length for the k∗(n) tree, we will now prove
+thatG(n)∈Ω 
+blog(n)/log(log(n)
+(meaning, it is lower-bounded by a scalar multiple of blog(n)/log(log(n))),
+under the assumption that the rejection rate rkis upper-bounded by a power-law of k. It then follows
+directly (as a corollary) that the growth rate of the tree generated by the Sequoia algorithm will also be in
+Ω 
+blog(n)/log(log( n)
+.
+5Recall that a k-ary tree is one where every non-leaf node has kchildren.
+22
+
+--- PAGE 23 ---
+Algorithm 4 Rcalculation
+1:Input: Mfor the maximum tree node, Lfor the maximum depth and Kfor the maximum number of
+branches of any node.
+2:Output: R(m,l,b )∀1≤m≤M,1≤l≤L,0≤b≤K.
+3:Initial array F[M][L][K] with 0
+4:# Initial the boundaries
+5:forl=1→Ldo
+6:forb=0→Kdo
+7: F[1][l][b]=¬b
+8:end for
+9:end for
+10:form=2→Mdo
+11: forl=2→Ldo
+12: F[m][l][1]=max 0≤j≤KF[m−1][l−1][j]
+13: forb=2→Kdo
+14: F[m][l][b]=max 1≤y≤m−1(F[y][l][b−1]×max 0≤j≤KF[m−y][l−1][j]))
+15: end for
+16: end for
+17:end for
+Algorithm 5 Tcalculation
+1:Input: Mfor the maximum tree node, Lfor the maximum depth and Kfor the maximum number of
+branches of any node. p[1],p[2],...p[K] for the probability of each branch.
+2:Output: T(m,l,b )∀1≤m≤M,1≤l≤L,0≤b≤K.
+3:Initial array T[M][L][K]=−∞
+4:# Initial the boundaries
+5:forl=1→Ldo
+6:forb=0→Kdo
+7: T[1][l][b]=¬b
+8:end for
+9:end for
+10:form=2→Mdo
+11: forl=2→Ldo
+12: T[m][l][1]=1+ p[1]×max 0≤j≤KT[m−1][l−1][j]
+13: forb=2→Kdo
+14: T[m][l][b]=max 1≤y≤m−1(T[y][l][b−1]+p[b]×max 0≤j≤KT[m−y][l−1][j]))
+15: end for
+16: end for
+17:end for
+18:Return array T
+Theorem C.3. Assume the chance rkof a token tree verification algorithm rejecting all kspeculated tokens ( k
+child nodes of some node in the tree) is upper bounded by a power-law of k; sork≤1/kbfor some b>0∈R. Then
+the growth rate G(n)for the k∗(n)tree is in Ω 
+blog(n)/log(log( n)
+.
+Proof. We will let k(n) =⌊log(n)1/b⌋denote the branch-width chosen for tree size n, and show that under
+this assumption, the growth rate G′(n) of the corresponding k(n)-tree is at leastblog(n)
+10log(log( n), assuming that n
+is large enough. Given that G′(n) is a lower bound on G(n) (because the above choice of k(n) might not be
+fully optimal), and using the definition of Ω, this proves that G(n)∈Ω 
+blog(n)/log(log(n)
+. Note that we will
+abbreviate k(n) askin many places throughout the proof, for brevity.
+If we let ddenote the depth of the tree, the number of nodes in the tree is 1+ k+k2+...+kd=kd+1−1
+k−1≤n.
+23
+
+--- PAGE 24 ---
+This implies d≤logk(n), which we can prove as follows:
+kd+1−1≤n(k−1)
+⇒kd+1≤nk−n+1≤nk
+⇒d+1≤logk(nk)=logk(n)+1
+⇒d≤logk(n)
+We can assume dis the largest integer such that d≤logk(n), so it also follows that d+1≥logk(n).
+Letting αk:= 1−rk, the expected length G′(n) of the accepted token sequence can be expressed as
+1·(1−αk)+2αk·(1−αk)+3α2
+k(1−αk)+...+(d+1)αd
+k= 1+ αk+α2
+k+...+αd
+k=1−αd+1
+k
+1−αk(the first equality is a
+result of telescoping sums, the second is from the sum of a finite geometric series). We will now lower bound
+this expression, making use of Lemma C.5 (defined and proven below).
+G(n)≥G′(n)=1−αd+1
+k
+1−αk
+=1−(1−rk)d+1
+rk
+≥d+1
+10applying Lemma C.5, and assuming rk·(d+1)≤log(1.9)
+≥logk(n)
+10
+=log(n)
+10log( k)
+≤log(n)
+10log(log( n)1/b)
+=blog(n)
+10log(log( n))
+Now we simply need to understand when rk·(d+1)≤log(1.9):
+rk·(d+1)≤1
+kb
+logk(n)+1
+≤2logk(n)
+(log(n)1/b−1)busing k(n)=⌊log(n)1/b⌋≥log(n)1/b−1
+≤2logk(n)
+(1
+2log(n)1/b)bassuming log( n)1/b≥2⇔n≥exp(2b)
+=2b+1log(n)
+log(k)log(n)
+=2b+1
+log(k)
+So if2b+1
+log(k)≤log(1.9), then it follows that rk·(d+1)≤log(1.9).
+2b+1
+log(k)≤log(1.9)⇔2b+1
+log(1.9)≤log(k)⇔exp2b+1
+log(1.9)
+≤k
+Given that k(n) =⌊log(n)1/b⌋≥log(n)1/b−1, we know that if log(n)1/b−1≥exp
+2b+1
+log(1.9)
+, then it must
+hold that k(n)≥exp
+2b+1
+log(1.9)
+as well. We can see that this holds if:
+log(n)1/b−1≥exp2b+1
+log(1.9)
+⇔n≥exp  
+1+exp2b+1
+log(1.9)!b!
+24
+
+--- PAGE 25 ---
+Thus, we have shown that as long as nis greater than the above expression, then G′(n)≥blog(n)
+10log(log( n). Because
+we know that G(n)≥G′(n), this concludes the proof that G(n) is in Ω 
+blog(n)/log(log( n)
+.
+We now prove, as a corollary of Theorem C.3, that the growth rate of the Sequoia tree is also in
+Ω 
+blog(n)/log(log( n)
+.
+Corollary C.4. Under the same assumptions on the rejection rates as Theorem C.3, it holds that the growth
+rate for the Sequoia tree is in Ω 
+blog(n)/log(log( n)
+.
+Proof. By construction, for every tree size n, theSequoia tree is the tree that has the largest expected number
+of generated tokens. Thus, for every value of nthe expected number of generated tokens for the Sequoia tree
+must be larger than that of the k∗(n) tree, which was shown in Theorem C.3 to be in Ω 
+blog(n)/log(log(n)
+.
+This concludes the proof.
+We now prove the lemma that we used to prove Theorem C.3:
+Lemma C.5. For any real number x∈(0,1], and integer m > 0such that mx≤log(1.9), it holds that
+1−(1−x)m
+x≥m
+10.
+Proof.
+1−(1−x)m
+x=1−
+1−mx+ m
+2
+x2− m
+3
+x3+ m
+4
+x4−...+(−1)mxm
+x
+=mx− m
+2
+x2+ m
+3
+x3− m
+4
+x4+...−(−1)mxm
+x
+=m−m
+2
+x+m
+3
+x2−m
+4
+x3+...−(−1)mxm−1
+≥m−m
+2
+x−m
+3
+x2−m
+4
+x3−...−xm−1
+≥m−m2
+2!x−m3
+3!x2−m4
+4!x3−...
+=m
+1−mx
+2!−(mx)2
+3!−(mx)3
+4!−(mx)4
+5!−(mx)5
+6!−...
+=m
+2−1−mx
+2!−(mx)2
+3!−(mx)3
+4!−(mx)4
+5!−(mx)5
+6!−...
+=m
+2−
+1+mx
+2!+(mx)2
+3!+(mx)3
+4!+(mx)4
+5!+(mx)5
+6!−...
+≥m
+2−
+1+mx+(mx)2
+2!+(mx)3
+3!+(mx)4
+4!+(mx)5
+5!+...
+=m 
+2−emx
+≥m
+10Assuming emx≤1.9, which is true by our initial assumption.
+C.4 Robustness results for Sequoia verification
+We now prove the robustness results for the Sequoia verification algorithm.
+Theorem C.6. TheSequoia verification algorithm satisfies both the optimal transport and the cover properties,
+while SpecInfer and SpecTr only satisfy the optimal transport property, and (top- k) naive sampling only satisfies
+the cover property.
+Proof. This proof is quite straightforward:
+25
+
+--- PAGE 26 ---
+•Sequoia satisfies the optimal transport property : It is clear that Sequoia satisfies the optimal
+transport property, because at k=1, it is identical to the original speculative decoding algorithm [25].
+•Sequoia satisfies the cover property : To see why Sequoia satisfies the cover property, we will use
+the following two facts:
+–If the support of Qis of size kandktokens are speculated by the draft model, the set of speculated
+tokens will always exactly equal the ktokens in the support of Q(because Sequoia does sampling
+without replacement from the draft model).
+–During the verification for-loop in Algorithm 1, the support of the residual will always be contained in
+the support of Pintersected with the set of tokens that have not yet been rejected. This is because the
+support of the residual can never grow (because pi(x)=0⇒pi+1(x)=norm (max(pi−qi,0))(x)=0,
+where piandqidenote the residual and draft probabilities at iteration i, respectively), and because
+if a token xis rejected it will “exit” the residual (because xis rejected implies qi(x)>pi(x) which
+implies that pi+1(x)=norm (max(pi−qi,0))(x)=0).
+Combining these two facts, we can see that if the first k−1 tokens were rejected, then the kthtoken must
+be accepted, because the residual must be a one-hot vector with probability 1 at the only remaining
+token, and the (updated) draft probabilities will also be this same one-hot vector (and thus, accepted
+with probability 1). Additionally, we can see that if Vtokens are sampled (where Vis the vocab size),
+these must exactly equal the Vtokens in the vocabulary, and thus one of those tokens must be accepted.
+In the case where the support of Qis equal to the full vocabulary, this result follows directly from the
+discussion above. In the case where the support of Qdoes not equal the full vocabulary, this is a result
+of the fact that once all tokens in the support of Qhave been sampled and rejected, we begin sampling
+(without replacement) from the uniform distribution over all non-rejected tokens.
+•SpecInfer satisfies the optimal transport property : For k=1, SpecInfer is identical to the original
+speculative decoding algorithm [25].
+•SpecInfer does not satisfy the cover property : It is easy to see that SpecInfer does not satisfy the
+cover property, with the following counter-example. Let Q=[0.5,0.5] and P=[1.0,0]. We can see that the
+support of Qis of size 2 and contains the support of P. But with probability 25%, SpecInfer will sample
+the second token twice in a row, and will reject both of them.
+•SpecTr satisfies the optimal transport property : For k= 1, SpecTr is identical to the original
+speculative decoding algorithm [25], because γ=1 by definition.
+•SpecTr does not satisfies the cover property : We can show that SpecTr (in particular, the
+‘k-sequential selection’ algorithm from [ 40]) does not satisfy the cover property, with the following counter-
+example. Let P= [1,0] and Q= [0.5,0.5]. Then βp,q(γ) =P1
+x=0min(Q(x),P(x)/γ) =min(0.5,1/γ) +
+min(0.5,0/γ) = 0 .5 (because γ∈[1,2] by assumption). We know the acceptance rate of SpecTr is
+1−(1−βp,q(γ))2=1−(1−0.5)2=0.75̸=1. Thus, SpecTr does not satisfy the cover property.
+•Top- knaive sampling does not satisfy the optimal transport property : Letting Q=[0.6,0.4]
+andP= [0.6,0.4], we can see that top- knaive sampling will accept with probability 0.6, whereas
+1−∥P−Q∥/2=1.0.
+•Top- knaive sampling satisfies the cover property : It’s easy to see that if the support of Qis of size
+kand contains the support of P, then top- knaive sampling will always accept (because it will sample
+from the target model and accept if the sampled token is among the top- ktokens according to the draft
+model). Similarly, if k=V, it must accept as well (because the top- Vtokens must be the full vocabulary,
+and so any sample from the target model must accept).
+D Additional Experiments
+We provide additional end-to-end results comparing Sequoia to baselines, extending the results from Section 4.1.
+Here, we provide on-chip results on an L40 GPU, similar to the results in Table 4, but on different hardware.
+26
+
+--- PAGE 27 ---
+Table 7: On-chip results (L40) : The optimal tree configuration and speedup for different pairs of draft
+and target models, and different temperatures, for Sequoia vs. SpecInfer. We specify the average number of
+generated tokens per decoding step in parentheses, next to the speedup factor. Sequoia attains up to 3 .95×
+speedup on an L40.
+Target LLM Draft Model T DatasetTree Config.SpeedupSpecInfer SpecInfer
+(size, depth) 5×8 8×8
+Llama2-7B JF68M 0 C4 (64,10) 3.95×(4.68) 3.50×(3.98) 3.30×(4.10)
+Llama2-7B JF68M 0.6 C4 (64,7) 3.10×(3.63) 2.28×(2.89) 2.31×(3.08)
+Llama2-7B JF68M 0OpenWebText (64,7) 3.12×(3.58) 2.79×(3.16) 2.62×(3.24)
+Llama2-7B JF68M 0.6 OpenWebText (64,6) 2.68×(3.12) 2.08×(2.54) 1.99×(2.64)
+Llama2-7B JF68M 0 CNN Daily (64,7) 3.30×(3.79) 2.89×(3.28) 2.73×(3.40)
+Llama2-7B JF68M 0.6 CNN Daily (64,6) 2.81×(3.27) 2.09×(2.59) 1.99×(2.65)
+Llama2-13B JF68M 0 C4 (64,10) 3.15×(4.25) 2.76×(3.61) 2.68×(3.72)
+Llama2-13B JF68M 0.6 C4 (64,8) 2.62×(3.57) 2.06×(2.81) 2.03×(2.93)
+Llama2-13B JF68M 0OpenWebText (64,8) 2.64×(3.52) 2.34×(3.05) 2.26×(3.14)
+Llama2-13B JF68M 0.6 OpenWebText (64,6) 2.28×(3.07) 1.79×(2.44) 1.78×(2.57)
+Llama2-13B JF68M 0 CNN Daily (64,7) 2.78×(3.68) 2.47×(3.21) 2.40×(3.33)
+Llama2-13B JF68M 0.6 CNN Daily (64,7) 2.37×(3.22) 1.85×(2.51) 1.80×(2.60)
+Llama2-13B JF160M 0 C4 (64,9) 3.07×(5.04) 2.71×(4.34) 2.62×(4.43)
+Llama2-13B JF160M 0.6 C4 (64,7) 2.65×(4.18) 2.07×(3.43) 2.05×(3.56)
+Llama2-13B JF160M 0OpenWebText (64,7) 2.60×(4.05) 2.24×(3.57) 2.18×(3.67)
+Llama2-13B JF160M 0.6 OpenWebText (64,6) 2.30×(3.54) 1.82×(2.99) 1.73×(2.99)
+Llama2-13B JF160M 0 CNN Daily (64,7) 2.71×(4.21) 2.34×(3.72) 2.27×(3.83)
+Llama2-13B JF160M 0.6 CNN Daily (64,6) 2.36×(3.63) 1.82×(2.99) 1.72×(2.99)
+27
