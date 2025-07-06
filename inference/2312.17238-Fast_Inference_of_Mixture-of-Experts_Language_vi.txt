@@ -1,0 +1,165 @@
+# Suy luận Nhanh của Các Mô hình Ngôn ngữ Mixture-of-Experts với Offloading
+
+Artyom Eliseev  
+Moscow Institute of Physics and Technology  
+Yandex School of Data Analysis  
+lavawolfiee@gmail.com
+
+Denis Mazur  
+Moscow Institute of Physics and Technology  
+Yandex  
+Researchcore  
+denismazur8@gmail.com
+
+## Tóm tắt
+
+Với việc áp dụng rộng rãi các Mô hình Ngôn ngữ Lớn (LLMs), nhiều nhà thực hành deep learning đang tìm kiếm các chiến lược để chạy những mô hình này hiệu quả hơn. Một chiến lược như vậy là sử dụng Mixture-of-Experts (MoE) thưa thớt — một loại kiến trúc mô hình trong đó chỉ một phần của các lớp mô hình hoạt động cho bất kỳ đầu vào nào. Tính chất này cho phép các mô hình ngôn ngữ dựa trên MoE tạo token nhanh hơn các đối tác "dày đặc" của chúng, nhưng nó cũng tăng kích thước mô hình do có nhiều "chuyên gia". Thật không may, điều này khiến các mô hình ngôn ngữ MoE tiên tiến trở nên khó chạy mà không có GPU cao cấp. Trong công trình này, chúng tôi nghiên cứu vấn đề chạy các mô hình ngôn ngữ MoE lớn trên phần cứng tiêu dùng với bộ nhớ gia tốc hạn chế. Chúng tôi xây dựng dựa trên các thuật toán offloading tham số và đề xuất một chiến lược mới tăng tốc offloading bằng cách tận dụng các tính chất vốn có của MoE LLMs. Sử dụng chiến lược này, chúng tôi có thể chạy Mixtral-8x7B với lượng tử hóa hỗn hợp trên phần cứng desktop và các instance Google Colab miễn phí.
+
+## 1 Giới thiệu
+
+Nhiều tiến bộ gần đây trong xử lý ngôn ngữ tự nhiên dựa vào các mô hình ngôn ngữ lớn được huấn luyện trước, như GPT-3 và 4 Brown et al. (2020); OpenAI (2023), Palm & Gemini Chowdhery et al. (2022); Team et al. (2023) và nhiều mô hình khác. Tuy nhiên, tiến bộ khoa học nhanh chóng trong lĩnh vực này sẽ không thể thực hiện được nếu không có các LLM mã nguồn mở như LLaMA 1 và 2 (Touvron et al., 2023), Falcon (TII UAE, 2023), BLOOM (Scao et al., 2022), OPT (Zhang et al., 2022), hoặc NeoX/Pythia (Biderman et al., 2023). Lợi thế chính của các LLM mã nguồn mở là các nhà nghiên cứu có thể triển khai chúng tại địa phương và sửa đổi chúng theo những cách mà không thể thực hiện được với các API độc quyền.
+
+Mặc dù các tham số LLM có sẵn công khai, việc sử dụng những mô hình này vẫn khó khăn do kích thước khổng lồ của chúng. Các mô hình ngôn ngữ mã nguồn mở tiên tiến yêu cầu nhiều GPU cao cấp¹ ngay cả đối với các khối lượng công việc suy luận cơ bản. Để sử dụng những LLM này trên các thiết lập phần cứng giá cả phải chăng hơn, người ta phải nén các tham số mô hình (Dettmers et al., 2022; Frantar et al., 2022) hoặc offload các tham số sang một kho lưu trữ rẻ hơn, có thể là RAM hoặc SSD (Pudipeddi et al., 2020; Sheng et al., 2023).
+
+Một số công trình gần đây sửa đổi kiến trúc transformer bằng cách giới thiệu các khối Mixture-of-Experts thưa thớt (Jacobs et al., 1991; Shazeer et al., 2017). Các khối MoE chứa nhiều "chuyên gia" (lớp), cũng như một "hàm gating" chọn chuyên gia nào được sử dụng trên một đầu vào cho trước. Kết quả là, khối MoE sử dụng một phần nhỏ của tất cả "chuyên gia" cho bất kỳ forward pass đơn lẻ nào, cho phép huấn luyện hiệu quả hơn về mặt tính toán Fedus et al. (2021); Du et al. (2022). Đáng chú ý, MoE nằm trong số những LLM lớn nhất Fedus et al. (2021) và tốt nhất Mixtral AI team (2023) có sẵn. Trong khi các mô hình Mixture-of-Experts có thể hiệu quả hơn các đối tác dày đặc của chúng, nhiều kỹ thuật để suy luận LLM hiệu quả không được thiết kế với MoE trong tâm trí và hoạt động dưới mức tối ưu trên các mô hình ngôn ngữ lớn hiện đại sử dụng các lớp mixture-of-experts.
+
+¹Khi triển khai với độ chính xác 16-bit, Falcon-180B cần khoảng 360GB, trong khi LLaMA-2 70B yêu cầu 140GB bộ nhớ gia tốc kết hợp.
+
+Trong công trình này, chúng tôi phát triển có hệ thống các kỹ thuật để chạy các mô hình ngôn ngữ MoE lớn với bộ nhớ GPU hạn chế. Mục tiêu chính của chúng tôi là suy luận (tạo token) với Mixtral-8x7B-Instruct — một trợ lý chat dựa trên MoE — trên phần cứng cấp desktop nơi chỉ một phần chuyên gia vừa vào bộ nhớ gia tốc. Vì mục tiêu đó:
+
+• chúng tôi quan sát cách mô hình ngôn ngữ MoE truy cập các chuyên gia của nó giữa các token, và tìm thấy một số quy luật: i) một số chuyên gia được tái sử dụng giữa các token liền kề và ii) các trạng thái ẩn của mô hình ở các lớp đầu đã "biết" chuyên gia nào sẽ được sử dụng ở các lớp tiếp theo.
+
+• chúng tôi thiết kế một chiến lược offloading cụ thể cho MoE tận dụng những quy luật này: i) nó sử dụng cache LRU để giảm đáng kể giao tiếp GPU-RAM, dẫn đến tạo token nhanh hơn và ii) nó đoán trước những chuyên gia nào cần thiết để chồng chéo tốt hơn việc tải chuyên gia với tính toán.
+
+• chúng tôi xem xét kịch bản cụ thể của việc chạy Mixtral-8x7B-Instruct trên T4, RTX 3060 và RTX 3080 Mobile và phát triển một kết hợp thực tế của lượng tử hóa hỗn hợp và thuật toán offloading được đề xuất để chạy mô hình này một cách tương tác ở 2-3 token mỗi giây tùy thuộc vào phần cứng. Mã nguồn với triển khai của chúng tôi có sẵn trực tuyến²
+
+## 2 Kiến thức nền & Công trình liên quan
+
+### 2.1 Mixture-of-Experts
+
+Sự bùng nổ gần đây của các mô hình ngôn ngữ MoE xây dựng trên một ý tưởng tương đối cũ (Jacobs et al., 1991; Jordan & Jacobs, 1994) về việc huấn luyện các ensemble của các mô hình chuyên biệt ("chuyên gia") và một hàm gating để chọn chuyên gia phù hợp cho nhiệm vụ. Để đạt được sự chuyên biệt, Mixture-of-Experts học bằng cách đồng thời i) huấn luyện hàm gating để chọn các chuyên gia tốt nhất và ii) huấn luyện bản thân các chuyên gia trên các mẫu được gán cho họ bởi hàm gating. Kể từ đó, nhiều biến thể MoE khác nhau xuất hiện, bao gồm mixture của các mô hình SVM (Collobert et al., 2002), quá trình Dirichlet (Shahbaba & Neal, 2009) và các mạng nơ-ron khác nhau.
+
+Shazeer et al. (2017) xây dựng dựa trên ý tưởng này để huấn luyện một Mixture-of-Experts gated thưa thớt để phục vụ như một mô hình ngôn ngữ. Mô hình đầy đủ bao gồm một backbone mạng nơ-ron hồi quy và một module MoE với tối đa 131072 chuyên gia. Khi xử lý một token cho trước, một hàm gating tuyến tính chọn 4 chuyên gia phù hợp nhất dựa trên trạng thái ẩn mới nhất. Mô hình kết quả (bao gồm hàm gating và chuyên gia) được huấn luyện end-to-end để tối thiểu hóa cross-entropy, với một regularizer bổ sung để thúc đẩy việc sử dụng chuyên gia đều nhau. Shazeer et al. (2017) quan sát rằng mô hình MoE không chỉ cải thiện perplexity mà còn học được các chuyên biệt chuyên gia có thể diễn giải: một số chuyên gia sẽ "chuyên biệt" về giới từ, trong khi những chuyên gia khác học để biểu đạt một khái niệm cụ thể (ví dụ như tốc độ).
+
+Kể từ đó, một số hướng công trình khám phá Mixture-of-Experts với các mô hình ngôn ngữ dựa trên Transformer cho dịch máy Lepikhin et al. (2020), mô hình hóa ngôn ngữ có mặt nạ Fedus et al. (2021), LLM đa mục đích Du et al. (2022) và những ứng dụng khác. Hầu hết những mô hình này tuân theo kiến trúc Transformer truyền thống (dày đặc) cho các lớp embedding và attention, và chỉ sử dụng Mixture cho các khối feedforward (MLP) và sử dụng hàm gating tuyến tính ở mức token. Một quan sát chung trong hầu hết những công trình này là các mô hình MoE rẻ hơn để huấn luyện và suy luận Fedus et al. (2021); Lepikhin et al. (2020), nhưng yêu cầu nhiều tham số hơn một mô hình dày đặc với perplexity tương đương.
+
+Các LLM Mixture-of-Experts được huấn luyện trước đã có sẵn công khai trong hơn một năm³. Tuy nhiên, những mô hình này dường như ít thu hút sự chú ý hơn các mô hình dày đặc tương đương, có thể vì kích thước mô hình khổng lồ (hơn một nghìn tỷ tham số) khiến chúng khó sử dụng. Gần đây nhất, Mistral AI đã phát hành một họ các mô hình Mixture of Experts thưa thớt gọi là Mixtral-8x7B với hiệu suất gần như tiên tiến nhất Mixtral AI team (2023). Mô hình này đã truyền cảm hứng cho một số công trình tiếp theo và ứng dụng thực tế, nhưng nó vẫn yêu cầu một gia tốc GPU cao cấp.
+
+### 2.2 Lượng tử hóa sau huấn luyện của LLMs
+
+Một cách tự nhiên để vượt qua điều này là giảm kích thước mô hình thông qua lượng tử hóa (Nagel et al., 2020; Gholami et al., 2021; Frantar et al., 2022), thưa thớt hóa Frantar & Alistarh (2023a); Ma et al. (2023),
+
+²https://github.com/dvmazur/mixtral-offloading  
+³https://huggingface.co/google/switch-c-2048, phát hành vào ngày 15 tháng 11 năm 2022
+
+phân rã Hsu et al. (2022), hoặc một sự kết hợp của những phương pháp này. Những loại nén này không cụ thể cho LLM và dựa trên các phương pháp cũ hơn nhiều ngoài phạm vi công việc của chúng tôi⁴. Tuy nhiên, các công trình gần đây phát hiện rằng có những thách thức độc đáo khi lượng tử hóa các mô hình ngôn ngữ dựa trên transformer rất lớn do các outlier xuất hiện Dettmers et al. (2022); Lin et al. (2023); Dettmers et al. (2023).
+
+Nói chung, tỷ lệ nén tối ưu cho hầu hết các LLM là 4 bit mỗi tham số Dettmers & Zettlemoyer (2022). Mặc dù có các thuật toán cực đoan hơn cho nén 3 và thậm chí 2-bit Chee et al. (2023); Lin et al. (2023); Dettmers et al. (2023), chúng thường kém hơn việc chọn một mô hình nhỏ hơn và lượng tử hóa nó khoảng 4 bit. Gần đây nhất, đã có một số công trình đồng thời để lượng tử hóa các mô hình Mixture-of-Experts (Kim et al., 2023; Frantar & Alistarh, 2023b).
+
+### 2.3 Suy luận với Parameter Offloading
+
+Một hướng công trình gần đây khám phá suy luận và huấn luyện các mô hình lớn với bộ nhớ gia tốc hạn chế bằng cách "offload" các tham số của chúng sang một bộ nhớ khác, rẻ hơn, như RAM hệ thống hoặc thậm chí SSD (Pudipeddi et al., 2020; Ren et al., 2021). Kỹ thuật này hoạt động bằng cách tải các tham số mô hình đúng lúc khi chúng cần thiết cho tính toán. Vì hầu hết các mô hình deep learning sử dụng các lớp theo một thứ tự cố định, offloading có thể pre-dispatch các tham số lớp tiếp theo ở nền, trước thời gian.
+
+Kỹ thuật này hoạt động đặc biệt tốt khi xử lý các batch dữ liệu lớn, trong quá trình huấn luyện Pudipeddi et al. (2020); Ren et al. (2021) hoặc suy luận batch lớn không tương tác Aminabadi et al. (2022); Sheng et al. (2023), nơi mỗi lớp xử lý rất nhiều token mỗi lần lớp được tải từ RAM. Ngược lại, khi thực hiện suy luận tương tác (ví dụ như trợ lý chat), offloading hoạt động chậm hơn đáng kể so với suy luận trên thiết bị. Điều này là do suy luận tương tác tạo token tự động hồi quy, từ trái sang phải. Theo cách này, hệ thống suy luận xử lý một hoặc một số ít token tại một thời điểm, và do đó dành phần lớn thời gian chờ đợi các tham số của lớp tiếp theo được tải.
+
+### 2.4 Thiết lập phần cứng
+
+Mặc dù phân tích của chúng tôi không cụ thể cho bất kỳ thiết lập phần cứng nào, chúng tôi nhắm mục tiêu các đặc tả phần cứng của các instance cloud rẻ / miễn phí Google (2023) và nửa trên của máy tính gaming Steam (2023): i) đủ bộ nhớ hệ thống để giữ các tham số mô hình, ii) một GPU với 11-16GB VRAM và iii) giao tiếp host-to-device ở 8-16GB/s (PCIe Gen.3). Nếu chúng ta kiểm tra các mô hình MoE mã nguồn mở phổ biến (Mixtral-8x7B và switch-c-2048), chúng ta thấy rằng tất cả non-expert có thể vừa một phần của bộ nhớ GPU có sẵn. Ngược lại, các chuyên gia tạo nên phần lớn tham số mô hình không vừa ngay cả với lượng tử hóa. Cuối cùng, ngay cả khi chúng ta có thể vừa các tham số mô hình trong bộ nhớ, chạy suy luận sinh ra yêu cầu bộ nhớ bổ sung cho các activation lớp và các key & value attention trong quá khứ.
+
+## 3 Phương pháp
+
+Trong công trình này, chúng tôi nhắm mục tiêu tìm một cách có hệ thống cách tối ưu để suy luận các LLM Mixture-of-Experts hiện đại trên desktop hoặc các instance cloud cấp thấp. Cụ thể hơn, chúng tôi tập trung vào nhiệm vụ tạo token tương tác, tức là tạo nhiều token mỗi giây ở batch size 1⁵.
+
+Khối lượng công việc suy luận sinh ra bao gồm hai giai đoạn: 1) mã hóa prompt đầu vào và 2) tạo token có điều kiện trên prompt đó. Sự khác biệt chính giữa hai giai đoạn này là các token prompt được mã hóa song song (từng lớp), trong khi việc tạo chạy tuần tự (từng token và từng lớp). Nói chung, giai đoạn 1 hoạt động tương đối tốt với các thuật toán Mixture-of-Experts hiện có, vì mỗi lớp chỉ có thể được tải một lần cho toàn bộ prompt. Ngược lại, khi tạo token, người ta phải tải lớp một lần cho mỗi token được tạo. Trong thực tế, điều này có nghĩa là tốc độ suy luận bị giới hạn bởi tốc độ tìm nạp tham số từ bộ nhớ hệ thống.
+
+Dưới đây, chúng tôi tìm kiếm các mẫu trong cách mô hình MoE tải các chuyên gia của nó và đề xuất các cách để khai thác những mẫu này để tăng tốc thời gian suy luận.
+
+⁴Để tìm hiểu thêm về những phương pháp này, vui lòng tham khảo các khảo sát như Gholami et al. (2021); Liang et al. (2021)  
+⁵Trái ngược với việc chạy xử lý một batch lớn các văn bản trong nhiều giây, như trong Sheng et al. (2023)
+
+### 3.1 Tính địa phương chuyên gia và LRU caching
+
+Như chúng tôi đã thảo luận trước đó trong Mục 2.1, các mô hình ngôn ngữ Mixture-of-Experts thường được quan sát là gán các chuyên gia riêng lẻ cho các nhiệm vụ con riêng biệt. Tuy nhiên, điều này không có nghĩa là mô hình sử dụng cùng một chuyên gia trong những chuỗi token dài. Thay vào đó, một số chuyên gia hoạt động trong các chuỗi ngắn 2-4 token, trong khi những chuyên gia khác thường được sử dụng với "khoảng trống", như được hiển thị trong Hình 1.
+
+Để tận dụng mẫu này, chúng ta có thể giữ các chuyên gia hoạt động trong bộ nhớ GPU như một "cache" cho các token tương lai. Nếu cùng những chuyên gia được kích hoạt lại trong tương lai, chúng sẽ có sẵn ngay lập tức. Tự nhiên, số lượng chuyên gia có thể được lưu trữ theo cách này rất hạn chế bởi bộ nhớ GPU có sẵn. Để đơn giản, chúng tôi chọn luôn giữ k chuyên gia ít được sử dụng gần đây nhất như một loại cache LRU. Nếu k lớn hơn số lượng chuyên gia hoạt động, cache sẽ lưu các chuyên gia từ nhiều token trước đó. Để đơn giản, chúng tôi giữ cùng một số lượng chuyên gia được cache cho mỗi lớp MoE.
+
+Chúng tôi minh họa một ví dụ về cách cache LRU lưu các chuyên gia trong Hình 1 (xem chú thích). LRU là một chiến lược rất đơn giản không xem xét các yếu tố như tần suất kích hoạt chuyên gia, kích thước cache khác nhau giữa các lớp MoE, hoặc bất kỳ mẫu tuần tự nào trong kích hoạt chuyên gia. Tuy nhiên, chúng tôi phát hiện rằng ngay cả chiến lược đơn giản này cũng có thể tăng tốc đáng kể suy luận cho các mô hình Mixture-of-Experts hiện đại như Mixtral-8x7B (xem Mục 4 để đánh giá chi tiết).
+
+### 3.2 Tải chuyên gia suy đoán
+
+Mặc dù LRU caching có thể giảm thời gian tải chuyên gia trung bình, phần lớn thời gian suy luận vẫn được dành để chờ đợi chuyên gia tiếp theo được tải. Lý do đằng sau điều này là, không giống như với các mô hình dày đặc, MoE offloading không thể chồng chéo hiệu quả việc tải chuyên gia với tính toán. Để hiểu vấn đề này, hãy zoom vào quá trình tạo một token duy nhất, từng lớp. Khối lượng công việc tính toán đầy đủ bắt đầu bằng việc embedding token trước đó thông qua look-up, sau đó xen kẽ giữa việc chạy self-attention và MLP cho mỗi khối transformer trong mô hình. Cuối cùng, các đầu ra từ khối transformer cuối cùng được sử dụng để dự đoán logit token tiếp theo với một phép chiếu tuyến tính.
+
+Đối với các mô hình thông thường (dày đặc), kiến trúc này cho phép lịch trình offloading hiệu quả mà pre-load lớp transformer tiếp theo trước thời gian, trong khi lớp trước đó vẫn đang chạy. Thật không may, lịch trình này không còn khả thi đối với các mô hình Mixture-of-Experts, nơi các lớp MLP MoE chọn chuyên gia nào để tải đúng lúc cho tính toán. Điều này là bởi vì hệ thống không thể pre-fetch lớp tiếp theo cho đến khi nó biết được chuyên gia nào nên được tải. Các mô hình ngôn ngữ MoE mã nguồn mở hiện đại chọn chuyên gia hoạt động bằng cách sử dụng các đầu ra cuối cùng của lớp trước đó, có nghĩa là chúng không thể pre-fetch chúng song song với lớp trước đó.
+
+Mặc dù không thể⁶ pre-fetch đáng tin cậy tập hợp chuyên gia tiếp theo trước thời gian, hệ thống vẫn có thể cố gắng đoán các chuyên gia tiếp theo có khả năng và tải chúng một cách suy đoán, trong khi xử lý lớp trước đó. Nếu đoán đúng, nó sẽ tăng tốc suy luận lớp tiếp theo; nếu không, nó có thể tải các chuyên gia thực tế của lớp tiếp theo sau đó. Nói cách khác, loại tải suy đoán này không thay đổi các dự đoán mô hình cuối cùng, nhưng có thể giảm độ trễ nếu đoán đủ chính xác.
+
+Trong khi phân tích các mô hình MoE hiện đại, chúng tôi phát hiện rằng có thể có được một đoán chính xác về các chuyên gia của lớp tiếp theo bằng cách áp dụng hàm gating của lớp tiếp theo vào các trạng thái ẩn của lớp trước đó — hoặc, cụ thể hơn, vào cùng những trạng thái ẩn được sử dụng bởi hàm gating của lớp MoE trước đó. Heuristic này dựa vào thực tế rằng các lớp transformer là residual, tức là mỗi lớp thêm vào các trạng thái ẩn trước đó thay vì tính toán lại chúng từ đầu. Kiến trúc này giới thiệu một inductive bias sao cho các trạng thái ẩn của bất kỳ lớp nào thành một ước tính tốt về các trạng thái ẩn của lớp tiếp theo.
+
+### 3.3 Thiết kế hệ thống & Chi tiết triển khai
+
+Trong mục này, chúng tôi mô tả các cân nhắc thiết kế thực tế và chi tiết triển khai mà chúng tôi đã sử dụng để suy luận các mô hình ngôn ngữ MoE trên phần cứng tiêu dùng và cloud cấp thấp. Thiết kế hệ thống của chúng tôi kết hợp các kỹ thuật caching & prefetching và một lược đồ lượng tử hóa MoE hỗn hợp.
+
+**Lượng tử hóa MoE.** Như chúng tôi đã mô tả trước đó trong Mục 2.2, có nhiều thuật toán lượng tử hóa trọng số được tối ưu hóa cho LLM. Nén mô hình có sự phối hợp tự nhiên với offloading vì các mô hình nén mất ít thời gian hơn để tải lên GPU. Trong các thí nghiệm của chúng tôi, chúng tôi cũng quan sát rằng các mô hình MoE có được trade-off chất lượng-kích thước tốt hơn khi lượng tử hóa chuyên gia xuống bitwidth thấp hơn, trong khi giữ tất cả các lớp non-expert ở 4-bit.
+
+Chúng tôi sử dụng Half Quadratic Quantization (HQQ) (Badri & Shaji, 2023) — một thuật toán lượng tử hóa không cần dữ liệu hỗ trợ nhiều tỷ lệ bit khác nhau. Tuy nhiên, chúng tôi chọn thuật toán này chỉ vì tiện lợi, vì nó đã được kiểm tra kỹ lưỡng cho các mô hình Mixtral. Vì phân tích của chúng tôi không dựa vào bất kỳ lựa chọn lượng tử hóa cụ thể nào, chúng tôi tin rằng nếu chúng tôi chọn một thuật toán lượng tử hóa khác (ví dụ GPTQ hoặc AWQ) kết luận của chúng tôi sẽ tương tự. Trong các thí nghiệm đầu của chúng tôi, chúng tôi cũng đã thử lượng tử hóa dưới 1-bit từ QMoE Frantar & Alistarh (2023b) hoạt động tốt trên mô hình Switch-c-2048. Tuy nhiên, chúng tôi phát hiện rằng nén dưới 1-bit gây ra sự mất mát quá đáng kể trong perplexity cho các mô hình Mixtral-8x7B.
+
+**Expert Offloading.** Như được mô tả trước đó, chúng tôi sử dụng cache LRU với số lượng k chuyên gia được cache bằng nhau mỗi lớp. Đối với Mixtral-8x7B, chúng tôi sử dụng k=2 cho GPU 12GB và k=4 cho GPU 16GB. Chúng tôi kích hoạt tải chuyên gia suy đoán ngay sau khi hệ thống hoàn thành việc tải tất cả chuyên gia cho lớp hiện tại. Việc tải chuyên gia suy đoán tìm nạp 1−2 chuyên gia có khả năng nhất. Các chuyên gia mới được tải không thay thế các chuyên gia hiện tại được cache. Nếu một chuyên gia được tải suy đoán sau đó được sử dụng trong suy luận lớp tiếp theo, nó sẽ thay thế chuyên gia ít được sử dụng gần đây nhất từ cache của lớp tiếp theo.
+
+Nhiều thiết bị tiêu dùng và instance cloud miễn phí có RAM host hạn chế không thể vừa toàn bộ mô hình⁷. Trong những trường hợp này, các chuyên gia phải được chia giữa host và device memory. Để hỗ trợ điều này, triển khai cache LRU chuyên gia của chúng tôi chia các chuyên gia giữa host và GPU device. Khi tải một chuyên gia vào cache GPU, hệ thống cũng offload chuyên gia ít được sử dụng gần đây nhất trên thiết bị về RAM để bảo toàn sự cân bằng bộ nhớ.
+
+Để tăng tốc offloading trong thực tế, chúng tôi phân bổ tất cả các tham số chuyên gia trong một buffer bộ nhớ liền kề có thể được di chuyển như một bản sao host-to-device duy nhất. Đối với các chuyên gia phía host (RAM), chúng tôi pin⁸ buffer bộ nhớ này để giao tiếp nhanh hơn. Triển khai của chúng tôi bổ sung phân bổ b=4 buffer on-device được sử dụng để sao chép và prefetch các chuyên gia không đồng bộ, mà không sửa đổi các chuyên gia hiện có. Những buffer này được chia sẻ giữa tất cả các lớp MoE để giảm dấu chân bộ nhớ. Tổng thể, hệ thống yêu cầu num_layers × num_experts buffer bộ nhớ chuyên gia được chia giữa host và device memory và b=4 buffer tạm thời, kích thước của mỗi buffer bằng một chuyên gia duy nhất.
+
+## 4 Thí nghiệm
+
+Trong mục này, chúng tôi xác minh các giả thuyết trước đó về hành vi MoE và benchmark độ trễ suy luận trong các điều kiện khác nhau. Chúng tôi tập trung đánh giá của mình vào các mô hình Mixtral-8x7B và Mixtral-8x7B-Instruct vì chúng đại diện cho hiện trạng tiên tiến hiện tại trong số các mô hình MoE mã nguồn mở. Chúng tôi tổ chức mục này như sau: Mục 4.1 đo lường hiệu quả của việc cache chuyên gia và pre-loading một cách riêng lẻ, Mục 4.2 so sánh các thuật toán nén mô hình khác nhau và xác minh các giả thuyết của chúng tôi từ Mục 3.3. Cuối cùng, Mục 4.3 đo lường độ trễ suy luận trong một số thiết lập phần cứng.
+
+⁶Cụ thể hơn, không thể thực hiện mà không thay đổi kiến trúc mô hình, điều này sẽ yêu cầu huấn luyện lại  
+⁷Đáng chú ý, Google Colab RAM không thể vừa Mixtral-8x7B với tỷ lệ nén hợp lý  
+⁸Điều này tương ứng với lệnh tensor.pin_memory() trong PyTorch.
+
+### 4.1 Expert LRU Cache và Speculative Loading
+
+Trong mục này, chúng tôi benchmark hiệu quả của hai chiến lược offloading chuyên gia: LRU caching và speculative loading, như được định nghĩa trong Mục 3.1 và 3.2 tương ứng. Cho đánh giá này, chúng tôi đo lường "expert recall" — phần nhỏ của những lần khi một chuyên gia cần thiết cho suy luận đã có sẵn trên GPU.
+
+Cho đánh giá này, chúng tôi chạy mô hình Mixtral-8x7B-Instruct trên bộ dữ liệu OpenAssistant (Köpf et al., 2023). Chúng tôi kiểm tra LRU caching bằng cách chạy mô hình trên các cuộc hội thoại được ghi lại và đo lường recall (aka "hit ratio" từ góc độ caching) cho các kích thước cache k khác nhau. Tiếp theo, chúng tôi kiểm tra speculative loading một cách riêng lẻ bằng cách "đoán" chuyên gia nào nên được tải (bằng cách áp dụng hàm gating của lớp tiếp theo trên các activation lớp hiện tại), sau đó đo lường tần suất các chuyên gia tiếp theo thực tế được tải theo cách này. Một recall của 1.0 tương ứng với tình huống mà cả hai (2) chuyên gia hoạt động Mixtral đều được pre-fetched. Chúng tôi kiểm tra speculative loading trong ba cài đặt: 1, 2 và 10 lớp trước.
+
+### 4.2 Lượng tử hóa MoE hỗn hợp
+
+Tiếp theo, chúng tôi kiểm tra cách các lược đồ Quantization khác nhau ảnh hưởng đến hiệu suất và kích thước MoE. Chúng tôi cũng sử dụng Mixtral-8x7B, nhưng lần này, chúng tôi sử dụng biến thể không được instruction-tuned vì nó phù hợp hơn với các benchmark có sẵn. Chúng tôi đo lường WikiText2 perplexity Merity et al. (2016), C4 perplexity Raffel et al. (2020), cũng như độ chính xác MMLU 5-shot Hendrycks et al. (2021). Mục tiêu của chúng tôi cho mục này là tìm ra sự cân bằng tốt nhất giữa kích thước và hiệu suất cho offloading với các thiết lập mục tiêu. Lưu ý rằng trong tổng số 46.7B tham số trong mô hình Mixtral-8x7B, các chuyên gia chiếm 45.1B (96.6%). Phần còn lại của các tham số mô hình được phân bổ cho embeddings, các lớp self-attention, MoE gates và các lớp nhỏ như LayerNorm.
+
+[Bảng 1: Đánh giá perplexity và kích thước mô hình của Mixtral-8x7B với lượng tử hóa khác nhau cho lớp attention được chia sẻ (Attn quant) và chuyên gia (Experts quant). Để so sánh, một mô hình Mistral-7B lượng tử hóa 4-bit có WikiText2 perplexity 5.03, C4 perplexity 7.56 và điểm MMLU 61.3%. Xem Mục 4.2 để biết chi tiết. Các giá trị màu xanh tương ứng với các cấu hình chúng tôi đã chọn để đánh giá hệ thống đầy đủ.]
+
+Như đã thảo luận trước đó, chúng tôi sử dụng thuật toán lượng tử hóa không cần dữ liệu HQQ Badri & Shaji (2023) và xem xét các lược đồ lượng tử hóa sau:
+
+1. FP16 (không lượng tử hóa)
+2. HQQ 4-bit với group size 64, scale group size 256
+3. HQQ 3-bit với group size 64, scale group size 128
+4. HQQ 2-bit với group size 16, scale group size 128
+
+Lưu ý rằng kích thước mô hình thực tế với lượng tử hóa n-bit lớn hơn n bit mỗi tham số. Điều này là bởi vì định dạng dữ liệu lượng tử hóa cũng lưu trữ scale lượng tử hóa và zero point cho mỗi nhóm trọng số. Đáng chú ý, lược đồ lượng tử hóa 2-bit ở trên sử dụng, trung bình, 2.6 bit mỗi tham số do số lượng lớn các lược đồ lượng tử hóa. Chúng tôi cũng giữ embeddings, logits, MoE gates và các lớp normalization ở định dạng 16-bit.
+
+Bảng 1 tóm tắt kết quả của chúng tôi: tổng thể, có vẻ thuận lợi khi lượng tử hóa các chuyên gia xuống 3 hoặc 2 bit trong khi giữ các lớp attention ở bitwidth cao hơn (16 hoặc 4 bit). Dựa trên những đánh giá này, chúng tôi đã chọn hai lược đồ lượng tử hóa (được tô sáng bằng màu xanh) cung cấp sự cân bằng hiệu suất-kích thước thuận lợi trong các ràng buộc phần cứng mục tiêu.
+
+### 4.3 Hiệu suất offloading thực tế
+
+Cuối cùng chúng tôi đánh giá hiệu suất của mô hình Mixtral8x7B-Instruct sử dụng các kỹ thuật offloading được đề xuất trong suốt báo cáo này. Dựa trên các đánh giá perplexity từ mục trước, chúng tôi đã chọn lượng tử hóa HQQ 4-bit cho các lớp attention được chia sẻ và lượng tử hóa 2- hoặc 3-bit cho các chuyên gia. Chúng tôi đánh giá hệ thống này bằng cách tạo token thông qua sampling trên các cuộc hội thoại OpenAssistant (Köpf et al., 2023) và đo lường số lượng token trung bình được tạo mỗi giây với batch size 1. Cho đánh giá này, chúng tôi luôn sample tỷ lệ thuận với các xác suất dự đoán, tức là không có temperature hoặc nucleus sampling.
+
+Chúng tôi xem xét bốn cấu hình phần cứng: một instance Colab miễn phí với GPU T4 (16GB VRAM, PCIe Gen.3), một laptop gaming thế hệ trước với RTX 3080 Mobile (16GB, PCIe Gen.4), một desktop gaming tầm trung với RTX 3060 (12GB, PCIe Gen.3) và một server trung tâm dữ liệu cao cấp với A100-80GB-SXM. Lưu ý rằng server A100 có thể chạy mô hình mà không cần offloading. Chúng tôi sử dụng offloading trên A100 chủ yếu để cung cấp tham chiếu cho các thiết lập khác. Cuối cùng, khi đánh giá các mô hình 3-bit, chúng tôi sử dụng cloud T4 từ Microsoft Azure vì các instance colab miễn phí không có đủ RAM cho cấu hình cụ thể này. Chúng tôi sử dụng k=2 cho RTX 3060 và k=4 cho tất cả GPU khác.
+
+[Bảng 2: Tốc độ suy luận cho Mixtral-8x7B ở cấp thấp, được đo bằng token mỗi giây.]
+
+Như được hiển thị trong Bảng 2, tất cả các thiết lập được đánh giá có thể tạo 2-4 token mỗi giây với thuật toán đầy đủ. Việc sử dụng pre-loading có vẻ có lợi nhất trên RTX 3060, có thể do kích thước cache LRU thấp hơn. Thú vị, RTX 3060 (desktop) hoạt động gần như bằng 3080 Mobile cao cấp hơn nhiều. Chúng tôi cho rằng điều này do cả hai GPU vẫn bị bottleneck bởi băng thông host-to-device, bị giới hạn bởi kiến trúc PCIe. Cuối cùng, tất cả các lược đồ đều vượt trội hơn đáng kể so với naive offloading mà tải toàn bộ lớp MoE.
+
+## 5 Kết luận và Công việc tương lai
+
+Trong công trình này, chúng tôi khám phá các chiến lược để tăng tốc các mô hình ngôn ngữ dựa trên Mixture-of-Experts trên phần cứng tiêu dùng với bộ nhớ GPU hạn chế. Chúng tôi đề xuất một cách tiếp cận tập trung vào MoE để offloading và khám phá cách lượng tử hóa hỗn hợp ảnh hưởng đến perplexity và hiệu suất trên các nhiệm vụ hiểu ngôn ngữ. Chúng tôi đánh giá các chiến lược được đề xuất và cho thấy rằng chúng tạo ra sự gia tăng đáng kể trong tốc độ tạo so với các cách tiếp cận naïve trên phần cứng cấp tiêu dùng, bao gồm Google Colab miễn phí.
+
+Phương pháp của chúng tôi cung cấp một giải pháp thực tế để suy luận các mô hình ngôn ngữ MoE lớn trên phần cứng bị hạn chế tài nguyên, cho phép truy cập rộng rãi hơn đến những mô hình mạnh mẽ này để nghiên cứu và phát triển. Là công việc tương lai, chúng tôi dự định khám phá thêm các chiến lược offloading, dựa trên dự đoán chuyên gia suy đoán.
+
+## Lời cảm ơn
+
+Các tác giả muốn cảm ơn mobicham@ cho những thảo luận hữu ích về lượng tử hóa Mixtral.
+
+## Tài liệu tham khảo
+
+[Phần tài liệu tham khảo được giữ nguyên như bản gốc vì chứa tên riêng, tiêu đề công trình khoa học và thông tin xuất bản]

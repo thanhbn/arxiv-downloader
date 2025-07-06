@@ -1,0 +1,371 @@
+# KV-Runahead: Suy luận LLM nhân quả có thể mở rộng bằng cách tạo Key-Value Cache song song
+
+Minsik Cho¹ Mohammad Rastegari² Devang Naik¹
+
+## Tóm tắt
+
+Suy luận Mô hình Ngôn ngữ Lớn hay LLM có hai giai đoạn, giai đoạn prompt (hoặc prefill) để xuất token đầu tiên và giai đoạn mở rộng (hoặc giải mã) để tạo ra các token tiếp theo. Trong công trình này, chúng tôi đề xuất một sơ đồ song song hóa hiệu quả, KV-Runahead để tăng tốc giai đoạn prompt. Quan sát chính là giai đoạn mở rộng tạo ra token nhanh hơn giai đoạn prompt vì có key-value cache (KV-cache). Do đó, KV-Runahead song song hóa giai đoạn prompt bằng cách điều phối nhiều tiến trình để điền vào KV-cache và giảm thiểu thời gian đến token đầu tiên (TTFT). Việc sử dụng sơ đồ KV-cache cho mục đích kép có hai lợi ích chính. Đầu tiên, vì KV-cache được thiết kế để tận dụng bản đồ attention nhân quả, chúng tôi giảm thiểu tính toán và tính toán tự động. Thứ hai, vì nó đã tồn tại cho giai đoạn mở rộng, KV-Runahead dễ triển khai. Chúng tôi tiếp tục đề xuất cân bằng tải ở mức ngữ cảnh để xử lý việc tạo KV-cache không đều (do attention nhân quả) và để tối ưu hóa TTFT. So với sơ đồ song song hóa hiện có như song song hóa tensor hoặc tuần tự nơi key và value được tạo cục bộ và trao đổi qua collective all-gather, kết quả thực nghiệm của chúng tôi chứng minh rằng KV-Runahead có thể cung cấp tăng tốc hơn 1.4× và 1.6× cho Llama 7B và Falcon 7B tương ứng.
+
+## 1. Giới thiệu
+
+Các mô hình ngôn ngữ lớn hay LLM, và đặc biệt là các mô hình Generative Pre-trained Transformer (GPT) đã cho thấy hiệu suất xuất sắc trên nhiều tác vụ ngôn ngữ phức tạp (Ouyang et al., 2022; Zhang et al., 2022a). Tuy nhiên, kiến trúc decoder và thực thi tự hồi quy trong LLM đặt ra hai thách thức cho suy luận hiệu quả: a) Thời gian đến token đầu tiên hay TTFT: tiêu thụ ngữ cảnh người dùng có thể dài và tạo ra token đầu tiên b) Thời gian cho mỗi Token đầu ra hay TPOT: tạo ra các token tiếp theo nhanh chóng (Liu et al., 2023a). Thách thức thứ hai được biết đến là vấn đề bị giới hạn bởi bộ nhớ, và một lượng lớn nghiên cứu đã được thực hiện (Pope et al., 2022), bao gồm thưa thớt hóa, lượng tử hóa, hoặc phân cụm trọng số (Frantar et al., 2023; Lin et al., 2023; Cho et al., 2023; Liu et al., 2023b) hoặc giải mã suy đoán (Leviathan et al., 2023; Chen et al., 2023). Nhưng, thách thức đầu tiên cho ngữ cảnh người dùng dài chủ yếu là vấn đề bị giới hạn bởi tính toán (Liu et al., 2023a; NVidia-LLM, 2023) và rất quan trọng cho trải nghiệm người dùng thuận lợi với tăng cường truy xuất (Ram et al., 2023), học trong ngữ cảnh (Dong et al., 2023), tóm tắt (Zhang et al., 2023b), tạo truyện (Zhang et al., 2023a), và vân vân.
+
+Vì TTFT cho ngữ cảnh dài bị giới hạn bởi tính toán, một giải pháp là sử dụng nhiều sức mạnh tính toán hơn dưới dạng song song hóa. SOTA hiện tại trong song song hóa LLM bao gồm song song hóa tensor và tuần tự (Patel et al., 2023; Li et al., 2023; Korthikanti et al., 2022; NVidia-LLM, 2023) nơi các tính toán key và value được phân phối trên nhiều tiến trình và sau đó trao đổi, nhằm tính toán bản đồ attention một cách hoàn hảo song song. Các phương pháp trên đủ tổng quát để điều khiển suy luận LLM (Vaswani et al., 2017), nhưng không đủ chuyên môn cho suy luận LLM có thể mở rộng, vì tính nhân quả trong attention không được tận dụng đầy đủ, dẫn đến chi phí phí tới 2× về cả tính toán và truyền thông so với trường hợp lý tưởng.
+
+Do đó, chúng tôi đề xuất một kỹ thuật song song hóa mới nhưng hiệu quả được thiết kế riêng cho suy luận LLM, KV-Runahead để giảm thiểu TTFT. Bằng cách tái sử dụng cơ chế key-value cache hay KV-cache (NVidia-LLM, 2023) (vốn đã tồn tại cho việc tạo token tiếp theo), KV-Runahead đề xuất của chúng tôi sử dụng các tiến trình khác để điền KV-cache cho tiến trình cuối cùng với cân bằng tải ở mức ngữ cảnh. Vì KV-cache giả định tính toán attention nhân quả, KV-Runahead giảm chi phí tính toán và truyền thông và cung cấp TTFT thấp hơn so với các phương pháp hiện có. Hơn nữa, KV-Runahead yêu cầu chi phí kỹ thuật tối thiểu, vì nó đơn giản làm cho giao diện KV-cache có mục đích kép. Chi tiết, đóng góp của chúng tôi như sau:
+
+¹Apple. USA ²Meta. USA (công việc được thực hiện khi đang ở Apple). Liên hệ: Minsik Cho <minsik@apple.com>.
+
+Proceedings of the 41st International Conference on Machine Learning, Vienna, Austria. PMLR 235, 2024. Copyright 2024 by the author(s).
+
+• Chúng tôi chứng minh rằng sơ đồ KV-cache có thể được sử dụng cho mục đích kép để song song hóa suy luận LLM cho TTFT thấp. Vì KV-cache được xây dựng trên decoder nhân quả và được điền song song, KV-Runahead có thể cung cấp tiết kiệm tính toán và truyền thông đáng kể so với song song hóa tensor/tuần tự.
+
+• Chúng tôi chỉ ra rằng việc sử dụng KV-cache cho song song hóa cho phép truyền thông bất đồng bộ. Do đó, KV-Runahead thay thế đồng bộ hóa toàn cục bằng truyền thông bất đồng bộ điểm-tới-điểm, và cung cấp tính mạnh mẽ chống lại biến động băng thông mạng.
+
+• Chúng tôi nhấn mạnh rằng phân chia ở mức ngữ cảnh có thể cân bằng tải suy luận LLM song song. Tính toán và truyền thông bất đối xứng phát sinh từ KV-cache và chuỗi phụ thuộc của nó qua các tiến trình song song. Tuy nhiên, chúng ta có thể giảm thiểu tác động tiêu cực lên TTFT với cân bằng tải ở mức ngữ cảnh được đề xuất.
+
+• Chúng tôi đề xuất tìm kiếm lưới phân cấp cho phân chia ngữ cảnh hiệu quả. Kết quả tìm kiếm như vậy đóng góp vào bảng tra cứu từ đó có thể nội suy phân chia tối thiểu hóa TTFT cho các độ dài ngữ cảnh khác nhau.
+
+## 2. Các Công trình Liên quan
+
+**Suy luận LLM:** Suy luận LLM tạo sinh gồm hai bước như trong Hình 1 (Patel et al., 2023). Khi ngữ cảnh người dùng được nhận, tất cả token đầu vào được tiêu thụ để tạo ra token đầu tiên, được gọi là giai đoạn prompt. Đồng thời, các embedding key và value được tính toán được lưu làm KV-cache (Park et al., 2020; Liu et al., 2023a) và được đưa vào tất cả các lần tạo token tiếp theo để đẩy nhanh giai đoạn mở rộng. Theo đó, KV-cache tăng trưởng khi nhiều token được tạo ra, bởi vì việc tạo token tiếp theo cần chú ý đến tất cả các token trước đó, bao gồm ngữ cảnh người dùng. Trong khi thước đo quan trọng cho giai đoạn mở rộng là thời gian cho mỗi token đầu ra hay TPOT, giai đoạn prompt cần phân phối token đầu tiên nhanh chóng được đo lường là thời gian đến token đầu tiên hay TTFT.
+
+**Tối ưu hóa TTFT:** Giảm thiểu TTFT, đặc biệt cho ngữ cảnh dài yêu cầu hai nỗ lực: quản lý KV-cache hiệu quả và tính toán bản đồ attention nhanh. PagedAttention (Kwon et al., 2023) tạo thuận lợi cho việc trao đổi dữ liệu bao gồm KV-cache giữa các hệ thống con bộ nhớ khác nhau để xử lý ngữ cảnh dài. Infinite-LLM (Lin et al., 2024) đề xuất hệ thống quản lý KV-cache phân tán ở quy mô đám mây để xử lý thích ứng độ dài ngữ cảnh cực dài. CacheGen (Liu et al., 2023a) đề xuất nén KV-cache cho các ngữ cảnh được tính toán trước để giảm TTFT. SplitWise (Patel et al., 2023) đề xuất sử dụng hai nền tảng khác nhau, một với khả năng tính toán cao cho giai đoạn prompt và một khác với khả năng tính toán thấp cho giai đoạn mở rộng bằng cách chuyển các trạng thái LLM, bao gồm KV-cache từ nền tảng đầu tiên sang nền tảng thứ hai.
+
+**Song song hóa Suy luận LLM:** Vì tối ưu hóa TTFT bị giới hạn bởi tính toán, người ta có thể sử dụng suy luận DNN song song. Song song hóa pipeline chia các lớp của một mô hình qua nhiều tiến trình, phân chia mô hình thành nhiều giai đoạn hoặc lớp (Huang et al., 2019; Narayanan et al., 2021a; Agrawal et al., 2023). Song song hóa Tensor là một trong những phương pháp song song phổ biến từ (HuggingFace-TensorParallelism; Shoeybi et al., 2020; Narayanan et al., 2021b) nơi một phép nhân ma trận lớn được phân tán và sau đó các ma trận đầu ra một phần được tập hợp, và được biết đến là vượt trội hơn song song hóa pipeline (Patel et al., 2023). Song song hóa chuỗi (NVidia-LLM, 2023; Li et al., 2023) là một thuật toán song song dữ liệu mới (bằng cách phân chia đều các chuỗi đầu vào trên nhiều tiến trình) kết hợp với thuật toán attention vòng phân tán. Bằng cách triển khai cấu trúc liên kết vòng trên tất cả các thiết bị, mỗi tiến trình trao đổi embedding key và value với các hàng xóm và xây dựng bản đồ attention đầy đủ cục bộ.
+
+Cả song song hóa tensor và chuỗi trong LLM đều tương tự về mặt toán học theo nghĩa là a) một trong hai ma trận (tức là, hoặc activation hoặc tham số) trong phép nhân sẽ được chia trên nhiều thiết bị, b) cả hai đều yêu cầu truyền thông tập thể để hợp nhất các kết quả một phần. Do đó, cả hai đều phổ biến cho suy luận LLM song song (Korthikanti et al., 2022), nhưng không đủ chuyên môn cho attention nhân quả, dẫn đến chi phí tính toán và truyền thông quá mức.
+
+## 3. Khả năng Mở rộng LLM Nhân quả và Động lực
+
+Trong phần này, chúng tôi sẽ thảo luận về giới hạn dưới của khả năng mở rộng của LLM dựa trên attention nhân quả cho ngữ cảnh người dùng đủ dài C trên p tiến trình song song. Giả sử ngữ cảnh người dùng C được phân chia thành C={c₀, c₁, c₂, ..., cₚ₋₁} cho p tiến trình, và mỗi tiến trình được ánh xạ độc quyền với một fabric tính toán (ví dụ: GPU). Tính toán tối thiểu trên p để tạo ra token đầu tiên, TTFT(p) với cân bằng tải hoàn hảo như sau:
+
+TTFT(p) ≥ α[½C² + ½(∑ᵢ₌₀^(p-1) cᵢ²)/p] (1)
+
+≥ α[½C² + ½p(C/p)²/p] = αC²/2(1/p + 1/p²) (2)
+
+= TTFT(1)/2(1/p + 1/p²) = TTFT*(p) (3)
+
+trong đó α là hệ số khớp sao cho TTFT(1) = αC² (hiệu suất một tiến trình) (Dao et al., 2022), và TTFT*(p) là giới hạn dưới của TTFT trên p. Ý nghĩa của TTFT*(p) là đối với ngữ cảnh người dùng rất dài, tồn tại khả năng mở rộng siêu tuyến tính (tức là, tăng tốc hơn 2× với 2 tiến trình) với LLM nhân quả trong thiết lập lý tưởng, như cân bằng tải hoàn hảo, chi phí truyền thông bằng không, và vân vân. Vui lòng xem khả năng mở rộng siêu tuyến tính của KV-Runahead được báo cáo trong Hình 8 (d).
+
+Hình 2 hình dung các khái niệm đằng sau Phương trình (1) về cơ bản chia một bản đồ attention, QK^T(C, C) trong các vùng bóng mờ trên p tiến trình. Chúng ta cần tính toán thực tế nhiều vùng hình chữ nhật sử dụng phép nhân ma trận-ma trận và che mặt nạ phần tam giác trên (đây là cách hầu hết LLM được triển khai). Do đó, với nhiều phân vùng hơn, chúng ta có thể loại bỏ tính toán lãng phí. Các thiết lập phân vùng tốt tương đương khác (tức là, sử dụng hình chữ nhật dọc để xấp xỉ tam giác dưới) có thể tồn tại, nhưng cái trong Hình 2 (d) thân thiện với LLM: dễ tạo ra ở mức ngữ cảnh, và hoàn toàn phù hợp với KV-cache.
+
+Do đó, chúng ta có thể trực quan ánh xạ các phân vùng trong Hình 2 (d) với p tiến trình, có thể được triển khai bằng cách sử dụng giao diện KV-cache đã tồn tại cho mục đích kép với nỗ lực tối thiểu, dẫn đến động lực đằng sau KV-Runahead. Ngoài ra, như thấy trong Hình 2 (d), mỗi tiến trình sẽ chịu tải tính toán khác nhau, do đó người ta có thể không hiệu quả giảm thiểu TTFT. Tuy nhiên, tối ưu hóa cᵢ một mình có thể dẫn đến tính toán quá mức toàn cục. Do đó, chúng tôi thực hiện phân chia ở mức ngữ cảnh để cân bằng tải và TTFT tối thiểu trong KV-Runahead.
+
+## 4. Tổng quan KV-Runahead
+
+Trong Hình 3, KV-Runahead được đề xuất được minh họa và so sánh với suy luận song song Tensor/chuỗi (hoặc TSP), đặc trưng cho cả song song hóa tensor (Shoeybi et al., 2020; Narayanan et al., 2021b) và song song hóa chuỗi (Li et al., 2023). Như trong Hình 3 (b), KV-Runahead bắt đầu với phân chia ngữ cảnh không đều để cân bằng tải. TSP hiện có song song hóa tính toán forward, nhưng KV-Runahead đạt được suy luận song song bằng cách sử dụng nhiều tiến trình để điền KV-cache cho tiến trình cuối cùng. Do đó, không giống như TSP nơi tính toán đối xứng và được phân phối đều (do đó không cần cân bằng phân chia ngữ cảnh), KV-Runahead cần phân chia ngữ cảnh tốt để cân bằng lượng KV-cache từ mỗi tiến trình tính toán và để giảm thiểu TTFT.
+
+Khi phân chia hoàn tất, mỗi tiến trình sẽ chạy mỗi lớp, có điều kiện trên KV-cache từ tiến trình trước của nó. Chi tiết, tiến trình hiện tại phải đợi KV-cache cần thiết đến từ tiến trình trước (tức là, chú ý đến sự không liên kết lớp trong Hình 3 (b)), tạo thành chuỗi phụ thuộc qua truyền thông ngang hàng cục bộ thay vì đồng bộ hóa toàn cục qua all-gather (Thakur et al., 2005).
+
+Chúng tôi sẽ đầu tiên elaborate về cách KV-Runahead hoạt động bên trong mỗi lớp về mặt tiết kiệm tính toán/truyền thông trong Phần 4.1, và sau đó thảo luận phân chia ngữ cảnh để cân bằng tải trong KV-Runahead trong Phần 4.2. Cuối cùng, Phần 4.3 thảo luận ngắn gọn về triển khai KV-Runahead.
+
+### 4.1. Thực thi Forward
+
+Tính toán attention nhân quả trên một tiến trình đơn được hiển thị trong Hình 1 (b), sẽ được song song hóa trong phần này. Đối với một ngữ cảnh cho trước, khi (Q, K, V) được tính toán, QK^T hoặc bản đồ attention được tính toán cho A. Mặc dù chỉ phần tam giác dưới của QK^T được cần do tính nhân quả, toàn bộ QK^T thường được tính toán qua phép nhân ma trận-ma trận dày đặc trước, sau đó thêm mặt nạ nói chung (HuggingFace-Transformers), vì không có ánh xạ tốt nào tới BLAS-L3 tồn tại hoặc viết kernel tùy chỉnh tốn kém (NVidia-cuBLAS).
+
+Một cách SOTA để cho phép suy luận song song cho LLM (ví dụ: GPT-3, Llama, và BLOOM), sẽ là sử dụng song song hóa tensor và chuỗi (Li et al., 2023; Patel et al., 2023; Shoeybi et al., 2020; Korthikanti et al., 2022), Song song hóa Tensor/chuỗi hoặc TSP trong Hình 4 nơi trọng tâm là song song hóa hành vi tiến trình đơn từ Hình 1 (b). Trong TSP, đối với ngữ cảnh được phân chia đều cho trước, (Q, K, V) được tính toán độc lập trên mỗi tiến trình như trong Hình 4 (a). Sau đó, thao tác tập thể all-gather được thực hiện để trao đổi K và V cho tất cả tiến trình để QK^T có thể được phân phối đều như hiển thị trong Hình 4 (b). Mặc dù TSP tuân thủ trung thành trường hợp tiến trình đơn trong Hình 1 (b), nó không tận dụng lợi thế của tính nhân quả trong suy luận LLM.
+
+Trong KV-Runahead của chúng tôi, chúng tôi bắt đầu với ngữ cảnh được phân chia không đều cho trước, và (Q, K, V) được tính toán độc lập trên mỗi tiến trình như trong Hình 5 (a). Do đó, mỗi tiến trình tính toán số lượng mục khác nhau trong (Q, K, V). Sau đó, KV-Runahead đơn giản điền KV-cache từ mỗi tiến trình và chuyển giao cho tiến trình tiếp theo trong chuỗi, bắt chước giai đoạn mở rộng trong Hình 1 (a). Kết quả là, chỉ tiến trình cuối cùng sẽ có (K, V) đầy đủ, nhưng vẫn mỗi tiến trình có thể xuất A trong cùng hình dạng với Q, điều khiển lớp tiếp theo. Vì KV-cache được xây dựng dựa trên tính nhân quả, KV-Runahead có thể tự động giảm thiểu tính toán tam giác trên và giảm số lượng tích vô hướng cho QK^T. Ví dụ, 27 tích vô hướng được cần trên tất cả tiến trình trong TSP như trong Hình 4 (b), nhưng KV-Runahead yêu cầu 21 (tối đa trong {p₀: 16, p₁: 21, p₂: 18}) như trong Hình 5 (b). Điều này cũng làm nổi bật động lực đằng sau phân chia ngữ cảnh không đều để giảm thiểu tính toán QK^T lớn nhất.
+
+KV-Runahead cũng loại bỏ các điểm đồng bộ hóa toàn cục và giảm tổng khối lượng lưu lượng được trao đổi giữa các tiến trình. Các thao tác All-gather trong Hình 4 (b) buộc tất cả tiến trình dừng lại và bảo đảm (K, V) đầy đủ (Thakur et al., 2005), trong khi KV-Runahead chỉ chia sẻ KV-cache cục bộ với tiến trình tiếp theo qua các thao tác gửi điểm-tới-điểm. Kết quả là, TSP trong Hình 4 (a) yêu cầu chia sẻ 36 mục (K, V) để đến trạng thái trong Hình 4 (b), nhưng KV-Runahead chỉ cần 22 để chuyển đổi sang Hình 5 (b). Chuỗi phụ thuộc như vậy từ KV-cache giới thiệu thời gian đợi dài hơn cho các tiến trình sau, nhưng KV-Runahead có thể vượt trội TSP ngay cả với những chi phí phí như vậy.
+
+Về lý thuyết, với số lượng đủ tiến trình song song và ngữ cảnh người dùng đủ dài (tức là, QK^T chi phối thời gian chạy), KV-Runahead có thể cung cấp tới 2× tăng tốc so với TSP, vì cả tổng tính toán QK^T và lưu lượng mạng giữa các tiến trình trong KV-Runahead đều bằng một nửa so với TSP. Có thể có thể handcraft một kernel BLAS tùy chỉnh/tốn kém cho TSP để tránh tính toán quá mức. Tuy nhiên, ngay cả với kernel tùy chỉnh được thiết kế riêng, truyền thông liên quan trong TSP vẫn không tối ưu vì nó vẫn sử dụng All-gather để trao đổi (K, V). KV-Runahead đề xuất tránh cả tính toán quá mức và lưu lượng mạng lãng phí một cách liền mạch, bằng cách sử dụng sơ đồ KV-cache đặc trưng LLM cho mục đích kép (vốn đã tồn tại cho giai đoạn mở rộng).
+
+Ngoài ra, tiết kiệm tính toán tương tự đạt được với kernel GPU tùy chỉnh, cũng có thể được áp dụng cho KVR. Từ Hình 5 (b), chúng ta vẫn có thể thấy một số tính toán lãng phí. Do đó, kernel tùy chỉnh sẽ tiết kiệm lãng phí như vậy để tăng cường hiệu suất của KVR. Tuy nhiên, lợi ích từ kernel tùy chỉnh sẽ giảm với nhiều GPU song song hơn, vì bản chất của KV-cache cho phép kỹ thuật của chúng tôi xấp xỉ tam giác dưới không bị che chính xác hơn với nhiều tiến trình hơn, như minh họa trong Hình 2 (b) và (d).
+
+Để đơn giản, giả sử rằng ngữ cảnh người dùng C được phân chia đều cho KV-Runahead và TSP trên p tiến trình. Sau đó, tổng lưu lượng TSP Net_tsp có thể được viết như sau:
+
+Net_tsp(C, p) = p(p-1)C/p = (p-1)C (4) (5)
+
+về cơ bản là tổng số mục (K, V) từ các tiến trình khác. Tổng lưu lượng KV-Runahead Net_kvr là tổng của tổng KV-cache được đưa vào mạng.
+
+Net_kvr(C, p) = C/p + 2C/p + 3C/p + ... = ∑ᵢ₌₁^(p-1) iC/p = (p-1)C/2 (6) (7)
+
+Việc giảm 2× là về tổng tính toán và lưu lượng mạng, không phải cho mỗi tiến trình riêng lẻ. Do đó, việc thực hiện cân bằng tải để tối đa hóa lợi ích so với TSP và giảm thiểu TTFT là rất quan trọng, và KV-Runahead hoàn thành điều này bằng cân bằng tải ở mức ngữ cảnh trong Phần 4.2.
+
+### 4.2. Cân bằng Tải ở Mức Ngữ cảnh
+
+Như đã thảo luận trong Phần 3, KV-Runahead cần cân bằng tải cho TTFT thấp. Chúng tôi đề xuất chạy tìm kiếm off-line cho phân chia tốt nhất, và sau đó lưu trữ kết quả trong bảng tra cứu phân chia. Ví dụ, chúng tôi tính toán trước phân chia tối ưu của ngữ cảnh người dùng ở các độ dài khác nhau cho số lượng tiến trình cho trước off-line bằng cách đo TTFT trên phần cứng đích, và sau đó đóng góp kết quả tìm kiếm vào bảng tra cứu. Trong quá trình suy luận, chúng ta có thể dự đoán phân chia tốt nhất bằng cách nội suy hai mục đã biết gần nhất trong bảng tra cứu. Ví dụ về prompt 10k, chúng ta có thể nội suy từ cấu hình phân chia đã biết từ 8k và 12k trong bảng tra cứu.
+
+Tìm cấu hình phân chia tốt nhất cho ngữ cảnh người dùng cho trước, mặc dù là chi phí phí off-line một lần, có thể tốn kém. Do đó, chúng tôi đề xuất tìm kiếm lưới phân cấp để tăng tốc. Từ bản chất của KV-Runahead, rất rõ ràng để thấy rằng tìm phân chia tối ưu TTFT có hai mục tiêu xung đột.
+
+• Các phân vùng cho các tiến trình trước phải nhỏ, nếu không các tiến trình sau sẽ đợi quá lâu để các tiến trình trước điền KV-cache và gửi chúng đi.
+
+• Các phân vùng cho các tiến trình sau cần nhỏ, nếu không các tiến trình sau sẽ là nút thắt cổ chai trong việc tạo token đầu tiên.
+
+Đối với hai tiến trình, chúng ta có thể sử dụng tìm kiếm nhị phân để tìm ra phân chia tốt nhất. Hình 6 (a) cho thấy TTFT thay đổi như thế nào khi chúng ta tăng phân vùng cho p₀ cho ngữ cảnh 16k nơi phân chia là C[0, 8192 + δ₁, 16384]. Khi δ₁ tăng, nó đạt đáy tại phân vùng [0, 9728, 16384] (tức là, δ₁ = 1536, do đó p₀ lấy C[0:9728] và p₁ lấy C[9728:16384]).
+
+Bằng cách tổng quát hóa tìm kiếm nhị phân thành tìm kiếm lưới phân cấp cho nhiều tiến trình (Zhang et al., 2022b), chúng ta có thể tìm phân chia chất lượng cao nhanh chóng cho độ dài ngữ cảnh người dùng cho trước. Hình 6 (b-d) mô tả quy trình tìm kiếm được đề xuất cho độ dài ngữ cảnh người dùng 96 trên 4 tiến trình, tìm (δ₁, δ₂) tối ưu cho phân chia C[0, 32 + δ₁, 64 + δ₂, 96]. Ở cấp đầu tiên, chúng tôi đặt bước tìm kiếm là 8 và đo TTFT trên mỗi lưới. Khi chúng tôi tìm thấy cặp (δ₁, δ₂) hoạt động tốt nhất, chúng tôi giới hạn tìm kiếm đến lưới xám và giảm bước tìm kiếm xuống 4 để thực hiện quét khác như trong Hình 6 (c). Chúng tôi lặp lại quy trình tương tự đệ quy cho đến khi bước tối thiểu được áp dụng, dẫn đến tìm kiếm cuối cùng như trong Hình 6 (d). Phân chia tốt nhất sau đó là [0, 28, 70, 96] và được đánh dấu là chấm đỏ trong Hình 6 (b).
+
+Bảng tra cứu phân chia toàn diện sẽ cho phép phân chia hiệu quả như trong Hình 3 (b) cho cân bằng tải hiệu quả. Đối với ngữ cảnh người dùng cho trước, chúng tôi sẽ nội suy và dự đoán phân chia tốt nhất từ hai mục gần nhất. Do đó, có bảng dày đặc và lớn sẽ có lợi với chi phí tìm kiếm một lần. Kết quả của chúng tôi cũng cho thấy rằng ngay cả với khoảng cách 4k giữa các mục, phân chia được dự đoán có thể mang lại TTFT xuất sắc (xem Hình 10).
+
+### 4.3. Triển khai
+
+Vì KV-Runahead sử dụng giao diện KV-cache cho mục đích kép, tồn tại trong hầu hết triển khai LLM để tạo token tiếp theo nhanh hơn trong giai đoạn mở rộng trong Hình 1 (a) (HuggingFace-Transformers), KV-Runahead dễ triển khai. Hình 7 cho thấy pseudocode/đồ thị tính toán không có và có KV-Runahead. Chú ý rằng KV-cache đã có trong đối số đầu vào cho khối attention. Chỉ có bổ sung là hai phần trong hộp xanh: a) ghi đè KV-cache bằng cách nhận nó từ pᵢ₋₁ trước khi nối với (K, V) cục bộ, và b) chuyển tiếp KV-cache đã cập nhật đến pᵢ₊₁ ngay sau nối. Chúng ta có thể làm cả recv và send bất đồng bộ bằng cách chồng lấp với qkvproj và softmax tương ứng, nhờ vào bản chất của kết nối điểm-tới-điểm. Chi tiết thêm về triển khai và ví dụ có thể được tìm thấy trong Phụ lục 5.
+
+Cả TSP và KV-Runahead đều yêu cầu có tensor trong không gian bộ nhớ liên tục để truyền thông mạng hiệu quả, sau đó là về KV-cache cho KV-Runahead: nếu KV-cache bị phân mảnh vật lý, việc sao chép bộ nhớ thêm tốn kém sẽ cần thiết. Do đó, quản lý KV-cache như vLLM (Kwon et al., 2023; vLLM) cần hỗ trợ phân bổ bộ nhớ vật lý liên tục trong giai đoạn prompt để hoạt động liền mạch với KV-Runahead.
+
+## 5. Kết quả Thực nghiệm
+
+Chúng tôi đã sử dụng PyTorch 2.0 (Paszke et al., 2019) và NCCL 2.14 để cho phép KV-Runahead trong Huggingface LLaMA 7B và Falcon 7B (Touvron et al., 2023; Almazrouei et al., 2023). Tất cả thí nghiệm của chúng tôi được thực hiện trên một node duy nhất với 8×NVidia A100 GPU, và dưới thiết lập băng thông cao (300GB/s) và thấp (10GB/s). Chú ý rằng chúng tôi đã tắt liên kết trực tiếp CUDA tốc độ cao (NVidia-NCCL, 2023) để cấu hình môi trường băng thông thấp.
+
+Chúng tôi sử dụng FP16 cho suy luận. Chúng tôi so sánh KV-Runahead với Song song hóa Tensor/Chuỗi (TSP) (Li et al., 2023; Shoeybi et al., 2020; Patel et al., 2023). Chú ý rằng KV-Runahead áp dụng cho bất kỳ LLM nào với attention nhân quả và không thay đổi độ chính xác tác vụ nào. Để phân tích, chúng tôi tạo ra một vài biến thể của KVR như dưới đây.
+
+**KVR-E** với phân chia ngữ cảnh đều  
+**KVR-S** với phân chia ngữ cảnh được tìm kiếm  
+**KVR-P** với phân chia ngữ cảnh được dự đoán/nội suy  
+
+**Tăng tốc:** Kết quả của chúng tôi được trình bày trong Hình 8 và 9 với nhiều độ dài ngữ cảnh và số GPU. Từ Hình 8 (a-c), chúng ta có thể thấy KVR-S (thậm chí KVR-E) luôn vượt trội TSP. Và, KVR-S có thể mang lại tăng tốc lớn hơn (hơn 40%) với ngữ cảnh dài hơn và nhiều GPU hơn, và mức tăng tốc thậm chí cao hơn trên mạng băng thông thấp (10GB/s) như trong (e, f). Ngoài ra, chú ý rằng TSP gặp lỗi hết bộ nhớ cho ngữ cảnh 16k trên 2 GPU, rõ ràng tiêu thụ nhiều bộ nhớ hơn. Hình 9 cho thấy kết quả tương tự với độ dài ngữ cảnh 8k, nhưng tăng tốc chỉ được quan sát với KVR-S cho ngữ cảnh 4k.
+
+Hình 8 (d) so sánh khả năng mở rộng của TSP, KVR-E, và KVR-S với hai giới hạn dưới: TTFT(p) giống như KVR-S không có truyền thông nào (vậy giới hạn dưới thực tế), và TTFT*(p) từ Phương trình (3) (vậy giới hạn dưới lý thuyết), dẫn đến các quan sát sau:
+
+• TTFT*(p) rất gần với TTFT(p), cho đến khi các phần không thể song song hóa trở nên chi phối, như trên 8 GPU.
+• KVR-S đến gần hơn nhiều so với TSP với TTFT(p).
+• KVR-S cách tới 17% từ TTFT(p) trong các thử nghiệm của chúng tôi.
+
+Thêm kết quả với LLM nhỏ hơn/lớn hơn khác và ngữ cảnh ngắn hơn/dài hơn có sẵn trong Phụ lục A.
+
+**Phân chia ở Mức Ngữ cảnh:** Hình 10 (a) tiết lộ phân chia ngữ cảnh được tìm kiếm cho các trường hợp trong Hình 8 (a-c). Nói chung, chúng ta có thể thấy các tiến trình trước cần tiêu thụ nhiều ngữ cảnh hơn, và các tiến trình sau tiêu thụ ít hơn, ngụ ý rằng thời gian đợi cho các tiến trình sau ít quan tâm hơn cho cấu hình. Chúng ta có thể sử dụng các phân chia này để xây dựng bảng tra cứu phân chia, và nội suy tuyến tính các phân chia cho ngữ cảnh 10k và 14k. Ví dụ, chúng ta có thể nội suy từ phân chia của 8k và 12k để có phân chia dự đoán cho 10k trên 4 GPU, kết quả là [0.350, 0.255, 0.210, 0.185] về tỷ lệ. Và có thể làm tương tự cho ngữ cảnh người dùng 12k trên 4 và 8 GPU. Theo kết quả của chúng tôi trong Hình 10 (b, c), ngay cả với khoảng cách 4k, KVR-P với phân chia dự đoán từ nội suy trong vòng 1.3% của các trường hợp KVR-S với cấu hình phân vùng được tìm kiếm và vẫn vượt trội TSP.
+
+**Truyền thông điểm-tới-điểm:** Để hiểu lợi ích của truyền thông bất đồng bộ điểm-tới-điểm của KVR so với thao tác all-gather trong TSP, chúng tôi thêm sidecar ồn ào để tạo lưu lượng mạng hai chiều giữa cặp GPU liền kề ngẫu nhiên (tức là, mô phỏng băng thông mạng không đồng nhất thay đổi động), tính trung bình nhiều TTFT cho độ dài ngữ cảnh 8k, 12k, và 16k, và sau đó báo cáo kết quả trong Hình 11. Chúng tôi thấy rằng KVR mạnh mẽ hơn nhiều chống lại băng thông không đồng nhất giữa các tiến trình: trong khi TSP làm suy thoái TTFT hơn 10% trung bình do băng thông hiệu quả không đồng nhất, KVR có tới 3.7% tác động lên TTFT, rõ ràng chứng minh lợi ích của cơ chế truyền thông trong KV-Runahead. Ngoài ra, KVR-S được điều chỉnh cho môi trường yên tĩnh, nhưng vẫn vượt trội TSP nhờ truyền thông điểm-tới-điểm.
+
+## 6. Kết luận
+
+Trong công trình này, chúng tôi đề xuất một kỹ thuật suy luận LLM song song hiệu quả, KV-Runahead, để giảm thiểu thời gian đến token đầu tiên. Với các kỹ thuật được đề xuất, chúng tôi quan sát được tăng tốc hơn 60% trong việc tạo token đầu tiên so với các sơ đồ song song hóa hiện có và tính mạnh mẽ cao hơn chống lại môi trường băng thông không đồng nhất.
+
+## 7. Tuyên bố Tác động
+
+Bài báo này trình bày công trình có mục tiêu thúc đẩy lĩnh vực Học máy. Có nhiều hậu quả xã hội tiềm tàng của công trình của chúng tôi, không có điều nào chúng tôi cảm thấy phải được làm nổi bật cụ thể ở đây.
+
+## Tài liệu Tham khảo
+
+Agrawal, A., Panwar, A., Mohan, J., Kwatra, N., Gulavani, B. S., and Ramjee, R. Sarathi: Efficient llm inference by piggybacking decodes with chunked prefills, 2023.
+
+Ainslie, J., Lee-Thorp, J., de Jong, M., Zemlyanskiy, Y., Lebrón, F., and Sanghai, S. Gqa: Training generalized multi-query transformer models from multi-head checkpoints, 2023.
+
+Almazrouei, E., Alobeidli, H., Alshamsi, A., Cappelli, A., Cojocaru, R., Debbah, M., Goffinet, E., Heslow, D., Launay, J., Malartic, Q., Noune, B., Pannier, B., and Penedo, G. Falcon-40B: an open large language model with state-of-the-art performance. 2023.
+
+Chen, C., Borgeaud, S., Irving, G., Lespiau, J.-B., Sifre, L., and Jumper, J. Accelerating large language model decoding with speculative sampling, 2023.
+
+Cho, M., Vahid, K. A., Fu, Q., Adya, S., Mundo, C. C. D., Rastegari, M., Naik, D., and Zatloukal, P. edkm: An efficient and accurate train-time weight clustering for large language models. 2023.
+
+Dao, T., Fu, D. Y., Ermon, S., Rudra, A., and Ré, C. Flashattention: Fast and memory-efficient exact attention with io-awareness. Advances in Neural Information Processing Systems, 2022.
+
+Dong, Q., Li, L., Dai, D., Zheng, C., Wu, Z., Chang, B., Sun, X., Xu, J., Li, L., and Sui, Z. A survey on in-context learning, 2023.
+
+Frantar, E., Ashkboos, S., Hoefler, T., and Alistarh, D. GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers. In arXiv, 2023.
+
+Huang, Y., Cheng, Y., Bapna, A., Firat, O., Chen, M. X., Chen, D., Lee, H., Ngiam, J., Le, Q. V., Wu, Y., and Chen, Z. Gpipe: Efficient training of giant neural networks using pipeline parallelism. In Advances in Neural Information Processing Systems, 2019.
+
+HuggingFace-TensorParallelism. https://huggingface.co/docs/transformers/v4.15.0/parallelism#tensor-parallelism.
+
+HuggingFace-Transformers. https://huggingface.co/docs/transformers/main_classes/output.
+
+Korthikanti, V., Casper, J., Lym, S., McAfee, L., Andersch, M., Shoeybi, M., and Catanzaro, B. Reducing activation recomputation in large transformer models, 2022.
+
+Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu, C. H., Gonzalez, J. E., Zhang, H., and Stoica, I. Efficient memory management for large language model serving with pagedattention, 2023.
+
+Leviathan, Y., Kalman, M., and Matias, Y. Fast inference from transformers via speculative decoding. In International Conference on Machine Learning, 2023.
+
+Li, S., Xue, F., Baranwal, C., Li, Y., and You, Y. Sequence parallelism: Long sequence training from system perspective. In Association for Computational Linguistics (ACL), 2023.
+
+Lin, B., Peng, T., Zhang, C., Sun, M., Li, L., Zhao, H., Xiao, W., Xu, Q., Qiu, X., Li, S., Ji, Z., Li, Y., and Lin, W. Infinite-llm: Efficient llm service for long context with distattention and distributed kvcache, 2024.
+
+Lin, J., Tang, J., Tang, H., Yang, S., Dang, X., and Han, S. AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration. arXiv, 2023.
+
+Liu, Y., Li, H., Du, K., Yao, J., Cheng, Y., Huang, Y., Lu, S., Maire, M., Hoffmann, H., Holtzman, A., Ananthanarayan, G., and Jiang, J. Cachegen: Fast context loading for language model applications, 2023a.
+
+Liu, Z., Oguz, B., Zhao, C., Chang, E., Stock, P., Mehdad, Y., Shi, Y., Krishnamoorthi, R., and Chandra, V. LLM-QAT: Data-Free Quantization Aware Training for Large Language Models. arXiv, 2023b.
+
+Narayanan, D., Phanishayee, A., Shi, K., Chen, X., and Zaharia, M. Memory-efficient pipeline-parallel dnn training. In International Conference on Machine Learning, 2021a.
+
+Narayanan, D., Shoeybi, M., Casper, J., LeGresley, P., Patwary, M., Korthikanti, V. A., Vainbrand, D., Kashinkunti, P., Bernauer, J., Catanzaro, B., Phanishayee, A., and Zaharia, M. Efficient large-scale language model training on gpu clusters using megatron-lm, 2021b.
+
+NVidia-cuBLAS. https://docs.nvidia.com/cuda/cublas/.
+
+NVidia-LLM. https://developer.nvidia.com/blog/mastering-llm-techniques-inference_optimization, 2023.
+
+NVidia-NCCL. https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html, 2023.
+
+Ouyang, L., Wu, J., Jiang, X., Almeida, D., Wainwright, C. L., Mishkin, P., Zhang, C., Agarwal, S., Slama, K., Ray, A., Schulman, J., Hilton, J., Kelton, F., Miller, L., Simens, M., Askell, A., Welinder, P., Christiano, P., Leike, J., and Lowe, R. Training language models to follow instructions with human feedback. In Advances in Neural Information Processing Systems, 2022.
+
+Park, J., Yoon, H., Ahn, D., Choi, J., and Kim, J. OPTIMUS: optimized matrix multiplication structure for transformer neural network accelerator. In Dhillon, I. S., Papailiopoulos, D. S., and Sze, V. (eds.), Proceedings of Machine Learning and Systems (MLSys), 2020.
+
+Paszke, A., Gross, S., Massa, F., Lerer, A., Bradbury, J., Chanan, G., Killeen, T., Lin, Z., Gimelshein, N., Antiga, L., Desmaison, A., Köpf, A., Yang, E., DeVito, Z., Raison, M., Tejani, A., Chilamkurthy, S., Steiner, B., Fang, L., Bai, J., and Chintala, S. Pytorch: An imperative style, high-performance deep learning library. Advances in Neural Information Processing Systems, 2019.
+
+Patel, P., Choukse, E., Zhang, C., Íñigo Goiri, Shah, A., Maleki, S., and Bianchini, R. Splitwise: Efficient generative llm inference using phase splitting, 2023.
+
+Pope, R., Douglas, S., Chowdhery, A., Devlin, J., Bradbury, J., Levskaya, A., Heek, J., Xiao, K., Agrawal, S., and Dean, J. Efficiently scaling transformer inference, 2022.
+
+Ram, O., Levine, Y., Dalmedigos, I., Muhlgay, D., Shashua, A., Leyton-Brown, K., and Shoham, Y. In-context retrieval-augmented language models, 2023.
+
+Shoeybi, M., Patwary, M., Puri, R., LeGresley, P., Casper, J., and Catanzaro, B. Megatron-lm: Training multi-billion parameter language models using model parallelism, 2020.
+
+Thakur, R., Rabenseifner, R., and Gropp, W. Optimization of collective communication operations in MPICH. The International Journal of High Performance Computing Applications, 19(1):49–66, 2005.
+
+Touvron, H., Lavril, T., Izacard, G., Martinet, X., Lachaux, M.-A., Lacroix, T., Rozière, B., Goyal, N., Hambro, E., Azhar, F., Rodriguez, A., Joulin, A., Grave, E., and Lample, G. Llama: Open and efficient foundation language models. In arXiv, 2023.
+
+Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones, L., Gomez, A. N., Kaiser, L. u., and Polosukhin, I. Attention is all you need. In Advances in Neural Information Processing Systems, 2017.
+
+vLLM. https://docs.vllm.ai/en/latest/.
+
+Zhang, H., Song, H., Li, S., Zhou, M., and Song, D. A survey of controllable text generation using transformer-based pre-trained language models, 2023a.
+
+Zhang, S., Roller, S., Goyal, N., Artetxe, M., Chen, M., Chen, S., Dewan, C., Diab, M., Li, X., Lin, X. V., Mihaylov, T., Ott, M., Shleifer, S., Shuster, K., Simig, D., Koura, P. S., Sridhar, A., Wang, T., and Zettlemoyer, L. Opt: Open pre-trained transformer language models. In arXiv, 2022a.
+
+Zhang, T., Ladhak, F., Durmus, E., Liang, P., McKeown, K., and Hashimoto, T. B. Benchmarking large language models for news summarization, 2023b.
+
+Zhang, Y., Liu, W., Wang, X., and Shaheer, M. A. A novel hierarchical hyper-parameter search algorithm based on greedy strategy for wind turbine fault diagnosis. Expert Systems with Applications, 202:117473, 2022b.
+
+---
+
+**Bảng 1.** Độ chính xác Top-1 với ImageNet1k: KV-Runahead vượt trội các sơ đồ khác với các tỷ lệ pruning khác nhau.
+
+| Mạng | 4 GPU | | | 8 GPU | | |
+|------|-------|-------|-------|-------|-------|-------|
+| Độ dài Ngữ cảnh | Phương pháp | | Phương pháp | | |
+| | TSP | KVR-S | Tăng tốc × | TSP | KVR-S | Tăng tốc × |
+| **Llama 7B** | | | | | | |
+| 1k | 0.107 | 0.097 | 1.11 | 0.117 | 0.098 | 1.19 |
+| 2k | 0.111 | 0.100 | 1.11 | 0.117 | 0.103 | 1.14 |
+| 4k | 0.20 | 0.17 | 1.17 | 0.12 | 0.11 | 1.14 |
+| 8k | 0.54 | 0.41 | 1.30 | 0.30 | 0.22 | 1.36 |
+| 12k | 1.06 | 0.76 | 1.39 | 0.57 | 0.41 | 1.37 |
+| 16k | 1.76 | 1.24 | 1.42 | 0.92 | 0.65 | 1.41 |
+| **Llama 13B** | | | | | | |
+| 1k | 0.140 | 0.126 | 1.12 | 0.150 | 0.129 | 1.16 |
+| 2k | 0.143 | 0.131 | 1.09 | 0.153 | 0.131 | 1.17 |
+| 4k | 0.32 | 0.29 | 1.12 | 0.19 | 0.16 | 1.17 |
+| 8k | 0.87 | 0.68 | 1.27 | 0.49 | 0.36 | 1.35 |
+| 12k | 1.71 | 1.25 | 1.36 | 0.91 | 0.66 | 1.37 |
+| 16k | 2.89 | 2.05 | 1.41 | 1.46 | 1.05 | 1.39 |
+| **Llama 30B** | | | | | | |
+| 1k | 0.21 | 0.20 | 1.08 | 0.23 | 0.19 | 1.19 |
+| 2k | 0.28 | 0.26 | 1.06 | 0.24 | 0.20 | 1.19 |
+| **Falcon 1B** | | | | | | |
+| 1k | 0.073 | 0.061 | 1.18 | 0.081 | 0.066 | 1.23 |
+| 2k | 0.067 | 0.060 | 1.12 | 0.079 | 0.065 | 1.23 |
+| 4k | 0.09 | 0.07 | 1.26 | 0.08 | 0.06 | 1.21 |
+| 8k | 0.25 | 0.19 | 1.28 | 0.15 | 0.10 | 1.58 |
+| **Falcon 7B** | | | | | | |
+| 1k | 0.107 | 0.095 | 1.12 | 0.119 | 0.096 | 1.24 |
+| 2k | 0.117 | 0.103 | 1.13 | 0.118 | 0.099 | 1.20 |
+| 4k | 0.28 | 0.21 | 1.30 | 0.18 | 0.12 | 1.47 |
+| 8k | 0.78 | 0.54 | 1.46 | 0.47 | 0.29 | 1.63 |
+
+## A. Thí nghiệm Bổ sung
+
+Trong phần này, chúng tôi trình bày kết quả bổ sung với phạm vi LLM rộng hơn sử dụng cả ngữ cảnh dài và ngắn để xác nhận rằng KV-Runahead sẽ tổng quát hóa tốt qua phổ LLM rộng hơn. Chúng tôi thí nghiệm với Falcon 1B, Llama 13B, và Llama 30B, (ngoài Llama 7B và Falcon-7B từ Phần 5) và tóm tắt kết quả trong Bảng 1 nơi chúng ta có thể quan sát:
+
+• KVR-S luôn vượt trội TSP cho tất cả trường hợp qua 4 và 8 GPU trên mạng băng thông cao.
+• Tăng tốc từ KVR-S ít hơn với đầu vào ngắn hơn (vì attention ít bị nút thắt cổ chai hơn).
+
+Ngoài ra, chúng tôi thử nghiệm Llama 7B với Multi-Query-Attention (MQA) và Group-Query-Attention (GQA) (Ainslie et al., 2023) trên mạng băng thông cao và báo cáo kết quả trong Bảng 2. MQA và GQA (Ainslie et al., 2023) là kỹ thuật chia sẻ key và value giữa các query để phần attention có thể hiệu quả hơn về mặt tính toán. Theo đó, chi phí tính toán projection (K, V) sẽ được giảm cho TSP và KVR, có lợi cho cả hai. Chi tiết, TSP có chi phí truyền thông thấp hơn vì nó có ít ma trận K và V hơn để allgather, và KVR sẽ có chi phí truyền thông thấp hơn với MQA hoặc GQA, vì nó dẫn đến cache (K, V) nhỏ hơn.
+
+So với trường hợp Multi-Head-Attention từ Hình 8 (b-c), tổng thể GQA8 và MQA giảm TTFT phổ quát. Ví dụ, tăng tốc lớn tới 1.22x với MQA. KVR chứng minh mức tăng tốc tốt hơn một chút so với TSP với GQA8 và MQA hơn so với MHA. Ví dụ về 8GPU và ngữ cảnh 16k, tăng tốc so với TSP là 1.41x với MHA (xem Hình 8 (c)), nhưng trở thành 1.48x với MQA và 1.46x với GQA.
+
+**Bảng 2.** Độ chính xác Top-1 với ImageNet1k: KV-Runahead vượt trội các sơ đồ khác với các tỷ lệ pruning khác nhau.
+
+| Mạng | 4 GPU | | | 8 GPU | | |
+|------|-------|-------|-------|-------|-------|-------|
+| Độ dài Ngữ cảnh | Phương pháp | | Phương pháp | | |
+| | TSP | KVR-S | Tăng tốc × | TSP | KVR-S | Tăng tốc × |
+| **Llama 7B MQA** | | | | | | |
+| 1k | 0.109 | 0.102 | 1.07 | 0.117 | 0.101 | 1.17 |
+| 2k | 0.107 | 0.102 | 1.05 | 0.120 | 0.101 | 1.18 |
+| 4k | 0.18 | 0.14 | 1.23 | 0.12 | 0.10 | 1.18 |
+| 8k | 0.49 | 0.37 | 1.33 | 0.26 | 0.18 | 1.44 |
+| 12k | 0.98 | 0.70 | 1.41 | 0.51 | 0.35 | 1.45 |
+| 16k | 1.65 | 1.16 | 1.43 | 0.84 | 0.57 | 1.48 |
+| **Llama 7B GQA8** | | | | | | |
+| 1k | 0.112 | 0.102 | 1.10 | 0.119 | 0.101 | 1.18 |
+| 2k | 0.113 | 0.102 | 1.12 | 0.118 | 0.103 | 1.15 |
+| 4k | 0.18 | 0.15 | 1.20 | 0.12 | 0.11 | 1.15 |
+| 8k | 0.50 | 0.38 | 1.32 | 0.27 | 0.19 | 1.42 |
+| 12k | 1.00 | 0.72 | 1.39 | 0.52 | 0.36 | 1.42 |
+| 16k | 1.67 | 1.16 | 1.44 | 0.86 | 0.59 | 1.46 |
+
+## B. Lợi ích Suy luận Song song
+
+Lợi ích của suy luận LLM song song phụ thuộc vào kích thước ngữ cảnh đầu vào (quyết định lợi ích song song hóa) và băng thông mạng (quyết định chi phí song song hóa). Để hiểu khi nào KVR (tức là, suy luận LLM song song nói chung) có giúp ích hay không, chúng tôi thí nghiệm với Llama 7B trên thiết lập băng thông thấp (10GB/s) và thiết lập băng thông kém (1GB/s) và báo cáo TTFT cho mỗi trường hợp trong Bảng 3. Các số in đậm là khi có lợi khi có suy luận multi-GPU so với suy luận single-GPU về TTFT. Người ta có thể quan sát:
+
+• Suy luận song song chỉ hữu ích khi băng thông đủ tốt HOẶC ngữ cảnh đầu vào đủ dài. Ví dụ, các số in đậm chỉ ra khi có lợi khi có suy luận multi-GPU so với suy luận single-GPU về TTFT tạo thành tam giác dưới trong bảng.
+
+• Ngay cả với suy luận song song, khi băng thông không đủ cao, sử dụng nhiều GPU hơn không phải lúc nào cũng giúp ích. Ví dụ về đầu vào 2K và 10GB/s, TTFT là 0.16 giây với 2GPU, nhưng trở nên tệ hơn thành 0.19 giây với 4GPU. Sự suy thoái như vậy rõ rệt hơn với mạng 1GB/s.
+
+**Bảng 3.** Độ chính xác Top-1 với ImageNet1k: KV-Runahead vượt trội các sơ đồ khác với các tỷ lệ pruning khác nhau.
+
+| Độ dài Ngữ cảnh | cơ sở 1 GPU | 10GB/s | | 1GB/s | |
+|------------------|-------------|---------|---------|-------|-------|
+| | | 2 GPU | 4 GPU | 2 GPU | 4 GPU |
+| 1k | 0.10 | 0.10 | 0.10 | 0.11 | 0.19 |
+| 2k | 0.24 | **0.16** | 0.19 | 0.21 | 0.35 |
+| 4k | 0.65 | **0.38** | **0.36** | 0.84 | 0.93 |
+| 8k | 1.95 | **0.99** | **0.72** | **1.31** | 2.06 |
+| 12k | 3.95 | **1.82** | **1.15** | **2.28** | **2.30** |
+
+Tất cả điều trên ngụ ý rằng đối với băng thông cơ sở hạ tầng cho trước, hệ thống tối ưu cho suy luận LLM có thể được xác định dựa trên phân phối kích thước đầu vào của ứng dụng đích. Yêu cầu người dùng cần được gán động vào hệ thống với số GPU phù hợp dựa trên thước đo tối ưu hóa (tức là, chi phí, độ trễ, sử dụng, và vân vân).
+
+## C. Pseudo Code và Ví dụ
+
+Bảng 5 cho thấy pseudo code đơn giản hóa cho tích hợp KV-Runahead vào triển khai transformer hiện có, cũng tương phản nó với TSP. Bảng 4 minh họa một phân chia có thể với TSP và KVR cho ví dụ trong Bảng 5, nhấn mạnh sự khác biệt của nó với TSP.
+
+**Bảng 4.** Ví dụ phân chia cho Bảng 5.
+
+| phương pháp | thứ hạng/gpu | kích thước phân vùng |
+|-------------|--------------|---------------------|
+| TSP | 0 | Antibiotics are a | 3 |
+| | 1 | type of medication | 3 |
+| | 2 | used to treat | 3 |
+| | 3 | bacterial infections | 2 |
+| KVR | 0 | Antibiotics are a type of | 5 |
+| | 1 | medication used to | 3 |
+| | 2 | treat bacterial | 2 |
+| | 3 | infections | 1 |
+
+**Bảng 5.** Pseudo Code Đơn giản hóa với Tích hợp KV-Runahead
+
+```
+input = 'Antibiotics are a type of medication used to treat bacterial infections'
+
+if method == 'tsp':
+    context = even_context_partitioning(input, rank, world_size)
+elif method == 'kvr':
+    context = kva_context_partitioning(input, rank, world_size)
+else:
+    context = input
+
+def forward(context, mask, rank, world_size, method, KV_cache=None):
+    if method == 'kvr' and rank > 0:
+        KV_cache = net_recv(rank - 1)
+    
+    if method == 'tsp':
+        Q = q_proj(context)
+        local_K = k_proj(context)
+        local_V = v_proj(context)
+        K, V = net_all_gather(local_K, local_V)
+    else:  # kvr, base
+        Q = q_proj(context)
+        K = k_proj(context)
+        V = v_proj(context)
+        if KV_cache:
+            K = cat(KV_cache[0], K)
+            V = cat(KV_cache[1], V)
+        KV_cache = stack(K, V)
+        if method == 'kvr' and rank < world_size - 1:
+            net_send(KV_cache, rank + 1)
+    
+    attn_weights = softmax(matmul(Q, K.T) + mask)
+    attn_output = matmul(attn_weights, V)
+    attn_output = o_proj(attn_output)
+    return attn_output, KV_cache
+```
+
+## D. Chi phí Tạo Bảng Tra cứu
+
+Chúng tôi phân tích chi phí để tính toán trước bảng tra cứu phân chia (là công việc một lần). Giả sử có N GPU và ngữ cảnh C với kích thước, và chúng tôi sẽ chọn kích thước bước ở mỗi cấp sao cho có 5 giá trị để kiểm tra cho mỗi cái như hiển thị trong Hình 6. Để thời gian cho mỗi lần chuyển tiếp để đo TTFT là T.
+
+Ở mỗi cấp, có (N-1)^5 tổ hợp để đánh giá. Khi tổ hợp tốt nhất được chọn, chúng ta có thể phóng to và lặp lại đánh giá cho log₅₋₁C cấp. Do đó, thời gian để tính toán trước bảng tra cứu sẽ là T(N-1)^5 log₅₋₁C.
+
+Ví dụ, nếu chúng ta giả sử T = 1 giây, N = 8, và C = 16k cho trường hợp trong Hình 8 (c), sẽ mất khoảng 33 giờ cho một mục. Hơn nữa, mỗi mục có thể được tìm kiếm song song, nếu có nhiều GPU khả dụng. Trong thực tế, sau vài mục, chúng ta có thể gieo tìm kiếm từ phân chia ngữ cảnh được nội suy với phạm vi hạn chế để đẩy nhanh.

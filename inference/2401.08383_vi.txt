@@ -1,0 +1,280 @@
+# Exploiting Inter-Layer Expert Affinity for Accelerating Mixture-of-Experts Model Inference
+# Khai thác mối quan hệ liên kết giữa các chuyên gia giữa các lớp để tăng tốc suy luận mô hình Mixture-of-Experts
+
+Jinghan Yao, Quentin Anthony, Aamir Shafi, Hari Subramoni, Dhabaleswar K. (DK) Panda
+Khoa Khoa học và Kỹ thuật Máy tính
+Đại học Bang Ohio
+Columbus, OH, Hoa Kỳ
+{yao.877, anthony.301, shafi.16, subramoni.1 }@osu.edu, panda@cse.ohio-state.edu
+
+**Tóm tắt** —Trong lĩnh vực các mô hình ngôn ngữ lớn (LLMs) như Generative Pre-trained Transformer (GPT), mô hình Mixture of Experts (MoE) đã nổi lên như một kỹ thuật mạnh mẽ để tăng cường khả năng biểu đạt và độ chính xác của mô hình. Tuy nhiên, việc triển khai các mô hình GPT MoE cho suy luận song song trên các hệ thống phân tán đặt ra những thách thức đáng kể, chủ yếu do việc truyền thông Alltoall rộng rãi cần thiết cho việc định tuyến chuyên gia và tổng hợp. Nút cổ chai truyền thông này làm trầm trọng thêm bối cảnh tính toán đã phức tạp, cản trở việc sử dụng hiệu quả các tài nguyên tính toán hiệu suất cao. Trong bài báo này, chúng tôi đề xuất một kỹ thuật tối ưu hóa nhẹ được gọi là ExFlow, để phần lớn tăng tốc suy luận của các mô hình MoE này. Chúng tôi có một góc nhìn mới trong việc giảm thiểu chi phí truyền thông bằng cách khai thác mối quan hệ liên kết chuyên gia giữa các lớp. Không giống như các phương pháp trước đây, giải pháp của chúng tôi có thể được áp dụng trực tiếp lên các mô hình MoE đã được huấn luyện trước mà không cần bất kỳ fine-tuning hoặc giảm độ chính xác nào. Bằng cách đề xuất một song song chuyên gia nhất quán ngữ cảnh trên các hệ thống phân tán, thiết kế ExFlow của chúng tôi chỉ sử dụng một truyền thông Alltoall để cung cấp cùng chức năng trong khi các phương pháp trước đây đều yêu cầu hai Alltoalls. Bằng cách xem xét cẩn thận xác suất có điều kiện trong việc định tuyến token qua nhiều lớp, chúng tôi đã chứng minh rằng các mô hình GPT MoE đã được huấn luyện trước ngầm thể hiện một mối quan hệ liên kết chuyên gia giữa các lớp mạnh mẽ. Sau đó, chúng tôi thiết kế một mô hình lập trình số nguyên hiệu quả để nắm bắt chính xác các đặc điểm như vậy và chỉ ra rằng bằng cách đặt các chuyên gia một cách phù hợp trên các GPU tương ứng, chúng tôi có thể giảm tới 67% độ trễ định tuyến cross-GPU của token trên các cấu hình phần cứng và cấu trúc liên kết khác nhau. Giải pháp của chúng tôi vượt trội hơn Deepspeed-MoE tiên tiến trong các mô hình GPT MoE với các chuyên gia từ 8 đến 64, với cải thiện tới 2.2x về thông lượng suy luận. Theo hiểu biết của chúng tôi, đây là công trình đầu tiên trong việc tận dụng mối quan hệ liên kết chuyên gia giữa các lớp để tăng tốc suy luận của các mô hình GPT MoE. Chúng tôi cũng cung cấp một nghiên cứu chi tiết về cách mô hình ngầm có được mối quan hệ liên kết chuyên gia này ở giai đoạn huấn luyện rất sớm và cách mối quan hệ liên kết này phát triển và ổn định trong suốt quá trình huấn luyện.
+
+**Từ khóa chỉ mục** —Mixture of experts, Suy luận song song, Truyền thông tập thể, Mô hình sinh, Hệ thống phân tán
+
+## I. GIỚI THIỆU
+
+Trong bối cảnh phát triển của trí tuệ nhân tạo (AI) và học sâu (DL), mô hình Mixture of Experts (MoE) [1]–[6] đã nổi lên như một kỹ thuật then chốt, củng cố hiệu quả và khả năng thích ứng của các mô hình. MoE hoạt động dựa trên nguyên tắc phân phối các nhiệm vụ giữa các chuyên gia chuyên biệt trong một kiến trúc mô hình rộng hơn, định tuyến đầu vào một cách động
+
+*Nghiên cứu này được hỗ trợ một phần bởi các dự án NSF #1818253, #1854828, #1931537, #2007991, #2018627, #2112606, #2311830, #2312927, và dự án XRAC #NCR-130002.
+
+đến chuyên gia thành thạo nhất dựa trên ngữ cảnh. Trong khi MoE là một kỹ thuật không phụ thuộc miền đã đạt được thành công trong các lĩnh vực như thị giác [7], [8], MoE đã đặc biệt có ích cho các mô hình ngôn ngữ lớn (LLMs) [9]–[11] trong việc mở rộng khả năng mô hình hóa ngôn ngữ trong khi hạn chế chi phí tính toán. Mặc dù mạnh mẽ trong việc mở rộng quy mô khả năng của các mô hình ngôn ngữ lớn, nó thường yêu cầu các chiến lược song song đặc biệt để giảm thiểu yêu cầu bộ nhớ, vì việc chứa tất cả các chuyên gia trên một GPU là không khả thi do mỗi chuyên gia thực tế là một mạng feed-forward (FFN) lớn.
+
+[THIS IS FIGURE: Hình 1 showing two parts: (a) Vanilla expert placement strategy causing intensive cross-GPU communication, and (b) leveraging inter-layer expert affinity to avoid unnecessary Alltoall communication. The figure shows GPUs, tokens, layers, and different types of expert affinity (low, medium, high) with various connection types.]
+
+Hình 1: Cho một mô hình MoE đã được huấn luyện trước, (a) chiến lược đặt chuyên gia vanilla gây ra truyền thông cross-GPU chintensive. (b) tận dụng mối quan hệ liên kết chuyên gia giữa các lớp có thể tránh truyền thông Alltoall không cần thiết.
+
+### A. Phát biểu vấn đề
+
+Các mô hình làm việc MoE [6], [12]–[14] hiện tại yêu cầu nghiêm ngặt hai tập hợp Alltoall trong mỗi lớp MoE, vì theo quyết định định tuyến được thực hiện bởi hàm gating, mỗi GPU sẽ đầu tiên phân tán đầu vào của nó đến các chuyên gia trên các GPU khác, và sau đó thu thập chúng trở lại sau khi tính toán. Tùy thuộc vào số lượng GPU liên quan, các tập hợp Alltoall sẽ giới thiệu một chi phí đáng kể. Các giải pháp hiện có [13], [14] giới thiệu loss nhận thức cấu trúc liên kết trong quá trình huấn luyện, cố gắng để hàm gating định tuyến nhiều token hơn đến các GPU cục bộ với độ trễ truyền thông ít hơn, tuy nhiên, trong khi nó có thể tăng tốc huấn luyện, ràng buộc heuristic này cản trở hiệu suất của mô hình và trở nên không hợp lệ trong giai đoạn suy luận một khi cấu trúc liên kết phần cứng thay đổi. Cho tính chất sử dụng nhiều tài nguyên của việc huấn luyện LLM và các kịch bản suy luận đa dạng, một thiết kế định tuyến MoE hiệu quả truyền thông, áp dụng được phổ quát vẫn là một yêu cầu cấp bách.
+
+### B. Động lực
+
+Trong một lớp Mixture of Experts (MoE), mỗi mô hình chuyên gia chuyên biệt trong một miền kiến thức riêng biệt [15], [16]. Các mô hình MoE hiện đại thường xếp chồng nhiều lớp MoE như vậy để tại mỗi lớp, đầu vào sẽ được định tuyến đến một hoặc một vài chuyên gia. Kiến thức miền mà mỗi chuyên gia chịu trách nhiệm có thể khác nhau trên các mô hình và huấn luyện khác nhau. Tuy nhiên, đối với một mô hình MoE đã được huấn luyện trước, chúng tôi tò mò về việc liệu có tồn tại một số tương quan giữa việc lựa chọn chuyên gia qua các lớp MoE khác nhau hay không. Nói cách khác, đối với một mô hình MoE đã được huấn luyện trước với nhiều chuyên gia mỗi lớp, cho một token đầu vào, nếu chúng ta biết rằng nó được định tuyến đến một chuyên gia cụ thể tại lớp i, khả năng định tuyến token đến các lớp tiếp theo là gì? Liệu nó sẽ hoàn toàn ngẫu nhiên? Hay là các chuyên gia nhất định sẽ thể hiện một xác suất cao hơn được chọn làm đích đến tiếp theo?
+
+Hình 2 hiển thị bản đồ nhiệt của ưu tiên định tuyến trên một mô hình GPT [17], [18] MoE đã được huấn luyện trước. Mô hình bao gồm 12 lớp MoE, và mỗi lớp có 32 chuyên gia, tham khảo II để biết thêm chi tiết. Chúng tôi chọn bốn cặp lớp liên tiếp và theo dõi việc lựa chọn chuyên gia của các token trong các lớp này. Trục Y mô tả chuyên gia ở lớp trước đó, và trục X mô tả chuyên gia ở lớp tiếp theo. Khối đỏ ở tọa độ (x, y) đại diện cho xác suất có điều kiện của các token được định tuyến đến chuyên gia y tại lớp i sau đó được định tuyến đến chuyên gia x tại lớp i+1. Màu càng đậm, xác suất có điều kiện càng cao. Nhìn vào cả bốn bản đồ nhiệt, chúng ta có thể quan sát rõ ràng rằng việc lựa chọn chuyên gia không ngẫu nhiên và các quyết định định tuyến ở các lớp trước đó sẽ ảnh hưởng lớn đến các quyết định định tuyến của lớp sau, và điều này đúng cho bất kỳ lớp nào trong mô hình. Do đó, chúng tôi định nghĩa xác suất có điều kiện như vậy trong việc lựa chọn chuyên gia qua các lớp khác nhau là mối quan hệ liên kết chuyên gia. [19], [20] trước đây đã quan sát thấy hiện tượng này, tuy nhiên nó chưa được nghiên cứu rộng rãi, thúc đẩy việc khám phá sâu và đề xuất tối ưu hóa tiếp theo của chúng tôi.
+
+### C. Giải pháp đề xuất
+
+Trong bài báo này, chúng tôi giới thiệu một góc nhìn mới về việc tối ưu hóa các mô hình Alltoall MoE bằng cách vượt ra ngoài các lớp MoE riêng lẻ và khai thác mối quan hệ liên kết của các chuyên gia giữa các lớp. Với việc xem xét cẩn thận tính song song dữ liệu ngầm trong song song chuyên gia hiện tại, chúng tôi đề xuất một thiết kế nhất quán ngữ cảnh trong đó mỗi GPU giữ ngữ cảnh của tất cả các token đang xử lý, sau đó cho phép chúng ta trực tiếp cắt giảm một nửa các hoạt động Alltoall trong mỗi lớp MoE. Hơn nữa, bằng cách khai thác mối quan hệ liên kết chuyên gia qua nhiều lớp MoE, chúng ta có thể giảm tới 40% trao đổi dữ liệu trong truyền thông Alltoall còn lại, mà không tạo ra bất kỳ bản sao nào của các chuyên gia bổ sung không thuộc về GPU rank hiện tại. Chiến lược tối ưu hóa của chúng tôi được thích ứng với các cấu trúc liên kết khác nhau của các nút tính toán, tận dụng băng thông phân cấp của việc sao chép bộ nhớ GPU, NVLINK [21] intra-node intra-node, và mạng inter-node. Giải pháp của chúng tôi có thể được áp dụng nhanh chóng cho các mô hình GPT MoE đã được huấn luyện trước khác nhau mà không cần bất kỳ huấn luyện lại hoặc fine-tuning trước đó trên mô hình, và được đảm bảo mang lại lợi ích bất kể số lượng chuyên gia có thể được lưu trữ trong khả năng bộ nhớ của một GPU duy nhất.
+
+Theo hiểu biết của chúng tôi, đây là công trình đầu tiên trong việc khám phá mối quan hệ liên kết chuyên gia giữa các lớp để tăng tốc suy luận GPT MoE đã được huấn luyện trước. Do đó, sau khi xem xét kỹ lưỡng các mô hình hiện tại trong song song chuyên gia, chúng tôi liệt kê các đóng góp của mình như sau:
+
+1) Chúng tôi khai thác tính chất mối quan hệ liên kết chuyên gia tồn tại ngầm trong các mô hình GPT MoE đã được huấn luyện trước hiện tại bằng cách nắm bắt xác suất có điều kiện kết hợp của các quyết định định tuyến chuyên gia qua nhiều lớp MoE.
+
+2) Chúng tôi phân tích kỹ lưỡng các mô hình tính toán và truyền thông trong các chiến lược song song hiện có, và đề xuất một song song chuyên gia nhất quán ngữ cảnh để phần lớn giảm số lượng tập hợp Alltoall trong các mô hình GPT MoE hiện tại.
+
+3) Chúng tôi thiết kế một thuật toán offline hiệu quả nhưng chính xác để nắm bắt mối quan hệ liên kết chuyên gia trong bất kỳ mô hình GPT MoE đã được huấn luyện trước nào bằng cách công thức hóa nó như một vấn đề Lập trình Tuyến tính Số nguyên, cho phép các giải pháp gần tối ưu. Các kết quả được dẫn xuất thông báo cho chiến lược đặt chuyên gia trong quá trình tải mô hình GPU.
+
+4) Chúng tôi đề xuất một giải pháp tối ưu hóa song song chuyên gia mới dựa trên nhất quán ngữ cảnh và mối quan hệ liên kết chuyên gia, được đặt tên là ExFlow. Nó không phụ thuộc vào implementation và dễ dàng áp dụng cho bất kỳ mô hình GPT MoE nào. ExFlow có thể tăng tốc đáng kể suy luận của các mô hình này.
+
+5) Chúng tôi so sánh ExFlow với các framework suy luận MoE tiên tiến hiện có trên nhiều mô hình GPT MoE đã được huấn luyện trước. Đối với các mô hình GPT MoE-16/32/64, giải pháp của chúng tôi cung cấp giảm tới 56%/65%/67% trong truyền thông Alltoall
+
+và cải thiện 120%/60%/80% trong thông lượng suy luận, tương ứng.
+
+## II. KIẾN THỨC NỀN TẢNG
+
+### A. Mô hình Chuyên gia
+
+Các mô hình chuyên gia, đặc biệt trong các lĩnh vực thị giác và ngôn ngữ, hoạt động dựa trên nguyên tắc chuyên biệt hóa phân tán, trong đó mỗi chuyên gia chịu trách nhiệm cho một tập con cụ thể của toàn bộ miền kiến thức. Các chuyên gia này thường là các mô-đun mạng nơ-ron được huấn luyện để xuất sắc trong các nhiệm vụ như nhận dạng đối tượng, phân tích cú pháp ngữ nghĩa, hoặc phân tích cảm xúc. Hệ thống tổng thể sử dụng một cơ chế gating để định tuyến dữ liệu đầu vào đến các chuyên gia có liên quan nhất, do đó tận dụng kiến thức cụ thể theo miền để cải thiện hiệu suất. Song song chuyên gia là một chiến lược tính toán cho phép thực hiện đồng thời các chuyên gia này, tăng tốc đáng kể suy luận và huấn luyện. Điều này rất quan trọng để xử lý dữ liệu quy mô lớn và các mô hình phức tạp, vì nó cho phép phân phối tải tính toán qua nhiều bộ tăng tốc phần cứng.
+
+Chuyển đến các mô hình ngôn ngữ lớn (LLMs), kiến trúc Mixture of Experts (MoE) đã có vai trò quan trọng trong việc mở rộng khả năng của chúng mà không tăng tuyến tính chi phí tính toán. MoE tích hợp nhiều chuyên gia vào một mô hình duy nhất và sử dụng một cơ chế gating mềm để kết hợp các đầu ra của chúng. Tuy nhiên, song song chuyên gia trong MoE cần hai hoạt động Alltoall quan trọng: 1) định tuyến dữ liệu đầu vào đến các chuyên gia thích hợp, và 2) tổng hợp các đầu ra từ tất cả các chuyên gia cho dự đoán cuối cùng. Mặc dù các hoạt động này là cần thiết cho chức năng của mô hình, chúng giới thiệu chi phí truyền thông đáng kể, đặc biệt trong các kịch bản suy luận phân tán liên quan đến nhiều GPU. Chi phí này có thể trở thành nút cổ chai, cản trở khả năng mở rộng và hiệu quả của hệ thống.
+
+### B. Chiến lược Gating và Tối ưu hóa
+
+Trong các mô hình Mixture of Experts (MoE), hàm gating [1] là một thành phần quan trọng định tuyến dữ liệu đầu vào đến các chuyên gia chuyên biệt, tối ưu hóa hiệu suất thông qua kiến thức cụ thể theo miền. GShard [22] gating sử dụng một cách tiếp cận dựa trên softmax, tập trung vào hiệu quả tính toán nhưng có thể làm trầm trọng thêm chi phí truyền thông do cách tiếp cận không biết về cấu trúc liên kết phần cứng. Mặt khác, topo-aware gating [13], [14] giảm thiểu chi phí này bằng cách giới thiệu các số hạng loss bổ sung vào mục tiêu huấn luyện, nhạy cảm với cấu trúc liên kết phần cứng. Tuy nhiên, điều này cần huấn luyện lại mô hình từ đầu, một nỗ lực tiêu tốn tài nguyên đặc biệt cho các mô hình quy mô lớn như GPT.
+
+Bảng I so sánh các framework MoE tiên tiến khác nhau với thiết kế đề xuất của chúng tôi. Mặc dù topo-aware gating có thể giảm hiệu quả chi phí truyền thông trong quá trình huấn luyện, lợi ích của nó không áp dụng được trong quá trình suy luận nếu cấu trúc liên kết phần cứng thay đổi. Hạn chế này đặt ra một vấn đề không nhất quán đáng kể cho các mô hình như GPT, thường được triển khai qua các cấu hình phần cứng khác nhau. Yêu cầu huấn luyện lại với topo-aware gating cũng thêm một lớp gánh nặng tính toán, làm cho nó trở thành lựa chọn ít thực tế hơn cho các mô hình đã được huấn luyện và triển khai. Quan trọng hơn, các tối ưu hóa hiện có trên các hàm gating vẫn ở trong lớp MoE riêng lẻ, trong khi thất bại trong việc điều tra có hệ thống dòng dữ liệu tổng thể qua nhiều lớp MoE trong mô hình.
+
+## III. THÁCH THỨC
+
+### A. Địa phương Dữ liệu
+
+Như được hiển thị trong Hình 3, các phương pháp song song chuyên gia phổ biến tích hợp cả song song dữ liệu (DP) và song song mô hình (MP) [23]. Trong thiết lập này, DP đảm bảo rằng các token và ngữ cảnh liên quan của chúng, như được duy trì bởi các GPU riêng lẻ, vẫn riêng biệt. Mặt khác, MP đảm bảo mỗi GPU duy trì quyền sở hữu độc quyền của các chuyên gia riêng biệt. Do đó, hai truyền thông Alltoall là không thể thiếu tại mỗi lớp MoE. Đầu tiên, trong tính toán attention [24], các token chú ý đến ngữ cảnh của chúng trên GPU cục bộ, và sau đó một hàm gating sẽ xác định đích đến chuyên gia của mỗi token. Alltoall đầu tiên sẽ định tuyến các token trên mỗi GPU đến các chuyên gia được nhắm mục tiêu trên các GPU khác, và điều này được gọi là token dispatch. Một khi Alltoall đầu tiên hoàn thành, mỗi GPU sẽ cung cấp các token đã nhận cho các chuyên gia mà nó giữ. Lưu ý rằng vì các chuyên gia về cơ bản là các FFN chỉ thực hiện một phép biến đổi phi tuyến trên các token, chúng không yêu cầu bất kỳ thông tin ngữ cảnh nào, không giống như mô-đun attention trước đó. Tuy nhiên, vì nhiều lớp MoE được xếp chồng, các mô-đun attention trong lớp tiếp theo sẽ yêu cầu các token được căn chỉnh với ngữ cảnh cục bộ, do đó ở cuối mỗi lớp, một truyền thông Alltoall khác được thực hiện để thu thập những token đã được dispatch đó. Do đó, để loại bỏ hoạt động Alltoall thứ hai, chúng ta cần vượt qua ràng buộc địa phương của song song dữ liệu, sao cho các token luôn có thể chú ý đến ngữ cảnh tương ứng của chúng bất kể GPU nào chúng đang cư trú.
+
+[THIS IS FIGURE: Hình 3 showing GPU layout with tokens T0-T3, experts, and attention mechanisms, illustrating how T2 needs to return to GPU 2 for attention computation due to current expert parallelism]
+
+Hình 3: Do song song chuyên gia hiện tại bao gồm song song dữ liệu, các GPU khác nhau không chia sẻ ngữ cảnh của các token. Do đó, T2 cần quay lại GPU 2 để thực hiện attention trong lớp tiếp theo.
+
+### B. Ánh xạ Mối quan hệ liên kết Chuyên gia đến Cấu trúc liên kết Phần cứng
+
+Vì mục tiêu là giảm thiểu độ trễ suy luận của các mô hình MoE với song song chuyên gia, chúng tôi quan tâm đến việc giảm chi phí truyền thông Alltoall càng nhiều càng tốt. Do đó, việc xác định mối quan hệ liên kết chuyên gia trong một mô hình MoE đã được huấn luyện trước là bước đầu tiên của chúng tôi, việc ánh xạ đúng mối quan hệ liên kết này đến phần cứng cơ bản là một nhiệm vụ quan trọng. Cho một mô hình MoE đã được huấn luyện trước, suy luận có thể xảy ra trên nhiều cấu hình phần cứng khác nhau, do đó chúng ta cần một thuật toán ánh xạ phổ quát để thiết kế của chúng tôi có thể thích ứng liền mạch với các cấu trúc liên kết không đồng nhất mà không cần bất kỳ sửa đổi hoặc fine-tuning nào của mô hình MoE.
+
+## IV. THIẾT KẾ EXFLOW
+
+Trong phần này, đầu tiên chúng tôi giới thiệu song song chuyên gia nhất quán ngữ cảnh. Chúng tôi sẽ cố gắng vượt qua ràng buộc địa phương dữ liệu như đã đề cập ở trên, vì điều này rất quan trọng khi chúng ta sau đó khai thác mối quan hệ liên kết chuyên gia. Sau đó chúng tôi sẽ giới thiệu cách mô hình hóa mối quan hệ liên kết chuyên gia một cách hiệu quả, và sử dụng nó để phần lớn tăng tốc suy luận của các mô hình GPT MoE.
+
+### A. Nhất quán Ngữ cảnh Token trong Song song Chuyên gia
+
+Trước khi đi sâu vào thiết kế của chúng tôi, chúng tôi muốn xem lại pipeline suy luận của các mô hình GPT. Cho một mô hình GPT đã được huấn luyện trước và một yêu cầu suy luận, nó lấy l từ mỗi yêu cầu làm đầu vào, điều này thường được gọi là Prompts. Prompts về cơ bản là các token. Khi mô hình cố gắng tạo ra một phản hồi cho yêu cầu này, nó sẽ tham khảo prompts để có thông tin ngữ cảnh. Vì GPT thực sự là một mô hình sinh, nó sẽ tạo ra một hoặc một vài từ trong mỗi lần lặp, và nối chúng vào các token prompt hiện tại, sau đó trở thành ngữ cảnh để tạo ra các từ trong lần lặp tiếp theo. Quan trọng, một khi được tạo ra, các token này vẫn bất biến trong các lần lặp tiếp theo, phục vụ hoàn toàn như ngữ cảnh và không trải qua các biến đổi hoặc cập nhật thêm bởi mạng. Để đơn giản, chúng tôi sử dụng thuật ngữ ngữ cảnh để đại diện cho prompts cũng như các token được tạo ra trong các lần lặp trước đó. Giả sử chúng ta có n GPU trong nhóm song song dữ liệu, để đạt được nhất quán ngữ cảnh token qua tất cả các GPU trong nhóm, chúng tôi sẽ tập trung vào cả phần before-inference và after-iteration liên quan đến toàn bộ quá trình suy luận MoE, như được hiển thị trong Hình 4.
+
+[THIS IS FIGURE: Hình 4 showing diagram of AllGather operations before inference and after each iteration to ensure context coherence across GPUs]
+
+Hình 4: Trước khi suy luận, chúng ta sử dụng Allgather để đảm bảo mỗi GPU có tất cả ngữ cảnh. Sau mỗi lần lặp, một Allgather khác được thực hiện trên các token mới được tạo ra, sau đó chúng ta nối chúng vào ngữ cảnh hiện tại cho lần lặp tiếp theo.
+
+Tại điểm bắt đầu suy luận, GPU i có gi yêu cầu, i ∈ {1, 2, . . . , n}, trước tiên chúng ta sẽ thực hiện một truyền thông AllGather qua các GPU trong đó mỗi GPU sẽ phát sóng gi ngữ cảnh của nó đến tất cả các GPU khác. Sau này, mỗi GPU trong nhóm sẽ có ∑ni=1 gi ngữ cảnh, có nghĩa là tất cả ngữ cảnh hiện đã nhất quán qua tất cả các GPU. Lưu ý rằng, mặc dù mỗi GPU hiện có ngữ cảnh từ các GPU khác, nó vẫn sẽ chỉ tạo ra các token cho các yêu cầu của riêng mình, tuân thủ các nguyên tắc song song dữ liệu.
+
+Khi hoàn thành lần lặp, mỗi GPU đã tạo ra một số token cho các yêu cầu của riêng mình, để đảm bảo ngữ cảnh vẫn nhất quán trong lần lặp tiếp theo, chúng ta cần mỗi GPU phát sóng những token mới được tạo ra này đến các GPU khác. Do đó, chúng ta cũng thực hiện một hoạt động AllGather bổ sung qua nhóm. Bằng cách làm như vậy, tại đầu lần lặp mới, mỗi GPU có ngữ cảnh cập nhật của tất cả các yêu cầu.
+
+Lợi ích của việc đảm bảo nhất quán ngữ cảnh token là gì? Trong Hình 3, chúng tôi đã đề cập lý do mà song song chuyên gia hiện tại yêu cầu nghiêm ngặt hai hoạt động Alltoall, đó là do loại trừ dữ liệu vì song song chuyên gia hiện tại ngầm thể hiện song song dữ liệu. Bây giờ, vì các ngữ cảnh nhất quán và hiển thị trên tất cả các GPU cho tất cả các token, một token có thể thực hiện tính toán attention tại chỗ với ngữ cảnh của nó, bất kể GPU nào nó hiện đang ở.
+
+Hình 16 hiển thị một mô hình MoE-8 3 lớp chạy trên 4 GPU, trong đó mỗi GPU giữ hai chuyên gia mỗi lớp. Chúng ta có token 1 trên GPU 1 và token 2 trên GPU 3. Token 1 sẽ được định tuyến đến E0 ở lớp 0, E4 ở lớp 1, E2 ở lớp 2 tương ứng. Token 2 sẽ được định tuyến đến E5 ở lớp 0, E5 ở lớp 1, E4 ở lớp 2 tương ứng. Hình 16(a) mô tả đường đi mà token 1 và token 2 sẽ đi theo theo mô hình song song chuyên gia vanilla. Sau mỗi lớp, cả hai token cần quay lại GPU ban đầu của chúng để tính toán attention. Đáng chú ý, đối với token 2, mặc dù tất cả các chuyên gia trên đường đi của nó đều ở GPU 2, nó vẫn phải thường xuyên quay lại GPU 3 vì ngữ cảnh của nó không nhìn thấy một cách nhất quán trên GPU 2. Đối với ví dụ đã cho, token 1 yêu cầu bốn truyền thông cross-GPU, và token 2 yêu cầu sáu truyền thông cross-GPU. Hình 16(b) minh họa, tuy nhiên, đường đi mà cả hai token đi khi chúng ta sử dụng song song chuyên gia nhất quán ngữ cảnh. Đối với token 1, khi nó được định tuyến đến GPU 0 ở lớp 0, nó hoàn thành FFN E0, và thực hiện tính toán attention tại chỗ với ngữ cảnh của nó được lưu trữ trên GPU 0. Sau đó, nó không phải quay lại GPU 1, thay vào đó, nó có thể đi trực tiếp đến E4 ở lớp 1, điều này tiết kiệm 1 truyền thông cross-GPU. Đối với token 2, cải thiện là phi thường, vì tất cả các chuyên gia trên đường đi của nó đều ở GPU 2, nó chỉ yêu cầu một truyền thông cross-GPU ở lớp 0, sau đó, tất cả FFN và attention có thể được thực hiện tại chỗ trên GPU 2. Lưu ý rằng, hàm gating được chia sẻ giữa tất cả các GPU, để bất kể token trên GPU nào, hàm gating luôn có thể định tuyến nó đến chuyên gia đúng.
+
+Bảng I hiển thị khối lượng truyền thông tổng thể trong song song chuyên gia nhất quán ngữ cảnh của chúng tôi so với các phương pháp hiện có, như FasterMoE [13], TA-MoE [14], và Deepspeed-MoE [12]. Trong thiết kế của chúng tôi, chúng ta cắt giảm một nửa Alltoalls, trong khi giới thiệu một AllGather ở cuối mỗi lần lặp. Chúng tôi thấy rằng khi mô hình có nhiều lớp hơn, chi phí của AllGather trở nên ít quan trọng hơn vì nó chỉ xảy ra ở lớp cuối cùng.
+
+### B. Mô hình hóa Mối quan hệ liên kết Chuyên gia Giữa các lớp
+
+Trong phần này, chúng tôi sẽ thảo luận về cách mô hình hóa mối quan hệ liên kết chuyên gia trong các mô hình GPT MoE đã được huấn luyện trước và cách mối quan hệ liên kết hướng dẫn chúng ta trong việc giảm truyền thông Alltoall. Đầu tiên, vì chúng ta đang tìm cách xác định mô hình của việc lựa chọn chuyên gia, chúng ta cần một tập hợp các token mà mô hình sẽ suy luận và chúng ta có thể theo dõi việc lựa chọn chuyên gia của chúng tại mỗi lớp. Ở đây chúng tôi lấy mẫu các token từ bộ dữ liệu Pile [25] để profile mô hình định tuyến chuyên gia, một nghiên cứu chi tiết hơn về lấy mẫu token sẽ được thảo luận trong V-G.
+
+Trong Hình 2, chúng tôi hiển thị bản đồ nhiệt của việc lựa chọn chuyên gia của các lớp liên tiếp trong một mô hình GPT 350M MoE-32 đã được huấn luyện trước. Chúng tôi đạt được điều này bằng cách tính toán xác suất có điều kiện qua các chuyên gia trong các lớp liên tiếp. Ở đây chúng tôi đưa ra một dạng toán học của mối quan hệ liên kết chuyên gia. Cho một mô hình MoE đã được huấn luyện trước với E chuyên gia mỗi lớp, giả sử chúng ta có N token, được ký hiệu bởi Tk, k ∈ {1, 2, . . . , N}, và chúng ta ký hiệu chuyên gia thứ i trên lớp j là Ei,j. Khi đó mối quan hệ liên kết chuyên gia giữa Ei,j và Ep,j+1 có thể được đóng gói bởi xác suất có điều kiện sau:
+
+P(Ep,j+1|Ei,j) = (1/N) ∑k=1^N P(Ep,j+1|Ei,j, Tk)     (1)
+
+Đối với chuyên gia Ei,j, mục tiêu của chúng ta là tìm một chuyên gia EA*,j+1, sao cho:
+
+(1/n) ∑k=1^N P(EA*,j+1|Ei,j, Tk) ≥ (1/N) ∑k=1^N P(Ep,j+1|Ei,j, Tk)
+
+cho tất cả p ∈ {1, 2, . . . , E} với i ≠ A*     (2)
+
+Do đó chúng tôi khẳng định chuyên gia EA*,j+1 là chuyên gia liên kết nhất với chuyên gia Ei,j. Mối quan hệ liên kết P(EA*,j+1|Ei,j) này làm sáng tỏ khả năng của các token tại Ei,j sau đó được định tuyến đến EA*,j+1. Chạy một mô hình với 8 chuyên gia mỗi lớp (E = 8) trên tám GPU, ví dụ, sẽ dẫn đến mỗi GPU giữ 1 chuyên gia mỗi lớp. Về cơ bản, đối với hai lớp liên tiếp bất kỳ, chúng ta có tám cặp chuyên gia. Đặt chiến lược những chuyên gia liên kết này trên các GPU giống hệt nhau đảm bảo rằng một token, một khi được định tuyến đến một GPU, thể hiện xu hướng cao để ở lại GPU đó, cho rằng các chuyên gia liên kết nhất của nó trong các lớp tiếp theo cũng cư trú trên cùng GPU. Tuy nhiên, một thách thức phát sinh khi công thức 2 suy ra EA*,j+1 cho nhiều chuyên gia từ lớp j, dẫn đến lặp lại. Điều này cần một chiến lược toàn diện để xác định mối quan hệ liên kết chuyên gia tối ưu toàn cầu.
+
+Hơn nữa, khi các GPU có khả năng lớn hơn, có nghĩa là mỗi GPU có thể giữ nhiều hơn một chuyên gia mỗi lớp, như được hiển thị trong Hình 16, không gian tìm kiếm trở nên lớn hơn nhiều. Cho khả năng C1 của một GPU duy nhất, ký hiệu số lượng chuyên gia nó sẽ giữ mỗi lớp, vấn đề trước đó thay đổi thành như sau:
+
+Cho các chuyên gia
+Ex1,j, Ex2,j, Ex3,j, ..., ExC1,j,
+trong đó x1,...,C1 ∈ {1, 2, . . . , E}     (3)
+
+Chúng ta muốn tìm các chuyên gia
+Ey1,j+1, Ey2,j+1, Ey3,j+1, ..., EyC1,j+1,
+trong đó y1,...,C1 ∈ {1, 2, . . . , E}     (4)
+
+tối đa hóa xác suất có điều kiện kết hợp sau:
+
+(1/n) ∑k=1^N ∑p=1^C1 ∑q=1^C1 P(Eyq,j+1|Exp,j, Tk)     (5)
+
+Giải quyết hàm mục tiêu tổng hợp này đảm bảo các token được định tuyến đến các chuyên gia x1, x2, x3, ..., xC tại lớp j thể hiện xu hướng cao để sau đó được định tuyến đến y1, y2, y3, ..., yC tại lớp j + 1.
+
+Hình 16(c) hiển thị cách giải pháp cho các vấn đề trên có thể hướng dẫn chúng ta trong việc đặt các chuyên gia sao cho khối lượng truyền thông Alltoall có thể được giảm thiểu. Ví dụ, nếu chúng ta biết rằng các chuyên gia E0 và E4 tại lớp 0 có mối quan hệ liên kết kết hợp cao đến các chuyên gia E4 và E7 tại lớp 1, chúng ta có thể đặt chúng lên GPU 0. Tương tự, chúng ta có thể tìm thấy các chuyên gia E2 và E5 tại lớp 2 có mối quan hệ liên kết cao đến các chuyên gia trước đó. Chúng tôi thấy rằng với việc đặt này, token 1 chỉ cần 1 truyền thông Alltoall để đến GPU 0, và nó sẽ đơn giản thực hiện tính toán attention tại chỗ vì tất cả các chuyên gia liên quan của nó trong các lớp tiếp theo đều ở GPU 0.
+
+### C. Mối quan hệ liên kết Chuyên gia Theo giai đoạn
+
+Trong Hình 1(b), chúng tôi mô tả một kịch bản phức tạp hơn nhưng thực tế, trong đó mỗi GPU giữ bốn chuyên gia mỗi lớp. Vì các cluster hiện đại tận dụng NVLINK cho truyền thông intra-node, và interconnect tốc độ cao cho inter-node. Nếu một token vẫn cần được định tuyến đến một chuyên gia bên ngoài GPU hiện tại của nó, chúng ta sẽ muốn chuyên gia đó được giữ tại một GPU intra-node (được ký hiệu bởi đường nét đứt đỏ), thay vì một GPU ở trên một node khác (được ký hiệu bởi đường nét đứt xanh), vì thực hiện truyền thông intra-node có băng thông cao hơn nhiều và độ trễ thấp hơn. Do đó, đối với các GPU trên cùng một node, chúng ta sẽ muốn các chuyên gia mà chúng giữ cũng thể hiện một mức độ mối quan hệ liên kết nhất định với nhau. Trong trường hợp này, mỗi chuyên gia có hai mức độ mối quan hệ liên kết. Mức độ đầu tiên của mối quan hệ liên kết là với các chuyên gia trên cùng GPU, trong khi mức độ thứ hai của mối quan hệ liên kết là với các chuyên gia trên cùng node. Do đó, chúng ta có thể thêm một ràng buộc vào công thức 5 trước đó, do đó các chuyên gia trên một GPU hiện có dạng mối quan hệ liên kết sau:
+
+(1/N) ∑k=1^N ∑p=1^C1 ∑q=1^C1 P(Eyq,j+1|Exp,j, Tk) +
+(1/N) ∑k=1^N ∑p=1^C1 ∑o=1^(C2-C1) P(Eyo,j+1|Exp,j, Tk)     (6)
+
+Lưu ý rằng C2 ký hiệu khả năng chuyên gia mỗi lớp của toàn bộ node, và Eyo,j+1 đại diện cho chuyên gia yo tại lớp j + 1 được giữ bởi các GPU intra-node khác.
+
+### D. Giải quyết tính hai mặt của Mối quan hệ liên kết bằng Lập trình Số nguyên
+
+Trong công thức 2, 5, và 6, chúng tôi cung cấp các hàm mục tiêu đơn giản để tìm một sự đặt các chuyên gia như vậy đảm bảo mối quan hệ liên kết chuyên gia tốt nhất. Tuy nhiên, như chúng tôi đã đề cập, các hàm mục tiêu này chỉ đứng ở góc độ của một GPU. Tìm chiến lược đặt chuyên gia tốt nhất cho tất cả các GPU trên tất cả các node là, tuy nhiên, một vấn đề tối ưu hóa tổ hợp phức tạp.
+
+Để vượt qua điều này, chúng tôi chuyển trọng tâm của mình đến Vấn đề Đối ngẫu Lagrange liên quan của nó. Ý tưởng là biến đổi vấn đề tối đa hóa của chúng ta thành một vấn đề tối thiểu hóa tương đương, dễ xử lý hơn về mặt tính toán. Về cơ bản, mối quan hệ liên kết cao ngụ ý việc định tuyến lại token tối thiểu. Do đó, tính hai mặt nổi lên từ những mục tiêu đan xen này: một tìm kiếm củng cố tích cực thông qua mối quan hệ liên kết, và cái khác nhắm mục tiêu giảm thiểu các rối loạn đối với mối quan hệ liên kết này. Để chuyển đổi sang vấn đề đối ngẫu, chúng ta phải thiết lập mối quan hệ giữa việc tối đa hóa mối quan hệ liên kết tổng hợp này và việc giảm thiểu chi phí định tuyến lại token. Điều này tự nhiên dẫn chúng ta đến việc xem xét các rối loạn đối với mối quan hệ liên kết, có thể được định lượng như chi phí định tuyến lại token giữa các GPU.
+
+Cho mục tiêu của chúng ta để giảm thiểu định tuyến lại token, chúng ta hình thành hàm đối ngẫu g(λ):
+
+g(λ, Ei,j) = inf[Ep,j+1][P(Ep,j+1|Ei,j) − λG(Ep,j+1, Ei,j)]     (7)
+
+Trong đó G(Ep,j+1, Ei,j) đại diện cho chi phí liên quan đến việc định tuyến lại token do việc lựa chọn chuyên gia trên các GPU khác biệt, và λ đóng vai trò như một số hạng regularization để cân bằng mối quan hệ liên kết và định tuyến lại token.
+
+Vì truyền thông inter-node luôn có độ trễ cao nhất và băng thông thấp nhất, ưu tiên đầu tiên của chúng ta là giảm lượng định tuyến inter-node. Hình 1(b) hiển thị một ví dụ về mối quan hệ liên kết chuyên gia theo giai đoạn, trong đó các mũi tên xanh lá ký hiệu mối quan hệ liên kết chuyên gia cao, các mũi tên đỏ ký hiệu mức độ trung bình của mối quan hệ liên kết, và các mũi tên xanh dương ký hiệu mối quan hệ liên kết chuyên gia thấp nhất. Mục tiêu của chúng ta là giữ các chuyên gia có mối quan hệ liên kết cao bên trong các GPU đơn lẻ, và giữ các chuyên gia có mối quan hệ liên kết trung bình bên trong các node đơn lẻ. Trong giai đoạn 1, chúng ta sẽ giảm định tuyến inter-node càng nhiều càng tốt, và trong giai đoạn 2, chúng ta sẽ giảm thiểu định tuyến intra-node dựa trên kết quả giai đoạn 1. Do đó, chúng tôi đề xuất một hàm mục tiêu không có hệ số theo chiến lược tối ưu hóa từ trên xuống.
+
+Công thức 8 là hàm mục tiêu, trong đó xpi,j là một biến nhị phân, ký hiệu liệu Ei,j có được giữ bởi GPU p hay không, Rk,j là một biến nhị phân, bằng một ký hiệu rằng đối với một token k tại lớp j, nó sẽ được định tuyến đến một chuyên gia bên ngoài node hiện tại (hoặc GPU). Lưu ý rằng, ở đây chúng ta áp dụng hàm mục tiêu hoàn toàn giống hệt cho cả giai đoạn 1 và 2 (như đã đề cập ở trên). Trong giai đoạn 1, Rk,j = 1 đại diện cho một định tuyến inter-node, trong khi trong giai đoạn 2, nó đại diện cho một định tuyến intra-node. Đối với các ràng buộc, chúng ta cần tất cả các node (hoặc GPU) được cân bằng tải, có nghĩa là đối với mỗi lớp, mỗi node (hoặc GPU) nên giữ cùng số lượng chuyên gia, được định nghĩa bởi công thức 9, trong đó E ký hiệu tổng số chuyên gia mỗi lớp, và P ký hiệu tổng số node (hoặc GPU). Hơn nữa, để đầy đủ, chúng ta cần công thức 10 để đảm bảo mỗi chuyên gia được giữ độc quyền bởi một node (hoặc GPU). Công thức 11 và 12 là các bất đẳng thức cần thiết ánh xạ việc đặt chuyên gia đến liệu một định tuyến cụ thể có cross-node (hoặc GPU) hay không. Sau khi giải quyết vấn đề lập trình tuyến tính số nguyên trên, biến xpi,j trong giải pháp sẽ được sử dụng trực tiếp như chiến lược đặt chuyên gia khi tải mô hình MoE lên GPU.
+
+Minimize ∑k=1^N ∑j=1^(L-1) Rk,j     (8)
+
+Biến xpi,j ∈ {0,1}, Rk,j ∈ {0,1}
+
+Ràng buộc ∑i=1^E xpi,j = E/P,
+∀j ∈ {1,2, . . . , L}, p ∈ {1,2, . . . , P}     (9)
+
+∑p=1^P xpi,j = 1,
+∀j ∈ {1,2, . . . , L}, i ∈ {1,2, . . . , E}     (10)
+
+Rk,j ≥ xpi,j − xpi,j+1     (11)
+Rk,j ≥ xpi,j+1 − xpi,j     (12)
+
+### E. Tính không nhạy cảm của Mối quan hệ liên kết Chuyên gia
+
+Để nắm bắt chính xác mối quan hệ liên kết chuyên gia giữa các lớp trong một mô hình MoE đã được huấn luyện trước, chúng ta cần sử dụng đủ token và theo dõi quyết định định tuyến của chúng tại mỗi lớp MoE. Vì mục tiêu là tăng tốc suy luận, chúng ta cũng cần điều tra liệu mối quan hệ liên kết chuyên gia có không nhạy cảm với phân phối của bộ dữ liệu hay không. Lý do là chúng ta không thể dự đoán các token thực tế và ngữ cảnh của chúng khi mô hình đang phục vụ các yêu cầu từ người dùng, do đó, mối quan hệ liên kết chuyên gia mà chúng ta học được từ bộ dữ liệu offline phải vẫn hiệu quả trong quá trình suy luận online. Chúng tôi sẽ phân tích thêm điều này trong thí nghiệm.
+
+## V. ĐÁNH GIÁ THỰC NGHIỆM
+
+### A. Thiết lập
+
+**Phần cứng:** Chúng tôi tiến hành tất cả các thí nghiệm trên cluster GPU Wilkes3 Ampere, trong đó mỗi node có 2 bộ vi xử lý AMD EPYC 7763 64-Core, và 4 GPU NVIDIA A100-SXM4-80GB, được kết nối bởi NVLINK. Đối với inter-node, nó được trang bị interconnect Mellanox HDR200 InfiniBand dual-rail.
+
+**Mô hình:** Chúng tôi sử dụng thư viện Deepspeed-Megatron [26], [27] cho việc huấn luyện trước. Trong quá trình suy luận, tất cả các mô hình đều với Top-1 gating và khả năng token biến đổi.
+
+[THIS IS TABLE: Bảng II showing MoE models used for experiments with columns for Model, Base, Experts, Layers, and D]
+
+**Bộ dữ liệu:** Chúng tôi chia bộ dữ liệu Pile [25] thành một tập huấn luyện và một tập đánh giá. Tập huấn luyện được sử dụng để huấn luyện mô hình, trong quá trình huấn luyện, chúng tôi ghi lại các quyết định định tuyến chuyên gia của token tại mỗi lớp. Chúng tôi giải quyết hàm mục tiêu 8 dựa trên nhật ký theo dõi và sau đó xác định chiến lược đặt chuyên gia. Sau đó, chúng tôi tải mô hình lên GPU theo chiến lược đặt và đánh giá hiệu suất trên tập đánh giá.
+
+[THIS IS FIGURE: Hình 6 showing communication overhead graph with different expert parallel sizes]
+
+Hình 6: Trên các mô hình GPT MoE đã được huấn luyện trước khác nhau, chúng tôi thay đổi kích thước song song chuyên gia và kiểm tra chi phí truyền thông tổng thể. 32L và 40L ký hiệu các mô hình GPT với 32 và 40 lớp.
+
+### B. Giảm Truyền thông Tập thể với Song song Chuyên gia Nhất quán Ngữ cảnh
+
+Trong song song chuyên gia vanilla, mỗi lớp MoE yêu cầu nghiêm ngặt hai tập hợp Alltoall vì các token cần được thu thập bởi GPU tương ứng của chúng trong nhóm song song dữ liệu để thực hiện tính toán attention. Với thiết kế nhất quán ngữ cảnh của chúng tôi, tuy nhiên, ngữ cảnh của tất cả các token nhất quán và hiển thị trên mỗi GPU, có nghĩa là chúng ta không còn cần Alltoall thứ hai để lấy các token, thay vào đó, chúng có thể thực hiện tính toán attention tại chỗ trên bất kỳ GPU nào. Hình 6 hiển thị chi phí truyền thông trong song song chuyên gia ban đầu và thiết kế nhất quán ngữ cảnh của chúng tôi.
+
+Chúng tôi đã thử nghiệm mô hình GPT 350M với 8, 16, 32, và 64 chuyên gia mỗi lớp tương ứng, và phát hiện ra rằng với nhất quán ngữ cảnh, một tỷ lệ lớn truyền thông Alltoall trở nên dư thừa vì các token sẽ thực hiện tính toán attention tại chỗ. Lưu ý rằng việc giảm chi phí truyền thông Alltoall là hơn 50%, lý do là các token có thể tìm thấy chuyên gia của chúng trên GPU cục bộ mặc dù những chuyên gia này không được tải theo cách nhận thức cấu trúc liên kết, do đó chúng có thể được định tuyến trực tiếp đến những chuyên gia đó mà không quay lại GPU ban đầu của chúng. Ngoài ra, chúng tôi thấy chi phí sử dụng AllGather để đảm bảo nhất quán ngữ cảnh ở cuối mỗi lần lặp là tầm thường trong các trường hợp 8 và 16-GPU. Mặc dù nó trở nên hơi nặng hơn với 32 và 64 GPU, truyền thông tổng thể vẫn ít hơn nhiều so với baseline. Ngoài ra, khi mô hình có 32 và 40 lớp, AllGather trở nên ít quan trọng hơn.
+
+### C. Giảm Định tuyến Token Cross-GPU với Mối quan hệ liên kết Chuyên gia
+
+[THIS IS FIGURE: Hình 7 showing bar chart of token routing reduction]
+
+Hình 7: Được đánh giá trên GPT 350M MoE-64 đã được huấn luyện trước, các thanh ký hiệu tỷ lệ phần trăm trung bình của các token được định tuyến đến các chuyên gia trên GPU hiện tại của chúng. Biểu đồ hiển thị bao nhiều truyền thông cross-GPU được giảm với thiết kế mối quan hệ liên kết chuyên gia của chúng tôi.
+
+Hình 7 minh họa việc giảm truyền thông cross-GPU từ hai góc độ. Đầu tiên, cho một mô hình MoE-64, khi sử dụng ít GPU hơn để thực hiện song song chuyên gia, mỗi GPU sẽ giữ nhiều chuyên gia hơn mỗi lớp. Ví dụ, khi sử dụng 4 GPU, mỗi GPU giữ 16 chuyên gia mỗi lớp, so với khi sử dụng 32 GPU, mỗi GPU chỉ có thể giữ 2 chuyên gia mỗi lớp, do đó một token có thể có khả năng được định tuyến đến các GPU khác nhiều hơn. Khung Deepspeed baseline không có bất kỳ tối ưu hóa nào về việc đặt các chuyên gia giữa các lớp, có nghĩa là các token có thể được định tuyến đến bất kỳ GPU nào với cơ hội bằng nhau. Trong thiết kế của chúng tôi, vì chúng tôi khai thác mối quan hệ liên kết chuyên gia giữa các lớp, trên 4 GPU, chúng ta có thể quan sát trung bình hơn một nửa các token không tham gia vào truyền thông Alltoall. Khi mở rộng đến 8 GPU, thiết kế mối quan hệ liên kết chuyên gia của chúng tôi có thể giữ 40% token vẫn ở cùng GPU, trong khi baseline giảm mạnh. Khi chúng tôi tải mô hình với 32 GPU, chúng ta vẫn có thể duy trì nó ở 28%. Hơn nữa, biểu đồ mô tả cải thiện trong việc giảm số lượng token đi ra thực sự sẽ yêu cầu truyền thông Alltoall, trong đó 40% truyền thông được tiết kiệm khi sử dụng 4 GPU, và 25% được tiết kiệm khi sử dụng 32 GPU.
+
+### D. Giảm Định tuyến Token Inter-node với Mối quan hệ liên kết Chuyên gia
+
+[THIS IS FIGURE: Hình 8 showing similar bar chart for inter-node communication]
+
+Hình 8: Tương tự như hình trước, nhưng ở đây các thanh ký hiệu tỷ lệ phần trăm trung bình của các token được định tuyến đến các chuyên gia trên node hiện tại của chúng. Biểu đồ hiển thị bao nhiều truyền thông inter-node được giảm với thiết kế mối quan hệ liên kết chuyên gia của chúng tôi.
+
+Xu hướng tương tự có thể được quan sát trong Hình 8, trong đó chúng tôi đo số lượng token được định tuyến đến các chuyên gia intra-node. Vì mối quan hệ liên kết chuyên gia theo giai đoạn của chúng tôi nhằm giảm định tuyến inter-node với ưu tiên cao nhất, nhiều token hơn có khả năng ở lại trong cùng node thay vì được định tuyến đến các chuyên gia trên các node khác. Trong các thí nghiệm của chúng tôi, chúng tôi thấy rằng với thiết kế mối quan hệ liên kết chuyên gia, các token trung bình có khả năng ở lại trong cùng node cao gấp 2x mà không tham gia vào truyền thông inter-node.
+
+[THIS IS FIGURE: Hình 9 showing pie charts of Alltoall overhead proportions across different node configurations]
+
+Hình 9: Tỷ lệ chi phí Alltoall so với thời gian dành cho tính toán. Ở đây chúng tôi chỉ đo bốn hoạt động quan trọng nhất trong mô hình MoE, vì những hoạt động khác là tầm thường.
+
+### E. Đánh giá Suy luận GPT MoE
+
+Sau khi xem xét tính chất của định tuyến cục bộ của token, bây giờ chúng tôi thực hiện một bài kiểm tra suy luận end-to-end trên toàn bộ mô hình đã được huấn luyện trước. Khi sử dụng số lượng node khác nhau để thực hiện song song chuyên gia, tỷ lệ chi phí Alltoall thay đổi rất nhiều. Hình 9 mô tả tỷ lệ mà mỗi hoạt động chiếm trong mô hình MoE. Khi chỉ sử dụng một node, tất cả các GPU được kết nối nội bộ qua NVLINK, có tốc độ cao và độ trễ thấp, do đó, chi phí truyền thông Alltoall khoảng 15%, và tính toán chiếm ưu thế trong tổng thời gian. Trong tình huống này, sẽ không có quá nhiều không gian cho chúng ta tối ưu hóa.
+
+Khi chúng ta bao gồm nhiều node tính toán hơn, chi phí Alltoall trở nên quan trọng hơn trong song song chuyên gia vanilla. Khi sử dụng 2 node, chúng ta quan sát sự tăng vọt của chi phí Alltoall lên khoảng 63% tổng thời gian. Khi mở rộng đến 8 node, suy luận gần như hoàn toàn bị ràng buộc bởi truyền thông, với 76% thời gian dành cho Alltoall. Hình 10 hiển thị bốn mô hình GPT 350M MoE đã được huấn luyện trước khác nhau dưới một loạt cấu hình song song. Đối với mô hình MoE-8, chúng tôi sử dụng 4 và 8 GPU để thực hiện song song chuyên gia, vì chi phí Alltoall trở nên nổi bật hơn trong truyền thông inter-node, chiến lược mối quan hệ liên kết chuyên gia của chúng tôi mang lại 10% tăng tốc khi sử dụng 8 GPU. Đối với mô hình MoE-16, chúng tôi quan sát tăng tốc đáng kể nhất 2.2x được thu được khi mỗi GPU giữ 2 chuyên gia mỗi lớp. Khi mở rộng đến 16 GPU trong đó mỗi GPU chỉ giữ 1 chuyên gia mỗi lớp, cải thiện là khoảng 20%. Trong các mô hình MoE-32, khi mô hình chạy trên 8 và 16 GPU, các phương pháp của chúng tôi có thể đạt được tăng tốc 1.6x. Và tương tự, đối với mô hình MoE-64, lợi ích cao nhất trong thông lượng là khi mỗi GPU giữ 8, 4, 2 chuyên gia mỗi lớp.
+
+Bằng cách xem xét xu hướng trong những kết quả này, chúng tôi tìm thấy một hành vi thú vị rằng khi mỗi GPU giữ nhiều chuyên gia hơn, thiết kế nhất quán ngữ cảnh và mối quan hệ liên kết chuyên gia có thể mang lại lợi ích hiệu suất nhiều hơn vì nó có thể phần lớn khai thác mối quan hệ liên kết chuyên gia trong mỗi GPU, có nghĩa là nó có thể tiết kiệm hầu hết truyền thông Alltoall. Tuy nhiên, khi mỗi GPU chỉ giữ 1 chuyên gia mỗi lớp, mối quan hệ liên kết chuyên gia sẽ chủ yếu ở mức intra-node, ví dụ MoE-32 trên 32 GPU, và MoE-64 trên 64 GPU. Trong những trường hợp này, chi phí trong việc giới thiệu nhiều node hơn trong truyền thông trở nên nổi bật so với những gì chúng ta tiết kiệm được với mối quan hệ liên kết chuyên gia intra-node. Đối với trường hợp 4-GPU, mặc dù mỗi GPU giữ nhiều chuyên gia mỗi lớp, không có nhiều lợi ích hiệu suất do chi phí Alltoall intra-node tầm thường trên hệ thống phần cứng mà các thí nghiệm của chúng tôi được tiến hành.
+
+[THIS IS FIGURE: Hình 10 showing multiple graphs of inference throughput across different MoE model configurations]
+
+Hình 10: Thông lượng suy luận mô hình GPT MoE end-to-end. Chúng tôi kiểm tra 7 biến thể của các mô hình đã được huấn luyện trước với nhiều node tính toán, mỗi node có 4 GPU. Kết quả được chuẩn hóa để visualize tốt hơn.
+
+### F. Tính chất Phát triển của Mối quan hệ liên kết Chuyên gia trong quá trình Huấn luyện Mô hình MoE
+
+Trong phần này, chúng tôi muốn điều tra cách mối quan hệ liên kết chuyên gia phát triển với việc huấn luyện mô hình. Hình 11 hiển thị tỷ lệ định tuyến chuyên gia tại đầu quá trình huấn luyện. Ở đây chúng tôi chỉ hiển thị thống kê của lớp MoE cuối cùng để đơn giản, vì chúng tôi xác nhận rằng các lớp MoE khác có phân phối tương tự. Tại đầu quá trình huấn luyện, mô hình thể hiện một phân phối rất lệch, biểu thị cho sự mất cân bằng rõ rệt giữa các chuyên gia, điều này phù hợp với kết quả trong các nghiên cứu khác [13]. Tuy nhiên, khi quá trình huấn luyện tiến triển, một phân phối đồng đều và cân bằng hơn được quan sát. Điều này cũng được phản ánh trong Hình 12a, trong đó chúng tôi đo mối quan hệ liên kết chuyên gia bằng cách giải quyết công thức 8 tại các lần lặp khác nhau của quá trình huấn luyện. Vài trăm lần lặp đầu tiên chỉ thấy một vài chuyên gia được kích hoạt thường xuyên mỗi lớp MoE, và mô hình thực sự có thể có mối quan hệ liên kết chuyên gia rất cao vì hầu hết các token được định tuyến đến một tập hợp chuyên gia cố định tại mỗi lớp. Sau khi vượt qua giai đoạn ban đầu, phân phối định tuyến chuyên gia trở nên đa dạng, và do đó mối quan hệ liên kết giảm vì có nhiều chuyên gia tham gia vào định tuyến. Sau 2k lần lặp đầu tiên của quá trình huấn luyện, mô hình bắt đầu thể hiện mối quan hệ liên kết chuyên gia ổn định hơn nhiều và nó tiếp tục tăng khi các chuyên gia trở nên cụ thể hơn theo miền, do đó mối quan hệ liên kết trở nên nổi bật hơn giữa các chuyên gia ở các lớp khác nhau.
+
+[THIS IS FIGURE: Hình 11 showing pie charts of expert routing proportions during early training]
+
+Hình 11: Tỷ lệ token được định tuyến đến mỗi chuyên gia tại lớp MoE cuối cùng, mỗi màu đại diện cho một chuyên gia. Hình này hiển thị lần lặp huấn luyện 0 đến 2000, vì quá trình huấn luyện bắt đầu với các tham số mô hình ngẫu nhiên, vài trăm lần lặp đầu tiên thấy một vài chuyên gia nhận hầu hết các token. Các mô hình được huấn luyện với GShard loss, do đó, tất cả đều thể hiện cân bằng tải trong việc lựa chọn chuyên gia.
+
+[THIS IS FIGURE: Hình 12 showing graphs of expert affinity evolution during training]
+
+Hình 12: Điều tra mối quan hệ liên kết chuyên gia khi mô hình được huấn luyện từ đầu. Mối quan hệ liên kết được scale để visualize tốt hơn.
+
+### G. Cần bao nhiêu Token để Nắm bắt Mối quan hệ liên kết Chuyên gia trong Mô hình Đã được Huấn luyện trước?
+
+Trong V-A, chúng tôi đã đề cập ngắn gọn về cách giải quyết đúng vấn đề lập trình tuyến tính số nguyên 8 để có được mối quan hệ liên kết chuyên gia trong một mô hình MoE đã được huấn luyện trước. Trong thực tế, tuy nhiên, vì bộ dữ liệu Pile chứa hàng trăm tỷ token, việc theo dõi và ghi lại tất cả các quyết định định tuyến của token là không khả thi. Do đó, chúng tôi chọn lấy mẫu ngẫu nhiên một phần token. Hình 13 hiển thị tăng tốc tương đối trong truyền thông Alltoall khi chúng tôi sử dụng số lượng token khác nhau để nắm bắt mối quan hệ liên kết chuyên gia. Vì mối quan hệ liên kết chuyên gia về cơ bản là một dạng xác suất có điều kiện giữa các ưu tiên định tuyến chuyên gia giữa các lớp, việc sử dụng thông tin của nhiều token hơn chắc chắn sẽ cho một phép xấp xỉ tốt hơn. Ở đây, chúng tôi thấy rằng cho các mô hình GPT MoE đã được huấn luyện trước, chúng tôi thường chỉ cần hàng nghìn token để nắm bắt chính xác mối quan hệ liên kết chuyên gia. Đối với các mô hình MoE-8, 1000 token là đủ, và đối với các mô hình MoE-64, 3000 token là đủ. Do đó, công thức 8 có thể được giải quyết hiệu quả bằng cách chỉ xem xét số lượng token này.
+
+[THIS IS FIGURE: Hình 13 showing graph of token count vs speedup]
+
+Hình 13: Số lượng token được lấy mẫu ngẫu nhiên được sử dụng để khai thác mối quan hệ liên kết chuyên gia và tăng tốc tương đối của nó trong quá trình suy luận. Các mô hình với nhiều chuyên gia hơn mỗi lớp yêu cầu nhiều token hơn để nắm bắt chính xác mối quan hệ liên kết chuyên gia.
+
+### H. Tính nhất quán trên Bộ dữ liệu Out-of-distribution
+
+Trong triển khai, các mô hình MoE có thể được sử dụng trong các kịch bản trong đó ngữ cảnh khác với bộ dữ liệu huấn luyện của chúng. Khi đó câu hỏi là, các mô hình MoE có luôn thể hiện mối quan hệ liên kết chuyên gia tương tự bất kể ngữ cảnh của dữ liệu đầu vào hay không? Nói cách khác, mối quan hệ liên kết chuyên gia có thực sự là một tính chất nội tại của mô hình MoE đã được huấn luyện trước không?
+
+[THIS IS TABLE: Bảng III showing consistency across different datasets]
+
+Bảng III hiển thị mối quan hệ liên kết chuyên gia trên các bộ dữ liệu không được bao gồm trong dữ liệu huấn luyện. Chúng tôi sử dụng bộ dữ liệu Pile [25] để profile mối quan hệ liên kết chuyên gia của một mô hình GPT 350M MoE-32, sau đó chúng tôi trực tiếp đo liệu mối quan hệ liên kết chuyên gia này có đúng trên ba bộ dữ liệu khác, cụ thể là C4 [28], Dolma [29], và Yelp Reviews [30]. Việc đặt chuyên gia mà chúng tôi giải quyết từ bộ dữ liệu Pile hiển thị mối quan hệ liên kết gần như giống hệt trên các bộ dữ liệu out-of-distribution khác, chứng minh mối quan hệ liên kết chuyên gia là một đặc điểm cố hữu trong các mô hình MoE đã được huấn luyện trước.
+
+## VI. CÔNG TRÌNH LIÊN QUAN
+
+Mặc dù nhiều công trình trước đây tồn tại để tối ưu hóa bước huấn luyện trước của các mô hình MoE. Mặc dù các phương pháp của chúng để đạt được điều này khác nhau như kết hợp song song chuyên gia với các chiến lược song song khác như song song tensor [31] và sharded optimizers [6], hoặc phát triển các kernel định tuyến được tối ưu hóa [32], [33], hoặc sử dụng CPU và SSD offload [34], hầu hết các chiến lược được tối ưu hóa cho mô hình huấn luyện MoE huấn luyện trước và phần cứng. Công trình của chúng tôi bổ sung cho những điều này, và được áp dụng độc quyền tại thời điểm suy luận.
+
+Jiamin Li et al. đề xuất expert popularity [19] giữa hai lớp liên tiếp. Tuy nhiên, họ chỉ tính toán các chuyên gia top-k phổ biến tại mỗi lớp MoE và sau đó tạo ra bản sao của những chuyên gia phổ biến nhất đó trên các GPU cục bộ. Điều này tương tự như công thức 2 trong phần phương pháp của chúng tôi. Như chúng tôi đã thảo luận, điều này chỉ đảm bảo một tối ưu địa phương cho các chuyên gia cụ thể, do đó, thay vì thực hiện tối ưu hóa đặt chuyên gia toàn cầu, họ sử dụng bộ nhớ bổ sung để chứa những chuyên gia phổ biến này cục bộ. Trong thiết kế của chúng tôi, chúng ta không cần những bản sao rõ ràng như vậy của các chuyên gia phổ biến vì chúng tôi hình thành nó như một hàm mục tiêu tối ưu hóa toàn cầu. Trong những trường hợp cực đoan nhất, trong đó bộ nhớ của GPU chỉ có thể chứa một chuyên gia mỗi lớp, phương pháp của chúng tôi vẫn có thể cung cấp tăng tốc bằng cách tận dụng mối quan hệ liên kết chuyên gia intra-node, như được hiển thị trong Hình 10.
+
+Jiaao He et al. đề xuất FasterMoE [13], và Chang Chen et al. [14] giới thiệu TA-MoE, cả hai đều tối ưu hóa việc huấn luyện mô hình MoE quy mô lớn thông qua các chiến lược gating nhận thức cấu trúc liên kết. Tuy nhiên, tính hợp lệ của những chiến lược này bị tổn hại đáng kể trong quá trình suy luận do tính chất thay đổi của các cấu trúc liên kết phần cứng. Sự khác biệt trong các cấu hình phần cứng trong quá trình suy luận làm cho cách tiếp cận gating nhận thức cấu trúc liên kết trở nên không hiệu quả, nhấn mạnh một hạn chế quan trọng của những phương pháp này trong việc thích ứng với môi trường phần cứng động. Mingshu Zhai et al. đề xuất SmartMoE [35], trong đó họ điều tra một chiến lược offline cho việc huấn luyện tối ưu hóa của các mô hình MoE. Nó chủ yếu xoay quanh việc phân tách không gian song song hybrid thành các pools tĩnh, thực sự cũng là để giải quyết một vấn đề tối ưu hóa tổ hợp.
+
+## VII. ĐÓNG GÓP VÀ KẾT LUẬN
+
+Tóm lại, chúng tôi đã giới thiệu ExFlow, một kỹ thuật tối ưu hóa mới tăng tốc đáng kể suy luận của các mô hình Mixture of Experts (MoE) dựa trên GPT trong các hệ thống phân tán. Bằng cách khai thác mối quan hệ liên kết chuyên gia giữa các lớp vốn có, ExFlow loại bỏ một truyền thông Alltoall quan trọng, giảm cả độ trễ và chi phí truyền thông. Cách tiếp cận của chúng tôi tận dụng một mô hình lập trình số nguyên cho việc đặt chuyên gia tối ưu, tạo điều kiện giảm tới 67% độ trễ định tuyến cross-GPU và cải thiện thông lượng lên đến 120% so với các phương pháp hiện có, mà không hy sinh độ chính xác của mô hình. Những tiến bộ này không chỉ cung cấp một giải pháp có thể mở rộng cho suy luận dựa trên MoE mà còn đưa ra những hiểu biết có giá trị về việc thu nhận giai đoạn đầu và ổn định của mối quan hệ liên kết chuyên gia trong việc huấn luyện mô hình, do đó mở đường cho nghiên cứu tương lai trong lĩnh vực này.
+
+## TÀI LIỆU THAM KHẢO
+
+[References 1-35 follow in the original format, maintaining the same numbering and citation style]
+
+## PHỤ LỤC
+
+[The appendix contains Figures 14-16 showing expert affinity patterns across different layers of a pre-trained GPT 350M MoE-32 model, with detailed heatmap visualizations]

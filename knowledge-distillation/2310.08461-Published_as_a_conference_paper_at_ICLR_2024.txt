@@ -1,0 +1,1961 @@
+# 2310.08461.pdf
+# Converted from PDF to TXT
+# Source path: /home/admin88/arxiv-downloader/knowledge-distillation/2310.08461.pdf
+# File size: 1886760 bytes
+
+===============================================
+PDF FILE CONTENT
+===============================================
+
+
+--- PAGE 1 ---
+Published as a conference paper at ICLR 2024
+DISTILL SPEC: IMPROVING SPECULATIVE DECODING
+VIAKNOWLEDGE DISTILLATION
+Yongchao Zhou1,3∗, Kaifeng Lyu1,4∗, Ankit Singh Rawat1, Aditya Krishna Menon1,
+Afshin Rostamizadeh1, Sanjiv Kumar1, Jean-François Kagy1†, Rishabh Agarwal2,5†
+1Google Research2Google DeepMind3University of Toronto4Princeton University5Mila
+ABSTRACT
+Speculative decoding (SD) accelerates large language model inference by employing a
+faster draft model for generating multiple tokens, which are then verified in parallel by
+the larger target model, resulting in the text generated according to the target model dis-
+tribution. However, identifying a compact draft model that is well-aligned with the target
+model is challenging. To tackle this issue, we propose DistillSpec , a method that uses
+knowledge distillation to better align the draft model with the target model before applying
+SD. DistillSpec makes two key design choices, which we demonstrate via systematic study
+to be crucial to improving the draft and target alignment: utilizing on-policy data genera-
+tion from the draft model, and tailoring the divergence function to the task and decoding
+strategy. Notably, DistillSpec yields 10−45% speedups over standard SD on a range of
+benchmarks, using both greedy and non-greedy sampling. We show that the distilled model
+can be well transferred to various tasks with an average speedup of 26% . Furthermore, we
+combine DistillSpec with lossy SD to achieve fine-grained control over the latency vs. task
+performance trade-off. Finally, in practical scenarios with models of varying sizes, first us-
+ing distillation to boost the performance of the target model and then applying DistillSpec
+to train a well-aligned draft model can reduce decoding latency by 6−10×with minimal
+performance drop, compared to standard decoding without distillation.
+1 I NTRODUCTION
+Large language models (LLMs) have revolutionized natural language understanding and genera-
+tion across diverse applications (OpenAI, 2023; Anil et al., 2023). However, their autoregressive
+generation nature poses significant computational challenges, especially in real-time deployments
+with stringent latency constraints (Thoppilan et al., 2022; Pope et al., 2023). Conversely, smaller
+language models, while computationally efficient, often lack the expressive power of their larger
+counterparts and achieve subpar performance. While reducing the inference cost of larger models,
+e.g., via quantization or pruning, or improving the performance of the smaller models, e.g., via
+knowledge distillation (KD) (Hinton et al., 2015), constitute natural approaches to enable a favor-
+able performance versus inference cost trade-off, these approaches frequently result in unacceptable
+performance gap compared to the high-quality large models. This has inspired a growing literature
+on designing mechanisms that combine both large and small models at inference to approximate the
+performance of the larger models without incurring their high computational cost.
+Among conventional approaches, model cascading aims to identify easy instances where smaller
+models suffice to achieve good performance, and soliciting larger models only on a subset of hard
+instances (Rowley et al., 1998; Xu et al., 2014) or tasks (Cai et al., 2023b). Different from such task-
+or instance-level cascading, speculative decoding (SD) (Leviathan et al., 2023; Chen et al., 2023)
+exploits the token-level variability in the computation demand during LLM inference by interac-
+tively invoking a small “draft” model and a large “target” model. At a given stage during inference,
+the draft model generates successive candidate tokens for multiple inference steps via autoregressive
+decoding. The target model then verifies the candidate tokens via parallel decoding, and employs
+rejection sampling to accept a subset of candidate tokens at contiguous positions.
+The main objective of SD is to speed up text generation while guaranteeing that the decoded tokens
+follow the target model distribution. SD relies on the insight that the combined cost of autoregres-
+sive decoding with a small draft model followed by parallel verification with the target model is
+∗Student Researcher at Google Research.†Advising contribution. Corresponding authors:
+<yczhou@cs.toronto.edu>, <jfkagy@google.com>, and <rishabhagarwal@google.com>.
+1arXiv:2310.08461v2  [cs.CL]  31 Mar 2024
+
+--- PAGE 2 ---
+Published as a conference paper at ICLR 2024
+50100150Speculative Decoding 
+ Speedup (%)+25% +19%
+XSum+16%+18%
+GSM8K+41%+46%
+CNNDM+10%+10%
+WMT+23%+28%
+BBH (Transfer)DistillSpec (Greedy) Standard SD (Greedy) DistillSpec (Non-Greedy) Standard SD (Non-Greedy)
+Figure 1: Performance comparison of standard speculative decoding (SD) vs. our proposed DistillSpec, with
+small- and XL-sized models from the T5 v1.1 family (Raffel et al., 2020) being utilized as the draft and the
+target models, respectively. DistillSpec enhances SD speed by better aligning the draft with the target via
+white-box knowledge distillation, resulting in a consistent 10 −45% speedup improvement over standard SD
+across various datasets. The distilled draft model from GSM8K transfers well to 23 unseen BigBenchHard
+tasks (Suzgun et al., 2022), resulting in an average speedup of 26% . See § 5.1 for additional details.
+lower than the cost of autoregressive decoding with the target model alone. However, the realized
+inference cost reduction or latency improvement crucially depends on the acceptance rate of the
+draft-generated tokens by the target model, which can be shown to be directly tied to the alignment
+between the token distributions of the draft and target models. Thus, a successful application of SD
+hinges on identifying a compact draft model that simultaneously has small autoregressive decoding
+costandis closely aligned with the target model.
+In this work, we propose DistillSpec, a novel approach that relies on KD (Hinton et al., 2015) to
+obtain an effective draft model. Unlike the standard application of KD which primarily focuses
+on improving the task performance of a small student model, DistillSpec aims at aligning the stu-
+dent (draft) model with the teacher (target) model to enhance the acceptance rate during SD. We
+undertake a comprehensive exploration of the distillation process for speeding up SD, considering
+several factors including the composition of training data, choice of divergence functions to define
+the training objective for KD, and decoding strategies. Notably, our findings underscore that using
+model-generated data is crucial for ensuring strong student-teacher alignment across various tasks
+via KD, and that the selection of the best-performing divergence function in DistillSpec is highly
+task-dependent and sensitive to the decoding strategy (i.e., greedy versus non-greedy). Furthermore,
+we explore the utility of DistillSpec for lossy SD (Leviathan et al., 2023) which allows for sampling
+away from the target model distribution. We show that combining DistillSpec with lossy SD enables
+a more fine-grained control over the latency versus task performance trade-off.
+Finally, we carry out a systematic study of how to design an efficient inference scheme in a practical
+setting where one has access to multiple models of increasing size and quality. Leveraging the
+insights that we have laid out about KD and SD, our study concludes that the most effective strategy
+involves first distilling a large model into a smaller one as the potential target model for performance
+optimization, followed by DistillSpec for distilling an even smaller model to be used as the draft
+model in SD. This approach results in a remarkable 6−10×reduction in latency, compared to a
+standalone non-distilled target model of the same size, with minimal performance degradation.
+Our key contributions are:
+(i) We propose DistillSpec, a method that uses KD to enhance draft model alignment with the target
+model (§4), and show that our method can improve SD speed by 10 −45% while preserving
+model performance across diverse datasets under greedy and non-greedy sampling (Figure 1).
+(ii) We conduct an extensive analysis of the optimal distillation recipe (§5.2) for model alignment,
+encompassing factors such as training data generation and different divergences, and emphasiz-
+ing the distinctions between standard KD and distillation tailored for SD.
+(iii) We extend DistillSpec to lossy SD, enabling refined control over the quality-latency trade-off.
+Moreover, we offer insights for combining KD and SD when several models are available (§5.3).
+2 R ELATED WORK
+Speculative decoding (SD). Due to the inherent sequential nature of autoregressive decoding,
+the primary latency bottleneck in LLM inference arises from memory read/write operations rather
+than arithmetic computations (Pope et al., 2023). Speculative decoding (Leviathan et al., 2023;
+2
+
+--- PAGE 3 ---
+Published as a conference paper at ICLR 2024
+Chen et al., 2023) (SD) addresses this challenge by utilizing a compact draft model to generate a
+batch of tokens sequentially, while validating them in parallel with a larger target model. Prior to SD,
+various parallel computing paradigms have been explored for autoregressive models, including block
+parallel sampling (Stern et al., 2018), shallow aggressive decoding (Sun et al., 2021), and aggressive
+decoding (Ge et al., 2022). However, these approaches are not readily adaptable to typical language
+models due to potential deviations from target model’s distribution, strict input constraints, or limited
+support for general stochastic sampling. Notably, recent variants of SD have considered different
+interactions between the draft and target model to reduce unnecessary computation (Kim et al.,
+2023) and incorporated parallel computation along the batch axis, sometimes combined with token
+tree verification, as seen in SpecTr (Sun et al., 2023), SpecInfer (Miao et al., 2023), and Medusa (Cai
+et al., 2023a). In contrast, our work focuses on enhancing SD by improving the alignment between
+the small draft model and the large target model through KD, which does not require any changes
+to serving infrastructures already implementing SD and is complementary to the recent variants of
+SD. Furthermore, we conduct a systematic study of lossy SD for providing nuanced control over the
+trade-off between quality and latency for specific serving models.
+Knowledge distillation (KD) for LLMs. KD (Bucilu ˇa et al., 2006; Hinton et al., 2015),
+which trains high-quality smaller student models with the supervision of larger teacher models,
+has emerged as a vital technique for reducing inference cost while maintaining model quality across
+a range of domains. In the context of LLMs, prior uses of KD (Taori et al., 2023; Fu et al., 2023)
+have mostly focused on black-box KD, wherein only the teacher’s output generations, generally
+via APIs, are accessible during student training. However, with the proliferation of open-source
+LLMs (Zhang et al., 2022; Touvron et al., 2023), which enable access to teacher weights and logits,
+there is a growing interest in white-box KD. White-box KD allows student models to benefit from
+richer supervision signals provided by white-box teacher models, leading to enhanced language
+abilities (Agarwal et al., 2023; Gu et al., 2023; Wen et al., 2023).
+Unlike prior works focused on creating highly capable standalone student models, we harness KD
+to foster closer collaboration between smaller and larger models in SD, which may be particularly
+valuable when a small distilled model alone cannot meet stringent quality requirements. While
+Stern et al. (2018) use a black-box KD approach (SeqKD) to enhance blockwise parallel decoding,
+their samples are generated from the large target model, which is prohibitively expensive for LLMs.
+Furthermore, they ignore the teacher model’s logits and train their draft model using only one-hot
+teacher labels—a reasonable choice for greedy decoding but a less effective one for non-greedy
+sampling (Figure 2). Concurrently, Liu et al. (2023) propose to improve SD using KD, but they
+assume an online setup with a changing query distribution, and focus on improving the acceptance
+rate rather than reducing the actual latency.
+3 B ACKGROUND : SPECULATIVE DECODING
+Notation. Given an input sequence xcomprising tokens from a pre-defined vocabulary, a lan-
+guage model Mprovides a distribution over possible output sequences y. Suppose we employ
+SD with a compact draft model Mqto assist a larger target model Mp. Let p(yt|x, y<t)and
+q(yt|x, y<t)represent the distributions governing next-token predictions at time step tforMpand
+Mq, respectively, given the context ρ={x, y<t}. Given input xas prefix, let p≤T(y|x)and
+q≤T(y|x)represent the distributions governing the sequence ysampled autoregressively from Mp
+andMq, respectively, where the generation stops either when an end-of-sequence token is sampled
+or the maximum sequence length Tis reached. For simplicity, we use p(yt)andq(yt)as shorthands
+forp(yt|x, y<t)andq(yt|x, y<t), whenever the context ρis clear. Similarly, p≤T(y)andq≤T(y)
+serve as shorthands for p≤T(y|x)andq≤T(y|x), whenever the input xis clear.
+Speculative sampling. Standard SD uses a procedure called speculative sampling to generate
+tokens from the draft model while maintaining the same output distribution as the target model. As
+detailed in Algorithm A.1 (Appendix), each step of SD works as follows. First, a block ofγtokens,
+denoted as yt, . . . , y t+γ−1, is autoregressively sampled from q(yt), . . . , q (yt+γ−1). Next, the γ
+tokens are verified in parallel by passing them to Mpas a whole block, which sequentially accepts
+token yt+iwith probability min (1 , p(yt+i)/q(yt+i)). If any token yt+iis rejected before the end of
+the block, the subsequent tokens are discarded and the rejected token is resampled from the adjusted
+distribution p′(yt+i)∝max(0 , p(yt+i)−q(yt+i)); otherwise, the drafted tokens are all accepted
+and an extra token is sampled from p(yt+γ)and appended to the output sequence. This process
+guarantees that the sequence of accepted and resampled tokens follow the same output distribution
+3
+
+--- PAGE 4 ---
+Published as a conference paper at ICLR 2024
+asp(yt+i)(Leviathan et al., 2023). The procedure is repeated until an end-of-sequence token is
+accepted, or the maximum sequence length Thas been reached.
+Efficiency measure: acceptance rate. Each SD step takes a constant amount of time, so the
+wall-clock time scales linearly with the number of steps. This number is equal to the total number of
+times that the target model rejects a token, plus the number of blocks accepted as a whole, where the
+latter term is small for large γ. This motivates us to use the acceptance rate as a surrogate efficiency
+measure for the wall-clock time. For an ideal SD process with γ=∞, we define the sequence-level
+acceptance rate α(x)for a given input xas follows:
+α(x) :=E[number of accepted tokens in generating y]
+E[number of tokens in y]=Ey∼p≤T(y|x)hP|y|
+t=1β(x, y<t)i
+Lp(x),(1)
+where β(x, y<t) :=Eyt∼q(yt)[min (1 , p(yt)/q(yt))]is the token-level acceptance rate, and expec-
+tations are taken over the randomness in SD. Since speculative sampling preserves the output dis-
+tribution of the target model, the denominator is simply equal to the expected length of the target
+output Lp(x) :=Ey∼p≤T(y|x)[|y|], which is invariant to the choice of draft model. Therefore, the
+acceptance rate is directly related to the expected total number of rejected tokens (1−α(x))·Lp(x),
+which lower bounds the expected number of SD steps.
+Efficiency measure: block efficiency. In practice, SD is usually employed with a fixed finite
+block size γ; thus, a more relevant efficiency measure is the block efficiency τ. Given an input x,
+we compute the block efficiency τ(x)as the expected number of accepted tokens per block. Note
+that, for a given block size γ, the maximum value of τ(x)isγ+ 1, corresponding to the case where
+all drafted tokens are accepted and augmented with an additional token sampled by the target model.
+If we assume that the token-level rates β(x, y<t)are i.i.d., then the sequence-level acceptance rate
+satisfies α=E[β]andτ(x) = (1 −αγ+1)/(1−α)(Leviathan et al., 2023).
+Wall-clock time improvement . For given block efficiency τ(x), the expected speedup of SD is
+given by τ(x)/(cγ+ 1) , where the relative latency cis the ratio between the times elapsed when
+making a single forward pass through the draft model Mqand through the target model Mp.
+4 D ISTILL SPEC: KNOWLEDGE DISTILLATION FOR SPECULATIVE DECODING
+As described in § 3, speculative decoding (SD) leverages a small (draft) model to reduce the latency
+of decoding from the larger (target) model distribution without any performance drop. However, the
+realized speedup critically depends on how “well-aligned” the draft model is to the target model. In
+this work, we propose DistillSpec , a general framework that improves SD by better aligning the tar-
+get model and draft model using white-box knowledge distillation (KD). We first present KD-based
+training of the draft model, and highlight how our objective of enhancing SD via KD influences
+our selection of training data generation method and divergence function—two key ingredients of
+DistillSpec. We then discuss how DistillSpec can be extended to lossy SD.
+Let the draft model Mθ
+qbe parameterized by θ. DistillSpec utilizes predictions from the target model
+Mpas a source of supervision in training the draft model Mθ
+q. We assume white-box access to both
+models, i.e., we can obtain their next-token distributions p(yt)andq(yt), and therefore we are able to
+generate samples from both models. Given a divergence function Dthat measures the misalignment
+between two distributions, KD-based training of the draft model seeks to minimize the divergence
+between the teacher (target) and student (draft) distributions over a training set G:
+θ∗:= arg min E(x,y)∼G
+D(Mp∥Mθ
+q)(y|x)
+, (2)
+where D(Mp∥Mθ
+q)(y|x) =1
+|y|P|y|
+t=1D 
+p(·|x, y<t)∥qθ(·|x, y<t)
+.We note that flexibility in how
+Gis constructed and the choice of divergence Dgives rise to different possible KD algorithms. For
+instance, Gmay consist of task-specific input-output pairs (X, Y)or sequences generated from Mp
+orMθ
+q. While forward KL (DFKL) is the commonly used divergence for KD (Hinton et al., 2015),
+recent works (Agarwal et al., 2023; Wei et al., 2022) have shown the effectiveness of alternative
+divergences, including reverse KL (DRKL), Jensen–Shannon divergence ( DJSD[β]), and total varia-
+tion distance ( DTVD). Further details on each divergence can be found in Appendix A.1. Table 1
+summarizes various distillation recipes, each being a specialized instance of Algorithm A.2.
+4
+
+--- PAGE 5 ---
+Published as a conference paper at ICLR 2024
+Table 1: Summary of various KD algorithms in terms of training data Gand divergence D(cf. Eq. 2). Wen
+et al. (2023); Agarwal et al. (2023) also consider other D; we list the most representative one.
+Name Divergence Training Data ( G)
+SeqKD (Kim & Rush, 2016) ( Black-box KD ) FKL Data generated by teacher Mp
+Supervised KD (Hinton et al., 2015) FKL Fixed dataset of input-output pairs
+ImitKD (Lin et al., 2020) FKL Fixed dataset + data generated by Mθ
+q
+f-Distill (Wen et al., 2023) TVD Data generated by Mθ
+qandMp
+On-policy GKD (Agarwal et al., 2023) FKL / JSD On-policy data from student Mθ
+q
+Our choices for GandDare guided by how the resulting distilled model, once employed as draft
+model, improves the speed of SD. Towards this, we first highlight the role that DTVD between p(yt)
+andq(yt)plays in dictating the acceptance rate (§ 3)—a key efficiency measure for SD.
+TVD as proxy for the acceptance rate. Leviathan et al. (2023, Corollary 3.6) show that the
+token-level acceptance rate β(x, y<t)satisfies β(x, y<t) = 1−DTVD(p(yt), q(yt)). Hence, Eq. 1
+implies that maximizing the sequence-level acceptance rate α(x)is equivalent to minimizing the
+expected DTVD between p(yt)andq(yt)over the output sequence distribution of Mp, i.e.:
+α(x) = 1−Ey∼p≤T(y|x)h|y|X
+t=1DTVD(p(yt), q(yt))i
+/Lp(x). (3)
+Choice of divergence. Based on Eq. 3, it appears that directly minimizing DTVD may be a princi-
+pled objective for draft model distillation. While optimizing DTVD(p, q)is theoretically inspired,
+our empirical study shows that such an objective may not consistently yield optimal results. We find
+that the choice of the most suitable divergence is highly task-dependent (§ 5.2).
+Choice of training data. As for G, one could resort to an existing ground-truth dataset, however
+the teacher’s output distribution may deviate from the ground-truth distribution despite the teacher
+having been fine-tuned on it. Moreover, ground-truth datasets are often limited in size, so training
+only on such data could result in overfitting. To mitigate these issues, we use model-generated
+outputs for distillation. Specifically, we prompt the model with a task input sampled from a ground-
+truth training dataset, and use the model response as data for distillation. Both the teacher and
+student models may be used to generate the distillation examples.
+Model-generated distillation data . Eq. 3 suggests optimizing the expected DTVD over outputs
+generated from the teacher. Decoding from a large teacher is generally prohibitively expensive, es-
+pecially at the scale of dataset required for KD. To reduce the generation cost, we explore using
+on-policy data during distillation, i.e., output sequences sampled from the student itself. Besides
+being more computationally efficient compared to teacher generations, this approach is motivated
+by Gu et al. (2023); Agarwal et al. (2023), who have shown that distilling on on-policy data improves
+student task performance. However, different from these prior works, our primary focus is on im-
+proving the student-teacher alignment. Thus, it may not be immediately clear whether minimizing
+the expected DTVD over on-policy (student-generated) data ensures an improved acceptance rate,
+which is computed as an expectation over the teacher’s output distribution (cf. Eq. 3). Our following
+result shows that this is indeed the case.
+Theorem 4.1. For SD, if the draft model Mθ
+qachieves on-policy KD loss ϵ=
+Ex∼X,y∼q≤T(y|x)
+DTVD(Mp∥Mθ
+q)(y|x)
+, then the sequence-level acceptance rate is at least
+Ex∼X[α(x)]≥1−T·Ex∼Xh
+T
+Lp(x)i
+ϵ. (4)
+When the target output length is always T, the bound simplifies to Ex∼X[α(x)]≥1−Tϵ.
+We defer the proof to Appendix A.2. Intuitively, it builds upon the following insights. If the on-
+policy KD loss is small, then, for any 1≤t≤T, the same loss evaluated only at the t-th token
+should also be small. Since the first token generation is independent of any other tokens, a small
+value of on-policy KD loss ensures that the first token distributions of the draft and target models
+are close. Then, an inductive argument shows that once the draft and target are similar on the first t
+tokens, the distributions of the (t+ 1)-th token should also be close. Our proof makes this argument
+rigorous by utilizing variational representations of DTVD, leading to a linear error bound in T.
+5
+
+--- PAGE 6 ---
+Published as a conference paper at ICLR 2024
+2.602.803.003.203.40Block Efficiency ()
+Without DistillationXSum
+4.004.505.00
+Without DistillationCNNDM
+4.804.905.005.10
+Without DistillationWMT
+3.253.503.754.004.25
+Without DistillationGSM8KSupervisedKD SeqKD ImitKD f-Distill GKD
+Figure 2: Distillation enhances block efficiency ( τ) across diverse datasets, highlighting the superiority of
+model-generated data over fixed ground truth data (SupervisedKD) and emphasizing the importance of white-
+box distillation in addressing SeqKD’s subpar performance.
+DistillSpec with lossy SD. DistillSpec enhances SD efficiency without any quality loss com-
+pared to the target model Mp. In practical applications, a reduction in model quality may be jus-
+tified in order to support even faster inference. For such scenarios, we extend DistillSpec to lossy
+SD (Leviathan et al., 2023), which uses a lenience function f(p, ϵ)that modifies the acceptance
+probability from min (1 , p(yt)/q(yt))tomin (1 , f(p(yt), ϵ)/q(yt))(cf. § 3). Here f: [0,1]2→R+
+is increasing and decreasing in its first and second arguments, respectively, and ϵ∈[0,1]is a free
+parameter (cf. Algorithm A.1). In this work, we evaluate multiple choices for the lenience functions:
+flin(p, ϵ) =p/ϵ,fsq(p, ϵ) =p/ϵ2, and fexp(p, ϵ) =pϵ. For example, when the lenience function
+isfsq(p, ϵ)andϵ= 0.1, token xsampled from q(yt)becomes hundred times more likely to be
+accepted by the target, thus enabling faster inference at the expense of a potential drop in generation
+quality. Lenience was discussed by Leviathan et al. (2023) in the context of flinand their treatment
+focuses solely on latency improvements, whereas we explore the use of different lenience functions
+as a precise control mechanism to achieve the desired quality-latency profile.
+5 E XPERIMENTS
+5.1 E NHANCING SPECULATIVE DECODING THROUGH DISTILLATION
+We evaluate the effectiveness of KD in improving the speed of speculative decoding (SD). We fol-
+low Leviathan et al. (2023) and investigate its impact on the acceptance rate α, block efficiency τ,
+and actual latency speedup with a batch size of 1 under greedy sampling ( T= 0) and standard
+temperature sampling ( T= 1).
+Tasks and models. Following Leviathan et al. (2023), we evaluate two model types: 1) GPT-
+like decoder-only Transformer models trained on LM1B task (Chelba et al., 2013) using a standard
+autoregressive objective, where the target and draft models have 234M and 33M parameters, re-
+spectively; and 2) standard encoder-decoder T5 v1.1 models (Raffel et al., 2020) fine-tuned on
+four different tasks, with T5-XL (3B) and T5-Small (77M) serving as the target and draft mod-
+els, respectively. We utilize two datasets from the T5 paper, namely WMT EnDe (Bojar et al.,
+2014) and CNN/DM (Hermann et al., 2015), which deal with translation and text summarization,
+respectively. The remaining two tasks used to test T5 models are XSum (Narayan et al., 2018) and
+GSM8K (Cobbe et al., 2021), which deal with abstractive summarization and arithmetic reasoning,
+respectively. See Appendix B for more details.
+Decoding speedup. Figure 1 shows that the impact of distillation on SD speed is evident, con-
+sistently yielding a 10 −46% improvement across various datasets. This effect is most pronounced
+when employing greedy decoding. The performance of KD for different block sizes and decoding
+strategies across five datasets is presented in Table C.1 (Appendix). These findings demonstrate
+that KD significantly enhances the acceptance rate and block efficiency of SD for both decoder-only
+and encoder-decoder models across all datasets. Distillation algorithms utilizing model-generated
+data consistently outperform other approaches, resulting in ∼20% additional speedup compared to
+standard SD on LM1B, XSum, CNN/DM, and GSM8K.
+Block efficiency. Figure 2 presents a comparison of block efficiency across different algorithms,
+employing temperature sampling ( T= 1) with a block size γ= 7. The figure underscores the
+utility of model-generated data: using ground-truth data (i.e., Supervised KD) ranks lowest across
+all settings. In contrast, f-Distill and GKD, which only use model-generated data, significantly out-
+perform other KD variants. The subpar performance of SeqKD, despite being purely trained on data
+6
+
+--- PAGE 7 ---
+Published as a conference paper at ICLR 2024
+0 20 40
+Training Efficiency (Walltime in hrs)0.620.640.660.680.700.72Acceptance Rate ()
+SupKD
+ImitKD
+SeqKD
+f-Distill
+GKD
+(a) acceptance rate vs. wall-time
+0 250 500 750 1000 1250
+Sorted T est Data Index23456Block Efficiency ()
+Distilled Drafter
+Standard Drafter (b) instance-level block eff. ( τ)
+2.5 3.0 3.5 4.0
+Theoretial Block Efficiency2.53.03.54.04.5Empirical Block Efficiencyy=xxsum
+cnndm
+wmt
+gsm8k (c) agreement of τ
+Figure 3: (a) White-box KD using teacher logits and model-generated data is crucial. Draft model’s on-policy
+data can be as effective as target model data. GKD achieves the best wall-time performance improvement
+on XSum. (b) Distillation improves the block efficiency for all examples on GSM8K. (c) Empirical block
+efficiency aligns well with its DTVD-based theoretical counterpart.
+generated by the target model, suggests that white-box distillation (i.e., supervision from the target
+model’s logits) is vital for SD. This is corroborated by Figure 3a, which illustrates the evolution of
+the acceptance rate throughout training. Supervised KD ranks lowest, and its performance plateaus
+early during training due to the static nature of the dataset. In contrast, algorithms using model-
+generated data lead to continual improvement of the acceptance rate. Despite f-Distill being much
+more computationally costly than GKD due to the use of teacher-generated data, both algorithms
+exhibit comparable performance. Notably, GKD achieves the best wall-time performance improve-
+ment. See Appendix C.1.2 for more visualizations of performance improvement during training.
+We also investigate whether KD improves block efficiency universally or impacts a limited subset
+of examples. Figure 3b depicts the improvement per example. We observe consistent gains in block
+efficiency across most examples, which can also be seen in various datasets (see Figure C.16). Fig-
+ure 3c illustrates a strong agreement between theoretical and empirical block efficiency values for
+several distilled models (each model is represented as a filled circle). Despite theoretical values oc-
+casionally overestimating or underestimating empirical values, possibly due to potential deviations
+from the i.i.d. token-level assumption (cf. §3), the ranking of distilled models remains highly con-
+sistent. In summary, these findings largely confirm that KD effectively optimizes block efficiency.
+Transferability of distilled models. We next examine the transferability of distilled models on
+diverse datasets unseen during training. We use a draft model distilled on GSM8K and test its
+ability to speed up SD on zero-shot chain-of-thought (CoT) prompting over 23 reasoning tasks from
+the BigBenchHard suite (Suzgun et al., 2022). The results, illustrated in Figure 1, indicate effective
+transferability to other datasets. Compared to standard SD, the distilled model significantly enhances
+average decoding speeds, yielding speedup improvements from 1.93 ×and 1.78 ×to 2.21 ×and
+2.02×for greedy and non-greedy decoding methods, respectively. Further analysis in Figure C.1
+reveals that using our distilled T5-Small as draft model is also compatible with larger target models
+(T5-XXL) despite being distilled from a different-sized model (T5-XL). Despite being not fully
+optimized, this configuration consistently outperforms standard SD by 7%−37% across various
+datasets. See Appendix C.1 for more details.
+5.2 D ISTILL SPEC RECIPE
+We now focus on identifying the optimal KD approach for SD. Following the training and evaluation
+protocols in § 5.1, we explore four training data construction methods and four divergence functions
+on XSum and GSM8K. Specifically, we explore the following variants of training data: 1) fixed
+ground-truth dataset DTrain, 2) data generated only from the draft model Mθ
+q, 3) data generated only
+from target Mp, 4) data generated from both Mθ
+qandMpin equal proportion. We also examine the
+following divergences: 1) forward KL (FKL), 2) Jenson-Shannon divergence (JSD), 3) reverse KL
+(RKL), and 4) total variation distance (TVD).
+Importance of training data and divergence in DistillSpec. Figure 4 illustrates the block
+efficiency improvement on XSum and GSM8K, in line with observations from § 5.1. We note that
+using model-generated data (last three rows) yields superior performance than using a fixed dataset
+(first row). Specifically, on XSum with greedy decoding, using data generated from both Mθ
+qand
+Mpleads to the best performance, with JSD slightly outperforming the other divergences. However,
+7
+
+--- PAGE 8 ---
+Published as a conference paper at ICLR 2024
+FKL JSD RKL TVDFixed (Train)
+Student (q)
+q+p
+Teacher (p)
+0.01 0.08 0.13 0.17
+0.48 0.49 0.45 0.46
+0.52 0.53 0.5 0.5
+0.51 0.53 0.5 0.51Block Efficiency Improvement
+0.00.10.20.30.40.5
+(a) XSum: τ(greedy)
+FKL JSD RKL TVDFixed (Train)
+Student (q)
+q+p
+Teacher (p)
+0.23 0.29 0.29 0.26
+0.61 0.42 0.43 0.38
+0.49 0.43 0.47 0.41
+0.35 0.43 0.46 0.42Block Efficiency Improvement
+0.00.10.20.30.40.50.6 (b) GSM8K: τ(greedy)
+FKL JSD RKL TVDFixed (Train)
+Student (q)
+q+p
+Teacher (p)
+0.22 0.31 0.32 0.29
+0.42 0.43 0.45 0.41
+0.36 0.47 0.47 0.44
+0.33 0.44 0.49 0.43Block Efficiency Improvement
+0.00.10.20.30.4 (c) GSM8K: τ(non-greedy)
+Figure 4: DistillSpec recipe . We report improvement in empirical block efficiency post-distillation on (a)
+XSum with greedy sampling, and GSM8K with (b) greedy and (c) non-greedy sampling. Which divergence
+function and data construction lead to the largest block efficiency improvements highly depends on the task.
+They should be treated as a hyperparameters to be tuned on our task of interest.
+on GSM8K with greedy decoding, FKL with only draft-generated data emerges as the best setup. In
+contrast, with temperature sampling (at T= 1), a different trend is observed as RKL combined with
+data generated by Mpis the most effective setup. See Appendix C.2.1 for results on different datasets
+and decoding strategies. Nonetheless, using only draft-generated data is found to be competitive.
+Impact of distillation on draft quality vs. compatibility. We also study how different distillation
+recipes affect task performance and whether there is any one design choice that is simultaneously
+optimal for improving both draft model task performance and its utility for SD (cf. Figure C.23,
+C.24). Similar to our earlier observations, the use of generated data is paramount for improving
+draft performance. Notably, utilizing data generated from Mθ
+qyields comparable or superior results
+compared to using data generated from Mp. However, which KD algorithm is optimal largely
+depends on the task at hand and the underlying decoding strategy. Figure 5a highlights an interesting
+dichotomy between block efficiency improvements and task performance gains via KD: distilled
+models with high task performance do not necessarily translate into more aligned drafters for SD.
+Recommendation. Interestingly, although TVD is the objective we should aim to optimize for
+SD (cf. Eq. 3), its direct optimization does not yield the best performance in most of the settings
+explored. We generally find that the choice of divergence in KD is a hyperparameter that needs to be
+tuned based on the task at hand and decoding strategy used. For training data construction, we pro-
+pose using the draft model Mθ
+qfor data generation as it can achieve similar or superior performance
+compared to the target model Mp, but at a much lower cost.
+5.3 Q UALITY VERSUS LATENCY TRADE -OFF
+Lossy speculative decoding. We analyze the quality-latency trade-off using lossy SD variants, as
+detailed in Algorithm A.1. As Figure 5b illustrates, employing either KD ( ⋆) or SD ( ×) alone does
+not fully bridge the performance or latency gaps, respectively. In such case, a leniency parameter
+(ε) can help interpolate between these two approaches, as demonstrated in Figure 5b where each
+point within a given group corresponds to a different value of ε. As the GSM8K experiment shows,
+the power of interpolation can be limited: even using a permissive lenience of ε= 10−5,flinstill
+results in high performance but high latency, while fsqtraces a similar but slightly extended trade-
+off curve. Although fexpmakes interpolation possible, it yields a worse quality-latency trade-off.
+Interestingly, it is possible to significantly reduce latency while preserving most of the quality on
+GSM8K, possibly because many tokens are inconsequential for final performance, and a variety of
+proposals can be safely accepted with minimal effect on generation quality. See Appendix C.3.1 for
+a comparison between non-distilled and distilled draft models, where we show that a distilled draft
+model enables a much better quality vs. latency trade-off.
+DistillSpec meets model garden. In many practical scenarios, we have access to multiple mod-
+els of different sizes—a model garden—to design the inference pipeline. We emulate this setting
+by focusing on the five model sizes in the T5 model family: T5-Small (77M), T5-Base (250M),
+T5-Large (800M), T5-XL (3B), and T5-XXL (11B). We study the quality-latency trade-off curves
+obtained from applying KD and SD as follows: 1) raw: deploying supervised fine-tuned (SFT) T5
+models; 2) distilled: applying KD by distilling smaller models from the larger T5 models; 3) spec-
+ulative: applying SD using T5 models; and 4) DistillSpec: applying KD on T5 models and using
+SD with distilled models as target and draft models.
+8
+
+--- PAGE 9 ---
+Published as a conference paper at ICLR 2024
+4 6 8
+Accuracy Improvement0.250.300.350.400.450.50 Improvement
+Divergence
+FKL
+JSD0.5
+RKL
+TVD
+TrainData
+Teacher (p)
+Student (q)
+Fixed (Train)
+q+p
+(a) quality vs. SD compatibility (GSM8K)
+0.5 1.0 1.5 2.0 2.5 3.0 3.5
+Relative Latency51015202530Performance - Accuracyflin(p,)=p/
+fsq(p,)=p/2
+fexp(p,)=p
+No Lenience
+Raw Draft
+Distilled Draft (b) DistillSpec with lossy SD (GSM8K)
+Figure 5: (a) The improvement on speculative decoding and downstream task performance are only weakly
+correlated. A high quality distilled model does not imply it can be an effective draft model in speculative
+decoding. (b) We employ leniency as a precise control mechanism to achieve the desired quality-latency profile.
+0.0 2.5 5.0 7.5 10.0 12.5 15.0 17.5
+Relative Latency1416182022Performance - Rouge2T arget Model
+T5-Small
+T5-Base
+T5-Large
+T5-XL
+T5-XXLServing Strategy
+Raw
+Distilled
+Speculative
+DistillSpec
+0 2 4 6 8 10 12 14
+Relative Latency102030Performance - AccuracyT arget Model
+T5-Small
+T5-Base
+T5-Large
+T5-XL
+T5-XXLServing Strategy
+Raw
+Distilled
+Speculative
+DistillSpec
+Figure 6: DistillSpec excels in both quality and latency, offering a remarkable 6.4x and 10.7x latency reduction
+on XSum (left) and GSM8K (right), while maintaining nearly identical performance.
+Figure 6 shows that SD effectively shifts the trade-off curve leftward, especially with larger model
+sizes. However, its efficacy diminishes with smaller model sizes when the computation time between
+the draft and target models is closely matched. In contrast, distillation, which optimizes the model
+for downstream task performance, appears to offer a superior trade-off between quality and latency,
+particularly for smaller models. Conversely, a reverse trend is observed for larger model sizes when
+evaluating the model with temperature sampling. Figure C.30a indicates a substantial gap between
+the distilled model and the larger teacher model, while the SD-based method is able to significantly
+reduce latency. This suggests that when stringent performance and decoding strategy constraints are
+in place, SD remains a valuable approach. Our DistillSpec method, which combines the benefits
+of distillation and SD, consistently achieves the best trade-off between quality and latency, yielding
+an impressive reduction in latency while maintaining nearly identical performance. Specifically,
+DistillSpec reduces relative latency from 17.3 to 2.7 and from 15.0 to 1.4 on XSum and GSM8K,
+respectively, representing speedup improvements of 6.4 ×and 10.7 ×. In contrast, the Rouge2 score
+only marginally decreases, from 23.1 to 23.0 on XSum, while the model accuracy on GSM8K
+actually improves from 33.1 to 34.8.
+6 C ONCLUSION
+In this paper, we evaluate the efficacy of white-box knowledge distillation (KD) in enhancing spec-
+ulative decoding (SD) through improved alignment between target and draft models. A thorough
+analysis is conducted to understand the impact of training data construction and divergence func-
+tions on KD performance. We underscore the significance of utilizing model-generated data and
+argue that employing the draft model’s on-policy data during KD is a cost-efficient way of improv-
+ing model alignment. Additionally, we assess the trade-off between quality and latency within the
+scope of lenience and availability of multiple models of varying quality and size (model garden),
+concluding that KD enables a superior trade-off compared to standard SD. The optimal strategy in-
+volves first applying KD for downstream task performance, followed by SD using a distilled draft
+model, resulting in a six to ten-fold decrease in latency with negligible performance loss. Our study
+contributes novel insights into white-box KD algorithms for LLMs and provides guidance for strik-
+ing an effective balance between quality and latency using KD and SD.
+9
+
+--- PAGE 10 ---
+Published as a conference paper at ICLR 2024
+ACKNOWLEDGMENTS
+We would like to extend a special thank you to Neha Gupta, Wittawat Jitkrittum, Nino Veillard,
+Yaniv Leviathan, Matan Kalman, Danny Vainstein, Natan Potikha, Ananda Theertha Suresh, Laz
+Karydas, Aishwarya PS, Pranav Nair, Praneeth Netrapalli, Nikunj Saunshi, Ziteng Sun, Keiran
+Paster, Olivier Bachem, Aleksandra Faust for insightful discussion and valuable feedback.
+REFERENCES
+Rishabh Agarwal, Nino Vieillard, Yongchao Zhou, Piotr Stanczyk, Sabela Ramos, Matthieu Geist,
+and Olivier Bachem. On-policy distillation of language models: Learning from self-generated
+mistakes. arXiv preprint arXiv:2306.13649 , 2023.
+Rohan Anil, Andrew M Dai, Orhan Firat, Melvin Johnson, Dmitry Lepikhin, Alexandre Passos,
+Siamak Shakeri, Emanuel Taropa, Paige Bailey, Zhifeng Chen, et al. Palm 2 technical report.
+arXiv preprint arXiv:2305.10403 , 2023.
+Ondrej Bojar, Christian Buck, Christian Federmann, Barry Haddow, Philipp Koehn, Johannes
+Leveling, Christof Monz, Pavel Pecina, Matt Post, Herve Saint-Amand, Radu Soricut, Lucia
+Specia, and Ale s Tamchyna. Findings of the 2014 workshop on statistical machine trans-
+lation. In Proceedings of the Ninth Workshop on Statistical Machine Translation , pp. 12–
+58, Baltimore, Maryland, USA, June 2014. Association for Computational Linguistics. URL
+http://www.aclweb.org/anthology/W/W14/W14-3302 .
+Cristian Bucilu ˇa, Rich Caruana, and Alexandru Niculescu-Mizil. Model compression. In Pro-
+ceedings of the 12th ACM SIGKDD international conference on Knowledge discovery and data
+mining , pp. 535–541, 2006.
+Tianle Cai, Yuhong Li, Zhengyang Geng, Hongwu Peng, and Tri Dao. Medusa: Simple frame-
+work for accelerating llm generation with multiple decoding heads. https://github.com/
+FasterDecoding/Medusa , 2023a.
+Tianle Cai, Xuezhi Wang, Tengyu Ma, Xinyun Chen, and Denny Zhou. Large language models as
+tool makers. arXiv preprint arXiv:2305.17126 , 2023b.
+Ciprian Chelba, Tomas Mikolov, Mike Schuster, Qi Ge, Thorsten Brants, Phillipp Koehn, and Tony
+Robinson. One billion word benchmark for measuring progress in statistical language modeling.
+arXiv preprint arXiv:1312.3005 , 2013.
+Charlie Chen, Sebastian Borgeaud, Geoffrey Irving, Jean-Baptiste Lespiau, Laurent Sifre, and John
+Jumper. Accelerating large language model decoding with speculative sampling. arXiv preprint
+arXiv:2302.01318 , 2023.
+Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Jacob Hilton, Reiichiro Nakano, Christopher
+Hesse, and John Schulman. Training verifiers to solve math word problems, 2021.
+Yao Fu, Hao Peng, Litu Ou, Ashish Sabharwal, and Tushar Khot. Specializing smaller language
+models towards multi-step reasoning. arXiv preprint arXiv:2301.12726 , 2023.
+Tao Ge, Heming Xia, Xin Sun, Si-Qing Chen, and Furu Wei. Lossless acceleration for seq2seq
+generation with aggressive decoding. arXiv preprint arXiv:2205.10350 , 2022.
+Yuxian Gu, Li Dong, Furu Wei, and Minlie Huang. Knowledge distillation of large language models.
+arXiv preprint arXiv:2306.08543 , 2023.
+Karl Moritz Hermann, Tomas Kocisky, Edward Grefenstette, Lasse Espeholt, Will Kay, Mustafa
+Suleyman, and Phil Blunsom. Teaching machines to read and comprehend. In Advances in
+neural information processing systems , pp. 1693–1701, 2015.
+Geoffrey Hinton, Oriol Vinyals, and Jeff Dean. Distilling the knowledge in a neural network. arXiv
+preprint arXiv:1503.02531 , 2015.
+Ferenc Huszár. How (not) to train your generative model: Scheduled sampling, likelihood, adver-
+sary? arXiv preprint arXiv:1511.05101 , 2015.
+10
+
+--- PAGE 11 ---
+Published as a conference paper at ICLR 2024
+Sehoon Kim, Karttikeya Mangalam, Jitendra Malik, Michael W Mahoney, Amir Gholami, and Kurt
+Keutzer. Big little transformer decoder. arXiv preprint arXiv:2302.07863 , 2023.
+Yoon Kim and Alexander M Rush. Sequence-level knowledge distillation. arXiv preprint
+arXiv:1606.07947 , 2016.
+Yaniv Leviathan, Matan Kalman, and Yossi Matias. Fast inference from transformers via speculative
+decoding. In International Conference on Machine Learning , pp. 19274–19286. PMLR, 2023.
+Alexander Lin, Jeremy Wohlwend, Howard Chen, and Tao Lei. Autoregressive knowledge distilla-
+tion through imitation learning. arXiv preprint arXiv:2009.07253 , 2020.
+Xiaoxuan Liu, Lanxiang Hu, Peter Bailis, Ion Stoica, Zhijie Deng, Alvin Cheung, and Hao Zhang.
+Online speculative decoding. arXiv preprint arXiv:2310.07177 , 2023.
+Xupeng Miao, Gabriele Oliaro, Zhihao Zhang, Xinhao Cheng, Zeyu Wang, Rae Ying Yee Wong,
+Zhuoming Chen, Daiyaan Arfeen, Reyna Abhyankar, and Zhihao Jia. Specinfer: Accelerating
+generative llm serving with speculative inference and token tree verification. arXiv preprint
+arXiv:2305.09781 , 2023.
+Shashi Narayan, Shay B. Cohen, and Mirella Lapata. Don’t give me the details, just the summary!
+topic-aware convolutional neural networks for extreme summarization. ArXiv , abs/1808.08745,
+2018.
+OpenAI. Gpt-4 technical report. ArXiv , abs/2303.08774, 2023. URL https://api.
+semanticscholar.org/CorpusID:257532815 .
+Reiner Pope, Sholto Douglas, Aakanksha Chowdhery, Jacob Devlin, James Bradbury, Jonathan
+Heek, Kefan Xiao, Shivani Agrawal, and Jeff Dean. Efficiently scaling transformer inference.
+Proceedings of Machine Learning and Systems , 5, 2023.
+Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan Narang, Michael Matena, Yanqi
+Zhou, Wei Li, and Peter J Liu. Exploring the limits of transfer learning with a unified text-to-text
+transformer. The Journal of Machine Learning Research , 21(1):5485–5551, 2020.
+H. A. Rowley, S. Baluja, and T. Kanade. Neural network-based face detection. IEEE Transactions
+on Pattern Analysis and Machine Intelligence , 20(1):23–38, 1998. doi: 10.1109/34.655647.
+Noam Shazeer and Mitchell Stern. Adafactor: Adaptive learning rates with sublinear memory cost.
+InInternational Conference on Machine Learning , pp. 4596–4604. PMLR, 2018.
+Mitchell Stern, Noam Shazeer, and Jakob Uszkoreit. Blockwise parallel decoding for deep autore-
+gressive models. Advances in Neural Information Processing Systems , 31, 2018.
+Xin Sun, Tao Ge, Furu Wei, and Houfeng Wang. Instantaneous grammatical error correction with
+shallow aggressive decoding. arXiv preprint arXiv:2106.04970 , 2021.
+Ziteng Sun, Ananda Theertha Suresh, Jae Hun Ro, Ahmad Beirami, Himanshu Jain, Felix Yu,
+Michael Riley, and Sanjiv Kumar. Spectr: Fast speculative decoding via optimal transport.
+InWorkshop on Efficient Systems for Foundation Models @ ICML2023 , 2023. URL https:
+//openreview.net/forum?id=d0mGsaheuT .
+Mirac Suzgun, Nathan Scales, Nathanael Schärli, Sebastian Gehrmann, Yi Tay, Hyung Won Chung,
+Aakanksha Chowdhery, Quoc V Le, Ed H Chi, Denny Zhou, et al. Challenging big-bench tasks
+and whether chain-of-thought can solve them. arXiv preprint arXiv:2210.09261 , 2022.
+Rohan Taori, Ishaan Gulrajani, Tianyi Zhang, Yann Dubois, Xuechen Li, Carlos Guestrin, Percy
+Liang, and Tatsunori B. Hashimoto. Stanford alpaca: An instruction-following llama model.
+https://github.com/tatsu-lab/stanford_alpaca , 2023.
+Romal Thoppilan, Daniel De Freitas, Jamie Hall, Noam Shazeer, Apoorv Kulshreshtha, Heng-Tze
+Cheng, Alicia Jin, Taylor Bos, Leslie Baker, Yu Du, et al. Lamda: Language models for dialog
+applications. arXiv preprint arXiv:2201.08239 , 2022.
+11
+
+--- PAGE 12 ---
+Published as a conference paper at ICLR 2024
+Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei, Niko-
+lay Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, et al. Llama 2: Open founda-
+tion and fine-tuned chat models. arXiv preprint arXiv:2307.09288 , 2023.
+Jason Wei, Xuezhi Wang, Dale Schuurmans, Maarten Bosma, Fei Xia, Ed Chi, Quoc V Le, Denny
+Zhou, et al. Chain-of-thought prompting elicits reasoning in large language models. Advances in
+Neural Information Processing Systems , 35:24824–24837, 2022.
+Yuqiao Wen, Zichao Li, Wenyu Du, and Lili Mou. f-divergence minimization for sequence-level
+knowledge distillation. arXiv preprint arXiv:2307.15190 , 2023.
+Zhixiang (Eddie) Xu, Matt J. Kusner, Kilian Q. Weinberger, Minmin Chen, and Olivier Chapelle.
+Classifier cascades and trees for minimizing feature evaluation cost. Journal of Machine Learning
+Research , 15(62):2113–2144, 2014.
+Susan Zhang, Stephen Roller, Naman Goyal, Mikel Artetxe, Moya Chen, Shuohui Chen, Christo-
+pher Dewan, Mona Diab, Xian Li, Xi Victoria Lin, et al. Opt: Open pre-trained transformer
+language models. arXiv preprint arXiv:2205.01068 , 2022.
+12
+
+--- PAGE 13 ---
+Published as a conference paper at ICLR 2024
+Appendix
+Table of Contents
+A Method 14
+A.1 Description of divergence functions . . . . . . . . . . . . . . . . . . . . . . . . 14
+A.2 Justification of using on-policy data . . . . . . . . . . . . . . . . . . . . . . . . 15
+A.3 DistillSpec algorithms . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 18
+B Implementation Details 19
+B.1 Datasets . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 19
+B.2 Models . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 19
+B.3 Distillation . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 20
+B.4 Evaluation . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 21
+C Additional Results 22
+C.1 Enhancing speculative decoding through knowledge distillation . . . . . . . . . 22
+C.2 Distillation recipe . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 35
+C.3 Quality versus latency trade-off . . . . . . . . . . . . . . . . . . . . . . . . . . 38
+13
+
+--- PAGE 14 ---
+Published as a conference paper at ICLR 2024
+A M ETHOD
+A.1 D ESCRIPTION OF DIVERGENCE FUNCTIONS
+Below are some common divergence functions used in distillation, given two discrete probability
+distribution P(C)andQ(C).
+Kullback-Leibler (KL) divergence.
+DKL(P∥Q) =X
+c∈CP(c) logP(c)
+Q(c)(A.1)
+We note that the KL divergence is not symmetric, i.e., DKL(P∥Q)̸=DKL(Q∥P). As such, we
+refer to DKL(P∥Q)as the forward KL (FKL) and DRKL(P||Q) := DKL(Q∥P)as the reverse
+KL(RKL) between PandQ. Minimization of the FKL under an empirical data distribution cor-
+responds to maximum likelihood estimation ( MLE ), which is the typical loss objective used in
+supervised learning given a fixed dataset.
+Jensen–Shannon (JS) divergence.
+DJS(P∥Q) =1
+2(DKL(P∥M) +DKL(Q∥M),where M=1
+2(P+Q) (A.2)
+Generalized Jensen-Shannon divergence ( DJSD[β]).
+DJSD[β](P∥Q) =βDKL
+PβP+ (1−β)Q
++ (1−β)DKL
+QβP+ (1−β)Q
+(A.3)
+Interestingly, it can be proved that limβ→0DJSD (β)(P∥Q)
+β=DKL(P∥Q)(Huszár, 2015). As such,
+DJSD[β]behaves similarly to forward KL for small values of β. Similarly, DJSD[β]has similar
+behavior to reverse KL for βclose to 1, since DJSD[β](P∥Q) =DJSD[1−β](Q∥P).
+Total variation distance (TVD).
+DTVD(P∥Q) =X
+c∈C|P(c)−Q(c)
+2| (A.4)
+14
+
+--- PAGE 15 ---
+Published as a conference paper at ICLR 2024
+A.2 J USTIFICATION OF USING ON -POLICY DATA
+In this section, we prove Theorem 4.1 which motivates our use of on-policy data. We follow the
+notations in Sections 3 and 4. In addition, we write ϵ(x) :=Ey∼q≤T(y|x)
+DTVD(Mp∥Mθ
+q)(y|x)
+for the distillation loss of a single input x.
+To ease the analysis, let decompose α(x)andϵ(x)into sums of contributions from each token.
+Lemma A.1. For all x,α(x) = 1−1
+Lp(x)PT
+t=1Atandϵ(x)≥1
+TPT
+t=1Et, where:
+At(x) :=Ey∼p≤T(y|x)
+1{t≤|y|}DTVD(p(yt|x, y<t), q(yt|x, y<t))
+, (A.5)
+Et(x) :=Ey∼q≤T(y|x)
+1{t≤|y|}DTVD(p(yt|x, y<t), q(yt|x, y<t))
+. (A.6)
+Proof. By Equation 3, we have:
+α(x) = 1−Ey∼p≤T(y|x)hP|y|
+t=1DTVD(p(yt|x, y<t), q(yt|x, y<t))i
+Lp(x).
+We can rewriteP|y|
+t=1DTVD(p(yt), q(yt)) =PT
+t=11{t≤|y|}DTVD(p(yt), q(yt))and swap the order
+between the summation and the expectation to obtain:
+α(x) = 1−PT
+t=1Ey∼p≤T(y|x)
+1{t≤|y|}DTVD(p(yt|x, y<t), q(yt|x, y<t))
+Lp(x),
+which proves Equation A.5.
+Similarly, by definition of ϵ(x)andDTVD we have:
+ϵ(x) =Ey∼q≤T(y|x)
+1
+|y||y|X
+t=1DTVD(p(yt|x, y<t), q(yt|x, y<t))
+
+≥Ey∼q≤T(y|x)
+1
+T|y|X
+t=1DTVD(p(yt|x, y<t), q(yt|x, y<t))
+.
+Again, we can rewriteP|y|
+t=1DTVD(p(yt), q(yt)) =PT
+t=11{t≤|y|}DTVD(p(yt), q(yt))and then
+swap the order between the summation and the expectation to obtain:
+ϵ(x)≥1
+TTX
+t=1Ey∼q≤T(y|x)
+1{t≤|y|}DTVD(p(yt|x, y<t), q(yt|x, y<t))
+,
+which proves Equation A.6.
+Lemma A.1 motivates us to study At(x)andEt(x)instead. Below we rewrite them in variational
+forms that will be used later. For this, we introduce some defintiions.
+Definition A.1. For any sequence z∈ {P,Q}τthat consists only of letters PandQ, we define
+M(x, y, z )as the distribution of sequences sampled as follows:
+1. Initialize a sequence of tokens as y;
+2. If there are t−1tokens, sample the t-th token from Mpifzt=P, and from Mqotherwise;
+3. Repeat until an end-of-sequence token is sampled, or the sequence length has reached τ.
+We use the shorthand PkandQkto represent the sequence of kconsecutive letters of PandQre-
+spectively. Let Ωkdenote the set of all possible strings of length k, and δ: Ωt→[−1/2,1/2]be a
+generic function that maps a sequence of ttokens to a real number in [−1,1]. We abuse the notation
+and assign δ(y) = 0 for all y /∈Ωt.
+15
+
+--- PAGE 16 ---
+Published as a conference paper at ICLR 2024
+Lemma A.2. For all xand all 1≤t≤T:
+At(x) = sup
+δ:Ωt→[−1/2,1/2]
+Ey∼M(x,∅,Pt)[δ(y)]−Ey∼M(x,∅,Pt−1Q)[δ(y)]	
+, (A.7)
+Et(x) = sup
+δ:Ωt→[−1/2,1/2]
+Ey∼M(x,∅,Qt−1P)[δ(y)]−Ey∼M(x,∅,Qt)[δ(y)]	
+. (A.8)
+Proof. For a fixed pair xandy, we rewrite the total variance distance between p(yt|x, y<t)and
+q(yt|x, y<t)as the following variational form:
+DTVD(p(yt|x, y<t), q(yt|x, y<t))
+= sup
+˜δ:Ω→[−1/2,1/2]
+
+Eyt∼p(yt|x,y<t)h
+˜δ(yt)i
+−Eyt∼q(yt|x,y<t)h
+˜δ(yt)i
+| {z }
+=:∆( x,y<t,˜δ)
+
+.
+After taking the expectations:
+At(x) =Ey∼p≤T(y|x)[DTVD(p(yt|x, y<t), q(yt|x, y<t))]
+=Ey∼p≤T(y|x)"
+sup
+˜δ:Ω→[−1/2,1/2]n
+∆(x, y<t,˜δ)o#
+=Ey∼M(x,∅,Pt−1)"
+sup
+˜δ:Ω→[−1/2,1/2]n
+1{|y|=t−1}∆(x, y,˜δ)o#
+= sup
+δ:Ωt→[−1/2,1/2]
+Ey∼M(x,∅,Pt−1)
+1{|y|=t−1}∆(x, y, δ (y,·))	
+,
+where the third equality uses the observation that for any function f,Ey∼p≤T(y|x)[f(x, y<t)]can
+be replaced with Ey∼M(x,∅,Pt−1)
+1{|y|=t−1}f(x, y)
+, and the last equality swaps the order between
+the expectation and the supremum. Finally, we move the expectations in ∆to merge with the
+expectation outside and obtain:
+At(x) = sup
+δ:Ωt→[−1/2,1/2]
+Ey∼M(x,∅,Pt)
+1{|y|=t}δ(y)
+−Ey∼M(x,∅,Pt−1Q)
+1{|y|=t}δ(y)	
+= sup
+δ:Ωt→[−1/2,1/2]
+Ey∼M(x,∅,Pt)[δ(y)]−Ey∼M(x,∅,Pt−1Q)[δ(y)]	
+,
+where the last step follows from our abuse of notation that δ(y) = 0 for all y /∈Ωt. This proves
+Equation A.7, and Equation A.8 can be proved similarly.
+Based on our variational forms of At(x)andEt(x), we obtain the following lemma for bounding
+At(x)in terms of Et(x).
+Lemma A.3. For all xand1≤t≤T:
+At(x)≤2t−1X
+k=1Ek(x) +Et(x). (A.9)
+Proof. It suffices to find an upper bound on Ey∼M(x,∅,Pt)[δ(y)]and a lower bound on
+Ey∼M(x,∅,Pt−1Q)[δ(y)]for all δ: Ωt→[−1/2,1/2].
+For all 1≤k≤t, we can replace the first PinEy∼M(x,∅,Qk−1Pt−k+1)[δ(y)]with Qby only intro-
+ducing an error of Ek+1(x):
+Ey∼M(x,∅,Qk−1Pt−k+1)[δ(y)] =Ey∼M(x,∅,Qk−1P)
+1{|y|=k}Ey′∼M(x,y,Pt−k)[δ(y′)]
+≤Ey∼M(x,∅,Qk)
+1{|y|=k}Ey′∼M(x,y,Pt−k)[δ(y′)]
++Ek(x)
+=Ey∼M(x,∅,QkPt−k)[δ(y)] +Ek(x),
+16
+
+--- PAGE 17 ---
+Published as a conference paper at ICLR 2024
+where the second inequality holds because we can define a function δ′: Ωk→
+[−1/2,1/2], suchthatδ (y) =1{|y|=k}Ey′∼M(x,y,Pt−k)[δ(y′)]and then apply Equation A.8.
+Now taking a telescoping sum over 1≤k≤t, we obtain:
+Ey∼M(x,∅,Pt)[δ(y)]≤Ey∼M(x,∅,Qt)[δ(y)] +tX
+k=1Ek(x). (A.10)
+Similarly, for all 1≤k≤t−1, we can replace the first PinEy∼M(x,∅,Qk−1Pt−kQ)[δ(y)]with Qand
+only introduce an error of Ek(x):
+Ey∼M(x,∅,Qk−1Pt−kQ)[δ(y)] =Ey∼M(x,∅,Qk−1P)
+1{|y|=k}Ey′∼M(x,y,Pt−k−1Q)[δ(y′)]
+=−Ey∼M(x,∅,Qk−1P)
+−1{|y|=k}Ey′∼M(x,y,Pt−k−1Q)[δ(y′)]
+≥ − 
+Ey∼M(x,∅,Qk)
+−1{|y|=k}Ey′∼M(x,y,Pt−k−1Q)[δ(y′)]
++Ek(x)
+=Ey∼M(x,∅,QkPt−k−1Q)[δ(y)]−Ek(x).
+Taking a telescoping sum over 1≤k≤t−1yields:
+Ey∼M(x,∅,Pt−1Q)[δ(y)]≥Ey∼M(x,∅,Qt)[δ(y)]−t−1X
+k=1Ek(x). (A.11)
+Subtracting Equation (A.11) from Equation (A.10), we have the following holds for all functions
+δ:S→[−1/2,1/2]:
+Ey∼M(x,∅,Pt)[δ(y)]−Ey∼M(x,∅,Pt−1Q)[δ(y)]≤tX
+k=1Ek(x) +t−1X
+k=1Ek(x) = 2t−1X
+k=1Ek(x) +Et(x),
+which proves the claim.
+Proof of Theorem 4.1. Summing Equation A.9 over 1≤t≤T, we have:
+TX
+t=1At(x)≤TX
+t=1(1 + 2( T−t))Et(x).
+Combining this with Lemma A.1 yields:
+α(x) = 1−1
+Lp(x)TX
+t=1At≥1−1
+Lp(x)TX
+t=1(1 + 2( T−t))Et(x)
+≥1−2T
+Lp(x)TX
+t=1Et(x)
+≥1−2T2
+Lp(x)ϵ(x),
+which proves the theorem statement after taking the expectation over x∼X.
+17
+
+--- PAGE 18 ---
+Published as a conference paper at ICLR 2024
+A.3 D ISTILL SPEC ALGORITHMS
+Algorithm A.1 Speculative decoding step
+Require: target model Mp, draft model Mq, context ρ={x, y<t}.
+Hyperparameters: block size ( γ), lenience Function f(p, ϵ)(ϵ= 1 for lossless and ϵ< 1 for lossy decoding).
+1:for all i= 0toγ−1do
+2: qt+i(y)←Mq(x, y<t+i),yt+i∼qt+i(y) ▷Sample γtokens from Mqautoregressively.
+3:end for
+4:(pt(y), . . . , p t+γ(y))←(Mp(x, y<t), . . . ,Mp(x, y<t+γ)) ▷RunMpin parallel.
+5:ri←f(pi(y),ϵ)
+qi(y),∀t≤i < t +γ ▷ Compute the rejection thresholds.
+6:ut∼Uniform(0 ,1), . . . , u t+γ−1∼Uniform(0 ,1) ▷Generate γrandom values.
+7:n←min ({i|0≤i < γ, u t+i> rt+i} ∪ {γ}) ▷Determine the number of accepted tokens n.
+8:ifn < γ then
+9: yt+n∼norm (max (0 , pt+n(y)−qt+n(y))) ▷Sample from the adjusted distribution.
+10:else
+11: yt+n∼pt+n(y) ▷Sample from Mp.
+12:end if
+Return {x, y<t+n+1} ▷Append ntokens from Mqand one token from Mp.
+Algorithm A.2 Knowledge distillation
+Require: target model Mp, draft model Mθ
+q, dataset (X, Y)containing input xand possibly output y.
+Hyperparameters: fixed data fraction λ1∈[0,1], student data fraction λ2∈[0,1], divergence function D,
+learning rate η.
+1:u1∼Uniform(0 ,1), u2∼Uniform(0 ,1) ▷Generate two random values.
+2:ifu1≤λ1then
+3: B={(xb, yb)}B
+b=1, where (xi, yi)∼(X, Y) ▷Sample inputs and outputs from (X, Y).
+4:else
+5: B′={(xb)}B
+b=1, where xi∼X ▷ Sample a batch of inputs from X.
+6: ifu2≤λ2then
+7: B={(xb, yb)}B
+b=1, where xi∼B′,yi∼Mθ
+q(·|xi) ▷Sample data from Mq.
+8: else
+9: B={(xb, yb)}B
+b=1, where xi∼B′,yi∼Mp(·|xi) ▷Sample data from Mp.
+10: end if
+11:end if
+Return θ←θ−η1
+BP
+(x,y)∈B∇θD(Mp∥Mθ
+q)(y|x) ▷Update θto minimize D(Mp∥Mθ
+q).
+18
+
+--- PAGE 19 ---
+Published as a conference paper at ICLR 2024
+B I MPLEMENTATION DETAILS
+B.1 D ATASETS
+In this section, we present a comprehensive overview of the datasets employed in this study.
+XSum (Narayan et al., 2018). The Extreme Summarization (XSum) dataset serves as an eval-
+uation benchmark for abstractive single-document summarization systems. This dataset comprises
+226,711 news articles, sourced from BBC articles spanning the years 2010 to 2017. These articles
+encompass a wide range of domains, including News, Politics, Sports, Weather, Business, Technol-
+ogy, Science, Health, Family, Education, Entertainment, and Arts. Summarization performance is
+evaluated using ROUGE scores on the validation dataset split of XSum and primarily emphasizes
+ROUGE-2, but with similar trends observed for ROUGE-LSum and ROUGE-1. A maximum input
+length of 1,024 and a maximum output length of 64 are employed for distillation and evaluation.
+CNN/DM (Hermann et al., 2015). The CNN/Daily Mail (CNN/DM) dataset is tailored for text
+summarization. It comprises abstractive summary bullets generated by humans from news stories on
+CNN and Daily Mail websites, presented in the form of questions with entities hidden. The questions
+can be answered using relevant passages from the source text. Similar to XSum, ROUGE scores
+on the validation dataset are reported, primarily emphasizing ROUGE-2 but with similar trends
+observed for ROUGE-LSum and ROUGE-1. A maximum input length of 2,048 and a maximum
+output length of 128 are used for distillation and evaluation.
+WMT EnDe (Bojar et al., 2014). The WMT14 EnDe dataset stands as a standard benchmark for
+machine translation. The task entails translating English text to German while preserving content,
+semantics and style. Evaluation is based on BLEU scores, which measures the similarity of machine-
+translated text to high-quality reference translations. A maximum input length of 80 and a maximum
+output length of 80 are employed for distillation and evaluation, with performance assessed on the
+original test split.
+GSM8K (Cobbe et al., 2021). The GSM8K dataset comprises 8.5K high-quality, linguistically
+diverse grade school math word problems crafted by human problem writers. The dataset is divided
+into 7.5K training problems and 1K test problems, with solutions typically requiring 2 to 8 steps
+involving elementary calculations using basic arithmetic operations. To enhance reasoning abilities,
+we explored distillation alongside zero-shot chain-of-thought (CoT), as described in Agarwal et al.
+(2023). A maximum input length of 256 and a maximum output length of 320 are used for distillation
+and evaluation.
+LM1B Chelba et al. (2013). The One Billion Word dataset (LM1B) is a widely recognized
+benchmark for language modeling. The training and held-out data are derived from the WMT 2011
+News Crawl dataset using Bash shell and Perl scripts. A maximum input length of 128 and a
+maximum output length of 128 are used for distillation and evaluation.
+B.2 M ODELS
+In accordance with Leviathan et al. (2023), we evaluate two model types: 1) GPT-like decoder-only
+Transformer models trained on the LM1B task (Chelba et al., 2013) using the standard autoregres-
+sive objective, where the target and draft models have 234M and 33M parameters, respectively;
+and 2) standard encoder-decoder T5 v1.1 models (Raffel et al., 2020) supervised fine-tuned on four
+different tasks, with T5-XL (3B) and T5-Small (77M) serving as the target and draft models, respec-
+tively.
+The target Mpin the decoder-only model experiment has hidden dimension 1,024, feed-forward
+dimension 4,096, 12 layers and 16 attention heads per transformer block, for a total of 234M
+parameters. The corresponding draft model Mθ
+qhas hidden dimension 512, feed-forward dimen-
+sion 1,024, 4 layers and 4 attention heads per transformer block, for a total of 33M parame-
+ters. All models utilize the T5 tokenizer with 32k tokens. As for the T5 base checkpoints, we
+start from LM-adapted T5v1.1 models. These LM-adapted models are initialized from T5v1.1
+and trained for an additional 100K steps on the LM objective discussed in the T5 paper (Raffel
+et al., 2020). These checkpoints are available at https://console.cloud.google.com/
+storage/browser/t5-data/pretrained_models .
+19
+
+--- PAGE 20 ---
+Published as a conference paper at ICLR 2024
+In our encoder-decoder distillation experiments, both the student and teacher models are initialized
+from models supervised fine-tuned on the original training dataset. This process for each dataset is
+detailed as follows:
+•XSum : for T5-Small, -Base, -Large, -XL and -XXL models, we warm start distillation
+from LM-Adapted T5v1.1 models supervised fine-tuned for 100K, 50K, 30k, 20K and 8K
+steps, respectively.
+•CNN/DM : for T5-Small,-Base,-Large, -XL and -XXL models, we warm start distillation
+from LM-Adapted T5v1.1 models supervised fine-tuned for 200K, 80K, 20k, 20k and 4K
+steps, respectively.
+•WMT : for T5-Small,-Base,-Large, -XL and -XXL models, we warm start distillation from
+LM-Adapted T5v1.1 models supervised fine-tuned for 250K, 250K, 110k , 50K and 10K
+steps, respectively.
+•GSM8K : all models are supervised fine-tuned starting from FLAN-T5 models on the
+PaLM-540 generated CoT dataset for 10K steps.
+B.3 D ISTILLATION
+Training Data for KD. We study the five KD algorithms outlined in Table 1. For SeqKD (Kim &
+Rush, 2016) and f-Distill (Wen et al., 2023), we opt for an online teacher data generation approach
+instead of a conventional fixed offline teacher-generated dataset. This approach, while computation-
+ally expensive, yields a more diverse dataset. For GKD, we exclude the static ground truth data and
+solely rely on the data generated by the online student model. All data generated by the teacher or
+the student is based on temperature sampling with a temperature of 1.0 (see Appendix C.1.3 for an
+ablation study on sampling temperature).
+Training Details. We employ an Adafactor optimizer (Shazeer & Stern, 2018) to train the draft
+student model ( Mθ
+q) in all our experiments, following the guidelines outlined in Algorithm A.2. In
+the context of our knowledge distillation (KD) loss function, defined in Eq. 2, we maintain the tem-
+peratures for both the target model, denoted as Tp, and the draft model, denoted as Tq, at a constant
+value of 1.0. We ought to emphasize the significance of maintaining this uniform temperature set-
+ting as it plays a pivotal role in speculative decoding, by ensuring a consistent and coherent semantic
+interpretation for both MpandMθ
+q. A summary of the hyperparameters used in our knowledge dis-
+tillation process can be found in Table B.1.
+Table B.1: Hyperparameters for distillation experiments.
+hyperparameter value
+training steps 300,000
+batch size 32
+dropout 0.0
+learning rate (LR) 0.0003
+LR warmup steps 5,000
+LR cooldown (begin, end) (150,000, 300,000)
+warmup schedule linear (from 0 to LR)
+cooldown schedule cosine decay (from LR to 0.1LR)
+20
+
+--- PAGE 21 ---
+Published as a conference paper at ICLR 2024
+B.4 E VALUATION
+To obtain scores for each task (specifically, ROUGE-2 for XSum and CNN/DM, BLEU for WMT,
+and accuracy for GSM8K), we employ the evaluation methodology in Agarwal et al. (2023). We
+assess models on all examples in the test or validation sets and report their average performance. To
+assess empirical speculative decoding performance, i.e., the empirical acceptance rate and empirical
+block efficiency, we conduct evaluations on all instances in the test or validation sets and report the
+average value of these metrics.
+To measure the actual latency, we follow Leviathan et al. (2023) and execute both our target model
+and draft models are on the same TPUv4 device without utilizing model parallelism. We randomly
+sample 500 examples from either the test or validation set, and measure the wall-clock decoding time
+on a batch size of 1. This measurement procedure is repeated three times, and the mean performance
+is reported. We have observed minimal variance across different random seeds in our results.
+21
+
+--- PAGE 22 ---
+Published as a conference paper at ICLR 2024
+C A DDITIONAL RESULTS
+C.1 E NHANCING SPECULATIVE DECODING THROUGH KNOWLEDGE DISTILLATION
+Table C.1: DistillSpec improves speculative decoding performance across various datasets and block
+sizes, for both greedy decoding and temperature sampling. BBH-A VG contains the evaluation of the
+distilled draft model from GSM8K on all BIG-Bench Hard (BBH) tasks (Suzgun et al., 2022); we
+report the average results over the 23 BBH tasks. See Figure C.2 and C.3 for a detailed breakdown
+of performance on individual BBH tasks.
+Dataset ModelSampling w/o Distillation with Distillation
+temp γ τ SPEED τ SPEED ∆ Method
+XSumTarget MpT=03 2.31 1.44 × 2.62 1.58 × +0.14×f-Distill
+5 2.57 1.43 × 3.08 1.62 × +0.19×f-Distill
+T5-XL (3B) 7 2.68 1.36 × 3.31 1.57 × +0.21×f-Distill
+Draft MqT=13 2.19 1.40 × 2.58 1.57 × +0.17×f-Distill
+5 2.39 1.37 × 3.01 1.61 × +0.25×f-Distill
+T5-Small (77M) 7 2.47 1.28 × 3.21 1.55 × +0.27×f-Distill
+CNNDMTarget MpT=03 2.83 1.89 × 3.19 2.11 × +0.22×f-Distill
+5 3.46 2.07 × 4.13 2.42 × +0.35× GKD
+T5-XL (3B) 7 3.85 2.07 × 4.83 2.53 × +0.46×f-Distill
+Draft MqT=13 2.49 1.71 × 2.87 1.93 × +0.23×f-Distill
+5 2.89 1.77 × 3.52 2.12 × +0.35×f-Distill
+T5-Small (77M) 7 3.08 1.71 × 3.92 2.12 × +0.41×f-Distill
+WMTTarget MpT=03 3.22 2.08 × 3.30 2.13 × +0.05×f-Distill
+5 4.17 2.33 × 4.32 2.41 × +0.08×f-Distill
+T5-XL (3B) 7 4.83 2.36 × 5.06 2.46 × +0.10×f-Distill
+Draft MqT=13 2.73 1.77 × 2.88 1.83 × +0.07× GKD
+5 3.29 1.83 × 3.48 1.93 × +0.10× GKD
+T5-Small (77M) 7 3.54 1.72 × 3.85 1.84 × +0.12×f-Distill
+GSM8KTarget MpT=03 2.60 1.51 × 2.96 1.69 × +0.18× GKD
+5 3.06 1.42 × 3.68 1.65 × +0.22× GKD
+T5-XL (3B) 7 3.27 1.36 × 4.14 1.60 × +0.24× GKD
+Draft MqT=13 2.58 1.48 × 2.84 1.64 × +0.16×f-Distill
+5 3.03 1.39 × 3.45 1.58 × +0.19×f-Distill
+T5-Small (77M) 7 3.23 1.33 × 3.84 1.53 × +0.20×f-Distill
+LM1BTarget MpT=03 2.96 3.66 × 3.13 3.97 × +0.31×f-Distill
+5 3.69 3.35 × 3.92 3.51 × +0.16×f-Distill
+GPT-Like (234M) 7 4.15 2.52 × 4.55 2.72 × +0.20×f-Distill
+Draft MqT=13 2.51 2.34 × 2.69 2.45 × +0.11×f-Distill
+5 2.90 2.79 × 3.20 3.02 × +0.23×f-Distill
+GPT-Like (33M) 7 3.10 1.98 × 3.51 2.18 × +0.20×f-Distill
+BBH-A VGTarget MpT=03 2.55 1.90 × 2.68 2.06 × +0.16×f-Distill
+5 2.98 1.92 × 3.19 2.16 × +0.24×f-Distill
+T5-XL (3B) 7 3.20 1.93 × 3.49 2.21 × +0.28×f-Distill
+Draft MqT=13 2.45 1.79 × 2.57 1.93 × +0.14×f-Distill
+5 2.81 1.80 × 3.03 1.98 × +0.18×f-Distill
+T5-Small (77M) 7 3.01 1.78 × 3.28 2.02 × +0.23×f-Distill
+22
+
+--- PAGE 23 ---
+Published as a conference paper at ICLR 2024
+100200Speculative Decoding 
+ Speedup (%)+15% +13%
+XSum+30%+37%
+GSM8K+20%+29%
+CNNDM+7%+9%
+WMT+27%+36%
+BBH (Transfer)DistillSpec (Greedy) Standard SD (Greedy) DistillSpec (Non-Greedy) Standard SD (Non-Greedy)
+Figure C.1: The distilled draft T5-Small model, derived from a T5-XL teacher model, is capable
+of generalizing to a larger target model (T5-XXL), resulting in a substantial acceleration in various
+scenarios. BBH-A VG contains the evaluation of the distilled draft model from GSM8K on all BIG-
+Bench Hard (BBH) tasks (Suzgun et al., 2022); we report the average results over the 23 BBH tasks.
+See Figure C.4 and C.5 for a detailed breakdown of performance on individual BBH tasks.
+40 60 80 100 120 140 160 180
+Speculative Decoding Speedup (%)temporal_sequences
+object_counting
+logical_deduction_five_objects
+web_of_lies
+logical_deduction_three_objects
+logical_deduction_seven_objects
+geometric_shapes
+reasoning_about_colored_objects
+movie_recommendation
+tracking_shuffled_objects_seven_objects
+tracking_shuffled_objects_five_objects
+penguins_in_a_table
+snarks
+disambiguation_qa
+dyck_languages
+boolean_expressions
+date_understanding
+word_sorting
+navigate
+causal_judgement
+tracking_shuffled_objects_three_objects
+multistep_arithmetic_two
+ruin_names
+sports_understanding
+salient_translation_error_detection
+formal_fallacies
+hyperbatonDistillSpec Avg
+Standard Avg
+DistillSpec
+Standard SD
+Figure C.2: Assessing DistillSpec’s model transferability on the BIG-Bench Hard suite: zero-shot
+CoT reasoning with non-greedy decoding. This study examines a T5-Small draft model, initially
+trained on the GSM8K dataset, across 23 varied tasks using T5-XL as the target model. DistillSpec
+can deliver significant speculative decoding speedups on a broad spectrum of tasks.
+23
+
+--- PAGE 24 ---
+Published as a conference paper at ICLR 2024
+40 60 80 100 120 140 160 180
+Speculative Decoding Speedup (%)object_counting
+temporal_sequences
+logical_deduction_five_objects
+web_of_lies
+logical_deduction_three_objects
+logical_deduction_seven_objects
+dyck_languages
+boolean_expressions
+geometric_shapes
+reasoning_about_colored_objects
+movie_recommendation
+ruin_names
+tracking_shuffled_objects_seven_objects
+snarks
+multistep_arithmetic_two
+disambiguation_qa
+penguins_in_a_table
+tracking_shuffled_objects_five_objects
+sports_understanding
+causal_judgement
+date_understanding
+salient_translation_error_detection
+word_sorting
+tracking_shuffled_objects_three_objects
+navigate
+formal_fallacies
+hyperbatonDistillSpec Avg
+Standard Avg
+DistillSpec
+Standard SD
+Figure C.3: Assessing DistillSpec’s model transferability on the BIG-Bench Hard suite: zero-shot
+CoT reasoning with greedy decoding. This study examines a T5-Small draft model, initially trained
+on the GSM8K dataset, across 23 varied tasks using T5-XL as the target model. DistillSpec can
+deliver significant speculative decoding speedups on a broad spectrum of tasks.
+24
+
+--- PAGE 25 ---
+Published as a conference paper at ICLR 2024
+50 100 150 200 250 300
+Speculative Decoding Speedup (%)web_of_lies
+temporal_sequences
+tracking_shuffled_objects_seven_objects
+formal_fallacies
+object_counting
+logical_deduction_five_objects
+logical_deduction_seven_objects
+tracking_shuffled_objects_five_objects
+logical_deduction_three_objects
+disambiguation_qa
+reasoning_about_colored_objects
+tracking_shuffled_objects_three_objects
+word_sorting
+causal_judgement
+geometric_shapes
+date_understanding
+boolean_expressions
+dyck_languages
+snarks
+penguins_in_a_table
+salient_translation_error_detection
+ruin_names
+navigate
+movie_recommendation
+multistep_arithmetic_two
+sports_understanding
+hyperbatonDistillSpec Avg
+Standard Avg
+DistillSpec
+Standard SD
+Figure C.4: Assessing DistillSpec’s model transferability on the BIG-Bench Hard suite: zero-shot
+CoT reasoning with non-greedy decoding. This study examines a T5-Small draft model, initially
+trained on the GSM8K dataset, across 23 varied tasks using T5-XXL as the target model. DistillSpec
+can deliver significant speculative decoding speedups on a broad spectrum of tasks.
+25
+
+--- PAGE 26 ---
+Published as a conference paper at ICLR 2024
+50 100 150 200 250 300 350
+Speculative Decoding Speedup (%)web_of_lies
+temporal_sequences
+formal_fallacies
+logical_deduction_seven_objects
+disambiguation_qa
+tracking_shuffled_objects_seven_objects
+object_counting
+logical_deduction_five_objects
+reasoning_about_colored_objects
+geometric_shapes
+causal_judgement
+ruin_names
+logical_deduction_three_objects
+dyck_languages
+boolean_expressions
+tracking_shuffled_objects_five_objects
+date_understanding
+word_sorting
+tracking_shuffled_objects_three_objects
+movie_recommendation
+snarks
+penguins_in_a_table
+sports_understanding
+multistep_arithmetic_two
+salient_translation_error_detection
+navigate
+hyperbatonDistillSpec Avg
+Standard Avg
+DistillSpec
+Standard SD
+Figure C.5: Assessing DistillSpec’s model transferability on the BIG-Bench Hard suite: zero-shot
+CoT reasoning with greedy decoding. This study examines a T5-Small draft model, initially trained
+on the GSM8K dataset, across 23 varied tasks using T5-XXL as the target model. DistillSpec can
+deliver significant speculative decoding speedups on a broad spectrum of tasks.
+26
+
+--- PAGE 27 ---
+Published as a conference paper at ICLR 2024
+C.1.1 E MPIRICAL BLOCK EFFICIENCY IMPROVEMENT
+2.202.402.60Block Efficiency ()
+Without DistillationXSum
+2.602.80
+Without DistillationCNNDM
+2.752.802.852.90
+Without DistillationWMT
+2.602.702.802.90
+Without DistillationGSM8KSupervisedKD SeqKD ImitKD f-Distill GKD
+Figure C.6: Empirical block efficiency improvement of DistillSpec for non-greedy sampling ( T= 1)
+and block size γ= 3. The draft model is trained using one of the distillation methods listed in
+Table 1 of Section 4. The dashed line indicates the block efficiency of speculative decoding using
+a non-distilled draft model. DistillSpec outperforms standard speculative decoding across all of the
+distillation methods being considered, with f-Distill and GKD yielding the highest gains.
+2.402.602.803.00Block Efficiency ()
+Without DistillationXSum
+2.803.003.203.403.60
+Without DistillationCNNDM
+3.303.403.50
+Without DistillationWMT
+3.003.203.40
+Without DistillationGSM8KSupervisedKD SeqKD ImitKD f-Distill GKD
+Figure C.7: Empirical block efficiency improvement of DistillSpec for non-greedy sampling ( T= 1)
+and block size γ= 5. The draft model is trained using one of the distillation methods listed in
+Table 1 of Section 4. The dashed line indicates the block efficiency of speculative decoding using
+a non-distilled draft model. DistillSpec outperforms standard speculative decoding across all of the
+distillation methods being considered, with f-Distill and GKD yielding the highest gains.
+2.502.753.003.25Block Efficiency ()
+Without DistillationXSum
+3.003.253.503.754.00
+Without DistillationCNNDM
+3.503.603.703.803.90
+Without DistillationWMT
+3.203.403.603.80
+Without DistillationGSM8KSupervisedKD SeqKD ImitKD f-Distill GKD
+Figure C.8: Empirical block efficiency improvement of DistillSpec for non-greedy sampling ( T= 1)
+and block size γ= 7. The draft model is trained using one of the distillation methods listed in
+Table 1 of Section 4. The dashed line indicates the block efficiency of speculative decoding using
+a non-distilled draft model. DistillSpec outperforms standard speculative decoding across all of the
+distillation methods being considered, with f-Distill and GKD yielding the highest gains.
+27
+
+--- PAGE 28 ---
+Published as a conference paper at ICLR 2024
+2.302.402.502.60Block Efficiency ()
+Without DistillationXSum
+2.803.003.20
+Without DistillationCNNDM
+3.233.253.283.30
+Without DistillationWMT
+2.602.702.802.903.00
+Without DistillationGSM8KSupervisedKD SeqKD ImitKD f-Distill GKD
+Figure C.9: Empirical block efficiency improvement of DistillSpec for greedy sampling ( T= 0)
+and block size γ= 3. The draft model is trained using one of the distillation methods listed in
+Table 1 of Section 4. The dashed line indicates the block efficiency of speculative decoding using
+a non-distilled draft model. DistillSpec outperforms standard speculative decoding across all of
+the distillation methods being considered, with GKD weakly outperforming the other methods on
+average.
+2.602.803.00Block Efficiency ()
+Without DistillationXSum
+3.403.603.804.004.20
+Without DistillationCNNDM
+4.154.204.254.304.35
+Without DistillationWMT
+3.003.203.403.60
+Without DistillationGSM8KSupervisedKD SeqKD ImitKD f-Distill GKD
+Figure C.10: Empirical block efficiency improvement of DistillSpec for greedy sampling ( T= 0)
+and block size γ= 5. The draft model is trained using one of the distillation methods listed in
+Table 1 of Section 4. The dashed line indicates the block efficiency of speculative decoding using
+a non-distilled draft model. DistillSpec outperforms standard speculative decoding across all of
+the distillation methods being considered, with GKD weakly outperforming the other methods on
+average.
+2.602.803.003.203.40Block Efficiency ()
+Without DistillationXSum
+4.004.505.00
+Without DistillationCNNDM
+4.804.905.005.10
+Without DistillationWMT
+3.253.503.754.004.25
+Without DistillationGSM8KSupervisedKD SeqKD ImitKD f-Distill GKD
+Figure C.11: Empirical block efficiency improvement of DistillSpec for greedy sampling ( T= 0)
+and block size γ= 7. The draft model is trained using one of the distillation methods listed in
+Table 1 of Section 4. The dashed line indicates the block efficiency of speculative decoding using
+a non-distilled draft model. DistillSpec outperforms standard speculative decoding across all of
+the distillation methods being considered, with GKD weakly outperforming the other methods on
+average.
+28
+
+--- PAGE 29 ---
+Published as a conference paper at ICLR 2024
+C.1.2 P ERFORMANCE IMPROVEMENT OVER TIME
+050K 100K 150K 200K 250K 300K
+Training Steps0.620.640.660.680.700.72Acceptance Rate ()
+SupKD
+ImitKD
+SeqKD
+f-Distill
+GKD
+(a) XSum
+050K 100K 150K 200K 250K 300K
+Training Steps0.720.740.760.78Acceptance Rate ()
+SupKD
+ImitKD
+SeqKD
+f-Distill
+GKD (b) CNNDM
+050K 100K 150K 200K 250K 300K
+Training Steps0.7800.7850.7900.7950.8000.8050.810Acceptance Rate ()
+SupKD
+ImitKD
+SeqKD
+f-Distill
+GKD
+(c) WMT
+050K 100K 150K 200K 250K 300K
+Training Steps0.740.760.780.80Acceptance Rate ()
+SupKD
+ImitKD
+SeqKD
+f-Distill
+GKD (d) GSM8K
+Figure C.12: Progression of the acceptance rate αof DistillSpec over the training of the draft model,
+measured by the number of training steps. The draft model is trained using one of the distillation
+methods listed in Table 1 of Section 4. GKD and f-Distill yields the most consistent improvement in
+αover training steps, while SupKD yields the least improvement and exhibits declining acceptance
+rates after ∼40k training steps on XSum and CNNDM.
+29
+
+--- PAGE 30 ---
+Published as a conference paper at ICLR 2024
+0 20 40
+Training Efficiency (Walltime in hrs)0.620.640.660.680.700.72Acceptance Rate ()
+SupKD
+ImitKD
+SeqKD
+f-Distill
+GKD
+(a) XSum
+0 50 100 150
+Training Efficiency (Walltime in hrs)0.720.740.760.78Acceptance Rate ()
+SupKD
+ImitKD
+SeqKD
+f-Distill
+GKD (b) CNNDM
+0 10 20
+Training Efficiency (Walltime in hrs)0.7800.7850.7900.7950.8000.8050.810Acceptance Rate ()
+SupKD
+ImitKD
+SeqKD
+f-Distill
+GKD
+(c) WMT
+0 20 40 60
+Training Efficiency (Walltime in hrs)0.740.760.780.80Acceptance Rate ()
+SupKD
+ImitKD
+SeqKD
+f-Distill
+GKD (d) GSM8K
+Figure C.13: Progression of the acceptance rate of DistillSpec over the training of the draft model,
+measured by the training wall time. The draft model is trained using one of the distillation methods
+listed in Table 1 of Section 4. GKD and f-Distill yield the most consistent improvement in αover
+training wall time, while SupKD yields the least improvement and even exhibits an inflection in the
+acceptance rate early during training.
+30
+
+--- PAGE 31 ---
+Published as a conference paper at ICLR 2024
+050K 100K 150K 200K 250K 300K
+Training Steps2.62.83.03.23.4Block EfficiencySupKD
+ImitKD
+SeqKD
+f-Distill
+GKD
+(a) XSum
+050K 100K 150K 200K 250K 300K
+Training Steps3.23.43.63.84.0Block EfficiencySupKD
+ImitKD
+SeqKD
+f-Distill
+GKD (b) CNNDM
+050K 100K 150K 200K 250K 300K
+Training Steps4.04.14.24.3Block EfficiencySupKD
+ImitKD
+SeqKD
+f-Distill
+GKD
+(c) WMT
+050K 100K 150K 200K 250K 300K
+Training Steps3.43.63.84.0Block EfficiencySupKD
+ImitKD
+SeqKD
+f-Distill
+GKD (d) GSM8K
+Figure C.14: Progression of the block efficiency τof DistillSpec over the training of the draft model,
+measured by the number of training steps. The draft model is trained using one of the distillation
+methods listed in Table 1 of Section 4. GKD and f-Distill yield the most consistent improvement in
+τover training, while SupKD yields the least improvement and exhibits a drop in block efficiency
+after∼40k training steps on XSum and CNNDM.
+31
+
+--- PAGE 32 ---
+Published as a conference paper at ICLR 2024
+050K 100K 150K 200K 250K 300K
+Training Step14151617Rouge2 Score (T=0.1)SupKD
+ImitKD
+SeqKD
+f-Distill
+GKD
+(a) XSum
+050K 100K 150K 200K 250K 300K
+Training Step13141516Rouge2 Score (T=0.1)SupKD
+ImitKD
+SeqKD
+f-Distill
+GKD (b) CNNDM
+050K 100K 150K 200K 250K 300K
+Training Step25.425.625.826.026.226.4Rouge2 Score (T=0.1)SupKD
+ImitKD
+SeqKD
+f-Distill
+GKD
+(c) WMT
+050K 100K 150K 200K 250K 300K
+Training Step46810121416Accuracy with Calculator (T=0.1)SupKD
+ImitKD
+SeqKD
+f-Distill
+GKD (d) GSM8K
+Figure C.15: Progression of the task performance of the draft model over the course of its training,
+as measured by the number of training steps. Task performance is based on sampling temperature
+T= 0.1and is measured by the Rouge2 score on the XSum and CNNDM datasets, and the accuracy
+score with the help of a calculator on GSM8K. The draft model is trained using one of the distillation
+methods listed in Table 1 of Section 4. GKD and f-Distill yield the most consistent improvement in
+task performance over training, while SupKD yields the least improvement and exhibits declining
+Rouge2 scores after ∼40k training steps on XSum and CNNDM.
+32
+
+--- PAGE 33 ---
+Published as a conference paper at ICLR 2024
+0 2500 5000 7500 10000
+Sorted T est Data Index123456Block Efficiency ()
+Distilled Drafter
+Standard Drafter
+(a) XSum
+0 250 500 750 1000 1250
+Sorted T est Data Index23456Block Efficiency ()
+Distilled Drafter
+Standard Drafter (b) CNNDM
+0 1000 2000 3000
+Sorted T est Data Index23456Block Efficiency ()
+Distilled Drafter
+Standard Drafter
+(c) WMT
+0 250 500 750 1000 1250
+Sorted T est Data Index23456Block Efficiency ()
+Distilled Drafter
+Standard Drafter (d) GSM8K
+Figure C.16: Comparison of the block efficiency of draft models trained with distillation vs. without
+distillation. The draft model is trained using f-Distill on XSum and CNNDM, and on-policy GKD
+on GSM8K. For each dataset and draft model, the block efficiency is sorted and plotted from lowest
+to highest index. The higher position of the curve for the distilled draft model at each index indi-
+cates that the distribution of block efficiency of the distilled draft model first-order stochastically
+dominates the block efficiency of the non-distilled draft model.
+33
+
+--- PAGE 34 ---
+Published as a conference paper at ICLR 2024
+C.1.3 S AMPLING TEMPERATURE EFFECT
+050K 100K 150K 200K 250K 300K
+Training Steps0.620.640.660.680.700.72Acceptance Rate ()
+JSD0.5 (T=1e-2)
+JSD0.5 (T=1.0)
+TVD (T=1e-2)
+TVD (T=1.0)
+(a) distilling on student generations (on-policy)
+050K 100K 150K 200K 250K 300K
+Training Steps0.620.640.660.680.700.720.74Acceptance Rate ()
+JSD0.5 (T=1e-2)
+JSD0.5 (T=1.0)
+TVD (T=1e-2)
+TVD (T=1.0) (b) distilling on target model generations
+Figure C.17: Effect of the sampling temperature on the acceptance rate in XSum decoding. We
+assess how varying the sampling temperature influences speculative decoding performance in two
+distinct scenarios: (a) the draft model is trained on its own generated sequences (on-policy distil-
+lation), and (b) the draft model is trained on sequences sampled from the target model. In both
+instances, we find that using a high sampling temperature is paramount for attaining superior per-
+formance.
+C.1.4 R EDUCTION IN CROSS -ENTROPY
+050K 100K 150K 200K 250K 300K
+Training Steps0.40.50.60.70.8Cross EntropySeqKD
+GKD
+(a) cross-entropy reduction on XSum
+050K 100K 150K 200K 250K 300K
+Training Steps0.30.40.50.60.70.8Cross EntropySeqKD
+GKD (b) cross-entropy reduction on CNNDM
+Figure C.18: BiLD (Kim et al., 2023) proposes an SD variant that uses the cross-entropy between
+the target and draft model as the rejection criterion and uses SeqKD to improve the alignment.
+Our experiment shows that GKD can reduce the cross-entropy more effectively than SeqKD. Thus,
+DistillSpec can potentially be utilized to improve BiLD.
+34
+
+--- PAGE 35 ---
+Published as a conference paper at ICLR 2024
+C.2 D ISTILLATION RECIPE
+C.2.1 S CORE AND BLOCK EFFICIENCY IMPROVEMENT
+FKL JSD RKL TVDFixed (Train)
+Student (q)
+q+p
+Teacher (p)
+3 4.3 5.1 4.3
+4 5.7 6.2 5.9
+4.1 5.7 6.3 6
+4.2 5.7 6.4 6Rouge2 Improvement
+0123456
+(a) non-greedy decoding ( T= 1)
+FKL JSD RKL TVDFixed (Train)
+Student (q)
+q+p
+Teacher (p)
+0.52 1.1 1.3 1.8
+3.6 3.6 3.3 3.8
+3.6 3.7 3.4 3.7
+3.6 3.7 3.3 3.5Rouge2 Improvement
+0.00.51.01.52.02.53.03.5 (b) greedy decoding ( T= 0)
+Figure C.19: Improvement in the Rouge2 score of DistillSpec over standard speculative decoding on
+XSum given by different combinations of divergence functions and generative distributions used in
+the draft model distillation (see Table 1 of Section 4), using greedy ( T= 0) and non-greedy ( T= 1)
+sampling.
+FKL JSD RKL TVDFixed (Train)
+Student (q)
+q+p
+Teacher (p)
+0.11 0.18 0.2 0.27
+0.48 0.59 0.55 0.58
+0.51 0.64 0.6 0.6
+0.52 0.63 0.58 0.62Block Efficiency Improvement
+0.00.10.20.30.40.50.6
+(a) non-greedy decoding ( T= 1)
+FKL JSD RKL TVDFixed (Train)
+Student (q)
+q+p
+Teacher (p)
+0.01 0.08 0.13 0.17
+0.48 0.49 0.45 0.46
+0.52 0.53 0.5 0.5
+0.51 0.53 0.5 0.51Block Efficiency Improvement
+0.00.10.20.30.40.5 (b) greedy decoding ( T= 0)
+Figure C.20: Improvement in the block efficiency of DistillSpec over standard speculative decoding
+on XSum given by different combinations of divergence functions and generative distributions used
+in the draft model distillation (see Table 1 of Section 4), using greedy ( T= 0) and non-greedy
+(T= 1) sampling.
+35
+
+--- PAGE 36 ---
+Published as a conference paper at ICLR 2024
+FKL JSD RKL TVDFixed (Train)
+Student (q)
+q+p
+Teacher (p)
+4.2 4.8 5 5.4
+9.2 6.7 7.5 5.3
+6.9 6.3 7.3 6.8
+5 6.2 6 7Accuracy Improvement
+02468
+(a) non-greedy decoding ( T= 1)
+FKL JSD RKL TVDFixed (Train)
+Student (q)
+q+p
+Teacher (p)
+3.9 5.4 6.1 4.3
+10 6.7 7.6 5.2
+9.2 5.8 7 6.7
+6.4 5.5 7 6.8Accuracy Improvement
+0246810 (b) greedy decoding ( T= 0)
+Figure C.21: Improvement in the accuracy score of DistillSpec over standard speculative decoding
+on GSM8K given by different combinations of divergence functions and generative distributions
+used in the draft model distillation (see Table 1 of Section 4), using greedy ( T= 0) and non-greedy
+(T= 1) sampling.
+FKL JSD RKL TVDFixed (Train)
+Student (q)
+q+p
+Teacher (p)
+0.22 0.31 0.32 0.29
+0.42 0.43 0.45 0.41
+0.36 0.47 0.47 0.44
+0.33 0.44 0.49 0.43Block Efficiency Improvement
+0.00.10.20.30.4
+(a) non-greedy decoding ( T= 1)
+FKL JSD RKL TVDFixed (Train)
+Student (q)
+q+p
+Teacher (p)
+0.23 0.29 0.29 0.26
+0.61 0.42 0.43 0.38
+0.49 0.43 0.47 0.41
+0.35 0.43 0.46 0.42Block Efficiency Improvement
+0.00.10.20.30.40.50.6 (b) greedy decoding ( T= 0)
+Figure C.22: Improvement in the block efficiency of DistillSpec over standard speculative decoding
+on GSM8K given by different combinations of divergence functions and generative distributions
+used in the draft model distillation (see Table 1 of Section 4), using greedy ( T= 0) and non-greedy
+(T= 1) sampling.
+36
+
+--- PAGE 37 ---
+Published as a conference paper at ICLR 2024
+C.2.2 I MPACT OF DISTILLATION ON DRAFT QUALITY VS .COMPATIBILITY
+3 4 5 6
+Rouge2 Improvement0.10.20.30.40.50.6 Improvement
+Divergence
+FKL
+JSD0.5
+RKL
+TVD
+TrainData
+Teacher (p)
+Student (q)
+Fixed (Train)
+q+p
+(a) non-greedy decoding ( T= 1)
+1 2 3
+Rouge2 Improvement0.00.10.20.30.40.5 Improvement
+Divergence
+FKL
+JSD0.5
+RKL
+TVD
+TrainData
+Teacher (p)
+Student (q)
+Fixed (Train)
+q+p
+ (b) greedy decoding ( T= 0)
+Figure C.23: Correlation plot of the improvements in the block efficiency (y-axis) and Rouge2 score
+(x-axis) of DistillSpec over standard speculative decoding on XSum given by different combinations
+of divergence functions and generative distributions used in the draft model distillation (see Table 1
+of Section 4), using greedy ( T= 0) and non-greedy ( T= 1) sampling.
+4 6 8
+Accuracy Improvement0.250.300.350.400.450.50 Improvement
+Divergence
+FKL
+JSD0.5
+RKL
+TVD
+TrainData
+Teacher (p)
+Student (q)
+Fixed (Train)
+q+p
+(a) non-greedy decoding ( T= 1)
+4 6 8 10
+Accuracy Improvement0.30.40.50.6 Improvement
+Divergence
+FKL
+JSD0.5
+RKL
+TVD
+TrainData
+Teacher (p)
+Student (q)
+Fixed (Train)
+q+p
+ (b) greedy decoding ( T= 0)
+Figure C.24: Correlation plot of the improvements in the block efficiency (y-axis) and Accuracy (x-
+axis) of DistillSpec over standard speculative decoding on GSM8K given by different combinations
+of divergence functions and generative distributions used in the draft model distillation (see Table 1
+of Section 4), using greedy ( T= 0) and non-greedy ( T= 1) sampling.
+37
+
+--- PAGE 38 ---
+Published as a conference paper at ICLR 2024
+C.3 Q UALITY VERSUS LATENCY TRADE -OFF
+C.3.1 L OSSY SPECULATIVE DECODING
+1 2 3 4
+Relative Latency810121416Performance - Rouge2flin(p,)=p/
+fsq(p,)=p/2
+fexp(p,)=p
+No Lenience
+Raw Draft
+Distilled Draft
+(a) using non-distilled draft model (standard SD)
+0.5 1.0 1.5 2.0 2.5 3.0 3.5
+Relative Latency81012141618Performance - Rouge2flin(p,)=p/
+fsq(p,)=p/2
+fexp(p,)=p
+No Lenience
+Raw Draft
+Distilled Draft (b) using distilled draft model (DistillSpec)
+Figure C.25: Tradeoff between task performance and decoding latency on XSum enabled by com-
+bining lossy speculative decoding with the alternative variants of DistillSpec presented in Section 4.
+The higher position and flatter slope of the tradeoff curve for DistillSpec indicate that the method
+enables larger latency gains for smaller reduction in model quality than are feasible under standard
+SD.
+0.5 1.0 1.5 2.0 2.5
+Relative Latency89101112Performance - Rouge2flin(p,)=p/
+fsq(p,)=p/2
+fexp(p,)=p
+No Lenience
+Raw Draft
+Distilled Draft
+(a) using non-distilled draft model (standard SD)
+0.25 0.50 0.75 1.00 1.25 1.50 1.75 2.00
+Relative Latency89101112Performance - Rouge2flin(p,)=p/
+fsq(p,)=p/2
+fexp(p,)=p
+No Lenience
+Raw Draft
+Distilled Draft (b) using distilled draft model (DistillSpec)
+Figure C.26: Tradeoff between task performance and decoding latency on CNNDM enabled by
+combining lossy speculative decoding with the alternative variants of DistillSpec presented in Sec-
+tion 4. The higher position and flatter slope of the tradeoff curve for DistillSpec indicate that the
+method enables larger latency gains for smaller reduction in model quality than are feasible under
+standard SD.
+38
+
+--- PAGE 39 ---
+Published as a conference paper at ICLR 2024
+0.5 1.0 1.5 2.0 2.5
+Relative Latency14151617Performance - Bleuflin(p,)=p/
+fsq(p,)=p/2
+fexp(p,)=p
+No Lenience
+Raw Draft
+Distilled Draft
+(a) using non-distilled draft model (standard SD)
+0.25 0.50 0.75 1.00 1.25 1.50 1.75 2.00 2.25
+Relative Latency151617Performance - Bleuflin(p,)=p/
+fsq(p,)=p/2
+fexp(p,)=p
+No Lenience
+Raw Draft
+Distilled Draft (b) using distilled draft model (DistillSpec)
+Figure C.27: Tradeoff between task performance and decoding latency on WMT enabled by com-
+bining lossy speculative decoding with the alternative variants of DistillSpec presented in Section
+4. While the similar height and slope of the tradeoff curves of DistillSpec and standard SD indicate
+a comparable quality-latency tradeoff between the two setups, DistillSpec exhibits lower latency
+overall.
+0.5 1.0 1.5 2.0 2.5 3.0 3.5 4.0
+Relative Latency51015202530Performance - Accuracyflin(p,)=p/
+fsq(p,)=p/2
+fexp(p,)=p
+No Lenience
+Raw Draft
+Distilled Draft
+(a) using non-distilled draft model (standard SD)
+0.5 1.0 1.5 2.0 2.5 3.0 3.5
+Relative Latency51015202530Performance - Accuracyflin(p,)=p/
+fsq(p,)=p/2
+fexp(p,)=p
+No Lenience
+Raw Draft
+Distilled Draft (b) using distilled draft model (DistillSpec)
+Figure C.28: Tradeoff between task performance and decoding latency on GSM8K enabled by com-
+bining lossy speculative decoding with the alternative variants of DistillSpec presented in Section
+4. While the similar height and slope of the tradeoff curves of DistillSpec and standard SD indicate
+a comparable quality-latency tradeoff between the two setups, DistillSpec exhibits lower latency
+overall.
+39
+
+--- PAGE 40 ---
+Published as a conference paper at ICLR 2024
+C.3.2 D ISTILL SPEC MEETS MODEL GARDEN
+0.0 2.5 5.0 7.5 10.0 12.5 15.0 17.5
+Relative Latency810121416Performance - Rouge2T arget Model
+T5-Small
+T5-Base
+T5-Large
+T5-XL
+T5-XXLServing Strategy
+Raw
+Distilled
+Speculative
+DistillSpec
+(a) non-greedy decoding ( T= 1)
+0.0 2.5 5.0 7.5 10.0 12.5 15.0 17.5
+Relative Latency1416182022Performance - Rouge2T arget Model
+T5-Small
+T5-Base
+T5-Large
+T5-XL
+T5-XXLServing Strategy
+Raw
+Distilled
+Speculative
+DistillSpec (b) greedy decoding ( T= 0)
+Figure C.29: Quality-latency trade-off curves on XSum using greedy ( T= 0) or non-greedy ( T= 1)
+sampling, for a single target LLM trained without distillation (“Raw”), trained by distilling from
+a larger LLM (“Distilled”), speculative decoding using a draft model trained without distillation
+(“Speculative”), and speculative decoding combining a distilled target LLM with a distilled draft
+model (“DistillSpec”).
+0 2 4 6 8 10 12 14
+Relative Latency102030Performance - AccuracyT arget Model
+T5-Small
+T5-Base
+T5-Large
+T5-XL
+T5-XXLServing Strategy
+Raw
+Distilled
+Speculative
+DistillSpec
+(a) non-greedy decoding ( T= 1)
+0 2 4 6 8 10 12 14
+Relative Latency102030Performance - AccuracyT arget Model
+T5-Small
+T5-Base
+T5-Large
+T5-XL
+T5-XXLServing Strategy
+Raw
+Distilled
+Speculative
+DistillSpec (b) greedy decoding ( T= 0)
+Figure C.30: Quality-latency trade-off curves on GSM8K using greedy ( T= 0) or non-greedy ( T=
+1) sampling, for a single target LLM trained without distillation (“Raw”), trained by distilling from
+a larger LLM (“Distilled”), speculative decoding using a draft model trained without distillation
+(“Speculative”), and speculative decoding using a distilled target LLM combining a distilled draft
+model (“DistillSpec”).
+40

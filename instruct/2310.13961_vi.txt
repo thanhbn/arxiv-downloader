@@ -1,0 +1,309 @@
+# Ensemble-Instruct: Tạo Dữ Liệu Điều Chỉnh Hướng Dẫn với Hỗn Hợp Không Đồng Nhất của các LM
+
+Young-Suk Lee, Md Arafat Sultan, Yousef El-Kurdi, Tahira Naseem  
+Asim Munawar, Radu Florian, Salim Roukos, Ramón Fernandez Astudillo  
+{ysuklee,yousefelk,tnaseem,raduf,roukos}@us.ibm.com  
+{arafat.sultan,asim,ramon.astudillo}@ibm.com  
+IBM Research AI
+
+## Tóm tắt
+
+Sử dụng học trong ngữ cảnh (ICL) để tạo dữ liệu, các kỹ thuật như Self-Instruct (Wang et al., 2023) hoặc Alpaca tiếp theo (Taori et al., 2023) có thể huấn luyện các tác nhân đối thoại mạnh với chỉ một lượng nhỏ giám sát của con người. Một hạn chế của các phương pháp này là chúng phụ thuộc vào các mô hình ngôn ngữ rất lớn (khoảng 175B tham số) mà cũng là độc quyền và không công khai. Ở đây chúng tôi khám phá việc áp dụng các kỹ thuật như vậy cho các mô hình ngôn ngữ nhỏ hơn nhiều (khoảng 10B–40B tham số) và có giấy phép cho phép. Chúng tôi thấy phương pháp Self-Instruct kém hiệu quả hơn ở các kích thước này và đề xuất các phương pháp ICL mới dựa trên hai ý tưởng chính: (a) Phân loại và đơn giản hóa các mẫu ICL để làm cho việc học prompt dễ dàng hơn cho LM, và (b) Kết hợp nhiều đầu ra LM để giúp chọn các ví dụ tổng hợp chất lượng cao. Thuật toán của chúng tôi tận dụng 175 nhiệm vụ hạt giống Self-Instruct và sử dụng các pipeline riêng biệt cho các hướng dẫn yêu cầu đầu vào và các hướng dẫn không yêu cầu. Các điều tra thực nghiệm với các LM khác nhau cho thấy: (1) Phương pháp đề xuất của chúng tôi tạo ra dữ liệu điều chỉnh hướng dẫn chất lượng cao hơn Self-Instruct, (2) Nó cải thiện hiệu suất của cả LM vanilla và được điều chỉnh hướng dẫn với biên độ đáng kể, và (3) Các LM được điều chỉnh hướng dẫn nhỏ hơn tạo ra đầu ra hữu ích hơn so với các đối tác chưa được điều chỉnh lớn hơn. Codebase của chúng tôi có sẵn tại https://github.com/IBM/ensemble-instruct.
+
+## 1 Giới thiệu
+
+Các mô hình ngôn ngữ được điều chỉnh hướng dẫn đã chứng minh khả năng tổng quát hóa zero-shot mạnh cho các nhiệm vụ mới (Chung et al., 2022a; Wei et al., 2021; Ouyang et al., 2022; Mishra et al., 2022; Wang et al., 2022; Longpre et al., 2023), tạo ra sự quan tâm đến việc tổng hợp tự động quy mô lớn dữ liệu điều chỉnh hướng dẫn (Honovich et al., 2022; Wang et al., 2023; Xu et al., 2032; Sun et al., 2023a; Xu et al., 2023). Trong bối cảnh này, Self-Instruct (Wang et al., 2023) đã cho thấy rằng một số lượng nhỏ các ví dụ hạt giống được chú thích bởi chuyên gia, kết hợp với học trong ngữ cảnh (ICL) với một mô hình cơ sở, có thể được sử dụng để tạo ra một bộ dữ liệu điều chỉnh hướng dẫn để hướng dẫn hiệu quả cùng mô hình cơ sở đó. Trong khi phương pháp này mang lại kết quả mạnh và nhiều công trình tiếp theo, hầu hết các kỹ thuật phụ thuộc vào các LM rất lớn (khoảng 175B tham số) (Wang et al., 2023; Taori et al., 2023), chỉ có sẵn thông qua các API truy cập đóng, hoặc có quyền truy cập mô hình bị hạn chế.
+
+Trong bài báo này, chúng tôi trình bày Ensemble-Instruct, một thuật toán mới cho phép tạo dữ liệu điều chỉnh hướng dẫn chất lượng cao với các LM nhỏ hơn (40B tham số trở xuống), cũng hoàn toàn có thể truy cập và có giấy phép sử dụng cho phép. Chúng tôi chỉ ra rằng, khi sử dụng các mô hình nhỏ hơn làm generator, Self-Instruct gặp khó khăn trong việc tạo ra văn bản có chất lượng đầy đủ, ảnh hưởng tiêu cực đến tính hữu ích của dữ liệu được tạo và hiệu suất mô hình downstream. Giữ nguyên trong framework ICL và sử dụng các nhiệm vụ hạt giống Self-Instruct, Ensemble-Instruct khám phá hai ý tưởng chính để giải quyết vấn đề này: (1) Phân loại và đơn giản hóa các prompt ICL để làm cho quá trình học few-shot dễ dàng hơn, và (2) Kết hợp nhiều đầu ra LM để cải thiện cả độ chính xác và tính đa dạng của dữ liệu được tạo.
+
+Một mẫu điều chỉnh hướng dẫn tiêu chuẩn minh họa một nhiệm vụ bao gồm: (a) một hướng dẫn mô tả hành động cần thực hiện, (b) một đầu vào tùy chọn mà hành động được thực hiện trên đó, và (c) đầu ra của hành động. Tương tự như Self-Instruct, chúng tôi tạo các mẫu trong hai giai đoạn: tạo hướng dẫn và tạo instance, trong đó một instance bao gồm một đầu vào (tùy chọn) và một đầu ra. Không giống như Self-Instruct, Ensemble-Instruct tìm cách đơn giản hóa vấn đề cho LM tạo sinh bằng cách đầu tiên phân loại các ví dụ thành hai loại—những ví dụ có đầu vào và những ví dụ không có—và sau đó sử dụng các pipeline riêng biệt cho hai loại này tận dụng các prompt độc đáo và đơn giản hóa riêng của chúng (§2.1). Hơn nữa, nó kết hợp các đầu ra của các LM khác nhau theo hai cách bổ sung: (1) bao gồm các ví dụ được tạo bởi một bộ sưu tập không đồng nhất của các LM trong tập cuối cùng để tăng tính đa dạng, và (2) bỏ phiếu đa số theo sau là lọc các ví dụ đồng thuận thấp để cải thiện độ chính xác (§2.4).
+
+Để hiểu các hiệu ứng của các phương pháp đề xuất của chúng tôi, chúng tôi chạy một đánh giá mở rộng của các mô hình khác nhau để tạo hướng dẫn. Điều này bao gồm các mô hình ngôn ngữ vanilla (T5) UL2-20B (Tay et al., 2022), FALCON-40B (Penedo et al., 2023), các mô hình được điều chỉnh hướng dẫn FLAN-T5-11B (Chung et al., 2022b) và FLAN-UL2-20B (Tay et al., 2022) và phiên bản được điều chỉnh chat của GPT-NeoX-20B (Black et al., 2022). Là các mô hình cơ sở để tinh chỉnh với dữ liệu được tạo của chúng tôi, chúng tôi sử dụng LM vanilla Pythia-1.4B (Biderman et al., 2023) để phân tích ablation, MPT-7B, một LM chỉ decoder tương tự như LLaMA (Touvron et al., 2023) cũng như GPT-JT-6B, một phiên bản được hướng dẫn của GPT-J (Wang và Komatsuzaki, 2021) được huấn luyện trên các bộ dữ liệu Chain of Thought và Natural instruction cùng những cái khác. Tất cả các mô hình được chọn đều là mã nguồn mở và có giấy phép cho phép (Apache-2).
+
+Chúng tôi đánh giá các mô hình được tinh chỉnh trên dữ liệu được tạo bởi Ensemble-Instruct trên bộ test Super-Natural Instructions (SuperNI) (Wang et al., 2022) và 252 nhiệm vụ hướng người dùng từ Wang et al. (2023). Các đóng góp của chúng tôi có thể được tóm tắt như sau:
+
+• Chúng tôi đề xuất một kỹ thuật để tạo dữ liệu điều chỉnh hướng dẫn chất lượng cao với các LM 40B tham số hoặc nhỏ hơn mà có thể truy cập mở, với giấy phép không hạn chế.
+
+• Chúng tôi vượt trội hơn việc huấn luyện Self-Instruct của GPT3 (175B) với một mô hình cơ sở nhỏ hơn nhiều (MPT-7B). Kỹ thuật này cũng cải thiện hiệu suất của GPT-JT-6B được điều chỉnh hướng dẫn.
+
+• Các nghiên cứu ablation chứng minh tầm quan trọng của các thành phần riêng lẻ trong kỹ thuật của chúng tôi.
+
+• Chúng tôi phát hành bộ dữ liệu điều chỉnh hướng dẫn tổng hợp khoảng 45k mẫu cùng với các mẫu ICL và codebase của chúng tôi.
+
+## 2 Ensemble-Instruct
+
+**Thuật toán 1 Kết hợp Đầu ra**
+Đầu vào: Đầu ra LM o1,o2,o3; Ngưỡng t  
+Đầu ra: Đầu ra tốt nhất obest  
+1: obest←None  
+2: Rs←ϕ  
+3: for (i, j) in {(1, 2), (1, 3), (2, 3)} do  
+4: Rs←Rs∪RougeL(oi, oj)  
+5: end for  
+6: if min(Rs) > t then  
+7: i, j←argmax(Rs)  
+8: obest←oi  
+9: end if  
+10: return obest  
+
+Một tổng quan cấp cao về Ensemble-Instruct được đưa ra trong Hình 1. Thuật toán có ba thành phần chính: (i) Phân loại nhiệm vụ và các prompt liên quan của chúng, (ii) Tạo hướng dẫn theo sau là instances, trong đó một instance bao gồm một đầu vào (tùy chọn) và một đầu ra, và (iii) Kết hợp các đầu ra từ nhiều LM.
+
+### 2.1 Phân loại Nhiệm vụ và Prompts
+
+Chúng tôi chia các nhiệm vụ, tức là các mẫu điều chỉnh hướng dẫn, thành hai loại: những loại mà hướng dẫn cần một đầu vào để có ý nghĩa (loại A) và những loại không cần (loại B). Các ví dụ về nhiệm vụ từ hai loại này có thể thấy trong Hình 1 và 2. Trong số các nhiệm vụ hạt giống của Wang et al. (2023), 125 thuộc loại A và 50 thuộc loại B. Đối với mỗi loại, chúng tôi sử dụng một pipeline chuyên dụng mà (a) chỉ sử dụng các demonstration ICL của loại đó, và (b) điều chỉnh số lượng demonstration theo độ khó của loại, ở các giai đoạn khác nhau của việc tạo sinh.
+
+### 2.2 Tạo Hướng dẫn
+
+Đối với các nhiệm vụ loại A, chúng tôi sử dụng 24 demonstration ICL trong quá trình tạo hướng dẫn. Trong số đó, 20 được lấy mẫu ngẫu nhiên từ 125 nhiệm vụ hạt giống cùng loại, và 4 được lấy mẫu từ các hướng dẫn đã được tạo trước đó bởi chính mô hình. Đối với các nhiệm vụ loại B, chúng tôi sử dụng 10 demonstration ICL, trong đó 8 được lấy mẫu từ 50 nhiệm vụ hạt giống loại B và 2 từ các hướng dẫn tổng hợp đã tạo trước đó. Hơn nữa, chúng tôi áp dụng phương pháp của Wang et al. (2023) về việc thêm một hướng dẫn mới vào tập chỉ khi điểm Rouge-L (Lin, 2004) của nó với mọi hướng dẫn hiện có nhỏ hơn 0.7.
+
+### 2.3 Tạo Instance
+
+Trong quá trình tạo instance, chúng tôi sử dụng 18 demonstration ICL cho các nhiệm vụ loại A và 15 cho các nhiệm vụ loại B, được chọn ngẫu nhiên từ các nhiệm vụ hạt giống. Hình 2 cho thấy các ví dụ về nhiệm vụ loại A và loại B, và các prompt được sử dụng để tạo instance.
+
+### 2.4 Kết hợp Đầu ra
+
+Các bước tạo hướng dẫn và instance về nguyên tắc nên hoàn thành quá trình tổng hợp một mẫu điều chỉnh hướng dẫn (Wang et al., 2023). Tuy nhiên, các mẫu được tạo bởi các LM nhỏ có thể không chính xác, điều này thúc đẩy chúng tôi thiết kế một bước cuối cùng là kết hợp đầu ra. Thay vì chỉ đơn giản chấp nhận ví dụ đã được tạo, chúng tôi sử dụng một tập bổ sung các LM để dự đoán đầu ra mới, được đưa ra cặp hướng dẫn-đầu vào đã tạo (loại A) hoặc hướng dẫn (loại B).
+
+Đầu ra cuối cùng được tạo ra bằng cách áp dụng Thuật toán đồng thuận tham lam 1 cho các đầu ra được tạo bởi các LM khác nhau. Thuật toán tính điểm Rouge-L giữa tất cả ba cặp đầu ra. Nếu Rouge-L thấp nhất trên một ngưỡng t, nó trả về phần tử đầu tiên của cặp có điểm Rouge-L cao nhất. Điều này có thể được xem như một phiên bản tham lam của giải mã Minimum Bayesian Risk (Goel và Byrne, 2000) với thêm thresholding. Ngưỡng tối thiểu t được đặt ở 0.01 trên tất cả các nhiệm vụ. Điều quan trọng cần lưu ý là nếu quá trình trên không chọn bất kỳ đầu ra nào trong ba đầu ra, ví dụ sẽ bị lọc ra.
+
+## 3 Phân tích Bộ dữ liệu Điều chỉnh Hướng dẫn
+
+Chúng tôi tạo ra nhiều bộ dữ liệu điều chỉnh hướng dẫn sử dụng một tập không đồng nhất các LM. Bảng 1 cho thấy các nhãn của các bộ dữ liệu tổng hợp của chúng tôi theo các LM được sử dụng ở các giai đoạn khác nhau của việc tạo sinh. Bảng 2 tóm tắt tập các LM chúng tôi sử dụng để tạo sinh.
+
+**Bảng 1:** Nhãn của các bộ dữ liệu điều chỉnh tổng hợp của chúng tôi theo các LM được sử dụng để tạo hướng dẫn, instances và đầu ra bổ sung để kết hợp. Các bộ dữ liệu với đầu ra từ một LM đơn lẻ và một ensemble các LM được đặt tiền tố với SO- và EO-, tương ứng. Phần còn lại của mỗi nhãn chỉ định các mô hình đã được sử dụng ở các giai đoạn khác nhau của quá trình. Nếu các đầu ra bổ sung được tạo sử dụng các LM được điều chỉnh hướng dẫn để kết hợp, bộ dữ liệu được thêm hậu tố -ILM. Nếu các LM vanilla được sử dụng cho cùng mục đích, chúng tôi sử dụng hậu tố -LM. Với các LM được điều chỉnh hướng dẫn, chúng tôi tạo đầu ra zero-shot; đối với các LM vanilla, chúng tôi sử dụng ICL few-shot.
+
+| Nhãn | Hướng dẫn | Instances | Đầu ra Bổ sung để Kết hợp |
+|------|-----------|-----------|---------------------------|
+| SO-FALCON | FALCON | FALCON | – |
+| SO-{UL2,NEOX} | UL2,GPT-NEOXT-CHAT | UL2,GPT-NEOXT-CHAT | – |
+| EO-FALCON-LM | FALCON | FALCON | UL2,FALCON |
+| EO-FALCON-ILM | FALCON | FALCON | FLAN-UL2,GPT-NEOXT-CHAT |
+| EO-{UL2,NEOX}-ILM | UL2,GPT-NEOXT-CHAT | UL2,GPT-NEOXT-CHAT | FLAN-UL2,FLAN-T5-XXL |
+
+### 3.1 Tạo Instance vs. Tạo Đầu ra
+
+Như được hiển thị trong Bảng 1, chúng tôi sử dụng một tập riêng biệt các LM cho việc tạo hướng dẫn và instance một mặt và tạo đầu ra để kết hợp mặt khác. Động cơ có hai mặt: (1) Chúng tôi quan sát thấy chỉ các mô hình decoder only tương đối lớn với 20B tham số trở lên mới có khả năng tạo các instance đầu vào-đầu ra (loại A). Do đó, chúng tôi sử dụng các mô hình decoder only bao gồm FALCON, GPT-NEOXT-CHAT để tạo instance đầu vào-đầu ra. (2) Các mô hình được điều chỉnh hướng dẫn có khả năng tạo đầu ra zero-shot chất lượng cao. Do đó, chúng tôi sử dụng các mô hình được điều chỉnh hướng dẫn bao gồm FLAN-UL2, FLAN-T5-XXL, GPT-NEOXT-CHAT để tạo đầu ra bổ sung để kết hợp. Chúng tôi thấy rằng các LM vanilla UL2, FALCON tụt hậu so với các mô hình được điều chỉnh hướng dẫn để tạo đầu ra, như được hiển thị trong EO-FALCON-LM của Bảng 4.
+
+**Bảng 2:** Các LM chúng tôi đã sử dụng để tạo dữ liệu điều chỉnh hướng dẫn. seq2seq biểu thị sequence-to-sequence và causal biểu thị decoder-only. GPT-NEOXT-CHAT được điều chỉnh trên bộ dữ liệu OIG. FLAN-UL2 và FLAN-T5-XXL được điều chỉnh trên các bộ sưu tập FLAN. Cả OIG và FLAN đều bao gồm dữ liệu SUPERNI. Các mô hình được điều chỉnh hướng dẫn được ký hiệu bằng †. Hiệu suất zero-shot của mỗi mô hình trên bộ test SUPERNI được cung cấp trong Rouge-L.
+
+| Mô hình | #params | Loại LM | Rouge-L |
+|---------|---------|---------|---------|
+| FALCON | 40B | causal | 12.7 |
+| UL2 | 20B | seq2seq | 10.4 |
+| GPT-NEOXT-CHAT | 20B | causal† | 6.6 |
+| FLAN-UL2 | 20B | seq2seq† | 77.5 |
+| FLAN-T5-XXL | 11B | seq2seq† | 73.0 |
+
+Bảng 3 báo cáo số lượng tạo instance hợp lệ, cũng như các mẫu được chấp nhận bởi Thuật toán ensemble 1, sử dụng FLAN-UL2 và FLAN-T5-XXL làm đầu ra bổ sung. Chúng tôi hiển thị kết quả cho 100 mẫu ngẫu nhiên sử dụng các mô hình khác nhau (FALCON, FLAN-UL2, GPT-NEOXT-CHAT) để tạo hướng dẫn và instances loại A sử dụng cùng prompt và ví dụ. Các mô hình được hướng dẫn gặp khó khăn trong việc tạo các instance hợp lệ và đặc biệt FLAN-UL2 không tạo ra instance hợp lệ nào cho 100 mẫu. Mặc dù không được hiển thị trong bảng, hầu hết các LM đều có khả năng tạo hướng dẫn và instances loại B, cho thấy rằng các hướng dẫn và instances không yêu cầu đầu vào là một nhiệm vụ dễ dàng hơn so với những cái yêu cầu đầu vào.
+
+**Bảng 3:** Số lượng hướng dẫn và instances loại A hợp lệ được tạo bởi các mô hình khác nhau cho 100 mẫu cũng như số lượng (và tỷ lệ phần trăm) các mẫu được lọc bởi Thuật toán 1. Tất cả các mô hình chia sẻ cùng prompt và ví dụ.
+
+| Mô hình | hướng dẫn | instance | ensemble |
+|---------|-----------|----------|----------|
+| FALCON | 100 | 72 | 49 (68%) |
+| GPT-NEOXT-CHAT | 100 | 40 | 25 (63%) |
+| FLAN-UL2 | 100 | 0 | 0 (0%) |
+
+### 3.2 So sánh Bộ dữ liệu LM Nhỏ
+
+Chúng tôi điều chỉnh hướng dẫn Pythia-1.4B-deduped với các bộ dữ liệu khác nhau và đánh giá chúng trên 119 nhiệm vụ của bộ test SUPERNI. Để validation, chúng tôi sử dụng 10,589 mẫu từ 106 nhiệm vụ huấn luyện SUPERNI. Lưu ý rằng các tập validation và test có sự chồng chéo nhiệm vụ bằng không. Chúng tôi điều chỉnh hướng dẫn mô hình trong 5 đến 7 epochs và chọn checkpoint với điểm Rouge-L validation cao nhất để đánh giá. Hiệu suất của các mô hình được điều chỉnh này trên tập test được hiển thị trong Bảng 4, trong đó M-SELF-INST biểu thị thuật toán và các mẫu ICL của Wang et al. (2023) áp dụng cho {UL2,NEOX}, và F-SELF-INST, thuật toán và các mẫu ICL của Wang et al. (2023) áp dụng cho FALCON. Chúng tôi cũng hiển thị hiệu suất của PYTHIA-1.4B-DEDUPED được tinh chỉnh với hai bộ dữ liệu bên ngoài, ALPACA và SELF-INST để so sánh với dữ liệu huấn luyện lớn hơn nhiều thu được với thuật toán SELF-INSTRUCT.
+
+**Bảng 4:** Hiệu quả của các bộ dữ liệu điều chỉnh hướng dẫn tổng hợp được đo bằng hiệu suất của các mô hình được điều chỉnh PYTHIA-1.4B-DEDUPED trên bộ test SUPERNI. Các nhãn bộ dữ liệu được mô tả trong Bảng 1. ALPACA và SELF-INST là các bộ dữ liệu tổng hợp bên ngoài để so sánh thêm. M-SELF-INST biểu thị thuật toán và các mẫu ICL của Wang et al. (2023) áp dụng cho {UL2, NEOX}. F-SELF-INST biểu thị thuật toán và các mẫu ICL của Wang et al. (2023) áp dụng cho FALCON. Tất cả các tập huấn luyện bao gồm 175 nhiệm vụ hạt giống và learning rate là 1e-5.
+
+| Bộ dữ liệu | # mẫu | Rouge-L |
+|------------|-------|---------|
+| ZERO-SHOT BASELINE | 0 | 9.8 |
+| ALPACA | 51,760 | 33.4 |
+| SELF-INST | 82,612 | 34.4 |
+| M-SELF-INST | 24,984 | 28.5 |
+| SO-{UL2,NEOX} | 25,660 | 33.6 |
+| EO-{UL2,NEOX}-ILM | 18,218 | 38.3 |
+| F-SELF-INST | 38,624 | 25.6 |
+| SO-FALCON | 30,537 | 34.4 |
+| EO-FALCON-LM | 26,503 | 32.9 |
+| EO-FALCON-ILM | 26,701 | 37.1 |
+
+Khoảng cách hiệu suất giữa M-SELF-INST và SO-{UL2,NEOX} cho thấy rằng việc phân loại và đơn giản hóa các prompt ICL của chúng tôi để tạo hướng dẫn và instance đã cải thiện hiệu suất so với Self-Instruct. Điều tương tự áp dụng cho mô hình FALCON lớn hơn, với SO-FALCON vượt trội hơn F-SELF-INST với biên độ lớn. Kết hợp đầu ra với các LM được điều chỉnh hướng dẫn cải thiện thêm hiệu suất trong cả hai cài đặt. Quan trọng, chúng tôi thấy kết hợp với các LM vanilla thông qua ICL kém hiệu quả hơn so với kết hợp với các LM được điều chỉnh hướng dẫn được áp dụng zero-shot. Cuối cùng, chúng tôi tạo ra dữ liệu hiệu quả mẫu hơn Self-Instruct: Chỉ với khoảng 30k ví dụ, SO-FALCON mang lại điểm Rouge-L là 34.4, bằng với điều Self-Instruct mang lại với khoảng 82k ví dụ.
+
+### 3.3 Phân tích Định tính
+
+Chúng tôi chọn ngẫu nhiên 140 mẫu (40 có đầu vào và 100 không có đầu vào) từ EO-{UL2,NEOX}-ILM và gán thủ công một trong ba loại cho mỗi mẫu: GOOD, BAD và MAYBE. GOOD cho thấy rằng không có lỗi trong hướng dẫn, đầu vào (tùy chọn) và đầu ra, và mẫu tổng thể là mạch lạc. MAYBE cho thấy rằng đầu vào và đầu ra không chứa lỗi, nhưng chất lượng còn đáng ngờ, ví dụ, đầu ra không hoàn chỉnh. BAD cho thấy rằng đầu vào hoặc đầu ra chứa lỗi và không mạch lạc với hướng dẫn.
+
+**Bảng 5:** Đánh giá thủ công về chất lượng dữ liệu điều chỉnh hướng dẫn tổng hợp trên 140 mẫu được chọn ngẫu nhiên.
+
+| Loại Instance | GOOD | BAD | MAYBE | tổng |
+|---------------|------|-----|-------|------|
+| output | 77 | 14 | 9 | 100 |
+| input-output | 22 | 15 | 3 | 40 |
+| tổng | 99 (70.7%) | 29 (20.7%) | 12 (8.6%) | 140 |
+
+Kết quả đánh giá thủ công được hiển thị trong Bảng 5, được thực hiện bởi một trong các tác giả. Chúng tôi thấy rằng các ví dụ chỉ chứa một hướng dẫn và một đầu ra (loại B) thường có chất lượng cao hơn (77% GOOD) so với những cái cũng chứa một đầu vào (loại A) (55% GOOD). Sự khác biệt về chất lượng này phản ánh độ khó tương đối của việc tạo chúng bởi các mô hình nhỏ hơn, tức là việc tạo các instance chỉ đầu ra dễ dàng hơn, như được gợi ý trong §3.1. Trong số 24,809 ví dụ M-SELF-INST trong Bảng 4 (sau khi loại trừ 175 nhiệm vụ hạt giống), 20,752 (83.6%) thuộc loại B, chứng minh thêm rằng việc tạo các instance chỉ đầu ra dễ dàng hơn. Pipeline Ensemble-Instruct tránh việc tạo sinh không cân bằng như vậy bằng cách đầu tiên phân loại các nhiệm vụ và sau đó tận dụng các tập prompt đơn giản hóa riêng biệt cho mỗi loại. Mỗi bộ dữ liệu của chúng tôi được tạo với Ensemble-Instruct là một sự phân chia gần như đều giữa các hướng dẫn có và không có đầu vào.
+
+Hình 3 cho thấy một số ví dụ tổng hợp trước và sau khi kết hợp đầu ra, mô tả một vài cách khác nhau mà kết hợp cải thiện chất lượng của đầu ra được tạo. Về hiệu ứng của kết hợp, các quan sát cho thấy rằng nó đặc biệt hiệu quả trong việc chọn đầu ra chính xác khi nó ngắn, ví dụ các nhiệm vụ phân loại, thông qua exact match. Đối với các đầu ra dài hơn từ các nhiệm vụ tạo sinh, ví dụ tóm tắt, thuật toán thường lọc ra các đầu ra vô nghĩa với ảo giác.
+
+## 4 Kết quả Thực nghiệm
+
+Chúng tôi thực hiện các đánh giá tự động sử dụng Rouge-L trên các tập đánh giá trong Bảng 6. Cả 119 nhiệm vụ SUPERNI và 252 nhiệm vụ hướng người dùng đều giống hệt với những cái được đánh giá trong Wang et al. (2023).
+
+**Bảng 6:** Dữ liệu đánh giá cho các đánh giá tự động sử dụng Rouge-L. Không có nhiệm vụ nào trong đánh giá được nhìn thấy trong quá trình huấn luyện.
+
+| Dữ liệu Đánh giá | # nhiệm vụ | # mẫu |
+|------------------|------------|-------|
+| SUPERNI | 119 | 11,810 |
+| User-Oriented | 252 | 252 |
+
+Chúng tôi để dành 106 nhiệm vụ (10,589 mẫu) từ 756 nhiệm vụ huấn luyện SuperNI làm tập dữ liệu validation. Để điều chỉnh hướng dẫn SuperNI, chúng tôi loại trừ tập validation khỏi huấn luyện để mô phỏng đánh giá trên các nhiệm vụ chưa thấy.
+
+Chúng tôi tinh chỉnh 2 LM cơ sở trên dữ liệu điều chỉnh hướng dẫn được tạo bởi kỹ thuật hiện tại: (1) một LM vanilla, MPT-7B, và (2) một LM được điều chỉnh hướng dẫn, GPT-JT-6B. Để tinh chỉnh các mô hình này, chúng tôi áp dụng QLoRA (Dettmers et al., 2023), cho phép chúng tôi huấn luyện cả hai LM với một GPU A100 đơn lẻ (bộ nhớ 40GB) trong vòng 24 giờ. Chúng tôi cũng thực hiện tinh chỉnh đầy đủ của MPT-7B cho 2 bộ dữ liệu, EO-{UL2,NEOX}-ILM và SUPERNI với 2 GPU A100 (bộ nhớ 80GB). Kết quả được hiển thị trong Bảng 7 và 8 cho bộ test SUPERNI, và trong Bảng 9 cho bộ test 252 nhiệm vụ hướng người dùng.
+
+Trong Bảng 7, MPT-7B được tinh chỉnh trên dữ liệu tổng hợp của chúng tôi được tạo từ các LM vanilla (SD I) vượt trội hơn cả T0 và GPT3 SELF-INST mặc dù thực tế là cái sau được tinh chỉnh trên hơn 80K mẫu trong khi MPT-7B chỉ được tinh chỉnh trên khoảng 30K mẫu. MPT-7B được tinh chỉnh trên dữ liệu tổng hợp của chúng tôi được tạo từ các mô hình được điều chỉnh hướng dẫn (SD II) vượt trội hơn dữ liệu được tạo sử dụng các LM vanilla (SD I) lên đến 3 điểm. Tinh chỉnh đầy đủ vượt trội hơn tinh chỉnh QLoRA 1.4 trên EO-{UL2,NEOX}-ILM (46.8 vs. 45.4). Tinh chỉnh đầy đủ lại vượt trội hơn tinh chỉnh QLoRA 2.2 trên huấn luyện SuperNI (50.4 vs. 48.2). MPT-7B được tinh chỉnh trên sự kết hợp của hai bộ dữ liệu tổng hợp EO-{UL2,NEOX∪FALCON}-ILM và tập huấn luyện SuperNI cải thiện điểm Rouge-L so với chỉ huấn luyện SuperNI 2.2 điểm (từ 48.2 đến 50.4). Chúng tôi thấy một mô hình tương tự trong Bảng 8 cho LM cơ sở được điều chỉnh hướng dẫn GPT-JT-6B. Thực tế là dữ liệu được tạo tổng hợp của chúng tôi cải thiện đáng kể hiệu suất của LM được điều chỉnh hướng dẫn gợi ý rằng kỹ thuật của chúng tôi tạo ra dữ liệu đủ khác biệt so với dữ liệu điều chỉnh hướng dẫn được kết hợp vào huấn luyện LM cơ sở.
+
+**Bảng 7:** Kết quả đánh giá trên bộ test SuperNI. SD I biểu thị dữ liệu tổng hợp được tạo chỉ từ các LM vanilla, và SD II, dữ liệu tổng hợp được tạo từ sự kết hợp của các LM vanilla và được điều chỉnh hướng dẫn. Superscript ff biểu thị tinh chỉnh đầy đủ. Superscript qlora, tinh chỉnh QLoRA. Learning rate được đặt ở 1e-6 cho tinh chỉnh đầy đủ và 5e-5 cho điều chỉnh QLoRA. EO-COMBO-ILM biểu thị EO-{UL2,NEOX∪FALCON}-ILM. Sự kết hợp của dữ liệu tổng hợp EO-COMBO-ILM và tập huấn luyện SUPERNI cải thiện so với tập huấn luyện SUPERNI 2.2 điểm, từ 48.2 đến 50.4. Điều chỉnh hướng dẫn với SD II vượt trội hơn điều chỉnh hướng dẫn với SD I. Để điều chỉnh hướng dẫn với SuperNI, chúng tôi lấy mẫu con 100 instances từ mỗi trong 650 nhiệm vụ huấn luyện.
+
+| Mô hình | # Params | Tập Huấn luyện | # Mẫu | Rouge-L |
+|---------|----------|----------------|-------|---------|
+| **Các LM Cơ sở Vanilla** |
+| T5-LM, Wang et al. (2023) | 11B | None (ZERO-SHOT) | 0 | 25.7 |
+| GPT3, Wang et al. (2023) | 175B | None (ZERO-SHOT) | 0 | 6.8 |
+| MPT | 7B | None (ZERO-SHOT) | 0 | 16.6 |
+| **Được điều chỉnh hướng dẫn w/ SD I** |
+| T0, Wang et al. (2023) | 11B | Self-Instruct (GPT3) | 82,612 | 33.1 |
+| GPT3 SELF-INST, Wang et al. (2023) | 175B | Self-Instruct (GPT3) | 82,612 | 39.9 |
+| MPTqlora, ours | 7B | SO-FALCON | 30,537 | 43.1 |
+| MPTqlora, ours | 7B | EO-FALCON-LM | 26,503 | 43.2 |
+| **Được điều chỉnh hướng dẫn w/ SD II** |
+| MPTqlora, ours | 7B | EO-FALCON-ILM | 26,701 | 44.4 |
+| MPTff, ours | 7B | EO-{UL2,NEOX}-ILM | 18,218 | 46.8 |
+| MPTqlora, ours | 7B | EO-{UL2,NEOX}-ILM | 18,218 | 45.4 |
+| MPTqlora, ours | 7B | EO-{UL2,NEOX∪FALCON}-ILM | 44,744 | 46.4 |
+| **Được điều chỉnh hướng dẫn w/ SUPERNI** |
+| Tk-Instruct, Wang et al. (2023) | 11B | SUPERNI | 50,000 | 46.0 |
+| GPT3, Wang et al. (2023) | 175B | SUPERNI | 50,000 | 49.5 |
+| MPTff, ours | 7B | SUPERNI | 64,528 | 50.4 |
+| MPTqlora, ours | 7B | SUPERNI | 64,528 | 48.2 |
+| **Được điều chỉnh hướng dẫn với SD II & SUPERNI** |
+| GPT3 SELF-INST, Wang et al. (2023) | 175B | Self-Instruct & SUPERNI | 132,612 | 51.6 |
+| MPTqlora, ours | 7B | EO-COMBO-ILM & SUPERNI | 109,272 | 50.4 |
+
+Trong Bảng 9, chúng tôi lưu ý rằng cả hai mô hình cơ sở, MPT-7B và GPT-JT-6B, hoạt động kém hơn trên bộ dữ liệu hướng người dùng so với bộ test SuperNI: 10.6 vs. 16.6 với MPT-7B và 6.2 vs. 10.4 với GPT-JT-6B. Tinh chỉnh các mô hình này trên khoảng 45K mẫu của dữ liệu tổng hợp cung cấp một sự thúc đẩy đáng kể cho điểm Rouge-L, từ 10.6 đến 22.1 cho MPT-7B, và từ 6.2 đến 21.5 cho GPT-JT-6B. Điều này gợi ý rằng dữ liệu tổng hợp mà chúng tôi tạo ra nắm bắt các đặc điểm của các hướng dẫn hướng người dùng ở một mức độ nhất định. Phù hợp với các kết quả được ghi nhận trong Bảng 4 cho bộ test SuperNI, dữ liệu được tạo bởi kỹ thuật của chúng tôi hiệu quả hơn dữ liệu được tạo sử dụng Self-Instruct (M-SELF-INST, F-SELF-INST) trên bộ dữ liệu hướng người dùng cũng vậy.
+
+**Bảng 8:** Kết quả của (LM cơ sở được điều chỉnh hướng dẫn) GPT-JT-6B được tinh chỉnh trên dữ liệu tổng hợp. EO-COMBO-ILM biểu thị EO-{UL2,NEOX∪FALCON}-ILM. Tất cả các mô hình được tinh chỉnh với QLoRA với learning rate 5e-5.
+
+| Trainset | # Mẫu | Rouge-L |
+|----------|-------|---------|
+| ZERO-SHOT | 0 | 10.4 |
+| FALCON | 30,537 | 41.7 |
+| EO-FALCON-LM | 26,503 | 40.5 |
+| EO-FALCON-ILM | 26,701 | 41.9 |
+| EO-{UL2,NEOX}-ILM | 18,218 | 42.7 |
+| EO-COMBO-ILM | 44,744 | 43.1 |
+| SUPERNI | 64,528 | 44.2 |
+
+**Bảng 9:** Kết quả trên bộ test 252 nhiệm vụ hướng người dùng.
+
+| Mô hình | Trainset | Rouge-L |
+|---------|----------|---------|
+| MPT-7B | ZERO-SHOT | 10.6 |
+| MPT-7B | M-SELF-INST | 20.6 |
+| MPT-7B | F-SELF-INST | 21.6 |
+| MPT-7B | EO-COMBO-ILM | 22.1 |
+| GPT-JT-6B | ZERO-SHOT | 6.2 |
+| GPT-JT-6B | M-SELF-INST | 16.5 |
+| GPT-JT-6B | F-SELF-INST | 17.4 |
+| GPT-JT-6B | EO-COMBO-ILM | 21.5 |
+
+Trong Bảng 10, chúng tôi hiển thị kết quả thực nghiệm với các mô hình lớn hơn nhiều khác để minh họa khả năng mở rộng của Ensemble-Instruct đề xuất cho bất kỳ mô hình black-box nào. Bất kể kích thước mô hình cơ sở, từ 6B đến 40B, tinh chỉnh mô hình cơ sở với dữ liệu tổng hợp EO-{UL2,NEOX∪FALCON}-ILM cải thiện điểm Rouge-L đáng kể. Hiệu suất mô hình được tinh chỉnh dường như tương quan tốt với kích thước tham số của mô hình cơ sở, tức là 43.1 cho GPT-JT-6B nhỏ nhất, 49.9 cho FALCON-40B lớn nhất và tất cả các kích thước mô hình và điểm khác ở giữa. Đặc biệt, kết quả thực nghiệm trên FALCON-40B cho thấy rằng Ensemble-Instruct không phải là một instance của chưng cất mô hình theo nghĩa là dữ liệu tổng hợp được tạo từ FALCON-40B và các mô hình nhỏ hơn cải thiện đáng kể hiệu suất zero-shot của tất cả các mô hình bao gồm cả mô hình lớn nhất FALCON-40B.
+
+**Bảng 10:** Kết quả tinh chỉnh trên các mô hình lớn chứng minh khả năng mở rộng của kỹ thuật Ensemble-Instruct cho bất kỳ mô hình black-box nào. Điểm zero-shot và mô hình được tinh chỉnh là Rouge-L trên bộ test SUPERNI. Cải thiện hiệu suất của FALCON-40B sau tinh chỉnh, so với hiệu suất zero-shot của nó cho thấy rằng Ensemble-Instruct không phải là một instance của chưng cất mô hình. Tất cả các mô hình được tinh chỉnh với EO-{UL2,NEOX∪FALCON}-ILM trong Bảng 7.
+
+| Mô hình-KíchThướcParam | zero-shot | fine-tuned |
+|-------------------------|-----------|------------|
+| GPT-JT-6B | 10.4 | 43.1 |
+| MPT-7B | 16.6 | 46.4 |
+| OPEN-LLAMA-13B | 11.9 | 46.7 |
+| MPT-30B | 12.2 | 49.5 |
+| FALCON-40B | 12.7 | 49.9 |
+
+## 5 Công trình Liên quan
+
+Công trình này liên quan trực tiếp đến Self-Instruct (Wang et al., 2023), mượn từ nó các nhiệm vụ hạt giống ban đầu và ý tưởng sử dụng ICL để điều chỉnh một mô hình cơ sở thành một mô hình tuân theo hướng dẫn. Nó cũng có thể được xem là liên quan đến các công trình tiếp theo như: Alpaca (Taori et al., 2023)—một ứng dụng thực tế của Self-Instruct—Evol-Instruct (Xu et al., 2023), tiến hóa lặp đi lặp lại các hướng dẫn thành các mức độ khó tăng dần và Dromedary (Sun et al., 2023b), kết hợp self-instruct với sửa chữa dựa trên nguyên tắc, tương tự như Constitutional AI (Bai et al., 2022). Một hạn chế cơ bản của các phương pháp này là chúng phụ thuộc vào các mô hình ngôn ngữ rất lớn (khoảng 175B tham số hoặc tối thiểu 65B tham số) cũng là độc quyền và không công khai. Ở đây chúng tôi khám phá các kỹ thuật để tạo dữ liệu điều chỉnh hướng dẫn sử dụng các LM nhỏ hơn nhiều (khoảng 10B–40B tham số) và có giấy phép cho phép. Chúng tôi rút ra một cách quan trọng từ một hỗn hợp không đồng nhất của các LM nhỏ hơn để tạo ra các đầu ra đa dạng và sau đó kết hợp nhiều đầu ra để chọn các ví dụ tổng hợp chất lượng cao, đồng thời cũng đơn giản hóa quá trình tạo hướng dẫn.
+
+Việc sử dụng một metric tham chiếu, như Rouge-L, để kết hợp các đầu ra của nhiều phân phối ngôn ngữ là một kỹ thuật phổ biến trong giải mã Minimum Bayesian Risk, với các ứng dụng cho speech-to-text (Goel và Byrne, 2000), machine translation (Kumar và Byrne, 2004), language modeling (Suzgun et al., 2022) và parsing (Lee et al., 2022), cùng nhiều ứng dụng khác. Ở đây chúng tôi sử dụng một kỹ thuật tương tự trong bối cảnh tạo hướng dẫn. Theo hiểu biết tốt nhất của chúng tôi, đây là ứng dụng đầu tiên của phương pháp như vậy cho việc tạo dữ liệu điều chỉnh hướng dẫn.
+
+Jiang et al. (2023) đề xuất LLM-Blender, một framework kết hợp để cải thiện chất lượng tạo sinh bằng cách tận dụng các thế mạnh đa dạng của nhiều mô hình ngôn ngữ. Trong khi chúng tôi sử dụng kết hợp đầu ra trong bối cảnh tạo dữ liệu tổng hợp với Rouge-L làm metric tham chiếu, LLM-Blender tập trung vào cải thiện chất lượng đầu ra mô hình sử dụng PairRanker và GenFuser, cả hai phương pháp đều tận dụng hiệu quả của kết hợp như một cách cải thiện chất lượng đầu ra.
+
+Cũng liên quan đến công trình này là các phương pháp trực tiếp chưng cất từ ChatGPT hoặc GPT-4 (OpenAI, 2023) mà không có chiến lược hướng dẫn cụ thể, như Vicuna, chưng cất ChatGPT, Baize (Xu et al., 2032), chưng cất các cuộc đối thoại và Orca (Mukherjee et al., 2023), sử dụng một lượng lớn đầu ra ChatGPT và GPT-4 và kết hợp các nhiệm vụ FLAN, prompt hệ thống và giải thích được tạo bằng máy được lấy mẫu từ các mô hình này. Sức mạnh của các phương pháp này dường như phụ thuộc nhiều hơn vào lượng và chất lượng của các mẫu giáo viên có sẵn hơn là vào các bias qui nạp của kỹ thuật tự hướng dẫn và vẫn phụ thuộc vào các mô hình độc quyền với giấy phép không cho phép.
+
+## 6 Kết luận
+
+Chúng tôi trình bày một kỹ thuật mới để tạo dữ liệu điều chỉnh hướng dẫn thông qua ICL, theo công trình Self-Instruct gần đây (Wang et al., 2023). Không giống như Self-Instruct, chúng tôi đề xuất các kỹ thuật tránh rõ ràng việc sử dụng các mô hình ngôn ngữ độc quyền như GTP-3, ChatGPT hoặc GPT-4. Chúng tôi chỉ ra rằng khi sử dụng các mô hình nhỏ hơn, Self-Instruct trở nên kém hiệu quả hơn. Để vượt qua điều này, chúng tôi rút ra từ hai ý tưởng chính: (a) Phân loại và đơn giản hóa các mẫu ICL để làm cho việc học prompt dễ dàng hơn, và (b) Kết hợp nhiều đầu ra LM để chọn các ví dụ chất lượng cao. Những ý tưởng này cho phép chúng tôi vượt trội hơn việc huấn luyện với Self-Instruct trong khi sử dụng cùng các nhiệm vụ hạt giống. Dữ liệu tổng hợp kết quả cho phép các mô hình cơ sở như MPT-7B vượt trội hơn GPT-3, một mô hình lớn hơn nhiều với 175B tham số. Kết quả của công trình này cũng khuyến khích sự rời bỏ khỏi các mô hình truy cập đóng để thúc đẩy các thuật toán tạo hướng dẫn.
+
+## 7 Hạn chế
+
+Do hạn chế về thời gian và tài nguyên, một số phần của thiết lập thực nghiệm không lý tưởng. Tất cả đầu ra mô hình được thu thập từ một API nội bộ phục vụ các mô hình từ HuggingFace. Do hạn chế của API này, số lượng mẫu khác nhau được thu thập cho mỗi mô hình có thể đã đưa vào nhiễu trong các ước tính hiệu suất. Chúng tôi báo cáo số lượng chính xác các mẫu được sử dụng để huấn luyện cùng với kết quả. Lưu ý rằng đối với các trường hợp sử dụng kết hợp, người ta phải tính đến rằng có một quá trình lọc bổ sung loại bỏ các mẫu. Chúng tôi cung cấp tỷ lệ gần đúng cho việc lọc kết hợp trong Bảng 3. Đối với bộ test hướng người dùng nhỏ chứa 252 nhiệm vụ, đánh giá tự động có thể không lý tưởng. Đánh giá con người thích hợp sẽ cung cấp một tín hiệu rõ ràng hơn nhưng điều này đòi hỏi đầu tư thời gian và tài nguyên đáng kể. Phương pháp sử dụng một tập các LM khác nhau, và do đó dữ liệu tổng hợp được tạo có thể dễ bị ảnh hưởng bởi các hạn chế của các LM như vậy, đặc biệt là các bias vốn có trong dữ liệu huấn luyện có thể có hại dẫn đến dữ liệu tổng hợp với thù hận, lạm dụng và định kiến xã hội.
+
+## Tài liệu tham khảo
+
+Stephen H. Bach, Victor Sanh, Zheng-Xin Yong, Albert Webson, Colin Raffel, Nihal V. Nayak, Abheesht Sharma, Taewoon Kim, M Saiful Bari, Thibault Fevry, Zaid Alyafeai, Manan Dey, Andrea Santilli, Zhiqing Sun, Srulik Ben-David, Canwen Xu, Gunjan Chhablani, Han Wang, Jason Alan Fries, Maged S. Al-shaibani, Shanya Sharma, Urmish Thakker, Khalid Almubarak, Xiangru Tang, Xiangru Tang, Mike Tian-Jian Jiang, and Alexander M. Rush. 2022. Promptsource: An integrated development environment and repository for natural language prompts.
+
+Yuntao Bai, Saurav Kadavath, Sandipan Kundu, Amanda Askell, Jackson Kernion, Andy Jones, Anna Chen, Anna Goldie, Azalia Mirhoseini, Cameron McKinnon, et al. 2022. Constitutional ai: Harmlessness from ai feedback. arXiv preprint arXiv:2212.08073.
+
+Stella Biderman, Hailey Schoelkopf, Quentin Anthony, Herbie Bradley, Kyle O'Brien, Eric Hallahan, Mohammad Aflah Khan, Shivanshu Purohit, USVSN Sai Prashanth, Edward Raff, et al. 2023. Pythia: A suite for analyzing large language models across training and scaling. arXiv preprint arXiv:2304.01373.
+
+Sid Black, Stella Biderman, Eric Hallahan, Quentin Anthony, Leo Gao, Laurence Golding, Horace He, Connor Leahy, Kyle McDonell, Jason Phang, et al. 2022. Gpt-neox-20b: An open-source autoregressive language model. arXiv preprint arXiv:2204.06745.
+
+Hyung Won Chung, Le Hou, Shayne Longpre, Barret Zoph, Yi Tay, William Fedus, Yunxuan Le, Xuezhi Wang, Mostafa Dehghani, Siddhartha Brahma, Albert Webson, Shixiang Shane Gu, Zhuyun Dai, Mirac Suzgun, Xinyun Chen, Aakanksha Chowdhery, Alex Castro-Ros, Marie Pellat, Kevin Robinson, Dasha Valter, Sharan Narang, Gaurav Mishra, Adams Yu, Vincent Zhao, Yanping Huang, Andrew Dai, Hongkun Yu, Slav Petrov, Ed H. Chi, Jeff Dean, Jacob Devlin, Adam Roberts, Denny Zhou, Quoc V. Le, and Jason Wei. 2022a. Scaling instruction-finetuned language models. arXiv:2210.11416.
+
+Hyung Won Chung, Le Hou, Shayne Longpre, Barret Zoph, Yi Tay, William Fedus, Eric Li, Xuezhi Wang, Mostafa Dehghani, Siddhartha Brahma, et al. 2022b. Scaling instruction-finetuned language models. arXiv preprint arXiv:2210.11416.
+
+Tim Dettmers, Artidoro Pagnoni, Ari Holtzman, and Luke Zettlemoyer. 2023. Qlora: Efficient finetuning of quantized llms. arXiv preprint arXiv:2305.14314.
+
+Leo Gao, Stella Biderman, Sid Black, Laurence Golding, Travis Hoppe, Charles Foster, Jason Phang, Horace He, Anish Thite, Noa Nabeshima, Shawn Presser, and Connor Leahy. 2020. The pile: An 800gb dataset of diverse text for language modeling. arXiv:2101.00027.
+
+Vaibhava Goel and William J Byrne. 2000. Minimum bayes-risk automatic speech recognition. Computer Speech & Language, 14(2):115–135.
+
+Or Honovich, Thomas Scialom, Omer Levy, and Timo Schick. 2022. Unnatural instructions: Tuning language models with (almost) no human labor. arXiv:2212.09689.
+
+Dongfu Jiang, Xiang Ren, and Bill Yuchen Lin. 2023. Llm-blender: Ensembling large language models with pairwise comparison and generative fusion. In Proceedings of the 61th Annual Meeting of the Association for Computational Linguistics (ACL 2023).
+
+Shankar Kumar and William Byrne. 2004. Minimum bayes-risk decoding for statistical machine translation. Technical report, JOHNS HOPKINS UNIV BALTIMORE MD CENTER FOR LANGUAGE AND SPEECH PROCESSING (CLSP).
+
+Young-Suk Lee, Ramón Fernandez Astudillo, Thanh Lam Hoang, Tahira Naseem, Radu Florian, and Salim Roukos. 2022. Maximum bayes smatch ensemble distillation for amr parsing. In Proceedings of the 2022 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies, pages 5379–5392.
+
+Chin-Yew Lin. 2004. Rouge: A package for automatic evaluation of summaries. In Text summarization branches out, pages 74–81.
+
+Shayne Longpre, Le Hou, Tu Vu, Albert Webson, Hyung Won Chung, Yi Tay, Denny Zhou, Quoc V Le, Barret Zoph, Jason Wei, et al. 2023. The flan collection: Designing data and methods for effective instruction tuning. arXiv preprint arXiv:2301.13688.
+
+Swaroop Mishra, Daniel Khashabi, Chitta Baral, and Hannaneh Hajishirzi. 2022. Cross-task generalization via natural language crowdsourcing instructions. In ACL.
+
+Subhabrata Mukherjee, Arindam Mitra, Ganesh Jawahar, Sahaj Agarwal, Hamid Palangi, and Ahmed Awadallah. 2023. Orca: Progressive learning from complex explanation traces of gpt-4. arXiv preprint arXiv:2306.02707.
+
+OpenAI. 2023. Gpt-4 technical report.
+
+Long Ouyang, Jeff Wu, Xu Jiang, Diogo Almeida, Carroll L. Wainwright, Pamela Mishkin, Chong Zhang, Sandhini Agarwal, Katarina Slama, Alex Ray, John Schulman, Jacob Hilton, Fraser Kelton, Luke Miller, Maddie Simens, Amanda Askell, Peter Welinder, Paul Christiano, Jan Leike, and Ryan Lowe. 2022. Training language models to follow instructions with human feedback. arxiv.org/abs/2203.02155.
+
+Guilherme Penedo, Quentin Malartic, Daniel Hesslow, Ruxandra Cojocaru, Alessandro Cappelli, Hamza Alobeidli, Baptiste Pannier, Ebtesam Almazrouei, and Julien Launay. 2023. The refinedweb dataset for falcon llm: Outperforming curated corpora with web data, and web data only. arXiv preprint arXiv:2306.01116.
+
+Zhiqing Sun, Yikang Shen, Qinhong Zhou, Hongxin Zhang, Zhenfang Chen, David Cox, Yiming Yang, and Chuang Gan. 2023a. Principle-driven self-alignment of language models from scratch with minimal human supervision. arXiv:2305.03047.
+
+Zhiqing Sun, Yikang Shen, Qinhong Zhou, Hongxin Zhang, Zhenfang Chen, David Cox, Yiming Yang, and Chuang Gan. 2023b. Principle-driven self-alignment of language models from scratch with minimal human supervision. arXiv preprint arXiv:2305.03047.
+
+Mirac Suzgun, Luke Melas-Kyriazi, and Dan Jurafsky. 2022. Follow the wisdom of the crowd: Effective text generation via minimum bayes risk decoding. arXiv preprint arXiv:2211.07634.
+
+Rohan Taori, Ishaan Gulrajani, Tianyi Zhang, Yann Dubois, Xuechen Li, Carlos Guestrin, Percy Liang, and Tatsunori B Hashimoto. 2023. Stanford alpaca: An instruction-following llama model.
+
+Yi Tay, Mostafa Dehghani, Vinh Q Tran, Xavier Garcia, Dara Bahri, Tal Schuster, Huaixiu Steven Zheng, Neil Houlsby, and Donald Metzler. 2022. Unifying language learning paradigms. arXiv preprint arXiv:2205.05131.
+
+Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne Lachaux, Timothée Lacroix, Baptiste Rozière, Naman Goyal, Eric Hambro, Faisal Azhar, et al. 2023. Llama: Open and efficient foundation language models. arXiv preprint arXiv:2302.13971.
+
+Ben Wang and Aran Komatsuzaki. 2021. GPT-J-6B: A 6 Billion Parameter Autoregressive Language Model. https://github.com/kingoflolz/mesh-transformer-jax.
+
+Yizhong Wang, Yeganeh Kordi, Swaroop Mishra, Alisa Liu, Noah A. Smith, Daniel Khashabi, and Hannaheh Hajishirzi. 2023. Self-instruct: Aligning language models with self-generated instructions. In ACL 2023.
+
+Yizhong Wang, Swaroop Mishra, Pegah Alipoormolabashi, Yeganeh Kordi, Amirreza Mirzaei, Anjana Arunkumar, Arjun Ashok, Arut Selvan Dhanasekaran, Atharva Naik, David Stap, et al. 2022. Super-naturalinstructions:generalization via declarative instructions on 1600+ tasks. In EMNLP.
+
+Jason Wei, Maarten Bosma, Vincent Zhao, Kelvin Guu, Adams Wei Yu, Brian Lester, Nan Du, Andrew M Dai, and Quoc V Le. 2021. Finetuned language models are zero-shot learners. In International Conference on Learning Representations.
+
+Can Xu, Qingfeng Sun, Kai Zheng, Xiubo Geng, Pu Zhao, Jiazhan Feng, Chongyang Tao, and Daxin Jiang. 2023. Wizardlm: Empowering large language models to follow complex instructions. arXiv preprint arXiv:2304.12244.
+
+Canwen Xu, Daya Guo, Nan Duan, and Julian McAuley. 2032. Baize: An open-source chat model with parameter-efficient tuning on self-chat data. arXiv: 2304.01196.

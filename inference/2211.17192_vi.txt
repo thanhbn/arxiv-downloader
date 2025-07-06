@@ -1,0 +1,416 @@
+# Suy luận nhanh từ Transformers thông qua Giải mã Suy đoán
+Yaniv Leviathan* 1Matan Kalman* 1Yossi Matias1
+
+## Tóm tắt
+Suy luận từ các mô hình tự hồi quy lớn như Transformers rất chậm - giải mã K token cần K lần chạy tuần tự của mô hình. Trong nghiên cứu này, chúng tôi giới thiệu giải mã suy đoán - một thuật toán lấy mẫu từ các mô hình tự hồi quy nhanh hơn mà không có bất kỳ thay đổi nào đối với đầu ra, bằng cách tính toán nhiều token song song. Trọng tâm của phương pháp chúng tôi nằm ở những quan sát rằng (1) các tác vụ mô hình hóa ngôn ngữ khó thường bao gồm các tác vụ con dễ hơn có thể được xấp xỉ tốt bởi các mô hình hiệu quả hơn, và (2) sử dụng thực thi suy đoán và một phương pháp lấy mẫu mới, chúng ta có thể làm cho việc giải mã chính xác từ các mô hình lớn nhanh hơn, bằng cách chạy chúng song song trên đầu ra của các mô hình xấp xỉ, có khả năng tạo ra nhiều token đồng thời, và mà không thay đổi phân phối. Phương pháp của chúng tôi có thể tăng tốc các mô hình sẵn có mà không cần đào tạo lại hoặc thay đổi kiến trúc. Chúng tôi chứng minh nó trên T5-XXL và cho thấy tăng tốc 2X-3X so với triển khai T5X tiêu chuẩn, với đầu ra giống hệt nhau.
+
+## 1. Giới thiệu
+Các mô hình tự hồi quy lớn, đặc biệt là các Transformer lớn (Vaswani et al., 2017), có khả năng cao hơn nhiều so với các mô hình nhỏ hơn, như đã được chứng minh vô số lần trong những năm gần đây ví dụ, trong các lĩnh vực văn bản hoặc hình ảnh, như GPT-3 (Brown et al., 2020), LaMDA (Thoppilan et al., 2022), Parti (Yu et al., 2022), và PaLM (Chowdhery et al., 2022). Thật không may, một bước giải mã từ những mô hình lớn hơn này chậm hơn đáng kể so với một bước từ các đối tác nhỏ hơn của chúng, và làm mọi thứ tệ hơn, những bước này được thực hiện tuần tự - giải mã K token cần K lần chạy tuần tự của mô hình.
+
+Với tầm quan trọng của các mô hình tự hồi quy lớn và cụ thể là các Transformer lớn, một số phương pháp đã được phát triển để làm cho suy luận từ chúng nhanh hơn. Một số phương pháp nhằm giảm chi phí suy luận cho tất cả đầu vào một cách bình đẳng (ví dụ Hinton et al., 2015; Jaszczur et al., 2021; Hubara et al., 2016; So et al., 2021; Shazeer, 2019). Các phương pháp khác xuất phát từ quan sát rằng không phải tất cả các bước suy luận đều sinh ra như nhau - một số cần một mô hình rất lớn, trong khi những cái khác có thể được xấp xỉ tốt bởi các mô hình hiệu quả hơn. Những phương pháp tính toán thích ứng này (ví dụ Han et al., 2021; Sukhbaatar et al., 2019; Schuster et al., 2021; Scardapane et al., 2020; Bapna et al., 2020; Elbayad et al., 2019; Schwartz et al., 2020) nhằm sử dụng ít tài nguyên tính toán hơn cho các bước suy luận dễ hơn. Mặc dù nhiều giải pháp này đã chứng minh được hiệu quả cực kỳ trong thực tế, chúng thường đòi hỏi thay đổi kiến trúc mô hình, thay đổi quy trình đào tạo và đào tạo lại các mô hình, và không duy trì đầu ra giống hệt nhau.
+
+Quan sát quan trọng ở trên, rằng một số bước suy luận là "khó hơn" và một số là "dễ hơn", cũng là động lực chính cho công việc của chúng tôi. Chúng tôi bổ sung quan sát rằng suy luận từ các mô hình lớn thường không bị tắc nghẽn do các phép toán số học, mà là do băng thông bộ nhớ và truyền thông, vì vậy các tài nguyên tính toán bổ sung có thể có sẵn. Do đó chúng tôi đề xuất tăng đồng thời làm phương pháp bổ sung để sử dụng một lượng tính toán thích ứng. Cụ thể, chúng tôi có thể tăng tốc suy luận mà không thay đổi kiến trúc mô hình, không thay đổi quy trình đào tạo hoặc cần đào tạo lại các mô hình, và không thay đổi phân phối đầu ra mô hình. Điều này được thực hiện thông qua thực thi suy đoán.
+
+Thực thi suy đoán (Burton, 1985; Hennessy & Patterson, 2012) là một kỹ thuật tối ưu hóa, phổ biến trong các bộ xử lý, nơi một tác vụ được thực hiện song song với việc xác minh liệu nó có thực sự cần thiết không - lợi ích là tăng đồng thời. Một ví dụ nổi tiếng của thực thi suy đoán là dự đoán nhánh. Để thực thi suy đoán hiệu quả, chúng ta cần một cơ chế hiệu quả để đề xuất các tác vụ thực thi có khả năng được cần đến. Trong nghiên cứu này, chúng tôi tổng quát hóa thực thi suy đoán sang setting ngẫu nhiên - nơi một tác vụ có thể được cần đến với một xác suất nào đó. Áp dụng điều này cho việc giải mã từ các mô hình tự hồi quy như Transformers, chúng tôi lấy mẫu các generations từ các mô hình xấp xỉ hiệu quả hơn làm tiền tố suy đoán cho các mô hình mục tiêu chậm hơn. Với một phương pháp lấy mẫu mới, lấy mẫu suy đoán, chúng tôi tối đa hóa xác suất của những tác vụ suy đoán này được chấp nhận, trong khi đảm bảo rằng đầu ra từ hệ thống của chúng tôi có cùng phân phối như những đầu ra từ mô hình mục tiêu một mình. Ví dụ, câu trong Hình 1, bao gồm 38 token, được tạo ra bởi phương pháp của chúng tôi chỉ với 9 lần chạy tuần tự của một mô hình mục tiêu lớn hơn (97M tham số) nhờ vào một mô hình xấp xỉ nhỏ hơn và hiệu quả hơn (6M tham số), trong khi xác suất tạo ra nó không thay đổi.
+
+*Đóng góp bằng nhau1Google Research, Mountain View, CA, USA. Liên hệ: Yaniv Leviathan <leviathan@google.com>.
+
+Proceedings of the 40thInternational Conference on Machine Learning, Honolulu, Hawaii, USA. PMLR 202, 2023. Copyright 2023 by the author(s).
+
+Chúng tôi phân tích phương pháp của mình trong nhiều tác vụ và kích thước mô hình khác nhau: tạo ra không điều kiện từ một mô hình giống GPT 97M tham số được đào tạo trên lm1b, dịch tiếng Anh sang tiếng Đức và tóm tắt bài báo tin tức với mô hình T5-XXL 11B tham số, và một tác vụ đối thoại với mô hình LaMDA 137B tham số. Chúng tôi triển khai phương pháp của mình và so sánh thời gian thực tế cho T5-XXL với những thời gian của triển khai T5X mạnh mẽ (Roberts et al., 2022), cho thấy cải thiện độ trễ out-of-the-box 2X-3X, mà không có bất kỳ thay đổi nào đối với đầu ra (Phần 4).
+
+Phương pháp của chúng tôi dễ dàng sử dụng trong các setting sản xuất thực tế, không đòi hỏi đào tạo các mô hình mới, và không thay đổi đầu ra. Do đó, trong các tình huống phổ biến nơi băng thông bộ nhớ là nút thắt cổ chai, và tài nguyên tính toán có sẵn, nó có thể là một mặc định tốt để tăng tốc lấy mẫu từ các mô hình tự hồi quy như Transformers.
+
+Để tóm tắt, những đóng góp chính của chúng tôi là: (1) Một tổng quát hóa của thực thi suy đoán sang setting ngẫu nhiên, với một phương pháp lấy mẫu mới mà chúng tôi gọi là lấy mẫu suy đoán, và (2) Một cơ chế giải mã mà chúng tôi gọi là giải mã suy đoán có thể tăng tốc giải mã từ các mô hình tự hồi quy, mà không có bất kỳ thay đổi nào đối với kiến trúc mô hình, chế độ đào tạo và phân phối đầu ra.
+
+## 2. Giải mã Suy đoán
+
+### 2.1. Tổng quan
+
+Gọi Mp là mô hình mục tiêu, suy luận từ đó chúng ta đang cố gắng tăng tốc, và p(xt|x<t) là phân phối chúng ta nhận được từ mô hình cho một tiền tố x<t. Gọi Mq là một mô hình xấp xỉ hiệu quả hơn cho cùng tác vụ, và ký hiệu bởi q(xt|x<t) là phân phối chúng ta nhận được từ mô hình cho một tiền tố x<t1. Ý tưởng cốt lõi là (1) sử dụng mô hình hiệu quả hơn Mq để tạo ra γ ∈ Z+ completions (xem Phần 3.5 về cách tối ưu chọn tham số này), sau đó (2) sử dụng mô hình mục tiêu Mp để đánh giá tất cả các dự đoán và xác suất tương ứng của chúng từ Mq song song, chấp nhận tất cả những cái có thể dẫn đến một phân phối giống hệt nhau, và (3) lấy mẫu một token bổ sung từ một phân phối được điều chỉnh để sửa cái đầu tiên bị từ chối, hoặc để thêm một cái bổ sung nếu tất cả đều được chấp nhận. Bằng cách đó, mỗi lần chạy song song của mô hình mục tiêu Mp sẽ tạo ra ít nhất một token mới (vì vậy số lần chạy tuần tự của mô hình mục tiêu không bao giờ có thể, ngay cả trong trường hợp xấu nhất, lớn hơn phương pháp tự hồi quy đơn giản), nhưng nó có khả năng tạo ra nhiều token mới, lên đến γ + 1, tùy thuộc vào mức độ Mq xấp xỉ Mp tốt.
+
+### 2.2. Lấy mẫu Tiêu chuẩn
+
+Đầu tiên, lưu ý rằng mặc dù có nhiều phương pháp và tham số lấy mẫu, như argmax, top-k, nucleus, và đặt nhiệt độ, và các triển khai phổ biến thường xử lý chúng khác nhau ở mức logits, tất cả chúng đều có thể dễ dàng được đưa vào lấy mẫu tiêu chuẩn từ một phân phối xác suất được điều chỉnh. Ví dụ, lấy mẫu argmax tương đương với việc đặt bằng không các phần tử không phải max của phân phối và chuẩn hóa. Do đó chúng ta chỉ có thể xử lý lấy mẫu tiêu chuẩn từ một phân phối xác suất, và đưa tất cả các loại lấy mẫu khác vào framework đó. Tiến về phía trước chúng ta sẽ giả định rằng p(x) và q(x) là các phân phối từ Mp và Mq tương ứng, được điều chỉnh cho phương pháp lấy mẫu.
+
+1Chúng tôi sẽ sử dụng p(x) để biểu thị p(xt|x<t) bất cứ khi nào tiền tố x<t rõ ràng từ ngữ cảnh, và tương tự cho q(x).
+
+### 2.3. Lấy mẫu Suy đoán
+
+Để lấy mẫu x ∼ p(x), thay vào đó chúng ta lấy mẫu x ∼ q(x), giữ nó nếu q(x) ≤ p(x), và trong trường hợp q(x) > p(x) chúng ta từ chối mẫu với xác suất 1 - p(x)/q(x) và lấy mẫu x lại từ một phân phối được điều chỉnh p'(x) = norm(max(0; p(x) - q(x))) thay thế. Dễ dàng chỉ ra (xem Phụ lục A.1) rằng đối với bất kỳ phân phối p(x) và q(x), và x được lấy mẫu theo cách này, thực sự x ∼ p(x).
+
+Cho phân phối q(x) thu được từ việc chạy Mq trên một tiền tố điều kiện, chúng ta có thể lấy mẫu một token x1 ∼ q(x). Sau đó chúng ta tính toán phân phối p(x) bằng cách chạy Mp trên tiền tố trong khi song song tính toán suy đoán phân phối của token tiếp theo x2 bằng cách chạy Mp trên tiền tố + [x1]. Một khi cả hai tính toán hoàn thành, chúng ta tiến hành như trên: Nếu x1 bị từ chối, chúng ta loại bỏ tính toán của x2 và lấy mẫu lại x1 từ một phân phối được điều chỉnh, và nếu x1 được chấp nhận, chúng ta giữ cả hai token. Thuật toán 1 tổng quát hóa ý tưởng này để lấy mẫu từ 1 đến γ + 1 token cùng một lúc.
+
+**Thuật toán 1** SpeculativeDecodingStep
+Đầu vào: Mp, Mq, tiền tố.
+// Lấy mẫu γ dự đoán x1, ..., xγ từ Mq tự hồi quy.
+for i = 1 to γ do
+    qi(x) ← Mq(tiền tố + [x1, ..., xi-1])
+    xi ∼ qi(x)
+end for
+// Chạy Mp song song.
+p1(x), ..., pγ+1(x) ← Mp(tiền tố), ..., Mp(tiền tố + [x1, ..., xγ])
+// Xác định số lượng dự đoán được chấp nhận n.
+r1 ∼ U(0,1), ..., rγ ∼ U(0,1)
+n ← min({i-1 | 1 ≤ i ≤ γ; ri > pi(x)/qi(x)} ∪ {γ})
+// Điều chỉnh phân phối từ Mp nếu cần.
+p'(x) ← pn+1(x)
+if n < γ then
+    p'(x) ← norm(max(0; pn+1(x) - qn+1(x)))
+end if
+// Trả về một token từ Mp, và n token từ Mq.
+t ∼ p'(x)
+return tiền tố + [x1, ..., xn, t]
+
+## 3. Phân tích
+
+### 3.1. Số Token được Tạo ra
+
+Hãy phân tích hệ số giảm trong số lần gọi tuần tự đến mô hình mục tiêu, hoặc tương đương, số token dự kiến được tạo ra bởi một lần chạy của Thuật toán 1.
+
+**Định nghĩa 3.1.** Tỷ lệ chấp nhận αx<t, cho một tiền tố x<t, là xác suất chấp nhận xt ∼ q(xt|x<t) bởi lấy mẫu suy đoán, như trong Phần 2.32.
+
+E(α) sau đó là một thước đo tự nhiên về mức độ Mq xấp xỉ Mp tốt. Nếu chúng ta đưa ra giả định đơn giản hóa rằng các α là i.i.d., và ký hiệu α = E(α), thì số token được tạo ra bởi một lần chạy của Thuật toán 1 là một biến hình học bị giới hạn, với xác suất thành công 1 - α và giới hạn γ + 1, và số token dự kiến được tạo ra bởi Thuật toán 1 thỏa mãn Phương trình (1). Xem Hình 2.
+
+E(#token được tạo) = (1 - α^γ+1)/(1 - α)  (1)
+
+[Hình 2 hiển thị số token dự kiến được tạo ra bởi Thuật toán 1 như một hàm của α cho các giá trị khác nhau của γ.]
+
+### 3.2. Tính toán α
+
+Bây giờ chúng ta sẽ suy ra một công thức đơn giản để tính α cho một tiền tố và hai mô hình Mp và Mq. Chúng ta bắt đầu bằng cách định nghĩa một divergence tự nhiên DLK:
+
+**Định nghĩa 3.2.** DLK(p,q) = Σx |p(x) - M(x)| = Σx |q(x) - M(x)| trong đó M(x) = (p(x) + q(x))/2.
+
+**Bổ đề 3.3.** DLK(p,q) = 1 - Σx min(p(x), q(x))
+
+**Chứng minh.** DLK(p,q) = Σx |p(x) - M(x)| = Σx |p-q|/2 = (1 - Σx (p+q-|p-q|)/2) = 1 - Σx min(p(x), q(x))
+
+Từ Bổ đề 3.3 chúng ta ngay lập tức có được các kết quả sau:
+
+2Như trước đây, chúng ta sẽ bỏ chỉ số dưới x<t bất cứ khi nào tiền tố rõ ràng từ ngữ cảnh.
+
+**Hệ quả 3.4.** DLK(p,q) là một divergence đối xứng trong [0,1]:
+DLK(p,q) = 0 ⟺ p = q.
+DLK(p,q) = 1 ⟺ p và q có support rời rạc.
+
+**Định lý 3.5.** α = 1 - DLK(p,q)
+
+**Chứng minh.** α = Ex∼q(x) min(1, p(x)/q(x)) = Σx min(p(x), q(x))
+
+Cuối cùng chúng ta có được:
+
+**Hệ quả 3.6.** α = 1 - E(DLK(p,q)) = E(Σ min(p,q))
+
+Xem Bảng 3 cho các giá trị được quan sát thực nghiệm trong các thí nghiệm của chúng tôi.
+
+### 3.3. Cải thiện Thời gian Thực
+
+Chúng tôi đã chỉ ra rằng với giả định i.i.d. thuật toán của chúng tôi giảm số lần gọi đến mô hình mục tiêu với hệ số (1 - α^γ+1)/(1 - α). Lưu ý rằng thực thi suy đoán nói chung, và thuật toán của chúng tôi nói riêng, giả định rằng chúng ta có đủ tài nguyên tính toán để hỗ trợ tăng đồng thời (Phần 3.4). Đối với phân tích thời gian thực, chúng ta sẽ giả định rằng chúng ta có thể chạy γ + 1 đánh giá đồng thời của Mp song song mà không tăng thời gian thực. Để có được cải thiện thời gian thực tổng thể, bây giờ chúng ta xem xét chi phí chạy mô hình xấp xỉ Mq.
+
+**Định nghĩa 3.7.** Gọi c, hệ số chi phí, là tỷ lệ giữa thời gian cho một lần chạy của Mq và thời gian cho một lần chạy của Mp.
+
+Lưu ý rằng không như α là một thuộc tính nội tại của các mô hình và tác vụ, giá trị của c phụ thuộc vào cấu hình phần cứng và chi tiết triển khai phần mềm. Trong các thí nghiệm của chúng tôi nơi Mq thường nhỏ hơn Mp vài bậc độ lớn, c luôn nhỏ hơn 0.05 và thường gần bằng 0.
+
+**Định lý 3.8.** Hệ số cải thiện dự kiến trong tổng thời gian thực bởi Thuật toán 1 là (1 - α^γ+1)/((1 - α)(γc + 1)).
+
+**Chứng minh.** Ký hiệu chi phí chạy một bước của Mp bởi T. Bây giờ, mỗi lần chạy Thuật toán 1 chi phí T γc + T (để chạy mô hình xấp xỉ Mq γ lần và chạy Mp một lần) và theo Phương trình (1) tạo ra (1 - α^γ+1)/(1 - α) token trung bình. Vì vậy chi phí dự kiến tổng thể để tạo ra một token với Thuật toán 1 là (γc + 1)(1 - α)/(1 - α^γ+1) T. Vì chi phí tạo ra một token với thuật toán giải mã tiêu chuẩn là T, chúng ta có được kết quả mong muốn.
+
+Lưu ý rằng Định lý 3.8 giả định các generations đủ dài (ví dụ, vì chúng ta chạy Mp ít nhất một lần, hệ số cải thiện bị giới hạn bởi số token được tạo ra).
+
+**Hệ quả 3.9.** Nếu α > γc, tồn tại γ* mà chúng ta sẽ có được cải thiện, và hệ số cải thiện sẽ ít nhất là (1 + α)/(1 + γc).
+
+**Chứng minh.** Nếu chúng ta có được cải thiện cho γ*, chúng ta cũng sẽ có được cải thiện cho bất kỳ γ' < γ* < γ*, vì vậy để phương pháp của chúng tôi mang lại cải thiện, chúng ta có thể đánh giá Định lý 3.8 cho γ = 1, cho ra (1 - α^2)/((1 - α)(c + 1)) = (1 + α)/(1 + c).
+
+### 3.4. Số Phép toán Số học
+
+Thuật toán 1 thực hiện γ + 1 lần chạy Mp song song, vì vậy số phép toán số học đồng thời tăng với hệ số γ + 1. Bây giờ, vì Thuật toán 1 tạo ra tối đa γ + 1 token mỗi lần chạy, tổng số phép toán số học có thể cao hơn so với thuật toán giải mã tiêu chuẩn. Khi chúng ta chấp nhận mẫu từ Mq, tăng đồng thời là "miễn phí" và tổng số phép toán không tăng3. Tuy nhiên khi chúng ta từ chối một dự đoán, tính toán bị lãng phí. Hãy phân tích tác động của phương pháp chúng tôi đối với tổng số phép toán số học.
+
+**Định nghĩa 3.10.** Gọi ĉ là tỷ lệ phép toán số học trên mỗi token của mô hình xấp xỉ Mq so với mô hình mục tiêu Mp.
+
+**Định lý 3.11.** Hệ số tăng dự kiến trong số tổng phép toán của Thuật toán 1 là ((1 - α)(γĉ + γ + 1))/(1 - α^γ+1).
+
+**Chứng minh.** Ký hiệu bởi T̂ số phép toán số học được thực hiện bởi baseline giải mã tiêu chuẩn mỗi token, tức là số phép toán của một lần chạy Mp. Sau đó một iteration của Thuật toán 1 chi phí T̂γĉ + T̂(γ + 1) phép toán (cho γ lần chạy Mq và γ + 1 lần chạy song song Mp). Chia cho số token dự kiến được tạo ra bởi Thuật toán 1, tức là Phương trình (1), và bởi T̂, chúng ta có được kết quả mong muốn.
+
+Nếu α thấp, sự tăng số phép toán số học cao, và ngược lại. Lưu ý rằng đối với bộ giải mã Transformer, tổng số phép toán số học bởi Thuật toán 1 (không tính các lần chạy Mq) có thể bị giới hạn từ trên bởi một lần chạy của bộ mã hóa Transformer cùng kích thước.
+
+Không như tổng số phép toán số học, tổng số lần truy cập bộ nhớ có thể giảm với phương pháp của chúng tôi. Cụ thể, trọng số của mô hình mục tiêu và KV cache có thể được đọc một lần mỗi lần thực thi Thuật toán 1, vì vậy số lần truy cập bộ nhớ để đọc chúng co lại với hệ số (1 - α^γ+1)/(1 - α), theo Phương trình (1).
+
+3Bỏ qua chi phí của Mq.
+
+### 3.5. Chọn γ
+
+Cho c và α và giả định đủ tài nguyên tính toán (xem Phần 3.4), γ tối ưu là cái tối đa hóa phương trình cải thiện thời gian thực (Định lý 3.8): (1 - α^γ+1)/((1 - α)(γc + 1)). Vì γ là một số nguyên, nó có thể dễ dàng được tìm thấy bằng số, xem Hình 3.
+
+Bảng 1 và Hình 4 minh họa sự đánh đổi giữa tốc độ suy luận và tổng số phép toán số học cho các giá trị khác nhau của α và γ, giả định c = ĉ = 0. Hình 5 cho thấy một sơ đồ trace đơn giản.
+
+[Hình 3 hiển thị γ tối ưu như một hàm của α cho các giá trị khác nhau của c.]
+
+**Bảng 1.** Tổng số phép toán số học và tốc độ suy luận so với baseline, cho các giá trị khác nhau của γ và α, giả định c = ĉ = 0.
+
+| α   | γ  | PHÉP TOÁN | TỐC ĐỘ |
+|-----|----|-----------:|------:|
+| 0.6 | 2  | 1.53X     | 1.96X |
+| 0.7 | 3  | 1.58X     | 2.53X |
+| 0.8 | 2  | 1.23X     | 2.44X |
+| 0.8 | 5  | 1.63X     | 3.69X |
+| 0.9 | 2  | 1.11X     | 2.71X |
+| 0.9 | 10 | 1.60X     | 6.86X |
+
+Thay vì chọn một giá trị duy nhất cho γ dựa trên α, vì các α không cố định, chúng ta có thể có được cải thiện thêm bằng cách dự đoán giá trị của α và thay đổi giá trị của γ tương ứng trong quá trình chạy Thuật toán 1. Để có được giới hạn trên cho hệ số cải thiện bổ sung, giả định chúng ta có một oracle cho α. Chúng ta sau đó sẽ có E(#token được tạo) = 1/(1 - α). Đối với các giá trị điển hình của c và α, và giả định tài nguyên tính toán không giới hạn, hệ số cải thiện thời gian thực nâng cao có thể cao hơn đến 60% so với hệ số cải thiện với γ cố định4.
+
+[Hình 4 hiển thị hệ số tăng tốc và sự tăng số phép toán số học như một hàm của α cho các giá trị khác nhau của γ.]
+
+### 3.6. Mô hình Xấp xỉ
+
+Lấy mẫu suy đoán, và do đó giải mã suy đoán, đảm bảo một phân phối đầu ra giống hệt nhau cho bất kỳ lựa chọn mô hình xấp xỉ Mq nào mà không có hạn chế (xem Phụ lục A.1). Trong các thí nghiệm của chúng tôi, chúng tôi chủ yếu thử nghiệm các Transformer nhỏ hơn có sẵn làm mô hình xấp xỉ. Hơn nữa, chúng tôi chỉ thử nghiệm các mô hình xấp xỉ có cùng kiến trúc với các mô hình mục tiêu Mp và sử dụng cùng chuẩn hóa xác suất. Trong thiết lập này, chọn Mq nhỏ hơn Mp khoảng hai bậc độ lớn thường hoạt động tốt nhất, cân bằng α và c (Định lý 3.8).
+
+Một loại mô hình xấp xỉ khác, mô hình chi phí không đáng kể, là những mô hình mà c ≈ 0, tức là mô hình xấp xỉ có chi phí không đáng kể so với mô hình mục tiêu. Trong trường hợp này, chúng ta có được cải thiện thời gian thực dự kiến là (1 - α^γ+1)/(1 - α), được giới hạn từ trên bởi 1/(1 - α) (chúng ta tiếp cận bằng nhau nếu γ lớn). Một loại thú vị của mô hình xấp xỉ chi phí không đáng kể là mô hình n-gram, nơi đánh giá tương đương với tra cứu bảng. Thú vị, trong các thử nghiệm thực nghiệm (Phần 4.2) chúng ta có được α khác không ngay cả cho những mô hình n-gram tầm thường này. Ví dụ, đối với tác vụ dịch tiếng Anh-Đức, với Mp là T5-XXL 11B và Mq là mô hình bigram tầm thường, chúng ta có được α ≈ 0.2 dẫn đến hệ số cải thiện tốc độ suy luận 1.25X với γ = 3.
+
+Các heuristic đơn giản khác có thể được sử dụng làm mô hình xấp xỉ chi phí không đáng kể. Ví dụ, trong các trường hợp nơi các chuỗi dài có khả năng lặp lại, như cho các tác vụ tóm tắt hoặc giao diện giống chat5, một mô hình xấp xỉ đơn giản chỉ sao chép các token từ ngữ cảnh trong trường hợp chúng ta tìm thấy một tiền tố khớp, có thể mang lại giá trị α cao. Những mô hình xấp xỉ không tham số này, có lợi thế bổ sung là thậm chí đơn giản hơn để triển khai từ quan điểm sản xuất.
+
+Một loại mô hình xấp xỉ khác có thể được sử dụng bởi giải mã suy đoán là mô hình không tự hồi quy, như những mô hình từ (Stern et al., 2018). Sau đó, thay vì vòng lặp tự hồi quy trong Thuật toán 1 chúng ta chỉ gọi mô hình không tự hồi quy một lần.
+
+Một ví dụ cuối cùng, thú vị chủ yếu từ quan điểm lý thuyết, là một mô hình xấp xỉ chọn token ngẫu nhiên, đảm bảo một số cải thiện (mặc dù rất nhỏ) cho tất cả mô hình Mp.
+
+4Giới hạn trên giả định rằng chúng ta vẫn chạy Mp để xác minh dự đoán của oracle. Nếu chúng ta bỏ qua những xác minh đó thì giới hạn không giữ và chúng ta sẽ có được cải thiện bổ sung đáng kể.
+
+5Ví dụ nơi người dùng và mô hình ngôn ngữ lặp lại trên nội dung, như văn bản hoặc mã ("bạn có thể viết lại câu chuyện này nhưng thay đổi kết thúc", "bạn có thể làm cho hàm này cũng làm X").
+
+## 4. Thí nghiệm
+
+### 4.1. Cải thiện Thời gian Thực Thực nghiệm
+
+Chúng tôi triển khai thuật toán của mình và so sánh nó với triển khai trong codebase T5X để tăng tốc T5-XXL.
+
+**Thiết lập** Chúng tôi thử nghiệm một mô hình T5 encoder-decoder tiêu chuẩn phiên bản 1.1 (Raffel et al., 2020) trên hai tác vụ từ bài báo T5: (1) Dịch tiếng Anh sang tiếng Đức được fine-tune trên WMT EnDe, và (2) Tóm tắt văn bản được fine-tune trên CCN/DM. Đối với cả hai tác vụ, chúng tôi sử dụng T5-XXL (11B) cho Mp. Đối với mô hình xấp xỉ Mq chúng tôi thử nghiệm một số cấu hình có sẵn, cụ thể là T5-large (800M), T5-base (250M), và T5-small (77M) (Raffel et al., 2020). Chúng tôi sử dụng checkpoint có sẵn cho tất cả mô hình. Chúng tôi đo cải thiện thời gian thực với batch size 1 trên một TPU-v4 cho cả lấy mẫu argmax (temp=0) và lấy mẫu tiêu chuẩn (temp=1).
+
+**Kết quả** Bảng 2 cho thấy kết quả thực nghiệm từ phương pháp của chúng tôi. Chúng ta thấy rằng T5-small (77M), với sự cân bằng tốt của c và α, cung cấp tăng tốc cao nhất trong số các mô hình xấp xỉ được thử nghiệm. Như mong đợi chúng ta thấy rằng α tăng với kích thước của mô hình xấp xỉ. Thú vị, α và cải thiện thời gian thực cao hơn cho lấy mẫu argmax (temp=0). Chúng tôi quan sát tăng tốc 2.6X (temp=1) và 3.4X (temp=0) trên tác vụ dịch và tăng tốc thấp hơn một chút 2.3X (temp=1) và 3.1X (temp=0) cho tác vụ tóm tắt. Những kết quả thực nghiệm này khớp tốt với dự đoán lý thuyết, với một số biến thiên do chi tiết triển khai (xem Phụ lục A.3).
+
+**Bảng 2.** Kết quả thực nghiệm để tăng tốc suy luận từ mô hình T5-XXL 11B.
+
+| TÁC VỤ | Mq         | TEMP | γ | α    | TỐC ĐỘ |
+|--------|------------|------|---|------|--------|
+| ENDE   | T5-SMALL   | 0    | 7 | 0.75 | 3.4X   |
+| ENDE   | T5-BASE    | 0    | 7 | 0.8  | 2.8X   |
+| ENDE   | T5-LARGE   | 0    | 7 | 0.82 | 1.7X   |
+| ENDE   | T5-SMALL   | 1    | 7 | 0.62 | 2.6X   |
+| ENDE   | T5-BASE    | 1    | 5 | 0.68 | 2.4X   |
+| ENDE   | T5-LARGE   | 1    | 3 | 0.71 | 1.4X   |
+| CNNDM  | T5-SMALL   | 0    | 5 | 0.65 | 3.1X   |
+| CNNDM  | T5-BASE    | 0    | 5 | 0.73 | 3.0X   |
+| CNNDM  | T5-LARGE   | 0    | 3 | 0.74 | 2.2X   |
+| CNNDM  | T5-SMALL   | 1    | 5 | 0.53 | 2.3X   |
+| CNNDM  | T5-BASE    | 1    | 3 | 0.55 | 2.2X   |
+| CNNDM  | T5-LARGE   | 1    | 3 | 0.56 | 1.7X   |
+
+### 4.2. Giá trị α Thực nghiệm
+
+Mặc dù chúng tôi chỉ triển khai phương pháp của mình cho T5, chúng tôi đo các giá trị α cho nhiều tác vụ, phương pháp lấy mẫu, mô hình mục tiêu Mp, và mô hình xấp xỉ Mq khác nhau. Cụ thể, chúng tôi đánh giá kỳ vọng từ Hệ quả 3.6 trên 10K token được tạo ra bởi Mp, cho mỗi setting dưới đây.
+
+**GPT-like (97M tham số)** Chúng tôi thử nghiệm một mô hình Transformer chỉ decoder trên tạo ngôn ngữ không điều kiện, được đào tạo trên lm1b (Chelba et al., 2013). Mô hình ở đây là một bộ giải mã Transformer giống GPT với activation Gelu (Hendrycks & Gimpel, 2016). Đối với Mq chúng tôi thử nghiệm với một mô hình bộ giải mã Transformer với 6M tham số: dim 256, dim feed-forward 1024, 2 lớp, 4 attention head, cũng như các mô hình unigram và bigram đơn giản. Mp có 97M tham số: dim 768, dim feed-forward 3072, 12 lớp, 12 attention head. Chúng tôi sử dụng tokenization Bert (Devlin et al., 2019) với 8k token cho tất cả mô hình.
+
+**LaMDA (137B tham số)** Chúng tôi thử nghiệm một mô hình LaMDA chỉ decoder trên một tác vụ đối thoại (Thoppilan et al., 2022). Chúng tôi sử dụng checkpoint có sẵn từ LaMDA 137B như Mp và LaMDA 8B, LaMDA 2B, và LaMDA 100M cho Mq.
+
+Xem Phần 4.1 cho thiết lập của mô hình T5-XXL (11B tham số).
+
+Bảng 3 tóm tắt các giá trị α cho các trường hợp được thử nghiệm. Chúng tôi quan sát rằng các mô hình xấp xỉ nhỏ hơn mô hình mục tiêu vài bậc độ lớn có xu hướng tạo ra các giá trị α từ 0.5 đến 0.9. Thú vị, chúng tôi cũng lưu ý rằng đối với tất cả mô hình, phân phối được điều chỉnh càng sắc nét, giá trị α càng cao. Cuối cùng, chúng tôi lưu ý rằng ngay cả các xấp xỉ unigram và bigram tầm thường cũng mang lại giá trị α không đáng kể. Ví dụ, đối với trường hợp dịch tiếng Anh sang tiếng Đức, mô hình bigram có giá trị α là 0.2, và vì c = 0 trong trường hợp này, mang lại cải thiện tốc độ 1.25X, điều này đáng ngạc nhiên cao cho mô hình xấp xỉ tầm thường này (nhưng vẫn thấp hơn tăng tốc chúng ta có được từ việc sử dụng T5-small làm mô hình xấp xỉ).
+
+**Bảng 3.** Giá trị α thực nghiệm cho các mô hình mục tiêu Mp, mô hình xấp xỉ Mq, và setting lấy mẫu khác nhau. T=0 và T=1 biểu thị lấy mẫu argmax và lấy mẫu tiêu chuẩn tương ứng6.
+
+| Mp                  | Mq              | SMPL | α    |
+|---------------------|-----------------|------|------|
+| GPT-LIKE (97M)      | UNIGRAM         | T=0  | 0.03 |
+| GPT-LIKE (97M)      | BIGRAM          | T=0  | 0.05 |
+| GPT-LIKE (97M)      | GPT-LIKE (6M)   | T=0  | 0.88 |
+| GPT-LIKE (97M)      | UNIGRAM         | T=1  | 0.03 |
+| GPT-LIKE (97M)      | BIGRAM          | T=1  | 0.05 |
+| GPT-LIKE (97M)      | GPT-LIKE (6M)   | T=1  | 0.89 |
+| T5-XXL (ENDE)       | UNIGRAM         | T=0  | 0.08 |
+| T5-XXL (ENDE)       | BIGRAM          | T=0  | 0.20 |
+| T5-XXL (ENDE)       | T5-SMALL        | T=0  | 0.75 |
+| T5-XXL (ENDE)       | T5-BASE         | T=0  | 0.80 |
+| T5-XXL (ENDE)       | T5-LARGE        | T=0  | 0.82 |
+| T5-XXL (ENDE)       | UNIGRAM         | T=1  | 0.07 |
+| T5-XXL (ENDE)       | BIGRAM          | T=1  | 0.19 |
+| T5-XXL (ENDE)       | T5-SMALL        | T=1  | 0.62 |
+| T5-XXL (ENDE)       | T5-BASE         | T=1  | 0.68 |
+| T5-XXL (ENDE)       | T5-LARGE        | T=1  | 0.71 |
+| T5-XXL (CNNDM)      | UNIGRAM         | T=0  | 0.13 |
+| T5-XXL (CNNDM)      | BIGRAM          | T=0  | 0.23 |
+| T5-XXL (CNNDM)      | T5-SMALL        | T=0  | 0.65 |
+| T5-XXL (CNNDM)      | T5-BASE         | T=0  | 0.73 |
+| T5-XXL (CNNDM)      | T5-LARGE        | T=0  | 0.74 |
+| T5-XXL (CNNDM)      | UNIGRAM         | T=1  | 0.08 |
+| T5-XXL (CNNDM)      | BIGRAM          | T=1  | 0.16 |
+| T5-XXL (CNNDM)      | T5-SMALL        | T=1  | 0.53 |
+| T5-XXL (CNNDM)      | T5-BASE         | T=1  | 0.55 |
+| T5-XXL (CNNDM)      | T5-LARGE        | T=1  | 0.56 |
+| LAMDA (137B)        | LAMDA (100M)    | T=0  | 0.61 |
+| LAMDA (137B)        | LAMDA (2B)      | T=0  | 0.71 |
+| LAMDA (137B)        | LAMDA (8B)      | T=0  | 0.75 |
+| LAMDA (137B)        | LAMDA (100M)    | T=1  | 0.57 |
+| LAMDA (137B)        | LAMDA (2B)      | T=1  | 0.71 |
+| LAMDA (137B)        | LAMDA (8B)      | T=1  | 0.74 |
+
+6Lưu ý rằng đầu ra từ mô hình LaMDA luôn đi qua bộ lọc Top 40. Điều này không ảnh hưởng đến argmax, nhưng có một số ảnh hưởng đến lấy mẫu tiêu chuẩn.
+
+## 5. Nghiên cứu liên quan
+
+Hiệu quả của suy luận từ các mô hình lớn được nghiên cứu rộng rãi (Dehghani et al., 2021). Nhiều phương pháp nhằm tăng tốc suy luận từ các mô hình lớn nói chung, và các mô hình tự hồi quy như Transformers nói riêng. Rất nhiều kỹ thuật cố gắng làm cho suy luận hiệu quả hơn cho tất cả token, ví dụ distillation (Hinton et al., 2015), sparsification (Jaszczur et al., 2021), quantization (Hubara et al., 2016), và modification kiến trúc (So et al., 2021; Shazeer, 2019). Gần hơn với phương pháp của chúng tôi là các phương pháp tính toán thích ứng điều chỉnh lượng tính toán theo độ khó vấn đề (Han et al., 2021). Các ví dụ bao gồm chú ý đến một tập con của đầu vào (Sukhbaatar et al., 2019), và early exit (Schuster et al., 2021; Scardapane et al., 2020; Bapna et al., 2020; Elbayad et al., 2019; Schwartz et al., 2020). Đáng chú ý, Wisdom of Committees (Schwartz et al., 2020) tận dụng các mô hình nhỏ hơn có sẵn, nhưng là một phương pháp tính toán thích ứng, và vì vậy nó sử dụng một heuristic để xác định khi nào dừng, mất đảm bảo đầu ra giống hệt nhau với những đầu ra của mô hình mục tiêu. Nói chung, các phương pháp tính toán thích ứng thường học, hoặc trong chính mô hình hoặc với một mô hình phụ trợ, khi nào một shortcut tính toán có thể được thực hiện. Thường, những phương pháp này tiết kiệm cả thời gian suy luận và phép toán số học, nhưng đòi hỏi thay đổi kiến trúc, thay đổi quy trình đào tạo và đào tạo mô hình tùy chỉnh hoặc đào tạo lại mô hình có sẵn. Chúng cũng thường thay đổi đầu ra của mô hình. Chúng tôi lưu ý rằng mặc dù nhiều phương pháp trên cải thiện tỷ lệ bộ nhớ trên phép toán số học, trong các trường hợp nơi tỷ lệ vẫn cao, những phương pháp này và phương pháp giải mã suy đoán của chúng tôi có thể hiệu quả cùng nhau.
+
+Hai phương pháp trước đây tận dụng thực thi suy đoán để tăng tốc giải mã từ các mô hình tự hồi quy. Blockwise Parallel Decoding (Stern et al., 2018) giải mã nhiều token song song, tương tự như công việc của chúng tôi. Tuy nhiên, nó chỉ hỗ trợ giải mã greedy (temperature=0) và không phải setting ngẫu nhiên tổng quát, nó đòi hỏi đào tạo bổ sung của một mô hình tùy chỉnh, và tập trung vào bảo tồn chất lượng tác vụ downstream, thay vì đảm bảo đầu ra giống hệt nhau. Shallow Aggressive Decoding (SAD) (Sun et al., 2021) cũng giải mã nhiều token song song, tương tự như công việc của chúng tôi. Không như công việc của chúng tôi, SAD chỉ hỗ trợ sao chép đầu vào sang đầu ra, và không phải mô hình xấp xỉ tổng quát, khiến nó chỉ phù hợp cho các trường hợp nơi đầu vào và đầu ra rất giống nhau như sửa lỗi ngữ pháp. Thêm vào đó, tương tự như Blockwise Parallel Decoding, SAD không hỗ trợ setting lấy mẫu ngẫu nhiên tổng quát.
+
+Sau khi chúng tôi ban đầu xuất bản công việc của mình, một triển khai độc lập của giải mã suy đoán (Chen et al., 2023) cho thấy cải thiện 2X-2.5X tương tự trên Chinchilla 70B.
+
+## 6. Thảo luận
+
+Chúng tôi đã trình bày lấy mẫu suy đoán cho phép thực thi suy đoán ngẫu nhiên hiệu quả - tức là thực thi suy đoán trong setting ngẫu nhiên. Chúng tôi đã phân tích tác động của nó đối với giải mã từ các mô hình tự hồi quy như Transformers thông qua giải mã suy đoán và đã chỉ ra rằng cho đủ tài nguyên tính toán, chúng ta có được tăng tốc có ý nghĩa 2X-3X trong thực tế so với T5X, một triển khai được tối ưu hóa phổ biến.
+
+Một hạn chế của thực thi suy đoán nói chung, và của giải mã suy đoán nói riêng, là độ trễ được cải thiện thông qua tăng đồng thời với chi phí là tăng số phép toán số học. Do đó, phương pháp của chúng tôi không hữu ích cho các cấu hình nơi tài nguyên tính toán bổ sung không có sẵn. Tuy nhiên, trong các trường hợp phổ biến nơi tài nguyên tính toán bổ sung có sẵn (ví dụ khi băng thông bộ nhớ là nút thắt cổ chai) phương pháp của chúng tôi cung cấp tăng tốc với lợi ích đáng kể: kiến trúc mô hình không thay đổi, đào tạo lại không cần thiết, và quan trọng nhất, phân phối đầu ra được đảm bảo giữ nguyên. Phương pháp của chúng tôi dễ triển khai, và có thể được sử dụng để tăng tốc suy luận sử dụng các mô hình out-of-the-box mà không phát triển và đánh giá các schemes tùy chỉnh.
+
+Có một số hướng cho nghiên cứu tiếp theo, quan trọng, nghiên cứu thêm về tính tương thích của giải mã suy đoán với beam search (xem Phụ lục A.4). Ngoài ra, mặc dù phương pháp của chúng tôi mang lại tăng tốc đáng kể với các mô hình xấp xỉ có sẵn, cải thiện lớn hơn có thể đạt được thông qua các mô hình xấp xỉ tùy chỉnh (Phần 3.6), như những mô hình với kiến trúc tùy chỉnh (ví dụ kích thước tùy chỉnh, mô hình không tự hồi quy, hoặc các heuristic khác nhau) hoặc với quy trình đào tạo tùy chỉnh (ví dụ distillation tiêu chuẩn với soft target từ Mp, hoặc tối ưu hóa Mq cho α trực tiếp). Cũng có thể thú vị để khám phá một phiên bản phân cấp của thuật toán, nơi mô hình xấp xỉ tự nó được tăng tốc bởi một mô hình thậm chí nhanh hơn, có thể cho phép các mô hình xấp xỉ có khả năng hơn. Trong công việc này chúng tôi cố định mô hình xấp xỉ và số lượng dự đoán γ trong suốt suy luận, nhưng thay đổi chúng trong quá trình suy luận có thể mang lại cải thiện bổ sung (Phần 3.5). Trong các thí nghiệm của chúng tôi chúng tôi luôn thực hiện cùng chuẩn hóa trên các phân phối được tạo ra bởi mô hình xấp xỉ như cái mong muốn cho mô hình mục tiêu (Phần 2.2), nhưng cải thiện thêm có thể đạt được bằng cách áp dụng các biến đổi khác nhau. Chúng tôi thử nghiệm giải mã suy đoán chỉ trong modality văn bản, nhưng nó có thể hoạt động tốt trong các domain khác (ví dụ hình ảnh) điều này sẽ thú vị để thử nghiệm.
+
+Cuối cùng, chúng tôi lưu ý rằng thực thi suy đoán ngẫu nhiên và lấy mẫu suy đoán có thể hữu ích ngoài phạm vi giải mã suy đoán từ các mô hình tự hồi quy. Ví dụ, cho hai hàm chậm, f(x) và g(y) sao cho f(x) tạo ra một phân phối từ đó đầu vào của g được lấy mẫu, chúng ta có thể sử dụng phương pháp của mình để chạy f và g song song. Thiết lập này có thể phát sinh ví dụ trong mô phỏng vật lý, hoặc trong học tăng cường nơi f là một mô hình lớn tạo ra phân phối trên các hành động, và g là mô phỏng thế giới, điều này sẽ thú vị để khám phá.
+
+## Lời cảm ơn
+
+Chúng tôi muốn gửi lời cảm ơn đặc biệt đến YaGuang Li vì sự giúp đỡ với mọi thứ liên quan đến LaMDA và tính toán các con số LaMDA trong bài báo, và đến Blake Hechtman vì những insight tuyệt vời và sự giúp đỡ với XLA. Chúng tôi cũng muốn cảm ơn các reviewer vì những bình luận sâu sắc, cũng như Asaf Aharoni, Reiner Pope, Sasha Goldshtein, Nadav Sherman, Eyal Segalis, Eyal Molad, Dani Valevski, Daniel Wasserman, Valerie Nygaard, Danny Vainstein, các nhóm LaMDA và Theta Labs tại Google, và gia đình chúng tôi.
+
+## Tài liệu tham khảo
+
+Bapna, A., Arivazhagan, N., and Firat, O. Controlling computation versus quality for neural sequence models. ArXiv, abs/2002.07106, 2020.
+
+Brown, T. B., Mann, B., Ryder, N., Subbiah, M., Kaplan, J., Dhariwal, P., Neelakantan, A., Shyam, P., Sastry, G., Askell, A., Agarwal, S., Herbert-Voss, A., Krueger, G., Henighan, T., Child, R., Ramesh, A., Ziegler, D. M., Wu, J., Winter, C., Hesse, C., Chen, M., Sigler, E., Litwin, M., Gray, S., Chess, B., Clark, J., Berner, C., McCandlish, S., Radford, A., Sutskever, I., and Amodei, D. Language models are few-shot learners. In Proceedings of the 34th International Conference on Neural Information Processing Systems, NIPS'20, Red Hook, NY, USA, 2020. Curran Associates Inc. ISBN 9781713829546.
+
+Burton, F. W. Speculative computation, parallelism, and functional programming. IEEE Transactions on Computers, C-34(12):1190–1193, 1985. doi: 10.1109/TC.1985.6312218.
+
+Chelba, C., Mikolov, T., Schuster, M., Ge, Q., Brants, T., Koehn, P. T., and Robinson, T. One billion word benchmark for measuring progress in statistical language modeling. In Interspeech, 2013.
+
+Chen, C., Borgeaud, S., Irving, G., Lespiau, J.-B., Sifre, L., and Jumper, J. M. Accelerating large language model decoding with speculative sampling. ArXiv, abs/2302.01318, 2023.
+
+Chowdhery, A., Narang, S., Devlin, J., Bosma, M., Mishra, G., Roberts, A., Barham, P., Chung, H. W., Sutton, C., Gehrmann, S., Schuh, P., Shi, K., Tsvyashchenko, S., Maynez, J., Rao, A., Barnes, P., Tay, Y., Shazeer, N. M., Prabhakaran, V., Reif, E., Du, N., Hutchinson, B. C., Pope, R., Bradbury, J., Austin, J., Isard, M., Gur-Ari, G., Yin, P., Duke, T., Levskaya, A., Ghemawat, S., Dev, S., Michalewski, H., García, X., Misra, V., Robinson, K., Fedus, L., Zhou, D., Ippolito, D., Luan, D., Lim, H., Zoph, B., Spiridonov, A., Sepassi, R., Dohan, D., Agrawal, S., Omernick, M., Dai, A. M., Pillai, T. S., Pellat, M., Lewkowycz, A., Moreira, E., Child, R., Polozov, O., Lee, K., Zhou, Z., Wang, X., Saeta, B., Díaz, M., Firat, O., Catasta, M., Wei, J., Meier-Hellstern, K. S., Eck, D., Dean, J., Petrov, S., and Fiedel, N. Palm: Scaling language modeling with pathways. ArXiv, abs/2204.02311, 2022.
+
+Dehghani, M., Arnab, A., Beyer, L., Vaswani, A., and Tay, Y. The efficiency misnomer. ArXiv, abs/2110.12894, 2021.
+
+Devlin, J., Chang, M.-W., Lee, K., and Toutanova, K. Bert: Pre-training of deep bidirectional transformers for language understanding. ArXiv, abs/1810.04805, 2019.
+
+Elbayad, M., Gu, J., Grave, E., and Auli, M. Depth-adaptive transformer. ArXiv, abs/1910.10073, 2019.
+
+Han, Y., Huang, G., Song, S., Yang, L., Wang, H., and Wang, Y. Dynamic neural networks: A survey. IEEE Transactions on Pattern Analysis and Machine Intelligence, 44: 7436–7456, 2021.
+
+Hendrycks, D. and Gimpel, K. Bridging nonlinearities and stochastic regularizers with gaussian error linear units. ArXiv, abs/1606.08415, 2016.
+
+Hennessy, J. L. and Patterson, D. A. Computer Architecture: A Quantitative Approach. Morgan Kaufmann, Amsterdam, 5 edition, 2012. ISBN 978-0-12-383872-8.
+
+Hinton, G. E., Vinyals, O., and Dean, J. Distilling the knowledge in a neural network. ArXiv, abs/1503.02531, 2015.
+
+Hubara, I., Courbariaux, M., Soudry, D., El-Yaniv, R., and Bengio, Y. Quantized neural networks: Training neural networks with low precision weights and activations. ArXiv, abs/1609.07061, 2016.
+
+Jaszczur, S., Chowdhery, A., Mohiuddin, A., Kaiser, L., Gajewski, W., Michalewski, H., and Kanerva, J. Sparse is enough in scaling transformers. In Neural Information Processing Systems, 2021.
+
+Raffel, C., Shazeer, N., Roberts, A., Lee, K., Narang, S., Matena, M., Zhou, Y., Li, W., and Liu, P. J. Exploring the limits of transfer learning with a unified text-to-text transformer. The Journal of Machine Learning Research, 21(1):5485–5551, 2020.
+
+Roberts, A., Chung, H. W., Levskaya, A., Mishra, G., Bradbury, J., Andor, D., Narang, S., Lester, B., Gaffney, C., Mohiuddin, A., Hawthorne, C., Lewkowycz, A., Salcianu, A., van Zee, M., Austin, J., Goodman, S., Soares, L. B., Hu, H., Tsvyashchenko, S., Chowdhery, A., Bastings, J., Bulian, J., García, X., Ni, J., Chen, A., Kenealy, K., Clark, J., Lee, S., Garrette, D. H., Lee-Thorp, J., Raffel, C., Shazeer, N. M., Ritter, M., Bosma, M., Passos, A., Maitin-Shepard, J. B., Fiedel, N., Omernick, M., Saeta, B., Sepassi, R., Spiridonov, A., Newlan, J., and Gesmundo, A. Scaling up models and data with t5x and seqio. ArXiv, abs/2203.17189, 2022.
+
+Scardapane, S., Scarpiniti, M., Baccarelli, E., and Uncini, A. Why should we add early exits to neural networks? Cognitive Computation, 12(5):954–966, 2020.
+
+Schuster, T., Fisch, A., Jaakkola, T., and Barzilay, R. Consistent accelerated inference via confident adaptive transformers. In Conference on Empirical Methods in Natural Language Processing, 2021.
+
+Schwartz, R., Stanovsky, G., Swayamdipta, S., Dodge, J., and Smith, N. A. The right tool for the job: Matching model and instance complexities. In Annual Meeting of the Association for Computational Linguistics, 2020.
+
+Shazeer, N. M. Fast transformer decoding: One write-head is all you need. ArXiv, abs/1911.02150, 2019.
+
+So, D. R., Ma'nke, W., Liu, H., Dai, Z., Shazeer, N. M., and Le, Q. V. Primer: Searching for efficient transformers for language modeling. ArXiv, abs/2109.08668, 2021.
+
+Stern, M., Shazeer, N., and Uszkoreit, J. Blockwise parallel decoding for deep autoregressive models. Advances in Neural Information Processing Systems, 31, 2018.
+
+Sukhbaatar, S., Grave, E., Bojanowski, P., and Joulin, A. Adaptive attention span in transformers. In Annual Meeting of the Association for Computational Linguistics, 2019.
+
+Sun, X., Ge, T., Wei, F., and Wang, H. Instantaneous grammatical error correction with shallow aggressive decoding. ArXiv, abs/2106.04970, 2021.
+
+Thoppilan, R., Freitas, D. D., Hall, J., Shazeer, N. M., Kulshreshtha, A., Cheng, H.-T., Jin, A., Bos, T., Baker, L., Du, Y., Li, Y., Lee, H., Zheng, H., Ghafouri, A., Menegali, M., Huang, Y., Krikun, M., Lepikhin, D., Qin, J., Chen, D., Xu, Y., Chen, Z., Roberts, A., Bosma, M., Zhou, Y., Chang, C.-C., Krivokon, I. A., Rusch, W. J., Pickett, M., Meier-Hellstern, K. S., Morris, M. R., Doshi, T., Santos, R. D., Duke, T., Søraker, J. H., Zevenbergen, B., Prabhakaran, V., Díaz, M., Hutchinson, B., Olson, K., Molina, A., Hoffman-John, E., Lee, J., Aroyo, L., Rajakumar, R., Butryna, A., Lamm, M., Kuzmina, V. O., Fenton, J., Cohen, A., Bernstein, R., Kurzweil, R., Aguera-Arcas, B., Cui, C., Croak, M., hsin Chi, E. H., and Le, Q. Lamda: Language models for dialog applications. ArXiv, abs/2201.08239, 2022.
+
+Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones, L., Gomez, A. N., Kaiser, Ł., and Polosukhin, I. Attention is all you need. Advances in neural information processing systems, 30, 2017.
+
+Yu, J., Xu, Y., Koh, J. Y., Luong, T., Baid, G., Wang, Z., Vasudevan, V., Ku, A., Yang, Y., Ayan, B. K., Hutchinson, B. C., Han, W., Parekh, Z., Li, X., Zhang, H., Baldridge, J., and Wu, Y. Scaling autoregressive models for content-rich text-to-image generation. ArXiv, abs/2206.10789, 2022.
+
+## A. Phụ lục
+
+### A.1. Tính đúng đắn của Lấy mẫu Suy đoán
+
+Bây giờ chúng ta sẽ chỉ ra rằng đối với bất kỳ phân phối p(x) và q(x), các token được lấy mẫu thông qua lấy mẫu suy đoán từ p(x) và q(x) được phân phối giống hệt nhau với những token được lấy mẫu từ p(x) một mình. Gọi α là xác suất chấp nhận (Định nghĩa 3.1).
+
+Lưu ý rằng khi p'(x) = norm(max(0; p(x) - q(x))) = (p(x) - min(q(x); p(x)))/(Σx'(p(x') - min(q(x'); p(x')))) = (p(x) - min(q(x); p(x)))/(1 - α), hằng số chuẩn hóa cho phân phối được điều chỉnh p'(x) là 1 - α, trong đó phương trình cuối cùng theo trực tiếp từ Bổ đề 3.3 và Định lý 3.5.
+
+Bây giờ:
+P(x = x₀) = P(dự đoán được chấp nhận; x = x₀) + P(dự đoán bị từ chối; x = x₀)
+
+Trong đó:
+P(dự đoán được chấp nhận; x = x₀) = q(x₀) min(1; p(x₀)/q(x₀)) = min(q(x₀); p(x₀))
+
+Và:
+P(dự đoán bị từ chối; x = x₀) = (1 - α)p'(x₀) = p(x₀) - min(p(x₀); q(x₀))
+
+Tổng thể:
+P(x = x₀) = min(p(x₀); q(x₀)) + p(x₀) - min(p(x₀); q(x₀)) = p(x₀).
+
+Như mong muốn.
+
+### A.2. Lấy mẫu Suy đoán so với Lấy mẫu Từ chối
+
+Lấy mẫu từ chối là quy trình lấy mẫu lặp sau đây trông có vẻ giống như của chúng ta một cách bề ngoài:
+
+1. Lấy mẫu x ∼ q(x) và r ∼ U(0,1).
+2. Nếu r < p(x)/(Mq(x)) trả về x.
+3. Về 1.
+
+Trong đó M = maxx p(x)/q(x). Chúng ta có thể sử dụng một phiên bản không lặp của lấy mẫu từ chối thay vì lấy mẫu suy đoán - cụ thể đi qua bước 1 và 2 ở trên, và nếu không thì lấy mẫu từ p(x) không được sửa đổi trực tiếp. Tuy nhiên điều đó sẽ kém hiệu quả hơn nhiều so với phương pháp của chúng ta. Cụ thể, xác suất chấp nhận dự kiến ở đây là Ex∼q(x) p(x)/(Mq(x)) = (Σx p(x) minx' q(x')/p(x'))/(Σx p(x) min(1; q(x)/p(x))) = (Σx min(p(x); q(x)))/α ≤ α (có khả năng nhỏ hơn nhiều) so với xác suất chấp nhận dự kiến trong phương pháp của chúng ta.
+
+### A.3. Dự đoán Lý thuyết so với Thời gian Chạy Thực nghiệm
+
+Bảng 4 so sánh cải thiện thời gian chạy dự kiến dựa trên Định lý 3.8 với thời gian chạy được đo thực nghiệm từ Bảng 2. Chúng tôi ước tính các giá trị c cho các mô hình khác nhau dựa trên profiler trace. Chúng ta có thể thấy rằng dự đoán lý thuyết chủ yếu khớp với thời gian chạy được đo. Những khác biệt lớn hơn là do: (1) khác biệt tối ưu hóa giữa triển khai của chúng tôi và baseline, và (2) giả định đơn giản hóa rằng các α là i.i.d. chỉ là một xấp xỉ (xem Phần 3.1).
+
+**Bảng 4.** Hệ số cải thiện dự kiến (EXP) so với hệ số cải thiện được đo thực nghiệm (EMP).
+
+| TÁC VỤ | Mq         | TEMP | γ | α    | c    | EXP | EMP |
+|--------|------------|------|---|------|------|-----|-----|
+| ENDE   | T5-SMALL   | 0    | 7 | 0.75 | 0.02 | 3.2 | 3.4 |
+| ENDE   | T5-BASE    | 0    | 7 | 0.8  | 0.04 | 3.3 | 2.8 |
+| ENDE   | T5-LARGE   | 0    | 7 | 0.82 | 0.11 | 2.5 | 1.7 |
+| ENDE   | T5-SMALL   | 1    | 7 | 0.62 | 0.02 | 2.3 | 2.6 |
+| ENDE   | T5-BASE    | 1    | 5 | 0.68 | 0.04 | 2.4 | 2.4 |
+| ENDE   | T5-LARGE   | 1    | 3 | 0.71 | 0.11 | 2.0 | 1.4 |
+| CNNDM  | T5-SMALL   | 0    | 5 | 0.65 | 0.02 | 2.4 | 3.1 |
+| CNNDM  | T5-BASE    | 0    | 5 | 0.73 | 0.04 | 2.6 | 3.0 |
+| CNNDM  | T5-LARGE   | 0    | 3 | 0.74 | 0.11 | 2.0 | 2.2 |
+| CNNDM  | T5-SMALL   | 1    | 5 | 0.53 | 0.02 | 1.9 | 2.3 |
+| CNNDM  | T5-BASE    | 1    | 3 | 0.55 | 0.04 | 1.8 | 2.2 |
+| CNNDM  | T5-LARGE   | 1    | 3 | 0.56 | 0.11 | 1.6 | 1.7 |
+
+### A.4. Áp dụng cho Beam Search
+
+Phương pháp của chúng tôi có thể được áp dụng, với một số penalty hiệu suất, cho lấy mẫu beam search. Cho beam width gốc w, chúng ta có thể thực hiện beam search với mô hình xấp xỉ Mq và beam width uw cho γ bước. Sau đó, chúng ta có thể sử dụng Mp để kiểm tra tất cả các ứng viên song song (chi phí ngân sách tính toán (w + uγ) lần chạy Mp). Cuối cùng, cho mỗi bước, chúng ta có thể chấp nhận dự đoán của Mq miễn là topw(Mp) ⊆ topu(Mq) để có được kết quả giống hệt nhau với beam search thông thường chỉ với Mp (với một quy trình phức tạp hơn chúng ta cũng có thể chấp nhận các trường hợp nơi các ứng viên chúng ta có được tình cờ có xác suất cao hơn so với những ứng viên của Mp một mình). Phân tích phương pháp của chúng tôi trong setting này phức tạp hơn và chúng tôi để dành cho công việc tương lai.
+
+### A.5. Độ khoan dung
+
+Một thuộc tính mạnh của Thuật toán 1 là phân phối đầu ra được đảm bảo giữ nguyên không thay đổi. Tuy nhiên, nếu chúng ta sẵn sàng cho phép một số thay đổi, với đảm bảo tốt, chúng ta có thể có được cải thiện tốc độ suy luận thêm. Để động viên thêm điều này, lưu ý rằng khi chúng ta đào tạo hai mô hình với kiến trúc và kích thước giống hệt nhau trên cùng tập dữ liệu, các phân phối xác suất được tạo ra sẽ không giống hệt nhau, vì vậy một số khoan dung có thể có ý nghĩa. Lưu ý rằng kết quả trong bài báo này ngoại trừ phần này sử dụng phiên bản nghiêm ngặt nhất của Thuật toán 1 và không cho phép khoan dung bất kỳ loại nào.
+
+Chúng ta có thể bao gồm một tham số khoan dung l ∈ [0,1] và nhân q(x) với l trước khi so sánh với p(x) trong Thuật toán 1. Điều này vẫn duy trì đảm bảo tốt rằng không token nào có thể được lấy mẫu với xác suất lớn hơn p(x)/l. Điều này có nghĩa ví dụ, rằng với l = 1/10 không token nào có thể được lấy mẫu với hơn 10X xác suất thật của nó, vì vậy chúng ta có thể đảm bảo rằng các token cực kỳ hiếm sẽ vẫn cực kỳ hiếm (không có đảm bảo về xác suất tối thiểu, vì vậy khoan dung có thể làm tổn hại tính đa dạng của các mẫu).
+
+Cụ thể, với hệ số khoan dung l chúng ta có α = Ex∼q(x) min(1, p(x)/(lq(x))) = Ex∼q(x) p(x)/max(p(x); lq(x)) = (1/l)Σx min(p(x); lq(x)) = Σx min(p(x)/l; q(x)).
+
+Bảng 5 cho thấy giá trị α cho các giá trị khác nhau của l khi Mp là T5-XXL (11B) và Mq là T5-small (77M). Với c = 0.015, sử dụng giá trị khoan dung 1, 0.5, 0.3, và 0.1 (có nghĩa là không token nào có thể được lấy mẫu với xác suất lớn hơn 1X, 2X, 3X và 10X của thật) chúng ta có được hệ số cải thiện 2.5X, 3.1X, 3.6X, và 5X tương ứng.
+
+**Bảng 5.** Giá trị α cho các giá trị khác nhau của l với lấy mẫu tiêu chuẩn nơi Mp là T5-XXL (11B) trên tác vụ dịch EnDe.
+
+| Mq              | l = 1 | l = 0.5 | l = 0.3 | l = 0.1 |
+|-----------------|-------|---------|---------|---------|
+| UNIGRAM         | 0.07  | 0.1     | 0.11    | 0.16    |
+| BIGRAM          | 0.19  | 0.23    | 0.25    | 0.32    |
+| T5-SMALL (77M)  | 0.62  | 0.71    | 0.76    | 0.84    |
+| T5-BASE (250M)  | 0.68  | 0.8     | 0.83    | 0.90    |
+
+Lưu ý rằng khi sử dụng temperature = 0 (tức là lấy mẫu argmax), chúng ta không thể sử dụng khoan dung như trên nữa. Thay vào đó, chúng ta có thể cho phép một số khoan dung trước khi chuẩn hóa các phân phối. Ví dụ, chúng ta có thể chấp nhận token x được lấy mẫu từ Mq trong trường hợp p(x) ≥ l max(p). Trong trường hợp này, chúng ta đo sự tăng thực nghiệm tương tự trong giá trị α như những giá trị với temperature = 1. Ví dụ, khi sử dụng giá trị khoan dung 1, 0.5, 0.3, và 0.1 cho Mp T5-XXL Mq T5-small cho dịch tiếng Anh-Đức, chúng ta có được giá trị α là 0.75, 0.75, 0.8, 0.87. Lấy ví dụ c = 0.015 và γ = 8 chúng ta có được hệ số cải thiện tốc độ 3.3X, 3.3X, 3.9X, và 4.9X tương ứng7.
+
+7Trong trường hợp này, không như trường hợp lấy mẫu tiêu chuẩn được hiển thị trong Bảng 5, hệ số khoan dung 0.5 không cải thiện tăng tốc.

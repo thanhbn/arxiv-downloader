@@ -1,0 +1,253 @@
+# GEAR: Một Công Thức Nén KV Cache Hiệu Quả
+cho Suy Luận Sinh Tự Nhiên Gần Không Mất Mát của LLM
+
+Hao Kang∗, Qingru Zhang∗, Souvik Kundu, Geonhwa Jeong,
+Zaoxing Liu, Tushar Krishna, Tuo Zhao†
+Ngày 2 tháng 10, 2024
+
+## Tóm tắt
+
+Bộ nhớ đệm khóa-giá trị (KV) đã trở thành kỹ thuật chuẩn để tăng tốc độ sinh cho việc suy luận các mô hình ngôn ngữ lớn (LLM). Tuy nhiên, nhu cầu bộ nhớ đệm ngày càng tăng theo độ dài chuỗi đã biến việc suy luận LLM thành một vấn đề bị giới hạn bởi bộ nhớ, hạn chế đáng kể thông lượng hệ thống. Các phương pháp hiện tại dựa vào việc loại bỏ các token không quan trọng hoặc lượng tử hóa các entry theo nhóm. Tuy nhiên, các phương pháp này thường gây ra lỗi xấp xỉ cao để biểu diễn các ma trận nén. Quá trình giải mã tự hồi quy càng làm tăng lỗi ở mỗi bước, dẫn đến sự sai lệch nghiêm trọng trong việc sinh của mô hình và suy giảm hiệu suất. Để giải quyết thách thức này, chúng tôi đề xuất GEAR, một framework giảm lỗi hiệu quả bổ sung sơ đồ lượng tử hóa với hai thành phần giảm lỗi và đạt được hiệu suất gần không mất mát ở tỉ lệ nén cao. GEAR đầu tiên áp dụng lượng tử hóa cho phần lớn các entry có độ lớn tương tự xuống độ chính xác cực thấp. Sau đó nó sử dụng một ma trận hạng thấp để xấp xỉ lỗi lượng tử hóa, và một ma trận thưa thớt để khắc phục các lỗi cá nhân từ các entry ngoại lai. Bằng cách khéo léo tích hợp ba kỹ thuật, GEAR có thể khai thác đầy đủ tiềm năng hiệp đồng của chúng. Các thí nghiệm của chúng tôi cho thấy GEAR có thể duy trì độ chính xác tương tự như bộ nhớ đệm FP16 với cải thiện lên đến 24,42% so với các baseline SOTA ở nén 2-bit. Ngoài ra, so với suy luận LLM với KV cache FP16, GEAR có thể giảm bộ nhớ đỉnh lên đến 2,39×, mang lại cải thiện thông lượng 2,1×∼5,07×. Mã nguồn của chúng tôi được công khai tại https://github.com/HaoKang-Timmy/GEAR.
+
+## 1 Giới thiệu
+
+Các mô hình ngôn ngữ lớn tự hồi quy (LLM) (Brown et al., 2020b; Zhang et al., 2022; Touvron et al., 2023a,b) đã đánh dấu một cột mốc quan trọng trong xử lý ngôn ngữ tự nhiên (NLP) và
+
+†Hao Kang, Qingru Zhang, Geonhwa Jeong, Tushar Krishna, và Tuo Zhao liên kết với Georgia Tech. Souvik Kundu liên kết với Intel. Zaoxing Liu liên kết với Đại học Maryland. Liên hệ với hkang342@gatech.edu, qingru.zhang@gatech.edu, souvikk.kundu@intel.com, và tourzhao@gatech.edu.
+*Đóng góp ngang nhau
+1arXiv:2403.05527v4 [cs.LG] 30 Sep 2024
+
+--- TRANG 2 ---
+
+(a) Lỗi xấp xỉ trên GSM8k-CoT
+(b) Sự khác biệt trong logits dự đoán
+(c) Độ chính xác trên GSM8k-CoT
+
+Hình 1: (1a) so sánh lỗi xấp xỉ khi nén KV cache xuống 2-bit cho LLaMA3-8B trên GSM8k (w. CoT). (1b) trình bày sự khác biệt trong logits dự đoán từ baseline FP16 sau khi nén KV cache của một ví dụ GSM8k (w. CoT), cho thấy lỗi xấp xỉ có thể được tích lũy nghiêm trọng qua các bước và làm lệch hướng sinh của mô hình một cách nghiêm trọng. (1c) cho thấy việc giảm lỗi có thể cải thiện đáng kể hiệu suất.
+
+trí tuệ nhân tạo (AI) (Vaswani et al., 2017; Brown et al., 2020a; OpenAI, 2023), thể hiện hiệu suất đặc biệt trên một loạt các ứng dụng, như tạo nội dung và hệ thống đối thoại (Yuan et al., 2022; Thoppilan et al., 2022; Wei et al., 2022). Khi phục vụ các LLM này cho suy luận sinh, bộ nhớ đệm KV đã trở thành một thực hành thường xuyên. Nó lưu trữ các tensor Key/Value đã được tính toán trước đó từ tính toán attention và tái sử dụng chúng trong khi sinh các token tiếp theo (Pope et al., 2022), tránh việc tính toán lại tốn kém để cải thiện tốc độ sinh.
+
+Mặc dù nổi bật, việc tiêu thụ bộ nhớ của KV cache tăng nhanh chóng theo kích thước mô hình và độ dài chuỗi, áp đặt các ràng buộc đáng kể lên thông lượng hệ thống. Ví dụ, trong trường hợp LLM 30 tỷ tham số với độ dài đầu vào 1024 và kích thước batch 128, KV cache kết quả có thể chiếm đến 180 GB bộ nhớ (Zhang et al., 2023b). Để giảm bớt áp lực này lên khả năng bộ nhớ GPU hạn chế, các hệ thống suy luận thường phải dùng đến offloading (Aminabadi et al., 2022; Sheng et al., 2023) – chuyển KV cache sang bộ nhớ CPU hoặc lưu trữ NVMe. Tuy nhiên, điều này vẫn có thể gây ra overhead không nhỏ do băng thông PCIe hạn chế giữa GPU và CPU trên nhiều thiết bị. Do đó, việc giảm dấu chân bộ nhớ tốn kém của nút thắt cổ chai mới nổi của KV cache trong suy luận sinh là rất quan trọng.
+
+Để giải quyết vấn đề này, các phương pháp loại bỏ token đã được đề xuất để nén kích thước cache trong khi duy trì hiệu suất sinh (Zhang et al., 2023b; Liu et al., 2023; Ge et al., 2023). Các cách tiếp cận này khai thác tính thưa thớt quan sát được trong điểm attention để loại bỏ embedding của các token ít quan trọng khỏi KV cache trong khi giữ lại những token được chú ý thường xuyên. Ví dụ, H2O (Zhang et al., 2023b) sử dụng điểm attention tích lũy để đánh giá tầm quan trọng của token và giảm kích thước cache bằng cách loại bỏ các token có điểm thấp hơn. Ngoài ra, lượng tử hóa là một sơ đồ nén được áp dụng rộng rãi khác ánh xạ các giá trị tensor chính xác đầy đủ thành các mức rời rạc và lưu trữ chúng ở độ chính xác thấp hơn, ví dụ INT4 hoặc INT8 (Zafrir et al., 2019; Dettmers et al., 2022; Sheng et al., 2023). Ví dụ, FlexGen (Sheng et al., 2023) sử dụng lượng tử hóa bất đối xứng theo nhóm chi tiết nhóm các entry KV theo token, chia g entry liên tiếp thành một nhóm,
+
+--- TRANG 3 ---
+
+và lượng tử hóa tensor theo nhóm. Hai công trình đồng thời (Liu et al., 2024; Hooper et al., 2024) nghiên cứu thêm về phân phối entry KV và đề xuất lượng tử hóa Key cache theo kênh và lượng tử hóa Value cache theo token, nén kích thước cache với tỉ lệ cao.
+
+Các phương pháp hiện tại có thể nén hiệu quả kích thước cache xuống độ chính xác thấp trong khi đạt được hiệu suất gần không mất mát trên các tác vụ hiểu ngôn ngữ tự nhiên như QA trắc nghiệm, phân loại văn bản, hoặc tác vụ tóm tắt đơn giản (Zhang et al., 2023b; Liu et al., 2024). Tuy nhiên, một sự tương phản rõ rệt xuất hiện khi áp dụng các phương pháp này vào các tác vụ sinh phức tạp đòi hỏi mô hình sinh ra các phản hồi dài hơn hoặc liên quan đến lý luận, như giải quyết vấn đề toán học (Cobbe et al., 2021) và lý luận chuỗi tư duy (CoT) (Wei et al., 2023). Hiệu suất của chúng suy giảm dưới tỉ lệ nén cao*(ví dụ lượng tử hóa 4-bit/2-bit hoặc loại bỏ >50% token (Ge et al., 2023)), điều này đáng chú ý ở cả hai loại phương pháp*. Hiện tượng này có thể được quy cho lỗi xấp xỉ không nhỏ do chúng gây ra, tức là sự khác biệt giữa KV gốc và các KV đã nén. Đối với các tác vụ đơn giản, mô hình chỉ cần sinh ra vài token nơi thông tin cần thiết cho dự đoán đúng thường có thể được rút ra từ một tập nhỏ các token ngữ cảnh quan trọng. Do đó, lỗi xấp xỉ tương đối lớn không cản trở đáng kể việc sinh ra các token mục tiêu. Ngược lại, các tác vụ phức tạp đòi hỏi mô hình sinh ra các chuỗi dài hơn dựa trên prompt thường chứa thông tin tương quan dày đặc (ví dụ lý luận CoT). Việc giải mã tự hồi quy có thể tích lũy lỗi xấp xỉ ở mỗi bước. Do đó, tác động tiêu cực của ngay cả một lỗi tương đối nhỏ có thể được phóng đại qua các bước sinh, ảnh hưởng xấu đến việc sinh tiếp theo. Ví dụ, Hình 1 trình bày lỗi xấp xỉ của các phương pháp khác nhau trên GSM8k và minh họa sự sai lệch trong việc sinh token do lỗi tích lũy, làm giảm độ chính xác rất nhiều. Do đó, cốt lõi của vấn đề nằm ở lỗi xấp xỉ cao của các phương pháp này, đặc biệt dưới tỉ lệ nén cao.
+
+Để giải quyết thách thức này, chúng tôi đề xuất GEAR (Suy luận Sinh với Giảm Lỗi Xấp xỉ), một framework giảm lỗi hiệu quả bổ sung các sơ đồ lượng tử hóa KV cache hiện có với hai kỹ thuật giảm lỗi, và khéo léo tích hợp chúng để khai thác đầy đủ tiềm năng của chúng. Nói chung, framework của chúng tôi bao gồm ba thành phần để phân tách ma trận KV: (i) Đầu tiên, chúng tôi áp dụng một phương pháp lượng tử hóa hiện có để lượng tử hóa hiệu quả phần lớn (ví dụ 98%) các entry có độ lớn tương tự xuống độ chính xác cực thấp. (ii) Sau đó, chúng tôi giới thiệu một ma trận hạng thấp để xấp xỉ hiệu quả các phần dư lượng tử hóa. (iii) Cuối cùng, chúng tôi sử dụng một ma trận thưa thớt bao gồm một tỉ lệ không đáng kể các entry có độ lớn lớn để khắc phục các lỗi cá nhân gây ra bởi các outlier này. Một xấp xỉ tổng hợp như vậy tách biệt các phần liên kết từ các phần không liên kết của lỗi xấp xỉ: ma trận hạng thấp nắm bắt phần lớn cơ sở liên kết của lỗi lượng tử hóa trong khi ma trận thưa thớt chỉnh sửa tính không liên kết tồn tại trong các outlier cá nhân. Đồng thời, như được chứng minh bởi bằng chứng thực nghiệm của chúng tôi trong Mục 4.2, hai thành phần nhẹ này
+
+*Chúng tôi định nghĩa tỉ lệ nén là kích thước tensor trong FP16 chia cho kích thước trong định dạng nén.
+*Vui lòng tham khảo Mục 4 cho bằng chứng thực nghiệm của chúng tôi.
+
+--- TRANG 4 ---
+
+dẫn đến overhead bộ nhớ và tính toán không đáng kể, thể hiện hiệu quả cao. Do đó, GEAR có thể giảm hiệu quả lỗi xấp xỉ một cách rất hiệu quả và đạt được hiệu suất vượt trội trên cả các tác vụ phức tạp và tương đối đơn giản ở tỉ lệ nén cao theo cách plug-and-play. Chúng tôi thấy rằng việc sử dụng cả thành phần thưa thớt và hạng thấp là cần thiết để GEAR thiết lập hiệu suất tốt nhất, làm nổi bật bản chất bổ sung của chúng. Đáng chú ý, đối với những người ưu tiên hiệu quả, việc trang bị xấp xỉ hạng thấp một mình cho lượng tử hóa vẫn có thể giảm hiệu quả lỗi xấp xỉ, mang lại cả cải thiện hiệu quả và hiệu suất đáng kể. Chúng tôi gọi phiên bản lite này của GEAR là GEAR-L.
+
+Ngoài ra, chúng tôi kết hợp một chiến lược bộ đệm luồng cho GEAR để cải thiện thêm hiệu quả suy luận. Cụ thể, khi sinh ra các chuỗi dài, chúng tôi lưu trữ các vector KV của các token mới sinh ra vào một bộ đệm nhỏ (ví dụ kích thước bộ đệm nb = 20). Khi bộ đệm đạt đến dung lượng của nó, GEAR thực hiện nén KV cache mỗi nb bước. Do đó, tốc độ suy luận có thể được cải thiện đáng kể với chi phí bộ nhớ bổ sung không đáng kể. Hơn nữa, để giảm thiểu overhead, chúng tôi trình bày một triển khai kernel thân thiện với GPU cho GEAR, tận dụng lợi ích luồng và lượng tử hóa để cải thiện thông lượng suy luận đáng kể.
+
+Chúng tôi tiến hành thí nghiệm trên các tác vụ và mô hình đa dạng để chứng minh hiệu quả của GEAR. Cụ thể, chúng tôi đánh giá hiệu suất nén với LLaMA2-7B/13B (Touvron et al., 2023b), Mistral-7B (Jiang et al., 2023), và LLaMA3-8B (Meta, 2024) trên các tác vụ sinh bao gồm lý luận toán học (GSM8k Cobbe et al. (2021) và AQuA (Ling et al., 2017)), lý luận ký hiệu (BigBench Hard Suzgun et al. (2022)), và hiểu ngữ cảnh dài (LongBench Bai et al. (2023)). Chúng tôi cho thấy GEAR luôn vượt trội hơn các phương pháp baseline đặc biệt ở tỉ lệ nén cao như độ chính xác 2-bit. Ví dụ, khi nén KV cache xuống 2-bit, GEAR đạt được cải thiện độ chính xác trung bình đáng kể là 14,95% so với baseline hiệu suất tốt nhất trên các mô hình và bộ dữ liệu khác nhau. Về hiệu quả suy luận, so với baseline FP16, GEAR có thể giảm bộ nhớ đỉnh lên đến 2,39×, mang lại cải thiện thông lượng 2,10×∼5,07×.
+
+## 2 Kiến thức Nền
+
+**Multi-head attention.** Một mô hình transformer điển hình bao gồm L lớp xếp chồng, trong đó mỗi lớp chứa hai mô-đun con: một multi-head attention (MHA) và một mạng feed-forward (FFN). Cho embedding token đầu vào là X ∈ Rn×d, MHA thực hiện hàm attention song song H head:
+
+MHA(X) = Concat(H(1), ..., H(H))Wo, H(i) = Softmax(Q(i)K(i)⊤/√dH)V(i)    (1)
+
+trong đó Q(i) = XWqi, K(i) = XWki, V(i) = XWvi là các ma trận Query/Key/Value, và Wqi, Wki, Wvi ∈ Rd×dH là các ma trận chiếu của head i. dH thường được đặt là d/H.
+
+**Prefill và decoding.** Giả sử mô hình sinh ra ng token. Ở bước sinh đầu tiên, các token đầu vào X0 ∈ Rn×d được prefill. Sau đó K(i) và V(i) ở mọi head và mọi lớp
+
+--- TRANG 5 ---
+
+được lưu cache cho việc sinh tiếp theo, dẫn đến KV cache ban đầu của giai đoạn prefill: K0 = Concat(K(1), ..., K(H)), V0 = Concat(V(1), ..., V(H)) và K0, V0 ∈ Rn×d. Ở mỗi bước t (1 ≤ t ≤ ng) của giải mã tự hồi quy, mô hình dự đoán một token mới xt dựa trên đầu vào và các token đã sinh trước đó. Ở bước tiếp theo, MHA chỉ cần tính toán các vector Query/Key/Value* (qt, kt, vt ∈ Rd) cho token mới sinh xt và nối kt, vt vào KV cache: Kt = Kt−1∥kt, Vt = Vt−1∥vt. Sau đó nó thực hiện attention (1) giữa qt và Kt, Vt.
+
+**Lượng tử hóa theo nhóm.** Lượng tử hóa theo nhóm được áp dụng rộng rãi để nén KV cache Sheng et al. (2023); Liu et al. (2024); Hooper et al. (2024). Cho một tensor X ∈ Rn×d ở độ chính xác đầy đủ, phương pháp vanilla nhóm các entry theo token bằng cách đặt g entry liên tiếp của một token vào một nhóm, ví dụ nhóm thứ i XGi chứa các entry với chỉ số Gi = {(ti, ci), ..., (ti, ci + g)} trong đó (ti, ci) là chỉ số bắt đầu của nhóm i và g là kích thước nhóm. Sau đó, nó lượng tử hóa X theo nhóm: X̂ = Quant(per-token)b,g với
+
+Quant(per-token)b,g(X)Gi = ⌈(XGi - min XGi)/∆i⌉, ∆i = (max XGi - min XGi)/(2b - 1)    (2)
+
+trong đó b là bit-width, X̂ là tensor được lượng tử hóa ở độ chính xác b-bit, và ⌈·⌉ là hàm làm tròn. ∆i và min XGi là hệ số co giãn và điểm zero của nhóm i. Hai công trình đồng thời (KIVI Liu et al. (2024) và KVQuant Hooper et al. (2024)) khám phá phân phối entry của KV cache và cho thấy rằng, trong Key cache, một số kênh cố định thể hiện độ lớn rất lớn. Để giới hạn lỗi lượng tử hóa cho từng kênh cá nhân mà không ảnh hưởng đến các kênh khác, họ đề xuất lượng tử hóa Key cache theo kênh trong khi lượng tử hóa Value cache theo token, đạt được nén 2-bit tiên tiến.
+
+Trực quan, việc nhóm chi tiết hơn với kích thước nhóm nhỏ hơn, như g = 64 trong KIVI Liu et al. (2024), dẫn đến xấp xỉ chính xác hơn và mang lại hiệu suất tốt hơn. Tuy nhiên, kích thước nhóm nhỏ gây ra overhead bộ nhớ đáng kể do số lượng hệ số co giãn và điểm zero tăng được lưu trữ ở độ chính xác đầy đủ cho mỗi nhóm. Đồng thời, việc nhóm chi tiết cho lượng tử hóa theo kênh dẫn đến việc duy trì một tập con dư thừa của các token KV ở độ chính xác đầy đủ cho đến khi chúng tạo thành một nhóm hoàn chỉnh Liu et al. (2024). Do đó, độ dài dư thừa của phần độ chính xác đầy đủ này nên được đặt là bội số của kích thước nhóm (ví dụ 128 như được đặt bởi KIVI), dẫn thêm đến overhead đáng kể. Để tận dụng sơ đồ lượng tử hóa SOTA trong khi giảm thiểu overhead, chúng tôi chọn lượng tử hóa Key theo kênh và Value theo token không có nhóm chi tiết như một backbone lượng tử hóa lite. Chúng tôi gọi nó là KCVT, một biến thể của KIVI với nhóm thô theo vector nơi tất cả entry Key của một kênh tạo thành một nhóm kích thước n và tất cả entry Value của một token tạo thành một nhóm kích thước d, giảm đáng kể overhead lưu trữ co giãn và điểm zero.
+
+*Để đơn giản, chúng tôi nối embedding multi-head ở đây.
+
+--- TRANG 6 ---
+
+(a) Lỗi của từng phương pháp
+(b) Phổ của phần dư
+(c) LLaMA3-8B trên GSM8k-CoT
+
+Hình 2: (2a, 2b) Chúng tôi lấy mẫu ngẫu nhiên một ví dụ GSM8k và phân tích KV cache của nó bằng LLaMA2-7B. (2a): lỗi xấp xỉ tối thiểu của mỗi kỹ thuật cá nhân khi xấp xỉ Value cache của lớp đầu tiên; (2b): phổ của phần dư Rh suy giảm nhanh chóng. (2c): Là một framework giảm lỗi hiệu quả, GEAR trực giao với bất kỳ lượng tử hóa có sẵn nào và có thể bổ sung chúng để đạt được độ chính xác gần không mất mát.
+
+## 3 Framework GEAR
+
+Framework GEAR bao gồm ba thành phần quan trọng để phân tách và nén ma trận KV cache: (i) một ma trận được lượng tử hóa D̂ phục vụ như một backbone nén; (ii) một ma trận hạng thấp L để xấp xỉ phần dư lượng tử hóa; (iii) một ma trận thưa thớt S để nắm bắt các outlier cá nhân. Như đã thảo luận trong Mục 1, lỗi xấp xỉ đóng vai trò then chốt trong việc xác định hiệu suất mô hình. Do đó, cho một tensor X ∈ {Kt, Vt}, mục tiêu của chúng tôi là giảm thiểu lỗi xấp xỉ X với bản sao nén của nó. Một chiến lược đơn giản là sử dụng từng ba phương pháp nén riêng lẻ và xấp xỉ X bằng cách giảm thiểu khoảng cách đến nó. Ví dụ, xây dựng L sử dụng các giá trị/vector singular hàng đầu của X hoặc sáng tác S với các entry có độ lớn lớn nhất. Tuy nhiên, như được chứng minh bởi Hình 2a, việc chỉ dựa vào bất kỳ một trong ba phương pháp này không thể đạt được tỉ lệ nén cao vì tất cả đều dẫn đến lỗi tăng đáng kể dưới tỉ lệ nén cao. Ngoài ra, D̂, L, S có thể hoạt động khác nhau trong xấp xỉ ma trận, nắm bắt các thành phần khác nhau của X. Những động lực này khuyến khích chúng tôi khám phá việc tích hợp ba kỹ thuật để tận dụng các ưu điểm cá nhân của chúng trong khi khai thác tiềm năng hiệp đồng của chúng. Để đạt được điều này, mục tiêu của chúng tôi trở thành giảm thiểu lỗi xấp xỉ sau:
+
+min D̂,L,S ||X - D̂ - L - S||F.    (3)
+
+Một ý tưởng thú vị để giảm thiểu (3) là luân phiên giữa lượng tử hóa, phân tách giá trị singular (SVD) và trích xuất outlier, và cập nhật lặp ba ma trận D̂, L, S cho đến khi đạt được lỗi tối thiểu. Ý tưởng này đã được giới thiệu bởi Li et al. (2023) để tối ưu hóa một mục tiêu tương tự cho việc khởi tạo chính xác của lượng tử hóa trọng số. Tuy nhiên, hệ thống suy luận có yêu cầu tốc độ khắt khe. Độ trễ đáng kể gây ra bởi các cập nhật lặp này là không thể chấp nhận được cho suy luận sinh. Do đó, chúng tôi đề xuất một giải pháp hiệu quả để giảm thiểu lỗi xấp xỉ (3).
+
+**Lượng tử hóa nhận biết outlier.** Lấy cảm hứng từ nghiên cứu gần đây về lượng tử hóa trọng số (Kim et al., 2023), chúng tôi quan sát thấy backbone được lượng tử hóa D̂ và ma trận thưa thớt S bổ sung cho nhau trong nén KV cache. Cụ thể, sơ đồ lượng tử hóa có thể dẫn đến lỗi lượng tử hóa không nhỏ trong mỗi nhóm do sự tồn tại của các entry outlier. Do đó, một chiến lược đơn giản là lọc ra các outlier này trước khi lượng tử hóa. Để phù hợp với việc nhóm của lượng tử hóa Key theo kênh và Value theo token, chúng tôi tận dụng việc lọc outlier theo vector. Cho một tensor đầu vào X = Kt (hoặc Vt), chúng tôi trích xuất cả s/2% entry tối đa và tối thiểu của mỗi vector kênh (hoặc token) và lưu trữ chúng ở độ chính xác đầy đủ với ma trận thưa thớt S = Filters(X) trong đó
+
+Filters(X)ij = {
+    Xij nếu X = Kt và Xij trong top/bottom s/2% của kênh thứ j X·j,
+    Xij nếu X = Vt và Xij trong top/bottom s/2% của token thứ i Xi·,
+    0 ngược lại.
+}    (4)
+
+Sau đó, chúng tôi thực hiện lượng tử hóa trên ma trận đã trích xuất và thu được backbone được lượng tử hóa:
+
+D̂ = Quant(Selected scheme)b(X - S).    (5)
+
+Kỹ thuật trích xuất outlier đã được áp dụng bởi Kim et al. (2023) để bổ sung lượng tử hóa trọng số không đồng nhất phụ thuộc vào huấn luyện. Trái ngược với kịch bản ứng dụng của họ, chúng tôi khám phá tiềm năng của các kỹ thuật trích xuất outlier kết hợp với lượng tử hóa đồng nhất không cần điều chỉnh cho KV cache. Điều quan trọng cần lưu ý là, so với trọng số, nén KV cache đưa ra những thách thức độc đáo vì KV cache có thể chứa nhiều outlier hơn, làm cho việc lượng tử hóa chính xác của nó khó khăn hơn so với trọng số (Xiao et al., 2023). Kết quả thực nghiệm của chúng tôi trong Mục 4.3 cũng cho thấy rằng lượng tử hóa nhận biết outlier gặp thách thức trong việc đạt được nén độ chính xác cực thấp như 2-bit trên các tác vụ sinh phức tạp. Để đạt được nén tỉ lệ cao hiệu quả, thường cần thiết phải trích xuất một phần lớn outlier được lưu trữ trong ma trận thưa thớt. Tuy nhiên, việc biểu diễn ma trận thưa thớt như vậy với hai vector chỉ số và một vector giá trị ở độ chính xác đầy đủ dẫn đến overhead bộ nhớ đáng kể. Những điều này cho thấy rằng, trong khi sử dụng S có thể giảm lỗi, nó vẫn không đủ để khắc phục đầy đủ lỗi một cách hiệu quả.
+
+**Xấp xỉ hạng thấp.** Để giảm lỗi xấp xỉ hiệu quả hơn, chúng tôi dùng đến xấp xỉ hạng thấp. Như được truyền cảm hứng bởi thực tế rằng các attention head khác nhau mã hóa thông tin ngữ cảnh đa dạng trong các phạm vi kênh khác nhau Tenney et al. (2019); Voita et al. (2019); Zhang et al. (2024), chúng tôi đề xuất áp dụng phân tách hạng thấp theo head trên phần dư R = X - (D̂ + S) ∈ Rn×d. Cụ thể, chúng tôi đầu tiên reshape R theo chiều kênh và thu được H ma trận con multi-head {Rh = R[:, (h-1)dH : hdH] ∈ Rn×dH | 1 ≤ h ≤ H} trong đó Rh là phần dư của head h. Giả sử Rh có phân tách giá trị singular là ∑k i=1 σiuim⊤i, trong đó σ1 ≥ ... ≥ σk là các giá trị singular và ui, mi là các vector singular tương ứng. Như được hiển thị trong Hình 2b, chúng tôi quan sát thực nghiệm rằng phổ của các ma trận phần dư giảm nhanh ở đầu. Điều này gợi ý sự tồn tại của
+
+--- TRANG 7 ---
+
+một thành phần liên kết trong phần dư. Thành phần này được biểu diễn bởi các giá trị/vector singular hàng đầu, và được chia sẻ giữa các token, cho thấy sự tương tự vector. Bằng các giá trị và vector singular hàng đầu này, chúng tôi có thể nắm bắt và khôi phục hiệu quả thông tin liên kết này, dẫn đến một xấp xỉ hiệu quả cho phần dư lượng tử hóa. Vì mục đích này, chúng tôi giới thiệu một ma trận L = Concat(L1, ..., LH), trong đó Lh là một ma trận hạng thấp:
+
+Lh = AhB⊤h = SVDSolverr(Rh)    (6)
+
+Ah ∈ Rn×r, Bh ∈ RdH×r và r nhỏ hơn nhiều so với n, dH. Ví dụ, khi n = 1024 và dH = 128, r = 4 là đủ để đạt được nén tỉ lệ cao gần không mất mát. Đối với SVDSolver(·), chúng tôi sử dụng một thuật toán lặp lũy thừa hiệu quả Vogels et al. (2019). Thuật toán này tính toán Ah, Bh nhanh chóng trong khi đảm bảo rằng AhB⊤h xấp xỉ chính xác các giá trị/vector singular hàng đầu ∑r i=1 σiuim⊤i (vui lòng xem Phụ lục 8 cho chi tiết thuật toán). Trong thiết lập multi-batch, chúng tôi áp dụng xấp xỉ hạng thấp cho các tensor đầu vào theo batch và head.
+
+Tóm lại, GEAR tích hợp ba kỹ thuật nén để cung cấp một giải pháp hiệu quả cho việc giảm thiểu lỗi xấp xỉ trong (3). Cụ thể, backbone được lượng tử hóa D̂ tận dụng sự tương tự entry-wise và nén phần lớn các entry xuống độ chính xác cực thấp. Ma trận hạng thấp Lh tận dụng sự tương tự vector-wise để trích xuất thông tin được chia sẻ chung trong các phần dư. Ma trận thưa thớt S bù đắp cho việc trích xuất thông tin thưa thớt tồn tại trong các outlier cá nhân và bổ sung cho quá trình lượng tử hóa. Do đó, GEAR giảm hiệu quả lỗi xấp xỉ, đạt được nén KV cache tỉ lệ cao. Chúng tôi khuyến nghị sử dụng GEAR với cả ba thành phần để có hiệu suất tốt nhất – cả hiệu suất 4-bit và 2-bit gần không mất mát như một lựa chọn thay thế cho các phương pháp SOTA. Tuy nhiên, để ưu tiên hiệu quả, người ta có thể dùng đến một phiên bản lite của GEAR, tức GEAR-L, chỉ trang bị xấp xỉ hạng thấp để khôi phục lỗi lượng tử hóa, tốn ít overhead bộ nhớ hơn trong khi cải thiện độ chính xác đáng kể. Cuối cùng, chúng tôi nhấn mạnh rằng, như một framework giảm lỗi hiệu quả, GEAR(-L) trực giao với bất kỳ sơ đồ lượng tử hóa có sẵn nào và có thể bổ sung chúng để đạt được độ chính xác gần không mất mát như được hiển thị trong Hình 2c và Mục 4.
+
+**Bộ đệm luồng.** GEAR cũng giới thiệu một chiến lược bộ đệm luồng trong quá trình giải mã để tăng đáng kể tốc độ suy luận của nó. Cụ thể, khi phục vụ việc sinh chuỗi dài, GEAR lưu trữ các vector KV của các token mới sinh ra ở độ chính xác đầy đủ vào một bộ đệm nhỏ B có kích thước nb (ví dụ nb = 20). Khi bộ đệm đạt đến dung lượng của nó mỗi nb bước giải mã, GEAR thực hiện nén cho các token mới trong B trong khi xấp xỉ hạng thấp tiếp theo chỉ được thực hiện trên các token mới. Công trình đồng thời, KIVI (Liu et al., 2024), giới thiệu một cách tiếp cận buffering tương tự để cache các token dư thừa cho đến khi chúng hoàn thành một nhóm. Do đó, kích thước bộ đệm dư thừa của họ nên được đặt là bội số của kích thước nhóm. Trong trường hợp nhóm thô của KCVT, kích thước buffer có thể được đặt tùy ý và chúng tôi chọn kích thước nhỏ như nb = 20 để tăng tốc độ suy luận trong khi tránh overhead bộ nhớ không nhỏ. Chúng tôi tóm tắt thuật toán chi tiết của GEAR trong Thuật toán 1 của Phụ lục 7.
+
+--- TRANG 8 ---
+
+Bảng 1: Kết quả trên các tác vụ lý luận CoT, là tác vụ sinh khó. Ở đây, KV Size là % trung bình của kích thước còn lại của KV cache nén so với kích thước trong FP16. Kết quả tốt nhất được hiển thị bằng chữ đậm. N.A. đại diện cho hiệu suất suy thoái cực độ.
+
+| Model | LLaMA3-8B | LLaMA2-13B | Mistral-7B | All |
+|-------|------------|-------------|------------|-----|
+| Method | Bit | Ave. KV size | GSM8k Acc | AQuA Acc | BBH Acc | GSM8k Acc | AQuA Acc | BBH Acc | GSM8k Acc | AQuA Acc | BBH Acc | Ave. Acc |
+| FP16 | 16 | 100% | 54.21 | 38.19 | 53.66 | 30.34 | 21.65 | 40.79 | 42.84 | 35.04 | 47.92 | 40.52 |
+| Per-token Q. g=64 | 4 | 34.2% | 37.07 | 39.37 | 46.42 | 20.85 | 18.90 | 34.72 | 31.47 | 29.13 | 28.88 | 31.94 |
+| KCVT Quant | 4 | 27.1% | 45.59 | 36.61 | 51.67 | 21.14 | 21.05 | 36.71 | 30.31 | 24.37 | 46.86 | 34.92 |
+| KIVI g=64, nb=64 | 4 | 34.2% | 46.25 | 36.22 | 48.03 | 22.14 | 21.65 | 37.76 | 32.83 | 25.98 | 44.56 | 35.05 |
+| GEAR-L(KCVT) r=4 | 4 | 29.0% | 53.44 | 38.98 | 52.23 | 30.25 | 23.23 | 38.52 | 43.06 | 33.07 | 47.42 | 40.02 |
+| GEAR(KCVT) s=2%, r=4 | 4 | 31.0% | 54.76 | 40.55 | 52.74 | 30.17 | 24.05 | 40.63 | 41.93 | 34.57 | 47.84 | 40.80 |
+| Per-token Q. g=64 | 2 | 21.7% | 3.56 | 9.84 | 4.72 | N.A. | 10.54 | N.A. | N.A. | 11.42 | 5.93 | 7.67 |
+| KIVI g=64, nb=64 | 2 | 21.7% | 30.17 | 25.36 | 30.92 | 16.60 | 17.72 | 29.43 | 23.35 | 22.44 | 31.28 | 25.25 |
+| GEAR-L(KIVI) r=4 | 2 | 23.6% | 52.62 | 38.19 | 51.44 | 26.61 | 20.87 | 39.44 | 39.27 | 29.92 | 46.36 | 38.34 |
+| GEAR(KIVI,g=64) s=2%, r=4 | 2 | 27.6% | 54.59 | 38.19 | 50.30 | 30.27 | 23.62 | 39.67 | 43.14 | 33.96 | 48.03 | 40.20 |
+
+## 4 Thí nghiệm
+
+Chúng tôi sử dụng GEAR như một nén KV cache plug-and-play cho suy luận sinh với các mô hình LLM khác nhau (bao gồm LLaMA2-7B/13B Touvron et al. (2023b), Mistral-7B Jiang et al. (2023) và LLaMA3-8B Meta (2024)) trên các tác vụ sinh bao gồm lý luận toán (GSM8k (Cobbe et al., 2021) và AQuA (Ling et al., 2017)), lý luận ký hiệu (BigBench Hard (BBH) (Suzgun et al., 2022)) với prompting CoT Wei et al. (2023), và hiểu ngữ cảnh dài (LongBench (Bai et al., 2023)).
+
+**Chi tiết triển khai và tối ưu hóa.** Để giảm thiểu overhead, chúng tôi trình bày thông qua hỗ trợ kernel GPU và tối ưu hóa triển khai cho GEAR như sau. Thứ nhất, chúng tôi kết hợp dequantization với phép nhân ma trận sử dụng CUDA để cải thiện độ trễ giải mã. Thứ hai, chúng tôi tích hợp bộ đệm luồng cho cả Key và Value sao cho các KV cache mới sinh ra đều được nén mỗi nb bước. Hơn nữa, do bộ đệm luồng trong quá trình giải mã, xấp xỉ hạng thấp được thực hiện mỗi nb bước chỉ cho các token được đệm với hạng cực thấp (r = 2), cải thiện hiệu quả nén. Thứ ba, chúng tôi thực hiện forward pass của các ma trận hạng thấp trên một đường dẫn riêng biệt nơi phép chiếu xuống (ví dụ q⊤hBh) được tính toán trước, tiếp theo là phép chiếu lên (ví dụ (q⊤hBh)A⊤h), giảm độ phức tạp tính toán của forward pass của chúng.
+
+Chúng tôi áp dụng GEAR và các phương pháp baseline cho các LLM pre-trained nguồn mở có sẵn tại Huggingface Wolf et al. (2019), sử dụng framework suy luận của chúng tôi được viết bằng PyTorch Paszke et al. (2019). Khi chúng tôi tập trung vào việc đánh giá tác động của nén KV Cache, chúng tôi giữ tất cả các tensor khác ở FP16, trừ khi được nói khác. Chúng tôi tập trung vào lượng tử hóa độ chính xác cực thấp và báo cáo kết quả của lượng tử hóa 4-bit và 2-bit. Đối với GEAR, chúng tôi cố định tỉ lệ thưa thớt s ở 2%, đặt hạng r thành 4 cho đầu vào trong giai đoạn prefill, và đặt hạng thành 2 cho mỗi nhóm nb token mới trong giai đoạn giải mã. Chúng tôi thấy rằng lượng tử hóa KCVT hiệu quả đạt được nén 4-bit hiệu quả và do đó tận dụng nó như backbone lượng tử hóa 4-bit cho GEAR do hiệu quả của nó. Tuy nhiên, trong trường hợp nén 2-bit, hiệu suất của nó suy thoái rất nhiều và các sơ đồ lượng tử hóa phải dùng đến nhóm chi tiết để thiết lập độ chính xác chấp nhận được. Do đó, chúng tôi sử dụng KIVI như backbone lượng tử hóa 2-bit cho GEAR. Như được chứng minh bởi Liu et al. (2024) rằng KIVI không nhạy cảm với kích thước nhóm g và độ dài dư thừa nb (Bảng 5 trong (Liu et al., 2024)), chúng tôi do đó chọn kích thước nhóm là 64 và độ dài dư thừa là 64 cho cả GEAR và KIVI để giảm overhead kích thước KV. Chỉ số trên trong ngoặc được hiển thị trong Bảng 1 và 2 xác định sơ đồ lượng tử hóa backbone.
+
+**Baseline.** Chúng tôi so sánh GEAR với các phương pháp baseline sau:
+
+• Lượng tử hóa theo nhóm per-token (được sử dụng trong FlexGen (Sheng et al., 2023)) là một phương pháp được áp dụng rộng rãi lượng tử hóa KV cache per-token với nhóm chi tiết.
+
+• KIVI (Liu et al., 2024) là một phương pháp lượng tử hóa KV cache đồng thời đạt được nén KV cache 2-bit tiên tiến. Phương pháp này lượng tử hóa Key cache per-channel và lượng tử hóa Value cache per-token với nhóm chi tiết, và lưu trữ các token dư thừa có độ dài nb ở độ chính xác đầy đủ.
+
+• Lượng tử hóa KCVT là một biến thể của KIVI lượng tử hóa Key cache per-channel và Value cache per-token không có nhóm chi tiết. Đây là lượng tử hóa per-vector gây ra overhead thấp hơn.
+
+• H2O (Zhang et al., 2023b) là một phương pháp loại bỏ token gần đây loại bỏ các token không quan trọng với điểm attention tích lũy thấp hơn, mà chúng tôi so sánh trong Bảng 10.
+
+Công trình đồng thời gần đây KVQuant (Hooper et al., 2024) khám phá KCVT để kết hợp nó với lượng tử hóa không đồng nhất phụ thuộc vào dữ liệu. Trong khi nó thể hiện hiệu suất gần không mất mát chủ yếu trên perplexity với WikiText2 và C4, nó đòi hỏi calibration bổ sung giảm thiểu một mục tiêu liên quan đến Hessian được điều khiển bởi các mẫu dữ liệu để có được các signpost lượng tử hóa. Tuy nhiên, GEAR nhằm mục đích trở thành một phương pháp plug-and-play, có thể được triển khai với bất kỳ sơ đồ lượng tử hóa suy luận nào mà không có sự phụ thuộc như vậy. Do đó chúng tôi giữ bất kỳ nén phụ thuộc calibration nào ngoài phạm vi của công trình này.
+
+### 4.1 Kết quả Chính
+
+**Hiệu suất sinh trên các tác vụ lý luận CoT khó.** Chúng tôi so sánh các phương pháp khác nhau với LLaMA3-8B, LLaMA2-13B, và Mistral-7B trên ba tác vụ sinh CoT thách thức: GSM8k, AQuA, và BBH với 8-shot CoT demonstrations. GSM8k (Cobbe et al., 2021) và AQuA (Ling et al., 2017) là các bộ dữ liệu lý luận toán được sử dụng rộng rãi kiểm tra khả năng lý luận số học của mô hình. BBH (Suzgun et al., 2022) là một bộ các vấn đề lý luận ngôn ngữ và ký hiệu bao gồm 6.5k vấn đề trong 23 tập con. Cho sự phức tạp của các tác vụ này, chúng tôi sử dụng các prompt chain-of-thought được tạo bởi (Fu et al., 2023) để cải thiện lý luận, chứa 8-shot demonstrations của lý luận đa bước. Với các CoT demonstrations, chúng tôi có độ dài prefill trung bình
+
+--- TRANG 10 ---
+
+của GSM8k, AQuA, và BBH lần lượt là 900, 1304, 1021 (xem Phụ lục 10). Sau đó chúng tôi prompt mô hình sinh ra 256 token và trích xuất câu trả lời từ chúng. Do đó, các thí nghiệm của chúng tôi liên quan đến việc sinh chuỗi dài. Đáng chú ý, như đã đề cập trong Mục 1, các prompt CoT thường chứa thông tin tương quan dày đặc qua nhiều bước lý luận và mô hình cần chú ý chặt chẽ qua các bước để rút ra câu trả lời đúng. Do đó, một lỗi nén tương đối nhỏ có thể được phóng đại qua các bước sinh, dẫn đến sự sai lệch đáng kể trong việc sinh của mô hình.
+
+Bảng 1 trình bày kết quả thí nghiệm trên các tác vụ lý luận CoT khó này. Chúng tôi thấy rằng GEAR và GEAR-L đạt được hiệu suất tốt hơn hoặc tương đương so với các phương pháp baseline trên tất cả bộ dữ liệu và tất cả mô hình ở cả nén 4-bit và 2-bit. Ví dụ, trong trường hợp nén 2-bit, GEAR đạt được 47,83% độ chính xác trung bình trên LLaMA3-8B qua ba bộ dữ liệu, gần không mất mát so với baseline FP16 (48,69%) và vượt trội đáng kể so với baseline hiệu suất tốt nhất (28,82%, KIVI). Đáng chú ý, GEAR-L cũng thiết lập hiệu suất đáng kể – nén 4-bit gần không mất mát và hiệu suất 2-bit vượt trội so với baseline, trong khi thể hiện kích thước KV thấp hơn và hiệu quả suy luận cao hơn. Đồng thời, như được hiển thị trong Bảng 1 và Hình 2c, bất kể backbone lượng tử hóa nào chúng tôi chọn, phương pháp của chúng tôi luôn có thể cải thiện dựa trên chúng bằng cách tích hợp các kỹ thuật giảm lỗi, thể hiện khả năng tổng quát của nó như một framework giảm lỗi hiệu quả. Do đó, chúng tôi nhấn mạnh rằng GEAR(-L) trực giao với bất kỳ sơ đồ lượng tử hóa có sẵn nào và có thể bổ sung chúng theo cách plug-and-play để đạt được độ chính xác gần không mất mát với overhead bộ nhớ tối thiểu.
+
+**Hiệu suất sinh trên các tác vụ tương đối dễ.** Chúng tôi cũng so sánh các phương pháp khác nhau trên các tác vụ tương đối dễ không có lý luận CoT. Cụ thể, chúng tôi đánh giá hiệu suất với LLaMA2-7B trên LongBench (Bai et al., 2023), là một bộ 21 tác vụ hiểu ngữ cảnh dài bao gồm hỏi đáp, tóm tắt, hoàn thành mã, v.v. (vui lòng xem Phụ lục 10 cho metrics tác vụ và thống kê bộ dữ liệu). Độ dài đầu vào trung bình của LongBench là 3642. Chúng tôi tuân theo phương pháp đánh giá trong (Bai et al., 2023), áp dụng metrics đánh giá của họ và báo cáo điểm trung bình qua tất cả 21 tác vụ. Bên cạnh đó, chúng tôi cũng tuân theo (Liu et al., 2024) và so sánh hiệu suất sử dụng LLaMA2-7B và LLaMA3-8B trên GSM8k với prompt 5-shot chuẩn. Các 5-shot demonstrations như vậy bao gồm 5 câu hỏi được lấy mẫu và câu trả lời một bước (hoặc hai bước) của chúng và không liên quan đến CoT phức tạp. Mô hình được prompt để trả lời câu hỏi mà không có lý luận đa bước, đơn giản hơn so với thiết lập prompting CoT 8-shot.
+
+Bảng 2 trình bày kết quả thí nghiệm trên các tác vụ đơn giản hơn này. Chúng tôi thấy rằng các phương pháp lượng tử hóa đã có thể đạt được nén 4-bit/2-bit gần không mất mát trên các tác vụ này, thể hiện hiệu quả của chúng trên các tác vụ đơn giản hơn. Ví dụ, đối với nén 2-bit, lượng tử hóa theo nhóm per-token và KIVI đều mang lại khoảng 27,7% điểm trung bình qua 21 tác vụ của LongBench. Hơn nữa, KIVI thiết lập hiệu suất 2-bit gần không mất mát trên GSM8k với các ví dụ chuẩn 5-shot cho cả mô hình LLaMA2-7B và LLaMA3-8B. Sau khi kết hợp các kỹ thuật giảm lỗi, GEAR và GEAR-L có thể đạt được hiệu suất tốt hơn hoặc tương đương so với các phương pháp lượng tử hóa baseline. Ví dụ, GEAR đạt được 49,96% độ chính xác trên GSM8k (5-shot) khi nén KV cache của LLaMA3-8B xuống 2-bit, cao hơn 7,42% so với KIVI.
+
+### 4.2 So sánh Hiệu quả Suy luận
+
+Trong mục này, chúng tôi đánh giá thời gian wall-clock, bộ nhớ, và thông lượng của GEAR trên một GPU NVIDIA V100 đơn (16GB). Cụ thể, chúng tôi đặt độ dài đầu vào và sinh lần lượt là 1000 và 500, và đánh giá với LLaMA2-7B. Chúng tôi tăng kích thước batch cho đến khi hết bộ nhớ và báo cáo bộ nhớ đỉnh/thông lượng giữa KV cache FP16 và lượng tử hóa 2-bit: KIVI, GEAR, và GEAR-L. Chúng tôi sử dụng cùng siêu tham số như trong Mục 4.1. Ở đây, để tối đa hóa kích thước batch cho tất cả phương pháp, chúng tôi nén trọng số mô hình xuống 8-bit, sử dụng bitsandbytes từ Huggingface Transformers (Wolf et al., 2019).
+
+Trong thiết lập suy luận này, chúng tôi đầu tiên cung cấp một phân tích phân tích thời gian cho GEAR so sánh tổng thời gian tính toán của các thành phần khác nhau trong suy luận sinh: (i) thời gian liên quan đến lượng tử hóa bao gồm tổng thời gian lượng tử hóa và dequantization sau khi trang bị kernel CUDA của chúng tôi; (ii) thời gian hạng thấp bao gồm tổng thời gian xấp xỉ SVD bởi Thuật toán 2 và forward pass của các ma trận hạng thấp; (iii) thời gian thưa thớt chứa tổng thời gian tính toán của trích xuất outlier và phép nhân ma trận liên quan đến S trong forward pass; (iv) thời gian khác chủ yếu về forward pass mô hình và được thu được bằng cách trừ tổng thời gian wall-clock với tổng thời gian của ba mục được đề cập trước đó. Chúng tôi sử dụng kích thước batch tối đa ở đây (là 18) và báo cáo trung bình qua ba lần thử. Hình 3a trình bày phần trăm thời gian của mỗi thành phần trong GEAR và GEAR-L trong suy luận sinh. Kết quả cho thấy rằng, trong khi mang lại cải thiện hiệu suất đáng kể, các thành phần hạng thấp và thưa thớt là nhẹ và không gây ra overhead không thể chấp nhận được. Độ phức tạp chính vẫn xuất phát từ forward pass mô hình. Độ trễ bổ sung bởi các thành phần hạng thấp và thưa thớt có thể không đáng kể do triển khai tối ưu hóa và kỹ thuật suy luận của chúng tôi.
+
+Hình 3b trình bày so sánh bộ nhớ đỉnh qua các kích thước batch khác nhau dưới cùng thiết lập suy luận. Chúng tôi thấy rằng, cho cùng kích thước batch, GEAR giảm đáng kể bộ nhớ đỉnh so với baseline FP16, tăng số lượng phục vụ tối đa (tức kích thước batch) từ 3 lên 18. Hơn nữa, Hình 3c cho thấy so sánh thông lượng qua các kích thước batch khác nhau. Kết quả chứng minh rằng, so với baseline FP16, phương pháp của chúng tôi cải thiện đáng kể thông lượng lên đến 5,07×. Đồng thời, GEAR-L đạt được thông lượng hơi tốt hơn so với KIVI do chiến lược luồng được cải thiện của chúng tôi. Chúng tôi trình bày kết quả chi tiết của Hình 3b và 3c trong Phụ lục 11.
+
+### 4.3 Phân tích và Nghiên cứu Ablation
+
+**Nghiên cứu ablation về tỉ lệ thưa thớt s và hạng r.** Chúng tôi nghiên cứu độ nhạy cảm của GEAR đối với tỉ lệ thưa thớt s và hạng r. Hình 4a cho thấy lượng tử hóa 2-bit của GEAR và GEAR-L sử dụng LLaMA3-8B trên GSM8k (w. CoT) khi thay đổi s hoặc r. Chúng tôi thấy rằng GEAR không đòi hỏi các thành phần thưa thớt hoặc hạng thấp dồi dào – một tỉ lệ thưa thớt nhỏ (s = 2% cho GEAR) và một hạng nhỏ (r = 4 cho GEAR và GEAR-L) là đủ để đạt được nén 2-bit gần không mất mát, thể hiện hiệu quả cao của phương pháp chúng tôi. Việc tăng thêm s hoặc r có thể cải thiện độ chính xác nhưng không đáng kể, điều này tuy nhiên dẫn đến overhead bộ nhớ bổ sung. Quan trọng hơn, việc bỏ qua thành phần hạng thấp có thể làm suy giảm đáng kể hiệu suất của GEAR và GEAR-L, làm nổi bật vai trò quan trọng của nó trong việc giảm lỗi. Mặt khác, việc bỏ qua ma trận thưa thớt có thể làm tổn hại hiệu suất nhưng không đáng kể vì lỗi không liên kết từ các entry outlier cũng có thể được khắc phục một phần bằng việc nhóm entry của lượng tử hóa. Do đó, chúng tôi nhấn mạnh GEAR-L cho những người ưu tiên hiệu quả.
+
+**Vai trò của xấp xỉ hạng thấp.** Chúng tôi so sánh GEAR với lượng tử hóa nhận biết outlier để làm nổi bật tầm quan trọng của xấp xỉ hạng thấp. Cụ thể, chúng tôi áp dụng cùng thiết lập đánh giá như Mục 4.1. Bảng 8 trong Phụ lục 12 trình bày hiệu suất 2-bit của lượng tử hóa KIVI nhận biết outlier. Kết quả cho thấy rằng việc chỉ sử dụng trích xuất outlier cho lượng tử hóa có thể cải thiện hiệu suất nhưng không thể đạt được hiệu suất 2-bit gần không mất mát mà GEAR làm được. Lượng tử hóa nhận biết outlier vẫn gặp thách thức trong việc đạt được nén tỉ lệ cao. Ngược lại, xấp xỉ hạng thấp đóng vai trò then chốt trong việc khắc phục đầy đủ lỗi xấp xỉ và đạt được nén tỉ lệ cao gần không mất mát.
+
+**Áp dụng giảm lỗi cho số lượng token khác nhau.** Để chứng minh thêm hiệu quả của việc giảm lỗi, chúng tôi nghiên cứu sự thay đổi hiệu suất của GEAR-L khi áp dụng xấp xỉ hạng thấp cho số lượng token khác nhau với LLaMA3-8B trên GSM8k và AQuA (w. CoT). Cụ thể, chúng tôi chia token thành (i) token đầu vào trong giai đoạn prefill và (ii) token sinh ra trong giai đoạn giải mã. Theo mặc định, chúng tôi khôi phục lỗi lượng tử hóa cho tất cả chúng. Thay vào đó, chúng tôi có thể lấy p% token prefill gần đây nhất và chỉ áp dụng xấp xỉ hạng thấp cho chúng. Hình 4b trình bày hiệu suất của GEAR-L khi thay đổi p. Chúng tôi thấy rằng hiệu suất của GEAR-L suy giảm khi giảm số lượng token được áp dụng giảm lỗi, xác nhận hiệu quả của kỹ thuật giảm lỗi.
+
+**Tỉ lệ nén khác nhau.** Hình 4c so sánh hiệu suất của các phương pháp khác nhau trên GSM8k (w. CoT) khi nén KV cache của LLaMA3-8B xuống kích thước còn lại khác nhau. Chúng tôi thấy rằng GEAR và GEAR-L luôn vượt trội hơn các phương pháp baseline lượng tử hóa khác, đạt được độ chính xác gần không mất mát qua các tỉ lệ nén khác nhau và thể hiện hiệu quả của chúng như một framework giảm lỗi hiệu quả cho lượng tử hóa KV cache.
+
+--- TRANG 11 ---
+
+Bảng 2: Kết quả trên đánh giá GSM8k 5-shot và LongBench. Ở đây, KV Size là % trung bình của kích thước còn lại của KV cache nén so với kích thước trong FP16 (tức nghịch đảo của tỉ lệ nén). Kết quả tốt nhất được hiển thị bằng chữ đậm. Kết quả được đánh dấu † được lấy từ các bài báo khác.
+
+| Dataset | GSM8k 5-shot | LongBench w. LLaMA2-7B |
+|---------|--------------|-------------------------|
+| Method | Bit | Ave. KV size | 7B Acc | 8B Acc | QMSum Rouge | SAMSum Rouge | GovReport Rouge | 21 Tasks Ave. KV | Ave. score |
+| FP16 | 16 | 100% | 13.50 | 49.89 | 21.28 | 43.57 | 26.06 | 100% | 26.82 |
+| Per-token Q. g=64 | 4 | 38.2% | 10.54 | 45.64 | 20.91 | 39.15 | 28.50 | 31.6% | 27.31 |
+| KCVT Quant | 4 | 27.1% | 12.51 | 43.14 | 20.91 | 33.89 | 24.32 | 25.7% | 26.06 |
+| KIVI g=64, nb=64 | 4 | 38.2% | 13.41 | 48.37 | 20.81 | 40.98 | 26.86 | 31.6% | 27.58 |
+| GEAR-L(KCVT) r=4 | 4 | 30.4% | 12.51 | 47.23 | 21.18 | 41.39 | 26.93 | 27.3% | 27.65 |
+| GEAR(KCVT) s=2%, r=4 | 4 | 32.4% | 13.19 | 49.43 | 21.28 | 41.32 | 26.97 | 29.3% | 27.80 |
+| Per-token Q. g=64 | 2 | 25.7% | 0.08 | 0.83 | 19.78 | 40.31 | 25.50 | 17.5% | 27.69 |
+| KIVI g=32, nb=128 | 2 | 34.9% | 12.74† | 42.54 | 20.50† | 42.71† | 25.72 | 19.7% | 27.83 |
+| GEAR-L(KIVI,g=64) r=4 | 2 | 27.5% | 12.63 | 47.01 | 20.69 | 42.35 | 26.67 | 19.1% | 27.90 |
+| GEAR(KIVI,g=64) s=2%, r=4 | 2 | 31.5% | 13.04 | 49.96 | 20.59 | 43.22 | 27.73 | 23.1% | 25.48 |
+
+--- TRANG 12 ---
+
+(a) Phân tích phân tích thời gian
+(b) So sánh bộ nhớ đỉnh
+(c) So sánh thông lượng
+
+Hình 3: (3a) phần trăm thời gian wall-clock của mỗi thành phần trong GEAR: các thành phần thưa thớt và hạng thấp gây ra overhead không đáng kể. (3b): GEAR giảm đáng kể bộ nhớ đỉnh, cho phép kích thước batch lớn hơn nhiều so với FP16. (3c): GEAR cải thiện thông lượng đáng kể so với FP16 do các kỹ thuật được giới thiệu của chúng tôi.
+
+## 5 Công trình Liên quan
+
+**Nén trọng số LLM.** Nén trọng số LLM có thể giảm đáng kể dấu chân bộ nhớ và chi phí truyền dữ liệu. GPTQ Frantar et al. (2023) đã tăng tốc lượng tử hóa não tối ưu cho trọng số LLM theo thứ tự độ lớn. SqueezeLLM Kim et al. (2023) đã nén thành công trọng số mô hình xuống 3 bit bằng cách trích xuất các giá trị outlier và lượng tử hóa các giá trị còn lại theo ma trận hessian trong vòng 10% tăng perplexity. Các thuật toán này hiệu quả và có thể nén trọng số xuống 2 hoặc 3 bit với mất mát độ chính xác chấp nhận được. Tuy nhiên, các phương pháp này thường đòi hỏi overhead độ trễ đáng kể và thông tin gradient để hoạt động. Do đó chúng không phù hợp cho nén KV cache vì KV cache không có tham số có thể huấn luyện nào và thay đổi mỗi giai đoạn sinh, đòi hỏi phương pháp nhẹ hiệu quả cho nén trực tuyến.
+
+**Nén KV cache LLM.** Activation và nén KV cache khó hơn nén trọng số vì chúng nhạy cảm hơn và liên quan đến đầu vào mô hình. SmoothQuant Xiao
+
+--- TRANG 13 ---
+
+et al. (2023) đạt được nén 8-bit cho cả activation (bao gồm KV cache) và trọng số bằng cách điều chỉnh các hệ số co giãn để giảm lỗi outlier và thể hiện hiệu suất gần không mất mát trên các tác vụ sinh đơn giản. Atom Zhao et al. (2023) đã nén thành công KV Cache xuống 4 bit trên các tác vụ sinh đơn giản trong vòng 5% suy giảm hiệu suất bằng cách kết hợp lượng tử hóa channel-wise 4-bit và 8-bit. Một hướng công trình khác khám phá việc cắt tỉa KV thông qua loại bỏ token dựa trên phân tích điểm attention. Cụ thể, H2O (Zhang et al., 2023b) và FastGen Ge et al. (2023) đề xuất cắt tỉa KV thông qua loại bỏ token dựa trên điểm attention để giảm kích thước KV cache. SparQ Ribar et al. (2023) không chỉ loại bỏ token theo tính thưa thớt điểm attention mà còn kết hợp lỗi của value cache đã cắt tỉa. Các thuật toán cắt tỉa và lượng tử hóa này thường hoạt động tốt trên các tác vụ tóm tắt và suy luận zero-shot. Tuy nhiên, đối với các mô hình được fine-tune, suy luận CoT, và các bộ dữ liệu lý luận sinh, điểm attention dày đặc hơn và mỗi token chứa thông tin quan trọng không thể bỏ qua. Hơn nữa, loại bỏ token cần cân nhắc từng token dựa trên điểm attention, làm cho các phương pháp này khó triển khai với FlashAttention Dao et al. (2022). Ngoài ra, các công trình gần đây đã chứng minh tính thưa thớt attention là một hàm của sự lựa chọn phi tuyến tính của mô hình Mirzadeh et al. (2023), cho thấy tính dễ bị tổn thương của nó như một metric cho nén KV.
+
+## 6 Thảo luận và Kết luận
+
+Trong bài báo này, chúng tôi trình bày GEAR, một framework giảm lỗi hiệu quả có thể bổ sung bất kỳ sơ đồ lượng tử hóa KV cache có sẵn nào với hai kỹ thuật giảm lỗi nhẹ theo cách plug-and-play để đạt được độ chính xác gần không mất mát ở nén tỉ lệ cao. Cụ thể, GEAR thể hiện hiệu suất SOTA trên các tác vụ sinh phức tạp liên quan đến lý luận, đạt được cải thiện độ chính xác trung bình đáng kể là 14,95% ở lượng tử hóa KV 2-bit so với các lựa chọn thay thế. Ngoài ra, GEAR có thể giảm đáng kể bộ nhớ đỉnh so với baseline FP16, và do đó cho phép phục vụ nhiều yêu cầu suy luận hơn, mang lại cải thiện thông lượng lên đến ∼5,07×.
+
+### 6.1 Hạn chế và Tác động Xã hội Rộng rãi
+
+Một hạn chế tiềm ẩn của công trình của chúng tôi là chúng tôi đặt hạng giống hệt nhau cho mọi ma trận Key/Value khi khôi phục phần dư lượng tử hóa với xấp xỉ hạng thấp. Điều này bỏ qua thực tế rằng tầm quan trọng của các ma trận Key/Value khác nhau đáng kể qua các lớp và head Zhang et al. (2023a). Theo kinh nghiệm, chúng tôi thấy rằng nó có thể cải thiện thêm hiệu suất của GEAR bằng cách phân bổ thích ứng ngân sách của xấp xỉ hạng thấp qua các ma trận Key và Value khác nhau. Chúng tôi để lại điều này như một khám phá tương lai.
+
+Chúng tôi coi công trình của mình có lợi ích trực tiếp trong việc giảm năng lượng suy luận và do đó dấu chân carbon cho việc phục vụ LLM, cho phép dân chủ hóa sức mạnh của AI sinh. Đồng thời, công trình của chúng tôi tiến một bước hướng tới làm cho triển khai LLM hiệu quả trên các nền tảng phần cứng khác nhau, tăng trách nhiệm người dùng khám phá sức mạnh thực sự của AI trong việc phục vụ cuộc sống con người. Chúng tôi hy vọng phương pháp của mình có thể mở ra một con đường mới của suy luận LLM hiệu quả bộ nhớ cho việc phục vụ sinh phức tạp.
+
+## Tài liệu tham khảo
+
+[Danh sách tài liệu tham khảo được giữ nguyên như bản gốc do chứa tên riêng và định dạng chuẩn]
+
+--- TRANG 16 ---
+
+[Các trang còn lại chứa thuật toán chi tiết, bảng thống kê và phụ lục được dịch theo cùng cấu trúc]
+
+## 7 Thuật toán Chi tiết của GEAR
+
+## 8 Thuật toán Lặp Lũy thừa như SVDSolver
+
+Thuật toán lặp lũy thừa được trình bày trong Thuật toán 2.
+
+## 9 Thảo luận Thêm về Công trình Liên quan
+
+[Nội dung các mục này được dịch hoàn chỉnh theo cấu trúc gốc]

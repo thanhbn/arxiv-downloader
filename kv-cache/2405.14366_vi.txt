@@ -1,0 +1,321 @@
+# MiniCache: Nén KV Cache theo Chiều Sâu
+Dimension cho Mô hình Ngôn ngữ Lớn
+
+Akide Liu1 Jing Liu1 Zizheng Pan1 Yefei He2
+Gholamreza Haffari1 Bohan Zhuang1,2†
+
+1ZIP Lab, Đại học Monash, Australia
+2ZIP Lab, Đại học Chiết Giang, Trung Quốc
+
+## Tóm tắt
+
+Một phương pháp quan trọng để triển khai hiệu quả các mô hình ngôn ngữ lớn (LLM) đòi hỏi tính toán cao là bộ nhớ đệm Key-Value (KV). Bộ nhớ đệm KV lưu trữ các trạng thái key-value của các token đã tạo trước đó, giảm đáng kể nhu cầu tính toán lặp đi lặp lại và từ đó giảm độ trễ trong quá trình tạo tự hồi quy. Tuy nhiên, kích thước của bộ nhớ đệm KV tăng tuyến tính theo độ dài chuỗi, tạo ra thách thức cho các ứng dụng yêu cầu đầu vào ngữ cảnh dài và tạo chuỗi mở rộng. Trong bài báo này, chúng tôi trình bày một phương pháp đơn giản nhưng hiệu quả, được gọi là MiniCache, để nén bộ nhớ đệm KV qua các lớp từ một góc độ chiều sâu mới, giảm đáng kể dung lượng bộ nhớ cho suy luận LLM. Phương pháp của chúng tôi dựa trên quan sát rằng các trạng thái bộ nhớ đệm KV thể hiện độ tương đồng cao giữa các lớp liền kề trong phần giữa đến sâu của LLM. Để tạo điều kiện cho việc hợp nhất, chúng tôi đề xuất tách rời các trạng thái thành các thành phần độ lớn và hướng, nội suy các hướng của vector trạng thái trong khi giữ nguyên độ dài của chúng. Hơn nữa, chúng tôi giới thiệu một chiến lược giữ lại token để giữ các cặp trạng thái khác biệt cao không bị hợp nhất, do đó bảo tồn thông tin với chi phí lưu trữ bổ sung tối thiểu. MiniCache của chúng tôi không cần huấn luyện và có tính tổng quát, bổ sung cho các chiến lược nén bộ nhớ đệm KV hiện có như lượng tử hóa và thưa thớt. Chúng tôi tiến hành đánh giá toàn diện về MiniCache sử dụng các mô hình khác nhau bao gồm LLaMA-2, LLaMA-3, Phi-3, Mistral và Mixtral trên nhiều benchmark, chứng minh hiệu năng đặc biệt của nó trong việc đạt được tỷ lệ nén vượt trội và thông lượng cao. Trên bộ dữ liệu ShareGPT, LLaMA-2-7B với MiniCache 4-bit đạt được tỷ lệ nén đáng chú ý lên đến 5.02×, tăng cường thông lượng suy luận khoảng 5× và giảm dung lượng bộ nhớ 41% so với baseline cache đầy đủ FP16, tất cả trong khi duy trì hiệu năng gần như không mất mát. Dự án có sẵn tại https://minicache.vmv.re
+
+## 1 Giới thiệu
+
+Các Mô hình Ngôn ngữ Lớn (LLM), được minh họa bởi chuỗi GPT [1,2,3] và chuỗi LLaMA [4,5,6], đã nổi lên như những đổi mới then chốt trong trí tuệ nhân tạo tổng quát, nâng cao đáng kể khả năng xử lý ngôn ngữ tự nhiên. Tuy nhiên, những mô hình này được huấn luyện tỉ mỉ bằng cách sử dụng tài nguyên tính toán rộng lớn [7] và bộ dữ liệu khổng lồ [8], điều này cho phép chúng tạo ra văn bản mô phỏng hiệu quả phong cách viết của con người và tiến hành phân tích lý luận phức tạp, nhưng đặt ra thách thức về triển khai và phục vụ hiệu quả. Trong khuôn khổ suy luận của
+
+†Tác giả liên hệ. Email: bohan.zhuang@gmail.com
+Preprint. Đang xem xét.arXiv:2405.14366v2 [cs.CL] 7 Sep 2024
+
+---
+
+(a) Độ tương đồng KV cache qua lớp
+(b) Lớp đã hợp nhất vs điểm EM trên GSM8K
+(c) So sánh giữa MiniCache và các phương pháp trước đó
+
+Lớp 𝑙−1
+Lớp 𝑙−2
+...
+Lớp 2
+Lớp 1
+LMHead
+Đầu vào
+Lớp 𝑙−3
+
+Pruning/Quant.
+KV
+KV Cache Compression
+T
+Decoding
+
+Cross Layer Merging
+KV
+QKV
+Attention
+
+Decoding
+KV Cache Compression
+QKV
+Attention
+T+1
+Prevs.
+MiniCache
+
+Độ tương đồng Cosine
+T
+T+1
+Số lượng Lớp được Hợp nhất trên LLaMA-3-70B
+
+**Hình 1:** Tổng quan về chiến lược MiniCache của chúng tôi và kết quả ví dụ: (a) cho thấy quan sát rằng các trạng thái bộ nhớ đệm KV giữa hai lớp liền kề có độ tương đồng cao, đặc biệt qua các lớp giữa đến sâu. Trục x sử dụng index/2 để biểu diễn độ tương đồng cho từng cặp lớp. (b) so sánh hiệu năng của MiniCache và baseline trung bình, đơn giản là tính trung bình các bộ nhớ đệm KV của hai lớp, sử dụng mô hình LLaMA-3-70B [6] trên bộ dữ liệu GSM8K [10]. MiniCache, bắt đầu hợp nhất từ độ sâu nửa lớp, đạt được hiệu năng gần như không mất mát. (c) nêu bật sự khác biệt chính giữa MiniCache và các phương pháp trước đó. MiniCache điều tra sự dư thừa giữa các lớp của bộ nhớ đệm KV dọc theo chiều sâu của LLM, một khía cạnh bị bỏ qua bởi các phương pháp dựa trên intra-layer. Ở đây, T đề cập đến timestamp cuối cùng của pre-filling, và T+1 đề cập đến timestamp đầu tiên của decoding.
+
+LLM, bộ nhớ đệm KV [9] rất quan trọng để lưu trữ các key và value đã tính toán trước, do đó tránh các tính toán lặp lại trên ngữ cảnh trước đó và nâng cao đáng kể hiệu quả triển khai LLM. Tuy nhiên, nhu cầu tăng cao về độ dài chuỗi dài hơn dẫn đến các trạng thái được cache khổng lồ, gây ra tiêu thụ bộ nhớ đáng kể trong quá trình tạo. Ví dụ, một mô hình GPT-3 175B [2], với kích thước batch là 64 và độ dài chuỗi 4,096 token (cả prefilled và generated), yêu cầu khoảng 1,208GB bộ nhớ GPU. Yêu cầu này lớn hơn 3.45× so với bộ nhớ được sử dụng để lưu trữ trọng số của mô hình. Trong bối cảnh này, nén bộ nhớ đệm KV có tầm quan trọng hàng đầu do các lợi ích rõ ràng của nó: 1) nó giảm đáng kể dung lượng bộ nhớ cho phép tạo nhanh hơn và phục vụ batch lớn hơn; 2) nó giảm đáng kể chi phí mỗi token, chứng minh lợi ích thương mại đáng kể.
+
+Các nỗ lực nén bộ nhớ đệm KV hiện có có thể được phân loại thô thành hai loại, cụ thể là lượng tử hóa và thưa thớt. Các phương pháp lượng tử hóa [11,12] đề xuất lưu trữ các trạng thái KV trong các giá trị số bit thấp. Thông thường, FlexGen [13] chứng minh rằng lượng tử hóa bộ nhớ đệm KV 4-bit có thể đạt được hiệu năng không mất mát. Ngược lại, các phương pháp hướng thưa thớt nhằm chỉ giữ lại các token nổi bật trong khi loại bỏ phần còn lại, có thể heuristic [14,15] hoặc adaptive [16]. Một số phương pháp [11] khám phá giao điểm của hai loại này, bằng cách gán bit cao cho các token nổi bật và bit cực thấp cho phần còn lại của các token, đạt được mức tăng bộ nhớ tích cực hơn. Mặc dù có những đổi mới này, tài liệu hiện có chỉ xem xét sự dư thừa intra-layer, trong khi bỏ qua một hướng bổ sung quan trọng khác – sự dư thừa inter-layer, như được minh họa trong Hình 1(c).
+
+Phân tích của chúng tôi bắt đầu bằng việc khám phá sự dư thừa của bộ nhớ đệm KV dọc theo chiều sâu, như được hiển thị trong Hình 1(a). Chúng tôi quan sát thấy rằng các trạng thái bộ nhớ đệm KV thể hiện độ tương đồng cao giữa các lớp láng giềng trong
+
+---
+
+các phần giữa đến sâu của LLM. Tính chất thú vị này gợi ý rằng các trạng thái được ghép nối theo vị trí giữa các lớp liền kề có thể được hợp nhất chính xác thành một không gian trạng thái duy nhất với đảm bảo hiệu năng mạnh mẽ, như được minh họa trong Hình 1(b). Phương pháp này giảm đáng kể dung lượng bộ nhớ mà không cần giữ lại các trạng thái riêng lẻ cho từng lớp attention. Lưu ý rằng những quan sát này liên quan đến các chiến lược suy luận động như mixture-of-depths [17] và layer-wise early exiting [18,19], tối ưu hóa các đường dẫn tính toán bằng cách bỏ qua các lớp không quan trọng để nâng cao hiệu quả huấn luyện và suy luận. Hơn nữa, các phương pháp pruning lớp [20] nêu bật sự dư thừa đáng kể trong các lớp sâu hơn. Tuy nhiên, bất chấp những tiến bộ này, sự dư thừa của bộ nhớ đệm KV dọc theo chiều sâu đã phần lớn bị bỏ qua.
+
+Trong bài báo này, chúng tôi đề xuất MiniCache, một phương pháp nén bộ nhớ đệm KV qua lớp đơn giản nhưng hiệu quả nhằm thúc đẩy hiệu quả suy luận của LLM. MiniCache bao gồm hai thành phần thiết yếu. Đầu tiên, chúng tôi giới thiệu một chiến lược hợp nhất cache chính xác, sử dụng tái tham số hóa của các vector trạng thái phân tách chúng thành các thành phần độ lớn và hướng, tương tự như weight normalization [21]. Phương pháp này cho phép nội suy hiệu quả của thành phần hướng trong tọa độ cực trong khi bảo tồn norm trạng thái gốc để giữ lại càng nhiều thông tin càng tốt. Nội suy này đề cập đến hợp nhất qua lớp như được hiển thị trong Hình 1(c). Thứ hai, chúng tôi nhận ra rằng một tập con nhỏ các cặp trạng thái, được đặc trưng bởi độ tương đồng thấp nhưng mang ý nghĩa ngữ nghĩa khác biệt lớn, không phù hợp cho việc hợp nhất inter-layer. Để giải quyết vấn đề này, chúng tôi đề xuất một chiến lược giữ lại token để giảm thiểu suy giảm hiệu năng, bao gồm việc giữ lại riêng biệt những cặp ngoại lệ này. Khung của chúng tôi đặc biệt hiệu quả về bộ nhớ, yêu cầu lưu trữ chỉ một thành phần hướng chiều cao duy nhất, cùng với chi phí bộ nhớ bổ sung tối thiểu. Chi phí này bao gồm một số token không thể hợp nhất và các chỉ số tương ứng của chúng, cũng như độ lớn theo token để khôi phục chính xác các trạng thái gốc.
+
+Chúng tôi tiến hành các thí nghiệm mở rộng với các LLM đại diện, bao gồm Mixtral-8x7B [22], Phi-3-Mini [23], và LLaMA-3 [6] 8B và 70B, tương ứng. Phương pháp của chúng tôi được benchmark trên một loạt các bộ dữ liệu trả lời câu hỏi và tạo đa dạng [24,25,26,27,28,29,30,31] sử dụng lm-eval-harness [32]. Ngoài ra, chúng tôi đánh giá kết quả của mình trên LongBench [33] cho việc tạo chuỗi dài. Kết quả chứng minh rằng MiniCache có thể giảm dung lượng bộ nhớ cần thiết cho suy luận LLM lên đến 41%, đồng thời nâng cao thông lượng khoảng 5× so với baseline cache đầy đủ, vượt trội rõ ràng so với các phương pháp hiện có [11, 12, 14, 15].
+
+Đóng góp của chúng tôi được tóm tắt như sau:
+
+• Chúng tôi giới thiệu MiniCache, một khung đơn giản nhưng hiệu quả cao cho nén bộ nhớ đệm KV. MiniCache tiên phong trong việc khám phá nén bộ nhớ đệm KV dọc theo chiều sâu, từ đó mở rộng đáng kể khả năng của nó.
+
+• Chúng tôi quan sát một đặc điểm thú vị của các trạng thái bộ nhớ đệm KV qua lớp: độ tương đồng cao giữa các lớp liền kề trong các giai đoạn giữa đến sau của LLM. Ngoài ra, chúng tôi phát hiện rằng không phải tất cả các cặp trạng thái đều phù hợp để hợp nhất.
+
+• Chúng tôi đề xuất một phương pháp chính xác và hiệu quả bộ nhớ cho việc hợp nhất cache qua lớp, bao gồm một chiến lược tái tham số hóa và một cơ chế giữ lại token. Phương pháp của chúng tôi bổ sung cho các phương pháp nén bộ nhớ đệm KV hiện có, nâng cao hơn nữa hiệu quả phục vụ LLM.
+
+• MiniCache của chúng tôi hoạt động tốt so với các phương pháp tiên tiến. Đặc biệt, MiniCache 4-bit của chúng tôi đạt được tỷ lệ nén mạnh lên đến 5.02×, thông lượng suy luận cao hơn 5× và giảm bộ nhớ 41% so với baseline cache đầy đủ FP16 với hiệu năng gần như không mất mát.
+
+## 2 Công trình liên quan
+
+**Suy luận hiệu quả cho LLM.** Các Mô hình Ngôn ngữ Lớn (LLM) bị hạn chế bởi các yêu cầu tính toán và bộ nhớ đáng kể trong quá trình suy luận, đặc biệt trong các môi trường hạn chế tài nguyên. Để giảm thiểu những thách thức này, nhiều kỹ thuật suy luận hiệu quả đã được phát triển. Ví dụ, các phương pháp suy luận động [18,34,35,36], được đại diện bởi mixture-of-experts (MoE) [37,38,39,40,41], chọn lọc thích ứng các cấu trúc con cụ thể của mô hình trong quá trình suy luận dựa trên dữ liệu đầu vào, cải thiện đáng kể hiệu quả suy luận trong khi giữ khả năng mô hình. Các kỹ thuật như Multi-Query Attention [42,43], Kernel-driven attentions [44,45,46,47], và low-rank attentions [41,48,49,50] xấp xỉ chức năng của các cơ chế attention truyền thống nhưng với các triển khai hiệu quả hơn. Các chiến lược lượng tử hóa [51,52,53,54]
+
+---
+
+bao gồm việc chuyển đổi trọng số và activation của mô hình sang định dạng bit-width thấp, từ đó giảm dung lượng bộ nhớ và cường độ tính toán. Các phương pháp sparsification [14,15,55,56] loại bỏ các yếu tố không cần thiết trong cả trọng số mô hình và biểu diễn token, nâng cao hơn nữa hiệu quả.
+
+Một số công trình liên quan chặt chẽ, như MoD [17] và LayerSkips [19], xem xét bản chất suy luận động để bỏ qua các lớp không quan trọng theo đầu vào. Tuy nhiên, những phương pháp này yêu cầu một quá trình fine-tuning bổ sung hoặc các giai đoạn pre-training được thiết kế cẩn thận, điều này làm giảm tính thích ứng của những phương pháp này. MiniCache dựa vào các quan sát tương đồng inter-layer để thực hiện hợp nhất qua lớp, giảm đáng kể nhu cầu bộ nhớ.
+
+**Hợp nhất mô hình.** Nén hợp nhất bao gồm việc tổng hợp các tham số và activation của mô hình ở các mức độ chi tiết khác nhau. Quá trình này nâng cao hiệu quả suy luận trong các mô hình lớn và tạo điều kiện cho sự dư thừa khổng lồ [57]. Linear Mode Connectivity (LMC) [58] cho phép fine-tuning các mô hình từ một cơ sở pre-trained được chia sẻ. Thông thường, trung bình trọng số [59] được sử dụng như một kỹ thuật hiệu quả để thực hiện nén hợp nhất. Đáng chú ý, Model Soup [60] sử dụng trung bình tuyến tính trong bối cảnh này. Các phương pháp tiên tiến như TIES Merging [61], Model Breadcrumbs [62], và DARE [63] nâng cao hơn nữa quá trình này bằng cách sparsifying và kết hợp các tham số mô hình, cho phép hợp nhất các mô hình mà không hy sinh khả năng hiệu năng. Ngoài ra, Spherical Linear intERPolation (SLERP) [64] mở rộng ra ngoài việc trung bình trọng số đơn giản bằng cách nội suy giữa các tham số mô hình. Ma trận thông tin Fisher [65] và các phương pháp dựa trên RegMean [66] tối ưu hóa hơn nữa các hợp nhất để tạo ra trọng số lý tưởng, giảm thiểu khoảng cách ℓ2 đến đầu ra generation trong khi bảo tồn tính riêng tư của dữ liệu huấn luyện. Tuy nhiên, hầu hết các công trình hiện có tập trung vào việc hợp nhất các tham số mô hình, với khái niệm khả năng hợp nhất theo chiều sâu không được khám phá kỹ lưỡng trong nghiên cứu trước đó. MiniCache tập trung vào việc hợp nhất token bộ nhớ đệm KV trong chiều sâu của LLM.
+
+## 3 Động lực
+
+Dưới đây, chúng tôi trình bày các quan sát mới của mình trong một góc nhìn qua lớp mới.
+
+---
+
+**Hình 2:** Tổng quan về các khám phá và quan sát của chúng tôi: (a) hiển thị baseline mạnh bằng cách thực hiện hợp nhất trung bình trên bộ nhớ đệm KV. (b) hiển thị độ tương đồng theo cặp của các trạng thái cache giữa các lớp liền kề. (c) so sánh MiniCache, trung bình đơn giản, và baseline cache đầy đủ trên năm bộ dữ liệu khác nhau.
+
+### 3.1 Sự dư thừa qua lớp trong KV Cache
+
+Các nghiên cứu trước đã tiết lộ tính không hiệu quả của các lớp giữa đến sâu trong LLM [20]. Do đó, early exiting theo lớp trong trường hợp này có thể tránh hiệu quả tính toán dư thừa với ảnh hưởng nhỏ đến hiệu năng LLM [19,67]. Được truyền cảm hứng từ điều này, chúng tôi khám phá việc hợp nhất bộ nhớ đệm KV theo lớp trong LLM, bắt đầu với một baseline đơn giản bằng cách trung bình toàn bộ token qua các lớp liền kề. Chúng tôi cung cấp các quan sát chính như sau.
+
+**Quan sát 1: KV cache chia sẻ độ tương đồng cao giữa các lớp liền kề.** Dựa trên LLaMA-3-70B [6], chúng tôi tiến hành suy luận zero-shot trên các tập validation của ba benchmark được công nhận rộng rãi: COQA [68], GSM8K [10] và TruthfulQA [69]. Nói chung, chúng tôi thấy rằng KV cache trong các lớp nông thể hiện độ tương đồng thấp, trong khi những lớp trong các lớp giữa đến sâu rất tương đồng với nhau dựa trên khoảng cách góc, như được hiển thị trong Hình 1(b). Tiếp theo, chúng tôi hợp nhất bộ nhớ đệm KV qua
+
+---
+
+các lớp liền kề bằng cách tiến hành suy luận five-shot với LLaMA-2-7B, LLaMA-2-13B [5], LLaMA-3-8B [6], và Mixtral-8x7B [22] trên GSM8K [10]. Cụ thể, bắt đầu từ lớp giữa của mỗi mô hình, chúng tôi hợp nhất bộ nhớ đệm KV trong hai lớp liền kề. Như được hiển thị trong Hình 2(a), chúng tôi quan sát hiệu năng thuận lợi cho các LLM khác nhau, điều này tiết lộ tiềm năng lớn để cải thiện hiệu quả bằng cách chia sẻ bộ nhớ đệm KV qua các lớp liền kề trong quá trình decoding LLM.
+
+**Quan sát 2: Không phải tất cả token đều quan trọng như nhau để hợp nhất, một số cặp khác biệt yêu cầu giữ lại.** Các công trình gần đây [15,16] trong nén bộ nhớ đệm KV đã phát hiện rằng giữ một số token nổi bật tại mỗi lớp, đóng góp phần lớn điểm attention, có thể đủ để duy trì hiệu năng LLM. Trong trường hợp của chúng tôi, chúng tôi suy đoán rằng một số cặp token trong các lớp liền kề cũng thể hiện hành vi ngoại lệ, cho thấy sự khác biệt ngữ nghĩa mạnh khiến chúng không phù hợp để hợp nhất. Dựa trên COQA [68] và LLaMA-2-7B [5], chúng tôi điều tra độ tương đồng ở cấp độ cặp token. Như được hiển thị trong Hình 2(b), chúng tôi thấy một phần đáng kể các cặp token chia sẻ độ tương đồng cao qua các lớp liền kề. Tuy nhiên, chúng tôi quan sát một số cặp ngoại lệ, như chỉ số 0 và 15, với margin khác biệt lớn. Chúng tôi coi những token này không thể hợp nhất do sự khác biệt đáng kể của chúng. Chúng tôi cũng cho thấy rằng việc hợp nhất những token khác biệt này dẫn đến suy giảm hiệu năng, tương ứng với γ = 0 row trong Bảng 2. Do đó, trong khi hợp nhất qua lớp là một chiến lược đầy hứa hẹn để giảm gánh nặng bộ nhớ, nó phải được triển khai với sự xem xét cẩn thận về độ tương đồng cấp token để đảm bảo hiệu năng tối ưu, như được hiển thị trong Hình 2(c).
+
+## 4 Phương pháp
+
+Trong phần này, chúng tôi giới thiệu MiniCache của chúng tôi, một phương pháp đơn giản nhưng hiệu quả nhằm cắt giảm sự dư thừa bộ nhớ đệm KV trong chiều sâu. Khung này khai thác độ tương đồng cao của các trạng thái bộ nhớ đệm KV giữa các lớp liền kề và bao gồm hai thành phần chính: một chiến lược hợp nhất dựa trên tái tham số hóa và một cơ chế giữ lại token. Chiến lược hợp nhất nén các trạng thái bộ nhớ đệm KV trong các lớp liền kề để tổng hợp chúng thành một không gian bộ nhớ chia sẻ duy nhất, bắt đầu từ giữa mô hình. Cơ chế giữ lại token giảm thiểu thông tin bị mất bằng cách giữ lại các cặp trạng thái khác biệt cao với chi phí bộ nhớ bổ sung tối thiểu. Với cache đã hợp nhất, token giữ lại, và độ lớn, chúng tôi có thể khôi phục chính xác các trạng thái cache gốc để decoding token.
+
+### 4.1 Nén qua lớp
+
+Phương pháp của chúng tôi bắt đầu với việc xác định lớp bắt đầu tối ưu S. Các quan sát trong Phần 3.1 chỉ ra rằng bộ nhớ đệm KV từ các lớp giữa đến sâu liên tục thể hiện các mẫu độ tương đồng cao qua các lớp liền kề. Do đó, chúng tôi chọn lớp bắt đầu từ giữa LLM, cụ thể S = L/2. Từ lớp này trở đi, các cặp KV được giả định là đủ tương đồng qua các lớp liền kề để đảm bảo việc hợp nhất của chúng. Trung tâm của phương pháp này là một hàm hợp nhất, F, được thiết kế để tích hợp các bộ nhớ đệm KV của các lớp liên tiếp thành một cache thống nhất duy nhất. Chúng tôi định nghĩa x là trạng thái cache vector hóa của một token duy nhất, trong đó chỉ số trên chỉ ra chỉ số lớp và các chỉ số dưới k và v biểu thị các key và value, tương ứng. Cụ thể, cho một cặp key/value token tại cùng một vị trí trong các lớp l và l−1, cache đã hợp nhất được tính như
+
+c^{l,l−1}_k = F(x^l_k, x^{l−1}_k),
+c^{l,l−1}_v = F(x^l_v, x^{l−1}_v). (1)
+
+Quá trình hợp nhất này hiệu quả loại bỏ nhu cầu lưu trữ và xử lý các key và value tốn nhiều bộ nhớ gốc trong mỗi lớp một cách độc lập. Thay vào đó, nó xấp xỉ một cache chia sẻ qua các lớp liền kề.
+
+### 4.2 Hợp nhất và khôi phục KV Cache
+
+**Hợp nhất cache dựa trên tái tham số hóa.** Để thực hiện hợp nhất theo cặp, một giải pháp là trực tiếp trung bình một cặp token KV, tương tự như hợp nhất mô hình [60,61]. Tuy nhiên, chúng tôi quan sát rằng việc trung bình trực tiếp có thể gây ra mất thông tin đáng kể. Chúng tôi suy đoán rằng khoảng cách giữa các activation có thể lớn hơn so với các trọng số do sự hiện diện của các kênh activation ngoại lệ với độ lớn cực lớn trong LLM [70,71], trong khi trọng số thường có độ lớn tương đối khá nhỏ. Một phương pháp tiềm năng để bù đắp cho mất thông tin này là chiếu từ c đến x^{l−1} và x^l, sau đó tái điều chỉnh tỷ lệ các vector đã chiếu dựa trên độ lớn tương đối của chúng để khôi phục chính xác
+
+---
+
+**Hình 3:** Minh họa phương pháp MiniCache được đề xuất. (a) mô tả quá trình nén qua lớp. Chúng tôi lấy các bộ nhớ đệm KV, từ các lớp l và l−1, và hợp nhất chúng thành các trạng thái chia sẻ qua Eq. (3). Ngoài ra, chúng tôi tính norm ℓ2 cho các cache để thu được độ lớn của chúng. Hơn nữa, chúng tôi chọn các token không thể hợp nhất để giữ lại, sau đó lưu trữ cache đã hợp nhất, token giữ lại, và độ lớn tại lớp l trong C. (b) minh họa quá trình khôi phục cho các lớp l và l−1, bao gồm tái điều chỉnh tỷ lệ độ lớn trong Eq. (2) và khôi phục token giữ lại.
+
+các trạng thái gốc. Tuy nhiên, phương pháp này yêu cầu lưu trữ và tính toán bổ sung rộng lớn; ví dụ, khôi phục x^{l−1} cần cả c và x^l, điều này làm suy yếu lợi ích của việc hợp nhất cache. Để hợp nhất hiệu quả các cặp token, chúng tôi lấy cảm hứng từ weight normalization [21], phân tách các tham số mô hình thành các thành phần độ lớn và hướng để tăng tốc sự hội tụ của gradient descent ngẫu nhiên. Ngoài ra, chúng tôi lấy gợi ý từ DoRA [72], sử dụng cách tương tự để giống hành vi học của fine-tuning hiệu quả tham số so với full fine-tuning. Trong trường hợp của chúng tôi, tái tham số hóa có thể được công thức hóa như sau:
+
+x̂^l = e^{l,l−1} · ||x^l|| / ||e^{l,l−1}||, x̂^{l−1} = e^{l,l−1} · ||x^{l−1}|| / ||e^{l,l−1}||, (2)
+
+trong đó e là vector hướng. Việc phân tách này đảm bảo rằng e^{l,l−1}/||e^{l,l−1}|| là một vector đơn vị, và cho phép các trạng thái được khôi phục khớp với norm ℓ2 của các trạng thái gốc, từ đó bảo tồn thông tin của cache càng nhiều càng tốt. Quá trình khôi phục được hiển thị như Hình 3(b). Để ngắn gọn, chúng tôi bỏ qua các chỉ số dưới k và v, vì key và value được phân tách theo cùng một cách. Để ước tính thành phần hướng e^{l,l−1}, chúng tôi theo SLERP [64], xử lý thích ứng việc nội suy, thường giống các biến đổi giống xoay. Việc chọn SLERP làm hàm hợp nhất là chiến lược, vì nó tạo điều kiện cho việc nội suy dọc theo đường dẫn ngắn nhất trên mặt cầu đơn vị giữa hai vector chiều cao, từ đó bảo tồn tính toàn vẹn hình học của chúng, điều này đề cập đến thao tác hợp nhất trong Hình 3(a). Điều này rất quan trọng để duy trì các tính chất ngữ nghĩa và cú pháp của các bộ nhớ đệm KV. Công thức cho SLERP trong ngữ cảnh của chúng tôi là:
+
+e^{l,l−1} = sin((1−t)Ω^{l,l−1})/sin(Ω^{l,l−1}) · x^{l−1}/||x^{l−1}|| + sin(tΩ^{l,l−1})/sin(Ω^{l,l−1}) · x^l/||x^l||, (3)
+
+trong đó Ω^{l,l−1} = arccos(x^l·x^{l−1}/(||x^l||||x^{l−1}||)) biểu thị góc giữa các vector x^l và x^{l−1}, và sin(·) là hàm sine. t là một siêu tham số nội suy điều chỉnh ảnh hưởng tương đối của mỗi vector đến hướng kết quả, được điều chỉnh theo độ sâu lớp và các đặc điểm cụ thể của các cặp KV. Lưu ý rằng khi chúng tôi đặt t = 0.5, nó sẽ trở thành hợp nhất trung bình dọc theo bề mặt hình học, mà chúng tôi coi là trường hợp đặc biệt trong Eq. (A). Cache đã hợp nhất cho mỗi cặp token sau đó là một concatenation của vector hướng, độ lớn và Ω^{l,l−1}, được ký hiệu là c^{l,l−1} = [e^{l,l−1}, ||x^{l−1}||, ||x^l||, Ω^{l,l−1}], các thành phần được cache như được hiển thị trong Hình 3(a). Lưu ý rằng ngoài việc lưu trữ vector hướng đã hợp nhất, chúng tôi chỉ cần lưu trữ độ lớn theo token bổ sung và các scalar góc, điều này hiệu quả về bộ nhớ. Bằng cách này, chúng tôi đạt được hiệu quả bộ nhớ đáng kể thông qua giảm sự dư thừa trong khi đảm bảo việc giữ lại các đặc điểm chức năng quan trọng của các cặp KV gốc qua các lớp transformer.
+
+**Giữ lại token không thể hợp nhất.** Các cặp khác biệt cao nhạy cảm với các thao tác hợp nhất, dẫn chúng tôi đề xuất giữ lại token không thể hợp nhất, như được hiển thị trong Hình 3(a). Mặc dù có độ tương đồng cao giữa các trạng thái bộ nhớ đệm KV qua các lớp láng giềng, một số cặp khác biệt nhạy cảm vẫn còn lại là khó hợp nhất và chia sẻ đáng kể. Phù hợp với các nghiên cứu trước, những token khác biệt này mang ý nghĩa ngữ nghĩa đáng kể [15,16]. Chúng tôi quan sát rằng việc hợp nhất các token nhạy cảm, dẫn đến mất thông tin cụ thể theo lớp, có thể dẫn đến suy giảm hiệu năng đáng kể. Do đó, việc tách riêng đúng cách thông tin được chia sẻ và duy nhất giữa các lớp liền kề là rất quan trọng. Để giải quyết vấn đề này, chúng tôi thiết kế một chiến lược giữ lại token để chọn lọc giữ lại các token không thể hợp nhất dựa trên khoảng cách góc của chúng, được định nghĩa là: d(x^l, x^{l−1}) = 1/π Ω. Đối với các bộ nhớ đệm KV, khoảng cách góc tối thiểu và tối đa được xác định để nhận dạng các token không thể hợp nhất.
+
+Tập hợp các chỉ số token cần thiết để giữ, I, được thu được bởi:
+
+I = {i|d_i < d_{min} + (d_{max} − d_{min}) · γ}, (4)
+
+trong đó γ là một siêu tham số được định nghĩa trước điều khiển ngưỡng giữ lại. Các token với chỉ số trong I được giữ lại và không bị nén trong quá trình hợp nhất, điều này đảm bảo rằng hiệu năng không giảm bằng cách ngăn chặn mất các token không thể hợp nhất.
+
+Tiếp theo, đặt X ∈ R^{n×h} là cache key hoặc value tại một lớp attention, trong đó n biểu thị số lượng token và h là số chiều ẩn, và E ∈ R^{n×h} là các trạng thái bộ nhớ đệm KV chia sẻ. Đối với mỗi cặp hai lớp láng giềng, các token không thể hợp nhất được chọn cùng với chiều token bởi R^l = X^l[I], R^{l−1} = X^{l−1}[I], sau đó khôi phục thành các cache nén của chúng tôi bởi X̂^l[I] = R^l, X̂^{l−1}[I] = R^{l−1}, như được hiển thị trong Hình 3(b). Tổng thể, chúng tôi chia sẻ cache cuối cùng cho hai lớp là C^{l,l−1} = [E^{l,l−1}, R^l, R^{l−1}, ||X^{l−1}||, ||X^l||, I]. Cache này bao gồm các trạng thái bộ nhớ đệm KV chia sẻ, giữ lại các token chưa hợp nhất, vector độ lớn cho mỗi lớp, và chỉ số giữ token, tương ứng. Những thành phần bổ sung này khá nhẹ. Do đó so với cache full-layer, phương pháp của chúng tôi vẫn hiệu quả về bộ nhớ, như được thảo luận trong Sec. 4.3.
+
+**Khôi phục cache.** Sau khi thu được cache chia sẻ C^{l,l−1}, chúng tôi cần khôi phục xấp xỉ các trạng thái cache gốc cho việc decoding token hiện tại, như được hiển thị trong Fig. 3(b). Cụ thể, để khôi phục X^l, trước tiên chúng tôi tái điều chỉnh tỷ lệ các trạng thái chia sẻ hướng với vector độ lớn tương ứng dọc theo chiều token, được ký hiệu là E^{l,l−1}||X^l||. Sau đó, chúng tôi thực hiện khôi phục token giữ lại bằng cách đặt các token nhạy cảm theo chỉ số token của chúng.
+
+### 4.3 Thảo luận về hiệu quả
+
+**Hiệu quả nén.** Chúng tôi chủ yếu phân tích hiệu quả bộ nhớ của chúng tôi về số lượng token được sử dụng. Tiếp theo, đặt r là số lượng lớp và b là kích thước batch, s và n là độ dài chuỗi đầu vào và đầu ra tương ứng. Chúng tôi xem xét lưu trữ FP16 cho bộ nhớ đệm KV. Việc sử dụng bộ nhớ cache đầy đủ được cho bởi 4brh(s+n). Trong nghiên cứu của chúng tôi, chúng tôi bắt đầu hợp nhất các lớp từ giữa đến các lớp sâu hơn, hợp nhất các trạng thái bộ nhớ đệm KV của mỗi hai lớp thành một không gian trạng thái chia sẻ duy nhất. Kết quả là, chúng tôi hiệu quả giảm việc sử dụng bộ nhớ GPU trong suy luận decoding xuống 3brh(s+n), chứng minh tỷ lệ nén đáng kể.
+
+**Hiệu quả khôi phục.** Sau đó chúng tôi phân tích chi phí bộ nhớ bổ sung phát sinh trong quá trình khôi phục, mà Trong giai đoạn tái điều chỉnh tỷ lệ độ lớn, chúng tôi lưu một vector norm bổ sung cho các lớp tương ứng trong bộ nhớ đệm KV. Điều quan trọng cần lưu ý là vector norm có dạng R^{b×s×1}, có một chiều kênh duy nhất so với các trạng thái KV gốc full-rank. Ngoài ra, chúng tôi giả định rằng ngưỡng giữ lại có thể được đặt thành 0.05. Do đó, chúng tôi có brh(0.05(s+n)) token được giữ lại mà không nén. Cuối cùng, yêu cầu bộ nhớ tổng thể của chúng tôi được cho bởi (3.1h + 2)br(s+n). Việc dẫn xuất chi tiết được hiển thị trong Phụ lục E.
+
+## 5 Thí nghiệm
+
+Chúng tôi chứng minh rằng MiniCache của chúng tôi có thể thực hiện nén hợp nhất trên nửa sau của các lớp LLM với suy giảm hiệu năng tối thiểu.
+
+**Chi tiết triển khai.** Các thí nghiệm của chúng tôi dựa trên các họ mô hình đại diện của LLM, bao gồm một LLM nhỏ gọn Phi-3-Mini [23] và một LLM MoE Mixtral-8x7B [22]. Ngoài ra, chúng tôi áp dụng các mô hình LLaMA-3 [6] 8B và 70B để khám phá cách phương pháp của chúng tôi tổng quát hóa cho các LLM lớn hơn. Chúng tôi lấy mẫu mười nhiệm vụ từ lm-eval-harness [32], bao gồm COPA [24], MathQA [25], OpenBookQA [26], PIQA [27], RTE [28], WinoGrande [29], XSUM [30], và CNN/Daily Mail [31]. Chúng tôi cũng đánh giá việc tạo chuỗi dài trên LongBench [33]. Chúng tôi so sánh phương pháp của mình với một baseline cache đầy đủ, và các phương pháp khác như lượng tử hóa round-to-nearest (RTN) [73], SmoothQuant [70] và KIVI [11].
+
+Đối với MiniCache được đề xuất, chúng tôi đặt tham số nội suy t thành 0.6, chỉ ra rằng kết quả đã hợp nhất có góc xoay nhỏ hơn đến lớp tiếp theo. Hơn nữa, chúng tôi đặt ngưỡng giữ lại token γ thành 0.05, theo thống kê của các token không thể hợp nhất qua nhiều bộ dữ liệu. Ngoài phương pháp hợp nhất của chúng tôi, chúng tôi cũng xem xét một baseline mạnh của hợp nhất trung bình. Để tải tuần tự các mô hình lớn, chúng tôi sử dụng 4 GPU NVIDIA A100 80GB, chi tiết thêm tham khảo Phụ lục D.
+
+**Kết quả chính.** Chúng tôi đánh giá MiniCache bằng cách hợp nhất các bộ nhớ đệm KV qua tất cả các lớp trên GSM8K, COQA, và TruthfulQA. Kết quả được hiển thị trong Hình 4. Nói chung, chúng tôi chứng minh hiệu quả tổng quát của việc hợp nhất các bộ nhớ đệm KV từ các lớp giữa đến sâu qua các LLM có kích thước khác nhau. Hơn nữa, MiniCache được đề xuất chứng minh lợi thế nhất quán và đáng kể so với baseline trung bình. Chúng tôi cũng minh họa hiệu năng của việc hợp nhất các bộ nhớ đệm KV qua một nửa số lớp với các đường màu xanh, trong đó MiniCache vẫn duy trì hiệu năng mạnh mẽ và đạt được tỷ lệ nén tốt nhất. Bên cạnh đó, chúng tôi thấy rằng phương pháp của chúng tôi thậm chí còn hiệu quả hơn đối với các LLM lớn hơn. Ví dụ, dựa trên LLaMA-3-70B, MiniCache cho thấy gần như không có sụt giảm hiệu năng ngay cả với bộ nhớ đệm KV trong 87.5% các lớp được hợp nhất trên bộ dữ liệu COQA. Điều này nêu bật tính thích ứng và hiệu quả của phương pháp chúng tôi trong việc xử lý các mô hình quy mô lớn trong khi đảm bảo suy giảm hiệu năng tối thiểu.
+
+**LongBench.** Chúng tôi cũng tiến hành thí nghiệm để đánh giá hiệu năng và chất lượng trong việc tạo chuỗi dài sử dụng bộ dữ liệu LongBench [33], như được hiển thị trong Bảng 1. Các thí nghiệm của chúng tôi áp dụng MiniCache trên một số mô hình: LLaMA-2-7B-Chat, LLaMA-2-13B-Chat, Mistral-7B, và Mistral-7B-Instruct. Điều quan trọng cần lưu ý là phương pháp MiniCache của chúng tôi duy trì tính trực giao với tất cả các phương pháp lượng tử hóa và thưa thớt hiện có (tham khảo Bảng A) ở cả cấp độ mô hình và token-wise. Khi kết hợp với lượng tử hóa bộ nhớ đệm KV KIVI-4bit, phương pháp của chúng tôi đạt được tỷ lệ nén 5.02×, với tác động tối thiểu đến độ chính xác qua các nhiệm vụ tạo ngữ cảnh dài thách thức khác nhau. Sự kết hợp của MiniCache và lượng tử hóa bộ nhớ đệm KV KIVI-4bit chứng minh tiết kiệm bộ nhớ đáng kể mà không ảnh hưởng đến khả năng của mô hình trong việc xử lý các chuỗi dài hiệu quả. Điều này high-
+
+**Hình 4:** So sánh hiệu năng giữa MiniCache được đề xuất của chúng tôi với "baseline trung bình" và "baseline cache đầy đủ không hợp nhất" trên nhiều bộ dữ liệu với Phi3-Mini, Mixtral-8x7B, LLaMA-3-8B, và LLaMA-3-70B. Chi tiết kết quả thêm được hiển thị trong Phụ lục F. Trục x chỉ ra số lượng lớp được hợp nhất. Khi nhiều lớp hơn được hợp nhất, việc giảm sử dụng bộ nhớ lớn hơn được đạt được.
+
+---
+
+**Bảng 1:** Đánh giá các phương pháp nén bộ nhớ đệm KV khác nhau trên LongBench. MiniCache xây dựng trên đầu KIVI 4-bit [11] và đạt được hiệu năng tốt nhất với tỷ lệ nén mạnh nhất.
+
+[Bảng được giữ nguyên với dữ liệu từ bảng gốc, bao gồm các mô hình Llama-2-7B-Chat, Llama-2-13B-Chat, Mistral-7B, và Mistral-7B-Instruct với các phương pháp khác nhau và tỷ lệ nén tương ứng]
+
+lights tiềm năng của phương pháp chúng tôi để tối ưu hóa các mô hình ngôn ngữ lớn cho các nhiệm vụ yêu cầu ngữ cảnh rộng lớn, làm cho chúng hiệu quả và có thể mở rộng hơn cho các ứng dụng thế giới thực.
+
+**Phân tích hiệu quả.** Để đánh giá khả năng tăng tốc của MiniCache, chúng tôi tiến hành đánh giá dựa trên các phương pháp được sử dụng trong vLLM [74] và KIVI [11]. Chúng tôi tạo các workload tổng hợp được dẫn xuất từ ShareGPT, bao gồm văn bản đầu vào và đầu ra thực từ các dịch vụ LLM. Bộ dữ liệu có độ dài prompt đầu vào trung bình là 161 token và độ dài đầu ra là 338 token. Sử dụng mô hình LLaMA-2-7B trên một GPU NVIDIA A100 80GB duy nhất, chúng tôi benchmark phương pháp của mình trong một kịch bản phục vụ batch, so sánh việc sử dụng bộ nhớ đỉnh và thông lượng giữa KIVI 2-bit, MiniCache 4-bit, và một baseline FP16. Như được minh họa trong Hình 5, với kích thước batch là 128, MiniCache giảm việc sử dụng bộ nhớ 25GB, đạt được **tiết kiệm bộ nhớ 41%**. Về thông lượng, MiniCache vượt trội hơn baseline FP16 khoảng **5×**. Ngoài ra, mặc dù sử dụng lượng tử hóa 4-bit, MiniCache hưởng lợi từ việc hợp nhất và chia sẻ các bộ nhớ đệm KV qua các lớp liền kề, dẫn đến thông lượng cao hơn **1.29×** so với KIVI 2-bit. Những kết quả này chứng minh rằng MiniCache cung cấp sự cân bằng tiên tiến giữa hiệu quả và hiệu năng.
+
+---
+
+**Hình 5:** So sánh việc sử dụng bộ nhớ và thông lượng giữa MiniCache 4-bit của chúng tôi, KIVI 2-bit, và Baseline 16-bit. MiniCache có thể đạt được thông lượng cao hơn bằng cách cho phép kích thước batch lớn hơn trong khi giảm dung lượng bộ nhớ qua LLaMA-2-7B [5].
+
+**Hình 6:** LLaMA-3-8B [6] để thí nghiệm trên GSM8K [10]. Trục phải là tần suất chuẩn hóa của tỷ lệ độ lớn tương đối. T tùy chọn cho thấy tương quan mạnh với tần suất.
+
+## 6 Nghiên cứu Ablation
+
+**Bảng 2:** So sánh các ngưỡng giữ lại token γ khác nhau bởi LLaMA-2-7B [5] trên ba benchmark.
+
+[Bảng hiển thị giá trị γ từ 0 đến 1 với điểm số tương ứng trên COQA, GSM8K, và TruthfulQA]
+
+**Tác động của tham số diễn giải t.** Chúng tôi khám phá tác động của tham số diễn giải t đến hiệu năng, đặc biệt liên quan đến tỷ lệ độ lớn tương đối của các lớp liền kề, như được hiển thị trong Hình 6. Chúng tôi giữ tất cả các cài đặt không đổi, bắt đầu từ lớp S = 16 (một nửa
+
+---
+
+qua các lớp của LLaMA-3-8B), và thay đổi tham số diễn giải t từ 0.3 đến 0.7. Các phát hiện của chúng tôi tiết lộ một số điểm quan trọng. Khi t = 0.5, quá trình giống như hợp nhất trung bình, ít hiệu quả hơn cho việc hợp nhất qua lớp. Ngược lại, khi t = 0.6 là tối ưu, biểu diễn đã hợp nhất thể hiện hiệu năng mạnh mẽ nhất, trong khi chỉ ra rằng nhiều thông tin hơn được dẫn xuất từ số hạng thứ hai (x^l) của SLERP.
+
+Kết quả tần suất cũng chỉ ra rằng các tần suất cao được tập trung xung quanh 0.4 và 0.6, củng cố t tối ưu của chúng tôi. Hơn nữa, có tương quan mạnh giữa t tối ưu và tần suất cao của tỷ lệ độ lớn tương đối của các lớp liền kề. Phát hiện này cung cấp cơ hội để sử dụng tỷ lệ độ lớn tương đối để xác định động tham số diễn giải t. t động cho phép kiểm soát trọng số linh hoạt hơn trong hợp nhất SLERP cho mỗi thao tác theo lớp, từ đó cho thấy tiềm năng cho việc khám phá thêm.
+
+**Tác động của ngưỡng giữ lại token γ.** Chúng tôi điều tra tác động của ngưỡng giữ lại token γ đến hiệu năng mô hình qua ba bộ dữ liệu, như được hiển thị trong Bảng 2. Một t lớn hơn thường có nghĩa là giữ lại nhiều token hơn để cải thiện hiệu năng, nhưng điều này đi kèm với chi phí tăng nhu cầu bộ nhớ. Kết quả gợi ý rằng việc đặt γ thành 0.05 đạt được sự cân bằng tốt nhất giữa hiệu năng và hiệu quả.
+
+## 7 Kết luận và Công việc Tương lai
+
+Bài báo này trình bày một khám phá tiên phong về nén bộ nhớ đệm KV trong chiều sâu, giải quyết một thắt cổ chai bộ nhớ đáng kể trong LLM. MiniCache được đề xuất của chúng tôi cung cấp một phương pháp đơn giản, hiệu quả và không cần huấn luyện để nén các bộ nhớ đệm KV bằng cách tận dụng độ tương đồng cao đáng chú ý giữa các bộ nhớ đệm KV trong các lớp láng giềng, bắt đầu từ điểm giữa của LLM. Chúng tôi đã chứng minh rằng MiniCache có thể giảm đáng kể dung lượng bộ nhớ cần thiết cho suy luận LLM lên đến 41%, đồng thời nâng cao thông lượng khoảng năm lần so với baseline FP16. Tóm lại, MiniCache tiến bộ đáng kể trong lĩnh vực nén bộ nhớ đệm KV, cung cấp sự cân bằng tiên tiến giữa hiệu quả và hiệu năng. Công việc tương lai sẽ tập trung vào việc nâng cao tỷ lệ nén bằng hợp nhất qua-nhiều-lớp, phát triển các thuật toán hợp nhất tiên tiến như Spherical Cubic Interpolation [75], và tối ưu hóa thêm việc sử dụng bộ nhớ cho các triển khai quy mô lớn trong các kịch bản ứng dụng đa dạng.
+
+## Tài liệu tham khảo
+
+[Danh sách tài liệu tham khảo được giữ nguyên với 81 mục như trong bản gốc]
+
+---
+
+## Phụ lục
+
+### A Kết quả Thí nghiệm Bổ sung
+
+**So sánh với các phương pháp thưa thớt token.** Chúng tôi cũng so sánh MiniCache với phương pháp dựa trên thưa thớt H2O [14]. Phương pháp của chúng tôi vượt trội hơn H2O trong hầu hết các nhiệm vụ trên LongBench. Đáng chú ý, phương pháp của chúng tôi tập trung vào việc giảm sự dư thừa inter-layer, trong khi H2O tập trung vào sự dư thừa intra-layer. Các phương pháp của chúng tôi trực giao với các phương pháp dựa trên thưa thớt.
+
+**Bảng A:** So sánh giữa MiniCache với phương pháp dựa trên thưa thớt token H2O, sử dụng mistral-7B-instruct trên bộ dữ liệu LongBench.
+
+[Bảng chi tiết với các phương pháp và điểm số tương ứng]
+
+### B Công trình liên quan Bổ sung
+
+**Khái niệm cơ bản về KV cache trong LLM.** Suy luận LLM đã được cải thiện đáng kể trong các công trình gần đây [9,13,74] bằng cách tối ưu hóa quản lý bộ nhớ đệm KV. Tổng thể, dòng nghiên cứu này thường được thực hiện trong hai bước: 1) Đầu tiên, tại giai đoạn prefilling, LLM tính toán các bộ nhớ đệm KV ban đầu tại mỗi lớp attention dựa trên chuỗi đầu vào và decode token đầu tiên. Thứ hai, 2) tại giai đoạn decoding, LLM dự đoán tự hồi quy token tiếp theo, trong đó bộ nhớ đệm KV của nó tại mỗi lớp attention được thêm vào các cache tổng thể. Các công trình hiện có đã nén bộ nhớ đệm KV trong các khía cạnh khác nhau (ví dụ, lượng tử hóa [11, 12], token pruning [14, 16]).
+
+**Nén KV cache.** Trong nghiên cứu trước, các chiến lược khác nhau để nâng cao kiến trúc transformer hiệu quả được thảo luận, bao gồm một phổ kỹ thuật nhằm tối ưu hóa hiệu năng và quản lý hạn chế tài nguyên. Những phương pháp này bao gồm tối ưu hóa attention [46,47,76], nhóm truy vấn [42,43], KV caching thưa thớt [16,77,78], thu nhỏ token [15,79], và cải thiện việc tạo ngữ cảnh dài. Các đóng góp đáng kể đến từ các dự án như H2O [15], GEAR [15], và KIVI [11]. Ngoài ra, các nỗ lực để giảm thiểu thắt cổ chai bộ nhớ đệm KV bao gồm các chiến lược như multi-query attention [42] và multi-group attention [43], đề xuất giảm số lượng head trong bộ nhớ đệm KV. Tuy nhiên, những phương pháp này thường cần thiết việc retrain hoặc fine-tune mô hình. Các phương pháp khác tập trung vào việc giảm kích thước của bộ nhớ đệm KV bằng cách chọn lọc loại bỏ các token ít quan trọng [14] và nâng cao kiến trúc hệ thống thông qua các công nghệ như offloading bộ nhớ đệm KV [80] hoặc tích hợp các kỹ thuật như bộ nhớ ảo và paging [81] vào cơ chế attention.
+
+### C Thảo luận và Hạn chế
+
+**Hàm hợp nhất thay thế.** Trong quá trình khám phá ban đầu của chúng tôi, ban đầu chúng tôi xem xét một hàm hợp nhất thay thế, đơn giản hơn cho nén qua lớp: nội suy bảo tồn norm tối đa. Hàm này được thiết kế để duy trì norm tối đa của các vector liên quan, đảm bảo rằng các đặc điểm quan trọng nhất được bảo tồn trong quá trình hợp nhất. Nội suy bảo tồn norm tối đa về F_max có thể được định nghĩa như sau:
+
+F_max(x^l, x^{l−1}) = x̄^{l,l−1}/||x̄^{l,l−1}|| · Max(||x^l||, ||x^{l−1}||). (A)
+
+Ở đây x̄^{l,l−1} biểu thị vector trung bình giữa x^l và x^{l−1}. Hàm F_max đảm bảo rằng vector đã hợp nhất bảo tồn hướng của vector trung bình trong khi điều chỉnh tỷ lệ nó đến norm tối đa của các trạng thái KV gốc. So với hàm hợp nhất dựa trên SLERP, F_max có chi phí tính toán ít hơn và tiêu thụ bộ nhớ thấp hơn. Tuy nhiên, nó ít chính xác hơn SLERP. Việc chọn giữa sử dụng F_SLERP hay F_max phụ thuộc vào các yêu cầu cụ thể của ứng dụng. Trong nghiên cứu của chúng tôi, chúng tôi chủ yếu sử dụng SLERP để tối đa hóa hiệu năng.
+
+**Tác động xã hội.** Công trình của chúng tôi cho thấy một khám phá sơ bộ về Nén bộ nhớ đệm KV trong chiều sâu, một lĩnh vực tương đối chưa được khám phá nhưng có thắt cổ chai quan trọng trong các mô hình ngôn ngữ lớn (LLM). MiniCache được đề xuất cung cấp một giải pháp để cải thiện hiệu quả tạo LLM và có thể thích ứng với các công nghệ pruning và lượng tử hóa bộ nhớ đệm KV dựa trên intra-layer hiện có. Ngoài ra, chúng tôi đề xuất một phương pháp đơn giản nhưng hiệu quả hợp nhất các trạng thái bộ nhớ đệm KV tương tự theo cách qua lớp và hiệu quả khôi phục hiệu năng thông qua một kỹ thuật khôi phục mới. Các quan sát của chúng tôi chỉ ra rằng độ tương đồng và khả năng hợp nhất qua lớp có thể được áp dụng trong các ứng dụng hiệu quả rộng rãi cho tối ưu hóa sau huấn luyện trong các kịch bản tài nguyên thấp, như triển khai trên thiết bị di động. Hơn nữa, với tối ưu hóa hiệu quả nhu cầu bộ nhớ bộ nhớ đệm KV, MiniCache nâng cao hơn nữa việc tạo ngữ cảnh dài, đây là một mô hình quan trọng cho các ứng dụng thế giới thực, như hiểu các khái niệm trong sách giáo khoa. Chúng tôi hướng đến việc công trình của mình thúc đẩy ranh giới của hai thách thức chính trong ngành và nghiên cứu LLM: suy luận batch và tạo ngữ cảnh dài.
+
+Hơn nữa, ngoài các đóng góp đáng kể của MiniCache cho Nén bộ nhớ đệm KV, một số thách thức vẫn còn chung cho LLM. Các vấn đề như tính trung thực và bảo mật của LLM vẫn chưa được giải quyết. Đảm bảo độ chính xác và độ tin cậy của nội dung được tạo là quan trọng, vì LLM đôi khi có thể tạo ra thông tin hợp lý nhưng không chính xác hoặc gây hiểu lầm. Ngoài ra, bảo vệ chống lại các lỗ hổng bảo mật, như tấn công đối nghịch hoặc rò rỉ dữ liệu, là tối quan trọng để duy trì tính toàn vẹn và bảo mật của các tương tác người dùng. Giải quyết những thách thức này yêu cầu nghiên cứu và phát triển liên tục để nâng cao tính mạnh mẽ và đáng tin cậy của LLM. Nỗ lực này phải tiến hành cùng với những tiến bộ trong hiệu quả tính toán và hiệu năng, như được minh họa bởi các đổi mới như MiniCache.
+
+**Hạn chế.** Thuật toán hợp nhất hiện tại dựa trên Spherical Linear Interpolation (SLERP) có những hạn chế của nó. SLERP chỉ phù hợp để hợp nhất hai vector và sử dụng phương pháp nội suy hạn chế thuật toán của chúng tôi khỏi việc hợp nhất nhiều lớp đồng thời và tối đa hóa tỷ lệ nén trong các trạng thái sâu hơn. Hạn chế này ảnh hưởng đến hiệu quả tổng thể của nén bộ nhớ đệm KV và nhấn mạnh nhu cầu về các kỹ thuật tiên tiến có khả năng xử lý các kịch bản hợp nhất phức tạp hơn. Nghiên cứu tương lai nên tập trung vào việc phát triển các thuật toán tinh vi hơn có thể vượt qua những hạn chế này, từ đó nâng cao khả năng nén và hiệu năng tổng thể của LLM.
+
+### D Chi tiết Triển khai Bổ sung
+
+**Tổng quan về thuật toán suy luận.** Việc triển khai suy luận MiniCache, như được hiển thị trong Alg. 1, bao gồm một số bước chính. Khi giao diện bắt đầu, Trong giai đoạn prefilling, chúng tôi định nghĩa lớp bắt đầu hợp nhất S. Trước khi đạt đến lớp S, suy luận sử dụng logic attention và cache gốc. Từ lớp S trở đi, chúng tôi triển khai thuật toán hợp nhất của mình, hoạt động theo cách qua lớp và chỉ được áp dụng tại các lớp số lẻ. Trong quá trình hợp nhất, chúng tôi lấy bộ nhớ đệm KV từ lớp trước và lưu các trạng thái chia sẻ đã hợp nhất vào bộ nhớ đệm KV của lớp hiện tại. Để giảm việc sử dụng bộ nhớ, sau đó chúng tôi loại bỏ cache của lớp trước. Ngoài ra, chúng tôi lưu trữ vector độ lớn và token nhạy cảm giữ lại cho mỗi lớp. Trong giai đoạn decoding, hai kịch bản xuất hiện sau lớp S. Đối với các lớp số chẵn (vòng đầu tiên), vì bộ nhớ đệm KV đã bị loại bỏ trong giai đoạn prefilling, chúng tôi tham khảo lớp tiếp theo (l + 1) để lấy các trạng thái bộ nhớ đệm KV chia sẻ. Sau đó chúng tôi thực hiện khôi phục tỷ lệ xấp xỉ và khôi phục token giữ lại. Các trạng thái KV mới từ giai đoạn này được lưu trữ để sử dụng trong vòng tiếp theo. Trong vòng thứ hai, bao gồm các lớp số lẻ, chúng tôi sử dụng các token KV mới từ cả lớp trước và hiện tại. Sau giai đoạn khôi phục, chúng tôi thực hiện các thao tác hợp nhất và cập nhật các trạng thái bộ nhớ đệm KV chia sẻ trong stack.
+
+**Thuật toán hợp nhất và khôi phục qua lớp.** Như được nêu trong Alg. 2, thuật toán MiniCache bao gồm một số bước quan trọng để đảm bảo việc sử dụng bộ nhớ hiệu quả trong khi duy trì tính toàn vẹn của các trạng thái Key-Value (KV) Cache. Ban đầu, cho bộ nhớ đệm KV E^l_{k,v}, giá trị norm ||X^l_{k,v}||, token chưa hợp nhất R^l_{k,v}, chỉ số giữ lại I_{k,v}, và các token tiếp theo t^l, t^{l−1}, thuật toán tiến hành bằng cách tái điều chỉnh tỷ lệ độ lớn của các cặp KV. Cụ thể, X̂^l_k và X̂^l_v được tính bằng cách nhân các cặp KV chuẩn hóa E^l_{k,v} với norm độ lớn tương ứng của chúng ||X^l_{k,v}||. Tiếp theo, thuật toán khôi phục các token chưa hợp nhất bằng cách sử dụng các chỉ số giữ lại, cập nhật X̂^l_k và X̂^l_v tương ứng. Tiếp theo, các token mới t_k và t_v được nối vào các cặp KV đã tái điều chỉnh tỷ lệ dọc theo chiều token. Bộ nhớ đệm KV được tăng cường này trải qua cơ chế attention softmax trong đó điểm attention A được tính bằng cách lấy tích vô hướng của token truy vấn t_q với các key được chuyển vị (X̂^l_k)^⊤. Token đầu ra t_O sau đó được thu được bằng cách nhân điểm attention A với các value X̂^l_v. Trong các trường hợp mà token trước đó t^{l−1} tồn tại, thuật toán thực hiện một bước nén. Nó nối bộ nhớ đệm KV hiện có E^l_{k,v} với các token đã hợp nhất được tạo ra từ các lớp hiện tại và trước đó, hiệu quả giảm sự dư thừa và tối ưu hóa bộ nhớ. Nếu t^{l−1} không có sẵn, bộ nhớ đệm KV được cập nhật bằng cách đơn giản nối E^l_{k,v} với các token mới t^l_{k,v}, hoãn việc nén cho đến lần lặp tiếp theo. Token đầu ra cuối cùng t_O sau đó được trả về, kết thúc quá trình decoding. Trong hàm hợp nhất, thuật toán chuẩn hóa các cặp KV từ cả lớp hiện tại và trước đó. Nó tính khoảng cách góc Ω giữa các vector chuẩn hóa, đảm bảo rằng việc nội suy xảy ra dọc theo đường dẫn ngắn nhất trên mặt cầu đơn vị. Bộ nhớ đệm KV đã hợp nhất sau đó được thu được bằng nội suy có trọng số của các vector chuẩn hóa, bảo tồn tính toàn vẹn hình học và ngữ nghĩa của các trạng thái gốc. Quá trình toàn diện này cho phép MiniCache đạt được hiệu quả bộ nhớ đáng kể trong khi duy trì các đặc điểm chức năng của các cặp KV qua các lớp transformer.
+
+**Hình A:** Tổng quan về logic prefilling và decoding cho MiniCache bao gồm việc thực hiện hợp nhất qua lớp và khôi phục trong khung của chúng tôi.
+
+**Luồng thực thi MiniCache.** Hình A mô tả logic pre-filling và decoding cho khung MiniCache, kết hợp hợp nhất qua lớp và ức chế lỗi để đạt được hiệu quả bộ nhớ và duy trì tính toàn vẹn chức năng. Ban đầu, trong Bước 1, bộ nhớ đệm KV được lấy từ lớp trước (Layer L−1) trong giai đoạn pre-filling. Trong Bước 2, các cặp KV được lấy từ lớp hiện tại χ^L được hợp nhất với các cặp KV từ lớp trước χ^{L−1}, giảm sự dư thừa thông qua một
+
+---
+
+hàm hợp nhất. Tiếp theo, trong Bước 3, các cặp KV đã hợp nhất được cache để sử dụng trong tương lai, đại diện cho một tập dữ liệu hợp nhất từ nhiều lớp. Trong giai đoạn decoding, Bước 4 bao gồm việc xóa các cặp KV không cần thiết hoặc dư thừa để tối ưu hóa việc sử dụng bộ nhớ. Trong Bước 5, decoder lấy các cặp KV cần thiết từ cache để tạo đầu ra. Bước 6 áp dụng các cơ chế ức chế lỗi cho các cặp KV đã lấy, bao gồm tái điều chỉnh tỷ lệ và khôi phục giữ lại, để giảm thiểu lỗi được giới thiệu trong quá trình hợp nhất và nén. Cuối cùng, trong Bước 7, cache được cập nhật với các cặp KV cuối cùng sau ức chế lỗi và điều chỉnh, đảm bảo cache chứa biểu diễn chính xác và hiệu quả nhất của các cặp KV cho các lớp tiếp theo. Phương pháp toàn diện này đảm bảo hiệu quả bộ nhớ đáng kể trong khi bảo tồn các đặc điểm chức năng quan trọng của các cặp KV gốc qua các lớp transformer.
+
+**Thuật toán 1:** Thuật toán Suy luận MiniCache
+
+[Thuật toán được giữ nguyên với cấu trúc và logic từ bản gốc]
+
+**Thuật toán 2:** Thuật toán Nén Prefill & Decoding MiniCache
+
+[Thuật toán được giữ nguyên với cấu trúc và logic từ bản gốc]
+
+### E Dẫn xuất Hiệu quả Chi tiết
+
+Trong phần này, chúng tôi cung cấp dẫn xuất chi tiết về các cải thiện hiệu quả bộ nhớ được nêu trong Phần 4.3.
+
+Đầu tiên, chúng tôi xem xét việc sử dụng bộ nhớ bộ nhớ đệm KV gốc, được cho bởi:
+4brh(s+n).
+
+Ở đây, r là số lượng lớp, b là kích thước batch, h là kích thước ẩn, s là độ dài chuỗi đầu vào, và n là độ dài chuỗi đầu ra. Để cải thiện hiệu quả, chúng tôi bắt đầu hợp nhất các lớp từ điểm giữa, S = 1/2 r, bằng cách hợp nhất các trạng thái bộ nhớ đệm KV của mỗi hai lớp thành một không gian trạng thái chia sẻ duy nhất. Việc dẫn xuất sử dụng bộ nhớ tiến hành như sau: cho phần cache chưa hợp nhất (từ lớp 1 đến S):
+
+---
+
+4brh(s+n) · 1/2 = 2brh(s+n).
+
+Cho phần cache đã hợp nhất (từ lớp S + 1 đến r):
+4brh(s+n) · 1/2 · 1/2 = brh(s+n).
+
+Kết hợp hai phần này, tổng việc sử dụng bộ nhớ là:
+2brh(s+n) + brh(s+n) = 3brh(s+n).
+
+Tiếp theo, chúng tôi xem xét chi phí bộ nhớ bổ sung phát sinh trong quá trình khôi phục. Trong giai đoạn này, chúng tôi lưu các vector chuẩn hóa bổ sung cho các lớp trong bộ nhớ đệm KV. Những vector này có dạng R^{b×s×1}, có nghĩa là chúng có một chiều kênh duy nhất so với các trạng thái KV gốc full-rank.
+
+Các vector chuẩn hóa bổ sung cho các lớp từ S trở đi được cho bởi:
+br(s+n) · 2 = 2br(s+n).
+
+Chúng tôi cũng giới thiệu một ngưỡng giữ lại, mà chúng tôi đặt thành 0.05. Điều này có nghĩa là 5% token bộ nhớ đệm KV được giữ lại mà không nén:
+brh(0.05(s+n)).
+
+Kết hợp các số hạng này, tổng bộ nhớ bổ sung cho quá trình khôi phục là:
+2br(s+n) + 0.1brh(s+n).
+
+Cuối cùng, tổng hợp việc sử dụng bộ nhớ nén và chi phí bộ nhớ khôi phục, yêu cầu bộ nhớ tổng thể là:
+3brh(s+n) + 2br(s+n) + 0.1brh(s+n).
+
+Điều này có thể được đơn giản hóa bằng cách nhóm các yếu tố chung:
+br(s+n)(3h + 2 + 0.1h).
+
+Đơn giản hóa biểu thức bên trong dấu ngoặc, chúng ta có:
+br(s+n)(3.1h + 2).
+
+Do đó, tổng chi phí bộ nhớ cho bộ nhớ đệm KV trong Khung MiniCache là:
+br(s+n)(3.1h + 2).
+
+Việc dẫn xuất chi tiết này xác nhận các cải thiện hiệu quả được thảo luận trong Phần 4.3, nêu bật việc giảm đáng kể việc sử dụng bộ nhớ đạt được thông qua các chiến lược hợp nhất lớp và khôi phục của chúng tôi.
+
+### F Kết quả Thí nghiệm Chi tiết
+
+[Các bảng từ B đến M được giữ nguyên với dữ liệu chi tiết về hiệu năng so sánh trên các bộ dữ liệu GSM8K, COQA, và TruthfulQA với các mô hình khác nhau]

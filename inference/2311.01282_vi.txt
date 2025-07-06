@@ -1,0 +1,380 @@
+# FLASH DECODING ++: SUY LUẬN NHANH HƠN CHO MÔ HÌNH NGÔN NGỮ LỚN TRÊN GPU
+# Được chuyển đổi từ PDF sang TXT
+# Đường dẫn nguồn: /home/admin88/arxiv-downloader/inference/2311.01282.pdf
+# Kích thước tệp: 1148854 bytes
+
+===============================================
+NỘI DUNG TỆP PDF
+===============================================
+
+
+--- TRANG 1 ---
+FLASH DECODING ++: SUY LUẬN NHANH HƠN CHO MÔ HÌNH NGÔN NGỮ LỚN TRÊN GPU
+
+Ke Hong†
+Đại học Tsinghua
+& Infinigence-AI
+Qiuli Mao
+Đại học Tsinghua
+& Infinigence-AI
+Kangdi Chen
+Infinigence-AI
+
+Guohao Dai†
+Đại học Giao thông Thượng Hải
+& Infinigence-AI
+Xiuhong Li
+Đại học Bắc Kinh
+Yuhan Dong
+Đại học Tsinghua
+
+Jiaming Xu†
+Đại học Giao thông Thượng Hải
+& Infinigence-AI
+Jun Liu
+Đại học Giao thông Thượng Hải
+& Infinigence-AI
+Yu Wang 
+Đại học Tsinghua
+
+daiguohao@sjtu.edu.cn, daiguohao@infini-ai.com, yu-wang@tsinghua.edu.cn
+
+TÓM TẮT
+Khi Mô hình Ngôn ngữ Lớn (LLM) trở nên ngày càng quan trọng trong các lĩnh vực khác nhau, hiệu suất suy luận LLM là vô cùng quan trọng đối với các ứng dụng LLM quy mô lớn. Tuy nhiên, các thách thức sau vẫn chưa được giải quyết trong việc tăng tốc suy luận LLM: (1) Cập nhật softmax một phần đồng bộ. Phép toán softmax yêu cầu một thao tác cập nhật đồng bộ giữa các kết quả softmax một phần, dẫn đến chi phí khoảng 20% cho tính toán attention trong LLM. (2) Tính toán chưa được tận dụng của GEMM phẳng. Hình dạng của các ma trận thực hiện GEMM trong suy luận LLM là phẳng, dẫn đến tính toán chưa được tận dụng và mất hơn 50% hiệu suất sau khi đệm số không trong các thiết kế trước đây (ví dụ: cuBLAS, CUTLASS, v.v.). (3) Mất hiệu suất do luồng dữ liệu tĩnh. Hiệu suất kernel trong LLM phụ thuộc vào các đặc điểm dữ liệu đầu vào khác nhau, cấu hình phần cứng, v.v. Một luồng dữ liệu đơn lẻ và tĩnh có thể dẫn đến mất 50.25% hiệu suất cho GEMM với các hình dạng khác nhau trong suy luận LLM.
+
+Chúng tôi trình bày FlashDecoding++, một engine suy luận LLM nhanh hỗ trợ các LLM chính thống và backend phần cứng. Để giải quyết các thách thức trên, FlashDecoding++ đề xuất một cách sáng tạo: (1) Softmax không đồng bộ với giá trị max thống nhất. FlashDecoding++ giới thiệu kỹ thuật giá trị max thống nhất cho các tính toán softmax một phần khác nhau để tránh đồng bộ hóa. Dựa trên điều này, pipelining chi tiết được đề xuất. (2) Tối ưu hóa GEMM phẳng với double buffering. FlashDecoding++ chỉ ra rằng GEMM phẳng với các hình dạng khác nhau đối mặt với các nút thắt cổ chai khác nhau. Sau đó, các kỹ thuật như double buffering được giới thiệu. (3) Luồng dữ liệu heuristic với sự thích ứng tài nguyên phần cứng. FlashDecoding++ tối ưu hóa luồng dữ liệu một cách heuristic sử dụng các tài nguyên phần cứng khác nhau (ví dụ: Tensor Core hoặc CUDA core) xem xét động lực đầu vào. Do tính linh hoạt của các tối ưu hóa trong FlashDecoding++, FlashDecoding++ có thể đạt được tăng tốc lên đến 4.86× và 3.93× trên cả GPU NVIDIA và AMD so với các triển khai Hugging Face. FlashDecoding++ cũng đạt được tăng tốc trung bình 1.37× so với các engine suy luận LLM hiện đại nhất trên các LLM chính thống.
+
+†Những tác giả này đóng góp như nhau cho công trình này.
+‡GS. Guohao Dai là Nhà khoa học trưởng tại Infinigence-AI, Ke Hong, Jiaming Xu, Qiuli Mao, và Jun Liu là thực tập sinh tại Infinigence-AI.
+GS. Guohao Dai và GS. Yu Wang là các tác giả tương ứng của bài báo này.arXiv:2311.01282v4 [cs.LG] 5 Jan 2024
+
+--- TRANG 2 ---
+FlashDecoding++: Suy luận Nhanh hơn cho Mô hình Ngôn ngữ Lớn trên GPU
+
+1 Giới thiệu
+Khi Mô hình Ngôn ngữ Lớn (LLM) đạt được thành công chưa từng có trong các lĩnh vực khác nhau [2,3,4,5], khối lượng công việc suy luận LLM đang tăng vọt. Ví dụ, OpenAI báo cáo rằng suy luận GPT-4 với độ dài ngữ cảnh 8K có chi phí $0.03 cho mỗi 1K token đầu vào và $0.06 cho mỗi 1K token đầu ra [6]. Hiện tại, OpenAI có 180.5 triệu người dùng và nhận được hơn 10 triệu truy vấn mỗi ngày [7]. Do đó, chi phí để vận hành mô hình của OpenAI như ChatGPT là khoảng $7 triệu mỗi ngày cho phần cứng tính toán cần thiết [8]. Vì vậy, các tối ưu hóa về hiệu suất suy luận LLM sẽ có tác động lớn xem xét các kịch bản suy luận LLM quy mô lớn. Nhiều công trình gần đây đã đề xuất các kỹ thuật để tăng tốc các nhiệm vụ suy luận LLM, bao gồm DeepSpeed [9], FlexGen [10], vLLM [11], OpenPPL [12], FlashDecoding [13], TensorRT-LLM [14], và các công trình khác [15, 16, 17, 12].
+
+Nhiệm vụ suy luận LLM tạo ra các token (ví dụ: từ) từ chuỗi đầu vào một cách tự hồi quy, và có thể được tổ chức thành hai giai đoạn điển hình: giai đoạn prefill và giai đoạn decode. Giai đoạn prefill tạo ra token đầu tiên bằng cách xử lý lời nhắc đầu vào, và nghiên cứu trước đây (ví dụ: FlashAttention [18,19]) tối ưu hóa độ trễ cho giai đoạn này. Giai đoạn decode tạo ra các token tiếp theo một cách tuần tự, và nhiều công trình [9,10,11,15,13,14,20] tập trung vào việc cải thiện thông lượng của việc tạo token (tức là giảm độ trễ của mỗi token). Giai đoạn prefill chiếm ưu thế về tổng thời gian cho các kịch bản đầu vào chuỗi dài hoặc tạo ra đầu ra ngắn [21, 22], trong khi giai đoạn decode chiếm một phần đáng kể thời gian khi xử lý các chuỗi đầu ra dài [23].
+
+Hình 2 cho thấy luồng dữ liệu chính của suy luận LLM với một lớp transformer cho cả giai đoạn prefill và giai đoạn decode. Một lớp transformer có thể được chia thành các phép toán GEMM (Nhân Ma trận Tổng quát) tuyến tính (ví dụ: K, Q, V, O chiếu trọng số và feedforward) và tính toán attention/softmax. Đối với tính toán attention, một phép toán softmax được áp dụng cho một hàng trong ma trận attention. Để cải thiện tính song song, các thiết kế trước đây [18,13] chia các ma trận attention thành các ô nhỏ hơn và các hàng cũng được chia để tính toán các kết quả softmax một phần. Một phép toán softmax đồng bộ được áp dụng để cập nhật các kết quả softmax một phần trước đó khi một kết quả softmax một phần mới được tính toán. Việc cập nhật softmax một phần đồng bộ như vậy chiếm 18.8% cho tính toán attention của suy luận Llama2-7B theo profiling của chúng tôi trên GPU NVIDIA Tesla A100 với độ dài đầu vào 1024, dẫn đến thách thức đầu tiên cho việc tăng tốc suy luận LLM. Thứ hai, tài nguyên tính toán bị tận dụng dưới mức cho phép toán GEMM phẳng trong giai đoạn decode. Bởi vì giai đoạn decode tạo ra token một cách tuần tự, phép toán GEMM tuyến tính có xu hướng có hình dạng phẳng (thậm chí biến thành phép toán GEMV (Nhân Ma trận-Vector Tổng quát) khi kích thước batch là 1). Đối với kích thước batch nhỏ (ví dụ: 8), các thiết kế trước đây [24,25] đệm ma trận với số không để thực hiện GEMM với kích thước lớn hơn (ví dụ: 64), dẫn đến hơn 50% tính toán chưa được tận dụng. Thứ ba, hiệu suất suy luận LLM chịu ảnh hưởng từ luồng dữ liệu tĩnh xem xét động lực đầu vào và cấu hình phần cứng. Ví dụ, kích thước batch nhỏ làm cho giai đoạn decode của suy luận LLM bị giới hạn bởi bộ nhớ và kích thước batch lớn làm cho nó bị giới hạn bởi tính toán. Một luồng dữ liệu đơn lẻ và tĩnh có thể dẫn đến mất 50.25% hiệu suất cho GEMM với các hình dạng khác nhau trong suy luận LLM.
+
+[Hình 1 với các số liệu thống kê về thông lượng và độ trễ được giữ nguyên]
+
+--- TRANG 3 ---
+FlashDecoding++: Suy luận Nhanh hơn cho Mô hình Ngôn ngữ Lớn trên GPU
+
+[Hình 2 với sơ đồ luồng dữ liệu được giữ nguyên]
+
+Để giải quyết những thách thức này và cho phép suy luận Mô hình Ngôn ngữ Lớn (LLM) nhanh hơn, chúng tôi trình bày FlashDecoding++ trong bài báo này. FlashDecoding++ đề xuất một cách sáng tạo các đóng góp sau:
+
+• Softmax không đồng bộ với giá trị max thống nhất. FlashDecoding++ tận dụng một giá trị max thống nhất cho các tính toán softmax một phần khác nhau. Mỗi kết quả softmax một phần có thể được xử lý riêng lẻ mà không cần cập nhật đồng bộ.
+
+• Tối ưu hóa GEMM phẳng với double buffering. FlashDecoding++ chỉ đệm kích thước ma trận lên 8 thay vì 64 trong các thiết kế trước đây cho GEMM hình dạng phẳng để cải thiện việc tận dụng tính toán. Chúng tôi chỉ ra rằng GEMM phẳng với các hình dạng khác nhau đối mặt với các nút thắt cổ chai khác nhau, và cải thiện thêm hiệu suất kernel với các kỹ thuật như double buffering.
+
+• Luồng dữ liệu heuristic với sự thích ứng tài nguyên phần cứng. FlashDecoding++ xem xét cả động lực đầu vào và cấu hình phần cứng và áp dụng tối ưu hóa kernel một cách động cho luồng dữ liệu suy luận LLM.
+
+Do tính linh hoạt của các tối ưu hóa, hiệu quả của FlashDecoding++ có thể được chứng minh trên cả GPU NVIDIA và AMD. FlashDecoding++ đạt được tăng tốc lên đến 4.86× và 3.93× trên cả GPU NVIDIA và AMD so với các triển khai Hugging Face tương ứng. Các kết quả mở rộng của chúng tôi cho thấy FlashDecoding++ đạt được tăng tốc trung bình 1.37× so với FlashDecoding [13], một engine suy luận LLM hiện đại nhất trên các LLM khác nhau (ví dụ: Llama2, ChatGLM2, v.v.).
+
+Phần còn lại của bài báo được tổ chức như sau. Phần 2 giới thiệu những kiến thức cơ bản về LLM và các công trình liên quan về tăng tốc suy luận LLM. Ba kỹ thuật của chúng tôi, softmax không đồng bộ với giá trị max thống nhất, tối ưu hóa GEMM phẳng với double buffering, và luồng dữ liệu heuristic với sự thích ứng tài nguyên phần cứng được trình bày chi tiết trong Phần 3, 4, và 5 tương ứng. Phần 6 trình bày các kết quả đánh giá. Các công trình liên quan về suy luận LLM được giới thiệu trong Phần 7, và Phần 8 kết luận bài báo.
+
+--- TRANG 4 ---
+FlashDecoding++: Suy luận Nhanh hơn cho Mô hình Ngôn ngữ Lớn trên GPU
+
+[Hình 3 với các sơ đồ giải pháp được giữ nguyên]
+
+2 Kiến thức cơ bản
+
+2.1 Tổng quan về Luồng dữ liệu Suy luận LLM
+Nhiệm vụ suy luận LLM là tạo ra các token từ chuỗi đầu vào, có thể được sử dụng để hoàn thành một câu hoặc trả lời một câu hỏi. Một tổng quan về luồng dữ liệu suy luận LLM được hiển thị trong Hình 2. Như chúng ta có thể thấy, luồng dữ liệu suy luận LLM có thể được tổ chức thành hai giai đoạn điển hình với các phép toán tương tự: một giai đoạn prefill và nhiều giai đoạn decode.
+
+Giai đoạn prefill "hiểu" chuỗi đầu vào (tức là "Đại dương lớn nhất là gì?"). Mỗi token (chúng tôi đặt một từ làm một token trong Hình 2) được mã hóa như một vector embedding, và chuỗi đầu vào được tổ chức thành một ma trận. Đầu ra chính của giai đoạn prefill là một token mới, được dự đoán là token tiếp theo sau chuỗi đầu vào (tức là "Pacific" trong hình này). Giai đoạn decode "tạo ra" chuỗi đầu ra (tức là "Pacific", "Ocean", v.v.) Token đầu ra của giai đoạn prefill được lấy làm đầu vào của giai đoạn decode. Giai đoạn decode được thực hiện một cách tự hồi quy, và mỗi token đầu ra được sử dụng làm token đầu vào cho lần tiếp theo (ví dụ: "Ocean" được sử dụng thêm làm đầu vào).
+
+2.2 Các Phép toán trong Suy luận LLM
+Các phép toán chính trong suy luận LLM được mô tả như các phép toán ①đến ⑥trong Hình 2, bao gồm chiếu tuyến tính (①và ⑤), attention (②, ③, và ④), và mạng feedforward (⑥). Để đơn giản, các phép toán như embedding vị trí [26], kích hoạt phi tuyến tính [27,28,29], mặt nạ [26], và các phép toán khác không được hiển thị trong hình. Các phép toán trong giai đoạn prefill và giai đoạn decode khác nhau về hình dạng dữ liệu. Bởi vì chỉ có một token (kích thước batch = 1) hoặc vài token (kích thước batch > 1) được xử lý tại một thời điểm, các ma trận đầu vào trong giai đoạn decode là các ma trận hình dạng phẳng hoặc thậm chí là vector.
+
+Chiếu Tuyến tính. Chiếu tuyến tính hoạt động như lớp kết nối đầy đủ, nhân đầu vào với các ma trận trọng số (tức là WK, WQ, WV, WO, được gọi là chiếu K, Q, V và O). Đối với giai đoạn prefill, chiếu K, Q, V tạo ra các ma trận K, Q, V. Đối với giai đoạn decode, chiếu K, Q, V tạo ra ba vector tương ứng và được nối với K và V (tức là KVcache, màu vàng và xanh nhạt trong Hình 2) trong giai đoạn prefill.
+
+softmax (Q×KT)×V (1)
+
+--- TRANG 5 ---
+FlashDecoding++: Suy luận Nhanh hơn cho Mô hình Ngôn ngữ Lớn trên GPU
+
+[Hình 4 với so sánh các phương án tính toán softmax được giữ nguyên]
+
+Attention. Phép toán attention chủ yếu được chia thành ba phép toán (②đến ④: Q×K, softmax, Attention ×V), như được hiển thị trong Eq. (1). Đối với P=Q×KT, phép toán softmax được thực hiện cho mỗi hàng của ma trận kết quả của P. Tính toán softmax chi tiết được hiển thị trong Hình 4(a). Giá trị tối đa m(x) được tính toán trước. Số mũ của mỗi phần tử chia cho em(x), f(x), sau đó được xử lý. Những số mũ này được chuẩn hóa về tổng của tất cả các số mũ (tức là l(x)) để có được kết quả softmax.
+
+Mạng Feedforward. Mạng feedforward chủ yếu bao gồm hai lớp kết nối đầy đủ. Lớp đầu tiên (⑥ FFN 1) mở rộng kích thước đặc trưng để tăng cường khả năng biểu diễn. Lớp thứ hai (⑥ FFN 2) khôi phục kích thước đặc trưng và đóng vai trò là lớp đầu ra.
+
+2.3 Tối ưu hóa Attention
+Phép toán softmax được hiển thị trong Hình 4(a) yêu cầu tất cả dữ liệu toàn cục được tính toán và lưu trữ trước khi nó có thể tiến hành. Điều này dẫn đến tiêu thụ bộ nhớ cao và tính song song thấp. Các công trình sau đó đề xuất kỹ thuật softmax một phần để giảm tiêu thụ bộ nhớ [18,19] hoặc cải thiện tính song song [13]. Hình 4(b) cho thấy sơ đồ của phép toán softmax một phần. Ý tưởng chính là chia vector x thành các vector một phần (tức là x′ và x′′). Các kết quả softmax một phần của x′ và x′′ được tính toán riêng biệt theo Hình 4(a), và sau đó được cập nhật đồng bộ với nhau. Tính toán chi tiết của việc cập nhật đồng bộ này được hiển thị trong Phương trình (2). Với việc triển khai softmax một phần, chúng ta có thể đạt được tính song song hiệu quả của tính toán đồng thời giảm chi phí bộ nhớ cho tính toán attention.
+
+m(x) =max(m(x′), m(x′′))
+f(x′) =em(x′)−m(x)f(x′)
+f(x′′) =em(x′′)−m(x)f(x′′)
+l(x) =f(x′) +f(x′′)
+softmax ([x′, x′′]) = [ f(x′), f(x′′)]÷l(x)(2)
+
+Tuy nhiên, vì softmax một phần cần được cập nhật theo các kết quả softmax một phần khác, nó không thể tránh khỏi việc giới thiệu các phép toán đồng bộ dữ liệu. Theo kết quả profiling của chúng tôi, một phép toán cập nhật đồng bộ như vậy dẫn đến 18.8% chi phí trong tính toán attention cho suy luận Llama2-7B trên GPU NVIDIA Tesla A100 với độ dài đầu vào 1024.
+
+3 Softmax Không đồng bộ với Giá trị Tối đa Thống nhất
+
+Động lực. Phép toán softmax một phần yêu cầu đồng bộ hóa giữa các vector một phần khác nhau, dẫn đến khoảng 20% chi phí của phép toán attention. Như được hiển thị trong Hình 3(a), việc đồng bộ hóa được yêu cầu sau khi giá trị tối đa của vector một phần được tính toán. Giá trị tối đa được sử dụng để cập nhật các kết quả softmax một phần trước đó (tức là tính toán lại attention trước đó). Vì vậy, để giảm chi phí đồng bộ hóa, vấn đề chính cần giải quyết là làm thế nào để tính toán mỗi kết quả softmax một phần mà không yêu cầu kết quả từ tính toán softmax một phần khác.
+
+--- TRANG 6 ---
+FlashDecoding++: Suy luận Nhanh hơn cho Mô hình Ngôn ngữ Lớn trên GPU
+
+[Hình 5 với phân phối thống kê được giữ nguyên]
+
+Thách thức. Lý do mà việc đồng bộ hóa được yêu cầu nằm ở chỗ giá trị tối đa của mỗi vector một phần là khác nhau. Giá trị tối đa được sử dụng để tránh tràn của phép toán số mũ (f(x) trong Hình 4(a)), và các số mũ được tổng hợp (l(x) trong Hình 4(a)) làm mẫu số của phép toán softmax. Một phép toán phi tuyến tính như vậy trên mỗi giá trị tối đa một phần làm cho việc đồng bộ hóa giữa mỗi tính toán softmax một phần không thể tránh khỏi.
+
+Phân tích và Hiểu biết. Theo công thức tính toán softmax, giá trị tối đa được sử dụng làm hệ số tỷ lệ cho cả tử số và mẫu số (tức là f(x) và l(x) trong Hình 4(a)). Hiểu biết chính của chúng tôi là, hệ số tỷ lệ có thể là một số tùy ý thay vì sử dụng giá trị tối đa về mặt toán học, được hiển thị trong Phương trình (3). Khi chúng ta đặt ϕ = 0, nó trở thành tính toán softmax ban đầu [30].
+
+softmax (x) =[ex1−m(x), ..., exd−m(x)]P
+iexi−m(x)
+=[ex1−ϕ, ..., exd−ϕ]P
+iexi−ϕ,∀ϕ∈R(3)
+
+Tuy nhiên, hệ số tỷ lệ không thể là một số tùy ý xem xét việc tràn của tính toán số mũ. Đối với trường hợp xi≫ϕ, exi−ϕ tràn và không thể được biểu diễn bằng số thực điểm cố định có độ rộng cố định (ví dụ: float32 cho kết quả số mũ trong các engine LLM hiện tại). Đối với trường hợp khác xi≪ϕ, exi−ϕ→0, dẫn đến mất độ chính xác. Vì vậy, một hệ số tỷ lệ phù hợp ϕ nên được chọn cẩn thận để tránh hai trường hợp trên. Hình 5 cho thấy phân phối thống kê của xi (các phần tử trong vector đầu vào của softmax) trong các LLM điển hình với các đầu vào khác nhau [31]. Hiểu biết chính của chúng tôi là, >99.99% xi nằm trong một phạm vi nhất định. Cụ thể, đối với Llama2-7B, chúng ta có −16.8< xi<6.5 cho >99.99% xi. Vì eb−a và ea−b có thể được biểu diễn bằng định dạng float32, chúng ta có thể đặt ϕ=a trong Phương trình (3). Đối với OPT-6.7B, chúng tôi không áp dụng kỹ thuật trong phần này vì phạm vi lớn trong Hình 5.
+
+Phương pháp: Không đồng bộ hóa. Dựa trên những hiểu biết trên, mỗi tính toán softmax một phần chia sẻ một giá trị tối đa thống nhất, ϕ. Sau phép toán softmax, một phép toán tích vô hướng được thực hiện giữa kết quả softmax và một cột của V (tức là v). Giả sử rằng vector đầu vào x có thể được chia thành p vector một phần, x= [x(1), ..., x(p)] (v= [v(1), ..., v(p)] tương ứng), chúng ta có:
+
+⟨softmax (x), v⟩=P
+iexi−ϕ·viP
+iexi−ϕ
+=Pp
+j=1Pd/p
+i=1ex(j)
+i−ϕ·v(j)
+iPp
+j=1Pd/p
+i=1ex(j)
+i−ϕ(4)
+
+Tích lũy bên trong trong cả tử số và mẫu số chỉ lấy các vector một phần x(j) và v(j) làm đầu vào, do đó chúng có thể được xử lý không đồng bộ và riêng lẻ. Tích lũy bên ngoài chỉ được xử lý sau khi tất cả các vector một phần được xử lý. Như chúng ta có thể thấy trong Hình 4(c), mỗi f(x(j)) được tính toán riêng lẻ, và softmax (x) được tính toán sau khi tất cả x(j) được tính toán.
+
+--- TRANG 7 ---
+FlashDecoding++: Suy luận Nhanh hơn cho Mô hình Ngôn ngữ Lớn trên GPU
+
+[Hình 6 với ví dụ tính toán softmax không đồng bộ được giữ nguyên]
+
+Phương pháp: Tính toán lại. Không mất tính tổng quát, chúng ta giả sử a < xi−ϕ < b cho mỗi xi để đảm bảo độ chính xác và tránh tràn. Sau đó, phép toán softmax một phần được xử lý riêng lẻ. Tuy nhiên, khi xi−ϕ≤a hoặc xi−ϕ≥b, tính toán softmax một phần không đồng bộ được chấm dứt cho vector x mà xi thuộc về. Softmax sau đó được tính toán lại bằng cách sử dụng sơ đồ softmax một phần đồng bộ (được sử dụng trong FlashAttention [18,19] và FlashDecoding [13]) được hiển thị trong Hình 4(b). Một sơ đồ tính toán lại như vậy tránh tràn trong khi giới thiệu chi phí không đáng kể dựa trên dữ liệu thống kê được hiển thị trong Hình 5.
+
+Ví dụ. Hình 6 cho thấy một ví dụ về sơ đồ softmax không đồng bộ. Chúng ta đặt a=−3, b= 3, ϕ= 6. Hai vector x và y được tính toán từ Q×KT trong Phương trình (1), và được chia thành 2 vector một phần. Chúng tôi bỏ qua quá trình từ Q×KT đến những vector một phần này. Đối với mỗi xi, chúng ta có a < xi−ϕ < b, chúng ta xử lý ex1−ϕ·v1+ex2−ϕ·v2 và ex1−ϕ+ex2−ϕ cho vector một phần đầu tiên của x bằng hai luồng không đồng bộ. Sau đó, mỗi luồng chuyển đến vector một phần tiếp theo cho tính toán tương ứng (tức là ex3−ϕ·v3+ex4−ϕ·v4 và ex3−ϕ+ex4−ϕ). Hai luồng được đồng bộ hóa khi tất cả các vector một phần được xử lý, và thực hiện phép toán chia trong Phương trình (4). Đối với y, vector một phần đầu tiên được xử lý tương tự. Tuy nhiên, chúng ta thấy rằng y3−ϕ > b, sau đó hai luồng được chấm dứt và luồng đầu tiên tính toán lại tất cả các vector một phần theo sơ đồ softmax một phần đồng bộ trong Hình 4(b).
+
+4 Tối ưu hóa GEMM Phẳng với Double Buffering
+
+Động lực. Quá trình của giai đoạn decode chủ yếu bao gồm phép toán GEMV (kích thước batch=1) hoặc GEMM phẳng (kích thước batch>1). Không mất tính tổng quát, các phép toán GEMV/GEMM có thể được biểu diễn bằng M, N, K, trong đó kích thước của hai ma trận được nhân là M×K và K×N. Các engine suy luận LLM trước đây sử dụng Tensor Core để tăng tốc các phép toán này bằng các thư viện như cuBLAS [24] và CUTLASS [25]. Mặc dù các kiến trúc Tensor Core hiện đại [32] xử lý GEMM với M= 8, các thư viện này thường chia chiều M thành 64 để ẩn độ trễ bộ nhớ. Tuy nhiên, đối với các phép toán GEMV hoặc GEMM phẳng trong giai đoạn decode, chúng ta thường có M≪64 và chiều M được đệm lên 64 với số không. Việc đệm dẫn đến tính toán chưa được tận dụng, và vấn đề chính là xử lý các phép toán GEMV hoặc GEMM phẳng với các ô nhỏ hơn (tức là đệm lên 8 tương ứng với các kiến trúc Tensor Core hiện đại) trong chiều M.
+
+Thách thức. Xử lý các phép toán GEMV hoặc GEMM phẳng không đơn giản khi chiều M được đệm lên 8. Kỹ thuật chia ô trong các thư viện hiện đại như cuBLAS [24] và CUTLASS [25] chỉ có thể được áp dụng cho chiều N và
+
+--- TRANG 8 ---
+FlashDecoding++: Suy luận Nhanh hơn cho Mô hình Ngôn ngữ Lớn trên GPU
+
+[Hình 7 với hiệu suất GEMM phẳng được giữ nguyên]
+
+chiều K. Các ô trên chiều K được xử lý tuần tự trong một khối GPU để tránh các phép toán atomic trong quá trình giảm. Việc chia ô trên chiều N ảnh hưởng đến cả tính song song và tỷ lệ tính toán/bộ nhớ, cả hai đều quan trọng cho việc tăng tốc GEMV và GEMM phẳng.
+
+Phân tích và Hiểu biết. Giả sử rằng kích thước chia ô của chiều N và chiều K lần lượt là BN và BK. Tính toán của mỗi ô GEMM là 2×M×BN×BK với tổng số B=N×K
+BN×BK ô GEMM. Tổng truy cập bộ nhớ là (M×BK+BN×BK)×B+M×N. Do đó, tỷ lệ tính toán/bộ nhớ là:
+
+2×M×BN×BK×B
+(M×BK+BN×BK)×B+M×N
+=2×M×K
+K+M×K
+BN+M(5)
+
+Mặt khác, tính song song là N
+BN. Do đó, tỷ lệ tính toán/bộ nhớ cho thấy mối tương quan dương với BN trong khi tính song song cho thấy mối tương quan âm với BN, phơi bày một mâu thuẫn trong việc cải thiện hiệu suất của GEMV hoặc GEMM phẳng. Chúng tôi mô tả hiệu suất chuẩn hóa của GEMM phẳng trong Hình 7 với N và BN khác nhau. Hiểu biết chính của chúng tôi là, đối với N nhỏ hơn, GEMM phẳng bị giới hạn bởi tính song song. Có 108 Multiprocessor Streaming (SM) trong NVIDIA Tesla A100. N
+BN có xu hướng là một hằng số (ví dụ: 128 hoặc 256), liên quan đến tính song song phần cứng (số lượng SM). Một hiểu biết chính khác là, đối với N lớn hơn, GEMM phẳng trở nên bị giới hạn bởi bộ nhớ. Hiệu suất của những trường hợp này có thể được cải thiện bằng cách ẩn độ trễ truy cập bộ nhớ.
+
+Phương pháp: Double Buffering. Để ẩn độ trễ truy cập bộ nhớ, chúng tôi giới thiệu kỹ thuật double buffering cho phép toán GEMM phẳng. Chúng tôi phân bổ hai bộ đệm riêng biệt trong bộ nhớ chia sẻ. Ô trong một bộ đệm thực hiện phép toán GEMM, trong khi bộ đệm khác tải một ô mới cho phép toán GEMM tiếp theo. Do đó, tính toán và truy cập bộ nhớ được chồng lên nhau. Chúng tôi áp dụng kỹ thuật như vậy khi N lớn trong thực tế của chúng tôi.
+
+Ví dụ. Hình 8 cho thấy ví dụ về tối ưu hóa GEMM phẳng của chúng tôi với double buffering. Đối với M < 8, chiều M trước tiên được đệm lên 8 xem xét các kiến trúc Tensor Core hiện đại. Các khối lượng công việc trong chiều K được xử lý trong một khối GPU (ví dụ: A1, A2, A3, ...), trong khi các khối lượng công việc trong chiều N được xử lý song song bằng các khối GPU khác nhau (ví dụ: C1, C2, ...). Chúng tôi lấy Khối GPU 1 làm ví dụ, ô đầu tiên cho mỗi ma trận trong chiều K (tức là A1 và B1) được tải vào bộ đệm bên trái trong bộ nhớ chia sẻ. Sau đó, phép toán GEMM được thực hiện giữa A1 và B1. Tiếp theo, A2 và B2 được tải vào bộ đệm bên phải trong bộ nhớ chia sẻ. Các ô tiếp theo được xử lý tương tự theo sơ đồ double buffering.
+
+--- TRANG 9 ---
+FlashDecoding++: Suy luận Nhanh hơn cho Mô hình Ngôn ngữ Lớn trên GPU
+
+[Hình 8 với sơ đồ double buffering được giữ nguyên]
+
+5 Luồng dữ liệu Heuristic với Sự thích ứng Tài nguyên Phần cứng
+
+Động lực. Mặc dù FlashDecoding++ tối ưu hóa phép toán GEMM phẳng trong Phần 4, nó không bao gồm tất cả các phép toán (thậm chí chỉ cho GEMM) trong suy luận LLM. Như đã đề cập trong Hình 2, hình dạng của GEMM trong các phép toán và hai giai đoạn khác nhau thay đổi. Do đó, khối lượng công việc GEMM trong suy luận LLM có thể là GEMV (kích thước batch=1 cho giai đoạn decode), GEMM phẳng (kích thước batch nhỏ cho giai đoạn decode và độ dài chuỗi ngắn cho giai đoạn prefill) và GEMM thông thường (kích thước batch lớn hoặc độ dài chuỗi dài cho giai đoạn prefill). Để tận dụng khả năng tính toán mạnh mẽ của Tensor Core, các framework hiện tại như FasterTransformer [33] và DeepSpeed [9] có xu hướng sử dụng triển khai GEMM được tối ưu hóa cao từ cuBLAS [24] để xử lý các khối lượng công việc khác nhau. Tuy nhiên, triển khai Tensor Core thất bại với khối lượng công việc GEMV. Khối lượng công việc GEMV có thể được tối ưu hóa bằng cách sử dụng CUDA Core trong các thiết kế trước đây như FastGEMV [34]. Đối với lớp tuyến tính Llama2-7B trong giai đoạn decode, triển khai Tensor Core từ cuBLAS chỉ đạt được 82.15% hiệu suất của triển khai CUDA Core sử dụng FastGEMV trên GPU NVIDIA A100. Mặt khác, sử dụng CUDA Core để thực hiện chiếu trên đầu vào decode kích thước batch=4 chỉ đạt được 49.75% hiệu suất so với triển khai Tensor Core. Do đó, để tiếp cận hiệu suất tính toán tối ưu, một luồng dữ liệu heuristic được cho là sẽ được khai thác trong việc triển khai cho các khối lượng công việc khác nhau.
+
+Thách thức. Mặc dù một luồng dữ liệu heuristic có thể tồn tại trong việc triển khai các khối lượng công việc tuyến tính khác nhau, việc xây dựng ánh xạ từ một khối lượng công việc nhất định đến một triển khai tối ưu là thách thức. Trong kịch bản suy luận LLM, có nhiều yếu tố ảnh hưởng đến hiệu suất triển khai của các khối lượng công việc tuyến tính: (a) Động lực đầu vào. Sự đa dạng của kích thước batch và độ dài chuỗi đầu vào mang lại các khối lượng công việc động. (b) Đa dạng mô hình. Khối lượng công việc tuyến tính thay đổi với các cấu trúc và kích thước mô hình khác nhau. (c) Khả năng GPU. Hiệu suất tương đối giữa các triển khai thay đổi với đặc điểm GPU, như băng thông bộ nhớ, kích thước cache, và khả năng tính toán. (d) Ảnh hưởng kỹ thuật. Nỗ lực kỹ thuật cũng ảnh hưởng cao đến hiệu suất kernel. Tất cả những yếu tố ảnh hưởng này xây dựng một không gian tìm kiếm lớn, làm cho việc tạo ra một ánh xạ hiệu quả giữa khối lượng công việc tuyến tính và triển khai tối ưu tương ứng trở nên không đơn giản.
+
+Phân tích và Hiểu biết. Mặc dù tất cả các yếu tố ảnh hưởng tạo thành một không gian tìm kiếm lớn, tính đồng nhất của các lớp khác nhau trong LLM làm giảm đáng kể không gian tìm kiếm cho tối ưu hóa toán tử. Hình 2 cho thấy bốn phép toán GEMV/GEMM tuyến tính trong giai đoạn prefill và giai đoạn decode, tức là chiếu K, Q, V, chiếu O, và hai phép toán feedforward. Mỗi phép toán GEMV/GEMM có thể được trừu tượng hóa như một phép nhân giữa ma trận hình (M×K) và ma trận hình (K×N). Hiểu biết chính của chúng tôi là, chỉ có bốn hình dạng [K, N] cho một LLM nhất định. Hơn nữa, M chỉ liên quan đến độ dài chuỗi đầu vào và kích thước batch cho giai đoạn prefill, và kích thước batch cho giai đoạn decode. Hình 9(a) cho thấy các hình dạng giới hạn của các phép toán GEMV/GEMM trong suy luận LLM.
+
+Phương pháp: Luồng quyết định cho các điểm uốn. Bởi vì chỉ có bốn hình dạng [K, N] tồn tại cho một LLM nhất định, chúng tôi sử dụng ba loại triển khai cho các phép toán GEMV/GEMM khi M thay đổi: FastGEMV cho các phép toán GEMV và GEMM phẳng (ImplA), tối ưu hóa GEMM phẳng của chúng tôi trong Phần 4 (ImplB), và các thư viện CUTLASS [25] được tối ưu hóa cho GEMM thông thường (ImplC). Do đó, điều quan trọng là quyết định có áp dụng ImplA hay ImplB cho M nhỏ, và ImplB hay ImplC cho M lớn. Hình 9(b) cho thấy luồng quyết định. FlashDecoding++ profiling hiệu suất của ImplA và ImplB cho một M nhất định, và tăng M để tìm một điểm uốn M1 nơi hiệu suất của ImplB
+
+--- TRANG 10 ---
+FlashDecoding++: Suy luận Nhanh hơn cho Mô hình Ngôn ngữ Lớn trên GPU
+
+[Hình 9 với luồng dữ liệu heuristic được giữ nguyên]
+
+tốt hơn ImplA. Một điểm uốn khác M2 được tìm thấy tương tự nơi hiệu suất của ImplC tốt hơn ImplB. Lưu ý rằng mỗi [N, K] có M1 và M2 riêng lẻ của nó.
+
+Phương pháp: Luồng dữ liệu heuristic. Đối với suy luận LLM runtime, FlashDecoding++ áp dụng ImplA sử dụng CUDA Core khi M < M1, và ImplB/ImplC sử dụng Tensor Core khi M1≤M < M2/M2≤M. Lưu ý rằng luồng quyết định được thực hiện offline, nó không ảnh hưởng đến hiệu suất của suy luận LLM runtime.
+
+Ví dụ. Hình 9(c) cho thấy một ví dụ về việc áp dụng luồng dữ liệu heuristic cho mô hình Llama2-7B. Bốn hình dạng [N, K] là [12288, 4096] cho chiếu K, Q, V, [4096, 4096] cho chiếu O, [11008, 4096] và [4096, 11008] cho FFN. Đối với mỗi [N, K], các điểm uốn được tìm thấy dựa trên luồng quyết định trong Hình 9(c). Sau đó, một bảng tra cứu được hình thành, và mỗi phép toán GEMV/GEMM được thực hiện theo các triển khai tương ứng trong runtime. Trong ví dụ này, FastGEMV được áp dụng cho chiếu K, Q, V khi kích thước batch=1 (M= 1) cho giai đoạn decode, và tối ưu hóa GEMM phẳng của chúng tôi được áp dụng khi kích thước batch=1/độ dài chuỗi đầu vào=8 cho FFN 1(M= 8).
+
+6 Đánh giá
+
+6.1 Thiết lập Thí nghiệm
+Chúng tôi đánh giá hiệu suất của FlashDecoding++ trên các GPU khác nhau với nhiều Mô hình Ngôn ngữ Lớn. Chúng tôi so sánh hiệu suất với một số engine suy luận LLM hiện đại nhất.
+
+--- TRANG 11 ---
+FlashDecoding++: Suy luận Nhanh hơn cho Mô hình Ngôn ngữ Lớn trên GPU
+
+[Bảng 1 và 2 với cấu hình phần cứng và mô hình được giữ nguyên]
+
+6.1.1 Nền tảng Phần cứng
+Chúng tôi đánh giá hiệu suất của FlashDecoding++ và các engine LLM khác trên cả nền tảng NVIDIA và AMD để thực hiện một so sánh toàn diện. Chúng tôi chọn hai GPU khác nhau cho mỗi nền tảng: Tesla A100 và RTX3090 cho NVIDIA, MI210 và RX7900XTX cho AMD. Chúng tôi hiển thị cấu hình chi tiết trong Bảng 6.1.1.
+
+6.1.2 Baseline Engine LLM
+Chúng tôi triển khai FlashDecoding++ của mình bằng frontend dựa trên Pytorch với backend C++ và CUDA cho GPU NVIDIA trong khi ROCm cho GPU AMD. Chúng tôi so sánh hiệu suất suy luận trong cả giai đoạn prefill và giai đoạn decode với các baseline engine LLM sau: Hugging Face (HF) [35], vLLM [11], DeepSpeed [9], TensorRT-LLM [14], OpenPPL [12], và FlashAttention2/FlashDecoding [19, 13]. Những baseline này được giới thiệu trong Phần 7.
+
+6.1.3 Mô hình
+Chúng tôi đánh giá hiệu suất của FlashDecoding++ với các engine suy luận LLM khác trên ba Mô hình Ngôn ngữ Lớn điển hình: Llama2, OPT, và ChatGLM2. Bảng 6.1.2 cho thấy cấu hình chi tiết của những mô hình này. Lưu ý rằng có thể có nhiều mô hình trong một LLM (ví dụ: Llama2-7B, Llama2-13B) với các cấu hình khác nhau (ví dụ: số lượng đầu và lớp).
+
+• Llama2 [1] là một bộ LLM mã nguồn mở chính thống được phát hành bởi Meta vào năm 2023. Đây là một tập hợp các mô hình văn bản sinh tính được đào tạo trước và tinh chỉnh có quy mô từ 7B đến 70B tham số.
+
+• OPT [36], là một bộ transformer chỉ giải mã được đào tạo trước có quy mô từ 125M đến 175B tham số được phát hành bởi Meta AI.
+
+• ChatGLM2 [37] là một LLM mã nguồn mở hỗ trợ trò chuyện song ngữ (Trung-Anh).
+
+6.2 So sánh với Hiện đại nhất
+Chúng tôi so sánh FlashDecoding++ với các engine suy luận LLM hiện đại nhất trong Hình 10 và Hình 11 trên GPU NVIDIA, Hình 12 và Hình 13 cho GPU AMD. Đối với giai đoạn decode, FlashDecoding++ đạt được tăng tốc lên đến 4.86× so với các triển khai Hugging Face trên ba LLM và hai GPU. Tăng tốc trung bình so với vLLM, DeepSpeed, TensorRT-LLM, OpenPPL, và FlashDecoding lần lượt là 1.24×, 1.44×, 1.13×, 1.24×, và 1.21× (1.37× trên Tesla A100 so với FlashDecoding). Đối với giai đoạn prefill, FlashDecoding++ đạt được tăng tốc lên đến 1.40× so với các triển khai Hugging Face. Tăng tốc trung bình so với DeepSpeed, TensorRT-LLM, OpenPPL, FlashAttention2 và FlashDecoding lần lượt là 1.05×, 1.06×, 1.08×, 1.09×, và 1.08×. Chúng tôi cũng hiển thị kết quả decode trên hai GPU AMD. Hiện tại, chỉ có triển khai Hugging Face ban đầu có thể được thực hiện trên GPU AMD làm baseline. FlashDecoding++ đạt được lên đến 2.27× và 3.93× so với baseline trên RX7900XTX và MI210 tương ứng.
+
+--- TRANG 12 ---
+FlashDecoding++: Suy luận Nhanh hơn cho Mô hình Ngôn ngữ Lớn trên GPU
+
+[Hình 10 với kết quả tăng tốc giai đoạn decode được giữ nguyên]
+
+7 Các Công trình Liên quan
+Tăng tốc suy luận mô hình ngôn ngữ lớn đã thu hút sự chú ý đáng kể trong nghiên cứu gần đây, với một số phương pháp và kỹ thuật đáng chú ý xuất hiện trong lĩnh vực này. DeepSpeed [9] là một engine toàn diện tối ưu hóa cả giai đoạn đào tạo và suy luận cho LLM. Nó đạt được hiệu suất suy luận mạnh mẽ thông qua fusion kernel và quản lý bộ nhớ GPU hiệu quả, với trọng tâm đặc biệt vào tối ưu hóa việc sử dụng bộ nhớ cho KVcache. vLLM [11] cải thiện
+
+--- TRANG 13 ---
+FlashDecoding++: Suy luận Nhanh hơn cho Mô hình Ngôn ngữ Lớn trên GPU
+
+[Hình 11 với kết quả tăng tốc giai đoạn prefill được giữ nguyên]
+
+việc sử dụng bộ nhớ GPU thông qua các kỹ thuật quản lý bộ nhớ hiệu quả và phương pháp PageAttention, dẫn đến tăng kích thước batch tối đa và nâng cao giới hạn trên của hiệu suất suy luận. FlashAttention [18,19] tối ưu hóa quá trình tính toán self-attention trong giai đoạn prefill thông qua cải thiện tính song song và phân phối khối lượng công việc. FlashDecoding [13] là một phần mở rộng của FlashAttention và tăng cường tính song song thông qua việc chia K và V, hỗ trợ tính toán self-attention hiệu quả cho chuỗi dài trong giai đoạn decode. FasterTransformer [33] và OpenPPL [12] triển khai các engine suy luận mô hình lớn bằng C++ để giảm chi phí từ việc lập lịch kernel, so với các triển khai Python. Chúng cũng sử dụng các kỹ thuật quản lý bộ nhớ và fusion kernel để đạt được suy luận LLM hiệu quả. TensorRT-LLM [14] được xây dựng trên TensorRT [38] và engine FasterTransformer [33] (C++) và kết hợp các công nghệ mã nguồn mở tiên tiến như FlashAttention [18,19]. Ngoài ra, nó tăng cường tính dễ sử dụng bằng cách cung cấp API Python.
+
+--- TRANG 14 ---
+FlashDecoding++: Suy luận Nhanh hơn cho Mô hình Ngôn ngữ Lớn trên GPU
+
+[Hình 12 và 13 với kết quả GPU AMD được giữ nguyên]
+
+8 Kết luận
+Chúng tôi đề xuất FlashDecoding++, một engine suy luận Mô hình Ngôn ngữ Lớn nhanh trong bài báo này. FlashDecoding++ tăng tốc các LLM chính thống với hỗ trợ backend phần cứng đa dạng. FlashDecoding++ đề xuất ba thiết kế mới: softmax không đồng bộ với giá trị max thống nhất, tối ưu hóa GEMM phẳng với double buffering, và luồng dữ liệu heuristic với sự thích ứng tài nguyên phần cứng, đạt được tăng tốc lên đến 4.86× và 3.93× trên GPU NVIDIA và AMD so với các triển khai Hugging Face. FlashDecoding++ cũng đạt được tăng tốc trung bình 1.37× so với các engine suy luận LLM hiện đại nhất, FlashDecoding, trên các LLM khác nhau.
+
+--- TRANG 15 ---
+FlashDecoding++: Suy luận Nhanh hơn cho Mô hình Ngôn ngữ Lớn trên GPU
+
+Tài liệu tham khảo
+[1]Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei, Nikolay Bashlykov,
+Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, et al. Llama 2: Open foundation and fine-tuned chat models.
+arXiv preprint arXiv:2307.09288 , 2023.
+[2]Arun James Thirunavukarasu, Darren Shu Jeng Ting, Kabilan Elangovan, Laura Gutierrez, Ting Fang Tan, and
+Daniel Shu Wei Ting. Large language models in medicine. Nature medicine , 29(8):1930–1940, 2023.
+[3]Rohan Anil, Andrew M. Dai, Orhan Firat, Melvin Johnson, Dmitry Lepikhin, Alexandre Passos, Siamak Shakeri,
+Emanuel Taropa, Paige Bailey, Zhifeng Chen, Eric Chu, Jonathan H. Clark, Laurent El Shafey, Yanping Huang,
+Kathy Meier-Hellstern, Gaurav Mishra, Erica Moreira, Mark Omernick, Kevin Robinson, Sebastian Ruder, Yi Tay,
+Kefan Xiao, Yuanzhong Xu, Yujing Zhang, Gustavo Hernandez Abrego, Junwhan Ahn, Jacob Austin, Paul
+Barham, Jan Botha, James Bradbury, Siddhartha Brahma, Kevin Brooks, Michele Catasta, Yong Cheng, Colin
+Cherry, Christopher A. Choquette-Choo, Aakanksha Chowdhery, Clément Crepy, Shachi Dave, Mostafa Dehghani,
+Sunipa Dev, Jacob Devlin, Mark Díaz, Nan Du, Ethan Dyer, Vlad Feinberg, Fangxiaoyu Feng, Vlad Fienber,
+Markus Freitag, Xavier Garcia, Sebastian Gehrmann, Lucas Gonzalez, Guy Gur-Ari, Steven Hand, Hadi Hashemi,
+Le Hou, Joshua Howland, Andrea Hu, Jeffrey Hui, Jeremy Hurwitz, Michael Isard, Abe Ittycheriah, Matthew
+Jagielski, Wenhao Jia, Kathleen Kenealy, Maxim Krikun, Sneha Kudugunta, Chang Lan, Katherine Lee, Benjamin
+Lee, Eric Li, Music Li, Wei Li, YaGuang Li, Jian Li, Hyeontaek Lim, Hanzhao Lin, Zhongtao Liu, Frederick Liu,
+Marcello Maggioni, Aroma Mahendru, Joshua Maynez, Vedant Misra, Maysam Moussalem, Zachary Nado, John
+Nham, Eric Ni, Andrew Nystrom, Alicia Parrish, Marie Pellat, Martin Polacek, Alex Polozov, Reiner Pope, Siyuan
+Qiao, Emily Reif, Bryan Richter, Parker Riley, Alex Castro Ros, Aurko Roy, Brennan Saeta, Rajkumar Samuel,
+Renee Shelby, Ambrose Slone, Daniel Smilkov, David R. So, Daniel Sohn, Simon Tokumine, Dasha Valter, Vijay
+Vasudevan, Kiran V odrahalli, Xuezhi Wang, Pidong Wang, Zirui Wang, Tao Wang, John Wieting, Yuhuai Wu,
+Kelvin Xu, Yunhan Xu, Linting Xue, Pengcheng Yin, Jiahui Yu, Qiao Zhang, Steven Zheng, Ce Zheng, Weikang
+Zhou, Denny Zhou, Slav Petrov, and Yonghui Wu. Palm 2 technical report, 2023.
+[4]Jan Clusmann, Fiona R Kolbinger, Hannah Sophie Muti, Zunamys I Carrero, Jan-Niklas Eckardt, Narmin Ghaffari
+Laleh, Chiara Maria Lavinia Löffler, Sophie-Caroline Schwarzkopf, Michaela Unger, Gregory P Veldhuizen, et al.
+The future landscape of large language models in medicine. Communications Medicine , 3(1):141, 2023.
+[5]Can Cui, Yunsheng Ma, Xu Cao, Wenqian Ye, and Ziran Wang. Receive, reason, and react: Drive as you say with
+large language models in autonomous vehicles. arXiv preprint arXiv:2310.08034 , 2023.
+[6] OpenAI. Openai pricing. [Online], 2023. https://openai.com/pricing .
+[7]Nerdynav. Up-to-date chatgpt statistics & user numbers [oct 2023]. [Online], 2023. https://nerdynav.com/
+chatgpt-statistics .
+[8]AFZAL AHMAD DYLAN PATEL. The inference cost of search disruption - large language model cost analysis.
+[Online], 2023. https://www.semianalysis.com/p/the-inference-cost-of-search-disruption .
+[9]Reza Yazdani Aminabadi, Samyam Rajbhandari, Ammar Ahmad Awan, Cheng Li, Du Li, Elton Zheng, Olatunji
+Ruwase, Shaden Smith, Minjia Zhang, Jeff Rasley, et al. Deepspeed-inference: enabling efficient inference of
+transformer models at unprecedented scale. In SC22: International Conference for High Performance Computing,
+Networking, Storage and Analysis , pages 1–15. IEEE, 2022.
+[10] Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan Li, Max Ryabinin, Beidi Chen, Percy Liang, Christopher
+Re, Ion Stoica, and Ce Zhang. Flexgen: High-throughput generative inference of large language models with a
+single gpu. 2023.
+[11] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph Gonzalez, Hao
+Zhang, and Ion Stoica. Efficient memory management for large language model serving with pagedattention. In
+Proceedings of the 29th Symposium on Operating Systems Principles , pages 611–626, 2023.
+[12] Sensetime. Openppl: A high-performance deep learning inference platform. [Online], 2023. https://openppl.
+ai/home .
+[13] Tri Dao, Daniel Haziza, Francisco Massa, and Grigory Sizov. Flash-decoding for long-context inference. [Online],
+2023. https://crfm.stanford.edu/2023/10/12/flashdecoding.html .
+[14] Neal Vaidya, Fred Oh, and Nick Comly. Optimizing inference on large language models with nvidia tensorrt-llm,
+now publicly available. [Online], 2023. https://github.com/NVIDIA/TensorRT-LLM .
+[15] Sensetime. A light and fast inference service for llm. [Online], 2023. https://github.com/ModelTC/
+lightllm .
+
+--- TRANG 16 ---
+FlashDecoding++: Suy luận Nhanh hơn cho Mô hình Ngôn ngữ Lớn trên GPU
+
+[16] Text generation inference: Fast inference optimize for llms. [Online], 2023. https://github.com/
+huggingface/text-generation-inference/ .
+[17] Mlc llm: Machine learning compilation for large language models. [Online], 2023. https://github.com/
+mlc-ai/mlc-llm .
+[18] Tri Dao, Dan Fu, Stefano Ermon, Atri Rudra, and Christopher Ré. Flashattention: Fast and memory-efficient
+exact attention with io-awareness. Advances in Neural Information Processing Systems , 35:16344–16359, 2022.
+[19] Tri Dao. Flashattention-2: Faster attention with better parallelism and work partitioning. arXiv preprint
+arXiv:2307.08691 , 2023.
+[20] Aaron Pham, Chaoyu Yang, Sean Sheng, Shenyang Zhao, Sauyon Lee, Bo Jiang, Fog Dong, Xipeng Guan, and
+Frost Ming. OpenLLM: Operating LLMs in production, June 2023.
+[21] Zihang Dai, Zhilin Yang, Yiming Yang, Jaime Carbonell, Quoc V Le, and Ruslan Salakhutdinov. Transformer-xl:
+Attentive language models beyond a fixed-length context. arXiv preprint arXiv:1901.02860 , 2019.
+[22] Z Dong, T Tang, L Li, and WX Zhao. A survey on long text modeling with transformers. arxiv 2023. arXiv
+preprint arXiv:2302.14502 .
+[23] Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song Han, and Mike Lewis. Efficient streaming language models
+with attention sinks. arXiv preprint arXiv:2309.17453 , 2023.
+[24] NVIDIA. cublas: Basic linear algebra on nvidia gpus. [Online], 2017. https://developer.nvidia.com/
+cublas .
+[25] NVIDIA. Cutlass: Cuda templates for linear algebra subroutines. [Online], 2017. https://github.com/
+NVIDIA/cutlass .
+[26] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Łukasz Kaiser, and
+Illia Polosukhin. Attention is all you need. Advances in neural information processing systems , 30, 2017.
+[27] Vinod Nair and Geoffrey E Hinton. Rectified linear units improve restricted boltzmann machines. In Proceedings
+of the 27th international conference on machine learning (ICML-10) , pages 807–814, 2010.
+[28] Dan Hendrycks and Kevin Gimpel. Gaussian error linear units (gelus). arXiv preprint arXiv:1606.08415 , 2016.
+[29] Prajit Ramachandran, Barret Zoph, and Quoc V Le. Searching for activation functions. arXiv preprint
+arXiv:1710.05941 , 2017.
+[30] John Bridle. Training stochastic model recognition algorithms as networks can lead to maximum mutual
+information estimation of parameters. Advances in neural information processing systems , 2, 1989.
+[31] Stephen Merity, Caiming Xiong, James Bradbury, and Richard Socher. Pointer sentinel mixture models, 2016.
+[32] NVIDIA. Nvidia tensor core. [Online], 2023. https://www.nvidia.com/en-us/data-center/
+tensor-cores/ .
+[33] NVIDIA. Fastertransformer: About transformer related optimization, including bert, gpt. [Online], 2017.
+https://github.com/NVIDIA/FasterTransformer .
+[34] Siping Wang. Fastgemv: High-speed gemv kernels. [Online], 2023. https://github.com/wangsiping97/
+FastGEMV .
+[35] Thomas Wolf, Lysandre Debut, Victor Sanh, Julien Chaumond, Clement Delangue, Anthony Moi, Pierric Cistac,
+Tim Rault, Remi Louf, Morgan Funtowicz, Joe Davison, Sam Shleifer, Patrick von Platen, Clara Ma, Yacine
+Jernite, Julien Plu, Canwen Xu, Teven Le Scao, Sylvain Gugger, Mariama Drame, Quentin Lhoest, and Alexander
+Rush. Transformers: State-of-the-art natural language processing. In Proceedings of the 2020 Conference on
+Empirical Methods in Natural Language Processing: System Demonstrations , pages 38–45, Online, October 2020.
+Association for Computational Linguistics.
+[36] Susan Zhang, Stephen Roller, Naman Goyal, Mikel Artetxe, Moya Chen, Shuohui Chen, Christopher Dewan,
+Mona Diab, Xian Li, Xi Victoria Lin, Todor Mihaylov, Myle Ott, Sam Shleifer, Kurt Shuster, Daniel Simig,
+Punit Singh Koura, Anjali Sridhar, Tianlu Wang, and Luke Zettlemoyer. Opt: Open pre-trained transformer
+language models, 2022.
+[37] Zhengxiao Du, Yujie Qian, Xiao Liu, Ming Ding, Jiezhong Qiu, Zhilin Yang, and Jie Tang. Glm: General
+language model pretraining with autoregressive blank infilling. In Proceedings of the 60th Annual Meeting of the
+Association for Computational Linguistics (Volume 1: Long Papers) , pages 320–335, 2022.
+[38] NVIDIA. Nvidia tensorrt: An sdk for high-performance deep learning inference. [Online]. https://developer.
+nvidia.com/tensorrt .

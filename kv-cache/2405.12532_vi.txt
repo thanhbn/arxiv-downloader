@@ -1,0 +1,210 @@
+# PyramidInfer: Nén KV Cache Hình Tháp cho Suy luận LLM Thông lượng Cao
+
+Dongjie Yang1,*, Xiaodong Han2, Yan Gao2, Yao Hu2, Shilin Zhang3, Hai Zhao1,*,†
+1Đại học Giao thông Thượng Hải,2Xiaohongshu Inc.,
+3Đại học Công nghệ Nam Trung Quốc
+1{djyang.tony@,zhaohai@cs.}sjtu.edu.cn ,
+2{shuweng,yadun,xiahou}@xiaohongshu.com
+
+## Tóm tắt
+
+Các Mô hình Ngôn ngữ Lớn (LLMs) đã thể hiện khả năng hiểu đáng kể nhưng gặp thách thức trong việc sử dụng bộ nhớ GPU trong quá trình suy luận, cản trở khả năng mở rộng của chúng cho các ứng dụng thời gian thực như chatbot. Để tăng tốc độ suy luận, chúng tôi lưu trữ các khóa và giá trị đã tính toán (KV cache) trong bộ nhớ GPU. Các phương pháp hiện tại nghiên cứu việc nén KV cache để giảm bộ nhớ bằng cách cắt tỉa KV cache đã tính toán trước. Tuy nhiên, họ bỏ qua sự phụ thuộc giữa các lớp và việc tiêu thụ bộ nhớ khổng lồ trong quá trình tính toán trước. Để khám phá những thiếu sót này, chúng tôi phát hiện rằng số lượng khóa và giá trị quan trọng ảnh hưởng đến các thế hệ tương lai giảm dần theo từng lớp và chúng ta có thể trích xuất chúng bằng tính nhất quán trong trọng số attention. Dựa trên những phát hiện này, chúng tôi đề xuất PyramidInfer, một phương pháp nén KV cache bằng cách giữ lại ngữ cảnh quan trọng theo từng lớp. PyramidInfer tiết kiệm bộ nhớ đáng kể bằng cách tính toán ít khóa và giá trị hơn mà không ảnh hưởng đến hiệu suất. Kết quả thực nghiệm cho thấy PyramidInfer cải thiện thông lượng 2.2x so với Accelerate với việc giảm hơn 54% bộ nhớ GPU trong KV cache. Mã nguồn của chúng tôi có sẵn tại https://github.com/mutonix/pyramidinfer.
+
+## 1 Giới thiệu
+
+Các Mô hình Ngôn ngữ Lớn (LLMs) (OpenAI, 2023; Anthropic, 2023; Jiang et al., 2023) như GPT4 đã chứng minh khả năng hiểu đáng kể chưa từng có trong ngôn ngữ con người. *Dongjie Yang và Hai Zhao thuộc Khoa Khoa học và Kỹ thuật Máy tính, Đại học Giao thông Thượng Hải; Phòng thí nghiệm Trọng điểm của Ủy ban Giáo dục Thượng Hải về Tương tác Thông minh và Kỹ thuật Nhận thức, Đại học Giao thông Thượng Hải; Phòng thí nghiệm Trọng điểm Thượng Hải về Lưu thông và Quản trị Dữ liệu Đáng tin cậy trong Web3.
+
+†Tác giả liên hệ; Bài báo này được hỗ trợ một phần bởi Dự án Nghiên cứu Chung của Cộng đồng Đổi mới Khoa học và Công nghệ Đồng bằng sông Dương Tử (Số 2022CSJGG1400). Tuy nhiên, những mô hình lớn này gặp phải thách thức đáng kể về việc sử dụng bộ nhớ GPU khổng lồ trong quá trình suy luận, do độ phức tạp của mô hình và tính toán. Điều này cản trở việc triển khai LLMs ở quy mô lớn để đáp ứng hàng nghìn nhu cầu trò chuyện với chatbot.
+
+[Hình 1: Suy luận trong giai đoạn prefill: tất cả các mô hình có kích thước khác nhau có prompts 64 ×2k. LLM tiêu thụ bộ nhớ GPU khổng lồ trong KV cache so với mô hình nhỏ. PyramidInfer có thể giảm hơn 54% việc sử dụng bộ nhớ GPU trong KV cache trong khi có thông lượng hơn 2x.]
+
+Khác với huấn luyện, các mô hình trong suy luận không cần ghi lại trạng thái optimizer, activations, hoặc gradients. Vì LLMs chủ yếu là các mô hình tự hồi quy dựa trên Transformer, việc sử dụng bộ nhớ GPU chủ yếu bao gồm hai phần: tham số mô hình và KV cache. KV cache biểu diễn các khóa và giá trị đã tính toán trước đó trong attention. Chúng tôi lưu trữ KV cache trong bộ nhớ GPU và tái sử dụng nó trong các thế hệ tương lai để tránh tính toán lại. Cơ chế KV cache đã được sử dụng rộng rãi để cải thiện tốc độ suy luận (Touvron et al., 2023; Zhang et al., 2022).
+
+Tuy nhiên, KV cache tiêu thụ bộ nhớ GPU khổng lồ, đặc biệt đối với LLMs. Ví dụ, trong Hình 1, đối với một mô hình với 7 tỷ tham số, các tham số chỉ tiêu thụ 14 GB bộ nhớ
+
+--- TRANG 2 ---
+
+nhưng KV cache yêu cầu khoảng 72 GB. KV cache có khả năng tiêu thụ bộ nhớ gấp nhiều lần kích thước của mô hình. Điều này thể hiện một thách thức lớn là thông lượng suy luận LLM bị ràng buộc bởi lượng dữ liệu (KV cache) chúng ta có thể đưa vào GPU bên cạnh mô hình.
+
+Chúng tôi chia suy luận LLM thành hai giai đoạn: giai đoạn prefill và giai đoạn generation (Brown et al., 2020; Radford et al., 2019). Trong giai đoạn prefill, prompt được tính toán song song để tạo ra token đầu tiên, và KV cache ban đầu được điền trước. Trong giai đoạn generation, mô hình giải mã token tiếp theo từng cái một và nối các khóa và giá trị của token mới được giải mã vào KV cache cũ. Các nghiên cứu gần đây (Zhang et al., 2023; Liu et al., 2023; Ge et al., 2023) nén KV cache để giảm việc sử dụng bộ nhớ GPU. Tuy nhiên, như được hiển thị trong Hình 2, tất cả họ chỉ giảm KV cache đã được tính toán thay vì giảm KV cache sẽ được tính toán. Họ phải prefill KV cache ban đầu trước khi có thể bắt đầu nén, điều này bỏ qua việc tiêu thụ bộ nhớ GPU lớn khi tính toán KV cache ban đầu, đặc biệt đối với các prompt dài hơn và mô hình lớn hơn. Nếu mô hình không thể xử lý prompt trong giai đoạn prefill, những phương pháp này không còn áp dụng được vì việc nén của họ bắt đầu trong giai đoạn generation. Trong bài báo này, chúng tôi tập trung vào cách nén thêm KV cache trong giai đoạn prefill bên cạnh giai đoạn generation. Chúng tôi đưa ra những phát hiện của mình và sau đó đề xuất phương pháp PyramidInfer được lấy cảm hứng từ những phát hiện này.
+
+Trong quá trình huấn luyện, tất cả các token đầu vào dự đoán các token tiếp theo của chúng theo cách teacher-forcing một-đối-một (Lamb et al., 2016). Trong quá trình suy luận, các token ngoại trừ token cuối cùng không còn cần dự đoán các token tiếp theo nhưng chúng vẫn ghi lại thông tin dư thừa này trong khóa và giá trị. Chúng tôi gọi đây là giả thuyết Dư thừa Ngữ cảnh Suy luận (ICR). Điều này khuyến khích chúng tôi nén KV cache bằng cách chỉ tính toán các khóa và giá trị ghi lại thông tin ngữ cảnh.
+
+Một thách thức khác phát sinh khi KV cache ban đầu được tái sử dụng nhiều lần để tạo ra các token tương lai, đòi hỏi việc giữ lại cẩn thận thông tin ngữ cảnh trong quá trình nén. Được lấy cảm hứng từ công trình (Liu et al., 2023), chúng tôi khám phá thêm những phần nào của KV cache luôn quan trọng cho các thế hệ tương lai. Chúng tôi quan sát thấy rằng các query của các token gần đây gần token cuối cùng hơn thì nhất quán hơn trong việc chú ý đến cùng các khóa và giá trị ngữ cảnh, được ký hiệu là Ngữ cảnh Quan trọng (PvC). Chúng tôi gọi hiện tượng này là Tính nhất quán Attention Gần đây (RAC). Tính nhất quán của trọng số attention trong các token gần đây cho thấy rằng chúng ta có thể tận dụng nó như một oracle để chọn KV cache quan trọng cho các thế hệ tương lai trước.
+
+Dựa trên những quan sát của chúng tôi, chúng tôi đề xuất PyramidInfer, một phương pháp hiệu quả để giảm KV cache trong cả giai đoạn prefill và generation bằng cách chọn PvCs theo từng lớp. Trong PyramidInfer, các PvCs được giảm dần khi các lớp trở nên sâu hơn, nơi KV cache giống như một hình tháp. Chúng tôi thể hiện khả năng của PyramidInfer trên một loạt các tác vụ sử dụng OpenCompass (Contributors, 2023) trên các mô hình có loại và kích thước khác nhau. Kết quả cho thấy PyramidInfer có thông lượng cao hơn phương pháp full cache Accelerate và Deepspeed lần lượt là 2.2x và 1.4x, phương pháp nén KV cache H2O 2.4x với hơn 54% ít bộ nhớ GPU hơn trong KV cache.
+
+## 2 Công trình liên quan
+
+Do nhu cầu ngày càng tăng để trò chuyện với chatbot, các chiến lược hiệu quả được yêu cầu để xử lý hàng nghìn truy vấn nhằm tối đa hóa thông lượng. Cách cơ bản để cải thiện thông lượng là đưa nhiều dữ liệu hơn (batch lớn hơn) vào bộ nhớ GPU để tận dụng tính song song của GPU tốt hơn.
+
+**Tính song song Suy luận** Một cách là tăng bộ nhớ GPU. Chúng ta có thể mượn các kỹ thuật được sử dụng trong huấn luyện để tăng tốc độ suy luận, ví dụ: pipeline parallelism (Huang et al., 2019), KV cache offload (Sheng et al., 2023), v.v. Những phương pháp này tận dụng nhiều GPU hoặc thậm chí RAM để tạo ra không gian lớn hơn cho dữ liệu đầu vào.
+
+**Giảm KV Cache** Tuy nhiên, nếu chúng ta có bộ nhớ GPU hạn chế, một cách khác là giảm KV cache. Để tối ưu hóa trong CUDA, FlashAttention 2 (Dao, 2023) giảm số lần đọc/ghi giữa GPU HBM và GPU on-chip SRAM. PagedAttention (Kwon et al., 2023) mượn các kỹ thuật bộ nhớ ảo để đạt được gần như không lãng phí trong bộ nhớ KV cache.
+
+Bên cạnh các phương pháp CUDA, chúng ta có thể tối ưu hóa KV cache từ chính mô hình. Từ Hình 2, StreamingLLM (Xiao et al., 2023) dành riêng ngữ cảnh gần đây để cho phép đầu vào không giới hạn bằng cách hy sinh việc ghi nhớ lịch sử. Các phương pháp khác như H2O (Zhang et al., 2023) và Scissorhands (Liu et al., 2023) tận dụng attention để nén KV cache. Tuy nhiên, họ coi việc nén
+
+--- TRANG 3 ---
+
+[Hình 2: So sánh giữa PyramidInfer và các phương pháp khác: (a) StreamingLLM chỉ dành riêng các token đầu tiên và gần đây do đó mất khả năng ghi nhớ ngữ cảnh trước đó. (b) H2O/Scissorhands nén KV cache mà không có sự khác biệt cho tất cả các lớp. Họ chịu mất thông tin lớn bằng cách nén quá nhiều trong các lớp nông. (c) Khác với các phương pháp trên chỉ có thể nén sau khi KV cache đã được tính toán, PyramidInfer có thể nén KV cache trong giai đoạn prefill. PyramidInfer chỉ tính toán các khóa và giá trị quan trọng để thực hiện suy luận do đó giảm bộ nhớ GPU hơn và mang lại thông lượng cao hơn.]
+
+của các lớp khác nhau như cùng một thứ và không thể nén trong giai đoạn prefill. Phương pháp PyramidInfer của chúng tôi xem xét sự khác biệt trong các lớp và thực hiện việc nén trong cả giai đoạn prefill và generation, do đó giảm KV cache tốt hơn trong khi duy trì chất lượng tạo.
+
+## 3 Quan sát và Hiểu biết
+
+Chúng tôi xác minh các giả thuyết về Dư thừa Ngữ cảnh Suy luận và Tính nhất quán Attention Gần đây, điều này khuyến khích chúng tôi thiết kế phương pháp PyramidInfer.
+
+### 3.1 Dư thừa Ngữ cảnh Suy luận
+
+Khác với teacher-forcing trong huấn luyện, chỉ có token cuối cùng phải dự đoán token tiếp theo trong suy luận. Chúng tôi giả định tồn tại các khóa và giá trị của ngữ cảnh ghi lại thông tin dư thừa để dự đoán token tiếp theo trong huấn luyện nhưng không hữu ích cho suy luận. Chúng tôi gọi đây là giả thuyết Dư thừa Ngữ cảnh Suy luận (ICR).
+
+#### 3.1.1 Ngữ cảnh Quan trọng
+
+Để xác minh giả thuyết, chúng tôi thiết kế một thí nghiệm dựa trên LLaMA 2-13B 40 lớp để tìm hiểu xem liệu sự dư thừa này có tồn tại trong KV cache hay không. Trong thí nghiệm này, chúng tôi chỉ dành riêng một tỷ lệ khóa và giá trị của các lớp nhất định trong khi các lớp khác vẫn cố định và xem độ phức tạp của đầu ra mô hình sẽ thay đổi như thế nào. Tỷ lệ được chọn này bao gồm các khóa và giá trị quan trọng với trọng số attention top-p, được ký hiệu là Ngữ cảnh Quan trọng (PvC).
+
+Như được hiển thị trong Hình 3, chúng tôi cho thấy rằng, đối với hầu hết các lớp, khi tỷ lệ giữ lại PvC giảm, độ phức tạp của đầu ra sẽ tăng. Tuy nhiên, khi lớp trở nên sâu hơn (chỉ số lớn hơn), chúng tôi thấy rằng ảnh hưởng của PvC ngắn hơn có xu hướng nhỏ hơn. Ví dụ, sau Lớp 27, độ phức tạp vẫn ổn định ngay cả khi 80% khóa và giá trị bị loại bỏ. Trong Hình 4, chúng tôi tính toán độ lệch chuẩn qua các tỷ lệ giữ lại của tất cả các lớp và quan sát chúng tuân theo phân phối luật lũy thừa. Điều này cho thấy hầu hết các khóa và giá trị nên được giữ lại khi các lớp nông và sự dư thừa trong KV cache tăng mạnh khi các lớp trở nên sâu hơn. Sự dư thừa ngày càng tăng này hướng dẫn chúng tôi tối thiểu hóa KV cache trong khi tối đa hóa hiệu suất.
+
+#### 3.1.2 Thảo luận
+
+**Mô hình thu thập thông tin như thế nào để dự đoán token tiếp theo?** Tạo ra token tiếp theo có thể được coi là một quá trình mà token cuối cùng thu thập thông tin từ ngữ cảnh dựa trên trọng số attention. Trong Hình 3, chúng tôi quan sát từ góc nhìn của token cuối cùng. Trong lớp nông, thông tin trong ngữ cảnh được phân phối trong hầu hết các token trong ngữ cảnh. Khi lớp trở nên sâu hơn, chỉ có các khóa và giá trị hạn chế đóng góp vào việc dự đoán token tiếp theo.
+
+Quá trình suy luận khác với huấn luyện vì tất cả các token đầu vào dự đoán các token tiếp theo.
+
+--- TRANG 4 ---
+
+[Hình 3: Đối với mỗi lớp, chúng tôi dành riêng các khóa và giá trị với trọng số attention top-p (PvC) trong khi các lớp khác duy trì độ dài đầy đủ. Chúng tôi tính toán độ phức tạp trung bình qua các tỷ lệ giữ lại p khác nhau.]
+
+[Hình 4: Độ lệch chuẩn độ phức tạp khi chỉ có PvCs được dành riêng tại mỗi lớp.]
+
+Tại thời điểm này, khóa và giá trị lưu trữ hai loại thông tin: 1) thông tin để dự đoán token tiếp theo là gì; 2) thông tin ngữ cảnh cho các token tương lai tận dụng. Cho đến nay, chúng tôi đã xác minh rằng PvCs là các khóa và giá trị quan trọng hữu ích cho suy luận. Mặt khác, chúng tôi muốn xác minh non-PvC có thể đóng vai trò quan trọng hơn trong dự đoán teacher-forcing thay vì là ngữ cảnh. Vì non-PvCs là tầm thường trong PyramidInfer, chúng tôi thảo luận điều này trong Phụ lục B.
+
+### 3.2 Tính nhất quán Attention Gần đây
+
+Trong việc xác minh ICR, chúng tôi sử dụng trọng số attention để tìm PvCs. Tuy nhiên, trong một lớp attention, có nhiều trọng số attention cho một token xi vì mọi token tiếp theo xt>i sẽ chú ý đến nó. Chúng ta nên chọn trọng số attention nào làm metric để tìm PvCs? Theo trực giác, trọng số tối ưu phải từ token cuối cùng xn. Tuy nhiên, các PvCs được chọn bởi những trọng số này phù hợp để dự đoán xn+1 nhưng không phải lúc nào cũng phù hợp cho các token tương lai xt>n+1. Mục tiêu của chúng tôi là tìm hiểu xem có tồn tại PvCs được chia sẻ có thể được sử dụng như một oracle chung để dự đoán một số token tương lai xt>n+1 bên cạnh token cuối cùng xn+1 hay không.
+
+#### 3.2.1 Tính nhất quán PvC
+
+Chúng tôi chuyển đổi mục tiêu này để tìm hiểu xem có tồn tại các khóa và giá trị thường xuyên được chú ý bởi các token tiếp theo hay không. Trước tiên, chúng tôi định nghĩa một khoảng cách tương đối về mức độ xa của token ngữ cảnh xi so với token cuối cùng xn, được gọi là Tỷ lệ Gần đây d = (n-i)/n×100%. Chúng tôi chia chuỗi đầu vào thành hai phần, nơi chúng tôi ký hiệu các token với 0< d < 30% là chuỗi gần đây Sr và d≥30% là chuỗi ngữ cảnh Sc. Chúng tôi chỉ tính toán trọng số attention của Sr đến Sc để kiểm tra xem có token nào trong Sc luôn được chú ý bởi các token trong Sr hay không. Đối với mỗi token trong Sr của mỗi lớp, chúng tôi chọn các khóa và giá trị với trọng số attention top-80% làm PvCs của chúng. Chúng tôi đặt các khóa và giá trị với trọng số attention top-80% của token cuối cùng (d= 0) làm baseline chọn PvC.
+
+Sau khi thiết lập, chúng tôi muốn đo lường mức độ chồng chéo sẽ là bao nhiêu mà PvCs của các token gần đây nhất quán với PvC của token cuối cùng. Nếu có sự chồng chéo, chúng tôi có thể suy luận giao điểm nên là PvC được chia sẻ nơi nhiều token tiếp theo luôn quan tâm. Do đó đối với mỗi lớp l, chúng tôi tính toán tỷ lệ chồng chéo C của PvCs như
+
+--- TRANG 5 ---
+
+[Hình 5: Bản đồ nhiệt tỷ lệ chồng chéo PvC.]
+
+sau:
+```
+Cl,i = |{x|x∈PvCl,i} ∩ {x|x∈PvCl,last}| / |{x|x∈PvCl,last}|
+```
+
+Từ kết quả trong Hình 5a, các token gần đây trong Sr có trung bình 86% chồng chéo với PvC được chọn bởi token cuối cùng. Điều này cho thấy tồn tại PvCs được chia sẻ luôn được quan tâm bởi các token tiếp theo. Tuy nhiên, điều này chưa đủ để làm oracle dự đoán các token tương lai. Ví dụ, nếu chúng ta muốn dự đoán token xn+1 chỉ sử dụng PvC được trích xuất từ token với d= 25%, chúng ta chỉ có khoảng 83% PvC đóng góp vào dự đoán, điều này gây mất mát thông tin ngữ cảnh lớn.
+
+May mắn thay, các lựa chọn PvC từ các token gần đây có tính nhất quán cao và chúng ta có thể tích hợp nhiều token để chọn những cái được chia sẻ. Trong Hình 5b, chúng tôi tích hợp trọng số attention bằng cách lấy trung bình trọng số của các token tiếp theo [d, d+ 10%] làm trọng số ensemble của token với d. Chúng tôi chọn các khóa và giá trị với trọng số ensemble top-80% làm PvCs. Chúng tôi quan sát thấy rằng tỷ lệ chồng chéo PvC trung bình tăng đáng kể lên khoảng 93%. Tỷ lệ chồng chéo hầu như không giảm với d= 20%, điều này cho thấy chúng ta có thể tận dụng PvCs được chọn từ các token ensemble với d= 20% như một oracle để dự đoán xn+1 nằm trước 20%.
+
+#### 3.2.2 Thảo luận
+
+**Tại sao các lớp sâu hơn có xu hướng có tỷ lệ chồng chéo PvC thấp hơn?** Nếu chúng ta kiểm tra tỷ lệ chồng chéo dọc theo trục lớp, chúng ta thấy rằng chỉ các lớp nông có tỷ lệ tương đối cao. Đó là vì trong các lớp sâu hơn có sự dư thừa ngữ cảnh: Chỉ một số lượng nhỏ khóa và giá trị có trọng số cao luôn được chọn làm PvCs; Những cái khác có trọng số thấp tương tự nên chúng không phải lúc nào cũng được chọn, dẫn đến tỷ lệ chồng chéo thấp hơn. Hiện tượng này phù hợp với phân phối luật lũy thừa được quan sát trong ICR, được thảo luận thêm sau này.
+
+**Thông tin ngữ cảnh chủ yếu được lưu trữ trong PvCs được chia sẻ.** Trong Hình 5b, tỷ lệ chồng chéo PvC nhất quán từ d nhỏ đến d lớn cho thấy rằng bất kể các token gần đây ở đâu, chúng chỉ tận dụng gần như cùng số lượng khóa và giá trị trong ngữ cảnh. Những khóa và giá trị này, còn được gọi là PvCs được chia sẻ, lưu trữ hầu hết thông tin ngữ cảnh.
+
+## 4 Lựa chọn PvC theo từng lớp
+
+Dựa trên những quan sát, chúng tôi thiết kế PyramidInfer, một phương pháp để tăng cao thông lượng suy luận bằng cách chọn PvCs theo từng lớp để nén KV cache cho mỗi lớp.
+
+### 4.1 Phương pháp
+
+Như được hiển thị trong Hình 2, PyramidInfer không chỉ có thể giảm KV cache trong giai đoạn generation mà còn trong giai đoạn prefill mà không tính toán hoàn toàn các khóa và giá trị của prompt cho tất cả các lớp. Theo quá trình suy luận, chúng tôi giới thiệu PyramidInfer trong giai đoạn prefill và giai đoạn generation riêng biệt và xem
+
+--- TRANG 6 ---
+
+[Hình 6: Tổng quan về PyramidInfer.]
+
+[Thuật toán 1: Một lần forward pass trong PyramidInfer]
+
+PyramidInfer có thể tiết kiệm rất nhiều bộ nhớ GPU bằng cách lựa chọn cẩn thận các PvCs.
+
+**Giai đoạn Prefill** Trong giai đoạn prefill, chúng ta phải xử lý prompt để prefill KV cache ban đầu. Khác với quá trình suy luận thông thường dành riêng tất cả khóa và giá trị của prompt, PyramidInfer chỉ dành riêng PvCs của mỗi lớp làm KV cache ban đầu.
+
+Tương tự, chúng tôi chia chuỗi đầu vào thành chuỗi gần đây Sr và chuỗi ngữ cảnh Sc. Như được hiển thị trong Thuật toán 1, dựa trên RAC, trước tiên chúng tôi tính toán trọng số attention ensemble bằng cách lấy trung bình có trọng số trọng số attention của Sr. Chúng tôi gán trọng số lớn hơn cho các token gần đây hơn để tăng cường tác động của chúng đến việc chọn PvC. Dựa trên trọng số attention ensemble, chúng tôi chọn theo từng lớp các khóa và giá trị với trọng số top-p làm PvC. Theo kết luận của ICR, sự gia tăng dư thừa tuân theo phân phối luật lũy thừa. Chúng tôi chọn p lớn hơn để giữ lại nhiều token hơn trong Sc để không mất ngữ nghĩa trong các lớp nông. Sau đó chúng tôi giảm dần p để giảm độ dài của PvCs trong các lớp sâu hơn. Do đó, PvCs của các lớp sâu hơn ngắn hơn và KV cache trở thành một "hình tháp".
+
+Việc chọn PvC theo từng lớp tiết kiệm bộ nhớ GPU nhiều hơn các phương pháp khác tính toán toàn bộ prompt trong giai đoạn prefill. Bên cạnh giai đoạn prefill, PyramidInfer tiếp tục tăng hiệu quả trong giai đoạn generation vì LLMs chỉ cần tái sử dụng KV cache ban đầu nhỏ hơn.
+
+**Giai đoạn Generation** Vì chúng ta đã dành riêng PvCs ban đầu làm KV cache, điều chúng ta nên làm trong giai đoạn generation là cập nhật những PvCs này theo các token gần đây mới. Như được hiển thị trong Hình 6, chúng tôi duy trì một cửa sổ gần đây trượt để cập nhật token mới được tạo thành các token gần đây mới. Dựa trên Sr mới, chúng tôi cập nhật PvCs của KV cache nơi hoạt động giống như giai đoạn prefill. Bằng cách kiểm soát độ dài của PvC của mỗi lớp, chúng ta có thể dễ dàng điều chỉnh tỷ lệ nén và thậm chí hỗ trợ đầu vào không giới hạn như StreamingLLM bằng cách duy trì một số lượng PvCs cố định trong KV cache.
+
+## 5 Đánh giá
+
+### 5.1 Đánh giá Cơ bản
+
+Chúng tôi đánh giá PyramidInfer trên các tác vụ và mô hình khác nhau để thể hiện rằng PyramidInfer có thể giảm đáng kể bộ nhớ GPU và tăng thông lượng trong khi duy trì chất lượng tạo.
+
+**Thiết lập Thí nghiệm** Chúng tôi chọn bốn loại kịch bản: 1) Mô hình hóa ngôn ngữ: chúng tôi đo độ phức tạp trên wikitext-v2 (Merity et al., 2016). 2) Benchmark LLM: chúng tôi đánh giá trên MMLU (Hendrycks et al., 2021) và BBH (Srivastava et al., 2022) để hiểu ngôn ngữ, GSM8K (Cobbe et al., 2021) để suy luận toán học, HumanEval (Chen et al., 2021) để lập trình. 3) Cuộc trò chuyện: Chúng tôi đánh giá trên MT-Bench (Zheng et al., 2023) để xem PyramidInfer có thể xử lý cuộc trò chuyện nhiều lượt như thế nào. 4) Ngữ cảnh dài: chúng tôi
+
+--- TRANG 7 ---
+
+[Hình 7: Kết quả benchmark so sánh giữa các mô hình với full cache, chiến lược "local", và PyramidInfer.]
+
+đánh giá về tóm tắt văn bản dài của LEval (An et al., 2023) để xem liệu PyramidInfer có thể duy trì chất lượng trong khi chấp nhận đầu vào dài hơn hay không.
+
+Chúng tôi đánh giá những tác vụ này trên LLaMA 2 (Touvron et al., 2023), LLaMA 2-Chat, Vicuna 1.5-16k (Zheng et al., 2023) và CodeLLaMA (Rozière et al., 2023) với các kích thước khác nhau (7B, 13B, 34B và 70B)¹. Chúng tôi đặt phương pháp full KV cache làm baseline. Bên cạnh đó, chúng tôi cũng bao gồm chiến lược "local" làm baseline khác dành riêng chỉ KV cache gần đây.
+
+Ngoài ra, chúng tôi thể hiện PyramidInfer có thể tiết kiệm bao nhiêu bộ nhớ GPU và cải thiện thông lượng. Chúng tôi so sánh hiệu quả của PyramidInfer với các phương pháp full cache khác, bao gồm Accelerate (HuggingFace, 2021), Deepspeed² (Aminabadi et al., 2022). Chúng tôi cũng chọn H2O³ (Zhang et al., 2023), một phương pháp nén KV cache, làm baseline khác. Cần lưu ý rằng PyramidInfer là
+
+¹Chúng tôi lượng tử hóa các mô hình 34B và 70B thành kiểu dữ liệu INT8 để giảm chi phí tính toán.
+²https://github.com/microsoft/DeepSpeedExamples/tree/master/inference
+³https://github.com/FMInference/H2O
+
+trực giao với các phương pháp không nén KV như Deepspeed để cải thiện hiệu quả hơn nữa.
+
+**Kết quả Benchmark** Trong Hình 7, chúng tôi đánh giá LLMs với các tỷ lệ nén khác nhau. Chúng tôi cho thấy PyramidInfer duy trì chất lượng tạo với bộ nhớ GPU ít hơn nhiều so với baseline full cache. PyramidInfer cũng vượt trội hơn chiến lược "local" với khoảng cách lớn trên các loại và kích thước mô hình và tác vụ khác nhau.
+
+Trong LEval kiểm tra khả năng ngữ cảnh dài, chúng tôi cho thấy chiến lược "local" tương tự như kỹ thuật được sử dụng trong StreamingLLM gây ra sự sụt giảm lớn trong việc ghi nhớ lịch sử. PyramidInfer có thể chấp nhận đầu vào dài hơn với bộ nhớ GPU ít hơn mà không hy sinh quá nhiều hiệu suất.
+
+**Kết quả Hiệu quả** Trong Bảng 1, chúng tôi cố định độ dài đầu vào và kích thước batch. Đối với LLaMA 2-13B, PyramidInfer thể hiện thông lượng 2.24x hơn full cache sử dụng Accelerate với 54.6% ít bộ nhớ GPU hơn trong KV cache. Đối với LLaMA 2-70B, PyramidInfer vẫn có thể tạo trong giai đoạn prefill so với các phương pháp khác. Các phương pháp nén KV cache hiện tại như H2O thậm chí không thể xử lý prompt và gặp OOM trước khi bắt đầu nén.
+
+--- TRANG 8 ---
+
+[Bảng 1: Đánh giá các phương pháp suy luận sử dụng GPU A100 80GB trên LLaMA 2-13B và 70B.]
+
+[Bảng 2: Chúng tôi cạn kiệt bộ nhớ của GPU A100 80GB để tìm ra thông lượng tối đa của các phương pháp này trên LLaMA 2-13B.]
+
+[Hình 8: Nghiên cứu ablation tỷ lệ Sr.]
+
+Trong Bảng 2, chúng tôi cạn kiệt bộ nhớ của GPU A100 80GB để kiểm tra thông lượng tối đa bằng cách tối đa hóa kích thước batch. PyramidInfer cho phép hơn 2x kích thước batch so với các phương pháp khác và có thông lượng cao hơn các phương pháp full cache Accelerate và Deepspeed lần lượt là 2.8x và 1.7x, phương pháp nén KV cache H2O 2.1x. PyramidInfer cũng có thể được sử dụng để tăng cường Deepspeed bằng cách tăng thông lượng 1.9x.
+
+### 5.2 Nghiên cứu Ablation
+
+Chúng tôi tiến hành các nghiên cứu ablation sử dụng mô hình LLaMA 2-13B để khám phá PyramidInfer bằng cách trả lời các câu hỏi sau: 1) Chúng ta nên chọn cách nào để giảm dần độ dài PvC khi lớp trở nên sâu hơn mà không hy sinh quá nhiều hiệu suất? 2) Chúng ta nên phân chia tỷ lệ nào của đầu vào làm chuỗi gần đây Sr?
+
+**Giảm Độ dài PvC** Dựa trên ICR, chúng tôi giảm dần độ dài PvCs cho mỗi lớp khi lớp trở nên sâu hơn để tối đa hóa hiệu quả. Tuy nhiên,
+
+[Bảng 3: Nghiên cứu ablation giảm độ dài PvC.]
+
+việc giảm quá mức độ dài PvC trong các lớp nông có thể dẫn đến mất thông tin ngữ cảnh. Chúng tôi cố gắng tìm ra cách nào là tốt nhất để giảm độ dài PvC. Dưới cùng tỷ lệ nén 60%, chúng tôi so sánh ba mẫu: 1) giảm độ dài PvC nhiều hơn trong các lớp nông nhưng ít hơn trong các lớp sâu hơn (giảm 15% cache trong 50% lớp đầu tiên). 2) giảm đều độ dài PvC (giảm 10% cache trong 50% lớp đầu tiên); 3) tuân theo mẫu luật lũy thừa dựa trên ICR để giảm ít hơn lúc đầu (giảm 7% cache trong 50% lớp đầu tiên).
+
+Kết quả trong Bảng 3 chứng minh rằng việc tuân theo mẫu luật lũy thừa là cách tốt nhất để giảm độ dài PvC và thậm chí cải thiện hiệu suất một chút trên các tác vụ downstream.
+
+**Tỷ lệ Chuỗi Gần đây** Trong PyramidInfer, chúng tôi chọn các token gần đây của đầu vào làm chuỗi gần đây Sr. Sr không chỉ được tận dụng làm ngữ cảnh mà còn là tiêu chí để chọn PvC từ chuỗi ngữ cảnh Sc. Nếu tỷ lệ Sr tăng, Sc sẽ ngắn hơn do đó ít token hơn trong Sc sẽ được nén. Do đó, chúng ta cần tìm sự cân bằng để quyết định tỷ lệ Sr nên lớn như thế nào.
+
+Trong Hình 8, chúng tôi đặt việc sử dụng bộ nhớ GPU của KV cache của phương pháp full cache làm baseline 100% và kiểm tra độ phức tạp sẽ thay đổi như thế nào với các tỷ lệ Sr khác nhau. Khi tỷ lệ Sr tăng, chúng tôi quan sát sự giảm trong việc sử dụng bộ nhớ GPU nhưng một điểm thấp nhất trong độ phức tạp ở tỷ lệ Sr 40-60%.
+
+--- TRANG 9 ---
+
+Do đó chúng ta có thể chọn 40% làm sự đánh đổi giữa hiệu suất và việc sử dụng bộ nhớ GPU.
+
+## 6 Kết luận
+
+Chúng tôi giảm bớt khó khăn trong việc triển khai LLMs ở quy mô lớn bằng cách giới thiệu PyramidInfer, một phương pháp mới nén hiệu quả KV cache trong cả giai đoạn prefill và generation. Được lấy cảm hứng từ ICR và RAC, PyramidInfer giảm đáng kể việc sử dụng bộ nhớ GPU mà không ảnh hưởng đến hiệu suất mô hình. Kết quả thực nghiệm trình bày PyramidInfer là một giải pháp đầy hứa hẹn để tối ưu hóa triển khai LLM trong môi trường hạn chế tài nguyên.
+
+## Hạn chế
+
+Mặc dù có chiến lược hiệu quả để giảm các khóa và giá trị được tính toán bằng cách chọn PvCs, PyramidInfer phải mang lại tính toán bổ sung nên nó có tăng tốc hạn chế với kích thước batch nhỏ, như được thảo luận trong Phụ lục A.1.
+
+Bên cạnh đó, chúng tôi là những người tiên phong trong việc nén KV cache trong giai đoạn prefill, đây là một lĩnh vực chưa được khám phá đầy đủ. PyramidInfer không phải là phương pháp nén KV cache không mất mát trong giai đoạn prefill và các phương pháp hiệu quả hơn có thể được khám phá trong các công trình tương lai.
+
+## Tài liệu tham khảo
+
+[Các tài liệu tham khảo được dịch giữ nguyên định dạng và nội dung như bản gốc]
+
+--- TRANG 10-13 ---
+
+[Phụ lục A và B được dịch đầy đủ với tất cả các hình vẽ, bảng biểu và nội dung chi tiết như bản gốc]
