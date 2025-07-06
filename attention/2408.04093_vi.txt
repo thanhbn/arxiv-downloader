@@ -1,0 +1,478 @@
+# TREE ATTENTION: GIẢI MÃ NHẬN THỨC TOPOLOGY CHO
+ATTENTION DÀI NGỌN CẢN TRÊN CỤM GPU
+
+Vasudev Shyam1∗, Jonathan Pilault1∗, Emily Shepperd2, Quentin Anthony1, Beren Millidge1
+1Zyphra,22EleutherAI
+jonathan.pilault@gmail.com, vasu@zyphra.com
+
+## TÓM TẮT
+
+Self-attention là hoạt động toán học cốt lõi của các kiến trúc transformer hiện đại và cũng là một nút thắt cổ chai tính toán đáng kể do độ phức tạp bậc hai của nó trong độ dài chuỗi. Trong công trình này, chúng tôi suy ra hàm năng lượng vô hướng mà gradient của nó tính toán khối self-attention, do đó làm sáng tỏ nền tảng lý thuyết của self-attention. Công thức của chúng tôi tiết lộ rằng việc rút gọn qua trục chuỗi có thể được tính toán hiệu quả song song thông qua một tree reduction. Thuật toán của chúng tôi, được gọi là Tree Attention, để song song hóa tính toán attention chính xác qua nhiều GPU cho phép giải mã cross-device được thực hiện nhanh hơn tiệm cận (lên đến 8× nhanh hơn trong các thử nghiệm của chúng tôi) so với các phương pháp tiên tiến như Ring Attention, đồng thời cũng yêu cầu ít khối lượng giao tiếp hơn đáng kể và phát sinh 2× ít bộ nhớ đỉnh hơn. Chúng tôi chứng minh rằng Tree Attention tăng tốc giải mã lên đến 4x trên Llama 3.1-8B và có thể được áp dụng cho nhiều thiết lập phần cứng và mạng khác nhau như nút H100 DGX, nút AMD MI300x, và NVIDIA RTX 4090 kết nối PCIe. Mã của chúng tôi được công khai tại đây: https://github.com/Zyphra/tree_attention
+
+## 1 GIỚI THIỆU
+
+Hoạt động self-attention là khối xây dựng tính toán cốt lõi của kiến trúc transformer Bahdanau et al. (2014); Vaswani et al. (2017), đã trở thành một kiến trúc được ứng dụng rộng rãi và có hiệu quả cao hiện đang được áp dụng quy mô lớn cho ngôn ngữ Brown et al. (2020); Kaplan et al. (2020); Hoffmann et al. (2022); Team et al. (2023); Achiam et al. (2023); Pilault et al. (2023), thị giác Dosovitskiy et al. (2020), âm thanh Betker (2023), và ra quyết định Chen et al. (2021); Reed et al. (2022). Tuy nhiên, độ phức tạp thời gian bậc hai của self-attention có nghĩa là cần tài nguyên đáng kể để huấn luyện và sinh từ các Mô hình Ngôn ngữ Lớn (LLM) dựa trên transformer, đặc biệt cho các mô hình có độ dài ngữ cảnh lớn.
+
+Trong quá trình inference, khối attention phần lớn quyết định các yêu cầu tính toán và bộ nhớ, trở nên đòi hỏi nhiều hơn khi độ dài chuỗi đầu vào tăng. Mặc dù LLM sinh ra một token tại một thời điểm, toàn bộ chuỗi các token trong quá khứ vẫn phải được lưu trữ trong bộ nhớ và sử dụng để tính toán điểm attention trong quá trình sinh. Vì attention thực hiện một việc khớp tương đồng của mỗi biểu diễn token với mọi token khác, nó phát sinh độ phức tạp tính toán bậc hai về mặt flops.
+
+Đã có những tiến bộ gần đây trong việc huấn luyện LLM để xử lý ngữ cảnh cực dài (lên đến 1M token) Chen et al. (2023); kai (2023); Peng et al. (2023). Các mô hình như vậy đạt được những khả năng mới về mặt chất lượng như học trong ngữ cảnh quy mô cực lớn của toàn bộ tập dữ liệu nhỏ được giữ trong prompt Reid et al. (2024); Lee et al. (2024); Bertsch et al. (2024). Chúng cũng có thể tránh việc đưa dữ liệu liên tục đa phương thức qua một sơ đồ token hóa có tổn thất Reid et al. (2024); Team (2024) bằng cách hoạt động trực tiếp ở cấp độ byte Xue et al. (2022); Wu et al. (2024). Tuy nhiên vấn đề là việc thực hiện inference trên các ngữ cảnh dài như vậy rất tốn kém.
+
+Để tăng tốc inference và giảm nhẹ yêu cầu bộ nhớ, các công trình gần đây đã cố gắng thay đổi chính cơ chế attention, hoặc bằng cách tuyến tính hóa nó Katharopoulos et al. (2020), hoặc xấp xỉ nó bằng một kernel map Choromanski et al. (2020b); Peng et al. (2021); Arora et al. (2024), điều này giảm độ phức tạp xuống tuyến tính với chi phí là giảm tính biểu đạt. Những người khác đã phát minh ra các kiến trúc trộn chuỗi thay thế như các mô hình không gian trạng thái được thiết kế để có thể tính toán hiệu quả trong thời gian tuyến tính và bộ nhớ không đổi Gu & Dao (2023); Dao & Gu (2024); Katsch (2023); Sun et al. (2023); Glorioso et al. (2024).
+
+[Hình 1: Topology Ring và Tree Attention. Do tính chất kết hợp của các hoạt động logsumexp và max của Tree Attention (Hình 1(a)), có thể cấu trúc việc rút gọn qua chuỗi như một cây, yêu cầu ít bước giao tiếp tiệm cận hơn Ring Attention (Hình 1(b)) cũng như ít bộ nhớ và khối lượng giao tiếp hơn.]
+
+Các phương pháp khác sử dụng thuật toán hiệu quả để giảm gánh nặng tính toán của attention trong khi giữ nguyên tính toán cốt lõi. Những phương pháp này bao gồm memory-efficient attention Rabe & Staats (2021), Flash Attention Dao et al. (2022) và Flash Decoding fla (2024), cung cấp một tập hợp các kernel nhận thức IO để ánh xạ hoạt động attention lên tài nguyên phần cứng GPU một cách cực kỳ hiệu quả, giảm đáng kể overhead bộ nhớ yêu cầu. Các công trình tiếp theo Character AI (2024); Kang et al. (2024); Liu et al. (2024); Nawrot et al. (2024) khám phá việc nén hoặc giảm KV cache cần thiết trong quá trình sinh. Cuối cùng, Ring Attention Liu et al. (2023) đề xuất một cách để song song hóa tính toán attention qua trục chuỗi giữa các GPU, do đó cho phép ngữ cảnh dài hơn đáng kể so với có thể phục vụ trên một GPU đơn. Vì phương pháp đề xuất của chúng tôi là một tính toán chính xác của attention¹, nó là một plugin thay thế cho bất kỳ cơ chế song song chuỗi đa GPU nào như các cơ chế Ring Attention tiên tiến. Bằng cách tận dụng hàm năng lượng chính xác cho khối self-attention, chúng tôi phát triển một phương pháp để tăng tốc inference cho các trường hợp sử dụng ngữ cảnh dài khi keys và values được chia sẻ qua nhiều GPU dọc theo trục chuỗi.
+
+Thuật toán đề xuất của chúng tôi để tính toán attention thông qua gradient của hàm năng lượng được xây dựng dựa trên một chiến lược tính toán song song hiệu quả và giao tiếp tree reduction. Đặc biệt, công thức này cho phép chúng tôi thiết kế một thuật toán nhanh hơn tiệm cận để thực hiện giải mã trong đó số bước giao tiếp tỷ lệ logarithmic với số thiết bị, thay vì tuyến tính như trong các phương án thay thế như Ring Attention Liu et al. (2023). Phương pháp nhận thức topology của chúng tôi được minh họa trong Hình 1 vượt trội đáng kể so với các phương pháp song song attention hàng đầu như Ring Attention trên nhiều thiết bị.
+
+## 2 CÔNG TRÌNH LIÊN QUAN
+
+Độ phức tạp tính toán của self-attention, được giới thiệu bởi Vaswani et al. (2017), đặt ra thử thách cho các chuỗi dài do sự phụ thuộc bậc hai vào độ dài chuỗi, 𝑂(𝑛²·𝑑). Để giải quyết điều này, các cơ chế xấp xỉ attention như Linformer (Wang et al., 2020) và Performer (Choromanski et al., 2020a) giảm độ phức tạp xuống tuyến tính 𝑂(𝑛) sử dụng các phép chiếu low-rank và xấp xỉ kernelized trên một thiết bị đơn. Các mô hình thưa thớt như Longformer (Beltagy et al., 2020) và BigBird (Zaheer et al., 2020) tối ưu hóa thêm các tính toán bằng cách hạn chế attention vào các cửa sổ địa phương hoặc mẫu thưa thớt, giảm đáng kể nhu cầu tài nguyên trong khi duy trì hiệu suất cho các tác vụ cụ thể. Tuy nhiên các phương pháp như vậy cung cấp xấp xỉ cho cơ chế attention trong khi chúng tôi tìm cách song song hóa tính toán attention chính xác qua trục chuỗi.
+
+Công trình lý thuyết cũng đã đóng góp vào việc cải thiện hiệu quả của cả phương pháp chính xác và xấp xỉ. Các phương pháp dựa trên kernel, như những phương pháp của Tsai et al. (2019), đề xuất các công thức thay thế cho self-attention có hiệu quả tính toán. Các khảo sát như Tay et al. (2020) nhấn mạnh những tiến bộ này, nhấn mạnh sự phối hợp giữa các chiến lược song song hóa và các kỹ thuật thưa thớt hoặc xấp xỉ, đảm bảo self-attention vẫn có thể mở rộng ngay cả trong môi trường tính toán hạn chế. Cũng cần lưu ý rằng Duman Keles et al. (2022) đã thiết lập các giới hạn dưới về độ phức tạp tính toán của self-attention, chứng minh rằng việc đạt được độ phức tạp thời gian dưới bậc hai là không khả thi trừ khi Giả thuyết Thời gian Hàm mũ Mạnh (SETH) là sai.
+
+Ngoài các phương pháp xấp xỉ, một số phương pháp tập trung vào việc song song hóa các tính toán attention chính xác. FlashAttention (Dao et al., 2022), chẳng hạn, tổ chức lại tính toán attention thành các khối nhỏ hơn, hiệu quả bộ nhớ tận dụng hệ thống phân cấp bộ nhớ GPU để cho phép xử lý song song attention chính xác nhanh hơn, và bằng cách đó giảm độ phức tạp bộ nhớ từ bậc hai xuống tuyến tính. Các kỹ thuật khác sử dụng các hoạt động ma trận được tối ưu hóa và chiến lược tiling để phân phối các tính toán attention qua các core hoặc thread một cách hiệu quả (Shen et al., 2021). Trong khi các phương pháp này nhằm tối đa hóa throughput trong khi duy trì độ chính xác của attention chính xác, chúng tập trung vào việc tăng tốc tính toán attention trên thiết bị đơn. Vì chúng tôi song song hóa attention chính xác qua nhiều thiết bị, Ring Attention (Liu et al., 2023) có thể so sánh nhất với công trình của chúng tôi. Cuối cùng, theo hiểu biết tốt nhất của chúng tôi, không có kỹ thuật nào khác khám phá giải mã song song đa thiết bị như chúng tôi đã làm trong bài báo này.
+
+## 3 SELF-ATTENTION
+
+Hoạt động self-attention có thể được biểu diễn như một tập hợp các tìm kiếm tương đồng dot product giữa queries và keys. Các điểm tương đồng này sau đó được rút gọn dọc theo trục chuỗi và softmaxed, sao cho đối với một query cho trước, có một phân phối xác suất của các tương đồng của mỗi key cho trước. Sau đó chúng ta lấy kỳ vọng của các vector value với phân phối này. Chúng ta ký hiệu các queries được gán cho một chuỗi có độ dài 𝑁 là {𝑞ₐ, 𝑎=1,···𝑁}, trong đó mỗi query là một vector có kích thước 𝑑 đại diện cho hidden dimension, 𝑞ₐ∈ℝᵈ, và tương tự các keys và values {(𝑘ₐ,𝑣ₐ), 𝑎=1,···𝑁}. Attention có thể được viết như
+
+𝑧ₐ = ∑ᵢ₌₁ᴺ softmax(𝑞ₐ·𝑘ᵢᵀ)𝑣ᵢ.
+
+Việc tính toán attention một cách ngây thơ theo cách này yêu cầu cụ thể hóa ma trận 𝑞𝑘 với chi phí tính toán và bộ nhớ bậc hai trong độ dài chuỗi. Memory-efficient attention Rabe & Staats (2021) là một cách lặp để tính toán các tương đồng softmax mà không bao giờ phải cụ thể hóa ma trận attention đầy đủ. Nó thực hiện các hoạt động sau, một query (hoặc một chunk queries) tại một thời điểm:
+
+𝑠ᵢ⁽ʲ⁾ = exp(𝑞ⱼ·𝑘ᵢ) (1)
+𝑛ᵢ⁽ʲ⁾ = 𝑛ᵢ₋₁⁽ʲ⁾ + 𝑣ᵢ𝑠ᵢ⁽ʲ⁾ (2)
+𝑑ᵢ⁽ʲ⁾ = 𝑑ᵢ₋₁⁽ʲ⁾ + 𝑠ᵢ⁽ʲ⁾ (3)
+
+Sau đó, một khi các giá trị 𝑣 và mẫu số softmax 𝑑 được tính toán, chúng ta chia để có điểm softmaxed cuối cùng 𝑧⁽ʲ⁾ = 𝑛⁽ʲ⁾/𝑑⁽ʲ⁾ cho mọi chỉ số query 𝑗. Việc tính toán attention theo cách lặp này giảm đáng kể bộ nhớ yêu cầu.
+
+Flash Attention Dao et al. (2022) sử dụng một phương pháp tương tự để giảm chi phí bộ nhớ và tính toán của attention, nhưng thuật toán không được điều chỉnh cho tính toán đa GPU. Flash Attention thực hiện thuật toán lặp của Rabe & Staats (2021) theo cách blockwise, sử dụng các primitive tính toán song song khối có sẵn bên trong tensor cores của GPU đơn. Ngoài ra, nó định kích thước chính xác các khối sao cho chúng có thể vừa vào SRAM của GPU cho toàn bộ tính toán attention, thực hiện hiệu quả kernel fusion và ngăn chặn nhiều hoạt động IO không cần thiết.
+
+## 4 SELF-ATTENTION NHƯ GRADIENT CỦA MỘT HÀM NĂNG LƯỢNG
+
+Theo thành công phổ biến của kiến trúc transformer, đã có nỗ lực đáng kể để hiểu toán học về bản chất và ý nghĩa của hoạt động attention và liên kết nó với các mô hình năng lượng (Krotov & Hopfield, 2016; Krotov, 2021; Millidge et al., 2022; Hoover et al., 2024), như Hopfield Networks (Ramsauer et al., 2020; D'Amico & Negri, 2024). Ramsauer et al. (2020) tiên phong trong lĩnh vực này bằng cách thực hiện một phân tích tương tự nhưng khác biệt để liên hệ self-attention với các mạng Hopfield hiện đại, cung cấp một diễn giải mới và sâu sắc về self-attention như thực hiện tìm kiếm bộ nhớ hetero-associative sử dụng một hàm tương đồng phi tuyến mạnh. Công trình này sau đó được mở rộng bởi Hoover et al. (2023), người đã suy ra một phiên bản modified của transformer dựa trên một hàm năng lượng. Tuy nhiên, trong khi từ lâu đã biết rằng hoạt động softmax có thể được suy ra như gradient của hàm vô hướng sau:
+
+∂/∂z_j log(∑ᵃ₌₁ⁿ exp(zₐ)) = e^z_j / ∑ᵃ₌₁ⁿ e^zₐ = softmax(z_j), (4)
+
+được biết đến như log-sum-exp, một hàm tương đương cho khối self-attention vẫn chưa được suy ra.
+
+Chúng tôi phát triển trong bài báo này một liên kết giữa attention và các hàm năng lượng bằng cách giới thiệu một vector nguồn phụ trợ ζ, đại diện cho "đóng góp bên ngoài" cho năng lượng của hệ thống (Hopfield, 1982). Nguồn ζ là tham số mà chúng ta tính gradient của hàm năng lượng vô hướng để có được hoạt động self-attention. Như chúng ta sẽ thấy, chúng ta cần nguồn để viết ra hàm sinh của các moment của phân phối vì việc lấy gradient theo ζ sẽ cho hoạt động self-attention chính xác.
+
+Hiểu biết này cho phép chúng ta đưa ra quan sát sau:
+
+**Quan sát 1.** Attention có thể được biểu diễn như gradient của một hàm năng lượng vô hướng 𝐹(ζ) theo nguồn ζ, sao cho:
+
+∑ᵃ₌₁ᴺ softmax(q·kₐ)vₐ = ∂F/∂ζ|_{ζ=0}, (5)
+
+trong đó hàm sinh moment (tức là hàm năng lượng) 𝐹(ζ) được định nghĩa là:
+
+F(ζ) = log ∑ₐ exp(q·kₐᵀ + ζ·vₐᵀ). (6)
+
+Bằng chứng của Quan sát 1 có thể được tìm thấy trong Phụ lục C.1. Xin lưu ý rằng công thức này cũng cho phép đưa ra diễn giải Bayesian của Attention trong Phụ lục C.2 và thúc đẩy thuật toán Tree Attention của chúng tôi trong Phần 5 tiếp theo.
+
+## 5 TREE ATTENTION
+
+Trong phần này chúng tôi cho thấy cách công thức của hoạt động attention như gradient của một hàm năng lượng đề xuất một chiến lược song song hiệu quả để tính toán nó. Hiểu biết chính là tận dụng một thuật toán hiệu quả để tính toán năng lượng, và sau đó vi phân nó để có được một thuật toán hiệu quả để tính toán attention.
+
+### 5.1 TÍNH TOÁN HÀM NĂNG LƯỢNG HIỆU QUẢ
+
+Hãy tập trung vào trường hợp giải mã với KV cache trong một mô hình ngôn ngữ causal trong đó chúng ta có một query và 𝑁 keys và values. Trong trường hợp này, hàm năng lượng là:
+
+F_dec = log ∑ᵃ₌₁ᴺ exp(q·kₐᵀ + ζ·vₐᵀ) ≡ logsumexp_a({q·kₐᵀ + ζ·vₐᵀ, a=1,···,N}). (7)
+
+Một sự thật quan trọng là cả logsumexp_a và max_a đều là các hoạt động kết hợp:
+
+logsumexp_a({T_a, logsumexp_a({R_a, S_a})}) = logsumexp_a({logsumexp_a({T_a, R_a}), S_a}),
+max_a({max_a({T_a, R_a}), S_a}) = max_a({T_a, max_a({R_a, S_a})}).
+
+Chúng ta có thể chứng minh rằng tính chất kết hợp này cho phép các reduction này được thực hiện hiệu quả song song với độ phức tạp thời gian logarithmic, miễn là chúng ta có đủ nhiều worker song song:
+
+**Định lý 1.** Độ phức tạp thời gian của một hoạt động reduction liên quan đến một hàm kết hợp, như logsumexp_a hoặc max_a, trên một mảng có kích thước 𝑁 sử dụng 𝑝 processor song song là 𝑂(𝑁/𝑝 + log 𝑝). Khi số processor 𝑝 bằng 𝑁, độ phức tạp thời gian được giảm xuống 𝑂(log 𝑁).
+
+Bằng chứng của Định lý 1 trong Phụ lục E.
+
+Kết hợp kết quả này, và cho â, b̂ ∈ {1,···,t} là các chỉ số intra-chunk, chúng ta có Thuật toán 1 song song cao như sau:
+
+**Thuật toán 1** Single Query Energy Forward (tính toán logsumexp)
+1: Chia k,v ∈ ℝᴺˣᵈʰ thành 𝑝 chunks {k_â, v_â, â ∈ {1,···,N/p}} có kích thước t = N/p
+2: Phân tán một bản sao của q, ζ, và mỗi k_â, v_â đến mỗi processor trong số 𝑝 processors.
+3: Tính toán song song r_â = q·k_âᵀ + ζ·v_âᵀ
+4: Tính toán m = Reduce(max, r_â) bằng cách thực hiện tree reduction.
+5: Phân tán m đến mọi thiết bị và cập nhật r_â → r_â - m.
+6: Tính toán lse = Reduce(logsumexp, r_â) bằng cách thực hiện tree reduction.
+7: Lưu lse, m cho gradient w.r.t ζ.
+8: Trả về lse
+
+### 5.2 GIẢI MÃ SONG SONG HIỆU QUẢ
+
+Một trong những hiểu biết cốt lõi của automatic differentiation là gradient của một hàm ∇_x f(x) có thể được tính toán với cùng độ phức tạp thời gian như tính toán f(x) Vieira (2016). Tuy nhiên cảnh báo là nếu hàm có một computational graph sâu, thì dấu chân bộ nhớ của việc tính toán gradient tăng theo độ sâu đó vì backpropagation yêu cầu lưu trữ các giá trị của các tensor trung gian. Trong trường hợp của chúng ta, computational graph liên quan đến việc tính toán năng lượng là nông và do đó overhead bộ nhớ là không đáng kể. Điều này có nghĩa là nếu chúng ta có thể tính toán năng lượng hiệu quả, chúng ta có được một thuật toán hiệu quả để tính toán gradient của nó (tức là hoạt động self-attention) một cách tự động.
+
+Trong trường hợp của chúng ta, chúng ta muốn tính toán gradient của hàm năng lượng theo ζ_A và sau đó đặt nó bằng không. Điều này có thể được thực hiện với các engine automatic differentiation đã đặt ζ là một tensor của các số không từ đầu. Tuy nhiên chúng ta có thể thực hiện thủ công một gradient theo ζ pass của Thuật toán 1 ở trên mà không cụ thể hóa ζ trong Thuật toán 2 dưới đây. Lưu ý đặc biệt rằng khi chúng ta đặt ζ_A = 0, A ∈ {1,···,d_h} thì lse chỉ liên quan đến logsumexp của dot product giữa queries và keys.
+
+**Thuật toán 2** Tree Decoding (sử dụng atomic operation trên mỗi thiết bị)
+1: Chia k,v ∈ ℝᴺˣᵈʰ thành 𝑝 chunks {k_â, v_â, â ∈ {1,···,N/p}} có kích thước t = N/p
+2: Tính toán m và lse sử dụng Thuật toán 1.
+3: Phân tán một bản sao của q, m và lse, và mỗi k_â, v_â đến mỗi processor trong số 𝑝 processors.
+4: Tính toán song song r_â = q·k_âᵀ - m
+5: Tính toán R_â = exp(r_â)/exp(lse)·v_â = exp(r_â - lse)·v_â
+6: Tính toán z = Reduce(sum, R_â)
+7: Trả về z
+
+Lưu ý ở đây rằng bằng cách lưu trữ lse, m cho backward pass, hoạt động reduction duy nhất còn lại cần được thực hiện là hoạt động ở dòng 5 của thuật toán trên. Reduction đơn này mất thời gian 𝑂(N/p) để tính toán các tổng địa phương trên mỗi thiết bị và thời gian log p để giao tiếp và kết hợp các kết quả partial, và do đó chúng ta có cùng độ phức tạp tiệm cận như việc tính toán logsumexp.
+
+Trong thực tế, chúng tôi thực hiện forward và gradient w.r.t. ζ trong một hàm duy nhất trả về cả giá trị và gradient của hàm năng lượng. Do đó chúng ta có thể kết hợp Thuật toán 1 và 2 thành Thuật toán 3 giải mã song song hiệu quả sau:
+
+**Thuật toán 3** Tree Decoding (sử dụng Flash Attention 2 trên mỗi thiết bị)
+1: Chia k,v ∈ ℝᴺˣᵈʰ giữa 𝑝 GPU, mỗi GPU với một chunk {k_â, v_â, â ∈ {1,···,N/p}} có kích thước t = N/p và phân tán q đến mỗi GPU.
+2: Sử dụng Flash Attention 2 để tính toán o = (∑_â exp(q·k_âᵀ)v_â)/(∑_b̂ exp(q·k_b̂ᵀ)) và lse = log ∑_b̂ exp(q·k_b̂ᵀ).
+3: Tính toán lại global max m = Allreduce(max, lse).
+4: Lấy numerator và denominator địa phương bằng cách tính toán: n = o*exp(lse - m), d = exp(lse - m).
+5: Tính toán numerator và denominator toàn cầu với: n_g = Allreduce(sum, n), d_g = Allreduce(sum, d).
+6: Trả về kết quả z = n_g/d_g.
+
+Thuật toán này yêu cầu ba hoạt động Allreduce tổng cộng, có nghĩa là độ phức tạp thời gian yêu cầu là 𝑂(3(N/p + log p)).
+
+### 5.3 CÁC HOẠT ĐỘNG COLLECTIVE HIỆU QUẢ SỬ DỤNG TOPOLOGY-AWARENESS
+
+**Communication overheads** Trong khi phân tích lý thuyết ở trên chỉ ra rằng chúng ta nên thấy speedups khi sử dụng tree-based reductions, điều này không nhất thiết được đảm bảo trong thực tế do các overhead tiềm năng khác nhau. Đặc biệt, lập luận của chúng tôi về độ phức tạp thời gian của thuật toán Tree Decoding đề xuất giả định rằng giao tiếp của các kết quả partial là tức thời, điều mà trong thực tế không bao giờ xảy ra. Thực tế, khi chúng ta mở rộng độ dài chuỗi, hoặc số GPU đặc biệt đến thiết lập multi-node, thời gian giao tiếp là đóng góp chủ đạo cho tổng thời gian thực thi. Tuy nhiên, quan trọng là, ngoài lợi ích tiệm cận, Tree Attention có lợi từ việc tận dụng topology hai cấp tiêu chuẩn trong các cụm GPU hiện đại.
+
+[Hình 2: NCCL Send/Recv giữa hai GPU H100 intra-node và inter-node. Các cụm GPU cung cấp topology hai tầng trong đó băng thông intra-node cao hơn đáng kể so với inter-node. Các thuật toán như Tree Attention khai thác topology này bằng cách giảm yêu cầu giao tiếp inter-node, cho phép overlap tốt hơn của giao tiếp với tính toán.]
+
+Chúng tôi benchmark thuật toán của mình với một thuật toán attention song song chuỗi được đề xuất trước đó gọi là Ring Attention. Như thuật toán của chúng tôi, Ring Attention giả định rằng chuỗi được chia sẻ qua các GPU và thực hiện tính toán attention mà không thu thập tất cả chuỗi vào một thiết bị duy nhất. Thay vào đó, nó giao tiếp các shard của keys và values theo cách point-to-point giữa các GPU láng giềng được sắp xếp logic trong topology vòng. Giao tiếp này được overlap với tính toán của shard địa phương của output. Ngược lại với chiến lược này, thuật toán của chúng tôi phân tán query và giao tiếp kết quả partial qua tất cả GPU khi thực hiện hoạt động AllReduce, nhưng không di chuyển các shard key và value giữa các GPU. Do đó, trong trường hợp giải mã, phương pháp của chúng tôi có lợi từ việc có khối lượng giao tiếp thấp hơn và chịu ít overhead chi phí giao tiếp hơn Ring Attention.
+
+**Implications of network bandwidth hierarchy** Ring Attention về bản chất không nhận thức topology, và chỉ mở rộng trong một mạng băng thông đồng nhất. Tuy nhiên, điều này mâu thuẫn với topology mạng hai cấp của các cụm GPU hiện đại, sử dụng các interconnect băng thông cao trong các node (NVLINK hoặc PCIe) và các interconnect băng thông tương đối thấp hơn qua các node (InfiniBand hoặc Ethernet). Các interconnect khác nhau rất nhiều về băng thông và latency (xem Hình 2). Do đó, Ring Attention bị bottleneck bởi interconnect chậm nhất, và không thể luôn overlap tính toán attention với giao tiếp. Chúng tôi thảo luận điểm này thêm trong 6.3 Tree Attention cải thiện Ring Attention bằng cách sử dụng các mẫu giao tiếp nhận thức topology mạng để tăng overlap của tính toán và giao tiếp, và giảm bottleneck khả năng mở rộng này về giao tiếp từ tính toán attention phân tán.
+
+Trong thực tế, các thư viện giao tiếp collective như NCCL cố gắng tự động phát hiện chiến lược giao tiếp đúng dựa trên các cân nhắc như khối lượng dữ liệu và topology mạng. Trong các cụm DGX, đối với các hoạt động collective trong một node, ring reduce được thực hiện trong khi tree reduction được thực hiện qua các node. Chúng ta thấy rằng do đó việc sử dụng các hoạt động collective tích hợp như Allreduce dẫn đến hiệu suất tốt hơn khi giải mã từ ngữ cảnh dài qua nhiều GPU so với việc ép buộc mẫu giao tiếp point to point của Ring Attention. Chúng tôi cho thấy cách chiến lược sau vượt trội Ring Attention khi giải mã từ ngữ cảnh rất dài qua nhiều GPU.
+
+Trong các thí nghiệm thực nghiệm, chúng tôi sử dụng Flash Attention 2 (Dao, 2023) trong mỗi thiết bị, cả cho thuật toán của chúng tôi và cho Ring Attention². Chúng tôi cung cấp một implementation JAX đơn giản của phương pháp chúng tôi trong Phụ lục D. Lưu ý rằng phương pháp của chúng tôi nhân bản Flash Decoding (fla, 2024) ngoại trừ trong trường hợp đó, việc song song hóa xảy ra ở cấp độ của các streaming multiprocessor (SM) khác nhau trong một GPU trong khi chúng tôi song song hóa giữa các GPU khác nhau. Tất cả các tính toán được thực hiện trong BF16.
+
+## 6 KẾT QUẢ
+
+Tương tự như Ring Attention, Tree Attention là một tính toán chính xác của attention. Vì các metric huấn luyện và đánh giá giống như đối với attention, kết quả thí nghiệm của chúng tôi tập trung chủ yếu vào latency trong phần 6.1, sử dụng bộ nhớ đỉnh trong phần 6.2 và khối lượng giao tiếp trong phần 6.3. Vì thuật toán của chúng tôi tính toán kết quả giống hệt số như forward pass của attention tiêu chuẩn, kết quả hiệu suất của chúng tôi chuyển giao liền mạch đến các kiến trúc transformer.
+
+Chúng tôi đã thực hiện các thí nghiệm trong Phần 6.1 đến 6.3 trên một cụm DGX H100 gồm 16 node, mỗi node chứa 8 GPU H100. Tất cả GPU trong node được kết nối qua topology NVLINK 4.0 all-to-all (900GBps). Các node được kết nối với nhau qua 8 interconnect InfiniBand NDR mỗi node (1 trên mỗi GPU), mỗi interconnect cung cấp 400 Gbps (dẫn đến băng thông injection node tổng hợp 3.2 Tbps).
+
+Chúng tôi cũng cho thấy so sánh Ring Attention và Tree Attention khi được sử dụng trong mô hình Llama 3 (Grattafiori et al., 2024) trong Phần 6.4 và C.3 trên các loại GPU và interconnect khác nhau: 8 GPU H100 với NVLINK 4.0, 8 GPU AMD MI300X với AMD infinity fabric cho giao tiếp intra-node và RoCE cho giao tiếp inter-node, và 2 GPU RTX 4090 với interconnect PCIe.
+
+### 6.1 LATENCY
+
+Về mặt tính hữu ích thực tế, nghiên cứu của chúng tôi về hàm năng lượng đã làm sáng tỏ một khả năng song song hóa chưa được chú ý trước đây bên trong tính toán attention – đó là reduction của logsumexp qua chiều chuỗi, có thể được thực hiện như một Allreduce song song. Như đã nêu trong Định lý 1, về mặt lý thuyết có thể thực hiện attention, mỗi query như các hoạt động song song N/p + log(p) thay vì N, trong đó số hạng logarithmic tỷ lệ với số thiết bị có sẵn để song song hóa. Khi attention được chia sẻ qua nhiều thiết bị, speedup tiệm cận này tạo ra speedup đáng kể so với các phương pháp thay thế cho giải mã.
+
+Để kiểm tra thực nghiệm lợi ích lý thuyết của phương pháp Tree Attention, chúng tôi tính toán latency bằng cách đo thời gian cần thiết để thực hiện giải mã cho các độ dài chuỗi khác nhau và số node H100 thay đổi. Chúng tôi so sánh Tree Attention với thời gian thực thi Ring Attention của chính chúng tôi trong Hình 3. Cả hai phương pháp đều sử dụng Flash Attention 2 Dao (2023) cho tính toán attention trên GPU cá nhân. Đối với các thí nghiệm của chúng tôi, chúng tôi benchmark trên một khối attention tiêu chuẩn gồm 16 head có chiều 128 qua các độ dài chuỗi khác nhau.
+
+Kết quả latency của chúng tôi cho thấy cách Tree Attention cải thiện so với Ring Attention khi chúng ta tăng độ dài chuỗi trong Hình 3(a) và tăng số GPU trong Hình 3(b). Để làm nổi bật tốt hơn các xu hướng thời gian thực thi với độ dài chuỗi tăng, chúng tôi cũng đã thêm thời gian thực thi tương đối của cả hai phương pháp so với thời gian thực thi của ring attention ở độ dài chuỗi 80k. Với thời gian thực thi tương đối trong Hình 3(a), chúng ta nhận thấy rằng thời gian thực thi của Tree attention trở nên phẳng khi số GPU tăng, trong khi thời gian thực thi tương đối của Ring Attention tiếp tục tăng. Như các đồ thị chứng minh, khi chúng ta mở rộng độ dài chuỗi hoặc số GPU, khoảng cách giữa thời gian thực thi Tree Attention và Ring Attention mở rộng tiệm cận.
+
+Đáng chú ý, Tree Attention đạt được speedup gần ×8 khi chúng tôi sử dụng 128 GPU trên độ dài chuỗi 5.12M. Chúng tôi mong đợi xu hướng này tiếp tục cho các độ dài chuỗi lớn hơn. Xin lưu ý rằng cụm DGX của chúng tôi được tạo thành từ 16 node mỗi node có 8 GPU. Kết quả cho 8 GPU sử dụng một node, cho 64 GPU sử dụng 8 node và cho 128 GPU sử dụng 16 node.
+
+### 6.2 CHI PHÍ BỘ NHỚ
+
+[Hình 4: Sử dụng bộ nhớ đỉnh của một khối attention đơn với Tree Attention vs Ring Attention khi được chia sẻ giữa hai RTX 4090. Kết quả được lấy bằng JAX memory profiler trên một GPU. Sự khác biệt về bộ nhớ đỉnh tỷ lệ với kích thước ẩn và độ dài chuỗi.]
+
+Để thực hiện Ring Attention với KV cache phân tán, cần phải broadcast query tương ứng với phần tử cuối cùng của chuỗi trở lại tất cả các thiết bị, như được nêu trong bước 2 của Thuật toán 1. Mỗi thiết bị sau đó sẽ giữ một tuple (q, k_â, v_â), trong đó â là chỉ số chunk, bao gồm vector query và một chunk địa phương của keys và values cụ thể cho chunk chuỗi trên thiết bị đó. Chi phí bộ nhớ để lưu trữ các đối tượng này giống như đối với Tree Decoding.
+
+Ngoài ra, Ring Attention phải lưu trữ k_â', v_â' đến từ thiết bị láng giềng và chunk của output o có cùng hình dạng với query được giữ bởi thiết bị đó. Ngược lại, phương pháp của chúng tôi yêu cầu lưu trữ thay vào đó chỉ chunk giao tiếp của numerator n, denominator d và max m. Chúng tôi không pre-allocate một tensor output mà thay vào đó chỉ trả về kết quả của việc thực hiện Allreduce cho numerator chia cho Allreduced denominator. Tóm lại chúng ta có các chi phí bộ nhớ đỉnh sau cho Ring và Tree attention:
+
+Mem_ring = 4btd + 2bd (8)
+Mem_tree = 2btd + 2bd + 2bn_h, (9)
+
+trong đó d = d_h × n_h, cho head size d_h và n_h số head, b biểu thị batch size và t = N/p. Như vậy, miễn là 2bn_h ≤ 2btd, điều mà hầu như luôn luôn xảy ra trong các tình huống thực tế, phương pháp của chúng tôi luôn có chi phí bộ nhớ đỉnh thấp hơn so với Ring Attention.
+
+Chúng tôi đo thực nghiệm việc sử dụng bộ nhớ đỉnh cho phương pháp của chúng tôi và Ring Attention để cho thấy rằng thực sự việc sử dụng bộ nhớ ít hơn đáng kể cho Tree Attention trong Hình 4. Như được dự đoán bởi lý thuyết, việc mở rộng kích thước ẩn hoặc độ dài chuỗi mở rộng việc sử dụng bộ nhớ đỉnh Ring Attention khoảng 2× nhanh hơn Tree Attention. Ví dụ, việc tăng gấp đôi kích thước ẩn từ 2048 lên 4096, tăng gấp đôi khoảng cách bộ nhớ đỉnh giữa hai phương pháp, từ 524MB lên 1040MB.
+
+### 6.3 KHỐI LƯỢNG GIAO TIẾP
+
+Đối với chiến lược giao tiếp P2P của Ring Attention, tổng khối lượng dữ liệu được giao tiếp giữa các thiết bị (theo đơn vị số phần tử tensor) mỗi lần lặp tỷ lệ với p và được cho bởi:
+
+V_ring = 2btd × p (10)
+
+trong đó p là số thiết bị. Yếu tố đầu tiên đến từ việc đếm tổng số phần tử được giao tiếp tương ứng với {(k_â, v_â), â=1,···,t}, tức là
+
+numel({(k_â, v_â), â=1,···,t}) = 2btd. (11)
+
+Chiến lược Allreduce chúng tôi sử dụng trong Tree Decoding yêu cầu khối lượng sau Anthony et al. (2024):
+
+V_Allreduce = 2 × (p-1)/p × numel. (12)
+
+Chúng tôi giao tiếp một shard của numerator, denominator và max, yêu cầu:
+
+numel(n,d,m) = bd + 2bn_h. (13)
+
+Lưu ý rằng chúng tôi đầu tiên thực hiện trên thiết bị các reduction địa phương để có được numerator và denominator địa phương trên mỗi thiết bị điều này do đó làm cho t, tức là kích thước của chunk chuỗi địa phương không xuất hiện trong biểu thức trên. Sau đó chúng ta có được:
+
+V_Tree = 2(p-1)/p × (bd + 2bn_h). (14)
+
+Phân tích lý thuyết của chúng tôi cho thấy rằng mỗi lần lặp thuật toán của chúng tôi duy trì khối lượng giao tiếp thấp hơn Ring Attention. Tuy nhiên lưu ý rằng Ring Attention khi được thực hiện trong thiết lập huấn luyện với nhiều query overlap giao tiếp và tính toán để ẩn chi phí giao tiếp của nó. Tuy nhiên, việc overlap giao tiếp và tính toán trong trường hợp giải mã là không khả thi vì tính toán attention trên một GPU đơn nhanh như thế nào so với thời gian giao tiếp chunk của keys và values giữa hai thiết bị.
+
+Cụ thể, hãy lấy ví dụ về giải mã từ ngữ cảnh có độ dài 640000 được chia giữa 8 GPU trong một node. Hãy lấy kích thước ẩn là 2048 và cố định kiểu dữ liệu của chúng ta là bfloat16. Mỗi thiết bị cho giải mã mất O(10⁻⁵) giây để thực hiện tính toán Flash Attention. Thời gian để di chuyển keys và values có kích thước tương ứng giữa các GPU liền kề như trong Hình 2 là khoảng O(10⁻³) giây. Latency phát sinh giữa các node thậm chí còn lớn hơn và do đó overlap không khả thi do sự chênh lệch này về timescale.
+
+### 6.4 HIỆU SUẤT VỚI MÔ HÌNH LLAMA TRANSFORMER
+
+Để cho thấy rằng Tree attention cũng có thể được sử dụng trong các ứng dụng thế giới thực, chúng tôi cũng đo throughput end-to-end với mô hình Llama 3.1 8B Grattafiori et al. (2024) trên các chuỗi prompt có độ dài 32k, 64k, 128k và 256k sử dụng ring attention hoặc tree attention cho giải mã (với prefill) 10 token trong Bảng 1. Chúng tôi chạy các thí nghiệm này trên 8 GPU H100 trong một cụm DGX (kết nối với NVLink) cũng như 4 GPU MI300X trong một cụm AMD được kết nối với AMD infinity fabric. Trong Bảng 2 của Phụ lục C.3, chúng tôi cũng cho thấy kết quả throughput tương tự trên 2 GPU RTX 4090 được kết nối với PCIe. Trong tất cả các trường hợp chúng ta thấy rằng Tree attention cho giải mã có latency thấp hơn đáng kể so với Ring Attention cho giải mã với giai đoạn prefill. Ring Attention nhanh hơn lên đến ×4 khi sử dụng 8x H100 và lên đến ×3 nhanh hơn khi sử dụng 4x MI300x. Chúng tôi mong đợi khoảng cách này tăng khi chúng ta tăng số node.
+
+Trong khi chúng tôi đã thảo luận trước đây rằng Ring Attention hoạt động tốt nhất khi được sử dụng với Ring Topology của các cụm TPU, Bảng 1 và 2 cho thấy rằng kết quả Tree Attention tổng quát hóa tốt cho các loại hệ thống khác nhau, số GPU, giao thức giao tiếp và topology mạng.
+
+**Bảng 1:** So sánh Thời gian Giải mã Trung bình (tính bằng giây) với giai đoạn prefill, sử dụng mô hình Llama 3.1 8B với Tree Attention (của chúng tôi) và Ring Attention (SOTA) qua các độ dài chuỗi và loại GPU khác nhau. Kết quả trung bình và standard error (±) được tính toán sử dụng 10 lần chạy thử.
+
+| Độ dài Chuỗi | 8x H100s |  | Speedup | 4x MI300x |  | Speedup |
+|-------------|----------|----------|---------|-----------|----------|---------|
+|  | Tree Attn | Ring Attn |  | Tree Attn | Ring Attn |  |
+| 32k | 0.60±0.15 | 2.57±0.35 | ×4 | 1.05±0.01 | 3.57±0.25 | ×3 |
+| 64k | 1.08±0.10 | 4.42±0.38 | ×4 | 2.36±0.01 | 7.33±0.25 | ×3 |
+| 128k | 2.68±0.28 | 6.38±0.58 | ×2 | 6.43±0.25 | 16.40±0.40 | ×3 |
+| 256k | 2.89±0.62 | 8.19±1.07 | ×3 | 15.30±4.93 | 35.12±5.02 | ×2 |
+
+## 7 THẢO LUẬN VÀ KẾT LUẬN
+
+Trong bài báo này, chúng tôi đã suy ra hàm năng lượng cho self-attention và chứng minh cách tính toán đạo hàm của hàm này cung cấp một phương pháp mới và hiệu quả để tính toán attention song song. Lợi thế này đặc biệt rõ ràng khi thực hiện giải mã qua nhiều thiết bị, trong trường hợp đó Tree Attention của chúng tôi cho phép chúng tôi vượt trội đáng kể so với SOTA Ring Attention với một thuật toán vượt trội tiệm cận, với speedup ×8 khi chúng tôi sử dụng 128 GPU trên độ dài chuỗi 5.12M. Chúng tôi cũng thấy rằng hoạt động AllReduce mà chúng tôi sử dụng liên quan đến việc gửi các đối tượng được rút gọn một phần, điều này giảm đáng kể khối lượng dữ liệu được giao tiếp cũng như yêu cầu bộ nhớ đỉnh. Trong một ứng dụng thế giới thực, sử dụng mô hình Llama 3.1 với 1B và 8B tham số, chúng tôi thấy rằng giải mã với giai đoạn prefill sử dụng Tree Attention mang lại cho chúng tôi speedup ×3-5 so với Ring Attention. Hơn nữa, bằng cách kiểm tra phương pháp của chúng tôi trên các loại cụm GPU khác nhau bao gồm AMD MI300x, chúng tôi cho thấy rằng Tree Attention tổng quát hóa rất tốt cho các giao thức giao tiếp và topology mạng khác nhau.
+
+## TÀI LIỆU THAM KHẢO
+
+[Phần tài liệu tham khảo được giữ nguyên như trong bản gốc]
+
+## PHỤ LỤC A: CÔNG TRÌNH LIÊN QUAN KHÁC
+
+Công trình gần đây đã cố gắng một công thức Bayesian của attention bằng cách suy ra một mô hình sinh xác suất khớp với các hoạt động được thực hiện trong một hoạt động self-attention Singh & Buckley (2023). Điều này theo một dòng công trình liên hệ self-attention với kiến trúc Hopfield Network được nghiên cứu kỹ Ramsauer et al. (2020). Ý tưởng là trong khi Hopfield Network được định nghĩa về mặt động lực học trên một landscape năng lượng, cùng một hình ảnh này có thể được đưa vào một diễn giải Bayesian bằng cách xác định hàm năng lượng với một hàm free energy biến phân và do đó suy ra mô hình sinh ngầm trong cập nhật self-attention.
+
+Đặc biệt, xem xét hàm năng lượng được đề xuất trong Hoover et al. (2023), đó là logsumexp. Vì gradient trong quy tắc cập nhật của bài báo đó được lấy theo đầu vào của khối, hàm kết quả là một phiên bản modified của hoạt động self-attention. Tương tự, quy tắc cập nhật trong Ramsauer et al. (2020) yêu cầu việc tying của một số weight nhất định (K và V) trong hoạt động attention. Điều này hạn chế derivation Hopfield để mô hình hóa các mạng lưu trữ auto-associative, trong khi transformer attention là hetero-associative.
+
+Một công trình liên quan đáng chú ý khác là Feng et al. (2024), trong đó các tác giả đưa ra những quan sát tương tự như chúng tôi trong phần 5 về cách các hoạt động kết hợp trong tính toán attention có thể được song song hóa hiệu quả để thúc đẩy một kiến trúc RNN modified dựa trên attention cho mô hình hóa chuỗi.
+
+Trong khi hàm năng lượng này tự nó chủ yếu là một tò mò toán học và lý thuyết, chúng tôi chứng minh dưới đây rằng khi kết hợp với automatic differentiation, công thức của chúng tôi tự nhiên dẫn đến các thuật toán song song có hiệu quả cao để tính toán attention và thực hiện giải mã, đặc biệt qua nhiều thiết bị.
+
+## PHỤ LỤC B: THÊM NỀN TẢNG VỀ HOẠT ĐỘNG TREE REDUCTION
+
+Một hoạt động tree reduction là một chiến lược phân cấp để thực hiện một hoạt động reduction (ví dụ, tổng, tích, maximum, minimum) trên một tập hợp các phần tử dữ liệu một cách hiệu quả, đặc biệt trong tính toán song song. Phương pháp này giảm độ phức tạp tính toán tổng thể và cho phép sử dụng hiệu quả các tài nguyên xử lý song song. Đây là cách nó hoạt động:
+
+• **Chia vấn đề thành các tác vụ nhỏ hơn:** Dữ liệu đầu vào được chia thành các chunk nhỏ hơn, và hoạt động reduction được thực hiện theo cặp giữa các phần tử liền kề trong các chunk này.
+
+• **Tạo thành cấu trúc giống cây:** Kết quả từ cấp độ reduction đầu tiên tự chúng được reduced theo cặp trong cấp độ tiếp theo. Điều này tiếp tục cho đến khi toàn bộ dataset được reduced thành một kết quả duy nhất.
+
+• **Tổng hợp lặp hoặc đệ quy:** Việc tổng hợp thường theo mẫu cây nhị phân, nhưng các số fan-in khác (ví dụ, k-ary trees) cũng có thể được sử dụng. Mỗi node trong cây đại diện cho một kết quả reduction partial, và root của cây giữ kết quả cuối cùng.
+
+Vì cấu trúc cây có độ sâu logarithmic đối với tổng số node, một tree reduction có thể giảm tiệm cận số bước tổng cần thiết để thực hiện một hoạt động khi có thể tổng hợp kết quả partial, và ngoài ra dễ dàng cho việc song song hóa vì k-ary trees có thể được định nghĩa để khớp với số processor có sẵn cho xử lý song song. Ngoài ra, nhiều topology mạng hiện tại như NVLINK và Infiniband của Nvidia, do lợi thế tự nhiên của cấu trúc cây, được thiết kế với topology như vậy có nghĩa là các hoạt động cây là tự nhiên và hiệu quả để thực hiện.
+
+## PHỤ LỤC C: ATTENTION NHƯ GRADIENT CỦA MỘT HÀM NĂNG LƯỢNG VÀ DIỄN GIẢI BAYESIAN
+
+### C.1 BẰNG CHỨNG CỦA QUAN SÁT 1
+
+Ở đây, chúng tôi cho thấy cách hoạt động self-attention có thể được viết như gradient của một hàm năng lượng. Đặc biệt, chúng tôi định nghĩa một hàm vô hướng phụ thuộc vào keys, queries, values và ngoài ra vào một vector phụ trợ mà chúng tôi gọi là nguồn ζ. Nguồn là tham số mà chúng ta tính gradient của hàm vô hướng để có được hoạt động self-attention. Chúng ta cần nguồn để viết ra hàm sinh của các moment của phân phối ở trên. Nó cũng là biến mà chúng ta có thể Taylor-expand hàm sinh và trích xuất các moment như các hệ số của các đơn thức của ζ xuất hiện trong chuỗi Taylor. Một cách rõ ràng, chúng ta muốn tìm một hàm F(q,k,v,ζ) sao cho:
+
+∑ᵃ₌₁ᴺ softmax(q·kₐ)vₐ = ∂F/∂ζ|_{ζ=0}. (15)
+
+Thuật ngữ này được lấy cảm hứng từ công trình về các mô hình dựa trên năng lượng trong machine learning Beal (2003); LeCun et al. (2006); Song & Kingma (2021). Một tóm tắt các biến và chỉ số được cung cấp trong phụ lục G.
+
+Chúng tôi đầu tiên cho thấy cách hàm năng lượng được cho bởi hàm sinh cumulant liên quan đến phân phối được cho bởi điểm attention. Lấy cảm hứng từ cơ học thống kê, nơi một hàm sinh cumulant tương tự định nghĩa Helmholtz Free energy (Landau & Lifshitz, 1958), chúng tôi gọi hàm sinh cumulant của chúng tôi là hàm năng lượng cho self-attention.
+
+Hãy tập trung vào trường hợp với một query đơn. Như đã lưu ý ở trên, chúng tôi tận dụng thực tế rằng hoạt động attention có thể được xem như tính toán giá trị kỳ vọng của các vector v trong phân phối được thiết lập bởi điểm attention z:
+
+z = ⟨v⟩ = ∑ᵃ₌₁ᴺ Pₐvₐ = (∑ᵃ₌₁ᴺ e^{q·k_a^T} vₐ)/(∑ᵢ₌₁ᴺ e^{q·k_i^T}). (16)
+
+Mật độ xác suất được cho bởi:
+
+Pₐ = e^{q·k_a^T}/(∑ᵢ₌₁ᴺ e^{q·k_i^T}). (17)
+
+Thường thì mẫu số hoặc hệ số chuẩn hóa được xác định với cái gọi là hàm phân vùng:
+
+Z = ∑ᵃ₌₁ᴺ e^{q·k_a^T}. (18)
+
+Bây giờ chúng ta có thể tính toán moment đầu tiên của phân phối xác suất được cho ở trên bằng cách giới thiệu một nguồn, ζ ∈ ℝᵈ. Trong trường hợp của chúng ta, với ζ, chúng ta có thể mở rộng hàm phân vùng thành hàm:
+
+Z(ζ) = ∑ᵃ₌₁ᴺ e^{q·k_a^T + ζ·v_a^T}. (19)
+
+Bây giờ, chúng ta có thể tính toán bất kỳ moment nào của phân phối như hệ số Taylor thứ n của Z(ζ)
+∀A₁,A₂,··· ∈ {1,···,d_h}:
+
+⟨vₐ₁···vₐₙ⟩ = (1/Z) ∂ⁿZ(ζ)/(∂ζₐ₁···∂ζₐₙ)|_{ζ=0}. (20)
+
+Nói cách khác, chúng ta có thể viết Z(ζ) như:
+
+Z(ζ) = Z[1 + ⟨v⟩ζ + (1/2!)⟨vₐ₁vₐ₂⟩ζₐ₁ζₐ₂ + ···] (21)
+
+Do đó, moment đầu tiên có thể được viết như:
+
+⟨v⟩ = (1/Z) ∂Z/∂ζ|_{ζ=0}, (22)
+
+có thể được viết như gradient của log của Z(ζ):
+
+⟨v⟩ = ∂/∂ζ log Z(ζ)|_{ζ=0}. (23)
+
+Đại lượng này là hàm sinh, hay còn gọi là free energy:
+
+F = log ∑ₐ exp(q·k_a^T + ζ·v_a^T). (24)
+
+Để tính toán causal self-attention, chúng tôi giới thiệu N nguồn ζᵢ mỗi nguồn ∈ ℝᵈ và lấy
+
+F_tot = ∑ᵢ₌₁ᴺ Fᵢ = ∑ᵢ₌₁ᴺ log ∑ᵃ₌₁ⁱ exp(qᵢ·k_a^T + ζᵢ·v_a^T). (25)
+
+Việc cắt ngắn tổng bên trong lên đến chỉ số i là do causal masking.
+
+Bây giờ, để tính toán phần tử thứ i của causal self-attention, chúng ta vi phân theo ζᵢ và đặt nó bằng không:
+
+∂F_tot/∂ζᵢ,ₐ|_{ζᵢ=0,∀i} = (∑ᵃ₌₁ⁱ exp(qᵢ·k_a^T)vₐ,ₐ)/(∑ᵃ₌₁ⁱ exp(qᵢ·k_a^T)). (26)
+
+Việc tổng quát hóa cho trường hợp multi-head attention là đơn giản. Trong trường hợp này, có một key, query và value cho mỗi head. Đối với n_h tổng số head, hàm sinh có dạng:
+
+F_tot = ∑ᵢ₌₁ᴺ ∑ₕ₌₁ⁿʰ Fᵢ,ₕ, (27)
+
+trong đó
+
+Fᵢ,ₕ = log ∑ᵃ₌₁ⁱ exp(qᵢ,ₕ·k_{h,a}^T + ζₕ,ᵢ·v_{h,a}^T). (28)
+
+Weight projection output được bao gồm trong định nghĩa của vⱼ ở đây, có nghĩa là
+
+vᵦ,ₐ = xᵦ,B̄(W^O W^V)ₐ,B̄ (29)
+
+trong đó W^O ∈ ℝᵈʰ×ℝᵈᵉᵐᵇ biểu thị một slice kích thước head của weight projection output và B̄ ∈ {1,···,d_h} trải dài các chỉ số intra-head. Trong ký hiệu chỉ số ở trên, các chỉ số head được gạch ngang trong khi các chỉ số không gian embedding không được gạch ngang. Chúng tôi tiếp tục tập trung vào trường hợp single-head, vì nó làm cho trình bày đơn giản hơn, và việc tổng quát hóa multi-head là ngay lập tức. Lưu ý rằng chúng tôi chứng minh rằng phương pháp hàm năng lượng của chúng tôi cũng có thể tính đến safe softmax trong Phụ lục F.
+
+### C.2 DIỄN GIẢI BAYESIAN
+
+Thực tế là có thể suy ra hoạt động self-attention như việc tối thiểu hóa một hàm năng lượng ngụ ý rằng có thể cung cấp một diễn giải Bayesian về self-attention bằng cách xác định một hàm likelihood và cho thấy rằng chúng ta có thể có được forward pass của khối attention từ việc tính toán ước lượng maximum a posteriori của likelihood này.
+
+Đặc biệt, chúng tôi đề xuất như sau cho hàm log-likelihood:
+
+Γ(ζ,z) = ∑ᵢ₌₁ᴺ ∑ₐ₌₁ᵈ zᵢ,ₐζᵢ,ₐ - F(ζ,x). (30)
+
+Chúng tôi ký hiệu bằng x đầu vào cho khối self-attention từ đó chúng ta có được q,k,v từ việc nhân nó với các weight W^Q, W^K, W^V tương ứng. Hãy tối thiểu hóa điều trên theo ζ và z đồng thời:
+
+∂Γ/∂ζᵢ,ₐ = 0, ∂Γ/∂zᵢ,ₐ = 0. (31)
+
+Các điều kiện này được viết rõ ràng đọc
+
+ζ*ᵢ,ₐ = 0, z*ᵢ,ₐ = ∂F/∂ζᵢ,ₐ. (32)
+
+Đưa điều kiện đầu tiên vào điều kiện thứ hai dẫn đến attention forward pass:
+
+z*ᵢ,ₐ = (∑ᵃ₌₁ⁱ e^{qᵢ·k_a^T} vₐ,ₐ)/(∑ᵦ₌₁ⁱ e^{qᵢ·k_b^T}). (33)
+
+Tóm lại, điều này có nghĩa chúng ta có thể có được gradient w.r.t. ζ từ ước lượng MAP của likelihood sau:
+
+z*ᵢ,ₐ, ζ*ᵢ,ₐ = argmax_{ζ,z} e^{-Γ(ζ,z)}. (34)
+
+Hơn nữa, một thủ tục như vậy cho phép chúng ta xác định mô hình dựa trên năng lượng liên quan đến hàm self-attention.
+
+### C.3 THÊM KẾT QUẢ HIỆU SUẤT VỚI MÔ HÌNH LLAMA TRANSFORMER
+
+Để mở rộng công trình của chúng tôi trong phần 6.4, và để chứng minh rằng Tree Attention có thể được áp dụng thành công cho một loạt các thiết lập phần cứng, chúng tôi cũng thí nghiệm với việc chạy Llama3.2-1B trên thiết lập dual NVIDIA RTX 4090. Hai 4090 được kết nối qua mạng PCIe. Ngay cả trong trường hợp này, chúng tôi quan sát được speedup 4x đáng kể (tăng lên 5x ở độ dài chuỗi dài hơn) của Tree Attention so với Ring Attention cho giải mã autoregressive.
+
+**Bảng 2:** So sánh Thời gian Giải mã Trung bình (tính bằng giây) với giai đoạn prefill sử dụng mô hình Llama 3.2 1B với Tree Attention (của chúng tôi) và Ring Attention (SOTA) qua các độ dài chuỗi khác nhau cho 4090s. Kết quả trung bình và standard error (±) được tính toán sử dụng 10 lần chạy thử.
+
+| Độ dài Chuỗi | Tree Attention | Ring Attention | Speedup |
+|-------------|----------------|----------------|---------|
+|  | Thời gian (s) | Thời gian (s) |  |
+| 8000 | 0.34 ±0.05 | 1.38±0.07 | ×4 |
+| 16000 | 0.58 ±0.07 | 2.77±0.04 | ×5 |
+| 20000 | 0.74 ±0.01 | 3.47±0.04 | ×5 |
+| 32000 | 1.01 ±0.02 | 5.45±0.03 | ×5 |
+
+## PHỤ LỤC D: MÃ JAX
+
+Dưới đây là phương thức tree_flash_decode. Codebase đầy đủ của chúng tôi có sẵn tại đây: https://anonymous.4open.science/r/tree_attention-7C32.
+
+```python
+import jax
+from jax import lax
+import jax.numpy as jnp
+from functools import partial
+from jax.sharding import Mesh,NamedSharding, PartitionSpec as P
+from jax.experimental import mesh_utils
+from jax.experimental.shard_map import shard_map
+from flash_attn_jax.flash import _flash_mha_vjp
+
+in_specs=(P(None, None, None, None), P(None, 'i', None, None), P(None, 'i', None, None))
+out_specs=P(None, None, None)
+
+@jax.jit
+@partial(shard_map, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_rep=False)
+def tree_flash_decode(q, k, v):
+    def flash_num_lse(q, k, v, config=dict(softmax_scale=1.0, is_causal=False, window_size=(-1, -1))):
+        tup = _flash_mha_vjp.fwd(q, k, v, config)
+        res,lse = tup[1][3],tup[1][4]
+        return res,lse
+    
+    loc_res, loc_lse = flash_num_lse(q, k, v)
+    a_max_global = lax.pmax(loc_lse, axis_name='i')
+    num_global = lax.psum(loc_res *jnp.exp(loc_lse - a_max_global), axis_name='i')
+    den_global = lax.psum(jnp.exp(loc_lse - a_max_global), axis_name='i')
+    return (num_global / den_global)
+```
+
+Hàm sử dụng Flash Attention 2 Dao (2023) để tính toán numerator và denominator địa phương, cả hai được tích lũy giữa các thiết bị sử dụng một Allreduce (đó là những gì psum và pmax gọi). NCCL xác định theo mẫu nào các kết quả này được giao tiếp.
+
+## PHỤ LỤC E: BẰNG CHỨNG ĐỊNH LÝ 1
+
+Chúng tôi chứng minh định lý 1 dưới đây.
+
+**Bằng chứng.**
+
+**Trường hợp Tuần tự:** Trên một GPU đơn, hoạt động reduction trên một mảng có kích thước N có độ phức tạp thời gian O(N) vì processor phải xử lý tuần tự từng phần tử.
+
+**Xử lý Song song với p Processor:** Chia mảng có kích thước N thành p chunk, mỗi chunk có kích thước N/p. Mỗi processor thực hiện hoạt động reduction trên chunk của nó một cách độc lập. Độ phức tạp thời gian cho mỗi processor là O(N/p).
+
+**Kết hợp Kết quả Partial:** Các kết quả partial từ p processor cần được kết hợp. Sử dụng mẫu cây cho reduction, các kết quả partial có thể được reduced trong O(log p) bước. Mỗi bước liên quan đến việc kết hợp các cặp kết quả, giảm một nửa số kết quả ở mỗi bước cho đến khi chỉ còn một kết quả.
+
+**Tổng Độ phức tạp Thời gian:** Tổng độ phức tạp thời gian là tổng của các độ phức tạp thời gian để xử lý các chunk và kết hợp kết quả:
+
+O(N/p) + O(log p).
+
+Điều này chứng minh rằng độ phức tạp thời gian của một reduction liên quan đến một hoạt động kết hợp trên một mảng có kích thước N là O(N/p + log p) khi sử dụng p processor song song, và nó giảm xuống O(log N) khi số processor bằng kích thước của mảng. □
+
+## PHỤ LỤC F: TÍNH TOÁN SAFE SOFTMAX
+
+Trong khi, về mặt toán học, attention sử dụng hoạt động softmax, trong thực tế điều này thường không ổn định về mặt số học khi sử dụng các hoạt động độ chính xác tương đối thấp. Để giải quyết điều này, một hàm tương đương về mặt toán học, 'safe softmax' thay vào đó được sử dụng, trừ tất cả dot product trong exponential bằng max. Điều này đảm bảo rằng tất cả các giá trị được exponentiated nhỏ hơn 1 và do đó ít có khả năng bùng nổ và gây ra sự không ổn định số học. Ở đây, chúng tôi chứng minh rằng phương pháp hàm năng lượng của chúng tôi cũng có thể tính đến safe softmax.
+
+Giả sử chúng ta so sánh hàm sinh của chúng ta
+
+F_tot = ∑ᵢ log ∑ᵃ₌₁ⁱ exp(qᵢ·k_a^T + ζₐ·v_a^T) (35)
+
+và một hàm được sửa đổi nhẹ:
+
+F'_tot = ∑ᵢ log ∑ᵃ₌₁ⁱ exp(qᵢ·k_a^T + ζᵢ·v_a^T - mᵢ). (36)
+
+Khi chúng ta lấy đạo hàm của hai đại lượng này, chúng ta thấy rằng chúng ta có được cùng kết quả:
+
+∂F_tot/∂ζᵢ|_{ζᵢ=0} = ∂F'_tot/∂ζᵢ|_{ζᵢ=0}. (37)
+
+Để thấy nó một cách rõ ràng:
+
+∂F'_tot/∂ζᵢ|_{ζᵢ=0} = (∑ᵃ₌₁ⁱ exp(qᵢ·k_a^T - mᵢ)vₐ)/(∑ᵃ₌₁ⁱ exp(qᵢ·k_a^T - mᵢ)) (38)
+= (∑ᵃ₌₁ⁱ exp(qᵢ·k_a^T)vₐ)/(∑ᵃ₌₁ⁱ exp(qᵢ·k_a^T)).
+
+Thông thường, khi tính toán softmax theo cách online, thủ tục này được thực hiện trong đó mᵢ là row max của q·k^T. Sự dịch chuyển này làm cho tổng của exponentials không dẫn đến overflow.
+
+## PHỤ LỤC G: KÝ HIỆU CHO CÁC PHƯƠNG TRÌNH
+
+Đây là tóm tắt các biến và chỉ số khác nhau sẽ được sử dụng trong các phần tiếp theo:
+
+**BẢNG I: Tên biến.**
+
+| Biến | Mô tả |
+|------|-------|
+| x | Đầu vào Attention |
+| q,k,v | Vector Query, key và value |
+| Γ | Log-likelihood Attention |
+| ζ | Vector nguồn |
+| m | Max của q·k^T |
+| Z | Hàm phân vùng |
+| z | Vector activation |
+| n | Numerator attention |
+| d | Denominator attention |
+| lse | Logsumexp điểm attention |
+| F | Hàm sinh |
+| P | Mật độ xác suất điểm attention |
+
+**BẢNG II: Tên chỉ số và phạm vi.**
+
+| Chỉ số | Mô tả |
+|--------|-------|
+| N | Độ dài chuỗi |
+| d | Chiều embedding |
+| d_h | Chiều head |
+| p | Số thiết bị |
+| t | Kích thước chunk N/p |
+| b | Kích thước batch |
+| a,i,j ∈ {1,···,N} | Chỉ số chuỗi |
+| A,B ∈ {1,···,d} | Chỉ số embedding |
+| Ā,B̄ ∈ {1,···,d_h} | Chỉ số intra-head |
+| h ∈ {1,···,n_h} | Chỉ số head |
+| â,b̂ ∈ {1,···,t} | Chỉ số intra chunk |

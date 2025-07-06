@@ -1,0 +1,382 @@
+# Nén Mạng Nơ-ron End-to-End thông qua các Surrogate Latency ℓ1/ℓ2 Regularized
+
+Anshul Nasery
+Google Research India
+anshulnasery@google.com
+
+Hardik Shah
+Google Research India
+hardiknshah@google.com
+
+Arun Sai Suggala
+Google Research India
+arunss@google.com
+
+Prateek Jain
+Google Research India
+prajain@google.com
+
+## Tóm tắt
+
+Nén mạng nơ-ron (NN) thông qua các kỹ thuật như pruning, quantization đòi hỏi việc thiết lập các siêu tham số nén (ví dụ: số lượng kênh cần được prune, bitwidths cho quantization) cho mỗi layer hoặc thủ công hoặc thông qua tìm kiếm kiến trúc mạng nơ-ron (NAS) có thể tốn kém về mặt tính toán. Chúng tôi giải quyết vấn đề này bằng cách cung cấp một kỹ thuật end-to-end tối ưu hóa cho Floating Point Operations (FLOPs) của mô hình hoặc cho latency trên thiết bị thông qua một surrogate latency ℓ1/ℓ2 mới. Thuật toán của chúng tôi có tính linh hoạt và có thể được sử dụng với nhiều phương pháp nén phổ biến bao gồm pruning, low-rank factorization và quantization. Quan trọng là, nó nhanh và chạy trong thời gian gần như bằng với việc huấn luyện một mô hình đơn; đây là một tăng tốc đáng kể về thời gian huấn luyện so với các phương pháp NAS tiêu chuẩn. Đối với nén BERT trên các tác vụ fine-tuning GLUE, chúng tôi đạt được giảm 50% FLOPs với chỉ 1% giảm hiệu suất. Đối với nén MobileNetV3 trên ImageNet-1K, chúng tôi đạt được giảm 15% FLOPs và 11% giảm latency trên thiết bị mà không giảm độ chính xác, trong khi vẫn yêu cầu ít hơn 3× tính toán huấn luyện so với các kỹ thuật nén SOTA. Cuối cùng, đối với transfer learning trên các tập dữ liệu nhỏ hơn, kỹ thuật của chúng tôi xác định các kiến trúc rẻ hơn 1.2×-1.4× so với MobileNetV3 tiêu chuẩn, bộ kiến trúc EfficientNet với chi phí huấn luyện và độ chính xác gần như tương đương.
+
+## 1 Giới thiệu
+
+Các mạng nơ-ron quy mô lớn liên tục cung cấp hiệu suất tốt nhất trên các tác vụ học tập phức tạp [1,2,3]. Nhưng chúng đặt gánh nặng lớn lên các tài nguyên tính toán như pin, bộ nhớ hoặc bộ xử lý khiến chúng khó triển khai trên các thiết bị edge như điện thoại, camera và thiết bị đeo. Một số nghiên cứu gần đây đã thiết kế các kỹ thuật để nén các mô hình ML và làm cho chúng hiệu quả cho suy luận. Tuy nhiên, như được mô tả chi tiết dưới đây, nhiều kỹ thuật này khó sử dụng trong thực tế và thường đạt được sự cân bằng độ chính xác vs thời gian suy luận dưới tối ưu.
+
+**Tìm kiếm siêu tham số cho nén.** Các nghiên cứu hiện tại thường dựa vào một trong những building block sau để thiết kế các mô hình hiệu quả: unstructured weights sparsity [4,5], pruning toàn bộ neurons hoặc low-rank factorization [6], quantization [7], distillation [8]. Việc tìm ra cách tối ưu để kết hợp các building block này (hoặc để tìm ra các siêu tham số như mức độ sparsity liên quan đến mỗi block) trong khi thỏa mãn ràng buộc latency/FLOPs/tài nguyên toàn cục là khó khăn và liên quan đến tìm kiếm tổ hợp. Vấn đề này càng trở nên nghiêm trọng hơn khi nhiều building block được sử dụng cho nén mô hình (ví dụ: đồng thời low rank factorization, sparsity/pruning của weights).
+
+**Neuron Pruning:** Trong số các kỹ thuật danh mục (a) được đề cập ở trên, một hướng nghiên cứu nổi bật đã tập trung vào unstructured pruning của weights với phân bổ ngân sách không đồng nhất trên các layer [4, 9,10,5]. Tuy nhiên, bất kỳ lợi ích nào về FLOPs sử dụng unstructured pruning đều khó chuyển đổi thành lợi ích latency thực tế vì phần cứng hiện đại - như GPU, TPU - được thiết kế nhiều hơn cho các phép toán ma trận dày đặc. Vì vậy, việc tập trung vào neuron pruning, loại bỏ toàn bộ neurons/channels, và low-rank factorization của weights, liên quan chặt chẽ đến neuron pruning, sẽ có lợi hơn. Các kỹ thuật gần đây trong hướng nghiên cứu này thêm một regularizer latency/FLOPs vào cross entropy loss tiêu chuẩn [11,12] để thiên vị mô hình về số lượng neurons thấp hơn. Thật không may, mục tiêu kết quả là rời rạc và khó tối ưu hóa. Để giảm thiểu điều này, các nghiên cứu hiện tại đã thiết kế các surrogate liên tục phù hợp hơn với tối ưu hóa kiểu SGD. Các phương pháp này hoặc làm việc trong không gian phân phối xác suất trên các mô hình đã prune và tối ưu hóa "mục tiêu kỳ vọng" [12,13,6] hoặc thay thế regularizer FLOPs không liên tục bằng một surrogate liên tục như chuẩn ℓ1 của weights của mạng [11]. Tuy nhiên, lớp kỹ thuật đầu thường không ổn định, khó thực hiện trong thực tế, và các nghiên cứu thực nghiệm cho thấy hiệu suất của chúng tương tự với magnitude based pruning đơn giản [14] (cũng xem biểu đồ bên trái của Hình 1). Hơn nữa, như chúng tôi chỉ ra trong nghiên cứu này, lớp kỹ thuật sau không thể thực thi sparsity khi có batch, layer normalization (xem Phần 3).
+
+**NAS:** Một số nghiên cứu trong danh mục (b) hình thành nén mô hình như một vấn đề Neural Architecture Search (NAS) blackbox và dựa vào các kỹ thuật NAS tiên tiến để tìm kiếm các mô hình hiệu quả [15, 16,17,18,19]. Các kỹ thuật này trực tiếp tính đến latency/FLOPs và có tiềm năng xác định phân bổ ngân sách tối ưu cho mỗi layer cho nhiều loại efficient blocks/cơ chế nén khác nhau. Tuy nhiên, các phương pháp này thường tốn kém về mặt tính toán vì chúng có cái nhìn blackbox về vấn đề và thực hiện tìm kiếm tổ hợp trên không gian kiến trúc. Mặc dù có những tiến bộ gần đây như TuNAS [18] và DARTS [20], các kỹ thuật này có thể chậm hơn và kém chính xác hơn một bậc so với phương pháp được đề xuất của chúng tôi (xem Hình 1).
+
+**Phương pháp của chúng tôi:** Trong nghiên cứu này, chúng tôi đề xuất một phương pháp nằm ngay giữa hai danh mục được đề cập ở trên. Nghĩa là, phương pháp của chúng tôi áp dụng cho một lớp lớn các efficient building block - như unstructured sparsity, neuron pruning, quantization - mà chúng tôi có thể viết tính toán FLOPs với một surrogate liên tục (xem Bảng 1). Hơn nữa, để đảm bảo rằng các regularizer FLOPs, latency của chúng tôi hoạt động ngay cả khi có batchnorm, layernorm, chúng tôi đề xuất một surrogate mới dựa trên chuẩn ℓ1/ℓ2. Trong khi các surrogate của chúng tôi là liên tục, chúng không khả vi. Trong những trường hợp như vậy, các optimizer tiêu chuẩn như SGD, Adam có thể khá chậm để hội tụ [24]. Để khắc phục điều này, chúng tôi đề xuất một phép chiếu trên các biến mask, sau mỗi bước SGD. Phương pháp được đề xuất của chúng tôi tăng tốc sự hội tụ và cũng xuất ra các giải pháp sparse chính xác do đó loại bỏ nhu cầu thresholding hậu xử lý, trong khi đủ đơn giản để không tăng thời gian huấn luyện đáng kể.
+
+Chúng tôi thực hiện thuật toán của mình với nhiều building block bao gồm pruning, low-rank factorization, quantization, và áp dụng nó trên nhiều vấn đề trong lĩnh vực phân loại hình ảnh và NLP. Cụ thể, chúng tôi chứng minh hiệu quả của kỹ thuật của mình cho nén MobileNetV3 trên ImageNet (xem Hình 1), nơi phương pháp của chúng tôi có thể học được một kiến trúc với FLOPs (latency) thấp hơn đến 15% (11%) trên điện thoại di động Pixel 6, mà không có bất kỳ giảm độ chính xác nào. Ở đây phương pháp của chúng tôi chính xác hơn MorphNet, một kỹ thuật SOTA tập trung độc quyền vào neuron-pruning, cũng như TuNAS, một kỹ thuật NAS SOTA. Hơn nữa, về thời gian huấn luyện, phương pháp của chúng tôi rẻ hơn 3× so với TuNAS. Chúng tôi muốn nhấn mạnh rằng MobileNetv3 là một kiến trúc được tối ưu hóa cao được tìm thấy bằng các kỹ thuật NAS hiệu quả [25], và kỹ thuật của chúng tôi có thể nén kiến trúc này thêm nữa.
+
+Một ứng dụng thú vị của nghiên cứu của chúng tôi là chúng tôi có thể áp dụng nó để tối ưu hóa một số mô hình "nền tảng" cơ bản nhất định cho các tác vụ fine-tuning riêng lẻ. Ví dụ, đối với nén BERT trên các benchmark GLUE, phương pháp của chúng tôi đạt được giảm 40−50% FLOPs với chỉ 1% giảm độ chính xác (xem Hình 1). Hơn nữa, kỹ thuật của chúng tôi vượt trội so với các baseline nén mô hình tiêu chuẩn. Tương tự đối với các tác vụ phân loại thị giác nhỏ hơn, kỹ thuật của chúng tôi nén MobileNetV3, bộ kiến trúc EfficientNet và xác định các kiến trúc rẻ hơn 1.2×-1.4× mà không mất độ chính xác đáng kể (xem Hình 3). Chúng tôi muốn lưu ý rằng tất cả các kết quả này được thu được với chi phí gần như bằng với việc huấn luyện một mô hình đơn cho tác vụ. Cuối cùng, chúng tôi cũng chứng minh tính linh hoạt của phương pháp bằng cách sử dụng nó để quantize một CNN trên CIFAR-10, và học các bit-widths (2,4,8,16) cho mỗi layer của nó. Kỹ thuật của chúng tôi tìm thấy một mô hình nhỏ hơn 55% so với mô hình float-16 cơ bản, trong khi đạt được cùng độ chính xác (xem Hình 5). Trong khi quantization bit thấp thường không được khai thác bởi các accelerator đa mục đích để tăng tốc tính toán, nó vẫn có thể dẫn đến giảm thời gian suy luận của các mô hình ngôn ngữ lớn như GPT vì các mô hình này bị giới hạn bởi băng thông bộ nhớ [26]. Đây là tóm tắt các đóng góp của chúng tôi:
+
+(1). Chúng tôi cung cấp một kỹ thuật nén mạng nơ-ron end-to-end trực tiếp tối ưu hóa mục tiêu FLOPs/latency regularized trong quá trình dẫn đến nén trong quá trình huấn luyện. Thuật toán của chúng tôi có thể được sử dụng với nhiều efficient building block phổ biến bao gồm pruning, low-rank factorization, quantization, và có thể tối ưu hóa cho latency suy luận trên thiết bị.
+
+(2). Chúng tôi thiết kế một surrogate ℓ1/ℓ2 regularized mới cho latency hoạt động ngay cả khi có batchnorm, layernorm. Thuật toán của chúng tôi nhanh và chạy trong cùng thời gian với việc huấn luyện một mô hình đơn, và không yêu cầu bất kỳ bước xử lý hậu kỳ nào.
+
+(3). Chúng tôi chứng minh hiệu suất của kỹ thuật trên cả các tác vụ ngôn ngữ và thị giác. Hơn nữa, đối với các cài đặt transfer learning nơi mục tiêu là lấy một kiến trúc cơ bản và tối ưu hóa nó cho các tác vụ riêng lẻ, kỹ thuật của chúng tôi vượt trội so với các kỹ thuật SOTA trong lĩnh vực rộng của nén mạng nơ-ron tự động.
+
+## 2 Nghiên cứu liên quan
+
+### 2.1 Neural Architecture Search
+
+Các nghiên cứu sớm về NAS đối xử với vấn đề như một vấn đề tối ưu hóa blackbox thuần túy (BO). Các nghiên cứu này dựa vào các kỹ thuật BO như random search [27], tối ưu hóa Gaussian process [17], và gradient descent bậc không [15,16], thuật toán tiến hóa để tối ưu hóa mục tiêu NAS và xác định một kiến trúc tốt. Một số nghiên cứu đã cải thiện các thuật toán này bằng cách sử dụng các heuristic như early stopping [27]. Tuy nhiên, các kỹ thuật này tốn kém về mặt tính toán, vì việc đánh giá mục tiêu tối ưu hóa tại bất kỳ điểm nào đều yêu cầu huấn luyện một mạng nơ-ron từ đầu. Hơn nữa, do độ phức tạp tính toán, các kỹ thuật này thực hiện tìm kiếm rất thô và không phù hợp cho tìm kiếm tinh vi trên cấu trúc sparsity hoặc low-rank.
+
+Các nghiên cứu gần đây đã cố gắng mở blackbox một chút. Trong các kỹ thuật này, không gian tìm kiếm đầu tiên được chuyển đổi thành không gian phân phối xác suất trên các kiến trúc. Tiếp theo, một mô hình surrogate (nhận một kiến trúc làm đầu vào và cố gắng xuất ra tập weights tối ưu cho kiến trúc) được huấn luyện để nhanh chóng đánh giá mục tiêu tối ưu hóa tại bất kỳ đầu vào nào [18,20,28,29,12]. Trong khi các kỹ thuật này nhanh, chúng liên quan đến huấn luyện kết hợp của mô hình surrogate trong quá trình tìm kiếm. Việc huấn luyện kết hợp này thường khiến quá trình tối ưu hóa không ổn định [30].
+
+**NAS cho Efficient ML.** Một số nghiên cứu gần đây tại giao điểm của efficient ML và NAS đã nhận ra tầm quan trọng của việc tính toán rõ ràng phần cứng trong quá trình tìm kiếm [15,31,32,33,34,35]. Các nghiên cứu này kết hợp thời gian suy luận thực tế vào mục tiêu tìm kiếm của chúng, thay vì các surrogate như FLOPs. Thời gian suy luận có thể được ước tính bằng một mạng nơ-ron khác, hoặc thông qua các bảng latency cho các phép toán số học cơ bản trên nền tảng mục tiêu [19]. Nhiều nghiên cứu này dựa vào các heuristic tìm kiếm greedy, ngẫu nhiên để giải quyết mục tiêu kết quả [32, 33]. Tuy nhiên, các heuristic này hoặc mất nhiều thời gian để tìm kiến trúc tối ưu hoặc không đảm bảo hội tụ đến giải pháp tối ưu. Có một số nghiên cứu dựa vào các thuật toán NAS được mô tả ở trên [15,31,18]. Tuy nhiên, các kỹ thuật này gặp những vấn đề tương tự như đã đề cập trước đó.
+
+**Hardware, Neural Architecture codesign.** Một số tham số cấp phần cứng như cấu hình tiling của tensor ảnh hưởng đáng kể đến thời gian suy luận của một mô hình. Các kỹ thuật NAS nhận biết phần cứng gần đây phơi bày các tham số cấp phần cứng này cho thuật toán NAS và đồng thời tìm kiếm trên kiến trúc mạng nơ-ron và cấu hình phần cứng [35]. Các kỹ thuật này có tiềm năng đạt được hiệu suất tốt hơn so với các kỹ thuật NAS vanilla không tìm kiếm trên cấu hình phần cứng.
+
+### 2.2 Model Compression
+
+Lĩnh vực nén mô hình rất rộng. Ở đây, chúng tôi tập trung vào các kỹ thuật thực hiện nén thời gian huấn luyện (trái ngược với nén hậu huấn luyện) sử dụng các building block sau: unstructured sparsity, pruning và low-rank factorization. Các nghiên cứu sớm về unstructured sparsity và pruning dựa vào magnitude, gradient based pruning [4,36,14]. Một số nghiên cứu đã khám phá các metrics đánh giá tinh vi hơn cho pruning [37,38,39,40,41]. Các kỹ thuật khác bao gồm thêm các chuẩn tạo sparsity như ℓ0, ℓ1 vào mục tiêu huấn luyện [13,5]. Một số nghiên cứu cũng đã khám phá low-rank factorization cho nén mô hình [42,43,44]. Một số kỹ thuật này lại dựa vào các regularizer tạo sparsity để tạo ra cấu trúc low-rank [6]. Các nghiên cứu khác dựa vào pruning dựa trên SVD. Một số nghiên cứu gần đây cố gắng tối ưu hóa mục tiêu FLOPs regularized để thực hiện pruning, low-rank factorization [11,12]. Tuy nhiên, như chúng tôi đã thảo luận trong phần giới thiệu, các kỹ thuật tối ưu hóa kết quả thường không ổn định và khó sử dụng trong thực tế.
+
+## 3 Phương pháp
+
+Trong phần này, chúng tôi mô tả phương pháp của mình cho nén mô hình. Để đơn giản trong trình bày, chúng tôi minh họa kỹ thuật của mình trên các mạng feed-forward và giới hạn bản thân trong pruning. Các ý tưởng ở đây có thể được mở rộng cho các kiến trúc khác (ví dụ: 1x1 convolutions trong CNN), và các efficient building block khác (ví dụ: unstructured sparsity, low-rank factorization, quantization) một cách đơn giản (xem Bảng 1 để biết chi tiết). Xem xét vấn đề sau: chúng ta được cho một mạng nơ-ron feed forward (FFN) được huấn luyện trước f∗(x) = σ(W∗_D σ(W∗_{D−1} σ(. . . σ(W∗_1 x)))), trong đó W∗_i ∈ R^{d_{i+1}×d_i} cho tất cả i ∈ [D], và một tập dữ liệu {(x_i, y_i)}^n_{i=1}. Mục tiêu của chúng ta là nén f∗ trong khi đồng thời hoạt động tốt trên tác vụ học. Vấn đề này có thể được hình thành như vấn đề tối ưu hóa sau
+
+min_W (1/n) ∑^n_{i=1} ℓ(x_i, y_i; W) + λ × Latency(W). (1)
+
+Ở đây W = {W_i}^D_{i=1}, với W_i ∈ R^{d'_{i+1}×d'_i} là ma trận weight tại layer i, λ là tham số regularization trao đổi giữa latency với độ chính xác và ℓ là supervised loss¹. Việc tối ưu hóa trực tiếp mục tiêu trên là không khả thi vì Latency(W) là một hàm rời rạc của các chiều của ma trận weight, và phụ thuộc vào phần cứng.
+
+Chúng tôi bây giờ trình bày kỹ thuật của mình để giải Phương trình (1). Để bắt đầu, chúng tôi thay thế Latency(W) bằng FLOPs(W)². Sau này, chúng tôi mở rộng nó cho latency thực tế. Mục tiêu trong trường hợp này được cho bởi
+
+min_W (1/n) ∑^n_{i=1} ℓ(x_i, y_i; W) + λ ∑^D_{i=1} d'_i d'_{i+1}. (2)
+
+¹Trong mục tiêu này, chúng tôi tìm kiếm trên d'_i sao cho d'_i ≤ d_i
+²FLOPs cũng là một hàm rời rạc của các chiều của W_i, và vấn đề tối ưu hóa kết quả vẫn không khả thi
+
+Để giải quyết mục tiêu này, chúng tôi liên kết các mask với mỗi neuron trong mạng. Cụ thể, chúng tôi tham số hóa ma trận weight trong layer thứ i là W_i × diag(α_i). Ở đây α_i ∈ {0,1}^{d_i} là các biến mask của layer i. Nếu α_{i,j} được đặt thành 0, thì neuron thứ j trong layer thứ (i−1) sẽ bị pruned. Regularizer FLOPs bây giờ có thể được viết theo các mask là ∑^D_{i=1} ∥α_i∥_0 ∥α_{i+1}∥_0, trong đó α_{D+1} là vector tĩnh của tất cả 1. Mục tiêu kết quả tuy nhiên không liên tục. Để làm cho nó liên tục và phù hợp với tối ưu hóa dựa trên gradient, một lớp kỹ thuật đặt phân phối Bernoulli Bern(p_{i,j}) trên mỗi mask α_{i,j} và giải quyết mục tiêu làm mịn sau [12, 13, 6]
+
+min_{W,p} E[(1/n) ∑^n_{i=1} ℓ(x_i, y_i; p, W) + λ ∑^D_{i=1} ∥α_i∥_0 ∥α_{i+1}∥_0].
+
+Kỳ vọng ở trên được lấy w.r.t các mask ngẫu nhiên α_i. Dễ thấy rằng mục tiêu trên tương đương với Phương trình (2), và do đó khó khăn như giải quyết phương trình sau. Thực tế, vấn đề trên có thể được chỉ ra là NP-hard bằng cách sử dụng quan sát rằng sparse linear regression là một trường hợp đặc biệt của nó [45]. Hơn nữa, tính chất rời rạc của α_i khiến quá trình tối ưu hóa không ổn định [13]. Để khắc phục điều này, [12,13,6] dựa vào một heuristic liên quan đến việc relaxing phân phối Bernoulli thành một phân phối liên tục như LogisticSigmoid. Tuy nhiên, nhược điểm chính của thuật toán kết quả là nó khó thực hiện trong thực tế và yêu cầu annealing rất cẩn thận các tham số của phân phối LogisticSigmoid. Một nhược điểm khác của lớp kỹ thuật này là hiệu suất của chúng không được hiểu rõ về mặt lý thuyết, ngay cả đối với các vấn đề đơn giản và cơ bản như sparse linear regression.
+
+Một cách tiếp cận khác để chuyển đổi mục tiêu rời rạc trong Phương trình (2) thành một hàm liên tục là thay thế chuẩn ℓ0 trên α_i bằng chuẩn ℓ1
+
+min_{W,α_i∈R^{d_i}} (1/n) ∑^n_{i=1} ℓ(x_i, y_i; α, W) + λ ∑^D_{i=1} ∥α_i∥_1 ∥α_{i+1}∥_1. (3)
+
+Cách tiếp cận này hấp dẫn hơn nhiều so với cách tiếp cận trước vì nó được biết là khôi phục các giải pháp sparse tối ưu cho nhiều vấn đề thống kê bao gồm sparse linear regression, low-rank matrix completion [46,47]. Hơn nữa, nó đơn giản hơn nhiều để thực hiện trong thực tế, với nhiều thuật toán được đề xuất cho sự hội tụ nhanh đến các điểm dừng của mục tiêu [24,48]. Do đó, các kỹ thuật nén SOTA gần đây dựa vào các surrogate chuẩn ℓ1 để tính toán regularizer FLOPs [11]. Một nhược điểm lớn của chuẩn ℓ1 tuy nhiên là nó không thúc đẩy sparsity khi có batch normalization và layer normalization [49,50]. Để thấy điều này, xem xét mạng 1-hidden layer sau: σ(BN(W_2 diag(α_2)σ(BN(W_1 diag(α_1)x)))). Người ta có thể scale down tất cả các entries của α_1 và scale up các weights W_1 mà không ảnh hưởng đến đầu ra của mạng. Làm điều này giảm giá trị mục tiêu trong Phương trình (3), nhưng không tạo ra bất kỳ sparsity nào trong mạng. Trong thực tế, chúng tôi thực sự nhận thấy hành vi này trong quá trình tối ưu hóa Phương trình (3), dẫn đến các giải pháp dưới tối ưu (xem Phần 3.2). Lưu ý rằng việc thêm penalty ℓ2 trên weights (tức là weight decay) không giảm thiểu vấn đề này vì bất kỳ scaling nào của α có thể được hấp thụ bởi các tham số batch norm mà không thay đổi đầu ra của mạng.
+
+### 3.1 Tạo sparsity thông qua regularizer ℓ1/ℓ2
+
+Chúng tôi bây giờ giới thiệu phương pháp của mình để làm cho mục tiêu trong Phương trình (2) liên tục. Chúng tôi thay thế chuẩn ℓ0 trên masks (∥α_i∥_0) bằng penalty ℓ1/ℓ2 (√d_i ∥α_i∥_1/∥α_i∥_2) và giải quyết vấn đề tối ưu hóa sau
+
+min_{W,α_i∈R^{d_i}} (1/n) ∑^n_{i=1} ℓ(x_i, y_i; α, W) + λ ∑^D_{i=1} (√d_i ∥α_i∥_1)/(∥α_i∥_2) × (√d_{i+1} ∥α_{i+1}∥_1)/(∥α_{i+1}∥_2). (4)
+
+Hạng tử √d_i trong tử số chuẩn hóa penalty nằm giữa [0, d_i]. Khi α_i đều là 1, regularizer đánh giá thành FLOPs. Quan sát rằng regularizer này không thay đổi với scaling của α. Do đó, giá trị của regularizer không thể đơn giản bị giảm bằng cách scale down α_i. Trong các thí nghiệm của chúng tôi trong phần 3.2 và Phụ lục C.2, chúng tôi chỉ ra rằng điều này xử lý batch, layer normalization tốt hơn regularizer ℓ1. Một số nghiên cứu đã nghiên cứu regularizer này trong bối cảnh sparse linear regression và chỉ ra rằng nó khôi phục tín hiệu sparse cơ bản dưới các điều kiện nhẹ trên dữ liệu [51,52,53]. [54] đã sử dụng một regularizer ℓ1/ℓ2 tương tự cho network pruning, nhưng kỹ thuật của họ không tối ưu hóa latency hoặc FLOPs, và dựa vào thresholding hậu huấn luyện để có sparsity.
+
+Vì một số lý do kỹ thuật được mô tả sau, chúng tôi thêm một ràng buộc tích cực trên α_i và giải quyết mục tiêu sau
+
+min_{W,α_i∈R^{d_i}_+} (1/n) ∑^n_{i=1} ℓ(x_i, y_i; α, W) + λ ∑^D_{i=1} (√d_i ∑^{d_i}_{j=1} α_{i,j})/(∥α_i∥_2) × (√d_{i+1} ∑^{d_{i+1}}_{j=1} α_{i+1,j})/(∥α_{i+1}∥_2). (5)
+
+Lưu ý rằng chúng tôi xem xét α ∈ R^{d_i}_+ thay vì các giá trị rời rạc hoặc bị chặn. Chúng tôi muốn nhấn mạnh rằng thay đổi này không làm giảm sức mạnh biểu diễn của mô hình chúng tôi. Nó chủ yếu được thực hiện vì lý do tính toán. Trong phần tiếp theo, chúng tôi sử dụng viết tắt ∥α_i∥_{1p} (p cho positive) để biểu thị ∑^{d_i}_{j=1} α_{i,j}.
+
+**Tầm quan trọng của các ràng buộc tích cực.** Mục tiêu trong Phương trình (4) là liên tục, nhưng không mịn. Đối với những loss như vậy, các kỹ thuật tối ưu hóa tiêu chuẩn như SGD, Adam chậm hội tụ đến các điểm dừng [55]. Hơn nữa, các thuật toán này không xuất ra các giải pháp sparse chính xác. Điều này buộc phải giới thiệu các bước xử lý hậu kỳ bổ sung vào pipeline nén. Ví dụ, [11,54] dựa vào optimizer Adam và thêm một bước pruning ở cuối, nơi các mask gần với 0 được pruned đi. Điều này khá cồng kềnh trong thực tế vì người ta cần chọn ngưỡng thích hợp cho pruning, điều này giới thiệu một siêu tham số có thể điều chỉnh bổ sung, và cần huấn luyện lại sau pruning.
+
+Để khắc phục điều này, chúng tôi thêm một ràng buộc tích cực vào các biến mask và sửa đổi mục tiêu thành Phương trình (5). Điều này làm cho regularizer mịn (ngoại trừ tại vector tất cả 0), và dễ tối ưu hóa bằng SGD, Adam. Sau mỗi bước cập nhật SGD/Adam, chúng tôi đơn giản chiếu các mask trở lại không gian số thực dương. Cập nhật tổng thể trông như sau
+
+W ← W - η∇_W(L(α,W) + λR(α)), α ← max(0, α - η∇_α(L(α,W) + λR(α))).
+
+Ở đây L(α,W) là empirical risk và R(α) là regularizer. Lưu ý, bước bổ sung duy nhất so với tối ưu hóa truyền thống, là việc clipping của α. Trong các nghiên cứu ablation của chúng tôi trong Phần 3.2 và Phụ lục C.2, chúng tôi xác thực tầm quan trọng của bước chiếu này, cùng với chuẩn ℓ1/ℓ2, trong việc khuyến khích các giải pháp sparse.
+
+### 3.2 Xác minh các lựa chọn thiết kế
+
+Để chứng minh thực nghiệm các nhược điểm của việc sử dụng penalty ℓ1 cho nén mô hình, chúng tôi thực hiện các thí nghiệm trên tập dữ liệu FashionMNIST với một mạng fully connected một hidden layer có một layer batch norm sau layer linear đầu tiên. Chúng tôi prune ra đầu vào của mạng bằng cách sử dụng một mask α trên đầu vào. Chúng tôi so sánh hiệu suất của các mạng được nén bằng regularizer FLOPs được tạo ra bởi chuẩn ℓ1 và ℓ1/ℓ2. Chúng tôi sử dụng SGD để tối ưu hóa cả hai mục tiêu. Hơn nữa, chúng tôi huấn luyện trước mạng bằng cách sử dụng CE loss tiêu chuẩn, và khởi tạo α = 1. Chúng tôi theo dõi phương sai của các giá trị tuyệt đối của các entries của α, tức là ∑^d_{i=1}(|α_i| - μ_α)²/d, trong đó μ_α = ∑^d_{i=1}|α_i|/d. Chúng tôi cũng theo dõi mean μ_α của các giá trị tuyệt đối của các entries của α. Cuối cùng, chúng tôi vẽ đường cong giữa FLOPs và chuẩn được xem xét của α (tức là ℓ1, ℓ1/ℓ2). Hình 2 trình bày kết quả từ các thí nghiệm này. Chúng ta có thể thấy rằng mục tiêu ℓ1 không được căn chỉnh với giá trị thực tế của FLOPs, trong khi regularizer được tính toán bằng ℓ1/ℓ2 là một proxy tốt hơn. Chúng tôi cũng thấy rằng mean và variance của α giảm mạnh khi regularizer FLOPs được tạo ra bởi ℓ1 được sử dụng cho nén. Điều này cho thấy rằng tất cả các entries của α được scale đồng nhất xuống một giá trị nhỏ, không bằng không, giảm giá trị mục tiêu regularizer, trong khi không cung cấp bất kỳ sparsity nào. Như thấy từ hình, ℓ1/ℓ2 không gặp phải nhược điểm này. Cuối cùng, chúng tôi lưu ý rằng chuẩn frobenius của ma trận weight W tăng khi regularization ℓ1 được sử dụng trên α, cho thấy rằng mạng đơn giản đang scale down α và scale up các weights để trốn tránh regularizer.
+
+### 3.3 Nén mô hình nhận biết phần cứng
+
+Trong phần này, chúng tôi mở rộng regularizer FLOPs để tính đến latency trên phần cứng mục tiêu. Regularizer kết quả đặc biệt hữu ích cho việc thực hiện nén mạng nhận biết phần cứng. Quan sát chính của chúng tôi là suy luận trên một mạng nơ-ron có thể được chia thành một loạt các phép toán nhân ma trận. Ví dụ, suy luận trên một FFN độ sâu D liên quan đến D phép nhân ma trận-vector, chiếm phần lớn thời gian. Vì vậy, việc có ước tính tốt về thời gian suy luận của toàn bộ mạng được quy về việc có ước tính tốt về latency của phép nhân ma trận-vector. Để đạt được điều này, chúng tôi dựa vào các bảng tra cứu. Trước khi bắt đầu giai đoạn pruning, chúng tôi xây dựng một bảng tra cứu 2 chiều T có entry thứ (d₁, d₂) là latency trên thiết bị của việc nhân một ma trận kích thước d₁×d₂ với một vector kích thước d₂. Một bảng như vậy dễ xây dựng, với việc truy cập vào thiết bị mục tiêu. Tiếp theo, để kết hợp bảng tra cứu T vào thuật toán pruning của chúng tôi, chúng tôi chuyển đổi nó thành một hàm liên tục bằng cách thực hiện nội suy tuyến tính trên các entries trong bảng [56]. Để chính xác, đối với bất kỳ (x, y) ∈ [d₁, d₁ + 1] × [d₂, d₂ + 1], trong đó d₁, d₂ ∈ ℕ ∪ {0}, chúng tôi định nghĩa T(x, y) là: T(x, y) = t₁ + (t₂ - t₁)(y - d₂), trong đó t₁ = T(d₁, d₂) + (T(d₁ + 1, d₂) - T(d₁, d₂))(x - d₁), và t₂ = T(d₁, d₂ + 1) + (T(d₁ + 1, d₂ + 1) - T(d₁, d₂ + 1))(x - d₁). Lưu ý rằng trái ngược với các kỹ thuật NAS black-box như [19] tìm kiếm trên không gian rời rạc của số lượng filter cho mỗi block, phương pháp của chúng tôi cần surrogate latency phải khả vi, và do đó chúng tôi cần các bảng latency được nội suy. Xem phụ lục để biết chi tiết về cách chúng tôi xây dựng các bảng.
+
+Chúng tôi sử dụng bảng tra cứu được nội suy này để xây dựng regularizer latency của chúng tôi như sau
+
+∑^D_{i=1} T(√d_i ∥α_i∥_{1p}/∥α_i∥_2, √d_{i+1} ∥α_{i+1}∥_{1p}/∥α_{i+1}∥_2). (6)
+
+Trong biểu thức trên, surrogate khả vi của chúng tôi cho ∥α_i∥_0 (tức là √d_i ∥α_i∥_{1p}/∥α_i∥_2), được sử dụng để index bảng tra cứu. Chúng tôi lưu ý rằng chuẩn ℓ1/ℓ2 rất quan trọng để kỹ thuật này thành công. Điều này là do √d_i ∥α_i∥_{1p}/∥α_i∥_2 được chuẩn hóa và luôn nằm giữa [0, d_i]. Ngược lại, việc sử dụng surrogate chuẩn ℓ1 trong regularizer cho chúng ta T(∥α_i∥_1, ∥α_{i+1}∥_1). Việc scale α_i bằng một hằng số có thể thay đổi drastically regularizer này, và làm cho tối ưu hóa không ổn định.
+
+## 4 Thí nghiệm
+
+Trong phần này, chúng tôi áp dụng framework của mình cho các tác vụ huấn luyện trước quy mô lớn và transfer learning trên các benchmark ngôn ngữ và thị giác tiêu chuẩn. Để chứng minh tính linh hoạt của kỹ thuật, chúng tôi thực hiện các thí nghiệm trên nhiều họ mô hình (MobileNet, EfficientNet [2], BERT), và nhiều building block (pruning, low-rank factorization, quantization). Chúng tôi cũng trình bày một nghiên cứu trường hợp sử dụng latency thực tế trên thiết bị thay vì FLOPs. Xem Phụ lục C.2 cho các nghiên cứu ablation khác.
+
+### 4.1 Huấn luyện trước ImageNet
+
+Chúng tôi bắt đầu bằng cách so sánh hiệu suất của kỹ thuật với các baseline trên nén MobileNetV3, cho phân loại ImageNet. Chúng tôi dựa vào low-rank factorization + pruning cho việc nén. Kết quả từ thí nghiệm này được trình bày trong Hình 1. Bằng cách thay đổi cường độ regularization của chúng tôi, chúng tôi thu được các mô hình với MACs và độ chính xác khác nhau. Chúng tôi thấy rằng các mô hình được tạo ra bởi phương pháp của chúng tôi vượt trội đáng kể so với MobileNetV3 và TuNAS trong chế độ MACs cao và trung bình. Cụ thể, đối với cùng độ chính xác như MobileNetV3Large, phương pháp của chúng tôi tìm thấy một mô hình với ít hơn 15% MACs. So sánh với TuNAS, chúng tôi đạt được giảm 30% MACs ở cùng mức độ chính xác. Tuy nhiên, chúng tôi thấy rằng mô hình của chúng tôi ngang bằng với MobileNetV3Small trong chế độ MACs thấp, cho thấy rằng mô hình trước đã được điều chỉnh tốt cho tác vụ này. Về tính toán cần thiết cho huấn luyện, TuNAS là đắt nhất trong tất cả các kỹ thuật chúng tôi đã thử; nó mất 2 ngày để huấn luyện với thiết lập phần cứng của chúng tôi. Ngược lại, phương pháp của chúng tôi mất 13 giờ (nhanh hơn 3−4× so với TuNAS), và MorphNet mất 10 giờ.
+
+### 4.2 Transfer Learning
+
+Một paradigm phổ biến trong việc triển khai các mô hình machine learning ngày nay là đầu tiên huấn luyện trước chúng trên một tập dữ liệu quy mô lớn như ImageNet, và sau đó fine-tune chúng cho tác vụ mục tiêu mong muốn. Tuy nhiên, việc triển khai các mô hình lớn không khả thi trên các thiết bị edge. Kỹ thuật của chúng tôi cung cấp một sửa đổi nhẹ cho quy trình fine-tuning tiêu chuẩn bằng cách tạo ra một mô hình nén với hiệu suất transfer learning tương đương trên tác vụ cụ thể. Chúng tôi chứng minh điều này trên các tác vụ thị giác và ngôn ngữ.
+
+**Các tác vụ thị giác.** Chúng tôi xem xét tác vụ fine-tuning một mô hình được huấn luyện trước ImageNet cho một tập dữ liệu nhỏ hơn. Chúng tôi xem xét Cars196 [57] và Food101 [58] là các tập dữ liệu mục tiêu, và so sánh với các họ mô hình MobileNetV3 và EfficientNet. Chúng tôi sử dụng các mô hình được huấn luyện trước ImageNet để khởi tạo. Chúng tôi vẽ các đường cong FLOP-accuracy trong Hình 3. Chúng tôi nén các kiến trúc MobileNetv3Large và EfficientNet-B4 và EfficientNet-B2 trong khi chuyển chúng đến tác vụ mục tiêu. Chúng tôi thấy rằng phương pháp của chúng tôi liên tục cải thiện so với các kiến trúc baseline trên các chế độ FLOPs khác nhau. Điều này là do kỹ thuật của chúng tôi có thể prune mô hình một cách thích ứng dựa trên độ khó của tác vụ phân loại. Trên cả hai tác vụ, chúng ta thấy cải thiện độ chính xác 1% so với MobileNetV3 small. Các cải thiện độ chính xác duy trì ở latency footprint của MobileNetV3Large-0.75, nơi chúng ta thấy cải thiện độ chính xác hơn 1.5% trên cả hai tập dữ liệu. Trên EfficientNet, chúng ta thấy giảm đến 40% FLOPs mà không có bất kỳ giảm độ chính xác nào trên Food101, và khoảng 20% giảm FLOPs trên tập dữ liệu Cars196 cho các mô hình lớn nhất (B4). Chúng ta cũng thấy khoảng 30% giảm FLOP trong khi duy trì hiệu suất transfer learning của các biến thể B1 và B0. Điều này chứng minh rằng các mô hình học được của chúng tôi có thể scale tốt hơn so với scaling heuristic được mô tả trong [2]. Xem phụ lục để biết kết quả bổ sung.
+
+**Fine-tuning BERT trên GLUE.** Chúng tôi xem xét 5 tập dữ liệu của benchmark GLUE [59] thường được sử dụng trong literature, và fine-tune một mô hình BERT-Base được huấn luyện trước với regularizer FLOPs của chúng tôi. Chúng tôi tham số hóa lại các ma trận weight của feed forward network của mỗi transformer block với parameterization low-rank+sparse của chúng tôi. Chúng tôi so sánh phương pháp của mình với model pruning, trong đó các số SOTA được lấy từ Hình 6 của [21], báo cáo độ chính xác tối đa trong số [60,61, 62,63,64,65]. Chúng tôi cũng báo cáo hiệu suất của các baseline dựa trên distillation được sử dụng rộng rãi [22,23]. Hình 1 trình bày hiệu suất trung bình trên 5 tập dữ liệu, và Hình 6 trong phụ lục trình bày hiệu suất riêng lẻ. Trong cả hai hình này, chúng tôi vẽ FLOPs tương đối của mô hình nén w.r.t BERT-base so với giảm độ chính xác w.r.t BERT-base (tương tự như [21]). Chúng tôi thấy rằng trên 4 trong 5 tập dữ liệu được xem xét, kỹ thuật của chúng tôi cung cấp độ chính xác cao hơn cho cùng số lượng FLOPs, cho thấy hiệu quả của phương pháp chúng tôi. Trên MRPC, một tập dữ liệu với rất ít mẫu, phương pháp của chúng tôi kém hơn trên FLOPs cao hơn, nhưng vượt trội so với các baseline trong chế độ FLOP thấp.
+
+### 4.3 Thí nghiệm bổ sung
+
+**Sử dụng regularizer latency.** Trong Phương trình 6, chúng tôi đề xuất một surrogate latency để tối ưu hóa latency suy luận thực tế trên thiết bị. Trong phần này, chúng tôi cung cấp bằng chứng thực nghiệm về hiệu quả của phương pháp này cho MobileNetv3 trên Pixel 6. Chúng tôi so sánh các đường cong accuracy-latency của các mô hình được tạo ra bằng cách sử dụng regularizer FLOPs, latency (xem Hình 4). Quan sát rằng việc sử dụng regularizer latency dẫn đến các mô hình với latency nhỏ hơn và do đó sự cân bằng latency-accuracy tốt hơn so với việc sử dụng regularizer FLOP. Chúng tôi cũng thấy rằng các mô hình này có hiệu suất tốt hơn MobileNetV3 (cải thiện độ chính xác 0.5−2% cho latency tương tự), mặc dù MobileNetv3 được tạo thủ công để suy luận nhanh hơn trên các thiết bị di động.
+
+**Quantization.** Trong tập thí nghiệm này, chúng tôi xem xét phân loại CIFAR-10 và nén một CNN 3 layer bằng quantization. Chúng tôi sử dụng công thức quantization được trình bày trong Bảng 1 và tìm kiếm trên quantization {2,4,8,16} bit cho mỗi layer. Chúng tôi so sánh với một baseline sử dụng cùng mức quantization tại mỗi layer. Hình 5 trình bày kết quả từ thí nghiệm này. Chi tiết về việc thực hiện có thể được tìm thấy trong phụ lục. Chúng tôi thấy rằng kỹ thuật của chúng tôi nén kích thước mô hình gần 55% mà không giảm độ chính xác (so với một mô hình với weights 16-bit). Kỹ thuật của chúng tôi cũng xuất ra một mô hình chính xác hơn 1.4% so với một mô hình quantized 2-bit với chỉ 4% FLOPs nhiều hơn. Trong biểu đồ bên phải trong Hình 5, chúng tôi hình ảnh hóa các bit-widths đã học của các mô hình của chúng tôi. Chúng tôi thấy rằng các layer sau được gán bit width nhỏ hơn, cho thấy tầm quan trọng của việc học các filter biểu cảm sớm trong mạng. Các mô hình khác nhau trong biểu đồ của chúng tôi được tìm thấy bằng cách thay đổi giá trị của hệ số regularizer, và do đó không cần tìm kiếm tổ hợp trên bit-widths.
+
+## 5 Kết luận và Nghiên cứu tương lai
+
+Trong nghiên cứu này, chúng tôi đã trình bày một kỹ thuật end-to-end cho nén mạng nơ-ron. Phương pháp của chúng tôi áp dụng cho nhiều loại efficient block bao gồm pruning, unstructured sparsity, quantization. Tại cốt lõi của thuật toán chúng tôi là một surrogate mới cho FLOPs, latency dựa trên chuẩn ℓ1/ℓ2, và hoạt động với batchnorm, layernorm. Thuật toán của chúng tôi hiệu quả về mặt tính toán và chạy trong cùng thời gian cần thiết để huấn luyện một mô hình đơn. Chúng tôi đã chứng minh hiệu quả của phương pháp trên các tác vụ huấn luyện trước và transfer learning khác nhau trên các benchmark ngôn ngữ và thị giác tiêu chuẩn. Là một nghiên cứu tương lai, sẽ hữu ích khi kết hợp thêm các efficient building block như ma trận đường chéo block vào framework của chúng tôi. Một hướng thú vị khác sẽ là làm cho kỹ thuật của chúng tôi nhận biết phần cứng hơn bằng cách kết hợp các tham số cấp phần cứng như tiling vào quá trình tìm kiếm của chúng tôi.
+
+## Tài liệu tham khảo
+
+[1] Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun. Deep residual learning for image recognition. In Proceedings of the IEEE conference on computer vision and pattern recognition, pages 770–778, 2016.
+
+[2] Mingxing Tan and Quoc Le. Efficientnet: Rethinking model scaling for convolutional neural networks. In International conference on machine learning, pages 6105–6114. PMLR, 2019.
+
+[3] Jared Kaplan, Sam McCandlish, Tom Henighan, Tom B Brown, Benjamin Chess, Rewon Child, Scott Gray, Alec Radford, Jeffrey Wu, and Dario Amodei. Scaling laws for neural language models. arXiv preprint arXiv:2001.08361, 2020.
+
+[4] Song Han, Jeff Pool, John Tran, and William Dally. Learning both weights and connections for efficient neural network. Advances in neural information processing systems, 28, 2015.
+
+[5] Aditya Kusupati, Vivek Ramanujan, Raghav Somani, Mitchell Wortsman, Prateek Jain, Sham Kakade, and Ali Farhadi. Soft threshold weight reparameterization for learnable sparsity. In International Conference on Machine Learning, pages 5544–5555. PMLR, 2020.
+
+[6] Ziheng Wang, Jeremy Wohlwend, and Tao Lei. Structured pruning of large language models. arXiv preprint arXiv:1910.04732, 2019.
+
+[7] Markus Nagel, Marios Fournarakis, Rana Ali Amjad, Yelysei Bondarenko, Mart van Baalen, and Tijmen Blankevoort. A white paper on neural network quantization. arXiv preprint arXiv:2106.08295, 2021.
+
+[8] Cristian Bucila, Rich Caruana, and Alexandru Niculescu-Mizil. Model compression. In Knowledge Discovery and Data Mining, 2006.
+
+[9] Tao Lin, Sebastian U Stich, Luis Barba, Daniil Dmitriev, and Martin Jaggi. Dynamic model pruning with feedback. arXiv preprint arXiv:2006.07253, 2020.
+
+[10] Alex Renda, Jonathan Frankle, and Michael Carbin. Comparing fine-tuning and rewinding in neural network pruning. In International Conference on Learning Representations, 2020.
+
+[11] Ariel Gordon, Elad Eban, Ofir Nachum, Bo Chen, Hao Wu, Tien-Ju Yang, and Edward Choi. Morphnet: Fast & simple resource-constrained structure learning of deep networks. In Proceedings of the IEEE conference on computer vision and pattern recognition, pages 1586–1595, 2018.
+
+[12] Shraman Ray Chaudhuri, Elad Eban, Hanhan Li, Max Moroz, and Yair Movshovitz-Attias. Fine-grained stochastic architecture search. arXiv preprint arXiv:2006.09581, 2020.
+
+[13] Christos Louizos, Max Welling, and Diederik P Kingma. Learning sparse neural networks through l_0 regularization. arXiv preprint arXiv:1712.01312, 2017.
+
+[14] Trevor Gale, Erich Elsen, and Sara Hooker. The state of sparsity in deep neural networks. arXiv preprint arXiv:1902.09574, 2019.
+
+[15] Mingxing Tan, Bo Chen, Ruoming Pang, Vijay Vasudevan, Mark Sandler, Andrew Howard, and Quoc V Le. Mnasnet: Platform-aware neural architecture search for mobile. In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition, pages 2820–2828, 2019.
+
+[16] Barret Zoph and Quoc V Le. Neural architecture search with reinforcement learning. arXiv preprint arXiv:1611.01578, 2016.
+
+[17] Kirthevasan Kandasamy, Willie Neiswanger, Jeff Schneider, Barnabas Poczos, and Eric Xing. Neural architecture search with bayesian optimisation and optimal transport. arXiv preprint arXiv:1802.07191, 2018.
+
+[18] Gabriel Bender, Hanxiao Liu, Bo Chen, Grace Chu, Shuyang Cheng, Pieter-Jan Kindermans, and Quoc V Le. Can weight sharing outperform random architecture search? an investigation with tunas. In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition, pages 14323–14332, 2020.
+
+[19] Tien-Ju Yang, Andrew Howard, Bo Chen, Xiao Zhang, Alec Go, Mark Sandler, Vivienne Sze, and Hartwig Adam. Netadapt: Platform-aware neural network adaptation for mobile applications. In Proceedings of the European Conference on Computer Vision (ECCV), pages 285–300, 2018.
+
+[20] Hanxiao Liu, Karen Simonyan, and Yiming Yang. Darts: Differentiable architecture search. arXiv preprint arXiv:1806.09055, 2018.
+
+[21] Woosuk Kwon, Sehoon Kim, Michael W Mahoney, Joseph Hassoun, Kurt Keutzer, and Amir Gholami. A fast post-training pruning framework for transformers. arXiv preprint arXiv:2204.09656, 2022.
+
+[22] Victor Sanh, Lysandre Debut, Julien Chaumond, and Thomas Wolf. Distilbert, a distilled version of bert: smaller, faster, cheaper and lighter, 2020.
+
+[23] Siqi Sun, Yu Cheng, Zhe Gan, and Jingjing Liu. Patient knowledge distillation for bert model compression. arXiv preprint arXiv:1908.09355, 2019.
+
+[24] Neal Parikh, Stephen Boyd, et al. Proximal algorithms. Foundations and trends ® in Optimization, 1(3):127–239, 2014.
+
+[25] Andrew Howard, Mark Sandler, Grace Chu, Liang-Chieh Chen, Bo Chen, Mingxing Tan, Weijun Wang, Yukun Zhu, Ruoming Pang, Vijay Vasudevan, et al. Searching for mobilenetv3. In Proceedings of the IEEE/CVF International Conference on Computer Vision, pages 1314–1324, 2019.
+
+[26] Charlie Chen, Sebastian Borgeaud, Geoffrey Irving, Jean-Baptiste Lespiau, Laurent Sifre, and John Jumper. Accelerating large language model decoding with speculative sampling. arXiv preprint arXiv:2302.01318, 2023.
+
+[27] Liam Li and Ameet Talwalkar. Random search and reproducibility for neural architecture search. In Uncertainty in artificial intelligence, pages 367–377. PMLR, 2020.
+
+[28] Hieu Pham, Melody Guan, Barret Zoph, Quoc Le, and Jeff Dean. Efficient neural architecture search via parameters sharing. In International Conference on Machine Learning, pages 4095–4104. PMLR, 2018.
+
+[29] Jieru Mei, Yingwei Li, Xiaochen Lian, Xiaojie Jin, Linjie Yang, Alan Yuille, and Jianchao Yang. Atomnas: Fine-grained end-to-end neural architecture search. arXiv preprint arXiv:1912.09640, 2019.
+
+[30] Thomas Elsken, Jan Hendrik Metzen, and Frank Hutter. Neural architecture search: A survey. The Journal of Machine Learning Research, 20(1):1997–2017, 2019.
+
+[31] Grace Chu, Okan Arikan, Gabriel Bender, Weijun Wang, Achille Brighton, Pieter-Jan Kindermans, Hanxiao Liu, Berkin Akin, Suyog Gupta, and Andrew Howard. Discovering multi-hardware mobile models via architecture search. In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition, pages 3022–3031, 2021.
+
+[32] Ji Lin, Wei-Ming Chen, Yujun Lin, John Cohn, Chuang Gan, and Song Han. Mcunet: Tiny deep learning on iot devices. arXiv preprint arXiv:2007.10319, 2020.
+
+[33] Zhen Dong, Yizhao Gao, Qijing Huang, John Wawrzynek, Hayden KH So, and Kurt Keutzer. Hao: Hardware-aware neural architecture optimization for efficient inference. In 2021 IEEE 29th Annual International Symposium on Field-Programmable Custom Computing Machines (FCCM), pages 50–59. IEEE, 2021.
+
+[34] Li Lyna Zhang, Yuqing Yang, Yuhang Jiang, Wenwu Zhu, and Yunxin Liu. Fast hardware-aware neural architecture search. In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition Workshops, pages 692–693, 2020.
+
+[35] Hadjer Benmeziane, Kaoutar El Maghraoui, Hamza Ouarnoughi, Smail Niar, Martin Wistuba, and Naigang Wang. A comprehensive survey on hardware-aware neural architecture search. arXiv preprint arXiv:2101.09336, 2021.
+
+[36] Jonathan Frankle and Michael Carbin. The lottery ticket hypothesis: Finding sparse, trainable neural networks. arXiv preprint arXiv:1803.03635, 2018.
+
+[37] Ehud D Karnin. A simple procedure for pruning back-propagation trained neural networks. IEEE transactions on neural networks, 1(2):239–242, 1990.
+
+[38] Pavlo Molchanov, Stephen Tyree, Tero Karras, Timo Aila, and Jan Kautz. Pruning convolutional neural networks for resource efficient inference. arXiv preprint arXiv:1611.06440, 2016.
+
+[39] Pavlo Molchanov, Arun Mallya, Stephen Tyree, Iuri Frosio, and Jan Kautz. Importance estimation for neural network pruning. In Proceedings of the IEEE/CVF conference on computer vision and pattern recognition, pages 11264–11272, 2019.
+
+[40] Yiwen Guo, Anbang Yao, and Yurong Chen. Dynamic network surgery for efficient dnns. Advances in neural information processing systems, 29, 2016.
+
+[41] Xin Dong, Shangyu Chen, and Sinno Pan. Learning to prune deep neural networks via layer-wise optimal brain surgeon. Advances in Neural Information Processing Systems, 30, 2017.
+
+[42] Max Jaderberg, Andrea Vedaldi, and Andrew Zisserman. Speeding up convolutional neural networks with low rank expansions. arXiv preprint arXiv:1405.3866, 2014.
+
+[43] Zhiyun Lu, Vikas Sindhwani, and Tara N Sainath. Learning compact recurrent neural networks. In 2016 IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP), pages 5960–5964. IEEE, 2016.
+
+[44] Yuhui Xu, Yuxi Li, Shuai Zhang, Wei Wen, Botao Wang, Wenrui Dai, Yingyong Qi, Yiran Chen, Weiyao Lin, and Hongkai Xiong. Trained rank pruning for efficient deep neural networks. In 2019 Fifth Workshop on Energy Efficient Machine Learning and Cognitive Computing-NeurIPS Edition (EMC2-NIPS), pages 14–17. IEEE, 2019.
+
+[45] Balas Kausik Natarajan. Sparse approximate solutions to linear systems. SIAM journal on computing, 24(2):227–234, 1995.
+
+[46] Robert Tibshirani. Regression shrinkage and selection via the lasso. Journal of the Royal Statistical Society: Series B (Methodological), 58(1):267–288, 1996.
+
+[47] Sahand Negahban, Bin Yu, Martin J Wainwright, and Pradeep Ravikumar. A unified framework for high-dimensional analysis of m-estimators with decomposable regularizers. Advances in neural information processing systems, 22, 2009.
+
+[48] Jihun Yun, Aurélie C Lozano, and Eunho Yang. Adaptive proximal gradient methods for structured neural networks. Advances in Neural Information Processing Systems, 34:24365–24378, 2021.
+
+[49] Sergey Ioffe and Christian Szegedy. Batch normalization: Accelerating deep network training by reducing internal covariate shift. In International conference on machine learning, pages 448–456. PMLR, 2015.
+
+[50] Jimmy Lei Ba, Jamie Ryan Kiros, and Geoffrey E Hinton. Layer normalization. arXiv preprint arXiv:1607.06450, 2016.
+
+[51] Penghang Yin, Ernie Esser, and Jack Xin. Ratio and difference of l_1 and l_2 norms and sparse representation with coherent dictionaries. Communications in Information and Systems, 14(2):87–109, 2014.
+
+[52] Yaghoub Rahimi, Chao Wang, Hongbo Dong, and Yifei Lou. A scale-invariant approach for sparse signal recovery. SIAM Journal on Scientific Computing, 41(6):A3649–A3672, 2019.
+
+[53] Chao Wang, Ming Yan, Yaghoub Rahimi, and Yifei Lou. Accelerated schemes for the l_1/l_2 minimization. IEEE Transactions on Signal Processing, 68:2660–2669, 2020.
+
+[54] Huanrui Yang, Wei Wen, and Hai Li. Deephoyer: Learning sparser neural network with differentiable scale-invariant sparsity measures. arXiv preprint arXiv:1908.09979, 2019.
+
+[55] Stephen Boyd, Stephen P Boyd, and Lieven Vandenberghe. Convex optimization. Cambridge university press, 2004.
+
+[56] Helmuth Späth. One dimensional spline interpolation algorithms. AK Peters/CRC Press, 1995.
+
+[57] Jonathan Krause, Michael Stark, Jia Deng, and Li Fei-Fei. 3d object representations for fine-grained categorization. In 4th International IEEE Workshop on 3D Representation and Recognition (3dRR-13), Sydney, Australia, 2013.
+
+[58] Lukas Bossard, Matthieu Guillaumin, and Luc Van Gool. Food-101 – mining discriminative components with random forests. In European Conference on Computer Vision, 2014.
+
+[59] Alex Wang, Amanpreet Singh, Julian Michael, Felix Hill, Omer Levy, and Samuel Bowman. GLUE: A multi-task benchmark and analysis platform for natural language understanding. In Proceedings of the 2018 EMNLP Workshop BlackboxNLP: Analyzing and Interpreting Neural Networks for NLP, pages 353–355, Brussels, Belgium, November 2018. Association for Computational Linguistics.
+
+[60] Zejian Liu, Fanrong Li, Gang Li, and Jian Cheng. EBERT: Efficient BERT inference with dynamic structured pruning. In Findings of the Association for Computational Linguistics: ACL-IJCNLP 2021, pages 4814–4823, Online, August 2021. Association for Computational Linguistics.
+
+[61] Zi Lin, Jeremiah Liu, Zi Yang, Nan Hua, and Dan Roth. Pruning redundant mappings in transformer models via spectral-normalized identity prior. In Findings of the Association for Computational Linguistics: EMNLP 2020, pages 719–730, Online, November 2020. Association for Computational Linguistics.
+
+[62] François Lagunas, Ella Charlaix, Victor Sanh, and Alexander Rush. Block pruning for faster transformers. In Proceedings of the 2021 Conference on Empirical Methods in Natural Language Processing, pages 10619–10629, Online and Punta Cana, Dominican Republic, November 2021. Association for Computational Linguistics.
+
+[63] Ziheng Wang, Jeremy Wohlwend, and Tao Lei. Structured pruning of large language models. In Proceedings of the 2020 Conference on Empirical Methods in Natural Language Processing (EMNLP), pages 6151–6162, Online, November 2020. Association for Computational Linguistics.
+
+[64] Mengzhou Xia, Zexuan Zhong, and Danqi Chen. Structured pruning learns compact and accurate models. In Proceedings of the 60th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pages 1513–1528, Dublin, Ireland, May 2022. Association for Computational Linguistics.
+
+[65] Hassan Sajjad, Fahim Dalvi, Nadir Durrani, and Preslav Nakov. On the effect of dropping layers of pre-trained transformer models. Computer Speech & Language, 77:101429, jan 2023.
+
+[66] Weihan Chen, Peisong Wang, and Jian Cheng. Towards mixed-precision quantization of neural networks via constrained optimization. In Proceedings of the IEEE/CVF International Conference on Computer Vision, pages 5350–5359, 2021.
+
+[67] Stefan Uhlich, Lukas Mauch, Fabien Cardinaux, Kazuki Yoshiyama, Javier Alonso Garcia, Stephen Tiedemann, Thomas Kemp, and Akira Nakamura. Mixed precision dnns: All you need is a good parametrization. arXiv preprint arXiv:1905.11452, 2019.
+
+[68] Mart Van Baalen, Christos Louizos, Markus Nagel, Rana Ali Amjad, Ying Wang, Tijmen Blankevoort, and Max Welling. Bayesian bits: Unifying quantization and pruning. Advances in neural information processing systems, 33:5741–5752, 2020.
+
+[69] Yoshua Bengio, Nicholas Léonard, and Aaron Courville. Estimating or propagating gradients through stochastic neurons for conditional computation. arXiv preprint arXiv:1308.3432, 2013.
+
+[70] Geoffrey Hinton, Oriol Vinyals, Jeff Dean, et al. Distilling the knowledge in a neural network. arXiv preprint arXiv:1503.02531, 2(7), 2015.
+
+[71] Maying Shen, Hongxu Yin, Pavlo Molchanov, Lei Mao, Jianna Liu, and Jose M Alvarez. Halp: hardware-aware latency pruning. arXiv preprint arXiv:2110.10811, 2021.
+
+[72] Yanyu Li, Pu Zhao, Geng Yuan, Xue Lin, Yanzhi Wang, and Xin Chen. Pruning-as-search: Efficient neural architecture search via channel pruning and structural reparameterization. arXiv preprint arXiv:2206.01198, 2022.
+
+## Phụ lục
+
+### A Tham số hóa lại cho Quantization
+
+Trong phần này, chúng tôi trình bày việc tham số hóa W_i cho quantization. Tương tự như bài báo chính, chúng tôi xem xét một FFN. Đối với mỗi layer của mạng, chúng tôi muốn tìm kiếm trên quantization {1,2,4...B} bit của weights³. Gọi W_i là ma trận weight của layer i. Gọi clip(W_i; r_{i,l}, r_{i,u}) là ma trận weight bị giới hạn trong [r_{i,l}, r_{i,u}]
+
+clip(W_i; r_{i,l}, r_{i,u}) = r_{i,u} - ReLU(r_{i,u} - r_{i,l} - ReLU(W_i - r_{i,l})).
+
+Khi rõ ràng từ ngữ cảnh, chúng tôi sử dụng ký hiệu ngắn gọn clip(W_i) để biểu thị clip(W_i; r_{i,l}, r_{i,u}). Gọi W_{i,b} là quantization b-bit của W_i, và gọi r^{(b)}_{i,l}, r^{(b)}_{i,u} là các tham số phạm vi liên quan đến W_{i,b}. W_{i,b} được thu được bằng cách chia đều phạm vi (r^{(b)}_{i,u} - r^{(b)}_{i,l}) thành 2^b điểm và gán mỗi phần tử của W_i cho điểm grid gần nhất
+
+W_{i,b} = r^{(b)}_{i,l} + \frac{r^{(b)}_{i,u} - r^{(b)}_{i,l}}{2^b - 1} \left\lfloor \frac{clip(W_i) - r^{(b)}_{i,l}}{(r^{(b)}_{i,u} - r^{(b)}_{i,l})/(2^b - 1)} \right\rceil.
+
+Ở đây ⌊·⌉ biểu thị hàm round-to-nearest-integer. Để chọn giữa W_{i,1}, W_{i,2}... W_{i,B}, chúng tôi giới thiệu các biến mask nhị phân α_{i,1}, α_{i,2}... α_{i,B}. Điều này dẫn chúng ta đến việc tham số hóa W_i sau
+
+α_{i,1}(W_{i,1} + α_{i,2}(W_{i,2} - W_{i,1} + α_{i,4}(W_{i,4} - W_{i,2} + α_{i,8}(...)))) (7)
+
+α_{i,b} = 0 có nghĩa là weights có thể được tham số hóa với ít hơn b bit. Quan sát rằng biểu thức trên có thể được viết lại như
+
+α_{i,1}(1-α_{i,2})W_{i,1} + α_{i,1}α_{i,2}(1-α_{i,4})W_{i,2} + α_{i,1}α_{i,2}α_{i,4}(1-α_{i,8})W_{i,4}...
+
+FLOPs cần thiết để tính toán đầu ra của layer này được cho bởi
+
+[∥α_{i,1}(1-α_{i,2})∥_0 + 2∥α_{i,1}α_{i,2}(1-α_{i,4})∥_0 + 4∥α_{i,1}α_{i,2}α_{i,4}(1-α_{i,8})∥_0 + ...]d_i d_{i+1}
+
+Vì tìm kiếm các mask nhị phân là không khả thi về mặt tính toán, chúng tôi làm cho chúng liên tục; nghĩa là, chúng tôi để α_{i,b} ∈ [0,1], ∀b ∈ {1,2,4,...B}. Chúng tôi xem xét một surrogate FLOPs liên tục được thu được bằng cách tính toán chuẩn ℓ1/ℓ2 của
+
+[α_{i,1}(1-α_{i,2}), 2α_{i,1}α_{i,2}(1-α_{i,4}), 4α_{i,1}α_{i,2}α_{i,4}(1-α_{i,8})...].
+
+Điều này dẫn chúng ta đến regularizer sau
+
+\frac{α_{i,1}(1-α_{i,2}) + 2α_{i,1}α_{i,2}(1-α_{i,4}) + 4α_{i,1}α_{i,2}α_{i,4}(1-α_{i,8})...}{\sqrt{(α_{i,1}(1-α_{i,2}))^2 + (2α_{i,1}α_{i,2}(1-α_{i,4}))^2 + (4α_{i,1}α_{i,2}α_{i,4}(1-α_{i,8}))^2...}} d_i d_{i+1}.
+
+**Nhận xét 1.** Regularizer ℓ1/ℓ2 của chúng tôi thường xuất ra α_i gần với 0/1. Trong nhiều trường hợp, chúng thực tế chính xác bằng 0/1. Trong trường hợp chúng không bằng 0,1, chúng tôi chiếu α_{i,b} về {0,1}. Điều này đảm bảo chúng tôi có quantized weights.
+
+**Nhận xét 2.** Có một số nghiên cứu khác đã cố gắng học lượng quantization/precision sử dụng tại mỗi layer [66,67,68]. Tuy nhiên, không giống như nghiên cứu của chúng tôi, các nghiên cứu này không tối ưu hóa trực tiếp cho FLOPs, latency. Chúng tôi muốn lưu ý rằng việc tham số hóa của chúng tôi liên quan chặt chẽ đến việc tham số hóa của [68].
+
+**Straight Through Estimator (STE).** Lưu ý rằng mục tiêu huấn luyện cho quantization không khả vi. Vì vậy, trong các thí nghiệm của chúng tôi, chúng tôi sử dụng STE để tối ưu hóa mục tiêu [69]. Đây là một kỹ thuật tiêu chuẩn để thực hiện quantization aware training.
+
+³B thường là lũy thừa của 2
+
+### B Chi tiết thực hiện và thí nghiệm
+
+Trong phần này, chúng tôi cung cấp chi tiết bổ sung về việc thực hiện kỹ thuật của chúng tôi. Chúng tôi warm-start quy trình pruning của mình với mô hình được huấn luyện trước (tức là f∗ trong Phần 3) được cung cấp cho chúng tôi. Trong các thí nghiệm của mình, chúng tôi nhận thấy rằng điều này tăng tốc sự hội tụ của thuật toán. Đối với cả nén MobileNetV3 và BERT, chúng tôi dựa vào pruning đồng thời, low-rank factorization của weights (xem Bảng 1 để biết chi tiết). Ở đây, chúng tôi tham số hóa weights W_i là U_i diag(β_i) V_i diag(α_i); việc đặt các entries của β_i thành 0 giúp giảm rank của ma trận weight, và α_i giúp trong pruning. Chúng tôi khởi tạo U_i, V_i, β_i bằng cách thực hiện SVD trên các ma trận weight của mạng được huấn luyện trước. Trong các thí nghiệm của mình, chúng tôi áp dụng kỹ thuật chỉ cho các layer 1×1 convolution trong mạng, mà việc hình thành regularizer của chúng tôi vẫn giống như được mô tả trong văn bản trước. Chúng tôi anneal cường độ regularization λ, tăng tuyến tính để ổn định việc huấn luyện. Cuối cùng, chúng tôi fine-tune mô hình được trả về bởi thuật toán pruning trên dữ liệu huấn luyện để cải thiện hiệu suất (điều này đơn giản liên quan đến việc đặt hệ số regularization FLOPs thành 0). Trong các giai đoạn fine-tuning và pruning, chúng tôi tận dụng mô hình được huấn luyện trước bằng cách thêm distillation loss vào cross-entropy loss tiêu chuẩn [70]. Chúng tôi thực hiện distillation giữa logits của mô hình được huấn luyện trước và logits của mô hình đang được fine-tuned.
+
+#### B.1 Huấn luyện trước ImageNet
+
+Thuật toán của chúng tôi được thực hiện bằng TensorFlow 2.0. Chúng tôi sử dụng các mô hình MobileNetV3 (hoặc EfficientNet) được huấn luyện trước được cung cấp trong framework này để warm-start các mô hình của chúng tôi. Chúng tôi khởi tạo U_i, β_i, V_i thành SVD của các filter 1x1 convolution, và các entries của α_i đồng nhất ngẫu nhiên giữa [0,0.5]. Chúng tôi sử dụng Adam để tối ưu hóa với các tham số mặc định, và tìm kiếm trên learning rates trong tập {10^{-4}, 5×10^{-5}, 10^{-5}}, với cosine decay, đây là thực hành tiêu chuẩn. Hệ số distillation được tìm kiếm trong số {0.1, 0.25, 0.5, 0.9} và nhiệt độ distillation được tìm kiếm trong số {2, 3, 4}. Đối với các thí nghiệm ImageNet của chúng tôi, chúng tôi huấn luyện mô hình trong 70000 bước, anneal tuyến tính regularizer trong 50000 bước đầu tiên. Chúng tôi fine-tune mô hình thu được trong 50000 bước khác. Đối với các thí nghiệm transfer learning, chúng tôi giảm xuống 25000 cho huấn luyện và 15000 cho fine-tuning. Chúng tôi sử dụng batch size 2048 cho tất cả thí nghiệm. Hệ số regularizer của chúng tôi được thay đổi từ 10^{-8} đến 10^{-6}. Phạm vi này được xác định bằng cách nhìn vào độ lớn của cross-entropy loss và regularizer FLOPs, và đảm bảo rằng chúng tương tự. Huấn luyện trước MobileNet mất khoảng 13 giờ.
+
+#### B.2 Transfer Learning
+
+**BERT.** Đối với các thí nghiệm fine-tuning BERT, chúng tôi bắt đầu với một mô hình BERT được huấn luyện trước và giới thiệu việc tham số hóa của chúng tôi theo cách tương tự như được mô tả ở trên. Chúng tôi sử dụng AdamW để tối ưu hóa, và tìm kiếm trên learning rates trong số {10^{-4}, 5×10^{-5}, 10^{-5}}. Hệ số regularizer của chúng tôi được thay đổi từ 10^{-7} đến 5*10^{-6}. Mỗi lần chạy fine-tuning mất từ 20 phút - 1 giờ.
+
+**EfficientNet, MobileNet.** Đối với các thí nghiệm EfficientNet và MobileNet, chúng tôi có thiết lập thí nghiệm tương tự và không gian tìm kiếm siêu tham số như huấn luyện trước MobileNet ImageNet được mô tả trong Phụ lục B.1, ngoại trừ việc chúng tôi không thực hiện bất kỳ model distillation nào. Chúng tôi cũng sử dụng RMSProp cho EfficientNet với exponential decay làm lịch trình LR, vì đây là optimizer được lựa chọn cho việc huấn luyện trước của nó. Chúng tôi huấn luyện trong 25000 bước với regularizer, và fine-tune trong 25000 bước khác.
+
+#### B.3 Quantization
+
+Chúng tôi huấn luyện một CNN với bốn layer convolution, với [64,128,256,128] filter và kernel size 3 với stride là 1 cho mỗi layer. Chúng tôi có thêm các layer batch-norm sau mỗi layer conv. Chúng tôi tìm kiếm learning rate trên {1e-4, 5e-4, 1e-3, 5e-3} cho baseline và mô hình của chúng tôi, và hệ số regularizer trên {1e-9, 3e-9, 5e-9, 7e-9, 1e-8}. Chúng tôi huấn luyện trong 100 epoch với batch size 512 trên một GPU V100 đơn, và sử dụng Adam với CosineDecay cho learning rate.
+
+#### B.4 Bảng Latency
+
+Như đã đề cập trong bài báo chính, các latency thực tế trên thiết bị được tính toán trên Pixel6 cho các thí nghiệm latency của chúng tôi. Chúng tôi lấp đầy bảng tra cứu latency T được chỉ định trong Phần 3.3 bằng cách profiling latency 1×1 convolution/matrix-vector multiplication tương ứng, trên thiết bị. Lưu ý rằng phép toán convolution được tối ưu hóa tốt hơn nhiều so với phép toán nhân ma trận trên kernel Pixel6. Do đó, đối với các thí nghiệm latency của chúng tôi trên MobileNet, bảng latency được lấp đầy bằng cách profiling các phép toán 1×1 convolution.
+
+Một phép toán 1x1 convolution được xác định bởi chiều đầu vào, kênh đầu vào và số lượng filter (kênh đầu ra). Stride cũng có thể khác nhau nhưng tất cả 1x1 convolution trong kiến trúc MobileNet có stride 1. Trong kiến trúc MobileNet, chúng ta gặp feature map với chiều đầu vào indim ∈ I = {1,7,14,28,56,112,224}. Hơn nữa, kênh đầu vào (inc) và đầu ra (outc) bị ràng buộc bởi inc, outc ∈ D = {d|∀d ∈ ℕ và d < 1281}. Do đó chúng tôi xây dựng bảng T, mỗi thành viên có thể được truy cập qua T(indim, inc, outc). Lưu ý rằng profiling T(indim, inc, outc) cho mọi giá trị có thể của (indim, inc, outc) ∈ I × D × D là đắt đỏ. Do đó chúng tôi phải chọn một số tuple (inc, outc) cho mỗi indim ∈ I mà chúng tôi tính toán latency thực tế trên thiết bị. Phần còn lại của bảng được lấp đầy bằng nội suy tuyến tính. Chúng tôi chọn các tuple này sao cho chúng bao phủ các 1×1 convolution được gặp trong Kiến trúc MobileNet. Đối với indim = α, gọi β biểu thị giá trị tối đa có thể của inc, và γ biểu thị giá trị tối đa có thể của outc trong MobileNet. Chúng tôi xây dựng tập P_{in} biểu thị các giá trị có khả năng được gặp bởi regularizer cho inc và tương tự P_{out} cho outc. Cuối cùng, các latency thực tế trên thiết bị được tính toán cho T(α, P_{in} × P_{out}). Việc xây dựng P_{in} và P_{out} được thực hiện bằng cách chọn một θ thích hợp và thêm tất cả giá trị trong phạm vi (β - θ, β] vào P_{in}, và (γ - θ, γ] vào P_{out}. Ngoài ra, từ các phạm vi còn lại tức là (0, β - θ] và (0, γ - θ] các điểm được lấy mẫu theo cấp số nhân bằng cách chọn điểm giữa của phạm vi mỗi lần và thay đổi giới hạn dưới của phạm vi thành điểm giữa cho một số lần lặp nhất định.
+
+Thiết lập thí nghiệm và cấu hình siêu tham số chúng tôi sử dụng cho các thí nghiệm bảng latency giống như cho các thí nghiệm FLOPs (xem Phần B.1).
+
+### C Kết quả thí nghiệm bổ sung
+
+#### C.1 Huấn luyện trước ResNet trên ImageNet
+
+Trong phần này, chúng tôi trình bày kết quả thí nghiệm bổ sung để chứng minh tính tổng quát của phương pháp. Chúng tôi nén kiến trúc ResNet cho phân loại ImageNet, sử dụng phương pháp của mình. Cụ thể, chúng tôi nén các 1×1 convolution bằng pruning và low-rank factorization. Chúng tôi so sánh phương pháp của mình với HALP [71] và PAS [72], hai phương pháp hiện đại cho tìm kiếm kiến trúc và nén cho ResNet. Phương pháp của chúng tôi nén ResNet-101 thành một mô hình với FLOPs tương tự như ResNet-50, trong khi đồng thời đạt được hiệu suất tốt hơn baseline ResNet-50. Hơn nữa, kỹ thuật của chúng tôi vượt trội so với các phương pháp SOTA cho cùng số lượng FLOPs, như thấy trong Hình 7. Chúng tôi sử dụng cùng siêu tham số như được mô tả trong Phần B.1, nhưng chúng tôi thay đổi hệ số regularizer FLOP giữa [1e−10, 1e−9] vì các mô hình ResNet có số lượng FLOPs cao hơn.
+
+#### C.2 Nghiên cứu Ablation
+
+**Ảnh hưởng của sparsity norm.** Trong phần 3, chúng tôi đã cung cấp các thí nghiệm quy mô nhỏ để biện minh cho các lựa chọn thiết kế của việc sử dụng projected-Adam và chuẩn ℓ1/ℓ2. Trong phần này, chúng tôi thực hiện các nghiên cứu ablation quy mô lớn trên MobileNetV3 cho huấn luyện ImageNet. Kết quả từ thí nghiệm này được trình bày trong Hình 8. Không có projected-Adam, chúng tôi nhận thấy rằng thuật toán tối ưu hóa không hội tụ đến các giải pháp sparse. Do đó, các mô hình kết quả không có giảm lớn trong MACs. Độ chính xác của các mô hình này cũng bị ảnh hưởng lớn. Mặt khác, việc sử dụng regularizer FLOPs dựa trên chuẩn ℓ1 với projected-Adam gặp vấn đề scaling được mô tả trong Phần 3.2. Điều này dẫn đến một phần lớn kênh bị pruned cho một số block, tạo ra một mô hình với độ chính xác giảm. Phương pháp của chúng tôi có độ chính xác tốt hơn 2-4% trong các chế độ FLOPs cao và trung bình so với các lựa chọn thay thế này.
+
+**So sánh các building block khác nhau.** Trong Bảng 1, chúng tôi đã mô tả các cách để tích hợp các building block khác nhau vào framework của chúng tôi. Trong Hình 8, chúng tôi chứng minh sự cân bằng độ chính xác vs thời gian suy luận của việc sử dụng hai trong số các building block này trong framework của chúng tôi, cụ thể là Pruning và Pruning+Low-rank Factorization. Chúng tôi thấy rằng tính linh hoạt bổ sung được cung cấp bởi Low-Rank Factorization dẫn đến các mô hình với ít MACs hơn cho cùng độ chính xác, và sự khác biệt thậm chí còn rõ rệt hơn đối với các mô hình nhỏ hơn. Chúng tôi lưu ý rằng chỉ channel pruning có thể cho chúng ta giảm 10% MACs so với họ MobileNetV3 ở cùng mức độ chính xác. Cụ thể, ở độ chính xác 73.4%, mô hình của chúng tôi có 136Mn MACs so với 155Mn MACs của mô hình họ MobileNetV3. Tương tự, ở độ chính xác 75.5%, mô hình của chúng tôi có 198Mn MACs so với 216Mn MACs của mô hình họ MobileNetV3. Việc thêm cấu trúc Low-Rank giới thiệu thêm 5% giảm MACs so với lợi ích từ channel pruning, mà không mất độ chính xác. Điều này cũng cho thấy hiệu quả của thuật toán chúng tôi trên nhiều building block. Việc kết hợp các efficient block khác như block structured sparsity, quantization là một hướng cho điều tra tương lai.
+
+### D Kết hợp các building block
+
+Bảng 2 trình bày việc tham số hóa các ma trận weight cho phép chúng ta tìm kiếm trên nhiều building block đồng thời.
+
+### E Hạn chế và Tác động rộng hơn
+
+Một hạn chế của nghiên cứu là chúng tôi chỉ nghiên cứu các building block phổ biến như sparsity, pruning, low-rank factorization và quantization. Mở rộng nghiên cứu của chúng tôi cho nhiều building block hơn như block sparsity và các dạng structured sparsity khác là một hướng tương lai thú vị. Một hạn chế khác, liên quan đến việc thực hiện kỹ thuật của chúng tôi, là nhu cầu thực hiện thủ công regularizer FLOPs cho các kiến trúc khác nhau. Một giải pháp tự động nhận bất kỳ kiến trúc nào và tính toán regularizer FLOPs sẽ làm cho framework của chúng tôi dễ sử dụng.
+
+Về tác động rộng hơn, chúng tôi tin rằng kỹ thuật của chúng tôi có thể được sử dụng để tìm các kiến trúc hiệu quả hơn cho các mô hình ngôn ngữ lớn như GPT. Điều này có thể giúp dân chủ hóa các mô hình này, và cũng giảm carbon footprint của chúng.

@@ -1,0 +1,388 @@
+# SampleAttention: Tăng tốc Gần như Không mất mát cho Suy luận LLM Ngữ cảnh dài với Attention Thưa Thích ứng có Cấu trúc
+
+Qianchao Zhu†, Jiangfei Duan‡, Chang Chen†, Siran Liu†, Xiuhong Li†, Guanyu Feng§
+Xin Lv§, Huanqi Cao∪, Chuanfu Xiao†, Xingcheng Zhang∩, Dahua Lin‡∩, Chao Yang†
+
+†Đại học Bắc Kinh‡Đại học Trung văn Hồng Kông
+§Zhipu.AI∪Đại học Thanh Hoa∩Phòng thí nghiệm AI Thượng Hải
+
+## Tóm tắt
+
+Các mô hình ngôn ngữ lớn (LLM) hiện nay hỗ trợ cửa sổ ngữ cảnh cực kỳ dài, nhưng độ phức tạp bậc hai của attention vani-la dẫn đến độ trễ Time-to-First-Token (TTFT) đáng kể. Các phương pháp hiện có để giải quyết độ phức tạp này yêu cầu pretraining hoặc finetuning bổ sung, và thường hy sinh độ chính xác mô hình. Trong bài báo này, trước tiên chúng tôi cung cấp cả nền tảng lý thuyết và thực nghiệm cho attention thưa gần như không mất mát. Chúng tôi phát hiện rằng việc nắm bắt động các mẫu thưa đặc trưng của đầu tại thời gian chạy với chi phí thấp là quan trọng. Để giải quyết điều này, chúng tôi đề xuất SampleAttention, một attention thưa có cấu trúc thích ứng và gần như không mất mát. Tận dụng các mẫu thưa đáng kể quan sát được, SampleAttention chú ý đến một tỷ lệ cố định các token liền kề để nắm bắt các mẫu cửa sổ cục bộ, và sử dụng phương pháp lọc key-value hướng dẫn bởi query hai giai đoạn, lựa chọn thích ứng một tập tối thiểu các key-value với chi phí thấp, để nắm bắt các mẫu dải cột. Các đánh giá toàn diện cho thấy SampleAttention có thể thay thế liền mạch attention vani-la trong các LLM sẵn có với gần như không mất độ chính xác, và giảm TTFT lên đến 2.42× so với FlashAttention.
+
+## 1 Giới thiệu
+
+Những tiến bộ gần đây [1-5] đua nhau mở rộng cửa sổ ngữ cảnh của các mô hình ngôn ngữ lớn (LLM) [6-8] cho các ứng dụng phức tạp hơn, bao gồm phân tích tài liệu [9], code copilot [10,11], và các cuộc hội thoại kéo dài [12,13]. Các LLM phổ biến như Gemini [14], Claude [15] và Kimi [16] hiện hỗ trợ độ dài ngữ cảnh vượt quá 1 triệu token. Tuy nhiên, việc tăng độ dài ngữ cảnh khiến việc hỗ trợ tương tác trực tiếp trở nên thách thức do độ phức tạp bậc hai của cơ chế attention. Như được minh họa trong Hình 1, thời gian tính toán attention tăng bậc hai theo độ dài chuỗi, nhanh chóng chiếm ưu thế trong độ trễ Time to First Token (TTFT) (tức độ trễ prefill). Ví dụ, trong ngữ cảnh 1 triệu token, attention của ChatGLM-6B [17] mất 1555 giây, chiếm hơn 90% TTFT khi đánh giá trên GPU A100.
+
+Nhiều giải pháp đã được đề xuất để giải quyết độ phức tạp bậc hai của attention, nhưng không giải pháp nào có thể được áp dụng liền mạch và thực tế cho các LLM đã được pretrain mà không cần finetuning hoặc pretraining và hy sinh độ chính xác mô hình. Các phương pháp trước đây khám phá việc xấp xỉ attention dày đặc với attention thưa tĩnh hoặc động [18-26], ma trận thấp hạng [27-29], và attention thưa và thấp hạng thống nhất [30,31]. Các trạng thái hồi quy [32-34] và bộ nhớ ngoài [35,36] cũng được nghiên cứu để giảm thiểu độ phức tạp. Tuy nhiên, các phương pháp này yêu cầu pretraining từ đầu hoặc finetuning bổ sung, và không thể đạt được độ chính xác như attention đầy đủ. StreamingLLM [37] cung cấp attention thưa không cần tuning cho các kịch bản tạo vô hạn, nhưng nó không thể giảm hiệu quả TTFT mà không mất độ chính xác. Do đó, chúng tôi đặt câu hỏi,
+
+**Làm thế nào chúng ta có thể giảm TTFT cho các LLM ngữ cảnh dài sẵn có với độ chính xác mô hình gần như không mất mát?**
+
+Trong bài báo này, trước tiên chúng tôi cung cấp cả nền tảng lý thuyết và thực nghiệm cho attention thưa gần như không mất mát. Chúng tôi phát hiện rằng tính thưa của ma trận điểm trung gian trong attention ngữ cảnh dài là vốn dĩ cao, đặc trưng của đầu, và nhận thức nội dung. Cụ thể, đối với một prompt ngữ cảnh dài nhất định, một số đầu attention chỉ tập trung vào 0.2% token, trong khi những đầu khác có thể cần chú ý đến hơn một nửa. Từ các mẫu thưa động, chúng tôi cũng chứng minh một số mẫu cửa sổ cục bộ và dải cột vốn có như được minh họa trong Hình 1. Ngoại trừ các token liền kề trong cửa sổ cục bộ, một số dải cột động dường như quan trọng cho attention gần như không mất mát. Tính thưa linh hoạt này chỉ ra rằng attention thưa nên nắm bắt động các mẫu thưa đặc trưng của đầu tại thời gian chạy để gần như không mất mát.
+
+Tuy nhiên, việc lựa chọn thích ứng các phần tử thiết yếu đòi hỏi chi phí đáng kể. Sự đánh đổi giữa hiệu quả và độ chính xác là một chủ đề vĩnh cửu trong thiết kế attention thưa.
+
+Để giải quyết những thách thức này, chúng tôi đề xuất SampleAttention, một attention thưa có cấu trúc thích ứng có thể được tích hợp liền mạch vào các LLM ngữ cảnh dài sẵn có với độ chính xác mô hình gần như không mất mát. SampleAttention tận dụng các mẫu thưa cửa sổ và dải đáng kể, do đó đạt được thưa có cấu trúc và hiệu quả phần cứng. Để giải quyết tính thưa thích ứng, SampleAttention chú ý đến một tỷ lệ cố định các token liền kề để nắm bắt các mẫu cửa sổ cục bộ, và sử dụng phương pháp lọc key-value hướng dẫn bởi query hai giai đoạn, lựa chọn thích ứng một tập tối thiểu các key-value với chi phí thấp, để tập trung vào các mẫu dải cột. SampleAttention tăng tốc đáng kể attention vani-la bằng cách giảm cả yêu cầu I/O và tính toán. Chúng tôi cũng triển khai các kernel hiệu quả phần cứng. Đáng chú ý, SampleAttention nhằm giảm chi phí tính toán của attention, và là trực giao và có thể kết hợp với các phương pháp loại bỏ KV cache hiện có [39-41] để giảm thêm tiêu thụ bộ nhớ.
+
+Chúng tôi đánh giá SampleAttention trên ChatGLM2 và InternLM2 với một bộ benchmark phổ biến bao gồm nhiều nhiệm vụ tạo sinh khác nhau qua các độ dài chuỗi khác nhau. Kết quả thực nghiệm cho thấy SampleAttention đạt được gần như không mất độ chính xác cho các LLM khác nhau, vượt trội đáng kể so với các công trình trước, và giảm TTFT lên đến 2.42× so với FlashAttention.
+
+## 2 Công trình liên quan
+
+**Attention xấp xỉ.** Nhiều công trình đã được đề xuất để xấp xỉ attention bậc hai với độ phức tạp thấp hơn [18-31,42,40,25]. Ví dụ, BigBird [20] kết hợp attention cửa sổ, toàn cục và ngẫu nhiên để nắm bắt sự phụ thuộc tầm xa. Reformer [21] giảm chi phí tính toán thông qua locality-sensitive hashing. LongNet [22] thay thế attention đầy đủ bằng dilated attention. Linformer [27] sử dụng ma trận thấp hạng để xấp xỉ attention. HyperAttention [26] sử dụng locality sensitive hashing để xác định các mục quan trọng trên bản đồ attention. Tuy nhiên, các phương pháp này sử dụng mẫu thưa tĩnh hoặc thô, và thường bỏ qua mẫu thưa đặc trưng của đầu. Chúng không thể được áp dụng không mất mát trong các LLM đã pretrain mà không cần finetuning hoặc training bổ sung.
+
+**Nén KV Cache.** Chuỗi dài đi kèm với tiêu thụ bộ nhớ KV cache đáng kể. StreamingLLM [37] giữ các attention sink và một số token gần đây cho tạo sinh độ dài vô hạn. H2O [39] động duy trì sự cân bằng của các token gần đây và heavy hitter theo điểm attention trong quá trình giải mã. FastGen [43] thích ứng xây dựng KV cache theo các chính sách đặc trưng của đầu quan sát được. Những nỗ lực gần đây cũng lượng tử hóa KV cache thành độ chính xác thấp hơn để giảm tiêu thụ bộ nhớ [44-46]. Những công trình này nhắm mục tiêu giảm tiêu thụ bộ nhớ của KV cache, trong khi SampleAttention tập trung vào giảm thiểu chi phí tính toán ngữ cảnh dài. SampleAttention có thể kết hợp với các phương pháp này để giảm thêm tiêu thụ bộ nhớ của KV cache.
+
+## 3 Nền tảng của Attention Thưa Gần như Không mất mát
+
+Chúng tôi bắt đầu với cơ chế attention đầy đủ thông thường cho một đầu attention, trong khi nội dung sau có thể được áp dụng liền mạch cho nhiều đầu attention. Gọi Q∈RSq×d và K, V∈RSk×d là tensor query và key-value của một đầu, trong đó Sq, Sk là độ dài chuỗi tương ứng, và d là chiều đầu. Đầu ra attention đầy đủ O∈RSq×d có thể được công thức hóa như,
+
+P=softmax (QKT/√d)∈[0,1]Sq×Sk, O=PV∈RSq×d, (1)
+
+trong đó softmax được áp dụng theo hàng, và P là điểm attention. Chúng tôi phát hiện, trong các LLM ngữ cảnh dài, ma trận điểm attention P trở nên cực kỳ lớn, dẫn đến kém hiệu quả. Hơn nữa, việc áp dụng softmax trên các chuỗi dài có xu hướng giảm ảnh hưởng của các phần tử nhỏ hơn, làm cho chúng ít quan trọng hơn. Hiểu biết này thúc đẩy chúng tôi nghiên cứu tính thưa vốn có trong các điểm attention, có thể tăng tốc cơ chế attention mà không ảnh hưởng đến độ chính xác.
+
+### 3.1 Nền tảng Lý thuyết
+
+Chúng tôi trước tiên trình bày nền tảng lý thuyết để khám phá tính thưa điểm attention. Giả sử chúng ta áp dụng mặt nạ attention M∈ {0,1}Sq×Sk cho điểm attention P để có được attention thưa. Đầu ra attention thưa ˜O∈RSq×d có thể được công thức hóa như,
+
+˜P=M∗P∈[0,1]Sq×Sk, ˜O=˜PV∈RSq×d, (2)
+
+trong đó ∗ biểu thị tích element-wise. Chúng tôi đưa ra một định lý cho attention thưa gần như không mất mát.
+
+**Định lý 1.** (attention thưa gần như không mất mát) Giả sử norm L1 của các giá trị V được giới hạn trên bởi R > 0. Cho ϵ >0, tồn tại mặt nạ attention M sao cho ||˜P−P||1≤ϵ/R, và điều sau đúng: ||˜O−O||1≤ϵ, trong đó ˜O xấp xỉ gần như không mất mát đầu ra attention O.
+
+Chứng minh Định lý 1 xin tham khảo Phụ lục A.1. Định lý 1 gợi ý rằng chúng ta luôn có thể tìm mặt nạ attention M để đạt được attention xấp xỉ gần như không mất mát cho một ngưỡng cho trước. Sau đó chúng tôi định nghĩa một metric quan trọng giúp hiểu và định lượng hiệu quả của attention thưa.
+
+**Định nghĩa 1.** Độ thưa (SD) đo tỷ lệ phần trăm tối đa các phần tử key-value có thể bị loại bỏ trong khi duy trì ngưỡng CRA α chỉ định, và được công thức hóa như,
+
+SD(α) = max_{M∈{0,1}^{Sq×Sk}} {1−∑_{i,j}M_{ij}/(Sq·Sk/2)} ∈[0,1], s.t. CRA(M)≥α, (3)
+
+trong đó CRA đánh giá mức độ mà ma trận điểm attention có thể được phục hồi.
+
+**Định nghĩa 2.** Attention dư tích lũy (CRA) được định nghĩa là tổng tối thiểu các xác suất attention còn lại trong mỗi query sau khi thưa hóa với M, và được công thức hóa như,
+
+CRA(M) = min_{i∈{0,···,Sq−1}} ∑_{k=0}^i ˜P_{ik}, trong đó ˜P=M∗P (4)
+
+Ở đây chúng tôi sử dụng minimum cho CRA vì chúng tôi muốn đảm bảo ngay cả hàng có điểm attention dư tối thiểu cũng có thể được phục hồi gần như không mất mát. Chúng ta có thể chỉ ra rằng CRA của attention thưa gần như không mất mát có một giới hạn dưới.
+
+**Bổ đề 1.** Cho ϵ >0, điều sau đúng cho attention thưa gần như không mất mát: CRA(M)≥1−ϵ/R.
+
+Bổ đề 1 có thể được chứng minh dễ dàng vì ||˜P−P||1= 1−CRA(M).
+
+**Điểm rút ra:** Bằng cách khám phá mặt nạ attention hiệu quả M đáp ứng ngưỡng CRA α mong muốn, chúng ta có thể giảm hiệu quả thời gian tính toán attention với attention thưa gần như không mất mát bằng cách giảm thiểu I/O và tính toán. Độ thưa cao hơn (SD(α)) mang lại tăng tốc lớn hơn.
+
+### 3.2 Nền tảng Thực nghiệm của Tính Thưa Thích ứng trong Attention
+
+Phần 3.1 khám phá khả năng xấp xỉ đầu ra attention bằng attention thưa gần như không mất mát, với chìa khóa nằm ở việc tìm mặt nạ attention hiệu quả. Trong phần này, chúng tôi trình bày các phát hiện thực nghiệm tiết lộ tính thưa thích ứng vốn có cao, đặc trưng của đầu, và nhận thức nội dung cùng các mẫu đáng kể. Những điều này có thể được tận dụng để đạt được attention thưa gần như không mất mát hiệu quả.
+
+**Độ Thưa Vốn dĩ Cao.** Các quan sát của chúng tôi tiết lộ rằng các LLM vốn dĩ thể hiện độ thưa đáng kể khi sử dụng attention thưa gần như không mất mát. Trong Hình 2(a), độ thưa trung bình qua các lớp khác nhau của nhiều LLM được mô tả, với ngưỡng α= 0.95 cho độ chính xác mô hình gần như không mất mát. Chúng tôi phát hiện rằng hầu hết các lớp thể hiện độ thưa cực kỳ cao, vượt quá 90%, bất kể độ dài đầu vào.
+
+Để định lượng thêm sự thay đổi trong độ thưa khi độ dài chuỗi tăng, chúng tôi tiến hành đánh giá mở rộng trên nhiệm vụ "Needle in a Haystack" [47], như được minh họa trong Hình 2(b). Các phát hiện của chúng tôi chỉ ra rằng khi ngữ cảnh trở nên dài hơn, có sự tăng tương ứng trong độ thưa.
+
+**Tính Thưa Thích ứng.** Tính thưa attention là đặc trưng của đầu và nhận thức nội dung. Độ thưa và cấu trúc thay đổi qua các đầu attention khác nhau và ngữ cảnh đầu vào. Hình 2(c) chứng minh rằng một số đầu trong hầu hết các lớp thể hiện giá trị SD(α=0.95) thấp hơn, ngay cả khi xử lý các chuỗi dài đến 90K. Ví dụ, một đầu trong lớp đầu tiên có độ thưa chỉ 27.4%, trong khi độ cao nhất có thể đạt 99.8%. Điều này gợi ý rằng các đầu khác nhau có thể có vai trò riêng biệt trong xử lý chuỗi dài, chỉ ra rằng nén đồng nhất qua tất cả đầu có thể không tối ưu.
+
+Hình 2(d) cho thấy nội dung khác nhau có độ dài tương tự dẫn đến các biến thể đáng chú ý trong các mẫu thưa trong cùng lớp và đầu. Điều này chỉ ra rằng các vùng có điểm attention cao hơn thay đổi đáng kể dựa trên kịch bản cho trước, chẳng hạn như các prompt người dùng khác nhau.
+
+**Các Mẫu Cửa sổ và Dải Đáng kể.** Chúng tôi xác định hai mẫu thưa đáng kể đóng góp đáng kể cho điểm attention, như được mô tả trong Hình 2(d). Mẫu cửa sổ cục bộ nắm bắt thông tin ngữ cảnh gần đây, trong khi mẫu dải cột thể hiện thông tin ngữ cảnh toàn cục quan trọng. Bằng cách kết hợp thích ứng hai mẫu này, các LLM có thể xử lý hiệu quả cả thông tin chi tiết và manh mối ngữ cảnh quan trọng. Hình 2(e) chứng minh rằng việc chọn một lượng nhỏ các dải cột quan trọng có thể bao phủ phần lớn giá trị của ma trận điểm attention đầy đủ, do đó đạt được CRA cao. Điều này chỉ ra sự tương đồng phân phối số cao qua các hàng.
+
+Mặc dù các mẫu tương tự đã được quan sát trong các công trình gần đây [43,37,39], chúng tập trung vào giảm tiêu thụ bộ nhớ KV cache trong quá trình giải mã. Việc di chuyển trực tiếp các phương pháp này để tăng tốc attention prefill yêu cầu tính toán điểm attention đầy đủ, điều này không thể chịu đựng được trong ngữ cảnh dài. Cách khám phá hiệu quả các mẫu này cho tăng tốc gần như không mất mát của prefill vẫn là thách thức.
+
+**Điểm rút ra:** Tính thưa attention là vốn dĩ cao, đặc trưng của đầu, và nhận thức nội dung, và thể hiện các mẫu cửa sổ cục bộ và dải cột đáng kể. Tính thưa thích ứng này chỉ ra rằng attention thưa nên nắm bắt động các mẫu thưa thích ứng tại thời gian chạy để gần như không mất mát.
+
+## 4 SampleAttention
+
+Trong phần này, chúng tôi giới thiệu phương pháp của chúng tôi để khám phá hiệu quả các mặt nạ attention hiệu quả với các mẫu thưa đáng kể quan sát được và tăng tốc attention với attention thưa gần như không mất mát.
+
+### 4.1 Công thức Bài toán
+
+Như đã thảo luận, chìa khóa để sử dụng attention thưa gần như không mất mát là tìm mặt nạ attention M với các tính chất sau để đạt được hiệu suất vượt trội: 1) **gần như không mất mát**: đáp ứng ngưỡng CRA α mong muốn, 2) **thích ứng**: thay đổi qua các đầu, lớp và nội dung khác nhau, 3) **hiệu quả phần cứng**: tối đa hóa hiệu quả phần cứng, 4) **có thể khám phá hiệu quả**: có thể được tìm thấy với chi phí tối thiểu. Một mặt nạ tĩnh rõ ràng không thể đáp ứng các tiêu chí này, và những tính chất này đặt ra thách thức đáng kể.
+
+Việc chọn mặt nạ attention M∈ {0,1}Sq×Sk trực tiếp từ lưới điểm attention Sq×Sk trong thời gian chạy là không hiệu quả phần cứng và gây ra chi phí cao do kích thước lưới và mẫu có thể ngẫu nhiên. Do đó, chúng tôi trước tiên sử dụng các mẫu thưa đáng kể quan sát được để đơn giản hóa và tái công thức bài toán, nhằm khám phá mặt nạ mẫu thưa có cấu trúc hiệu quả phần cứng ˆM,
+
+ˆM:=M_window(w)∪M_stripe(I_KV), w∈ {1,···, S_k}, I_KV⊆ {0,···, S_k−1}, (5)
+
+trong đó w là kích thước cửa sổ cho mặt nạ cửa sổ M_window(w), và I_KV là tập các chỉ số key-value quan tâm cho mặt nạ dải M_stripe(I_KV) (như được minh họa trong Hình 3). Chúng tôi tận dụng mẫu thưa cố định, hiệu quả phần cứng, và xác định thích ứng kích thước và chỉ số trong thời gian chạy theo ngữ cảnh. Hơn nữa, mặt nạ attention có cấu trúc ˆM duy trì tính chất gần như không mất mát,
+
+**Định lý 2.** Mặt nạ mẫu thưa có cấu trúc hiệu quả phần cứng ˆM duy trì thưa gần như không mất mát.
+
+Chứng minh Định lý 2 xin tham khảo Phụ lục A.1. Với công thức đã cho, bài toán bây giờ là tìm w và I_KV cho mỗi đầu để đáp ứng các tính chất yêu cầu trong thời gian chạy.
+
+### 4.2 Phương pháp
+
+**Kích thước Cửa sổ Được Điều chỉnh w.** Điểm attention cao có xu hướng xảy ra trong các cửa sổ cục bộ có kích thước khác nhau, tùy thuộc vào ngữ cảnh, như được hiển thị trong Hình 2(d). Tuy nhiên, việc xác định động kích thước cửa sổ cục bộ cho mỗi token gây ra chi phí cao và không hiệu quả phần cứng. Thay vào đó, chúng tôi đặt kích thước cửa sổ w như một tỷ lệ cố định của độ dài chuỗi (⌈r_w%×S_k⌉), trong đó S_k là độ dài chuỗi của yêu cầu đầu vào. Tỷ lệ này được điều chỉnh đủ lớn để nắm bắt các cửa sổ cục bộ quan trọng, và nó cũng phù hợp với kích thước cửa sổ động qua các độ dài ngữ cảnh khác nhau. Trong khi các công trình trước đã khám phá attention cửa sổ [20,39,37], chúng thường dựa vào kích thước cửa sổ cố định, không thể nắm bắt đầy đủ các phụ thuộc cục bộ qua các độ dài ngữ cảnh khác nhau.
+
+**Chỉ số KV Quan tâm I_KV.** Mẫu dải thể hiện tính động hơn, và bài toán còn lại của chúng tôi là lựa chọn hiệu quả và động một tập tối thiểu các chỉ số key-value quan tâm I_KV cho prompt đầu vào và ngưỡng CRA α mong muốn,
+
+arg min_{I_KV} |I_KV| s.t. min_{i∈{0,···,S_q−1}} ∑_{j∈I_KV} P_{ij} ≥ α. (6)
+
+Lý tưởng, việc tính toán toàn bộ ma trận điểm attention P và sau đó chọn I_KV sẽ tối ưu, nhưng điều này gây ra chi phí bậc hai không thể chấp nhận được cả về tính toán và tiêu thụ bộ nhớ. May mắn thay, phân phối tương tự của các giá trị số lớn qua các hàng, như quan sát trong Phần 3.2, có thể được tận dụng để đơn giản hóa quá trình lựa chọn chỉ số. SampleAttention giới thiệu phương pháp lọc key-value hướng dẫn bởi query hai giai đoạn để xấp xỉ giải pháp. Thuật toán kiểu PyTorch tham khảo Phụ lục A.7. Các đánh giá của chúng tôi cho thấy xấp xỉ hoạt động khá tốt (Phần 5).
+
+**Giai đoạn-1: Lấy mẫu Attention Hướng dẫn bởi Query.** SampleAttention trước tiên lấy mẫu ma trận điểm attention bằng cách tính toán điểm chính xác cho một vài query (Hình 3 ①). Điều này được thúc đẩy bởi mẫu thưa dải cột đáng kể: một điểm cao cho P_ik gợi ý một xác suất cao rằng P_jk(j̸=i) cũng cao. Do đó chúng ta có thể chọn một tập con tối thiểu của các query {i_1,···, i_l} ⊆ {0,···, S_q−1} để xấp xỉ điểm attention với chi phí thấp. SampleAttention thực hiện lấy mẫu stride dọc theo các hàng dựa trên tỷ lệ lấy mẫu được định trước r_row=l/S_q. Thực nghiệm cho thấy phương pháp đơn giản này hiệu quả: lấy mẫu một lượng nhỏ hàng có thể xấp xỉ chính xác CRA thực, chi tiết thêm có thể tìm thấy trong Phụ lục A.5.
+
+**Giai đoạn-2: Lọc Key-Value Dựa trên Điểm.** SampleAttention sau đó lọc các chỉ số key-value quan tâm dựa trên điểm attention được lấy mẫu. Giải chính xác Phương trình 6 cho các query được lấy mẫu là không hiệu quả do độ dài chuỗi dài. Để giải quyết điều này, SampleAttention lọc key-value dựa trên điểm attention tích lũy dọc theo cột (Hình 3 ②), đây là xấp xỉ thống kê hơn của điểm attention. Sau khi giảm theo cột, SampleAttention riêng biệt chọn các chỉ số key-value top-k có thể đáp ứng ngưỡng CRA α mong muốn cho mỗi đầu. Attention sink cũng có thể được khám phá theo cách này.
+
+**Bảng 1:** Ý nghĩa của các siêu tham số và phương pháp điều chỉnh.
+
+| Siêu tham số | Mô tả | Điều chỉnh |
+|-------------|-------|------------|
+| α | Ngưỡng CRA mong muốn | |
+| r_row | Tỷ lệ lấy mẫu trong giai đoạn-1 | Profiling offline riêng biệt |
+| r_w% | Tỷ lệ kích thước cửa sổ cục bộ | |
+
+**Điều chỉnh Siêu tham số.** SampleAttention cần điều chỉnh một số siêu tham số như được liệt kê trong Bảng 1. Những siêu tham số này ảnh hưởng đến cả độ chính xác mô hình và độ trễ suy luận. Ví dụ, α lớn giảm tăng tốc độ trễ nhưng cải thiện độ chính xác mô hình, trong khi r_row lớn tăng chi phí lấy mẫu nhưng giảm lỗi xấp xỉ attention. Chúng tôi phát hiện rằng siêu tham số cố định, thu được bằng profiling offline nhẹ, cho một LLM hoạt động tốt qua các nhiệm vụ khác nhau. Do đó chúng tôi sử dụng một tập dữ liệu nhỏ chứa 22 yêu cầu từ 25K-96K độ dài ngữ cảnh để xác định các siêu tham số này. Các ảnh hưởng chi tiết của việc thay đổi các siêu tham số này được nghiên cứu trong Phần 5.3.
+
+### 4.3 Triển khai Hiệu quả Phần cứng
+
+Để đạt được tăng tốc đáng kể trong thời gian wall-clock, SampleAttention được triển khai với nhận thức IO để tối đa hóa hiệu quả phần cứng. Thứ nhất, việc lọc key-value hướng dẫn bởi query bao gồm một loạt các toán tử nhỏ (bmm, softmax, reduction) đọc và ghi các kết quả trung gian lớn. SampleAttention giảm đáng kể chi phí IO bằng cách kết hợp các toán tử này. Thứ hai, SampleAttention triển khai một kernel attention thưa có cấu trúc thích ứng hiệu quả bằng cách sửa đổi FlashAttention [48]. Những tối ưu hóa nhận thức phần cứng này tăng cường hiệu suất tốc độ đáng kể.
+
+## 5 Thực nghiệm
+
+### 5.1 Thiết lập
+
+**Backbone.** Chúng tôi đánh giá phương pháp của chúng tôi trên hai biến thể LLM mã nguồn mở được sử dụng rộng rãi: ChatGLM2-6B với cửa sổ ngữ cảnh 96K dựa trên GLM [17], và internLM2-7B [49] với cửa sổ ngữ cảnh 200K dựa trên LLAMA2 [8]. Tất cả các mô hình được sử dụng đều là transformer chỉ decoder [50], và được pretrain thông qua mô hình hóa ngôn ngữ nhân quả. Chúng bao gồm các thành phần kiến trúc tương tự, chẳng hạn như rotary positional encoding [51], và grouped-query attention [52]. Đồng thời, có những khác biệt đáng chú ý, ví dụ, cái trước tăng cường khả năng cửa sổ ngữ cảnh thông qua tiếp tục training với độ dài chuỗi mở rộng, trong khi cái sau đạt được ngoại suy độ dài thông qua rope scaling. Chúng tôi chỉ thay thế triển khai attention đầy đủ trong giai đoạn prefill prompt bằng SampleAttention và các baseline khác nhau, trong khi duy trì KV cache không nén trong giai đoạn decode.
+
+**Nhiệm vụ.** Chúng tôi đánh giá SampleAttention và khả năng hiểu của các phương pháp khác trong các kịch bản ngữ cảnh dài trên ba nhiệm vụ riêng biệt: LongBench [53], BABILong [54], và Needle in a Haystack [47]. LongBench, một benchmark đa nhiệm vụ, bao gồm QA tài liệu đơn và đa, tóm tắt, học few-shot, nhiệm vụ tổng hợp, và hoàn thành mã. Nó cung cấp hơn 4,750 trường hợp thử nghiệm với độ dài nhiệm vụ từ 4K-35K. BABILong là một bài kiểm tra benchmark tạo sinh được thiết kế để đánh giá khả năng suy luận ngữ cảnh dài, bao gồm 20 nhiệm vụ khác nhau. Do tính chất tạo sinh của nó, độ dài nhiệm vụ có thể được đặt linh hoạt từ 4K-88K. Ngoài ra, bài kiểm tra căng thẳng "Needle in a Haystack" thách thức các mô hình trích xuất chính xác thông tin từ một câu cụ thể được chôn trong một tài liệu dài ở vị trí ngẫu nhiên. Chúng tôi đã đặt số khoảng độ sâu là 32, với độ dài từ 10K-96K. Lưu ý rằng trong các nhiệm vụ này, mỗi trường hợp được đánh giá sau khi mô hình cung cấp đầu ra. Đầu ra này được so sánh với câu trả lời tiêu chuẩn hoặc được đánh giá bởi các mô hình tiên tiến hơn, chẳng hạn như GPT-4 [55], để chấm điểm.
+
+### 5.2 Kết quả Độ chính xác
+
+**Bảng 2:** So sánh độ chính xác qua các phương pháp thưa khác nhau trên LongBench và BABILong. Kết quả tốt nhất được làm nổi bật bằng **Đậm** trong khi kết quả tốt thứ hai được đánh dấu bằng _Gạch dưới_.
+
+| Mô hình | Baseline | LongBench | | | | | | BABILong |
+|---------|----------|-----------|---|---|---|---|---|----------|
+| | | Single-Doc QA | Multi-Doc QA | Summarization | Few-shot Learning | Synthetic Tasks | Code Completion | Total Scores | Total Scores |
+| ChatGLM2 6B | Full Attention | 161.15 | 147.76 | 98.64 | 243.66 | 87.00 | 99.20 | 837.40 | 30.20 |
+| | SampleAttention(α= 0.95) | 158.75 | 147.18 | 98.03 | 242.93 | 87.82 | 98.20 | 833.00 | 31.04 |
+| | BigBrid | 158.47 | 131.40 | 94.96 | 243.45 | 41.96 | 95.70 | 765.94 | 27.68 |
+| | Streaming LLM | 82.96 | 94.91 | 91.67 | 159.01 | 6.10 | 84.62 | 519.27 | 14.60 |
+| | HyperAttention | 85.76 | 80.71 | 85.18 | 175.28 | 8.82 | 73.19 | 508.94 | 17.00 |
+| | Hash-Sparse | 73.30 | 52.61 | 75.46 | 84.35 | 10.87 | 67.90 | 364.49 | 11.20 |
+| InternLM2 7B | Full Attention | 73.25 | 75.15 | 98.10 | 257.40 | 53.38 | 128.18 | 685.46 | 35.24 |
+| | SampleAttention(α= 0.95) | 77.53 | 76.01 | 98.52 | 254.95 | 53.02 | 126.83 | 686.86 | 36.88 |
+| | BigBrid | 72.55 | 73.16 | 95.59 | 254.87 | 19.88 | 120.99 | 637.04 | 34.12 |
+| | Streaming LLM | 31.49 | 26.44 | 35.32 | 133.53 | 3.33 | 89.44 | 319.55 | 5.96 |
+| | HyperAttention | 87.98 | 33.40 | 38.52 | 95.78 | 3.09 | 77.80 | 336.57 | 16.64 |
+| | Hash-Sparse | 20.12 | 11.37 | 24.32 | 49.88 | 5.87 | 45.28 | 156.84 | 2.82 |
+
+**Baseline và cài đặt.** Chúng tôi xem xét attention đầy đủ (như baseline vàng), BigBrid [20], StreamingLLM [37], HyperAttention [26] và Hash-Sparse [24] như các baseline để so sánh độ chính xác mô hình qua các nhiệm vụ khác nhau. Để duy trì tính nhất quán, chúng tôi gán cùng tỷ lệ kích thước cửa sổ 8% cho SampleAttention, BigBrid, và StreamingLLM. BigBrid giữ tỷ lệ toàn cục 8%. StreamingLLM đặt attention sink ban đầu ở 4 token. HyperAttention đặt cả kích thước bucket và số cột được lấy mẫu là 256, và Hash-Sparse sử dụng số bucket là 16. Tỷ lệ lấy mẫu r_row và ngưỡng α cho SampleAttention được đặt lần lượt là 5% và 0.95, thông qua profiling offline.
+
+**Kết quả chính.** Bảng 2 và Hình 4 hiển thị kết quả độ chính xác của các mô hình trên ba nhiệm vụ downstream. Kết quả chi tiết được liệt kê trong Phụ lục A.2. Kết quả cho thấy:
+
+• Hiệu suất về độ chính xác của SampleAttention nhất quán mạnh mẽ qua tất cả benchmark (bao gồm các lĩnh vực con), các mô hình khác nhau, và các độ dài chuỗi đa dạng. Khi so sánh với attention đầy đủ, đóng vai trò tiêu chuẩn vàng, SampleAttention nhất quán đạt được điểm trên 99% của attention đầy đủ, chứng minh hiệu quả gần như không mất mát.
+
+• BigBrid thể hiện các mức độ suy giảm hiệu suất khác nhau qua các nhiệm vụ khác nhau, với "Synthetic Task" đặt ra thách thức đáng kể. Tuy nhiên, trung bình, BigBrid vẫn đạt được điểm xấp xỉ 91% so với những điểm đạt được bởi attention đầy đủ.
+
+• StreamingLLM, HyperAttention và Hash-Sparse dẫn đến suy giảm hiệu suất qua tất cả nhiệm vụ, chứng minh rằng các kỹ thuật này thất bại trong việc nắm bắt các phần tử KV quan trọng trong chuỗi dài ở giai đoạn prefill.
+
+### 5.3 Nghiên cứu Ablation Siêu tham số
+
+Chúng tôi tiến hành các thử nghiệm thêm về tác động của ba siêu tham số quan trọng trong SampleAttention đối với độ chính xác của các nhiệm vụ downstream. Những thực nghiệm này tuân thủ các cài đặt được nêu trong Phần 5.2, chỉ thay đổi một siêu tham số tại một thời điểm. Kết quả chi tiết dưới các cấu hình siêu tham số khác nhau được cung cấp trong Bảng 5.2.
+
+**Bảng 3:** Kết quả thay đổi ba siêu tham số trong SampleAttention trên ChatGLM2-6B. Kết quả tốt nhất được làm nổi bật bằng **Đậm** trong khi kết quả tốt thứ hai được đánh dấu bằng _Gạch dưới_.
+
+| Nhiệm vụ | full attention | Ngưỡng CRA α | | | | Cửa sổ cục bộ r_w% | | Tỷ lệ mẫu r_row | | |
+|----------|----------------|---------------|---|---|---|-------------------|---|-------------------|---|---|
+| | | α= 0.80 | α= 0.90 | α= 0.95 | α= 0.98 | r_w= 4 | r_w= 8 | 2% | 5% | 10% |
+| LongBench | 837.40 | 820.30 | 824.98 | 833.00 | 829.80 | 792.87 | 833.00 | 809.34 | 833.00 | 831.14 |
+| BABILong | 30.20 | 27.28 | 29.08 | 31.04 | 31.16 | 31.12 | 31.04 | 28.92 | 31.04 | 30.64 |
+| Needle in a Haystack | 2235 | 2130 | 2090 | 2239 | 2231 | 2084 | 2239 | 2106 | 2239 | 2231 |
+
+**Ngưỡng CRA α.** Đặt α quá thấp dẫn đến suy giảm hiệu suất do lọc quá mức các phần tử KV. Điều này đại diện cho sự đánh đổi rõ ràng giữa hiệu suất và tăng tốc. Tuy nhiên, ngay cả khi α được đặt ở 80%, điểm hiệu suất trung bình của SampleAttention vẫn vượt quá 94.5% của attention đầy đủ tiêu chuẩn, xác thực hiệu quả việc hiệu quả của SampleAttention. Ngoài ra, hiệu suất ổn định khi α đạt đến ngưỡng đủ cao. Do đó, việc tiến hành profiling để xác định α phù hợp cho một mô hình cho trước là cần thiết.
+
+**Kích thước cửa sổ cục bộ và tỷ lệ lấy mẫu.** Ngoài ra, việc đặt tỷ lệ cửa sổ cục bộ hoặc tỷ lệ lấy mẫu quá nhỏ cũng dẫn đến giảm hiệu suất. Cụ thể, giảm một nửa tỷ lệ kích thước cửa sổ cục bộ (k=4) dẫn đến suy giảm hiệu suất hơn 6% trong các nhiệm vụ LongBench và "Needle-in-a-Haystack". Điều này xác nhận tầm quan trọng cao của các phần tử KV trong vùng cửa sổ cục bộ. Ngoài ra, giảm tỷ lệ lấy mẫu xuống 2% dẫn đến mất khoảng 4.5% hiệu suất. Tuy nhiên, hiệu suất ổn định khi tỷ lệ lấy mẫu đạt đến một ngưỡng nhất định, vì kết quả top-k cho attention xấp xỉ trở nên ổn định.
+
+### 5.4 Benchmarking Tăng tốc Gia tốc
+
+Chúng tôi tiến hành micro-benchmark trên một GPU NVIDIA-A100 đơn (80GB) để đánh giá hiệu suất tốc độ của hoạt động attention trong quá trình prefill và các metric TTFT. Các baseline được chọn là scaled_dot_product_attention của PyTorch (ghi chú là SDPA) và FlashAttention2. Tất cả các thử nghiệm được tiến hành sử dụng cấu hình từ ChatGLM2-6B: 32 head, và d= 128, với dữ liệu tổng hợp từ benchmark "Needle-in-a-Haystack" làm đầu vào. Chúng tôi chuẩn hóa kích thước batch của dữ liệu đầu vào thành 1 để hỗ trợ độ dài chuỗi dài hơn.
+
+**Tăng tốc và chi phí lấy mẫu** Hình 5 hiển thị kết quả profiling được tiến hành trên 28 lớp đầy đủ của mô hình sử dụng dữ liệu được tạo từ 8K đến 96K. Hình 5(a), tập trung vào hiệu suất GPU của module attention, chỉ ra rằng cả SampleAttention (α= 0.95) và SampleAttention (α= 0.80) không thể hiện lợi thế tốc độ so với FlashAttention2 ở độ dài ngắn hơn, do chi phí lấy mẫu và kích thước batch nhỏ. Tuy nhiên, đối với các chuỗi dài hơn như 96K, việc tiết kiệm đáng kể trong chuyển bộ nhớ KV cho phép các hoạt động attention của SampleAttention(α= 0.95) và SampleAttention(α= 0.80) đạt được tăng tốc 2.20× và 5.12× so với FlashAttention2, trong khi giảm metric TTFT lần lượt 1.62× và 2.28×. Hơn nữa, Hình 5(c) chứng minh rằng khi độ dài chuỗi tăng, tỷ lệ chi phí lấy mẫu giảm, gợi ý rằng SampleAttention có thể cung cấp lợi ích tăng tốc lớn hơn cho các chuỗi dài hơn.
+
+**Mở rộng độ dài chuỗi lên 1M.** Chúng tôi tiến hành đánh giá hiệu suất GPU có thể mở rộng đến độ dài chuỗi 1 triệu, dựa trên kết quả profiling từ lớp đầu tiên. Vì SampleAttention nhận thức nội dung, đối với các chuỗi dài hơn 128K, chúng tôi lấy độ trễ attention trung bình mỗi lớp từ kết quả lớp đầu tiên của SampleAttention kết hợp với phân tích độ thưa mô hình để tránh vấn đề bộ nhớ. Hình 6 minh họa rằng ở mức mở rộng chuỗi lên 1M, các ngưỡng 0.95 và 0.80 lần lượt đạt được giảm metric TTFT 2.27× và 4.62×.
+
+## 6 Kết luận
+
+Trong bài báo này, chúng tôi trước tiên trình bày cả nền tảng lý thuyết và thực nghiệm cho attention thưa gần như không mất mát, và sau đó tận dụng các mẫu đáng kể quan sát được để thiết kế SampleAttention, một attention thưa có cấu trúc thích ứng có thể thay thế liền mạch FlashAttention trong các LLM ngữ cảnh dài mà không mất độ chính xác. SampleAttention giảm đáng kể TTFT của các yêu cầu ngữ cảnh dài. Các hạn chế và công việc tương lai được thảo luận trong Phụ lục A.6.
+
+---
+
+## Tài liệu tham khảo
+
+[1]Wenhan Xiong, Jingyu Liu, Igor Molybog, Hejia Zhang, Prajjwal Bhargava, Rui Hou, Louis Martin, Rashi Rungta, Karthik Abinav Sankararaman, Barlas Oguz, et al. Effective long-context scaling of foundation models. arXiv preprint arXiv:2309.16039, 2023.
+
+[2]Xiaoran Liu, Hang Yan, Shuo Zhang, Chenxin An, Xipeng Qiu, and Dahua Lin. Scaling laws of rope-based extrapolation. arXiv preprint arXiv:2310.05209, 2023.
+
+[3]Yukang Chen, Shengju Qian, Haotian Tang, Xin Lai, Zhijian Liu, Song Han, and Jiaya Jia. Longlora: Efficient fine-tuning of long-context large language models. In TheTwelfth International Conference onLearning Representations, 2023.
+
+[4]Dacheng Li, Rulin Shao, Anze Xie, Ying Sheng, Lianmin Zheng, Joseph E. Gonzalez, Ion Stoica, Xuezhe Ma, and Hao Zhang. How long can open-source llms truly promise on context length?, June 2023.
+
+[5]Shouyuan Chen, Sherman Wong, Liangjian Chen, and Yuandong Tian. Extending context window of large language models via positional interpolation. arXiv preprint arXiv:2306.15595, 2023.
+
+[6]Tom B. Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared Kaplan, Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, Sandhini Agarwal, Ariel Herbert-Voss, Gretchen Krueger, Tom Henighan, Rewon Child, Aditya Ramesh, Daniel M. Ziegler, Jeffrey Wu, Clemens Winter, Christopher Hesse, Mark Chen, Eric Sigler, Mateusz Litwin, Scott Gray, Benjamin Chess, Jack Clark, Christopher Berner, Sam McCandlish, Alec Radford, Ilya Sutskever, and Dario Amodei. Language models are few-shot learners. In Hugo Larochelle, Marc'Aurelio Ranzato, Raia Hadsell, Maria-Florina Balcan, and Hsuan-Tien Lin, editors, Advances inNeural Information Processing Systems 33:Annual Conference on Neural Information Processing Systems 2020, NeurIPS 2020, December 6-12, 2020, virtual, 2020.
+
+[7]Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Łukasz Kaiser, and Illia Polosukhin. Attention is all you need. Advances inneural information processing systems, 30, 2017.
+
+[8]Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei, Nikolay Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, et al. Llama 2: Open foundation and fine-tuned chat models. arXiv preprint arXiv:2307.09288, 2023.
+
+[9]Tianyi Zhang, Faisal Ladhak, Esin Durmus, Percy Liang, Kathleen McKeown, and Tatsunori Hashimoto. Benchmarking large language models for news summarization. Transactions ofthe Association forComputational Linguistics, 12, 2024.
+
+[10] Mark Chen, Jerry Tworek, Heewoo Jun, Qiming Yuan, Henrique Ponde de Oliveira Pinto, Jared Kaplan, Harri Edwards, Yuri Burda, Nicholas Joseph, Greg Brockman, et al. Evaluating large language models trained on code. arXiv preprint arXiv:2107.03374, 2021.
+
+[11] Baptiste Roziere, Jonas Gehring, Fabian Gloeckle, Sten Sootla, Itai Gat, Xiaoqing Ellen Tan, Yossi Adi, Jingyu Liu, Tal Remez, Jérémy Rapin, et al. Code llama: Open foundation models for code. arXiv preprint arXiv:2308.12950, 2023.
+
+[12] Wei-Lin Chiang, Zhuohan Li, Zi Lin, Ying Sheng, Zhanghao Wu, Hao Zhang, Lianmin Zheng, Siyuan Zhuang, Yonghao Zhuang, Joseph E. Gonzalez, Ion Stoica, and Eric P. Xing. Vicuna: An open-source chatbot impressing gpt-4 with 90%* chatgpt quality, March 2023.
+
+[13] Rohan Taori, Ishaan Gulrajani, Tianyi Zhang, Yann Dubois, Xuechen Li, Carlos Guestrin, Percy Liang, and Tatsunori B. Hashimoto. Stanford alpaca: An instruction-following llama model. https://github.com/tatsu-lab/stanford_alpaca, 2023.
+
+[14] Gemini Team, Rohan Anil, Sebastian Borgeaud, Yonghui Wu, Jean-Baptiste Alayrac, Jiahui Yu, Radu Soricut, Johan Schalkwyk, Andrew M Dai, Anja Hauth, et al. Gemini: a family of highly capable multimodal models. arXiv preprint arXiv:2312.11805, 2023.
+
+[15] Anthropic. Claude. https://www.anthropic.com/claude, 2023.
+
+[16] Moonshot. Kimi chat. https://kimi.moonshot.cn/, 2023.
+
+[17] Zhengxiao Du, Yujie Qian, Xiao Liu, Ming Ding, Jiezhong Qiu, Zhilin Yang, and Jie Tang. Glm: General language model pretraining with autoregressive blank infilling. arXiv preprint arXiv:2103.10360, 2021.
+
+[18] Joshua Ainslie, Santiago Ontanon, Chris Alberti, Vaclav Cvicek, Zachary Fisher, Philip Pham, Anirudh Ravula, Sumit Sanghai, Qifan Wang, and Li Yang. ETC: Encoding long and structured inputs in transformers. In Bonnie Webber, Trevor Cohn, Yulan He, and Yang Liu, editors, Proceedings ofthe2020 Conference onEmpirical Methods inNatural Language Processing (EMNLP), pages 268–284, Online, November 2020. Association for Computational Linguistics.
+
+[19] Iz Beltagy, Matthew E Peters, and Arman Cohan. Longformer: The long-document transformer. arXiv preprint arXiv:2004.05150, 2020.
+
+[20] Manzil Zaheer, Guru Guruganesh, Kumar Avinava Dubey, Joshua Ainslie, Chris Alberti, Santiago Ontanon, Philip Pham, Anirudh Ravula, Qifan Wang, Li Yang, et al. Big bird: Transformers for longer sequences. Advances inneural information processing systems, 33:17283–17297, 2020.
+
+[21] Nikita Kitaev, Łukasz Kaiser, and Anselm Levskaya. Reformer: The efficient transformer. arXiv preprint arXiv:2001.04451, 2020.
+
+[22] Jiayu Ding, Shuming Ma, Li Dong, Xingxing Zhang, Shaohan Huang, Wenhui Wang, Nanning Zheng, and Furu Wei. Longnet: Scaling transformers to 1,000,000,000 tokens. arXiv preprint arXiv:2307.02486, 2023.
+
+[23] Rewon Child, Scott Gray, Alec Radford, and Ilya Sutskever. Generating long sequences with sparse transformers. arXiv preprint arXiv:1904.10509, 2019.
+
+[24] Matteo Pagliardini, Daniele Paliotta, Martin Jaggi, and François Fleuret. Faster causal attention over large sequences through sparse flash attention. arXiv preprint arXiv:2306.01160, 2023.
+
+[25] Aurko Roy, Mohammad Saffar, Ashish Vaswani, and David Grangier. Efficient content-based sparse attention with routing transformers. Transactions oftheAssociation forComputational Linguistics, 9:53–68, 2021.
+
+[26] Insu Han, Rajesh Jayaram, Amin Karbasi, Vahab Mirrokni, David Woodruff, and Amir Zandieh. Hyperattention: Long-context attention in near-linear time. In The Twelfth International Conference onLearning Representations, 2023.
+
+[27] Sinong Wang, Belinda Z Li, Madian Khabsa, Han Fang, and Hao Ma. Linformer: Self-attention with linear complexity. arXiv preprint arXiv:2006.04768, 2020.
+
+[28] Krzysztof Marcin Choromanski, Valerii Likhosherstov, David Dohan, Xingyou Song, Andreea Gane, Tamas Sarlos, Peter Hawkins, Jared Quincy Davis, Afroz Mohiuddin, Lukasz Kaiser, et al. Rethinking attention with performers. In International Conference onLearning Representations, 2020.
+
+[29] Angelos Katharopoulos, Apoorv Vyas, Nikolaos Pappas, and François Fleuret. Transformers are rnns: Fast autoregressive transformers with linear attention. In International conference on machine learning, pages 5156–5165. PMLR, 2020.
+
+[30] Beidi Chen, Tri Dao, Eric Winsor, Zhao Song, Atri Rudra, and Christopher Ré. Scatterbrain: Unifying sparse and low-rank attention. Advances inNeural Information Processing Systems, 34:17413–17426, 2021.
+
+[31] Beidi Chen, Tri Dao, Kaizhao Liang, Jiaming Yang, Zhao Song, Atri Rudra, and Christopher Re. Pixelated butterfly: Simple and efficient sparse training for neural network models. In International Conference onLearning Representations, 2021.
+
+[32] Albert Gu and Tri Dao. Mamba: Linear-time sequence modeling with selective state spaces. arXiv preprint arXiv:2312.00752, 2023.
+
+[33] Bo Peng, Eric Alcaide, Quentin Anthony, Alon Albalak, Samuel Arcadinho, Huanqi Cao, Xin Cheng, Michael Chung, Matteo Grella, Kranthi Kiran GV, et al. Rwkv: Reinventing rnns for the transformer era. arXiv preprint arXiv:2305.13048, 2023.
+
+[34] Aydar Bulatov, Yury Kuratov, and Mikhail Burtsev. Recurrent memory transformer. Advances inNeural Information Processing Systems, 35:11079–11091, 2022.
+
+[35] Yuhuai Wu, Markus N Rabe, DeLesley Hutchins, and Christian Szegedy. Memorizing transformers. arXiv preprint arXiv:2203.08913, 2022.
+
+[36] Sebastian Borgeaud, Arthur Mensch, Jordan Hoffmann, Trevor Cai, Eliza Rutherford, Katie Millican, George Bm Van Den Driessche, Jean-Baptiste Lespiau, Bogdan Damoc, Aidan Clark, et al. Improving language models by retrieving from trillions of tokens. In International conference onmachine learning, pages 2206–2240. PMLR, 2022.
+
+[37] Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song Han, and Mike Lewis. Efficient streaming language models with attention sinks. arXiv preprint arXiv:2309.17453, 2023.
+
+[38] Vijay Janapa Reddi, Christine Cheng, David Kanter, Peter Mattson, Guenther Schmuelling, Carole-Jean Wu, Brian Anderson, Maximilien Breughe, Mark Charlebois, William Chou, et al. Mlperf inference benchmark. In 2020 ACM/IEEE 47th Annual International Symposium on Computer Architecture (ISCA), pages 446–459. IEEE, 2020.
+
+[39] Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong Chen, Lianmin Zheng, Ruisi Cai, Zhao Song, Yuandong Tian, Christopher Ré, Clark Barrett, et al. H2o: Heavy-hitter oracle for efficient generative inference of large language models. Advances inNeural Information Processing Systems, 36, 2024.
+
+[40] Luka Ribar, Ivan Chelombiev, Luke Hudlass-Galley, Charlie Blake, Carlo Luschi, and Douglas Orr. Sparq attention: Bandwidth-efficient llm inference. arXiv preprint arXiv:2312.04985, 2023.
+
+[41] Jesse Mu, Xiang Li, and Noah Goodman. Learning to compress prompts with gist tokens. Advances inNeural Information Processing Systems, 36, 2024.
+
+[42] Lei Zhu, Xinjiang Wang, Zhanghan Ke, Wayne Zhang, and Rynson WH Lau. Biformer: Vision transformer with bi-level routing attention. In Proceedings oftheIEEE/CVF conference on computer vision andpattern recognition, pages 10323–10333, 2023.
+
+[43] Suyu Ge, Yunan Zhang, Liyuan Liu, Minjia Zhang, Jiawei Han, and Jianfeng Gao. Model tells you what to discard: Adaptive kv cache compression for llms. arXiv preprint arXiv:2310.01801, 2023.
+
+[44] Haojie Duanmu, Zhihang Yuan, Xiuhong Li, Jiangfei Duan, Xingcheng Zhang, and Dahua Lin. Skvq: Sliding-window key and value cache quantization for large language models. arXiv preprint arXiv:2405.06219, 2024.
+
+[45] Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu, Julien Demouth, and Song Han. Smoothquant: Accurate and efficient post-training quantization for large language models. InInternational Conference onMachine Learning, pages 38087–38099. PMLR, 2023.
+
+[46] Yilong Zhao, Chien-Yu Lin, Kan Zhu, Zihao Ye, Lequn Chen, Size Zheng, Luis Ceze, Arvind Krishnamurthy, Tianqi Chen, and Baris Kasikci. Atom: Low-bit quantization for efficient and accurate llm serving. arXiv preprint arXiv:2310.19102, 2023.
+
+[47] G Kamradt. Needle in a haystack–pressure testing llms, 2023.
+
+[48] Tri Dao, Dan Fu, Stefano Ermon, Atri Rudra, and Christopher Ré. Flashattention: Fast and memory-efficient exact attention with io-awareness. Advances inNeural Information Processing Systems, 35:16344–16359, 2022.
+
+[49] Zheng Cai, Maosong Cao, Haojiong Chen, Kai Chen, Keyu Chen, Xin Chen, Xun Chen, Zehui Chen, Zhi Chen, Pei Chu, et al. Internlm2 technical report. arXiv preprint arXiv:2403.17297, 2024.
+
+[50] Alec Radford, Karthik Narasimhan, Tim Salimans, Ilya Sutskever, et al. Improving language understanding by generative pre-training. 2018.
+
+[51] Jianlin Su, Murtadha Ahmed, Yu Lu, Shengfeng Pan, Wen Bo, and Yunfeng Liu. Roformer: Enhanced transformer with rotary position embedding. Neurocomputing, 568:127063, 2024.
+
+[52] Joshua Ainslie, James Lee-Thorp, Michiel de Jong, Yury Zemlyanskiy, Federico Lebrón, and Sumit Sanghai. Gqa: Training generalized multi-query transformer models from multi-head checkpoints. arXiv preprint arXiv:2305.13245, 2023.
+
+[53] Yushi Bai, Xin Lv, Jiajie Zhang, Hongchang Lyu, Jiankai Tang, Zhidian Huang, Zhengxiao Du, Xiao Liu, Aohan Zeng, Lei Hou, et al. Longbench: A bilingual, multitask benchmark for long context understanding. arXiv preprint arXiv:2308.14508, 2023.
+
+[54] Yuri Kuratov, Aydar Bulatov, Petr Anokhin, Dmitry Sorokin, Artyom Sorokin, and Mikhail Burtsev. In search of needles in a 10m haystack: Recurrent memory finds what llms miss. arXiv preprint arXiv:2402.10790, 2024.
+
+[55] Josh Achiam, Steven Adler, Sandhini Agarwal, Lama Ahmad, Ilge Akkaya, Florencia Leoni Aleman, Diogo Almeida, Janko Altenschmidt, Sam Altman, Shyamal Anadkat, et al. Gpt-4 technical report. arXiv preprint arXiv:2303.08774, 2023.
+
+## A Phụ lục
+
+### A.1 Chứng minh các Định lý
+
+**Đối với Định lý 1,**
+
+**Chứng minh.** Trong trường hợp xấu nhất, chúng ta có thể đặt mặt nạ attention M thành tất cả số một, đảm bảo rằng điểm attention thưa ˜P giống hệt với điểm attention gốc P. Do đó, luôn có thể tìm mặt nạ attention M thỏa mãn điều kiện ||˜P−P||1≤ϵ/R. Với mặt nạ attention đó,
+
+||˜O−O||1=||˜PV−PV||1=||(˜P−P)V||1≤ ||˜P−P||1· ||V||1. (7)
+
+Do đó, ||˜O−O||1≤ϵ, hoàn thành chứng minh.
+
+**Đối với Định lý 2,**
+
+**Chứng minh.** Trong trường hợp xấu nhất, chúng ta cũng có thể đặt mặt nạ attention ˆM thành tất cả số một, đảm bảo rằng điểm attention thưa ˜P giống hệt với điểm attention gốc P. Trong trường hợp này, ˆM duy trì mẫu thưa có cấu trúc được phân rã. Do đó, theo chứng minh của Định lý 1 hoàn thành chứng minh.
+
+### A.2 Kết quả chi tiết
+
+Hình 7 và Hình 8 báo cáo điểm chi tiết của hai mô hình được đánh giá trên các nhiệm vụ BABILong và "Needle in a Haystack" qua các độ dài chuỗi khác nhau, tương ứng. Đối với cài đặt của các baseline và thống kê điểm tổng thể, xin tham khảo Phần 5.2.
+
+[Các hình chi tiết và bảng được giữ nguyên vị trí và cấu trúc]
+
+### A.3 Trực quan hóa attention
+
+Hình 9 và Hình 10 trình bày các mẫu thưa qua nhiều đầu khác nhau trong mô hình ChatGLM2-6B (28 lớp x 32 đầu) dưới độ dài chuỗi 61K. Chúng tôi tiến hành lọc từng hàng dựa trên trọng số softmax attention đầy đủ, sử dụng ngưỡng CRA α= 0.95, và chọn ngẫu nhiên bốn đầu từ các lớp khác nhau để hiển thị.
+
+Theo kết quả trực quan hóa trên phần lớn các đầu, chúng tôi quan sát hai mẫu riêng biệt và nổi bật phổ biến trong bản đồ nhiệt của trọng số attention: dải cột và cửa sổ cục bộ. Các mẫu dải cột thể hiện thông tin ngữ cảnh toàn cục trong khi các mẫu cửa sổ đường chéo nắm bắt thông tin cục bộ.
+
+### A.4 Phân tích độ thưa
+
+Để định lượng thêm mức độ thưa được tiết lộ khi độ dài chuỗi tăng, chúng tôi tiến hành các thử nghiệm khả năng mở rộng trên mô hình ChatGLM2-6B sử dụng nhiệm vụ "Needle-in-a-Haystack" để đánh giá độ thưa. Kết quả được trình bày trong Bảng 5. Theo kết quả, việc tăng độ dài chuỗi đưa ra độ thưa rõ ràng hơn. Với mỗi lần tăng gấp đôi độ dài, tỷ lệ phần tử KV cần thiết để duy trì cùng ngưỡng α giảm khoảng 20%. Đồng thời, ngưỡng nhỏ hơn dẫn đến lọc nhiều phần tử KV hơn, cũng có thể dẫn đến suy giảm hiệu suất nhiệm vụ về độ chính xác. Ngoài ra, Hình 11 minh họa thống kê tần suất của các phần tử KV được giữ lại trong chiều Sk cho các đầu thể hiện các mức độ thưa khác nhau.
+
+### A.5 Hiệu quả của lấy mẫu
+
+Để xác minh hiệu quả của phương pháp lấy mẫu này, chúng tôi tiến hành thử nghiệm trên các đầu khác nhau sử dụng hai tỷ lệ lấy mẫu rw riêng biệt. Chúng tôi áp dụng các tỷ lệ khác nhau của dải top-k kết hợp với mặt nạ cửa sổ được điều chỉnh cho các ma trận attention đầy đủ để quan sát các thay đổi trong CRA. Kết quả, như được hiển thị trong Bảng 6, chỉ ra rằng CRA đạt được bằng cách chọn dải top-k ở tỷ lệ lấy mẫu 5% rất gần với kết quả thu được từ điểm attention đầy đủ. Điều này xác nhận rằng phương pháp lấy mẫu đơn giản của SampleAttention rất hiệu quả.
+
+### A.6 Hạn chế và Công việc Tương lai
+
+Chúng tôi thảo luận các hạn chế của SampleAttention và hướng tương lai trong phần phụ này.
+
+**Mẫu và lấy mẫu khác.** Chúng tôi cũng xác định các cấu trúc đường chéo bổ sung trong các đầu có mức độ thưa thấp hơn. Mặc dù SampleAttention có khả năng bao phủ các vùng này bằng cách chọn tỷ lệ đầy đủ các KV, việc nắm bắt chính xác các mẫu này có thể dẫn đến cải thiện hiệu suất thêm. Ngoài ra, xem xét chi phí thời gian liên quan đến lấy mẫu, cách cải thiện thêm hiệu quả lấy mẫu để đạt được tăng tốc ngay cả ở độ dài chuỗi ngắn hơn vẫn là thách thức quan trọng cho nghiên cứu tương lai.
+
+**Điều chỉnh siêu tham số.** Kết quả thực nghiệm chứng minh rằng các siêu tham số ảnh hưởng đáng kể đến sự đánh đổi giữa hiệu suất nhiệm vụ và tăng tốc. Do đó, việc xác định nhanh chóng các siêu tham số hiệu quả cho một mô hình cụ thể nổi lên như một thách thức quan trọng. Trong tương lai, chúng tôi nhằm triển khai autotuning các siêu tham số này trong thời gian chạy nhiệm vụ, cho phép SampleAttention nhất quán đạt được độ chính xác cao và độ trễ thấp qua các độ dài chuỗi và kịch bản đa dạng.
+
+**Serving.** Sau khi tích hợp SampleAttention vào framework serving phân tán, chúng tôi phát hiện rằng các yêu cầu với chuỗi cực dài (>=128K) hoặc kích thước batch lớn sẽ gây ra vấn đề bộ nhớ. Cần nhiều nỗ lực kỹ thuật hơn để đạt được hiệu quả bộ nhớ, có thể thông qua các chiến lược như triển khai pipeline hoặc song song chuỗi và phân khúc dọc theo chiều chuỗi.
+
+### A.7 Thuật toán Triển khai Kiểu PyTorch
+
+Thuật toán 1 trình bày pseudo-code súc tích của triển khai SampleAttention theo kiểu PyTorch. Liên kết đến mã nguồn dựa trên PyTorch và Triton, cùng với các script để tái tạo kết quả thực nghiệm chính, sẽ được cung cấp trong phiên bản camera-ready.
+
+**Thuật toán 1:** Triển khai SampleAttention
+
+**Đầu vào:** Q ∈RSq×d, K∈RSk×d, V∈RSk×d, α∈(0,1), rrow∈(0,1), rw∈N
+
+```python
+# Giai đoạn1: Lấy mẫu Attention Hướng dẫn bởi Query
+SampleWeight = sample_bmm_softmax_reduction(Q,K, rrow)
+SortedWeight = SampleWeight.sort(dim=-1)
+WeightSum = SortedWeight.sum(dim=-1)
+
+# Giai đoạn2: Lọc Key-Value Dựa trên Điểm
+# ví dụ prefixsum_sample_list=[0.0125, 0.025,0.05,0.1,0.2,0.4,0.8,1.0] * Sk
+SD_sample_list = SortedWeight[::,:prefixsum_sample_list].sum()/WeightSum
+KV_ratio_per_head = searchsorted(SD_sample_list, α)
+IKV_per_head = gather_KV_Index(SortedWeight.idx, KV_ratio_per_head)
+
+# Tính toán thưa của attention
+# mặt nạ kết hợp của IKV và kích thước cửa sổ được điều chỉnh k
+M_Merged = merge_mask( IKV_per_head , rw)
+Output = sparse_flash_attn(Q, K, V, M_Merged)
+```

@@ -1,0 +1,353 @@
+ScatterMoE
+Triển khai Mixture-of-Experts Phân tán
+Shawn Tan
+tanjings@mila.quebecYikang Shen
+yikang.shen@ibm.comRameswar Panda
+rpanda@ibm.com
+Aaron Courville
+courvila@iro.umontreal.ca
+
+Tóm tắt
+ScatterMoE là một triển khai của Sparse Mixture-of-Experts (SMoE) trên GPU. ScatterMoE xây dựng dựa trên các kỹ thuật trong các triển khai hiện tại, và vượt qua một số hạn chế hiện tại để cải thiện suy luận theo lô, tốc độ huấn luyện, và dấu chân bộ nhớ. Triển khai này đạt được điều này bằng cách tránh cả việc đệm và tạo các bản sao quá mức của đầu vào. Chúng tôi cũng kết hợp các phép biến đổi tuyến tính chuyên gia và các thao tác sắp xếp lại với ParallelLinear, một mô-đun có thể được sử dụng để mở rộng khái niệm SMoE. Chúng tôi đánh giá hiệu suất triển khai của mình so với Megablocks, và cho thấy nó cho phép thông lượng cao hơn và dấu chân bộ nhớ thấp hơn. Chúng tôi cũng cho thấy cách ParallelLinear cho phép mở rộng khái niệm Mixture-of-Experts thông qua một minh họa với triển khai Mixture of Attention.
+https://github.com/shawntan/scattermoe
+
+1 Giới thiệu
+Sparse Mixture of Experts (SMoE; Shazeer et al. 2017) đã trở nên phổ biến ngày càng tăng để mở rộng quy mô các mô hình ngôn ngữ dựa trên Transformer. Trong khi các ứng dụng của SMoE như Switch Transformer (Fedus et al., 2022) sử dụng SMoE để mở rộng các mô hình "cực kỳ" lớn bằng cách phân phối tính toán của các chuyên gia qua các nút tính toán, nó đã tỏ ra hữu ích ngay cả trong việc mở rộng quy mô các mô hình nhỏ hơn nơi bộ nhớ thiết bị là một vấn đề.
+
+Đối với SMoE, tính thưa thớt là chìa khóa trong việc giảm chi phí tính toán. Tuy nhiên, việc khai thác đầy đủ tính thưa thớt để cải thiện thông lượng của các mô-đun MoE là thách thức. Trong khi nhiều nghiên cứu học sâu được triển khai trong PyTorch (Paszke et al., 2019), triển khai ngây thơ của SMoE không tận dụng đầy đủ tính song song của GPU và do đó chậm.
+
+Các triển khai ban đầu trên Tensor Processing Units (TPU) cho Switch Transformers yêu cầu tất cả kích thước tensor, hoặc dung lượng, phải được chỉ định tại thời điểm biên dịch, điều này đảm bảo rằng tất cả tải cho mọi chuyên gia đều bằng nhau (Fedus et al., 2022). Điều này tạo ra vấn đề khi các chuyên gia không cân bằng: Khi bộ định tuyến gán nhiều token hơn dung lượng cho phép cho một chuyên gia cụ thể, một số token bị loại bỏ. Tương tự, khi các chuyên gia được sử dụng ít, các tensor được đệm, điều này tạo ra phân bổ bộ nhớ không cần thiết. Sau đó, Megablocks (Gale et al., 2023) và PIT (Zheng et al., 2023) đã đóng khung tính toán SMoE như một bài toán nhân ma trận thưa thớt, có thể được tính toán hiệu quả với các thuật toán tối ưu hóa ma trận thưa thớt. Trong cả hai trường hợp này, các tác giả đã có thể tạo ra một triển khai SMoE dựa trên GPU hiệu quả hơn.
+
+Mặc dù có những tiến bộ gần đây này, vẫn còn chỗ để cải thiện. Đầu tiên, các triển khai hiện tại của SMoE thực hiện một bản sao ban đầu scatter-to-group của đầu vào, tạo ra chi phí phân bổ bộ nhớ trong quá trình huấn luyện vì các tensor được lưu trữ để sử dụng trong lượt truyền ngược. Một số triển khai đệm các tensor được định tuyến để chúng có kích thước khối bằng nhau, điều này càng tăng chi phí bộ nhớ. Thứ hai, Megablocks và PIT yêu cầu dịch bài toán SMoE thành định dạng ma trận thưa thớt. Trong khi điều này chỉ chiếm một phần nhỏ chi phí tính toán, định dạng ma trận thưa thớt làm cho biểu diễn trung gian khó mở rộng hơn.
+
+1arXiv:2403.08245v2  [cs.LG]  4 Oct 2024
+
+--- TRANG 2 ---
+ScatterMoE
+Hình 1: Các triển khai hiện tại của SMoE Multi-layer Perceptrons (MLP) yêu cầu một bản sao của các embedding khi nhóm (trái), trong khi ScatterMoE kết hợp bước nhóm và biến đổi tuyến tính (phải), giảm dấu chân bộ nhớ của phương pháp chúng tôi. Các màu sắc khác nhau đại diện cho các chuyên gia khác nhau, trong khi các hộp chữ nhật dọc đại diện cho các embedding với các bước thời gian liên quan được ghi nhãn phía trên hoặc phía dưới chúng.
+
+Trong bài báo này, chúng tôi trình bày ScatterMoE, một triển khai SMoE giảm thiểu chi phí bộ nhớ này. Điều này được thực hiện nhờ ParallelLinear, một nguyên thủy mà chúng tôi giới thiệu để thực hiện các thao tác ma trận nhóm trên các vector phân tán. Các biểu diễn trung gian kết quả (ví dụ trạng thái ẩn của một SMoE MLP) có thể được hiển thị dưới dạng các tensor PyTorch tiêu chuẩn, cho phép mở rộng dễ dàng các phương pháp SMoE hiện tại sang các loại mô-đun chuyên gia khác. Chúng tôi chứng minh tính hữu ích của biểu diễn này bằng cách triển khai SMoE Attention với ParallelLinear, theo đặc tả trong Tan et al. (2023). Trong phần cuối, chúng tôi đánh giá hiệu suất ScatterMoE so với triển khai PyTorch ngây thơ và Megablocks.
+
+2 Công trình liên quan
+Các triển khai khác & Phụ thuộc Các phần cốt lõi của ScatterMoE được triển khai với Triton¹(Tillet et al., 2019), một ngôn ngữ dựa trên tile cho lập trình GPU trong Python, làm cho nó dễ tiếp cận nhất để sửa đổi và mở rộng. So sánh chính của chúng tôi là với Megablocks², được triển khai sử dụng framework STK³ cũng sử dụng Triton. Megablocks cũng được sử dụng trong mô hình Megatron-LM (Shoeybi et al., 2019; Narayanan et al., 2021; Korthikanti et al., 2023), và việc sử dụng rộng rãi của nó như một phương pháp hiệu quả để huấn luyện SMoE. Một thư viện phổ biến khác để triển khai SMoE là CUTLASS⁴(Kim et al., 2022), mà Megablocks sử dụng như tùy chọn nhóm.
+
+Các ứng dụng khác của SMoE Ngoài MLP, các phiên bản SMoE của mô-đun attention cũng đã được đề xuất (Zhang et al., 2022; Csordás et al., 2023). Các triển khai mixture-of-attention (MoA) này đã được sử dụng để mở rộng quy mô Universal Transformers (Dehghani et al., 2018; Tan et al., 2023), và cũng cho các ứng dụng học liên tục trong một Transformer được mô-đun hóa hoàn toàn (Shen et al., 2023). Tính toán SMoE hiệu quả sẽ mang lại lợi ích lớn cho việc huấn luyện và suy luận của các mô hình này.
+
+¹https://github.com/openai/triton
+²https://github.com/stanford-futuredata/megablocks
+³https://github.com/stanford-futuredata/stk
+⁴https://github.com/NVIDIA/cutlass
+
+2
+
+--- TRANG 3 ---
+ScatterMoE
+(a) Nhóm đến nhóm
+ (b) Phân tán đến nhóm
+(c) Phân tán đến phân tán
+ (d) Nhóm đến phân tán
+Hình 2: ParallelLinear cho phép thực hiện các kết hợp khác nhau của các phép biến đổi SMoE cho phép đầu vào và đầu ra có thể được nhóm hoặc phân tán. Chức năng cơ bản này tạo thành cơ sở cho cả lượt truyền thuận và lượt truyền ngược của ScatterMoE. Không giống như các triển khai hiện tại, các thao tác này được thực hiện mà không cần sao chép (hoặc đệm) bổ sung của các tensor đầu vào và đầu ra.
+
+3 Phương pháp
+Trong bài báo này, chúng tôi sẽ duy trì quy ước ký hiệu chữ đậm cho ma trận, tức là X. Trừ khi nói khác, chiều đầu tiên là batch-time (chiều batch và time được làm phẳng) để dễ hiểu. Ngoài ra, Xi biểu thị hàng thứ i của X.
+
+3.1 Sparse Mixture-of-Experts
+Các mô-đun SMoE được tạo thành từ E chuyên gia thường là các mô-đun con có kiến trúc tương tự. Mỗi token trong T token đầu vào được định tuyến thông qua một mô-đun định tuyến, và sau đó dựa trên trọng số đầu ra của bộ định tuyến, được gán cho k chuyên gia, trong đó k≤E. Tuy nhiên, phương pháp ngây thơ để tính toán SMoE (lặp qua tất cả các token và đánh giá đầu ra chuyên gia tương ứng) quá chậm, và không khai thác tính song song đầy đủ của tính toán GPU.
+
+Trong thực tế, các triển khai SMoE thường thực hiện các bước chính sau:
+1. Định tuyến – Dựa trên mỗi embedding token Xt, bộ định tuyến gán trọng số cho mỗi chuyên gia g(Xt), và chỉ k chuyên gia hàng đầu được chọn.
+2. Nhóm – Bước này nhóm tất cả các token được gán cho cùng một chuyên gia lại với nhau. Nếu k>1, như thường xảy ra, thì điều này cũng dẫn đến "fan out" các token, kết quả là kN embedding tổng cộng.
+3. Biến đổi chuyên gia – Bây giờ các token được nhóm theo chuyên gia, mỗi chuyên gia (một phép biến đổi tuyến tính) có thể được tính toán hiệu quả bằng các phép biến đổi vector theo lô (nhân ma trận-ma trận).
+4. Phân tán – Bước này trả mỗi token để được nhóm theo bước thời gian ban đầu của nó. Điều này vẫn dẫn đến kN embedding tổng cộng.
+5. Tổng có trọng số – Bước này kết hợp k đầu ra trên mỗi token bằng trọng số định tuyến ban đầu của nó,
+Yt=∑
+e∈topk (g(Xt))ge(Xt)·fe(Xt)
+kết quả là N embedding.
+
+3
+
+--- TRANG 4 ---
+ScatterMoE
+Thông thường, mỗi chuyên gia là một Multi-layer Perceptron (MLP) với một lớp ẩn có chiều dexpert.
+
+Trong Megablocks, các bước (1) và (4) dẫn đến việc sao chép đầu vào ban đầu. Họ tiếp tục đệm các khối token theo từng chuyên gia để chúng phù hợp với số lượng bằng nhau cho tính toán GPU thuận tiện (Xem Hình 1). Điều này phân bổ mảng được đệm cho các embedding trong High Bandwidth Memory (HBM) và sao chép các embedding ban đầu theo thứ tự được sắp xếp vào đó. Một Grouped GeMM sau đó được thực hiện trên mảng được sắp xếp theo chuyên gia.
+
+Mặt khác, ScatterMoE tránh thực hiện toàn bộ mảng được đệm trong HBM. Thay vì sao chép tất cả các embedding vào một mảng được đệm, chúng tôi sắp xếp các token theo các chuyên gia, và đệm các chỉ số thay thế. Khi tải một tile vào Static RAM (SRAM), chúng tôi tải theo các chỉ số được đệm, kết quả là một tile được đệm.
+
+3.2 Thao tác ParallelLinear
+Triển khai SMoE của chúng tôi dựa vào ParallelLinear, cho phép các kết hợp khác nhau của General Matrix Multiplications (GeMM) được nhóm. Để đạt được điều này, chúng tôi đã viết một kernel Triton, scatter2scatter, cho phép tất cả các kết hợp thao tác được hiển thị trong Hình 2. Thao tác này kết hợp các GeMM được nhóm và các thao tác đọc và ghi phân tán, cho phép chúng tôi bỏ qua bước nhóm và sao chép trung gian. ParallelLinear cho phép các tùy chọn nhóm và phân tán cho cả đầu vào và đầu ra, dẫn đến bốn kết hợp có thể có được thấy trong Hình 2. Với các kết hợp của các thao tác này, chúng tôi có thể triển khai cả lượt truyền thuận và lượt truyền ngược của ParallelLinear.
+
+Thuật toán 1 cung cấp mã giả của ParallelLinear. Nó là một wrapper mỏng xung quanh kernel scatter2scatter, và các tùy chọn nhóm được cung cấp như các đối số cho ParallelLinear. Đây là công cụ chính của triển khai SMoE của chúng tôi, và có thể được sử dụng để triển khai cả MLP và lớp attention. Chúng tôi đã triển khai lượt truyền ngược của ParallelLinear độc lập với việc sử dụng downstream của nó để cho phép nó được sử dụng như một nguyên thủy để xây dựng các chuyên gia khác.
+
+Thuật toán 1 ParallelLinear FORWARD
+Đầu vào:
+X T×din ma trận đầu vào oT chỉ số thứ tự
+W E×din×dout tensor biến đổi k top-k
+mặc định k =1
+pS×j trọng số định tuyến
+trong đó Sj=Tk mặc định p:(Tk×1) =1
+*tùy chọn
+grouped in True, False grouped out True, False
+Đầu ra:
+Y S×dout ma trận đầu ra
+Ŷ←scatter2scatter (X,W,o,k,*options )
+if p≠∅then
+Ŷ←viewŶ,S,j,−1
+// reshape và tổng có trọng số nếu p được cung cấp.
+Y←bmm
+p,Ŷ
+else
+Y←Ŷ
+end if
+
+3.2.1 Lượt truyền ngược
+Trong một phép biến đổi tuyến tính theo lô điển hình Y=XW, chúng ta cần tính toán các gradient ∇X và ∇W.
+∇X=∇YW⊤, ∇W=X⊤∇Y,
+
+4
+
+--- TRANG 5 ---
+ScatterMoE
+Trong ParallelLinear, chúng ta sẽ cần tính toán các gradient này cho mỗi chuyên gia trong E chuyên gia. Trong khi điều này có thể được tính toán theo cách mà cả X và ∇Y đều được phân tán, triển khai của thao tác này nhanh nhất khi cả X và ∇Y đều được nhóm⁵.
+
+Thuật toán 2 ParallelLinear BACKWARD
+Đầu vào:
+∇Y S×dout ma trận gradient Ŷ Tk×dout từ lượt truyền thuận
+W E×din×dout tensor biến đổi X T×din từ lượt truyền thuận
+k top-k oTk từ lượt truyền thuận
+mặc định k =1
+cột pS×j trọng số định tuyến
+trong đó Sj=Tk mặc định p:(T×1) =1
+Đầu ra:
+∇X cùng kích thước với X ∇W cùng kích thước với W
+∇p cùng kích thước với p
+if p≠∅then
+∇p←bmm∇Y,Ŷ
+¯∇Y←group (∇Y,o,p) // trọng số và nhóm
+else
+¯∇Y←Y
+end if
+if X is not grouped then
+¯X←group (X,o,∅)
+else
+¯X←X
+end if
+∇W←groupXTY¯X,¯∇Y
+¯∇X←scatter2scatter
+¯∇Y,W⊤,o, 1
+// nhóm đến phân tán hoặc nhóm tùy thuộc vào đầu vào ban đầu
+
+Thuật toán 2 nhóm các embedding khi chúng không được nhóm để tính toán ∇W. groupXTY là kernel triển khai phép nhân ma trận được nhóm này. Trong khi việc nhóm này phát sinh phân bổ bộ nhớ bổ sung cho các ma trận có thể rất lớn, các phân bổ mảng này có thể được tái sử dụng. Khi các gradient ∇p đã được tính toán, mảng cho Ŷ có thể được sử dụng làm đầu ra cho ¯∇Y. ¯X có thể được tái sử dụng cho ¯∇X vì chúng có cùng chiều. Sau đó chúng ta có thể tiếp tục giảm thiểu việc sử dụng bộ nhớ trong lượt truyền ngược bằng cách tái sử dụng các mảng được sử dụng cho các thao tác nhóm. Chúng tôi tô màu các mảng được tái sử dụng bằng màu xanh dương và cam tương ứng trong Thuật toán 2.
+
+3.2.2 SMoE Multi-layer Perceptron (SMoE MLP)
+Trong bối cảnh của một SMoE MLP, chúng ta có thể giảm dấu chân bộ nhớ hơn nữa. MLP yêu cầu hai phép biến đổi tuyến tính, và có thể được triển khai ngây thơ với hai thao tác ParallelLinear được cài đặt để thực hiện các phép biến đổi scatter-to-scatter. Tuy nhiên, chúng ta có thể cấu hình hai phép biến đổi tuyến tính này thành scattered-to-grouped sau đó grouped-to-scattered tương ứng. Điều này sẽ cho phép mỗi phép biến đổi ParallelLinear trong SMoE MLP chỉ yêu cầu một thao tác nhóm trong lượt truyền ngược.
+
+3.3 Khả năng mở rộng: Mixture-of-Attention (MoA)
+Đã có một số đề xuất để áp dụng SMoE cho lớp attention (Zhang et al., 2022; Csordás et al., 2023; Tan et al., 2023). Bất kể công thức nào, trước khi lớp attention được áp dụng, các embedding nên theo thứ tự thời gian (phân tán) để tạo điều kiện cho việc áp dụng embedding vị trí và tính toán kết quả của trọng số attention và embedding giá trị. Với các triển khai SMoE hiện tại, sẽ có một cặp thao tác group-scatter bổ sung, phát sinh chi phí bộ nhớ bổ sung.
+
+⁵Chúng tôi đã thử nghiệm scatterXTY và thấy nó chậm hơn một thao tác nhóm theo sau bởi groupXTY
+
+5
+
+--- TRANG 6 ---
+ScatterMoE
+Thuật toán 3 SMOE MULTI-LAYER PERCEPTRON
+Đầu vào:
+X T×dmodel ma trận đầu vào oT vector thứ tự được nhóm
+W1E×dmodel×dexpert tensor biến đổi
+W2E×dexpert×dmodel tensor biến đổi
+Đầu ra:
+Y T×dmodel ma trận đầu ra
+H←ParallelLinear (X,W1,o,∅,grouped in=False ,grouped out=True )
+H←σĤ
+// trong đó σ là bất kỳ phi tuyến tính điểm nào
+Y←ParallelLinear (H,W2,o,p,grouped in=True ,grouped out=False )
+
+Thuật toán 4 SMOE MULTI-HEAD ATTENTION
+Đầu vào:
+X B×T×dmodel ma trận đầu vào k top-k
+oBTk chỉ số được nhóm p B×T×k trọng số bộ định tuyến
+WKdmodel×dout biến đổi key WV dmodel×dout biến đổi value
+WQ E×dmodel×dout biến đổi query WO E×dout×dmodel biến đổi output
+Đầu ra:
+O B×T×dmodel ma trận đầu ra
+V←X⊤WV
+K←X⊤WK
+Q←ParallelLinear
+X,WQ,o,∅,grouped in=False ,grouped out=False
+Ô←Attention (Q,K,V)
+O←ParallelLinearÔ,WO,o,p,grouped in=False ,grouped out=False
+
+ScatterMoE cung cấp một lợi thế. Vì chúng ta có thể duy trì thứ tự phân tán thông qua một phép biến đổi ParallelLinear, chúng ta có thể triển khai MoA mà không cần phân bổ các mảng bổ sung cho việc nhóm và phân tán. Hình 3 hiển thị các thao tác được sử dụng cho SMoE Attention. Trong báo cáo này, chúng tôi cụ thể triển khai và đánh giá hiệu suất biến thể Mixture of Multi-head Attention được tìm thấy trong Tan et al. (2023).
+
+Hình 3: ParallelLinear cho phép các phép biến đổi scattered to scattered giữ nguyên thứ tự thời gian.
+
+Phiên bản này giống như Grouped-query Attention (GQA; Ainslie et al. 2023), trong đó mỗi key head có nhiều query head có thể, trong khi trong cài đặt SMoE, sẽ có hexpert key head, với k·hexpert query head được chọn từ E·hexpert head có thể, trong đó hexpert là số head trên mỗi chuyên gia.
+
+Theo các quy ước triển khai attention tiêu chuẩn, chúng tôi đặt dout=dexpert·dhead, trong đó dhead là số chiều cho mỗi head. Sau đó chúng tôi reshape phù hợp khi thực hiện thao tác attention để các head riêng biệt tương tác độc lập.
+
+Trong Thuật toán 4, chúng tôi cũng xem xét chiều thời gian, vì vậy chúng tôi biểu thị các đầu vào và mảng trung gian như các tensor 3 chiều với các chiều cho batch, time, và chiều embedding (B×T×d). Trong thực tế, chúng tôi giả định rằng đầu vào là liên tục và được sắp xếp theo batch-time, cho phép chúng tôi làm phẳng tensor và tiến hành như chúng tôi đã làm trong trường hợp MLP. Lưu ý rằng đối với SMoE attention, một điểm khác biệt chính là chúng tôi yêu cầu ParallelLinear đưa ra một đầu ra không được nhóm sau phép biến đổi đầu tiên, và nó nhận một đầu vào không được nhóm cho phép biến đổi đầu ra, có nghĩa là cả hai phép biến đổi ParallelLinear đều sử dụng cấu hình scattered to scattered (Hình 2c).
+
+6
+
+--- TRANG 7 ---
+ScatterMoE
+(a) Thông lượng huấn luyện mô hình 1.5B
+ (b) Thông lượng đơn vị SMoE MLP
+ (c) Sử dụng bộ nhớ đơn vị SMoE MLP
+Hình 4
+
+4 Hiệu suất
+Trong phần này, chúng tôi bao gồm hiệu suất của triển khai chúng tôi cho cả huấn luyện và suy luận. Như một bài kiểm tra tích hợp tổng thể, chúng tôi đánh giá hiệu suất phương pháp của mình trong Mixtral (Jiang et al., 2024), sử dụng cấu hình ~1.5B tham số,
+dmodel =1024, dexpert =3584, k=2, E=8, L=16,
+
+Chúng tôi so sánh với triển khai ngây thơ từ HuggingFace (Naive HF impl.), sau đó thay thế lớp SMoE bằng Megablocks sparse (MB (Sparse)) và grouped memory efficient (MB (Mem. eff.)), và cuối cùng ScatterMoE (Ours). Mục tiêu của chúng tôi là đo lường thông lượng tổng thể trong một cài đặt huấn luyện.
+
+Chúng tôi chạy huấn luyện cho 100 bước cập nhật huấn luyện, với kích thước batch hiệu quả là 256 và 2048 token trên mỗi instance, trên 8 GPU A100 trên cùng một nút tính toán. Đối với cả naive và ScatterMoE, điều này dẫn đến kích thước batch thực tế là 128 và 2 bước tích lũy, trong khi các benchmark Megablocks yêu cầu kích thước batch là 64 và 4 bước tích lũy. Chúng tôi chạy huấn luyện cho 100 bước và tính toán thông lượng tổng thể. Phương pháp của chúng tôi vượt trội hơn cả triển khai Sparse Megablocks 38.1% trong cài đặt này. Điều này chỉ ra tầm quan trọng của dấu chân bộ nhớ nhỏ hơn, nhưng ở các chiều lớn hơn với kích thước batch tương đương, lợi ích không đáng kể.
+
+Phần còn lại của phần này bao gồm các thí nghiệm benchmark khác mà chúng tôi đã thực hiện chi tiết hơn, kiểm tra tác động của việc giảm tính thưa thớt, tăng granularity của các chuyên gia, và benchmark triển khai Mixture of Attention của chúng tôi.
+
+4.1 Unit Benchmarking trên SMoE MLP
+Trừ khi nói khác, chúng tôi sử dụng các siêu tham số mô hình sau,
+dmodel =4096, dff=2dmodel , dexpert =dff/k, E=8k
+
+Ví dụ, các đơn vị ẩn hoạt động cho một MLP là 2·4096 =8192. Nếu k=4, thì E=4·8=32, với mỗi chuyên gia có 8192/k=2048 chiều. Mỗi điểm dữ liệu trên biểu đồ là trung vị và phần trăm thứ 5 và 95 của 100 lần chạy mô-đun. Trong bài kiểm tra đơn vị này, chúng tôi sử dụng triển khai PyTorch hiệu quả hơn từ triển khai của Tan et al. (2023)⁶.
+
+Hình 4a tóm tắt hiệu suất tổng thể cho một SMoE MLP trong đó E=32, k=4, và T=30·2048. Tất cả thời gian benchmark được đo trên GPU Nvidia A100. Nói chung, chúng tôi thấy rằng ScatterMoE có thông lượng cao hơn một chút trong quá trình huấn luyện, cho cùng kích thước đầu vào. Phương pháp của chúng tôi hiển thị biên cải thiện lớn hơn cho suy luận.
+
+Về tiêu thụ bộ nhớ, triển khai SMoE MLP của chúng tôi sử dụng 66.2% bộ nhớ mà Megablocks sử dụng trong quá trình huấn luyện, trong khi chỉ sử dụng 53.6% bộ nhớ của Megablocks nếu chúng ta chỉ xem xét suy luận.
+
+⁶https://github.com/shawntan/SUT/tree/main/sut layer/parallel linear/parallel experts
+
+7
+
+--- TRANG 8 ---
+ScatterMoE
+(a) Thông lượng huấn luyện
+ (b) Thông lượng suy luận
+Hình 5: Tăng k và E trong khi cố định số tham số hoạt động và tổng tham số. Chúng tôi thấy rằng triển khai của chúng tôi mở rộng quy mô tốt hơn với k cao hơn. Hiệu suất mở rộng quy mô granularity suy luận. Sự khác biệt trong thông lượng tương đối cao hơn nếu chúng ta chỉ xem xét lượt truyền thuận.
+
+4.2 Granularity và Thông lượng
+Krajewski et al. (2024) định nghĩa khái niệm granularity. Cho một SMoE MLP với các tham số hoạt động tương đương như một MLP với lớp chiều trung gian có chiều dff, và với mỗi chuyên gia có chiều dexpert, thì granularity được định nghĩa là,
+G=dff/dexpert
+
+Ở đây, chúng tôi đo lường tác động của thông lượng khi chúng tôi thay đổi G trong khi cố định dff. Tương ứng, với các giá trị G cao hơn, chúng ta cần tăng các giá trị của k và E— granularity cao hơn yêu cầu nhiều chuyên gia hơn để đạt được cùng các tham số hoạt động.
+
+Chúng tôi kiểm tra các giá trị k∈ {1, 2, 4, 8, 16}, và E=8k cho tính chia hết của kích thước chiều. Hình 5 hiển thị cách thông lượng của cả hai phương pháp thay đổi tương đối so với một mô hình với các tham số hoạt động tương đương. Vì chúng tôi duy trì các tham số hoạt động và tổng không đổi cho các lần chạy này, các kết quả này cũng không đổi cho tất cả G.
+
+Chúng tôi thấy rằng ScatterMoE mở rộng quy mô với G với thông lượng tốt hơn. Điều này có thể liên quan đến việc tăng zero-padding yêu cầu cho số lượng E cao hơn trong trường hợp Megablocks — khi số lượng chuyên gia tăng và các embedding được gán cho mỗi chuyên gia giảm, sẽ có nhiều padding được giới thiệu hơn. Nếu chúng ta chỉ xem xét lượt truyền thuận, khoảng cách tương đối giữa phương pháp của chúng tôi và Megablocks cũng cao hơn nhiều so với trường hợp huấn luyện. Điều này làm cho phương pháp của chúng tôi thuận lợi cho suy luận theo lô, đặc biệt với các cài đặt granularity cao. Kết quả của Krajewski et al. (2024) đề xuất G cao hơn cho các mô hình SMoE, và triển khai của chúng tôi có vẻ phù hợp cho ứng dụng này.
+
+4.3 Giảm tính thưa thớt
+Chúng ta có thể xem SMoE như một phép nội suy giữa một mô hình với kích thước chỉ bằng các tham số hoạt động k·dexpert và một mô hình dense đầy đủ lớn với E·dexpert. Tuy nhiên, SMoE đi kèm với chi phí bổ sung (ví dụ định tuyến, sắp xếp), và chúng tôi muốn đo lường việc giảm tính thưa thớt sẽ ảnh hưởng đến thông lượng như thế nào, so với một mô hình dense đầy đủ.
+
+Trong thí nghiệm này, chúng tôi đã kiểm tra trên các giá trị k≤30 tăng dần. Tăng k thêm nữa đạt đến giới hạn bộ nhớ thiết bị cho Megablocks. Chúng tôi duy trì E=64 cho tất cả các lần chạy, và so sánh hiệu suất của cả Megablocks và ScatterMoE với một mô hình dense có dff=E·dexpert.
+
+8
+
+--- TRANG 9 ---
+ScatterMoE
+(a) Thông lượng MoA
+ (b) Thông lượng huấn luyện
+ (c) Thông lượng suy luận
+Hình 8: Các đường cong cho granularity tăng dần cho triển khai MoMHA. Trong trường hợp này, baseline Active params thay đổi trong thông lượng vì các vector key và value được chia sẻ qua các chuyên gia.
+
+Hình 6: Các đường cong thông lượng tương đối khi chúng ta giảm tính thưa thớt (tăng k)
+
+Nói chung, chúng tôi thấy rằng trong khi triển khai của chúng tôi thực hiện với thông lượng hơi tốt hơn tổng thể, cả Megablocks và triển khai của chúng tôi đều vẫn hiệu quả hơn một MLP dense lớn với các tham số tương đương. Tuy nhiên, lưu ý rằng trong trường hợp này, thông lượng cho k=30, E=64 đã đạt đến thông lượng cho một mô hình dense tương đương với cùng tham số. Tăng k thêm nữa vượt quá bộ nhớ của thiết bị mà chúng tôi chạy benchmark cho Megablocks.
+
+4.4 Mixture-of-Attention
+Như đã đề cập trước đó, chúng tôi triển khai biến thể Mixture of Multi-head Attention (MoMHA) của Attention SMoE như được mô tả trong Tan et al. (2023). Triển khai này cho phép nhiều attention head trên mỗi chuyên gia, và chia sẻ các embedding key và value qua các chuyên gia attention. Công thức này tương tự như Grouped-query Attention (GQA; Ainslie et al. 2023), trong đó mỗi head của key có một số query head, mỗi cái tạo thành một nhóm. Các chuyên gia MoMHA tương đương với các nhóm trong GQA, trong đó mỗi nhóm có kích thước k.
+
+Cho các benchmark sau, chúng tôi tuân thủ các tham số sau:
+dmodel =4096, dhead =128, T=16·2048, h=32, hexpert =h/k,E=8k
+trong đó dhead là chiều của mỗi attention head và h là số attention head hoạt động.
+
+Chúng tôi đã triển khai một baseline tương đương trong Megablocks sử dụng cấu hình 'dense' trong thư viện. Phiên bản này vẫn gặp vấn đề với việc phải thực hiện các bước nhóm và phân tán dư thừa.
+
+Cho k=8, chúng tôi thấy rằng triển khai của chúng tôi vượt trội hơn Megablocks, 24.0% thông lượng cho suy luận. Chúng tôi cũng lưu ý từ Hình 8, rằng khi chúng tôi tăng granularity (ít head hơn trên mỗi chuyên gia / hexpert nhỏ hơn), khoảng cách giữa triển khai của chúng tôi và Megablocks cũng tăng. Một lần nữa, phương pháp của chúng tôi thuận lợi để sử dụng trong các cài đặt granularity cao cho Mixture-of-Attention.
+
+9
+
+--- TRANG 10 ---
+ScatterMoE
+Nhiệm vụ Chỉ số Hugging Face ScatterMoE Lỗi tuyệt đối
+winogrande
+accuracy0.7632 0.7640 0.0008
+sciq 0.9520 0.9580 0.0060
+race 0.4057 0.4010 0.0047
+piqa 0.8330 0.8368 0.0038
+openbookqa 0.4680 0.4740 0.0060
+hellaswag 0.8396 0.8405 0.0009
+copa 0.9300 0.9300 0.0000
+boolq 0.8523 0.8541 0.0018
+arceasy 0.8350 0.8350 0.0000
+arcchallenge 0.5973 0.5981 0.0008
+wikitext perplexity 5.6135 5.6142 0.0007
+Bảng 1: So sánh kết quả Language Model Evaluation Harness: Hugging Face v. triển khai ScatterMoE. Sự khác biệt trong kết quả giữa cả hai triển khai là không đáng kể.
+
+4.5 So sánh Suy luận Mixtral
+Cuối cùng, chúng tôi đã chuyển đổi Mixtral 8x7B⁷ để sử dụng ScatterMoE, và chạy LM Evaluation Harness (Gao et al., 2023) trên một số benchmark (Xem Bảng 1). Vì ScatterMoE là một triển khai thay thế của Sparse MoE, chúng tôi không mong đợi bất kỳ sự khác biệt nào trong kết quả đánh giá cuối cùng. Lỗi tuyệt đối giữa triển khai ngây thơ Hugging Face và ScatterMoE đủ nhỏ, điều này chứng minh điều này.
+
+Chúng tôi đã bao gồm script để chuyển đổi các tham số mô hình từ định dạng Hugging Face sang định dạng tương thích cho ScatterMoE⁸.
+
+5 Kết luận & Hạn chế
+ScatterMoE là một triển khai SMoE trong Triton giảm dấu chân bộ nhớ và cung cấp thông lượng hơi cao hơn trên GPU so với các giải pháp hiện tại. Chúng tôi cũng đã thiết kế ScatterMoE để sử dụng nguyên thủy ParallelLinear, mà chúng tôi hình dung sẽ là một mô-đun có thể được mở rộng để xây dựng các mô-đun kiểu SMoE khác yêu cầu các phép biến đổi tuyến tính được nhóm hoặc phân tán. Hiện tại, ScatterMoE không triển khai kernel chuyên biệt để tăng tốc giải mã, và cần thêm công việc cho song song hóa trong cài đặt đa nút. Các tính năng bổ sung này sẽ được thêm vào trong các lần lặp tương lai, và chúng tôi tin rằng việc kiểm tra thêm bởi chúng tôi và cộng đồng mã nguồn mở sẽ loại bỏ bất kỳ lỗi còn lại và các vấn đề hiệu suất chưa được tối ưu hóa. Cuối cùng, chúng tôi cũng đã cung cấp một triển khai của lớp MLP và Attention dựa trên ScatterMoE, mà chúng tôi hy vọng sẽ có lợi cho bất kỳ triển khai tương lai nào của các mô hình dựa trên Mixture-of-Expert, và phục vụ như các ví dụ làm việc để mở rộng khái niệm SMoE sang các biến thể khác của các chuyên gia dựa trên phép biến đổi tuyến tính.
+
+Lời cảm ơn
+Chúng tôi muốn cảm ơn Bowen Pan đã kiểm tra và phản hồi về ScatterMoE, và lời khuyên quý báu của Songlin Yang trong quá trình phát triển các kernel ScatterMoE. Cuối cùng, chúng tôi muốn cảm ơn Mayank Mishra đã giúp kích hoạt torch.compile⁹ và tích hợp ScatterMoE vào Dolomite Engine (Mishra, 2024)¹⁰.
+
+⁷https://huggingface.co/mistralai/Mixtral-8x7B-v0.1
+⁸https://github.com/shawntan/scattermoe/blob/main/examples/convert.py
+⁹https://github.com/mayank31398/kernel-hyperdrive/
+¹⁰https://github.com/IBM/dolomite-engine
+
+10
+
+--- TRANG 11 ---
+ScatterMoE
+Tài liệu tham khảo
+Joshua Ainslie, James Lee-Thorp, Michiel de Jong, Yury Zemlyanskiy, Federico Lebrón, và Sumit Sanghai. Gqa: Training generalized multi-query transformer models from multi-head checkpoints. arXiv preprint arXiv:2305.13245, 2023.
+
+Róbert Csordás, Piotr Piekos, và Kazuki Irie. Switchhead: Accelerating transformers with mixture-of-experts attention. arXiv preprint arXiv:2312.07987, 2023.
+
+Mostafa Dehghani, Stephan Gouws, Oriol Vinyals, Jakob Uszkoreit, và Łukasz Kaiser. Universal transformers. arXiv preprint arXiv:1807.03819, 2018.
+
+William Fedus, Barret Zoph, và Noam Shazeer. Switch transformers: Scaling to trillion parameter models with simple and efficient sparsity. The Journal of Machine Learning Research, 23(1):5232–5270, 2022.
+
+Trevor Gale, Deepak Narayanan, Cliff Young, và Matei Zaharia. MegaBlocks: Efficient Sparse Training with Mixture-of-Experts. Proceedings of Machine Learning and Systems, 5, 2023.
+
+Leo Gao, Jonathan Tow, Baber Abbasi, Stella Biderman, Sid Black, Anthony DiPofi, Charles Foster, Laurence Golding, Jeffrey Hsu, Alain Le Noac'h, Haonan Li, Kyle McDonell, Niklas Muennighoff, Chris Ociepa, Jason Phang, Laria Reynolds, Hailey Schoelkopf, Aviya Skowron, Lintang Sutawika, Eric Tang, Anish Thite, Ben Wang, Kevin Wang, và Andy Zou. A framework for few-shot language model evaluation, 12 2023. URL https://zenodo.org/records/10256836.
+
+Albert Q Jiang, Alexandre Sablayrolles, Antoine Roux, Arthur Mensch, Blanche Savary, Chris Bamford, Devendra Singh Chaplot, Diego de las Casas, Emma Bou Hanna, Florian Bressand, et al. Mixtral of experts. arXiv preprint arXiv:2401.04088, 2024.
+
+Young Jin Kim, Rawn Henry, Raffy Fahim, và Hany Hassan Awadalla. Who says elephants can't run: Bringing large scale moe models into cloud scale production. arXiv preprint arXiv:2211.10017, 2022.
+
+Vijay Anand Korthikanti, Jared Casper, Sangkug Lym, Lawrence McAfee, Michael Andersch, Mohammad Shoeybi, và Bryan Catanzaro. Reducing activation recomputation in large transformer models. Proceedings of Machine Learning and Systems, 5, 2023.
+
+Jakub Krajewski, Jan Ludziejewski, Kamil Adamczewski, Maciej Pioro, Michał Krutul, Szymon Antoniak, Kamil Ciebiera, Krystian Krol, Tomasz Odrzygózdzí, Piotr Sankowski, et al. Scaling laws for fine-grained mixture of experts. arXiv preprint arXiv:2402.07871, 2024.
+
+Mayank Mishra. Dolomite Engine: A Hyper-Optimized Library for Pretraining and Fine-tuning, June 2024. URL https://github.com/ibm/dolomite-engine.
+
+Deepak Narayanan, Mohammad Shoeybi, Jared Casper, Patrick LeGresley, Mostofa Patwary, Vijay Korthikanti, Dmitri Vainbrand, Prethvi Kashinkunti, Julie Bernauer, Bryan Catanzaro, et al. Efficient large-scale language model training on gpu clusters using megatron-lm. In Proceedings of the International Conference for High Performance Computing, Networking, Storage and Analysis, pp. 1–15, 2021.
+
+Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory Chanan, Trevor Killeen, Zeming Lin, Natalia Gimelshein, Luca Antiga, et al. Pytorch: An imperative style, high-performance deep learning library. Advances in neural information processing systems, 32, 2019.
+
+Noam Shazeer, Azalia Mirhoseini, Krzysztof Maziarz, Andy Davis, Quoc Le, Geoffrey Hinton, và Jeff Dean. Outrageously large neural networks: The sparsely-gated mixture-of-experts layer. arXiv preprint arXiv:1701.06538, 2017.
+
+11
+
+--- TRANG 12 ---
+ScatterMoE
+Yikang Shen, Zheyu Zhang, Tianyou Cao, Shawn Tan, Zhenfang Chen, và Chuang Gan. Moduleformer: Learning modular large language models from uncurated data. arXiv preprint arXiv:2306.04640, 2023.
+
+Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper, và Bryan Catanzaro. Megatron-lm: Training multi-billion parameter language models using model parallelism. arXiv preprint arXiv:1909.08053, 2019.
+
+Shawn Tan, Yikang Shen, Zhenfang Chen, Aaron Courville, và Chuang Gan. Sparse universal transformer. arXiv preprint arXiv:2310.07096, 2023.
+
+Philippe Tillet, Hsiang-Tsung Kung, và David Cox. Triton: an intermediate language and compiler for tiled neural network computations. In Proceedings of the 3rd ACM SIGPLAN International Workshop on Machine Learning and Programming Languages, pp. 10–19, 2019.
+
+Xiaofeng Zhang, Yikang Shen, Zeyu Huang, Jie Zhou, Wenge Rong, và Zhang Xiong. Mixture of attention heads: Selecting attention heads per token. arXiv preprint arXiv:2210.05144, 2022.
+
+Ningxin Zheng, Huiqiang Jiang, Quanlu Zhang, Zhenhua Han, Lingxiao Ma, Yuqing Yang, Fan Yang, Chengruidong Zhang, Lili Qiu, Mao Yang, et al. Pit: Optimization of dynamic sparse deep learning models via permutation invariant transformation. In Proceedings of the 29th Symposium on Operating Systems Principles, pp. 331–347, 2023.
+
+12

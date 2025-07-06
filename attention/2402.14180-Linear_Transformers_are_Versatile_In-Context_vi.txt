@@ -1,0 +1,516 @@
+# Linear Transformers là Những Người Học Linh Hoạt Trong Ngữ Cảnh
+
+Max Vladymyrov
+Google Research
+mxv@google.com
+
+Johannes von Oswald
+Google, Paradigms of Intelligence Team
+jvoswald@google.com
+
+Mark Sandler
+Google Research
+sandler@google.com
+
+Rong Ge
+Duke University
+rongge@cs.duke.edu
+
+## Tóm tắt
+
+Nghiên cứu gần đây đã chứng minh rằng các transformer, đặc biệt là các mô hình attention tuyến tính, thực hiện ngầm định các thuật toán tương tự gradient-descent trên dữ liệu được cung cấp trong ngữ cảnh trong bước suy luận forward của chúng. Tuy nhiên, khả năng của chúng trong việc xử lý các vấn đề phức tạp hơn vẫn chưa được khám phá. Trong bài báo này, chúng tôi chứng minh rằng mỗi lớp của một linear transformer duy trì một vector trọng số cho một bài toán hồi quy tuyến tính ngầm định và có thể được hiểu là thực hiện một biến thể của preconditioned gradient descent. Chúng tôi cũng điều tra việc sử dụng linear transformers trong một tình huống thách thức nơi dữ liệu huấn luyện bị nhiễu với các mức độ nhiễu khác nhau. Đáng chú ý, chúng tôi chứng minh rằng đối với vấn đề này, linear transformers khám phá ra một thuật toán tối ưu hóa phức tạp và hiệu quả cao, vượt trội hoặc sánh ngang về hiệu suất với nhiều baseline hợp lý. Chúng tôi phân tích thuật toán này và cho thấy đó là một phương pháp tiếp cận mới kết hợp momentum và adaptive rescaling dựa trên mức độ nhiễu. Các phát hiện của chúng tôi cho thấy rằng ngay cả linear transformers cũng sở hữu khả năng đáng ngạc nhiên để khám phá các chiến lược tối ưu hóa tinh vi.
+
+## 1 Giới thiệu
+
+Kiến trúc transformer (Vaswani et al., 2017) đã cách mạng hóa lĩnh vực machine learning, thúc đẩy các đột phá trên nhiều lĩnh vực khác nhau và phục vụ như một nền tảng cho các mô hình mạnh mẽ (Anil et al., 2023; Achiam et al., 2023; Team et al., 2023; Jiang et al., 2023). Tuy nhiên, mặc dù thành công rộng rãi, các cơ chế thúc đẩy hiệu suất của chúng vẫn là một khu vực nghiên cứu tích cực.
+
+Một thành phần quan trọng của thành công của chúng được quy cho in-context learning (ICL, Brown et al., 2020) – một khả năng nổi lên của transformers để đưa ra dự đoán dựa trên thông tin được cung cấp trong chính chuỗi đầu vào, mà không cần cập nhật tham số tường minh.
+
+Gần đây, một số bài báo (Garg et al., 2022; Akyürek et al., 2022; von Oswald et al., 2023a) đã đề xuất rằng ICL có thể được giải thích một phần bởi một meta-optimization ngầm định của transformers diễn ra trên ngữ cảnh đầu vào (còn gọi là mesa-optimization Hubinger et al., 2019). Họ đã chỉ ra rằng transformers với các lớp linear self-attention (còn gọi là linear transformers) được huấn luyện trên các tác vụ hồi quy tuyến tính có thể thực hiện nội bộ tối ưu hóa dựa trên gradient.
+
+Cụ thể, von Oswald et al. (2023a) đã chứng minh rằng linear transformers có thể thực hiện các lần lặp của một thuật toán tương tự như thuật toán gradient descent (mà họ gọi là GD++), với mỗi lớp attention đại diện cho một bước của thuật toán. Sau đó, Ahn et al. (2023); Zhang et al. (2023) đã đặc trưng hóa hành vi này hơn nữa, cho thấy rằng giải pháp đã học là một dạng preconditioned GD, và giải pháp này là tối ưu cho linear transformers một lớp.
+
+## 2 Kiến thức cơ bản
+
+Trong phần này chúng tôi giới thiệu các ký hiệu cho linear transformers, dữ liệu và loại vấn đề chúng tôi xem xét.
+
+### 2.1 Linear transformers và in-context learning
+
+Cho chuỗi đầu vào e₁, e₂, ..., eₙ ∈ ℝᵈ⁺¹, một head đơn trong một lớp linear self-attention thường được tham số hóa bởi bốn ma trận, key Wᴷ, query Wᵠ, value Wᵛ và projection Wᴾ. Đầu ra của lớp non-causal tại vị trí i là eᵢ + Δeᵢ trong đó Δeᵢ được tính như
+
+Δeᵢ = Wᴾ ∑ⁿⱼ₌₁ ⟨Wᵠeᵢ, Wᴷeⱼ⟩ Wᵛeⱼ. (1)
+
+Tương đương, người ta có thể sử dụng các tham số P = WᴾWᵛ và Q = WᴷᵀWᵠ, và phương trình trở thành
+
+Δeᵢ = P ∑ⁿⱼ₌₁ (eⱼᵀQeᵢ) Peⱼ. (2)
+
+Nhiều heads (P₁, Q₁), (P₂, Q₂), ..., (Pₕ, Qₕ) đơn giản cộng các hiệu ứng của chúng
+
+Δeᵢ = ∑ᴴₖ₌₁ P ∑ⁿⱼ₌₁ (eⱼᵀQₖeᵢ) Pₖeⱼ. (3)
+
+Chúng tôi định nghĩa một linear transformer như một mạng neural nhiều lớp bao gồm L lớp linear self-attention được tham số hóa bởi θ = {Qₖˡ, Pₖˡ} với k = 1...H, l = 1...L. Để cô lập các cơ chế cốt lõi, chúng tôi xem xét một kiến trúc decoder-only đơn giản hóa, loại trừ các thành phần MLPs và LayerNorm. Kiến trúc này cũng được sử dụng trong công trình trước đây (von Oswald et al., 2023a; Ahn et al., 2023).
+
+Chúng tôi xem xét hai phiên bản của linear transformers: FULL với các tham số transformer được biểu diễn bởi các ma trận đầy đủ và DIAG, nơi các tham số bị hạn chế chỉ đến các ma trận đường chéo.
+
+Lấy cảm hứng từ von Oswald et al. (2023a), trong bài báo này chúng tôi xem xét dữ liệu hồi quy như chuỗi token. Mỗi token eᵢ = (xᵢ, yᵢ) ∈ ℝᵈ⁺¹ bao gồm một vector đặc trưng xᵢ ∈ ℝᵈ và đầu ra tương ứng yᵢ ∈ ℝ. Ngoài ra, chúng tôi thêm một query token eₙ₊₁ = (xₜ, 0) vào chuỗi, nơi xₜ ∈ ℝᵈ đại diện cho dữ liệu test. Mục tiêu của in-context learning là dự đoán yₜ cho dữ liệu test xₜ. Chúng tôi hạn chế attention chỉ tập trung vào n token đầu tiên của chuỗi sao cho nó bỏ qua query token.
+
+Chúng tôi sử dụng (xᵢˡ, yᵢˡ) để biểu thị token thứ i trong đầu ra của transformer tại lớp l. Lớp ban đầu đơn giản là đầu vào: (xᵢ⁰, yᵢ⁰) = (xᵢ, yᵢ). Đối với một mô hình với các tham số θ, chúng tôi đọc dự đoán bằng cách lấy số âm² của tọa độ cuối cùng của token cuối cùng trong lớp cuối cùng như ŷ_θ({e₁, ..., eₙ}, eₙ₊₁) = -yₙ₊₁ᴸ.
+
+Hãy cũng định nghĩa ký hiệu sau để được sử dụng xuyên suốt bài báo
+
+Σ = ∑ⁿᵢ₌₁ xᵢ(xᵢ)ᵀ; α = ∑ⁿᵢ₌₁ yᵢxᵢ; λ = ∑ⁿᵢ₌₁ (yᵢ)²
+
+Σˡ = ∑ⁿᵢ₌₁ xᵢˡ(xᵢˡ)ᵀ; αˡ = ∑ⁿᵢ₌₁ yᵢˡxᵢˡ; λˡ = ∑ⁿᵢ₌₁ (yᵢˡ)²
+
+### 2.2 Mô hình hồi quy nhiễu
+
+Như một bài toán mô hình, chúng tôi xem xét dữ liệu được tạo từ một mô hình hồi quy tuyến tính nhiễu. Đối với mỗi chuỗi đầu vào τ, chúng tôi lấy mẫu một vector trọng số ground-truth w_τ ~ N(0, I), và tạo n điểm dữ liệu như xᵢ ~ N(0, I) và yᵢ = ⟨w_τ, xᵢ⟩ + ξᵢ, với nhiễu ξᵢ ~ N(0, σ²_τ).
+
+Lưu ý rằng mỗi chuỗi có thể có các vector trọng số ground-truth khác nhau w_τ, nhưng mọi điểm dữ liệu trong chuỗi chia sẻ cùng w_τ và σ_τ. Query được tạo như xₜ ~ N(0, I) và yₜ = ⟨w_τ, xₜ⟩ (vì nhiễu độc lập, việc chúng ta có bao gồm nhiễu trong y_q sẽ chỉ là một hằng số cộng vào mục tiêu cuối cùng).
+
+Chúng tôi định nghĩa thêm một ordinary least square (OLS) loss như
+
+L_OLS(w) = ∑ⁿᵢ₌₁ (yᵢ - ⟨w, xᵢ⟩)². (4)
+
+Giải pháp OLS là w* := Σ⁻¹α với residuals rᵢ := yᵢ - ⟨w*, xᵢ⟩.
+
+Trong sự hiện diện của nhiễu σ_τ, w* nói chung không bằng ground truth w_τ. Đối với một mức độ nhiễu đã biết σ_τ, estimator tốt nhất cho w_τ được cung cấp bởi ridge regression:
+
+L_RR(w) = ∑ⁿᵢ₌₁ (yᵢ - ⟨w, xᵢ⟩)² + σ²_τ‖w‖², (5)
+
+với giải pháp w*_σ² := (Σ + σ²_τI)⁻¹α. Tất nhiên, trong thực tế, phương sai của nhiễu không được biết và phải được ước tính từ dữ liệu.
+
+### 2.3 Các vấn đề fixed vs. mixed noise variance
+
+Chúng tôi xem xét hai vấn đề khác nhau trong khung hồi quy tuyến tính nhiễu.
+
+**Fixed noise variance.** Trong tình huống này, phương sai σ_τ vẫn không đổi cho tất cả dữ liệu huấn luyện. Ở đây, in-context loss là:
+
+L(θ) = E[w_τ~N(0,I), xᵢ~N(0,I), ξᵢ~N(0,σ²_τ)] (ŷ_θ({e₁, ..., eₙ}, eₙ₊₁) - yₜ)², (6)
+
+trong đó eᵢ = (xᵢ, yᵢ) và yᵢ = ⟨w_τ, xᵢ⟩ + ξᵢ. Vấn đề này ban đầu được khám phá bởi Garg et al. (2022). Sau đó, von Oswald et al. (2023a) đã chứng minh rằng một linear transformer (6) hội tụ đến một dạng giải pháp gradient descent, mà họ gọi là GD++. Chúng tôi định nghĩa điều này chi tiết sau.
+
+**Mixed noise variance.** Trong trường hợp này, phương sai nhiễu σ_τ được rút từ một phân phối cố định p(σ_τ) cho mỗi chuỗi. In-context learning loss trở thành:
+
+L(θ) = E[w_τ~N(0,I), xᵢ~N(0,I), ξᵢ~N(0,σ²_τ), σ_τ~p(σ_τ)] (ŷ_θ({e₁, ..., eₙ}, eₙ₊₁) - yₜ)². (7)
+
+Nói cách khác, mỗi chuỗi huấn luyện τ có một mức độ nhiễu cố định σ_τ, nhưng các chuỗi huấn luyện khác nhau có các mức độ nhiễu khác nhau được lấy mẫu từ một phân phối cụ thể p(σ_τ). Tình huống này thêm độ phức tạp vì mô hình phải dự đoán w_τ cho phân phối nhiễu thay đổi, và giải pháp tối ưu có thể sẽ liên quan đến một số loại ước tính nhiễu. Chúng tôi đã phát hiện rằng về mặt thực nghiệm, GD++ thất bại trong việc mô hình hóa phương sai nhiễu này và thay vào đó hội tụ đến một giải pháp có thể được hiểu như một ước tính phương sai nhiễu đơn lẻ trên tất cả dữ liệu đầu vào.
+
+## 3 Công trình liên quan
+
+**In-context Learning as Gradient Descent** Công trình của chúng tôi dựa trên nghiên cứu mà khung in-context learning như các (biến thể của) gradient descent (Akyürek et al., 2022; von Oswald et al., 2023a). Đối với linear transformer 1 lớp, một số công trình Zhang et al. (2023); Mahankali et al. (2023); Ahn et al. (2023) đặc trưng hóa các tham số tối ưu và dynamics huấn luyện. Các công trình gần đây hơn mở rộng các ý tưởng đến các mô hình auto-regressive (Li et al., 2023; von Oswald et al., 2023b) và các mô hình phi tuyến (Cheng et al., 2023). Fu et al. (2023) nhận thấy rằng transformers hoạt động tương tự như các phương pháp Newton bậc hai trên dữ liệu tuyến tính, mà chúng tôi đưa ra một giải thích hợp lý trong Định lý 5.1.
+
+**In-context Learning in LLMs** Cũng có nhiều công trình nghiên cứu cách in-context learning hoạt động trong các LLMs được pre-trained (Kossen et al., 2023; Wei et al., 2023; Hendel et al., 2023; Shen et al., 2023). Do độ phức tạp của các mô hình như vậy, cơ chế chính xác cho in-context learning vẫn là một vấn đề mở lớn. Một số công trình (Olsson et al., 2022; Chan et al., 2022; Akyürek et al., 2024) xác định induction heads như một cơ chế quan trọng cho các tác vụ in-context learning đơn giản, chẳng hạn như copying, token translation và pattern matching.
+
+**Other theories for training transformers** Ngoài setting của các mô hình tuyến tính, một số công trình khác (Garg et al., 2022; Tarzanagh et al., 2023; Li et al., 2023; Huang et al., 2023; Tian et al., 2023a,b) xem xét tối ưu hóa transformers dưới các giả định dữ liệu và mô hình khác nhau. Wen et al. (2023) cho thấy rằng có thể khó để giải thích "thuật toán" được thực hiện bởi transformers mà không có các hạn chế rất mạnh.
+
+**Mixed Linear Models** Một số công trình quan sát rằng transformers có thể đạt được hiệu suất tốt trên hỗn hợp các mô hình tuyến tính (Bai et al., 2023; Pathak et al., 2023; Yadlowsky et al., 2023). Trong khi các công trình này cho thấy rằng transformers có thể thực hiện nhiều biến thể của các kỹ thuật model-selection, kết quả của chúng tôi cho thấy rằng linear transformers giải quyết các vấn đề như vậy bằng cách khám phá thuật toán tối ưu hóa thú vị với nhiều hyperparameters được điều chỉnh trong quá trình huấn luyện. Chiến lược như vậy khá khác biệt với các cách truyền thống của việc thực hiện model selection. Transformers cũng được biết đến là có thể thực hiện các thuật toán mạnh trong nhiều setup khác nhau (Guo et al., 2023; Giannou et al., 2023).
+
+**Effectiveness of linear and kernel-like transformers** Một ràng buộc chính trên kiến trúc transformer là nó mất O(N²) thời gian cho một chuỗi có độ dài N, trong khi đối với linear transformer điều này có thể được cải thiện thành O(N). Mirchandani et al. (2023) cho thấy rằng ngay cả linear transformers cũng khá mạnh mẽ cho nhiều tác vụ. Các công trình khác (Katharopoulos et al., 2020; Wang et al., 2020; Schlag et al., 2021; Choromanski et al., 2020) sử dụng các ý tưởng tương tự như kernel/random features để cải thiện thời gian chạy gần như tuyến tính trong khi không mất nhiều hiệu suất.
+
+## 4 Linear transformers duy trì mô hình hồi quy tuyến tính tại mỗi lớp
+
+Trong khi các transformer lớn, phi tuyến có thể mô hình hóa mối quan hệ phức tạp, chúng tôi cho thấy rằng linear transformers bị hạn chế để duy trì một mô hình hồi quy tuyến tính dựa trên đầu vào, theo nghĩa là đầu ra lớp thứ l luôn là một hàm tuyến tính của đầu vào với các hệ số latent (và có thể phi tuyến).
+
+**Định lý 4.1.** Giả sử đầu ra của một linear transformer tại lớp thứ l là (x₁ˡ, y₁ˡ), (x₂ˡ, y₂ˡ), ..., (xₙˡ, yₙˡ), (xₜˡ, yₜˡ), thì tồn tại các ma trận Mˡ, vectors uˡ, wˡ và scalars aˡ sao cho
+
+x^(l+1)_i = M^l x_i + y_i u^l, x^(l+1)_t = M^l x_t,
+y^(l+1)_i = a^l y_i - ⟨w^l, x_i⟩, y^(l+1)_t = -⟨w^l, x_t⟩.
+
+Lưu ý rằng Mˡ, uˡ, wˡ và aˡ không tuyến tính trong đầu vào, nhưng điều này vẫn đặt ra các hạn chế về những gì linear transformers có thể làm. Ví dụ, chúng tôi cho thấy rằng nó không thể biểu diễn một hàm bậc hai:
+
+**Định lý 4.2.** Giả sử đầu vào của một linear transformer là (x₁, y₁), (x₂, y₂), ..., (xₙ, yₙ) trong đó xᵢ ~ N(0, I) và yᵢ = w^T xᵢ, hãy đặt đầu ra lớp thứ l là (x₁ˡ, y₁ˡ), (x₂ˡ, y₂ˡ), ..., (xₙˡ, yₙˡ) và đặt yˡ = (y₁ˡ, ..., yₙˡ) và y* = (x₁⁽¹⁾², x₂⁽¹⁾², ..., xₙ⁽¹⁾²) (ở đây xᵢ⁽¹⁾ chỉ là tọa độ đầu tiên của xᵢ), thì khi n ≫ d với xác suất cao, cosine similarity của y* và yˡ là tối đa 0.1.
+
+Định lý 4.1 ngụ ý rằng đầu ra của linear transformer luôn có thể được giải thích như các kết hợp tuyến tính của đầu vào với các trọng số latent aˡ và wˡ. Các ma trận Mˡ, vectors uˡ, wˡ và số aˡ không tuyến tính và thực tế có thể khá phức tạp, mà chúng tôi đặc trưng hóa dưới đây:
+
+**Bổ đề 4.3.** Trong setup của Định lý 4.1, nếu chúng ta đặt
+
+[A^l b^l; (c^l)^T d^l] := ∑ᴴₖ₌₁ P^l_k ∑ⁿⱼ₌₁ [x^l_j; y^l_j] ((x^l_j)^T, y^l_j) Q^l_k,
+
+thì người ta có thể tính đệ quy các ma trận Mˡ, vectors uˡ, wˡ và số aˡ cho mỗi lớp sử dụng
+
+M^(l+1) = (I + A^l)M^l + b^l(w^l)^T
+u^(l+1) = (I + A^l)u^l + a^l b^l
+a^(l+1) = (1 + d^l)a^l + ⟨c^l, u^l⟩
+w^(l+1) = (1 + d^l)w^l - (M^l)^T c^l,
+
+với điều kiện khởi tạo a⁰ = 1, w⁰ = 0, M⁰ = I, u⁰ = 0.
+
+Các cập nhật cho các tham số phức tạp và phi tuyến, cho phép linear transformers thực hiện các thuật toán mạnh mẽ, như chúng ta sẽ thấy sau trong Phần 5. Thực tế, ngay cả với P và Q đường chéo, chúng vẫn linh hoạt. Các cập nhật trong trường hợp này có thể được đơn giản hóa thêm thành một dạng quen thuộc hơn:
+
+**Bổ đề 4.4.** Trong setup của Định lý 4.1 với các tham số đường chéo, uˡ, wˡ được cập nhật như
+
+u^(l+1) = (I - Λ^l)u^l + Γ^l Σ(a^l w* - w^l);
+w^(l+1) = (1 + s^l)w^l - Π^l Σ(a^l w* - w^l) - Φ^l u^l.
+
+Ở đây Λˡ, Γˡ, sˡ, Πˡ, Φˡ là các ma trận và số phụ thuộc vào Mˡ, uˡ, aˡ, wˡ trong Bổ đề 4.3.
+
+Lưu ý rằng Σ(a^l w* - w^l) là (tỷ lệ với) gradient của một mô hình tuyến tính f(w^l) = ∑ⁿᵢ₌₁(a^l yᵢ - ⟨w^l, xᵢ⟩)². Điều này làm cho các cập nhật tương tự như gradient descent với momentum:
+
+u^(l+1) = (1-β)u^l + ∇f(w^l); w^(l+1) = w^l - ηu^l.
+
+Tất nhiên, công thức trong Bổ đề 4.4 vẫn phức tạp hơn nhiều với các ma trận ở vị trí của β và η, và cũng bao gồm một gradient term cho việc cập nhật w.
+
+## 5 Sức mạnh của các ma trận attention đường chéo
+
+Mặc dù linear transformers bị hạn chế, chúng có thể giải quyết các vấn đề in-context learning phức tạp. Về mặt thực nghiệm, chúng tôi đã phát hiện rằng chúng có thể giải quyết rất chính xác hồi quy tuyến tính với mixed noise variance (7), với các trọng số đã học cuối cùng rất nặng về đường chéo với một số thành phần low-rank (xem Hình 4). Đáng ngạc nhiên, loss cuối cùng vẫn nhất quán đáng kể ngay cả khi các ma trận Q và P của chúng (3) là đường chéo. Ở đây chúng tôi sẽ phân tích trường hợp đặc biệt này và giải thích hiệu quả của nó.
+
+Vì các phần tử của x là bất biến hoán vị, một tham số hóa đường chéo giảm mỗi attention heads xuống chỉ bốn tham số:
+
+P^l_k = [p^l_(x,k) I, 0; 0, p^l_(y,k)]; Q^l_k = [q^l_(x,k) I, 0; 0, q^l_(y,k)]. (8)
+
+Sẽ hữu ích để tham số hóa lại linear transformer (3) sử dụng:
+
+ω^l_(xx) = ∑ᴴₖ₌₁ p^l_(x,k) q^l_(x,k), ω^l_(xy) = ∑ᴴₖ₌₁ p^l_(x,k) q^l_(y,k),
+ω^l_(yx) = ∑ᴴₖ₌₁ p^l_(y,k) q^l_(x,k), ω^l_(yy) = ∑ᴴₖ₌₁ p^l_(y,k) q^l_(y,k). (9)
+
+Điều này dẫn đến các cập nhật lớp đường chéo sau:
+
+x^(l+1)_i = x^l_i + ω^l_(xx) Σ^l x^l_i + ω^l_(xy) y^l_i α^l
+x^(l+1)_t = x^l_t + ω^l_(xx) Σ^l x^l_t + ω^l_(xy) y^l_t α^l
+y^(l+1)_i = y^l_i + ω^l_(yx) ⟨α^l, x^l_i⟩ + ω^l_(yy) y^l_i λ^l,
+y^(l+1)_t = y^l_t + ω^l_(yx) ⟨α^l, x^l_t⟩ + ω^l_(yy) y^l_t λ^l. (10)
+
+Bốn biến ω^l_(xx), ω^l_(xy), ω^l_(yx), ω^l_(yy) đại diện cho luồng thông tin giữa dữ liệu và các nhãn qua các lớp. Ví dụ, term được điều khiển bởi ω^l_(xx) đo luồng thông tin từ x^l đến x^(l+1), ω^l_(yx) đo luồng từ x^l đến y^(l+1) và tương tự. Vì mô hình luôn có thể được nắm bắt bởi 4 biến này, việc có nhiều heads không tăng đáng kể sức mạnh biểu diễn của nó. Khi chỉ có một head, phương trình ω^l_(xx) ω^l_(yy) = ω^l_(xy) ω^l_(yx) luôn đúng, trong khi các mô hình với nhiều hơn một head không có giới hạn này. Tuy nhiên, về mặt thực nghiệm, ngay cả các mô hình với một head cũng khá mạnh mẽ.
+
+### 5.1 GD++ và least squares solver
+
+GD++, được giới thiệu trong von Oswald et al. (2023a), đại diện cho một linear transformer được huấn luyện trên vấn đề fixed noise variance (6). Đó là một biến thể của diagonal linear transformer, với tất cả các heads thỏa mãn q^l_(y,k) = 0. Dynamics chỉ bị ảnh hưởng bởi ω^l_(xx) và ω^l_(yx), dẫn đến các cập nhật đơn giản hơn:
+
+x^(l+1)_i = (I + ω^l_(xx) Σ^l) x^l_i
+y^(l+1)_i = y^l_i + ω^l_(yx) ⟨α^l, x^l_i⟩. (11)
+
+Cập nhật trên x hoạt động như preconditioning và cập nhật trên y thực hiện gradient descent trên dữ liệu. Trong khi phân tích hiện tại bởi Ahn et al. (2023) chưa đưa ra tỷ lệ hội tụ nhanh cho GD++, chúng tôi cho thấy ở đây rằng nó thực tế là một thuật toán tối ưu hóa bậc hai cho bài toán least squares (4):
+
+**Định lý 5.1.** Cho (x₁, y₁), ..., (xₙ, yₙ), (xₜ, 0) trong đó Σ có các eigenvalues trong phạm vi [ν, μ] với condition number κ = ν/μ. Đặt w* là giải pháp tối ưu cho bài toán least squares (4), thì tồn tại các hyperparameters cho thuật toán GD++ xuất ra ŷ với độ chính xác |ŷ - ⟨xₜ, w*⟩| ≤ ε‖xₜ‖‖w*‖ trong l = O(log κ + log log 1/ε) bước. Đặc biệt, điều đó ngụ ý tồn tại một linear transformer l-lớp có thể giải quyết tác vụ này.
+
+Tỷ lệ hội tụ O(log log 1/ε) thường chỉ đạt được bởi các thuật toán bậc hai như phương pháp Newton.
+
+### 5.2 Hiểu ω_yy: adaptive rescaling
+
+Nếu một lớp chỉ có ω^l_(yy) ≠ 0, nó có hiệu ứng rescaling. Lượng scaling liên quan đến lượng nhiễu được thêm trong một setting model selection. Quy tắc cập nhật cho lớp này là:
+
+y^(l+1)_i = (1 + ω^l_(yy) λ^l) y^l_i.
+
+Điều này rescales mỗi y bởi một hệ số phụ thuộc vào λ^l. Khi ω^l_(yy) < 0, điều này thu nhỏ đầu ra dựa trên norm của y trong lớp trước. Điều này hữu ích cho vấn đề mixed noise variance, vì giải pháp ridge regression scales giải pháp least squares bởi một hệ số phụ thuộc vào mức độ nhiễu.
+
+Cụ thể, giả sử Σ ≈ E[Σ] = nI, giải pháp ridge regression trở thành w*_(σ²) ≈ n/(n+σ²) w*, đó chính xác là một phiên bản scaled của giải pháp OLS. Hơn nữa, khi nhiễu lớn hơn, hệ số scaled nhỏ hơn, điều này phù hợp với hành vi của ω_yy âm.
+
+Chúng tôi có thể chỉ ra rằng sử dụng adaptive scaling ω_yy, ngay cả một linear transformer 2 lớp có thể đủ để giải quyết một ví dụ đơn giản của vấn đề categorical mixed noise variance σ_τ ∈ {σ₁, σ₂} và n → ∞:
+
+**Định lý 5.2.** Giả sử đầu vào của transformer là (x₁, y₁), (x₂, y₂), ..., (xₙ, yₙ), (x_q, 0), trong đó xᵢ ~ N(0, 1/n I), yᵢ = w^T xᵢ + ξᵢ. Ở đây ξᵢ ~ N(0, σ²) là nhiễu có mức độ nhiễu σ có thể nhận một trong hai giá trị: σ₁ hoặc σ₂. Thì khi n đi đến +∞, tồn tại một tập các tham số cho linear transformers hai lớp sao cho w² ngầm định của linear transformer hội tụ đến kết quả ridge regression tối ưu (và đầu ra của linear transformer là -⟨w², x_q⟩). Hơn nữa, lớp đầu tiên chỉ có ω_yx khác không và lớp thứ hai chỉ có ω_yy khác không.
+
+### 5.3 Hiểu ω_xy: adapting step-sizes
+
+Term cuối cùng trong mô hình đường chéo, ω_xy, có hiệu ứng phức tạp hơn. Vì nó chỉ thay đổi tọa độ x, nó không có hiệu ứng tức thì trên y. Để hiểu cách nó ảnh hưởng đến y, chúng tôi xem xét một quy trình hai bước đơn giản hóa, nơi bước đầu tiên chỉ có ω_xy ≠ 0 và bước thứ hai chỉ có ω_yx ≠ 0 (vì vậy bước thứ hai chỉ đang thực hiện một bước gradient descent). Trong trường hợp này, lớp đầu tiên sẽ cập nhật xᵢ như:
+
+x¹ᵢ = xᵢ + yᵢ ω_xy ∑ⁿⱼ₌₁ yⱼ xⱼ
+= xᵢ + ω_xy yᵢ ∑ⁿⱼ₌₁ (⟨w*, xⱼ⟩ + rⱼ) xⱼ
+= xᵢ + ω_xy yᵢ Σ w*
+= xᵢ + ω_xy (⟨w*, xᵢ⟩ + rᵢ) Σ w*
+= (I + ω_xy Σ w* (w*)^T) xᵢ + ω_xy rᵢ Σ w*.
+
+Có hai hiệu ứng của term ω_xy, một là hiệu ứng multiplicative trên xᵢ, và cái khác là một term additive làm cho x-output liên quan đến residual rᵢ. Bước multiplicative trong xᵢ có hiệu ứng preconditioning chưa biết. Để đơn giản, chúng tôi giả sử term multiplicative nhỏ, tức là:
+
+x¹ᵢ ≈ xᵢ + ω_xy rᵢ Σ w*; x¹ₜ ≈ xₜ.
+
+Lớp đầu tiên không thay đổi y, vì vậy y¹ₜ = yₜ và y¹ᵢ = yᵢ. Đối với tập xᵢ này, chúng ta có thể viết đầu ra trên y trong lớp thứ hai như
+
+y²ₜ = yₜ + ω_yx ∑ⁿᵢ₌₁ yᵢ (x¹ᵢ)^T xₜ
+≈ yₜ + ω_yx [∑ⁿᵢ₌₁ yᵢ xᵢ + ω_xy ∑ⁿᵢ₌₁ yᵢ rᵢ Σ w*] xₜ
+= yₜ + ω_yx (1 + ω_xy ∑ⁿᵢ₌₁ r²ᵢ) (Σ w*)^T xₜ.
+
+Ở đây chúng tôi đã sử dụng các tính chất của residual rᵢ (đặc biệt ∑ᵢ yᵢ xᵢ = Σ w*, và ∑ᵢ yᵢ rᵢ = ∑ᵢ r²ᵢ). Lưu ý rằng (Σ w*)^T xₜ về cơ bản là những gì một bước gradient descent trên đầu vào gốc nên làm.
+
+Do đó, một cách hiệu quả, mạng hai lớp đang thực hiện gradient descent, nhưng step size là tích của -ω_yx và (1 + ω_xy ∑ᵢ r²ᵢ). Hệ số (1 + ω_xy ∑ᵢ r²ᵢ) phụ thuộc vào mức độ nhiễu, và khi ω_xy, ω_yx < 0, step size hiệu quả nhỏ hơn khi có nhiều nhiễu hơn. Điều này đặc biệt hữu ích trong vấn đề model selection, vì một cách trực quan người ta muốn thực hiện early-stopping (step sizes nhỏ) khi nhiễu cao.
+
+## 6 Thực nghiệm
+
+Trong phần này, chúng tôi điều tra dynamics huấn luyện của linear transformers khi được huấn luyện với vấn đề mixed noise variance (7). Chúng tôi đánh giá ba loại mô hình linear transformer single-head:
+
+• **FULL.** Huấn luyện các ma trận tham số đầy đủ.
+• **DIAG.** Huấn luyện các ma trận tham số đường chéo (10).
+• **GD++.** Một biến thể đường chéo hạn chế hơn nữa được định nghĩa trong (11).
+
+Đối với mỗi thí nghiệm, chúng tôi huấn luyện mỗi sửa đổi linear transformer với số lượng lớp thay đổi (1 đến 7) sử dụng Adam optimizer trong 200,000 iterations với learning rate 0.0001 và batch size 2,048. Trong một số trường hợp, đặc biệt là đối với số lượng lớp lớn, chúng tôi phải điều chỉnh learning rate để ngăn ngừa các vấn đề ổn định. Chúng tôi báo cáo kết quả tốt nhất trong 5 lần chạy với các training seeds khác nhau. Chúng tôi sử dụng N = 20 ví dụ in-context trong D = 10 chiều. Chúng tôi đánh giá thuật toán sử dụng 100,000 chuỗi mới. Tất cả các thí nghiệm được thực hiện trên một GPU H100 với 80GB VRAM. Trung bình mất 4-12 giờ để huấn luyện một thuật toán duy nhất, tuy nhiên thử nghiệm với các tham số weight decay khác nhau, optimizer tốt hơn và learning rate schedule có thể sẽ giảm số này đáng kể.
+
+Chúng tôi sử dụng adjusted evaluation loss như metric hiệu suất chính. Nó được tính bằng cách trừ oracle loss từ loss của predictor. Oracle loss là giải pháp closed-form của ridge regression loss (5), giả sử phương sai nhiễu σ_τ đã biết. Adjusted evaluation loss cho phép so sánh hiệu suất mô hình trực tiếp qua các phương sai nhiễu khác nhau. Điều này quan trọng vì nhiễu cao làm giảm đáng kể dự đoán mô hình. Điều chỉnh của chúng tôi không ảnh hưởng đến quy trình tối ưu hóa của mô hình, vì nó chỉ sửa đổi loss bằng một hằng số cộng.
+
+**Baseline estimates.** Chúng tôi đánh giá linear transformer so với giải pháp closed-form cho bài toán ridge regression (5). Chúng tôi ước tính phương sai nhiễu σ_τ sử dụng các phương pháp sau:
+
+• **Constant Ridge Regression (CONST RR).** Phương sai nhiễu được ước tính sử dụng một giá trị scalar duy nhất cho tất cả các chuỗi, được điều chỉnh riêng cho mỗi vấn đề mixed variance.
+
+• **Adaptive Ridge Regression (ADARR).** Ước tính phương sai nhiễu qua unbiased estimator (Cherkassky & Ma, 2003) σ²_est = 1/(n-d) ∑ⁿⱼ₌₁(yⱼ - ŷⱼ)², trong đó ŷⱼ đại diện cho giải pháp của ordinary least squares (4), được tìm thấy dưới dạng closed-form.
+
+• **Tuned Adaptive Ridge Regression (TUNED RR).** Tương tự như trên, nhưng sau khi nhiễu được ước tính, chúng tôi điều chỉnh hai tham số bổ sung để tối thiểu hóa evaluation loss: (1) một giá trị ngưỡng tối đa cho phương sai ước tính, (2) một điều chỉnh multiplicative cho noise estimator. Các giá trị này được điều chỉnh riêng cho mỗi vấn đề.
+
+Lưu ý rằng tất cả các baseline trên đều dựa trên ridge regression, đây là một giải pháp closed-form, non-iterative. Vì vậy, chúng có lợi thế thuật toán so với linear transformers không có quyền truy cập vào matrix inversion. Các baseline này giúp chúng tôi đánh giá hiệu suất tốt nhất có thể, thiết lập upper bound thay vì một so sánh hoàn toàn tương đương.
+
+Một so sánh trung thực hơn với phương pháp của chúng tôi sẽ là một phiên bản iterative của ADARR không sử dụng matrix inversion. Thay vào đó, chúng ta có thể sử dụng gradient descent để ước tính nhiễu và giải pháp cho ridge regression. Tuy nhiên, trong thực tế, gradient descent estimator này chỉ hội tụ đến ADARR sau ≈100 iterations. Trái lại, linear transformers thường hội tụ trong ít hơn 10 lớp.
+
+Chúng tôi xem xét hai lựa chọn cho phân phối của σ_τ:
+
+• **Uniform.** σ_τ ~ U(0, σ_max) được rút từ phân phối đều bị giới hạn bởi σ_max. Chúng tôi thử nhiều kịch bản với σ_max từ 0 đến 7.
+
+• **Categorical.** σ_τ ∈ S được chọn từ một tập rời rạc S. Chúng tôi thử nghiệm S = {1,3} và S = {1,3,5}.
+
+Phương pháp của chúng tôi tổng quát hóa vấn đề được nghiên cứu bởi Bai et al. (2023), người chỉ xem xét categorical variance selection và chỉ ra các thí nghiệm với hai giá trị σ_τ.
+
+**Uniform noise variance.** Đối với uniform noise variance, Hình 1 cho thấy FULL và DIAG đạt được hiệu suất tương đương qua các số lượng lớp khác nhau và σ_max khác nhau. Mặt khác, GD++ hội tụ đến một giá trị cao hơn, gần gũi với hiệu suất của baseline CONST RR. Khi σ_max tăng, linear transformers cho thấy lợi thế rõ ràng so với các baseline. Với 4 lớp, chúng vượt trội so với giải pháp closed-form ADARR cho σ_max = 4 và lớn hơn. Các mô hình với 5 hoặc nhiều lớp hơn sánh ngang hoặc vượt qua hiệu suất của TUNED RR.
+
+Phần trên của Hình 2 cung cấp góc nhìn chi tiết về hiệu suất của các mô hình 7 lớp và các baseline. Ở đây, chúng tôi tính các hồ sơ per-variance qua phạm vi phương sai nhiễu từ 0 đến σ_max + 1. Chúng ta có thể thấy rằng hiệu suất kém của GD++ đến từ khả năng ước tính kém qua toàn bộ phạm vi phương sai nhiễu. Hiệu suất của nó gần gũi với CONST RR, gợi ý rằng GD++ ở bên dưới cũng có thể đang ước tính một phương sai không đổi duy nhất cho tất cả dữ liệu.
+
+ADARR ước tính hoàn hảo các vấn đề không có nhiễu, nhưng gặp khó khăn hơn khi phương sai nhiễu tăng. TUNED RR cải thiện ước tính một chút bằng cách kết hợp σ_max vào các tham số có thể điều chỉnh của nó, nhưng dự đoán của nó vẫn gặp khó khăn trong phạm vi giữa. FULL và DIAG thể hiện hiệu suất tương đương qua tất cả phương sai nhiễu. Trong khi cần nghiên cứu thêm để xác nhận hoặc phủ nhận sự tương đương của chúng một cách dứt khoát, chúng tôi tin rằng các mô hình này thực tế không giống hệt nhau mặc dù hiệu suất tương tự.
+
+Ở phần dưới của Hình 2, chúng tôi đặt phương sai nhiễu thành σ_max = 5 và hiển thị hồ sơ per-variance cho các mô hình với các lớp thay đổi. Các mô hình hai lớp cho FULL và DIAG hoạt động giống như GD++, chỉ mô hình hóa một phương sai nhiễu duy nhất ở giữa. Tuy nhiên, kết quả nhanh chóng cải thiện trên toàn bộ phổ nhiễu cho 3 hoặc nhiều lớp hơn. Trái lại, GD++ nhanh chóng hội tụ đến một giải pháp suboptimal.
+
+**Categorical noise variance.** Hình 3 cho thấy sự khác biệt đáng chú ý giữa các mô hình DIAG và FULL cho categorical noise variance σ_τ ∈ {1,3}. Điều này có thể xuất phát từ một local minima xấu, hoặc gợi ý một sự khác biệt cơ bản giữa các mô hình cho vấn đề này. Thú vị, từ per-variance profiling chúng ta thấy rằng DIAG extrapolates tốt hơn cho các phương sai không được sử dụng để huấn luyện, trong khi FULL, mặc dù có lỗi in-distribution thấp hơn, hoạt động tệ hơn trên các phương sai chưa thấy. Hình 4 cho thấy các trọng số đã học của linear transformer 4 lớp với tham số hóa FULL. Các trọng số rất nặng về đường chéo, có thể với một số thành phần low-rank.
+
+Đối với σ_τ ∈ {1,3,5}, việc kiểm tra hồ sơ per-variance ở phần dưới của Hình 3 tiết lộ sự khác biệt trong hành vi của chúng. FULL thể hiện hồ sơ per-variance phức tạp hơn với nhiều biến động hơn so với mô hình đường chéo, gợi ý khả năng biểu diễn lớn hơn. Đáng ngạc nhiên, nó không chuyển đổi thành kết quả loss tốt hơn so với DIAG.
+
+Để so sánh dễ dàng, chúng tôi biên soạn kết quả của tất cả các phương pháp và baseline trong Bảng 1 trong Phụ lục.
+
+## 7 Kết luận
+
+Nghiên cứu của chúng tôi tiết lộ khả năng đáng ngạc nhiên của linear transformers trong việc giải quyết các vấn đề in-context learning thách thức. Chúng tôi cho thấy rằng mỗi lớp duy trì một mô hình hồi quy tuyến tính ngầm định, giống như một biến thể phức tạp của preconditioned gradient descent với hành vi giống momentum.
+
+Đáng chú ý, khi được huấn luyện trên các vấn đề hồi quy tuyến tính nhiễu với phương sai nhiễu chưa biết, linear transformers không chỉ vượt trội so với các baseline tiêu chuẩn mà còn khám phá ra một thuật toán tối ưu hóa tinh vi kết hợp điều chỉnh step-size nhận biết nhiễu và rescaling. Khám phá này làm nổi bật tiềm năng của linear transformers để tự động khám phá các thuật toán tối ưu hóa mới khi được trình bày với các vấn đề phù hợp, mở ra những con đường thú vị cho nghiên cứu tương lai, bao gồm khám phá thuật toán tự động sử dụng transformers và tổng quát hóa đến các lĩnh vực vấn đề khác.
+
+Trong khi các phát hiện của chúng tôi chứng minh khả năng ấn tượng của linear transformers trong việc học các thuật toán tối ưu hóa, chúng tôi thừa nhận các hạn chế trong công trình của chúng tôi. Bao gồm việc tập trung vào các mô hình tuyến tính đơn giản hóa, phân tích chủ yếu các ma trận attention đường chéo, và nhu cầu khám phá thêm về tính tối ưu của các thuật toán đã khám phá, tổng quát hóa đến các lớp hàm phức tạp, khả năng mở rộng với các bộ dữ liệu lớn hơn, và khả năng áp dụng cho các kiến trúc transformer phức tạp hơn. Chúng tôi tin rằng các hạn chế này trình bày các hướng có giá trị cho nghiên cứu tương lai và nhấn mạnh nhu cầu hiểu biết sâu hơn về các cơ chế học ngầm định trong các kiến trúc transformer.
+
+## 8 Lời cảm ơn
+
+Các tác giả muốn cảm ơn Nolan Miller và Andrey Zhmoginov vì những gợi ý và phản hồi có giá trị của họ trong suốt quá trình phát triển dự án này. Một phần công trình này được thực hiện trong khi Rong Ge đang thăm Google Research. Nghiên cứu của Rong Ge được hỗ trợ một phần bởi NSF Award DMS-2031849 và CCF-1845171 (CAREER).
+
+## Tài liệu tham khảo
+
+Josh Achiam, Steven Adler, Sandhini Agarwal, Lama Ahmad, Ilge Akkaya, Florencia Leoni Aleman, Diogo Almeida, Janko Altenschmidt, Sam Altman, Shyamal Anadkat, et al. Gpt-4 technical report. arXiv preprint arXiv:2303.08774, 2023.
+
+Kwangjun Ahn, Xiang Cheng, Hadi Daneshmand, and Suvrit Sra. Transformers learn to implement preconditioned gradient descent for in-context learning. arXiv preprint arXiv:2306.00297, 2023.
+
+Ekin Akyürek, Dale Schuurmans, Jacob Andreas, Tengyu Ma, and Denny Zhou. What learning algorithm is in-context learning? investigations with linear models. arXiv preprint arXiv:2211.15661, 2022.
+
+Ekin Akyürek, Bailin Wang, Yoon Kim, and Jacob Andreas. In-Context language learning: Architectures and algorithms. arXiv preprint arXiv:2401.12973, 2024.
+
+Rohan Anil, Andrew M Dai, Orhan Firat, Melvin Johnson, Dmitry Lepikhin, Alexandre Passos, Siamak Shakeri, Emanuel Taropa, Paige Bailey, Zhifeng Chen, et al. Palm 2 technical report. arXiv preprint arXiv:2305.10403, 2023.
+
+Yu Bai, Fan Chen, Huan Wang, Caiming Xiong, and Song Mei. Transformers as statisticians: Provable in-context learning with in-context algorithm selection. arXiv preprint arXiv:2306.04637, 2023.
+
+Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, et al. Language models are few-shot learners. Advances in neural information processing systems, 33:1877–1901, 2020.
+
+Stephanie Chan, Adam Santoro, Andrew Lampinen, Jane Wang, Aaditya Singh, Pierre Richemond, James McClelland, and Felix Hill. Data distributional properties drive emergent in-context learning in transformers. Advances in Neural Information Processing Systems, 35:18878–18891, 2022.
+
+Xiang Cheng, Yuxin Chen, and Suvrit Sra. Transformers implement functional gradient descent to learn non-linear functions in context. arXiv preprint arXiv:2312.06528, 2023.
+
+Vladimir Cherkassky and Yunqian Ma. Comparison of model selection for regression. Neural computation, 15(7):1691–1714, 2003.
+
+Krzysztof Choromanski, Valerii Likhosherstov, David Dohan, Xingyou Song, Andreea Gane, Tamas Sarlos, Peter Hawkins, Jared Davis, Afroz Mohiuddin, Lukasz Kaiser, et al. Rethinking attention with performers. arXiv preprint arXiv:2009.14794, 2020.
+
+Deqing Fu, Tian-Qi Chen, Robin Jia, and Vatsal Sharan. Transformers learn higher-order optimization methods for in-context learning: A study with linear models. arXiv preprint arXiv:2310.17086, 2023.
+
+Shivam Garg, Dimitris Tsipras, Percy S Liang, and Gregory Valiant. What can transformers learn in-context? a case study of simple function classes. Advances in Neural Information Processing Systems, 35:30583–30598, 2022.
+
+Angeliki Giannou, Shashank Rajput, Jy-yong Sohn, Kangwook Lee, Jason D Lee, and Dimitris Papailiopoulos. Looped transformers as programmable computers. arXiv preprint arXiv:2301.13196, 2023.
+
+Tianyu Guo, Wei Hu, Song Mei, Huan Wang, Caiming Xiong, Silvio Savarese, and Yu Bai. How do transformers learn in-context beyond simple functions? a case study on learning with representations. arXiv preprint arXiv:2310.10616, 2023.
+
+Roee Hendel, Mor Geva, and Amir Globerson. In-context learning creates task vectors. arXiv preprint arXiv:2310.15916, 2023.
+
+Yu Huang, Yuan Cheng, and Yingbin Liang. In-context convergence of transformers. arXiv preprint arXiv:2310.05249, 2023.
+
+Evan Hubinger, Chris van Merwijk, Vladimir Mikulik, Joar Skalse, and Scott Garrabrant. Risks from learned optimization in advanced machine learning systems. arXiv preprint arXiv:1906.01820, 2019.
+
+Albert Q Jiang, Alexandre Sablayrolles, Arthur Mensch, Chris Bamford, Devendra Singh Chaplot, Diego de las Casas, Florian Bressand, Gianna Lengyel, Guillaume Lample, Lucile Saulnier, et al. Mistral 7b. arXiv preprint arXiv:2310.06825, 2023.
+
+Angelos Katharopoulos, Apoorv Vyas, Nikolaos Pappas, and François Fleuret. Transformers are rnns: Fast autoregressive transformers with linear attention. In International conference on machine learning, pp. 5156–5165. PMLR, 2020.
+
+Jannik Kossen, Tom Rainforth, and Yarin Gal. In-context learning in large language models learns label relationships but is not conventional learning. arXiv preprint arXiv:2307.12375, 2023.
+
+Yingcong Li, Muhammed Emrullah Ildiz, Dimitris Papailiopoulos, and Samet Oymak. Transformers as algorithms: Generalization and stability in in-context learning. In International Conference on Machine Learning, pp. 19565–19594. PMLR, 2023.
+
+Arvind Mahankali, Tatsunori B Hashimoto, and Tengyu Ma. One step of gradient descent is provably the optimal in-context learner with one layer of linear self-attention. arXiv preprint arXiv:2307.03576, 2023.
+
+Suvir Mirchandani, Fei Xia, Pete Florence, Brian Ichter, Danny Driess, Montserrat Gonzalez Arenas, Kanishka Rao, Dorsa Sadigh, and Andy Zeng. Large language models as general pattern machines. arXiv preprint arXiv:2307.04721, 2023.
+
+Catherine Olsson, Nelson Elhage, Neel Nanda, Nicholas Joseph, Nova DasSarma, Tom Henighan, Ben Mann, Amanda Askell, Yuntao Bai, Anna Chen, et al. In-context learning and induction heads. arXiv preprint arXiv:2209.11895, 2022.
+
+Reese Pathak, Rajat Sen, Weihao Kong, and Abhimanyu Das. Transformers can optimally learn regression mixture models. arXiv preprint arXiv:2311.08362, 2023.
+
+Imanol Schlag, Kazuki Irie, and Jürgen Schmidhuber. Linear transformers are secretly fast weight programmers. In International Conference on Machine Learning, pp. 9355–9366. PMLR, 2021.
+
+Lingfeng Shen, Aayush Mishra, and Daniel Khashabi. Do pretrained transformers really learn in-context by gradient descent? arXiv preprint arXiv:2310.08540, 2023.
+
+Davoud Ataee Tarzanagh, Yingcong Li, Xuechen Zhang, and Samet Oymak. Max-margin token selection in attention mechanism. In Thirty-seventh Conference on Neural Information Processing Systems, 2023.
+
+Gemini Team, Rohan Anil, Sebastian Borgeaud, Yonghui Wu, Jean-Baptiste Alayrac, Jiahui Yu, Radu Soricut, Johan Schalkwyk, Andrew M Dai, Anja Hauth, et al. Gemini: a family of highly capable multimodal models. arXiv preprint arXiv:2312.11805, 2023.
+
+Yuandong Tian, Yiping Wang, Beidi Chen, and Simon Du. Scan and snap: Understanding training dynamics and token composition in 1-layer transformer. arXiv preprint arXiv:2305.16380, 2023a.
+
+Yuandong Tian, Yiping Wang, Zhenyu Zhang, Beidi Chen, and Simon Du. Joma: Demystifying multilayer transformers via joint dynamics of mlp and attention. In NeurIPS 2023 Workshop on Mathematics of Modern Machine Learning, 2023b.
+
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Łukasz Kaiser, and Illia Polosukhin. Attention is all you need. Advances in neural information processing systems, 30, 2017.
+
+Johannes von Oswald, Eyvind Niklasson, Ettore Randazzo, João Sacramento, Alexander Mordvintsev, Andrey Zhmoginov, and Max Vladymyrov. Transformers learn in-context by gradient descent. In International Conference on Machine Learning, pp. 35151–35174. PMLR, 2023a.
+
+Johannes von Oswald, Eyvind Niklasson, Maximilian Schlegel, Seijin Kobayashi, Nicolas Zucchet, Nino Scherrer, Nolan Miller, Mark Sandler, Max Vladymyrov, Razvan Pascanu, et al. Uncovering mesa-optimization algorithms in transformers. arXiv preprint arXiv:2309.05858, 2023b.
+
+Sinong Wang, Belinda Z Li, Madian Khabsa, Han Fang, and Hao Ma. Linformer: Self-attention with linear complexity. arXiv preprint arXiv:2006.04768, 2020.
+
+Jerry Wei, Jason Wei, Yi Tay, Dustin Tran, Albert Webson, Yifeng Lu, Xinyun Chen, Hanxiao Liu, Da Huang, Denny Zhou, et al. Larger language models do in-context learning differently. arXiv preprint arXiv:2303.03846, 2023.
+
+Kaiyue Wen, Yuchen Li, Bingbin Liu, and Andrej Risteski. Transformers are uninterpretable with myopic methods: a case study with bounded dyck grammars. In Thirty-seventh Conference on Neural Information Processing Systems, 2023.
+
+Steve Yadlowsky, Lyric Doshi, and Nilesh Tripuraneni. Pretraining data mixtures enable narrow model selection capabilities in transformer models. arXiv preprint arXiv:2311.00871, 2023.
+
+Ruiqi Zhang, Spencer Frei, and Peter L Bartlett. Trained transformers learn linear models in-context. arXiv preprint arXiv:2306.09927, 2023.
+
+## A Chứng minh từ Phần 4 và 5
+
+### A.1 Chứng minh Định lý 4.1
+
+Chúng tôi trước tiên đưa ra chứng minh cho Định lý 4.1. Trong quá trình này chúng tôi cũng sẽ chứng minh Bổ đề 4.3, vì Định lý 4.1 theo ngay lập tức từ một quy nạp dựa trên bổ đề.
+
+**Chứng minh.** Chúng tôi làm điều này bằng quy nạp. Tại l = 0, dễ dàng kiểm tra rằng chúng ta có thể đặt a⁽⁰⁾ = 1, w⁽⁰⁾ = 0, M⁽⁰⁾ = I, u⁽⁰⁾ = 0.
+
+Giả sử điều này đúng cho một lớp l nào đó, nếu các trọng số của lớp l là (P₁ˡ, Q₁ˡ), ..., (Pₖˡ, Qₖˡ) cho k heads, tại đầu ra của lớp l + 1 chúng ta có:
+
+[x^(l+1)_i; y^(l+1)_i] = [x^l_i; y^l_i] + ∑ᵖₖ₌₁ P^l_k ∑ⁿⱼ₌₁ [x^l_j; y^l_j] ((x^l_j)^T, y^l_j) Q^l_k [x^l_i; y^l_i]. (12)
+
+Lưu ý rằng phương trình tương tự đúng cho i = n + 1 chỉ bằng cách đặt y_{n+1} = 0. Đặt ma trận giữa có cấu trúc sau:
+
+[A b; c^T d] := ∑ᵖₖ₌₁ P^l_k ∑ⁿⱼ₌₁ [x^l_j; y^l_j] ((x^l_j)^T, y^l_j) Q^l_k,
+
+Thì người ta có thể chọn các tham số của lớp tiếp theo như trong Bổ đề 4.3
+
+M^(l+1) = (I + A)M^l + b(w^l)^T
+u^(l+1) = (I + A)u^l + a^l b
+a^(l+1) = (1 + d)a^l + ⟨c, u^l⟩
+w^(l+1) = (1 + d)w^l - (M^l)^T c.
+
+Người ta có thể kiểm tra rằng lựa chọn này thỏa mãn (12).
+
+### A.2 Chứng minh Bổ đề 4.4
+
+Bổ đề này thực tế là một hệ quả của Bổ đề 4.3. Chúng tôi trước tiên đưa ra một phiên bản chi tiết hơn nêu rõ các ma trận chưa biết Λˡ, Γˡ, Πˡ, Φˡ:
+
+**Bổ đề A.1.** Trong setup của Định lý 4.1 với các tham số đường chéo (9), người ta có thể tính đệ quy các ma trận uˡ, wˡ sử dụng công thức sau
+
+u^(l+1) = ((1 + ω^l_{xy}(a^l)²ρ)I + ω^l_{xx}Σ^l) u^l + a^l ω^l_{xy} (M^l + a^l u^l (w*)^T) Σ(a^l w* - w^l),
+
+w^(l+1) = (1 + ω^l_{yy}λ^l)w^l - ω^l_{yx}(M^l)^T(M^l + a^l u^l (w*)^T)Σ(a^l w* - w^l) - a^l ρ ω^l_{yx}(M^l)^T u^l,
+
+trong đó ρ = ∑ⁿᵢ₌₁ r²ᵢ và điều kiện khởi tạo a⁰ = 1, w⁰ = 0, M⁰ = I, u⁰ = 0
+
+**Chứng minh.** Đầu tiên, chúng tôi tính ma trận sau xuất hiện trong Bổ đề 4.3 cho trường hợp đường chéo cụ thể:
+
+[A^l b^l; (c^l)^T d^l] = ∑ᵖₖ₌₁ P^l_k ∑ⁿⱼ₌₁ [x^l_j; y^l_j] ((x^l_j)^T, y^l_j) Q^l_k,
+
+= [ω^l_{xx}Σ^l ω^l_{xy}α^l; ω^l_{yx}(α^l)^T ω^l_{yy}λ^l].
+
+Điều này ngụ ý rằng A^l = ω^l_{xx}Σ^l, b^l = ω^l_{xy}α^l, c^l = ω^l_{yx}α^l và d^l = ω^l_{yy}λ^l. Tiếp theo chúng tôi viết lại α^l:
+
+α^l = ∑ⁿᵢ₌₁ y^l_i x^l_i = ∑ⁿᵢ₌₁ (a^l yᵢ - ⟨w^l, xᵢ⟩)(M^l xᵢ + yᵢ u^l)
+= ∑ⁿᵢ₌₁ (a^l rᵢ + ⟨a^l w* - w^l, xᵢ⟩)((M^l + a^l u^l (w*)^T)xᵢ + rᵢ u^l)
+= ∑ⁿᵢ₌₁ ⟨a^l w* - w^l, xᵢ⟩(M^l + a^l u^l (w*)^T)xᵢ + ∑ⁿᵢ₌₁ a^l r²ᵢ u^l
+= (M^l + a^l u^l (w*)^T)Σ(a^l w* - w^l) + a^l ρ u^l.
+
+Ở đây bước đầu tiên theo Định lý 4.1, bước thứ hai thay thế yᵢ bằng ⟨w*, xᵢ⟩ + rᵢ, bước thứ ba sử dụng thực tế rằng ∑ⁿᵢ₌₁ rᵢ xᵢ = 0 để loại bỏ các terms chéo.
+
+Chứng minh còn lại chỉ thay thế công thức cho α^l vào Bổ đề 4.3.
+
+Bây giờ Bổ đề A.1 ngụ ý Bổ đề 4.4 ngay lập tức bằng cách đặt Λ^l = -ω^l_{xy}(a^l)²ρI - ω^l_{xx}Σ^l, Γ^l = a^l ω^l_{xy}(M^l + a^l u^l (w*)^T), s^l = ω^l_{yy}λ^l, Π^l = ω^l_{yx}(M^l)^T(M^l + a^l u^l (w*)^T) và Φ^l = a^l ρ ω^l_{yx}(M^l)^T.
+
+### A.3 Chứng minh cho Định lý 4.2
+
+**Chứng minh.** Bởi Định lý 4.1, chúng ta biết y^l_i = ⟨w^l, xᵢ⟩ cho một số w^l. Khi n ≫ d, với xác suất cao norm của y^l là cỡ Θ(√n)‖w^l‖, và norm của y* là Θ(√n). Do đó chúng ta chỉ cần giới hạn correlation. Correlation bằng
+
+|⟨y*, y^l⟩| = |w^l_1 ∑ⁿᵢ₌₁ x³ᵢ₍₁₎ + ∑ⁿᵢ₌₁ xᵢ₍₁₎² ∑ᵈⱼ₌₂ w^l_j xᵢ₍ⱼ₎|.
+
+Chúng ta biết với xác suất cao |∑ⁿᵢ₌₁ x³ᵢ| = O(√n) vì E[x³ᵢ] = 0. Term thứ hai có thể được viết như ⟨w^l, v⟩ trong đó v là một vector có tọa độ v₁ = 0 và vⱼ = ∑ⁿᵢ₌₁ xᵢ₍₁₎² xᵢ₍ⱼ₎ cho 2 ≤ j ≤ d, do đó với xác suất cao ‖v‖ = O(√nd). Do đó, với xác suất cao cosine similarity là tối đa
+
+|⟨y*, y^l⟩|/(‖y*‖‖y^l‖) = O(1)|⟨y*, y^l⟩|/(n‖w^l‖) = O(1)|w^l_1∑ⁿᵢ₌₁ x³ᵢ₍₁₎ + ∑ⁿᵢ₌₁ xᵢ₍₁₎² ∑ᵈⱼ₌₂ w^l_j xᵢ₍ⱼ₎|/(n‖w^l‖)
+≤ O(1)(|w^l_1||∑ⁿᵢ₌₁ x³ᵢ₍₁₎| + |w^l|‖v‖)/(n‖w^l‖) ≤ O(1)(√n + √nd)/n.
+
+Khi n ≫ d điều này có thể được làm nhỏ hơn bất kỳ hằng số cố định nào.
+
+### A.4 Chứng minh cho Định lý 5.1
+
+Trong phần này chúng tôi chứng minh Định lý 5.1 bằng cách tìm các hyperparameters cho thuật toán GD++ giải quyết các vấn đề least squares với độ chính xác rất cao. Các bước đầu tiên trong cấu trúc lặp đi lặp lại làm cho dữ liệu xᵢ có điều kiện tốt hơn, và bước cuối cùng là một bước duy nhất của gradient descent. Chứng minh dựa trên một số bổ đề, trước tiên chúng tôi quan sát rằng nếu dữ liệu có điều kiện rất tốt, thì gradient descent một bước giải quyết vấn đề một cách chính xác:
+
+**Bổ đề A.2.** Cho (x₁, y₁), ..., (xₙ, yₙ) trong đó Σ := ∑ⁿᵢ₌₁ xᵢ x^T_i có eigenvalues giữa 1 và 1 + ε. Đặt w* := arg minw ∑ⁿᵢ₌₁(yᵢ - ⟨w, xᵢ⟩)² là giải pháp least squares tối ưu, thì ŵ = ∑ⁿᵢ₌₁ yᵢ xᵢ thỏa mãn ‖ŵ - w*‖ ≤ ε‖w*‖.
+
+**Chứng minh.** Chúng ta có thể viết yᵢ = ⟨xᵢ, w*⟩ + rᵢ. Bởi thực tế rằng w* là giải pháp tối ưu chúng ta biết rᵢ thỏa mãn ∑ⁿᵢ₌₁ rᵢ xᵢ = 0. Do đó ŵ = ∑ⁿᵢ₌₁ yᵢ xᵢ = ∑ⁿᵢ₌₁ ⟨xᵢ, w*⟩ xᵢ = Σ w*. Điều này ngụ ý
+
+‖ŵ - w*‖ = ‖(Σ - I)w*‖ ≤ ‖Σ - I‖‖w*‖ ≤ ε‖w*‖.
+
+Tiếp theo chúng tôi cho thấy rằng bằng cách chỉ áp dụng bước preconditioning của GD++, người ta có thể có được ma trận x có điều kiện tốt rất nhanh. Lưu ý rằng ma trận Σ được cập nhật như Σ ← (I - γΣ)Σ(I - γΣ), vì vậy một eigenvalue của λ trong ma trận Σ gốc sẽ trở thành λ(1 - γλ)². Bổ đề sau cho thấy rằng transformation này hiệu quả trong việc thu nhỏ condition number
+
+**Bổ đề A.3.** Giả sử ν/μ = κ ≥ 1.1, thì tồn tại một hằng số toàn cầu c < 1 sao cho chọn γν = 1/3 ngụ ý
+
+max_{λ∈[ν,μ]} λ(1-γλ)² / min_{λ∈[ν,μ]} λ(1-γλ)² ≤ cκ.
+
+Mặt khác, nếu ν/μ = κ ≤ 1 + ε trong đó ε ≤ 0.1, thì chọn γν = 1/3 ngụ ý
+
+max_{λ∈[ν,μ]} λ(1-γλ)² / min_{λ∈[ν,μ]} λ(1-γλ)² ≤ 1 + 2ε².
+
+Tuyên bố đầu tiên cho thấy rằng người ta có thể giảm condition number bởi một hệ số không đổi trong mỗi bước cho đến khi nó là một hằng số nhỏ. Tuyên bố thứ hai cho thấy rằng một khi condition number nhỏ (1 + ε), mỗi lần lặp có thể đưa nó gần hơn nhiều đến 1 (đến cỡ 1 + O(ε²)).
+
+Bây giờ chúng tôi chứng minh bổ đề.
+
+**Chứng minh.** Đầu tiên, lưu ý rằng hàm f(x) = x(1 - γx)² đơn điệu không giảm cho x ∈ [0, ν] nếu γν = 1/3 (thực vậy, đạo hàm của nó f'(x) = (1 - γx)(1 - 3γx) luôn không âm). Do đó, max luôn đạt được tại x = ν và min luôn đạt được tại x = μ. Tỷ lệ mới do đó là
+
+ν(1-γν)² / μ(1-γμ)² = κ^{4/9} / (1-1/3κ)².
+
+Khi κ ≥ 1.1 tỷ lệ 4/9 / (1-1/3κ)² luôn dưới 4/9 / (1-1/3.3)² đó là một hằng số bị giới hạn khỏi 1.
+
+Khi κ = 1 + ε < 1.1, chúng ta có thể viết RHS theo ε
+
+ν(1-γν)² / μ(1-γμ)² = κ^{4/9} / (1-1/3κ)² = (1 + ε)(1 + 1/2(1 - 1/(1+ε)))^{-2}.
+
+Lưu ý rằng bằng lựa chọn cẩn thận của γ, RHS có khai triển Taylor sau:
+
+(1 + ε)(1 + 1/2(1 - 1/(1+ε)))^{-2} = 1 + 3ε²/4 - 5ε³/4 + O(ε⁴).
+
+Người ta sau đó có thể kiểm tra RHS luôn bị giới hạn trên bởi 2ε² khi ε < 0.1.
+
+Với hai bổ đề chúng ta bây giờ sẵn sàng chứng minh định lý chính:
+
+**Chứng minh.** Bởi Bổ đề A.3 chúng ta biết trong O(log κ + log log 1/ε) iterations, bằng cách gán κ theo cách của Bổ đề A.3 người ta có thể giảm condition number của x xuống κ' ≤ 1 + ε/2κ (chúng tôi chọn ε/2κ ở đây để tạo độ lỏng cho phân tích sau).
+
+Đặt Σ' là ma trận covariance sau các iterations này, và ν', μ' là upper và lower bound cho các eigenvalues của nó. Dữ liệu xᵢ được chuyển đổi thành dữ liệu mới x'ᵢ = Mxᵢ cho một số ma trận M. Đặt M = AΣ^{-1/2}, thì vì M' = AA^T chúng ta biết A là một ma trận với singular values giữa √μ' và √ν'. Giải pháp tối ưu (w*)' = M^{-T}w* có norm tối đa √ν/√μ' ‖w*‖. Do đó bởi Bổ đề A.2 chúng ta biết bước gradient một bước với ŵ = ∑ⁿᵢ₌₁ 1/μ' yᵢ xᵢ thỏa mãn ‖ŵ - (w*)'‖ ≤ (κ' - 1)√ν/√μ' ‖w*‖. Dữ liệu test xₜ cũng được chuyển đổi thành x'ₜ = AΣ^{-1/2}xₜ, và thuật toán xuất ra ⟨ŵ, x'ₜ⟩, vì vậy lỗi là tối đa √ν‖w*‖ * ‖x'ₜ‖ ≤ (κ' - 1)√κ√κ' ‖w*‖ * ‖xₜ‖. Bằng lựa chọn κ' chúng ta có thể kiểm tra rằng RHS là tối đa ε‖w*‖‖xₜ‖.
+
+### A.5 Chứng minh Định lý 5.2
+
+**Chứng minh.** Quan sát chính ở đây là khi n → ∞, dưới các giả định chúng ta có limₙ→∞ ∑ⁿᵢ₌₁ xᵢ x^T_i = I. Do đó các giải pháp ridge regression hội tụ đến w*_{σ²} = 1/(1+σ²) ∑ⁿᵢ₌₁ yᵢ xᵢ và đầu ra mong muốn là ⟨w*_{σ²}, x_q⟩.
+
+Bằng các tính toán trước đây, chúng ta biết sau lớp đầu tiên, w ngầm định là w¹ = ω_{yx} ∑ⁿᵢ₌₁ yᵢ xᵢ. Miễn là ω_{yx} là một hằng số, khi n → ∞ chúng ta biết 1/n ∑ⁿᵢ₌₁ (y¹ᵢ)² = σ² (vì phần của yₜ phụ thuộc vào x là không đáng kể so với nhiễu), do đó đầu ra của lớp thứ hai thỏa mãn
+
+w² = (1 + nσ²ω_{yy})w¹ = (1 + nσ²ω_{yy})ω_{yx} ∑ⁿᵢ₌₁ yᵢ xᵢ.
+
+Do đó, miễn là chúng ta chọn ω_{yx} và ω_{yy} để thỏa mãn (1 + nσ²ω_{yy})ω_{yx} = 1/(1+σ²) khi σ = σ₁ hoặc σ₂ (lưu ý rằng đây là hai phương trình tuyến tính trên ω_{yx} và nω_{yx}ω_{yy}, vì vậy chúng luôn có giải pháp), thì chúng ta có limₙ→∞ w² = w*_{σ²} cho hai mức độ nhiễu.
+
+## B Thêm thí nghiệm
+
+Ở đây chúng tôi cung cấp kết quả của các thí nghiệm bổ sung không có trong văn bản chính.
+
+Hình 6 cho thấy một ví dụ về unadjusted loss. Rõ ràng, nó thực tế không thể so sánh các phương pháp qua các mức độ nhiễu khác nhau theo cách này.
+
+Hình 7 cho thấy hồ sơ per-variance của các dự đoán trung gian của mạng có độ sâu thay đổi. Có vẻ như GD++ thể hiện hành vi điển hình của các thuật toán dựa trên GD: các iterations sớm mô hình nhiễu cao hơn (tương tự như early stopping), dần dần hội tụ hướng tới dự đoán nhiễu thấp hơn. DIAG thể hiện pattern này ban đầu, nhưng sau đó cải thiện đáng kể, đặc biệt cho các phạm vi nhiễu thấp hơn. Thú vị, FULL hiển thị xu hướng ngược lại, trước tiên cải thiện dự đoán nhiễu thấp, theo sau bởi sự suy giảm trong độ chính xác dự đoán nhiễu cao hơn, đặc biệt trong lớp cuối cùng.
+
+Cuối cùng, Bảng 1 trình bày kết quả số toàn diện cho các thí nghiệm của chúng tôi qua các mô hình mixed noise variance khác nhau. Đối với mỗi biến thể mô hình (được đại diện bởi một cột), kết quả hiệu suất tốt nhất được đánh dấu in đậm.
+
+Hình 1: Hiệu suất in-context learning cho bài toán hồi quy tuyến tính nhiễu qua các mô hình với số lượng lớp khác nhau và σ_max cho σ_τ ~ U(0, σ_max). Mỗi marker tương ứng với một mô hình được huấn luyện riêng với số lượng lớp cho trước. Các mô hình với attention weights đường chéo (DIAG) khớp với những mô hình có attention weights đầy đủ (FULL). Các mô hình chuyên biệt trên một nhiễu cố định (GD++) hoạt động kém, tương tự như giải pháp Ridge Regression với nhiễu không đổi (CONST RR). Trong số các baseline, chỉ giải pháp Ridge Regression chính xác được điều chỉnh (TUNED RR) là có thể so sánh với linear transformers.
+
+Hình 2: Hồ sơ per-variance của hành vi mô hình cho uniform noise variance σ_τ ~ U(0, σ_max). Hai hàng trên: mô hình 7 lớp với σ_max thay đổi. Hàng dưới: mô hình với số lượng lớp thay đổi, σ_max = 5 cố định. Nhiễu in-distribution được tô màu xám.
+
+Hình 3: Hiệu suất in-context learning cho hồi quy tuyến tính nhiễu qua các mô hình với số lượng lớp thay đổi cho conditional noise variance σ_τ ∈ {1,3} và σ_τ ∈ {1,3,5}. Trên: loss cho các mô hình với nhiều số lượng lớp và hồ sơ per-variance cho các mô hình với 7 lớp. Dưới: Hồ sơ per-variance của mô hình qua các số lượng lớp khác nhau. Nhiễu in-distribution được tô màu xám.
+
+Hình 4: Trọng số cho linear transformer 4 lớp với tham số hóa FULL được huấn luyện với categorical noise σ_τ ∈ {1,3}. Trên: trọng số cho ma trận Q^l, dưới: trọng số cho ma trận P^l.
+
+Hình 5: Các mô hình Linear transformer cho thấy sự giảm nhất quán trong lỗi per layer khi được huấn luyện trên dữ liệu với mixed noise variance σ_τ ~ U(0,5). Các thanh lỗi đo phương sai trên 5 training seeds.
+
+Hình 6: Ví dụ về unadjusted loss được đưa ra bằng cách tối thiểu hóa trực tiếp (7). Khá khó để thấy sự biến đổi giữa các phương pháp có thể so sánh được sử dụng loss này trực tiếp.
+
+Hình 7: Chất lượng dự đoán layer by layer cho các mô hình khác nhau với σ_τ ~ U(0,5). Các thanh lỗi đo std trên 5 training seeds.
+
+Bảng 1: Adjusted evaluation loss cho các mô hình với nhiều số lượng lớp với uniform noise variance σ_τ ~ U(0, σ_max). Chúng tôi đánh dấu in đậm các kết quả tốt nhất cho mỗi setup vấn đề (tức là mỗi cột).

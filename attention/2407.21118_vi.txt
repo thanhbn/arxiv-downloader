@@ -1,0 +1,446 @@
+# Palu: Nén KV-Cache với Phép Chiếu Hạng Thấp
+# PALU: NÉN KV-CACHE VỚI PHÉP CHIẾU HẠNG THẤP
+
+Chi-Chih Chang1,3∗†Wei-Cheng Lin1∗Chien-Yu Lin2∗
+Chong-Yan Chen1Yu-Fang Hu1Pei-Shuo Wang1Ning-Chi Huang1
+Luis Ceze2Mohamed S. Abdelfattah3Kai-Chiang Wu1
+1Đại học Quốc gia Yang Ming Chiao Tung2Đại học Washington3Đại học Cornell
+
+TÓM TẮT
+Các phương pháp nén KV-Cache hậu huấn luyện thường hoặc lấy mẫu một tập con các token hiệu quả hoặc lượng tử hóa dữ liệu thành độ rộng bit số thấp hơn. Tuy nhiên, các phương pháp này không thể khai thác tính dư thừa trong chiều ẩn của các tensor KV. Bài báo này trình bày một phương pháp nén chiều ẩn gọi là Palu, một khung nén KV-Cache sử dụng phép chiếu hạng thấp để giảm việc sử dụng bộ nhớ LLM trong thời gian suy luận. Palu phân tách các lớp tuyến tính thành các ma trận hạng thấp, lưu trữ các trạng thái trung gian được nén, và tái tạo các khóa và giá trị đầy đủ một cách tức thời. Để cải thiện độ chính xác, tỷ lệ nén và hiệu quả, Palu còn bao gồm (1) một sơ đồ phân tách hạng thấp độ hạt trung bình, (2) một thuật toán tìm kiếm hạng hiệu quả, (3) các cải tiến tương thích lượng tử hóa nhận biết hạng thấp, và (4) các kernel GPU được tối ưu hóa với việc hợp nhất toán tử. Các thí nghiệm rộng rãi với các LLM phổ biến cho thấy Palu nén KV-Cache 50%, trong khi duy trì độ chính xác mạnh mẽ và đạt được tăng tốc lên đến 1.89× trên module attention dựa trên RoPE. Khi kết hợp với lượng tử hóa, thiết kế thân thiện với lượng tử hóa vốn có của Palu tạo ra sự suy giảm độ chính xác nhỏ hoặc không đáng kể, trong khi tiết kiệm bộ nhớ bổ sung hơn các phương pháp chỉ lượng tử hóa và đạt được tăng tốc lên đến 2.91× cho attention dựa trên RoPE. Hơn nữa, nó duy trì độ chính xác tương đương hoặc thậm chí tốt hơn (lên đến 1.19 perplexity thấp hơn) so với các phương pháp chỉ lượng tử hóa. Những kết quả này chứng minh khả năng vượt trội của Palu trong việc giải quyết hiệu quả các thách thức về hiệu quả và bộ nhớ của suy luận LLM do KV-Cache gây ra. Mã nguồn của chúng tôi được công khai tại: https://github.com/shadowpa0327/Palu
+
+1 GIỚI THIỆU
+
+Các mô hình ngôn ngữ lớn (LLM) đã đẩy AI vào các ứng dụng và khả năng mới, cung cấp trí tuệ cấp cao mà các mô hình học máy (ML) trước đây không thể đạt được. Để tăng tốc suy luận, việc lưu trữ các trạng thái Key-Value (KV-Cache) trong bộ nhớ là một kỹ thuật đơn giản nhưng hiệu quả. Tuy nhiên, kích thước của KV-Cache có thể tăng nhanh chóng, gây căng thẳng cho dung lượng bộ nhớ và băng thông đặc biệt với độ dài ngữ cảnh dài (Fu, 2024); hơn nữa, bản chất bị giới hạn bộ nhớ của giai đoạn giải mã hạn chế tốc độ suy luận khi tải dữ liệu KV-Cache (Gholami et al., 2024). Do đó, nén KV-Cache đã trở thành một chủ đề nghiên cứu trung tâm để chạy LLM hiệu quả.
+
+Mặc dù các cơ chế attention mới nổi như Multi-Query Attention (MQA) (Shazeer, 2019), Group-Query Attention (GQA) (Ainslie et al., 2023) và Multi-head Latent Attention (MLA) (DeepSeek-AI et al., 2024) có thể giảm kích thước KV-Cache, nó hoặc yêu cầu huấn luyện trước mô hình hoặc có tác động đáng kể đến độ chính xác của mô hình khi chuyển đổi từ Multi-Head Attention (MHA) truyền thống (Chen et al., 2024). Ngược lại, các kỹ thuật nén KV-Cache hậu huấn luyện cung cấp một phương pháp thay thế để nâng cao hiệu quả cho các mô hình hiện có. Trong số các phương pháp nén KV-Cache khác nhau, lượng tử hóa (Liu et al., 2024b; Hooper et al., 2024) và loại bỏ token (Zhang et al., 2024; Xiao et al., 2024) nổi bật như những chiến lược hiệu quả để giảm dấu chân bộ nhớ của KV-Cache.
+
+∗Đóng góp bằng nhau
+†Liên hệ: Chi-Chih Chang, cc2869@cornell.edu
+
+--- TRANG 2 ---
+
+Palu: Nén KV-Cache với Phép Chiếu Hạng Thấp
+
+Các phương pháp lượng tử hóa nhằm giảm độ rộng bit được sử dụng để biểu diễn từng phần dữ liệu, trong khi các kỹ thuật loại bỏ token tập trung vào việc giữ lại một tập hợp con của KV-Cache. Tuy nhiên, cả hai phương pháp đều bỏ qua các chiều ẩn của KV-Cache, nơi thường có sự dư thừa đáng kể. Để tận dụng tiềm năng chưa được khai thác này, chúng tôi giới thiệu Palu, một khung nén KV-Cache hậu huấn luyện tận dụng phép chiếu hạng thấp để giảm chiều ẩn của các tensor KV, cung cấp một chiều nén bổ sung và trực giao với các phương pháp lượng tử hóa và loại bỏ token hiện có.
+
+Một cách ngây thơ để sử dụng phép chiếu hạng thấp để nén KV-Cache là ánh xạ trực tiếp các ma trận được lưu trữ vào không gian hạng thấp (Jolliffe & Cadima, 2016; Zhao et al., 2024). Tuy nhiên, phương pháp này áp đặt một overhead không thể chấp nhận được khi tính toán các ma trận phân tách trong thời gian chạy. Để tránh điều này, Palu phân tách tĩnh các ma trận trọng số chiếu Key và Value và lưu trữ các biểu diễn tiềm ẩn của phép phân tách hạng thấp (xem Hình 1). Thiết kế sáng tạo này cho phép Palu giảm bộ nhớ trong khi giảm thiểu overhead thời gian chạy của phép phân tách hạng thấp KV-Cache.
+
+[Hình 1: Phương pháp chiếu hạng thấp của Palu cho việc giảm KV-Cache. Một ma trận trọng số W của phép chiếu tuyến tính được phân tách thành hai ma trận hạng thấp. Đầu vào X được chiếu xuống thành biểu diễn tiềm ẩn H, được lưu trữ. Y có thể được tái tạo từ H bằng cách sử dụng ma trận chiếu lên B.]
+
+Trong việc thiết kế một chiến lược phân tách hiệu quả cho các module attention với nhiều attention head, chúng tôi quan sát thấy một sự đánh đổi rõ ràng giữa độ chính xác và overhead tái tạo. Phân tách các ma trận chiếu trên tất cả các attention head cùng nhau cải thiện độ chính xác bằng cách bảo tồn thông tin toàn cầu, nhưng phương pháp này làm tăng đáng kể chi phí tái tạo. Mặt khác, phân tách từng head riêng biệt giảm overhead tái tạo nhưng dẫn đến mất mát độ chính xác cao hơn. Để giải quyết điều này, Palu giới thiệu một phép phân tách hạng thấp nhóm head độ hạt trung bình đạt được sự cân bằng giữa độ chính xác và hiệu quả tái tạo.
+
+Đối với LLM, mỗi module chiếu tuyến tính có độ nhạy cảm khác nhau với nén (Sharma et al., 2023; Yuan et al., 2023). Để khai thác độ nhạy cảm và cải thiện độ chính xác, chúng tôi thiết kế một thuật toán tìm kiếm hạng hiệu quả dựa trên thông tin Fisher (Ly et al., 2017; Liu et al., 2021). Thuật toán của chúng tôi tự động gán hạng cao hơn cho các ma trận quan trọng và hạng thấp hơn cho những ma trận ít quan trọng hơn, tăng cường độ chính xác ở cùng tỷ lệ nén KV-Cache tổng thể.
+
+Ngoài phép phân tách hạng thấp, Palu tương thích với các kỹ thuật lượng tử hóa. Chúng tôi phát hiện rằng phép phân tách hạng thấp có thể tạo ra các giá trị ngoại lai nghiêm trọng trong biểu diễn tiềm ẩn, điều này cản trở đáng kể việc lượng tử hóa bit thấp chính xác. Mặc dù phép biến đổi Hadamard đã được chứng minh là hiệu quả cho việc loại bỏ giá trị ngoại lai trong các nghiên cứu gần đây (Tseng et al., 2024; Ashkboos et al., 2024b; Liu et al., 2024a; Chiang et al., 2024), việc tích hợp nó thường gây ra overhead tính toán trong thời gian chạy. Tuy nhiên, cấu trúc cặp ma trận vốn có của Palu khiến nó rất tương thích với kỹ thuật này, cho phép các ma trận biến đổi được hợp nhất một cách liền mạch vào các ma trận tiến và lùi, loại bỏ hiệu quả các giá trị ngoại lai mà không ảnh hưởng đến hiệu quả thời gian chạy.
+
+Chúng tôi đánh giá Palu trên các LLM và benchmark được sử dụng rộng rãi. Các thí nghiệm của chúng tôi chứng minh rằng Palu duy trì độ chính xác zero-shot mạnh mẽ và perplexity với nén hạng thấp lên đến 50%. Hơn nữa, khi kết hợp nén hạng thấp với lượng tử hóa, Palu đạt được mức nén ấn tượng hơn 91.25% (giảm 11.4×) và tạo ra perplexity thấp hơn đáng kể là 1.19 so với KVQuant (Hooper et al., 2024), một phương pháp lượng tử hóa KV-Cache tiên tiến, chỉ đạt được tỷ lệ nén 87.5%.
+
+Đối với đánh giá độ trễ, dưới tỷ lệ nén KV-Cache 50% không có lượng tử hóa, Palu chứng minh tăng tốc lên đến 1.89× và 2.2× cho các module attention dựa trên RoPE và không dựa trên RoPE. Khi tích hợp với lượng tử hóa, Palu đạt được gia tốc lên đến 2.91× và 6.17× trên attention dựa trên RoPE và không dựa trên RoPE, tương ứng. Những kết quả này nhấn mạnh khả năng của Palu trong việc giảm đáng kể dấu chân bộ nhớ KV-Cache trong khi tăng cường hiệu quả suy luận cho LLM.
+
+--- TRANG 3 ---
+
+Palu: Nén KV-Cache với Phép Chiếu Hạng Thấp
+
+Các đóng góp chính của chúng tôi bao gồm:
+• Palu, một khung nén KV-Cache hậu huấn luyện mới lưu trữ các biểu diễn tiềm ẩn hạng thấp của các trạng thái Key và Value.
+• Phép phân tách hạng thấp nhóm head (G-LRD), một tối ưu hóa để cân bằng độ chính xác và hiệu quả tái tạo.
+• Một thuật toán tìm kiếm hạng tự động để gán thích ứng các hạng cho mỗi ma trận được phân tách, với tỷ lệ nén mục tiêu cho trước.
+• Một tối ưu hóa tương thích lượng tử hóa được đồng thiết kế loại bỏ các giá trị ngoại lai do hạng thấp gây ra và không áp đặt overhead thời gian chạy.
+
+2 KIẾN THỨC NỀN TẢNG
+
+2.1 CƠ CHẾ MULTI-HEAD ATTENTION
+
+Cơ chế multi-head attention (MHA) (Vaswani et al., 2017) là một thành phần cốt lõi của kiến trúc transformer. Cho một token đầu vào mới x∈Rd, một MHA với n head chiếu đầu vào vào nhiều query, key và value sử dụng các ma trận trọng số Wq_i, Wk_i, và Wv_i, tương ứng, cho mỗi head i, như được thể hiện bởi
+
+qi=xWq_i, ki=xWk_i, vi=xWv_i. (1)
+
+Ở đây, ki và vi biểu diễn key và value tại bước thời gian t cho head i. Sau đó chúng ta có thể tính điểm attention cho mỗi head i và đầu ra attention tương ứng như
+
+pt,i=Softmax(qiKT_i/√dh), ai=piVi, (2)
+
+trong đó Ki và Vi biểu thị phép nối của key và value hiện tại và tất cả các key và value trước đó tương ứng với head thứ i. Đầu ra MHA cuối cùng được thu được bằng cách nối đầu ra của tất cả các head và sau đó áp dụng lớp chiếu đầu ra Wo, như được thể hiện bởi
+
+MHA(x) = ∑(i=1 to h) aiWo_i = ∑(i=1 to h) (piVi)Wo_i, (3)
+
+trong đó Wo_i ∈ Rdh×d biểu diễn các ma trận con của ma trận chiếu đầu ra cho mỗi head i.
+
+2.2 PHÉP PHÂN TÍCH GIÁ TRỊ SINGULAR (SVD)
+
+SVD (Jolliffe & Cadima, 2016) là một kỹ thuật thường được sử dụng để tính toán xấp xỉ hạng thấp cho một ma trận cho trước. Chúng tôi bây giờ giới thiệu việc sử dụng cụ thể SVD cho phương pháp phân tách hạng thấp mặc định của Palu.
+
+Cho một ma trận trọng số W∈Rm×n, SVD phân tách W thành ba ma trận: W=UΣVT. Ở đây, U và V là các ma trận trực giao chứa các vector singular trái và phải, tương ứng. Ma trận Σ là một ma trận đường chéo bao gồm các giá trị singular. Chúng tôi mô tả phép phân tách như
+
+W≈AB, A=Ur√Σr, B=√ΣrVT_r,
+
+trong đó A∈Rm×r, B∈Rr×n, Σr∈Rr×r. Σr là một ma trận đường chéo chứa r giá trị singular lớn nhất, và Ur, VT_r là các vector singular tương ứng được cắt bớt từ U và VT. Việc cắt bớt này và việc hình thành ma trận tiếp theo cho phép chúng ta xấp xỉ ma trận trọng số W với hai ma trận hạng thấp A và B, từ đó giảm lưu trữ bởi (mr+rn)/mn.
+
+3 KHUNG PALU
+
+3.1 NÉN KV-CACHE THÔNG QUA PHÉP CHIẾU HẠNG THẤP
+
+Để áp dụng phép chiếu hạng thấp hiệu quả hơn việc phân tách trực tiếp KV-Cache trong thời gian chạy, Palu sử dụng SVD để phân tách các ma trận chiếu Key và Value. Phương pháp này dựa trên
+
+--- TRANG 4 ---
+
+Palu: Nén KV-Cache với Phép Chiếu Hạng Thấp
+
+Hình 2: Palu sử dụng phép phân tách hạng thấp (W≈AB) để chiếu key (hoặc value) thành một biểu diễn tiềm ẩn chiều thấp hơn (h), từ đó giảm kích thước của KV-Cache. Key gốc (Kt) được tái tạo tức thời với Bk, và Bv được hợp nhất vào Wo để tránh overhead tái tạo. Việc hợp nhất cũng giảm gánh nặng tính toán cho phép chiếu đầu ra.
+
+quan sát rằng phép phân tách hạng thấp viết lại lớp chiếu tuyến tính từ y=xW thành y=xAB. Ở đây, A∈Rd×r là ma trận chiếu hạng thấp, và B∈Rr×d là ma trận tái tạo được tạo ra bởi SVD. Quá trình tiến hành đầu tiên chiếu xuống token đầu vào x∈Rd vào không gian tiềm ẩn chiều thấp h∈Rr và sau đó chiếu lên trở lại không gian gốc:
+
+h=Ax, y=Bh (4)
+
+Quá trình hai bước này cho phép Palu (1) lưu trữ biểu diễn tiềm ẩn chiều thấp hơn thay vì các trạng thái key và value gốc, và (2) tái tạo chúng trong quá trình giải mã.
+
+3.1.1 TÍCH HỢP VỚI CƠ CHẾ ATTENTION VÀ HỢP NHẤT MA TRẬN NGOẠI TUYẾN
+
+Chúng tôi bây giờ mô tả cách Palu phân tách các lớp tuyến tính key và value cho cơ chế attention. Đối với mỗi attention head i, Palu áp dụng SVD và ánh xạ ma trận chiếu key Wk_i và ma trận chiếu value Wv_i thành Ak_iBk_i và Av_iBv_i.
+
+Dựa trên công thức đầu ra attention trong Phương trình 2, Palu hấp thụ ma trận tái tạo Bv_i vào ma trận chiếu đầu ra Wo_i ngoại tuyến:
+
+aiWo_i = (piVi)Wo_i = (piHv_iBv_i)Wo_i = piHv_i(Bv_iWo_i) (5)
+
+Việc hợp nhất như vậy cho phép Palu bỏ qua việc tái tạo rõ ràng các vector value đầy đủ, giảm số lượng phép nhân ma trận, và cải thiện hiệu quả. Một phương pháp tương tự áp dụng cho việc tính toán điểm attention. Ma trận Bk_i có thể được hợp nhất vào ma trận chiếu query Wq_i ngoại tuyến, như được thể hiện bởi
+
+qiKT_i = qi(Hk_iBk_i)T = qiKT_i = xtWq_i(Bk_i)T(Hk_i)T = xt[Wq_i(Bk_i)T](Hk_i)T. (6)
+
+Ở đây, Bk_i∈Rr×dh và Wq_i∈Rd×dh, vì vậy ma trận được hợp nhất (Wq_i(Bk_i)T) có kích thước Rd×r. Việc hợp nhất này tăng cường hiệu quả tính toán bằng cách giảm chiều ma trận trong quá trình tính toán điểm attention.
+
+3.1.2 TƯƠNG THÍCH VỚI EMBEDDING VỊ TRÍ
+
+Các LLM gần đây, như họ Llama, áp dụng Rotary Positional Embedding (tức là RoPE (Su et al., 2021)) vào các trạng thái Query và Key trước khi nhân chúng. Bản chất phi tuyến tính của các embedding vị trí này ngăn cản việc hợp nhất ma trận của điểm attention, như được nêu trong Phương trình 6. Để giải quyết điều này, Palu tái tạo động các key từ biểu diễn tiềm ẩn trong quá trình giải mã. Chúng tôi nâng cao hiệu quả tái tạo với một kernel GPU được thiết kế tùy chỉnh, được chi tiết trong Mục 4.1 và được mô tả thêm trong Phụ lục B.
+
+Lưu ý rằng đối với một số phương pháp embedding vị trí, như ALiBi (Press et al., 2022), hoặc các cơ chế attention mới, như MLA (DeepSeek-AI et al., 2024), embedding vị trí không được áp dụng trực tiếp vào các trạng thái Key. Do đó, việc hợp nhất được mô tả trong Phương trình 6 vẫn có hiệu lực. Đối với các module attention không dựa trên RoPE này, Palu đạt được tăng tốc lớn hơn so với attention dựa trên RoPE, vì việc tái tạo của chúng có thể được tránh bằng việc hợp nhất ma trận. Một quy trình làm việc chi tiết của Palu trong bối cảnh attention dựa trên RoPE của Llama được minh họa trong Hình 2.
+
+3.2 MỨC ĐỘ HẠT PHÂN TÁCH
+
+3.2.1 PHÉP PHÂN TÁCH HẠNG THẤP MULTI-HEAD
+
+Chúng tôi đặt tên cho sơ đồ phân tách theo head trong Mục 3.1.1 là phép phân tách hạng thấp multi-head (M-LRD). Chúng tôi phát hiện M-LRD thường gây ra sự suy giảm độ chính xác không thể bỏ qua (thảo luận thêm trong Mục 4.2), có thể vì SVD không nắm bắt được thông tin chung được chia sẻ giữa các head. Do đó, cần có các phương pháp thay thế để bảo tồn độ chính xác mô hình.
+
+3.2.2 PHÉP PHÂN TÁCH HẠNG THẤP JOINT-HEAD
+
+Một phương pháp thay thế là phân tách chung các ma trận trọng số cho tất cả các head. Bằng cách xem xét ma trận trọng số kết hợp Wjoint = [W1,W2,...,Wn]∈Rd×(dh·nh), chúng ta có thể thực hiện một phép phân tách hạng thấp duy nhất Wjoint≈AjointBjoint, trong đó Ajoint∈Rd×rjoint và Bjoint∈Rrjoint×(dh·nh). Chúng tôi gọi sơ đồ này là phép phân tách hạng thấp joint-head (J-LRD).
+
+J-LRD có ưu điểm bảo tồn các thành phần chính chung được chia sẻ giữa các head khác nhau. Điều này xảy ra vì SVD đặc biệt hiệu quả trong việc nắm bắt các thành phần chiếm ưu thế khi được áp dụng cho một ma trận lớn hơn, kết hợp, dẫn đến một xấp xỉ chính xác hơn.
+
+Đối với J-LRD, biểu diễn tiềm ẩn chung được chia sẻ giữa tất cả các head có thể được tính với hjoint=xAjoint. Trong quá trình giải mã, các trạng thái gốc cho mỗi head có thể được tái tạo thông qua
+
+[y1,...,yn] = hjointBjoint.
+
+Overhead Suy luận Cao. Mặc dù bảo tồn độ chính xác mô hình tốt hơn, J-LRD gây ra overhead tính toán và bộ nhớ đáng kể trong quá trình giải mã. Cụ thể, tổng số phép toán dấu phẩy động (FLOP) để tái tạo trạng thái Key hoặc Value của một head bây giờ trở thành rjoint·dh·n. Giả sử cùng kích thước với tổng các biểu diễn tiềm ẩn hạng thấp (tức là rjoint=∑ri), tổng chi phí tái tạo cao hơn n lần so với M-LRD, có tổng FLOP là ri·dh·n. Khi xem xét việc hợp nhất ma trận trong Mục 3.1.1, ma trận được hợp nhất của J-LRD có kích thước rjoint·d·n, cũng lớn hơn n lần so với M-LRD, dẫn đến tiêu thụ bộ nhớ cao hơn đáng kể.
+
+Hình 3: Thực hiện phân tách ở các mức độ hạt khác nhau. Phân tách chung nhiều head có thể đạt được độ chính xác cao hơn. Giả sử cùng tổng kích thước của các biểu diễn tiềm ẩn (tức là 4·ri=2·rg=rjoint), FLOP cho overhead tái tạo trong các sơ đồ phân tách joint-head lớn hơn 4 lần so với các sơ đồ multi-head.
+
+--- TRANG 5 ---
+
+--- TRANG 6 ---
+
+Palu: Nén KV-Cache với Phép Chiếu Hạng Thấp
+
+3.2.3 PHÉP PHÂN TÁCH HẠNG THẤP GROUP-HEAD
+
+Để cân bằng sự đánh đổi giữa độ chính xác và chi phí tái tạo, chúng tôi đề xuất phép phân tách hạng thấp group-head (G-LRD). G-LRD phân tách các ma trận cho một nhóm head cùng nhau. Với các ma trận trọng số kết hợp, nó nắm bắt thông tin được chia sẻ trong mỗi nhóm trong khi hạn chế overhead tính toán và bảo tồn độ chính xác.
+
+Để minh họa quá trình G-LRD, xem xét các ma trận trọng số cho một nhóm s head, Wgj=[Wj,1...Wj,s], trong đó Wgj∈Rd×(dh·s). Chúng ta phân tách hạng thấp Wgj≈AgjBgj, trong đó Agj∈Rd×rg và Bgj∈Rrg×(dh·s). Biểu diễn tiềm ẩn được chia sẻ giữa các attention head trong cùng nhóm có thể được tính như hgj=xUgj. Trong quá trình giải mã, key hoặc value gốc cho mỗi head có thể được tái tạo thông qua
+[yj,1...yj,s] = hgjBgj.
+
+FLOP để tái tạo key và value cho mỗi head trong G-LRD là rg·dh·ng, trong đó ng=n/s là số lượng nhóm. So sánh chi phí với J-LRD và giả sử cùng tổng kích thước hạng (rg·ng=rjoint), G-LRD giảm chi phí tái tạo bởi ng. Tương tự, G-LRD cũng giảm kích thước ma trận được hợp nhất bởi ng. Tóm lại, G-LRD cung cấp một trung điểm giữa overhead tính toán và độ chính xác xấp xỉ. Chúng tôi minh họa M-LRD, J-LRD và G-LRD trong Hình 3. Vui lòng tham khảo Phụ lục C để thảo luận thêm về chi phí của các mức độ hạt phân tách khác nhau.
+
+3.3 PHÂN BỔ HẠNG TỰ ĐỘNG
+
+Để phân bổ kích thước hạng lý tưởng cho mục tiêu phân tách, việc ước tính chính xác tầm quan trọng của ma trận mục tiêu (ví dụ: trọng số nhóm) là rất quan trọng. Trong Palu, chúng tôi xác định thông tin Fisher (Ly et al., 2017; Liu et al., 2021) như một bộ xấp xỉ chính xác vì nó có thể định lượng lượng thông tin cho mỗi tham số. Sau đó chúng tôi sử dụng tổng thông tin Fisher để ước tính tầm quan trọng của ma trận trọng số của mỗi lớp tuyến tính (Abdelfattah et al., 2021).
+
+Giả sử rằng độ nhạy cảm nén tỷ lệ thuận với thông tin Fisher, chúng tôi xác định hạng cho mỗi ma trận trọng số bằng cách tính tỷ lệ thông tin Fisher của nó với tổng thông tin Fisher trên tất cả các mục tiêu phân tách. Chúng tôi sử dụng tỷ lệ này để phân bổ tỷ lệ nén (tức là mức hạng r), đảm bảo rằng các lớp quan trọng hơn giữ lại mức hạng cao hơn. Để nghiên cứu ablation chi tiết về Phân bổ Hạng Tự động của chúng tôi, vui lòng tham khảo Phụ lục G.3.
+
+3.4 TƯƠNG THÍCH LƯỢNG TỬ HÓA
+
+(a) Low-Rank Key Cache (b) Low-Rank Key Cache (với Hadamard)
+[Hình 4: Phân phối kích hoạt của key cache hạng thấp tại lớp attention thứ 4 của Llama-2.]
+
+Chúng tôi tích hợp lượng tử hóa vào Palu để nén KV-Cache thêm nữa. Chúng tôi quan sát thấy rằng các biểu diễn tiềm ẩn được nén hạng thấp có các giá trị ngoại lai nghiêm trọng, điều này hạn chế khả năng áp dụng lượng tử hóa trong Palu. Không giống như các giá trị ngoại lai tự nhiên được mô tả trong tài liệu lượng tử hóa KV-Cache trước đây (Liu et al., 2024b; Hooper et al., 2024), những giá trị ngoại lai này được gây ra bởi việc phân tích nhân tử hạng thấp dựa trên SVD.
+
+Hình 4 (a) cho thấy phân phối của các trạng thái key được nén hạng thấp từ một lớp của Llama-2 với G-LRD. Các mẫu giá trị ngoại lai lặp lại xuất hiện ở đầu mỗi nhóm được phân tách vì SVD sắp xếp các giá trị eigen lớn hơn ở các hàng hoặc cột đầu tiên, dẫn đến các giá trị giảm nhanh chóng trong biểu diễn tiềm ẩn. Mẫu này kéo dài phân phối dữ liệu và gây hại cho độ chính xác lượng tử hóa.
+
+Lấy cảm hứng từ tài liệu lượng tử hóa LLM gần đây (Ashkboos et al., 2024b; Tseng et al., 2024), chúng tôi áp dụng phép biến đổi Walsh-Hadamard (WHT, Fino & Algazi) để loại bỏ các giá trị ngoại lai (Hình 4 (b)), cho phép độ chính xác lượng tử hóa cao. Tuy nhiên, phép biến đổi này gây ra một phép nhân ma trận bổ sung với overhead thời gian chạy liên quan. Không giống như các phương pháp trước đây (Ashkboos et al., 2024b) phải áp dụng WHT trực tuyến khi lượng tử hóa KV-Cache, chúng tôi tối ưu hóa quá trình này bằng cách tích hợp ma trận Hadamard vào các trọng số được phân tách hạng thấp mà không có overhead tính toán bổ sung, như được mô tả bởi
+
+--- TRANG 7 ---
+
+Palu: Nén KV-Cache với Phép Chiếu Hạng Thấp
+
+W≈AB = (AR)(RTB) = ÂB̂, (7)
+
+trong đó R là ma trận Hadamard. Tối ưu hóa này cho phép Palu tích hợp kỹ thuật nén hạng thấp được đề xuất với lượng tử hóa bit thấp. Các thí nghiệm của chúng tôi cho thấy rằng, trên cơ sở nén hạng thấp, phương pháp lượng tử hóa của chúng tôi chỉ làm tăng perplexity một cách không đáng kể, ngay cả ở mức độ cực đoan như 3-bit hoặc 2-bit với một sơ đồ lượng tử hóa đơn giản theo token (xem Mục 4.3).
+
+4 THÍ NGHIỆM
+
+4.1 THIẾT LẬP THÍ NGHIỆM
+
+Mô hình và Nhiệm vụ. Chúng tôi đánh giá Palu trên bốn họ LLM, Llama-2 (Touvron et al., 2023), Llama-3 (Dubey et al., 2024), Mistral (Jiang et al., 2023) và LongChat (Li et al., 2023). Để đánh giá độ chính xác, chúng tôi đo perplexity trên các bộ dữ liệu WikiText-2 (Merity et al., 2016) và C4 (Raffel et al., 2020) và sử dụng LM-Evaluation-Harness (Gao et al., 2023) để đo độ chính xác zero-shot trên sáu nhiệm vụ common sense. Chúng tôi cũng đánh giá độ chính xác ngữ cảnh dài trên 16 nhiệm vụ trong LongBench (Bai et al., 2023). Trừ khi có chỉ định, chúng tôi đề cập đến baseline như một mô hình với KV-Cache không được nén. Xem Phụ lục H để biết thêm chi tiết về bộ dữ liệu và cài đặt.
+
+Cài đặt Nén. Chúng tôi triển khai Palu dựa trên thư viện Huggingface (Wolf et al., 2020). Phân tách các lớp chiếu Key và Value được thực hiện bằng phương pháp SVD nhận biết cắt bớt được đề xuất bởi SVD-LLM (Wang et al., 2024). Trừ khi có chỉ định khác, kết quả của Palu là G-LRD với kích thước nhóm 4 (gs-4), với kích thước hạng bằng nhau cho mỗi nhóm. Để tính toán thông tin Fisher trong tìm kiếm hạng, chúng tôi sử dụng 2048 mẫu ngẫu nhiên từ Wikitext-2, mỗi mẫu có độ dài chuỗi 1024. Để tích hợp lượng tử hóa trong Palu, chúng tôi sử dụng lượng tử hóa số nguyên bất đối xứng đơn giản theo token. Để đánh giá kết quả lượng tử hóa, chúng tôi so sánh Palu với các phương pháp lượng tử hóa KV-Cache tiên tiến, bao gồm Atom (Zhao et al., 2023), KVQuant (Hooper et al., 2024), và KIVI (Liu et al., 2024b). Tham khảo Mục 5 để có tóm tắt ngắn gọn về các phương pháp này.
+
+Triển khai GPU Kernel. Để tính toán hiệu quả điểm attention với RoPE trong Palu, chúng tôi triển khai một kernel tùy chỉnh trong Triton (Tillet et al., 2019). Kernel của chúng tôi hợp nhất việc tái tạo key, áp dụng RoPE, và phép nhân cuối cùng với query trong một lần gọi kernel duy nhất, giảm thiểu di chuyển dữ liệu (Xem Phụ lục B). Để tích hợp lượng tử hóa, chúng tôi triển khai các kernel trong CUDA cho các trường hợp hợp nhất ma trận trên cả điểm attention và đầu ra attention (tham khảo Mục 3.1.1 và Hình 2). Kernel của chúng tôi hợp nhất quá trình khử lượng tử hóa và phép nhân tiếp theo với key hoặc value được nén hạng thấp, cho phép xử lý hiệu quả trên KV-Cache tiềm ẩn được lượng tử hóa. Khi đánh giá tăng tốc với lượng tử hóa, chúng tôi so sánh với baseline không được nén và KIVI (Liu et al., 2024b), mà chúng tôi sử dụng mã chính thức† trong các thí nghiệm của chúng tôi.
+
+4.2 KẾT QUẢ VỚI CÁC MỨC ĐỘ HẠT PHÂN TÁCH KHÁC NHAU
+
+Chúng tôi đánh giá perplexity và độ chính xác zero-shot của Palu với tỷ lệ nén hạng thấp 50% sử dụng M-LRD, G-LRD, và J-LRD trên Llama-2-7B và Llama-3-8B-Instruct, và trình bày kết quả trong Bảng 1.
+
+Bảng 1: Perplexity và độ chính xác zero-shot của Palu ở tỷ lệ nén 50%.
+[Bảng chứa dữ liệu so sánh cho các mô hình Llama-2-7B và Llama-3-8B-Inst với các phương pháp khác nhau]
+
+†https://github.com/jy-yuan/KIVI
+
+--- TRANG 8 ---
+
+Palu: Nén KV-Cache với Phép Chiếu Hạng Thấp
+
+Đánh giá Perplexity. Như Bảng 1 cho thấy, đối với mô hình Llama-2-7B, phương pháp M-LRD của Palu không thể duy trì perplexity thấp ở tỷ lệ nén 50%. Ngược lại, mặc dù có chi phí tính toán lại cao, J-LRD vượt trội đáng kể so với M-LRD và đạt được perplexity 5.62 trên WikiText-2.
+
+Đối với G-LRD, vẫn duy trì chi phí tính toán thấp, cho ra perplexity 6.01 trên Wikitext-2, cho thấy sự cân bằng tuyệt vời giữa độ chính xác mô hình và overhead nén. Xu hướng tương tự cũng được quan sát thấy trong mô hình Llama-3-8B. Thêm kết quả về Llama-2-13B có thể tìm thấy trong Phụ lục F.
+
+Kết quả Đánh giá Zero-shot. Tương tự như đánh giá perplexity, phương pháp J-LRD thể hiện hiệu suất tốt nhất cho độ chính xác zero-shot trên Llama-2-7B, chỉ với 0.23% suy giảm độ chính xác trung bình. Phương pháp M-LRD dẫn đến hiệu suất trung bình thấp nhất, với 7.26% giảm độ chính xác so với baseline. So sánh, G-LRD chỉ có 2.4% suy giảm độ chính xác trung bình, cung cấp điểm tối ưu giữa độ chính xác mô hình và overhead nén một lần nữa.
+
+4.3 KẾT QUẢ TÍCH HỢP LƯỢNG TỬ HÓA
+
+Bảng 2: Perplexity lượng tử hóa và kích thước KV-Cache cho Llama-2-7B trên WikiText-2. Đối với perplexity, độ dài chuỗi là 4096. Kích thước KV-Cache được thể hiện cho độ dài chuỗi 128K.
+[Bảng chứa dữ liệu so sánh các phương pháp khác nhau với bit khác nhau]
+
+Bảng 2 thể hiện tác động của lượng tử hóa đối với perplexity và kích thước KV-Cache khi kết hợp với Palu. Với lượng tử hóa 3-bit, Palu chỉ gây ra sự gia tăng perplexity nhẹ 0.08 và 0.23 ở tỷ lệ nén hạng thấp 30% và 50%. Những điều này chứng minh sự đánh đổi độ chính xác tối thiểu cho lợi ích nén đáng kể so với baseline 16-bit.
+
+Đáng chú ý, ở lượng tử hóa 2-bit, Palu vượt trội quyết định so với phương pháp KVQuant tiên tiến, giảm perplexity 1.19 và 0.54, trong khi cắt giảm thêm việc sử dụng bộ nhớ 30% và 50%. Những kết quả này thiết lập Palu với lượng tử hóa như một phương pháp nén KV-Cache vượt trội.
+
+4.4 ĐÁNH GIÁ TRÊN CÁC BỘ DỮ LIỆU NGỮ CẢNH DÀI
+
+Để đánh giá khả năng của Palu cho các tình huống ngữ cảnh dài, chúng tôi đánh giá độ chính xác của baseline, KIVI và Palu trên LongBench (Bai et al., 2023). Ở đây chúng tôi đánh giá trên các mô hình Mistral-7B và LongChat-7B, có độ dài ngữ cảnh lên đến 32K. Chúng tôi báo cáo điểm trung bình cho từng loại nhiệm vụ riêng biệt, cũng như trung bình tổng thể trên tất cả 16 nhiệm vụ. Kết quả được thể hiện trong Bảng 3.
+
+Như Bảng 3 chỉ ra, chúng tôi thấy rằng ở mức nén hạng thấp 50%, Palu tương đối khó khăn để bảo tồn hoàn toàn độ chính xác. Tuy nhiên, ở mức nén 30%, Palu đạt được chỉ một sự suy giảm độ chính xác trung bình nhỏ (<1%) so với baseline cho cả hai mô hình.
+
+Hơn nữa, Palu có thể lượng tử hóa KV-Cache tiềm ẩn hạng thấp xuống 3 bit, với ít hơn 1% suy giảm độ chính xác thêm. Nhìn chung, Palu duy trì độ chính xác trung bình mạnh mẽ 40.77% và 34.33% cho Mistral-7B và LongChat-7B, với tỷ lệ nén ấn tượng 7.59x.
+
+Khi so sánh với KIVI (Liu et al., 2024b), Palu đạt được độ chính xác tương tự, trong khi có thêm 30% tỷ lệ nén từ hạng thấp.
+
+Đáng chú ý, Palu không yêu cầu các kỹ thuật lượng tử hóa nhóm phức tạp và độ chính xác hỗn hợp được sử dụng bởi KIVI, dẫn đến hiệu quả suy luận cao (xem Mục 4.5 để biết chi tiết).
+
+4.5 ĐÁNH GIÁ ĐỘ TRỄ
+
+Trong phần này, chúng tôi cung cấp đánh giá độ trễ và tăng tốc, sử dụng Llama-2-7B làm mô hình cơ sở. Chúng tôi đo độ trễ trên một GPU RTX 4090 duy nhất và so sánh Palu với các baseline FP16 và KIVI-4-bit.
+
+Chúng tôi đánh giá độ trễ của Palu ở tỷ lệ nén 50%, trong đó chúng tôi đặt tỷ lệ nén cho key và value lần lượt là 75% và 25%. Việc phân bổ này dựa trên quan sát của chúng tôi từ kết quả phân bổ hạng (xem Phụ lục G.3 để biết chi tiết).
+
+Đối với baseline FP16, chúng tôi sử dụng triển khai mặc định từ HuggingFace. Đối với KIVI, chúng tôi sử dụng các kernel CUDA từ repository chính thức của nó. Chúng tôi không áp dụng FlashAttention (Dao et al., 2022) để so sánh công bằng với các baseline của chúng tôi. Do dung lượng bộ nhớ nhỏ của GPU RTX 4090, chúng tôi áp dụng lượng tử hóa 4-bit (Frantar et al., 2024) cho trọng số của tất cả các lớp tuyến tính. Kết quả của chúng tôi là trung bình của 100 lần chạy.
+
+Bảng 3: Kết quả thí nghiệm trên Longbench. Độ rộng bit trung bình được ước tính cho mỗi phương pháp, giả sử độ dài ngữ cảnh 10K. Mỗi cột biểu diễn điểm trung bình cho các nhiệm vụ của từng loại.
+[Bảng chứa dữ liệu so sánh cho Mistral-7B-v0.2 và LongChat-7B-v1.5]
+
+(a) Module Attention (w/ RoPE) (c) Mô hình End-to-End (w/ RoPE) (d) Mô hình End-to-End (w/o RoPE) (b) Module Attention (w/o RoPE)
+[Hình 5: Tăng tốc chuẩn hóa cho cả module attention và giải mã mô hình end-to-end. Các đường liền biểu diễn đo lường chính xác, trong khi các đường đứt chỉ ra các baseline FP16 bị hết bộ nhớ, và tăng tốc được so sánh với độ trễ ước tính của baseline.]
+
+4.5.1 TĂNG TỐC CỦA MODULE ATTENTION VÀ GIẢI MÃ END-TO-END
+
+Tăng tốc module attention. Chúng tôi so sánh độ trễ với attention tiêu chuẩn không có nén hoặc lượng tử hóa và thể hiện tăng tốc của Palu và KIVI-4-bit trong Hình 5 (a) và (b) cho attention dựa trên RoPE và không dựa trên RoPE. Đối với attention dựa trên RoPE, chúng tôi áp dụng kernel tái tạo trực tuyến cho key và sử dụng hợp nhất ngoại tuyến cho value như được mô tả trong Mục 3.1.2.
+
+Như được thể hiện trong Hình 5 (a), Palu có tăng tốc tối thiểu hoặc không có tăng tốc khi độ dài chuỗi ngắn, ví dụ 4K. Tuy nhiên, khi độ dài chuỗi tăng, Palu mang lại lợi ích hiệu suất đáng kể. Ở độ dài đầu vào 64K, Palu đạt được tăng tốc 1.89× so với baseline FP16 khi chỉ sử dụng phép chiếu hạng thấp.
+
+Bằng cách áp dụng thêm lượng tử hóa 4-bit cho các trạng thái Value, tăng tốc tăng lên 2.91× cho cùng độ dài ngữ cảnh 64K, nhờ kernel độ chính xác thấp được tối ưu hóa và thời gian tải bộ nhớ giảm. Hiệu suất này vượt trội đáng kể so với KIVI-4-bit, chỉ đạt được tăng tốc 1.89× ở 64K, bị cản trở bởi overhead của lượng tử hóa nhóm hạt mịn. Đáng chú ý, đối với attention dựa trên RoPE, Palu-4-bit không lượng tử hóa key, vì kernel tái tạo trực tuyến của chúng tôi hiện chỉ hỗ trợ độ chính xác FP16.
+
+Đối với attention không dựa trên RoPE, chúng tôi áp dụng hợp nhất ma trận cho cả trạng thái Key và Value (Phương trình 6), loại bỏ hiệu quả tất cả overhead tái tạo. Ở độ dài chuỗi 64K với tỷ lệ nén 50%, Palu đạt được tăng tốc 2.20× so với baseline FP16. Bằng cách áp dụng thêm lượng tử hóa 4-bit cho cả trạng thái Key và Value, Palu tăng cường tăng tốc lên 6.17× cho độ dài đầu vào 64K. Những kết quả này chứng minh rằng việc kết hợp nén hạng thấp và lượng tử hóa nâng cao đáng kể hiệu quả suy luận, đặc biệt trong các tình huống ngữ cảnh dài.
+
+--- TRANG 10 ---
+
+Palu: Nén KV-Cache với Phép Chiếu Hạng Thấp
+
+Tăng tốc end-to-end. Chúng tôi trình bày tăng tốc end-to-end trong Hình 5 (c) và (d), đo độ trễ tạo token tiếp theo ở các độ dài đầu vào khác nhau và so sánh kết quả với baseline FP16. Tương tự như kết quả hiệu suất attention, Palu cho thấy tăng tốc tối thiểu hoặc không có tăng tốc cho chuỗi ngắn nhưng mang lại gia tốc đáng kể cho chuỗi dài hơn. Không có lượng tử hóa, Palu đạt được tăng tốc lên đến 1.71× và 2.05× cho các mô hình dựa trên RoPE và không dựa trên RoPE, tương ứng. Với tỷ lệ nén 50%, Palu chạy lên đến độ dài đầu vào 32K trên GPU RTX 4090. Bằng cách kết hợp lượng tử hóa 4-bit, Palu xử lý các chuỗi thậm chí dài hơn và mang lại tăng tốc end-to-end 2.59× và 5.53× ở độ dài chuỗi 64K. Palu tích hợp với lượng tử hóa cung cấp lợi thế tốc độ đáng kể so với KIVI-4-bit, chỉ đạt 1.78× và 1.81× tăng tốc ở độ dài chuỗi 32K cho các tình huống RoPE và không RoPE, tương ứng, và bị hết bộ nhớ cho chuỗi dài hơn.
+
+4.5.2 KERNEL CHO ĐIỂM ATTENTION DỰATRÊN ROPE
+
+Trong phần này, chúng tôi đánh giá hiệu suất của kernel tái tạo trực tuyến cho điểm attention dựa trên RoPE. Chúng tôi đo độ trễ từ vector query trước RoPE đến điểm attention sau GEMV, và so sánh với GEMV của PyTorch, được sử dụng trong attention baseline (xem Hình 2).
+
+Hình 6: Tăng tốc của kernel điểm attention của Palu với tái tạo trực tuyến.
+
+Chúng tôi trình bày tăng tốc cho kích thước nhóm 1, 4, và 32 ở các độ dài chuỗi khác nhau trong Hình 6. Đối với gs-32 (J-LRD), phép phân tách độ chính xác cao nhất, chi phí tái tạo cao gây ra sự chậm chạp đáng kể trên tất cả độ dài chuỗi. Đối với gs-1 (M-LRD), kernel của chúng tôi đạt được tăng tốc lên đến 3.56× ở độ dài chuỗi 16K, cho thấy hiệu suất mạnh mẽ khi mất mát độ chính xác vừa phải có thể chấp nhận được. Đối với gs-4 (G-LRD), kernel của chúng tôi đạt tăng tốc lên đến 1.95×. Những kết quả này nhấn mạnh nhu cầu khám phá các mức độ hạt phân tách khác nhau để có sự đánh đổi độ chính xác và tốc độ tốt hơn.
+
+Chúng tôi cũng quan sát thấy rằng tăng tốc giảm cho độ dài chuỗi vượt quá 16K do chi phí tái tạo tăng, chuyển việc tái tạo trực tuyến từ bị giới hạn bộ nhớ sang bị giới hạn tính toán. Một tối ưu hóa tiềm năng là lượng tử hóa thêm các ma trận trọng số được phân tách và tận dụng phần cứng thông lượng cao, độ chính xác thấp (ví dụ: INT4 Tensor Cores) cho tái tạo trực tuyến, mà chúng tôi để dành cho công việc tương lai. Mặc dù tăng tốc giảm ở độ dài dài hơn, tăng tốc attention tổng thể của Palu tăng với đầu vào dài hơn, nhờ hợp nhất ma trận trên trạng thái Value và dấu chân bộ nhớ giảm.
+
+5 CÔNG TRÌNH LIÊN QUAN
+
+SVD cho Nén LLM. Một số công trình đã khám phá việc sử dụng SVD để nén LLM. Một phương pháp sớm (Noach & Goldberg, 2020) áp dụng SVD tiêu chuẩn cho các ma trận trọng số, dẫn đến lỗi nén đáng kể. FWSVD (Hsu et al., 2022) giải quyết điều này bằng cách sử dụng thông tin Fisher để ưu tiên các tham số, trong khi ASVD (Yuan et al., 2023) xem xét các giá trị ngoại lai kích hoạt. SVD-LLM (Wang et al., 2024) tiếp tục giảm thiểu mất mát nén cho mỗi giá trị singular. Không giống như các phương pháp này, nén trọng số mô hình, Palu tập trung vào giảm kích thước KV-Cache. Một công trình đồng thời, (Yu et al., 2024), cũng khám phá nén KV-Cache sử dụng phép chiếu hạng thấp, tạo ra các ma trận hạng thấp từ KV-Cache với dữ liệu hiệu chuẩn và nhóm các attention head tương tự như G-LRD của Palu. Tuy nhiên, nó yêu cầu fine-tuning LoRA sau phân tách. Ngược lại, Palu trực tiếp phân tách ma trận trọng số, bảo tồn độ chính xác mà không cần fine-tuning, và giới thiệu các đổi mới bổ sung, bao gồm tìm kiếm hạng, tích hợp lượng tử hóa, và các kernel GPU được tối ưu hóa.
+
+Nén KV-Cache. Lượng tử hóa là một kỹ thuật được sử dụng rộng rãi để nén KV-Cache. Atom (Zhao et al., 2023) áp dụng lượng tử hóa đơn giản theo token, trong khi WKVQuant (Yue et al., 2024) giới thiệu một sơ đồ hai cấp để nâng cao độ chính xác. KIVI (Liu et al., 2024b) sử dụng lượng tử hóa theo kênh và theo token cho Key và Value, kết hợp với lượng tử hóa nhóm hạt mịn ở kích thước nhóm 32. KVQuant (Hooper et al., 2024) sử dụng thiết lập tương tự nhưng kết hợp lượng tử hóa không đều và ma trận thưa để xử lý các giá trị ngoại lai. Trên cơ sở các phương pháp này, GEAR thêm ma trận hạng thấp để bù đắp cho lỗi lượng tử hóa. Trong Palu, chúng tôi tận dụng các kỹ thuật hạng thấp để khai thác sự dư thừa chiều ẩn và, với lượng tử hóa đơn giản theo token, đạt được kết quả nén xuất sắc.
+
+MLA. Mô hình DeepSeek-V2 được phát hành gần đây (DeepSeek-AI et al., 2024) giới thiệu cơ chế MLA, giảm kích thước KV-Cache bằng cách chiếu xuống Key và Value thành không gian hạng thấp và tái tạo chúng thành hạng đầy đủ tại thời gian chạy. Mặc dù MLA có thể tương tự như Palu ở mức cao, đặc biệt với J-LRD, thiết kế và quá trình dẫn xuất của chúng tôi về cơ bản khác nhau. Không giống như MLA, một cơ chế attention mới yêu cầu pre-training, Palu được thiết kế cụ thể cho tích hợp hậu huấn luyện. Palu tập trung vào việc chuyển đổi các mô hình hiện có với MHA hoặc GQA để hỗ trợ KV-Cache nén hạng thấp, bảo tồn độ chính xác cao trong khi nâng cao hiệu quả suy luận.
+
+6 KẾT LUẬN
+
+Chúng tôi giới thiệu Palu, một khung nén KV-Cache mới phân tách các ma trận trọng số chiếu tuyến tính và lưu trữ các biểu diễn tiềm ẩn được nén. Chúng tôi đề xuất các tối ưu hóa khác nhau, bao gồm phép phân tách hạng thấp nhóm head, thuật toán phân bổ hạng tự động, cải tiến tương thích lượng tử hóa, và các kernel tùy chỉnh với hợp nhất toán tử. Với những tối ưu hóa này, Palu có thể duy trì độ chính xác trong khi đạt được giảm bộ nhớ đáng kể và tăng tốc suy luận cao. Các thí nghiệm cho thấy rằng, với nén hạng thấp 50% và lượng tử hóa 4-bit, Palu tăng tốc module attention dựa trên RoPE lên đến 2.91× và mang lại tăng tốc end-to-end lên đến 2.2× cho cùng mô hình dựa trên RoPE, trong khi bảo tồn độ chính xác mạnh mẽ trên các benchmark khác nhau.
+
+TÀI LIỆU THAM KHẢO
+
+[Danh sách tài liệu tham khảo dài với các trích dẫn học thuật - giữ nguyên format và nội dung như bản gốc]
+
+--- TRANG 11 ---
+
+[Tiếp tục danh sách tài liệu tham khảo]
+
+--- TRANG 12 ---
+
+[Tiếp tục danh sách tài liệu tham khảo]
+
+--- TRANG 13 ---
+
+[Tiếp tục danh sách tài liệu tham khảo]
+
+--- TRANG 14 ---
+
+[Tiếp tục danh sách tài liệu tham khảo]
+
+--- TRANG 15 ---
+
+[Tiếp tục danh sách tài liệu tham khảo]
+
+--- TRANG 16 ---
+
+[Tiếp tục danh sách tài liệu tham khảo]
+
+--- TRANG 17 ---
+
+[Tiếp tục danh sách tài liệu tham khảo]
+
+--- TRANG 18 ---
+
+Palu: Nén KV-Cache với Phép Chiếu Hạng Thấp
+
+PHỤ LỤC
+
+A CƠ BẢN LƯỢNG TỬ HÓA
+
+Các kỹ thuật lượng tử hóa sử dụng các giá trị bit thấp rời rạc để xấp xỉ các điểm dấu phẩy động độ chính xác cao. Hàm lượng tử hóa đều bất đối xứng tổng quát được định nghĩa như:
+
+X̃=clamp⌊X/s⌉+z,0,2^B−1), (8)
+
+trong đó X̃ biểu thị tensor được xấp xỉ với biểu diễn bit thấp (tức là số nguyên 4-bit), X là tensor dấu phẩy động, s=(Xmax−Xmin)/(2^B−1) là hệ số tỷ lệ, và z=−⌊Xmin/s⌉ là điểm zero. ⌊·⌉ là phép toán làm tròn.
+
+B CHI TIẾT TRIỂN KHAI KERNEL
+
+[Hình 7: Minh họa kernel GPU được hợp nhất của chúng tôi để tính toán điểm attention với tái tạo trực tuyến...]
+
+Kernel cho tính toán điểm attention với tái tạo. Ý tưởng trung tâm của Palu là tận dụng các biểu diễn tiềm ẩn hạng thấp để tăng tốc cơ chế attention bằng cách giảm overhead truyền dữ liệu. Thay vì làm việc trực tiếp với ma trận key kích thước đầy đủ, chúng tôi lưu trữ và truyền một biểu diễn tiềm ẩn nén hạng thấp, được ký hiệu là H∈R^(L×r). Trong quá trình tính toán, kernel GPU tùy chỉnh của chúng tôi thực hiện tái tạo tức thời bằng cách sử dụng ma trận tái tạo B∈R^(r×dh), tạo ra ma trận key được khôi phục K∈R^(L×dh), trong đó L là độ dài chuỗi, dh là chiều ẩn, và r biểu thị hạng còn lại sau khi thực hiện phép chiếu hạng thấp. Vector query, được biểu diễn như q∈R^(1×dh), sau đó nhân với các key được tái tạo để thu được điểm attention.
+
+Để tận dụng hiệu quả tính song song, chúng tôi thực hiện chia ô dọc theo chiều độ dài chuỗi L. Cụ thể, chúng tôi chia chuỗi thành các ô nhỏ hơn có kích thước Ltile, gán mỗi ô cho một thread block chuyên dụng. Mỗi thread block độc lập tái tạo một ma trận con Hi∈R^(Ltile×dh) từ biểu diễn tiềm ẩn hạng thấp H, sau đó áp dụng embedding vị trí bằng RoPE, và cuối cùng thực hiện phép nhân ma trận-vector giữa q và Hi để tạo ra điểm attention một phần. Thiết kế này đảm bảo rằng tất cả các tính toán trung gian, từ tái tạo đến embedding và phép nhân cuối cùng, vẫn hoàn toàn trong bộ nhớ trên chip (tức là bộ nhớ chia sẻ), từ đó giảm thiểu truy cập bộ nhớ độ trễ cao và tận dụng đầy đủ khả năng xử lý song song của GPU để đạt được tăng tốc đáng kể.
+
+--- TRANG 19 ---
+
+Palu: Nén KV-Cache với Phép Chiếu Hạng Thấp
+
+C THẢO LUẬN VỀ SỬ DỤNG BỘ NHỚ
+
+Trong công việc này, kết quả thí nghiệm tập trung vào tỷ lệ nén của KV-Cache như một chỉ số chính. Tuy nhiên, việc xem xét việc tiết kiệm bộ nhớ tổng thể như một yếu tố quan trọng hơn là rất cần thiết. Ví dụ, như được chứng minh trong Mục 2.2, một tỷ lệ nén điển hình 30% có thể dẫn đến sự gia tăng kích thước trọng số khoảng 40%. Sự gia tăng này được tính toán dưới giả định rằng m=n và r=0.7n, dẫn đến phương trình (mr+nr)/mn=1.4. Sự gia tăng như vậy chỉ ra việc sử dụng bộ nhớ bổ sung đáng kể.
+
+Vấn đề này chủ yếu phát sinh trong các sơ đồ phân tách J-LRD, nơi các phép chiếu của tất cả head được phân tách chung. Ngược lại, các sơ đồ phân tách M-LRD và sơ đồ G-LRD được tối ưu hóa của chúng tôi liên quan đến các ma trận mục tiêu không vuông. Ví dụ, trong sơ đồ G-LRD với kích thước nhóm 4, ma trận mục tiêu được hình thành bằng cách nối các ma trận chiếu gốc của mỗi attention head trong nhóm. Trong mô hình Llama-2-7b, với chiều embedding 4096 và chiều head 128, mỗi ma trận chiếu là 4096×128, dẫn đến ma trận được nối có kích thước 4096×512. Trong trường hợp này, các chiều nên được xem xét như m=8n. Áp dụng phương trình được tham chiếu (mr+nr)/mn với r=0.7n, chúng ta thấy rằng (mr+nr)/mn=0.7875, không chỉ ra chi phí lưu trữ bổ sung và thực tế đạt được 21.25% tiết kiệm bộ nhớ bổ sung.
+
+Hơn nữa, điều quan trọng cần nhấn mạnh là các trọng số liên quan đến các phép chiếu K và V chỉ chiếm 2 trong số 7 lớp tuyến tính trong các khối transformer, chỉ bao gồm 16% tham số trong các mô hình Llama-2-7b. Điều này hạn chế tác động tổng thể đến việc sử dụng bộ nhớ. Do đó, trong khi J-LRD có thể gây ra overhead, các sơ đồ M-LRD và G-LRD cung cấp các lựa chọn thay thế hiệu quả không dẫn đến việc sử dụng bộ nhớ tăng, khiến chúng trở thành các tùy chọn khả thi cho các ứng dụng thực tế.
+
+D GIẢM BỘ NHỚ TỔNG THỂ
+
+Trong Hình 8, chúng tôi thể hiện tổng việc sử dụng bộ nhớ, bao gồm trọng số mô hình và KV-Cache dưới các độ dài chuỗi khác nhau. Chúng tôi quan sát thấy rằng KV-Cache nhanh chóng trở thành điểm nghẽn bộ nhớ khi độ dài chuỗi tăng. Ở độ dài chuỗi 64k, KV-Cache chiếm 78% tổng tiêu thụ bộ nhớ. Với nén hạng thấp 50%, Palu hiệu quả giảm việc sử dụng bộ nhớ 1.7×, và khi kết hợp với lượng tử hóa 2-bit, nó tiếp tục giảm tổng việc sử dụng bộ nhớ 4.6×.
+
+Hình 8: Tổng việc sử dụng bộ nhớ cho các độ dài chuỗi khác nhau trong Llama-2-7B. nén hạng thấp ở 50% cho Palu.
+
+E TÍCH HỢP Palu VỚI LORA FINETUNE
+
+LoRA (Hu et al., 2022) đã trở thành một trong những kỹ thuật fine-tuning hiệu quả được sử dụng rộng rãi nhất để thích ứng mô hình với các nhiệm vụ hoặc miền cụ thể với dữ liệu hạn chế. Nó cũng đã được áp dụng với các phương pháp nén LLM (Wang et al., 2024; Ma et al., 2023) như một kỹ thuật phục hồi sau nén để khôi phục mất mát thông tin sau nén. Trong Palu, LoRA cũng có thể áp dụng để tăng cường độ chính xác thêm nữa.
+
+--- TRANG 20 ---
+
+Palu: Nén KV-Cache với Phép Chiếu Hạng Thấp
+
+Bảng 4: Đánh giá tích hợp LoRA với Palu trên Llama-2-7B.
+[Bảng chứa dữ liệu so sánh với và không có LoRA]
+
+Để tích hợp LoRA với Palu, chúng tôi giới thiệu các ma trận hạng thấp bổ sung A'r∈R^(d×r') và B'r∈R^(r'×d) để tinh chỉnh phép chiếu hạng thấp gốc như dưới đây:
+
+h=Ax+A'rB'rx (9)
+
+Ở đây, A sẽ là các tham số cố định được tạo ra từ phép phân tách hạng thấp từ trọng số pre-trained của các lớp tuyến tính, trong khi A'r và B'r là các tham số có thể huấn luyện để nắm bắt các sắc thái cụ thể theo nhiệm vụ và khôi phục thông tin bị mất trong quá trình nén.
+
+Thiết lập. Theo Ashkboos et al. 2024a, chúng tôi lấy mẫu 8k mẫu từ bộ dữ liệu huấn luyện Alpaca làm bộ dữ liệu fine-tuning và áp dụng LoRA với hạng r'=32 và α=32. Tất cả các siêu tham số khác được căn chỉnh với Ashkboos et al. (2024a), ngoại trừ tỷ lệ học 2e^(-4), và việc sử dụng bộ lập lịch tỷ lệ học cosine.
+
+Kết quả Thí nghiệm. Chúng tôi trình bày kết quả thí nghiệm với LoRA trong Bảng 4. Theo Ashkboos et al. 2024a Với LoRA được kết hợp, J-LRD tiếp tục cho thấy suy giảm hiệu suất tối thiểu với mức giảm trung bình 1.00%. G-LRD (gs=4) và M-LRD cho thấy kết quả cải thiện so với các đối tác không có LoRA, với mức giảm trung bình lần lượt là 2.01% và 5.14%. Đáng chú ý, với tích hợp LoRA, G-LRD chỉ cho thấy 1.03% chênh lệch độ chính xác so với J-LRD.
+
+F KẾT QUẢ THÊM VỀ ĐỘ CHÍNH XÁC ZERO-SHOT
+
+Tiếp theo Mục 4.2, chúng tôi tiếp tục báo cáo kết quả đánh giá perplexity và zero-shot của Palu trên Llama-2-13B ở tỷ lệ nén 50%. Như thể hiện trong Bảng 5, chúng tôi quan sát thấy rằng Palu đạt được sự suy giảm độ chính xác cạnh tranh khoảng 3% hoặc ít hơn trên các phương pháp khác nhau sử dụng J-LRD, G-LRD, hoặc M-LRD. Do đó, người dùng có thể áp dụng M-LRD trước để tối ưu hóa hiệu quả thêm nữa.
+
+Bảng 5: Perplexity và độ chính xác zero-shot của Palu, với các chiến lược phân tách khác nhau ở 50%
+[Bảng chứa dữ liệu cho mô hình Llama-2-13B]
+
+G NGHIÊN CỨU ABLATION
+
+G.1 ẢNH HƯỞNG CỦA KÍCH THƯỚC NHÓM KHÁC NHAU
+
+Vì phương pháp G-LRD được đề xuất của chúng tôi cho phép cân bằng hiệu suất và hiệu quả bằng cách điều chỉnh kích thước nhóm, chúng tôi đã tiến hành nghiên cứu ablation về kích thước nhóm. Như được thấy trong Bảng 6, khi kích thước nhóm tăng, lượng thông tin được chia sẻ cũng tăng, dẫn đến hiệu suất được cải thiện.
+
+--- TRANG 21 ---
+
+Palu: Nén KV-Cache với Phép Chiếu Hạng Thấp
+
+Bảng 6: Nghiên cứu ablation về kích thước nhóm phân tách hạng thấp trên perplexity cho mô hình Llama-2-7B ở tỷ lệ nén 50% sử dụng Wikitext-2.
+[Bảng chứa dữ liệu cho các kích thước nhóm khác nhau]
+
+G.2 ẢNH HƯỞNG CỦA PHÉP BIẾN ĐỔI WALSH-HADAMARD
+
+Chúng tôi tiến hành nghiên cứu ablation để phân tích lợi ích của việc áp dụng Phép biến đổi Walsh-Hadamard (WHT). Kết quả thí nghiệm được báo cáo trong Bảng 7. Ở mức lượng tử hóa 3-bit, chúng tôi quan sát thấy rằng Phép biến đổi Hadamard chỉ mang lại một lượng perplexity nhỏ. Tuy nhiên, khi chúng tôi lượng tử hóa biểu diễn hạng thấp cực đoan hơn (tức là 2-bit), chúng ta có thể quan sát thấy cải thiện perplexity đáng chú ý 4.17. Đáng nhấn mạnh lại rằng Phép biến đổi Hadamard sẽ không mang lại overhead bổ sung trong quá trình suy luận, vì Palu tối ưu hóa quá trình WHT thông qua tiền xử lý ngoại tuyến. Người đọc có thể tham khảo Mục 3.4 để biết thêm chi tiết.
+
+G.3 PHÂN BỔ HẠNG TỰ ĐỘNG VS. PHÂN BỔ HẠNG ĐỀU
+
+Bảng 8 trình bày nghiên cứu ablation về tác động của các sơ đồ phân bổ hạng khác nhau đối với độ chính xác của mô hình. Việc áp dụng tìm kiếm hạng dẫn đến cải thiện hiệu suất đáng chú ý. Ví dụ, ở tỷ lệ nén 50%, có sự giảm đáng kể perplexity 2.18. Hình 9 trực quan hóa việc phân bổ hạng trên các khối transformer khác nhau cho các lớp chiếu key và value. Kết quả rõ ràng chứng minh một kết quả phân bổ không đều. Cụ thể, chúng tôi quan sát thấy rằng value thường được phân bổ hạng cao hơn key. Ngoài ra, nửa đầu của các lớp được gán hạng cao hơn, cho thấy tầm quan trọng lớn hơn của chúng trong việc bảo tồn hiệu suất mô hình. Việc trực quan hóa này nhấn mạnh hiệu quả của thuật toán tìm kiếm hạng của chúng tôi trong việc xác định và phân bổ hạng thích hợp cho các thành phần khác nhau, từ đó tối ưu hóa sự cân bằng giữa nén và độ chính xác.
+
+Bảng 7: Nghiên cứu Ablation về các cài đặt lượng tử hóa khác nhau để lượng tử hóa các biểu diễn tiềm ẩn hạng thấp. Giống như Mục 4.3, chúng tôi sử dụng WikiText-2 với độ dài chuỗi được đặt thành 4096 làm benchmark đánh giá.
+[Bảng chứa dữ liệu so sánh với và không có Hadamard]
+
+Hình 9: Trực quan hóa tỷ lệ nén hạng thấp theo lớp trên Llama-2-7B với 50% tỷ lệ nén tổng thể. Ở đây, tỷ lệ nén (tức là hạng) được phân bổ bằng thuật toán phân bổ hạng tự động dựa trên Thông tin Fisher được đề xuất.
+
+Bảng 8: Nghiên cứu ablation về có và không có tìm kiếm hạng. Chúng tôi sử dụng Llama-2-7b và Wikitext-2 với độ dài chuỗi 2048 làm benchmark.
+[Bảng chứa dữ liệu so sánh Uniform vs Automatic]
+
+H CHI TIẾT THÍ NGHIỆM
+
+H.1 CHI TIẾT ĐÁNH GIÁ ZERO-SHOT
+
+Chúng tôi đã chọn sáu nhiệm vụ zero-shot từ benchmark LM-eval để đánh giá Palu:
+• OpenBookQA (độ chính xác, Mihaylov et al.)
+• HellaSwag (acc norm, Zellers et al.)
+• PIQA (độ chính xác, Bisk et al.)
+• ARC-Easy (độ chính xác, Clark et al.)
+• ARC-Challenge (acc norm, Clark et al.)
+• WinoGrande (độ chính xác, Sakaguchi et al.)
+
+Chúng tôi báo cáo độ chính xác cho WinoGrande, PIQA, và ARC-Easy, và độ chính xác được chuẩn hóa theo độ dài chuỗi (acc norm) cho HellaSwag và ARC-Challenge.
+
+H.2 CHI TIẾT ĐÁNH GIÁ LONG BENCH
+
+Đối với đánh giá LongBench trong bản thảo, chúng tôi đã chọn tám nhiệm vụ từ bốn nhóm con, đảm bảo đánh giá toàn diện Palu. Các nhiệm vụ và chỉ số tương ứng được chi tiết dưới đây:
+
+• Single-Document QA:
+  – Qasper (điểm F1, Dasigi et al.)
+• Summarization:
+  – QMSum (điểm ROUGE, Zhong et al.)
+  – MultiNews (điểm ROUGE, Fabbri et al.)
+• Few-shot Learning:
+  – TREC (điểm phân loại, Li & Roth)
+  – TriviaQA (điểm F1, Joshi et al.)
+  – SAMSum (điểm ROUGE, Gliwa et al.)
+• Code Completion:
+
+--- TRANG 22 ---
+
+--- TRANG 23 ---
+
+Palu: Nén KV-Cache với Phép Chiếu Hạng Thấp
+
+  – LCC (điểm tương tự, Guo et al.)
+  – RepoBench-P (điểm tương tự, Liu et al.)
+
+Trong quá trình đánh giá, chúng tôi đặt độ dài chuỗi tối đa thành 31500 cho cả mô hình Mistral và LongChat.

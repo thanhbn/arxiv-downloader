@@ -1,0 +1,1005 @@
+# 2408.07092.pdf
+# Chuyển đổi từ PDF sang TXT
+# Đường dẫn nguồn: /home/admin88/arxiv-downloader/attention/2408.07092.pdf
+# Kích thước file: 1538652 bytes
+
+===============================================
+NỘI DUNG FILE PDF
+===============================================
+
+
+--- TRANG 1 ---
+Post-Training Sparse Attention với Double Sparsity
+Shuo Yang13Ying Sheng2Joseph E. Gonzalez1Ion Stoica1Lianmin Zheng1
+1UC Berkeley2Stanford3Shanghai Jiao Tong University
+Tóm tắt
+Quá trình suy luận cho các mô hình ngôn ngữ lớn là chậm và tốn nhiều bộ nhớ,
+với một trong những nút thắt cổ chai quan trọng nhất là việc truy cập Key-Value (KV) cache
+quá mức. Bài báo này giới thiệu "Double Sparsity," một kỹ thuật sparse attention
+post-training mới được thiết kế để giảm bớt nút thắt cổ chai này bằng cách giảm truy cập KV cache.
+Double Sparsity kết hợp token sparsity, tập trung vào việc chỉ sử dụng
+các token quan trọng để tính toán self-attention, với channel sparsity, một
+phương pháp sử dụng các kênh đặc trưng quan trọng để xác định các token quan trọng. Khái niệm
+chính của chúng tôi là mẫu của channel sparsity tương đối tĩnh, cho phép chúng tôi
+sử dụng calibration offline để làm cho nó hiệu quả tại runtime, từ đó cho phép xác định
+chính xác và hiệu quả các token quan trọng. Hơn nữa, phương pháp này có thể được kết hợp
+với offloading để đạt được giảm đáng kể việc sử dụng bộ nhớ. Kết quả thực nghiệm
+chứng minh rằng Double Sparsity có thể đạt được1
+16token và channel sparsity
+với tác động tối thiểu đến độ chính xác trên nhiều tác vụ khác nhau, bao gồm wiki-2 perplexity,
+key-value retrieval, và long context benchmarks với các mô hình bao gồm Llama-
+2-7B, Llama-2-70B, và Mixtral-8x7B. Nó mang lại tăng tốc lên đến 14.1 ×trong
+các phép toán attention và cải thiện 1.9 ×trong suy luận end-to-end trên GPU.
+Với offloading, nó đạt được tăng tốc decoding speed 16.3 ×so với
+các giải pháp state-of-the-art tại độ dài sequence 256K. Mã nguồn của chúng tôi có thể
+truy cập công khai tại https://github.com/andy-yang-1/DoubleSparse .
+1 Giới thiệu
+Các Mô hình Ngôn ngữ Lớn (LLMs) đã tiến bộ đáng kể trong khả năng machine learning, cho
+phép một loạt rộng các ứng dụng từ xử lý ngôn ngữ tự nhiên đến các tác vụ giải quyết vấn đề
+phức tạp (OpenAI, 2023; Touvron et al., 2023; Google, 2023). Tuy nhiên, quá trình suy luận của chúng
+vẫn đắt đỏ và chậm do decoding từng token một. Quá trình decoding này thể hiện intensity
+tính toán thấp, khiến nó phần lớn bị giới hạn bởi bộ nhớ. Trong quá trình decoding, cần truy cập
+vào hai loại bộ nhớ: trọng số mô hình và Key-Value (KV) cache trong các lớp self-attention
+(Vaswani et al., 2017). Cả hai có thể rất lớn và do đó trở thành nút thắt cổ chai. Khi batch size
+lớn hoặc độ dài sequence dài, kích thước của KV cache có thể dễ dàng vượt quá kích thước của
+trọng số mô hình (Pope et al., 2023).
+Trong khi nghiên cứu rộng rãi đã tập trung vào việc giảm truy cập vào trọng số mô hình thông qua
+quantization và sparsification, việc giảm truy cập vào KV cache đã nhận được ít sự chú ý hơn.
+Trong bài báo này, chúng tôi khám phá các phương pháp để giảm truy cập vào KV cache trong quá trình
+suy luận, từ đó làm cho tính toán attention hiệu quả hơn về băng thông và tăng tốc việc thực thi của nó.
+Trọng tâm của chúng tôi là các phương pháp post-training có thể được áp dụng trực tiếp vào một mô hình
+đã được pre-trained để cung cấp tăng tốc wall-clock mà không yêu cầu quá nhiều overhead training
+hoặc fine-tuning bổ sung. Các nghiên cứu trước đã cố gắng tận dụng quantization (Hooper et al., 2024;
+Liu et al., 2024b), compression (Nawrot et al., 2024), và sparsity (Zhang et al., 2024; Anagnostidis
+et al., 2024; Ge et al., 2024; Ribar et al., 2023) để đạt được những mục tiêu này. Trong số đó,
+sparsity có tiềm năng đáng kể nếu có thể đạt được tỷ lệ sparsity cao. Trực giác của sparsification
+là không phải mọi token đều quan trọng như nhau để decoding token tiếp theo. Do đó, trong quá trình
+decoding, chúng ta có thể dựa vào một tập con nhỏ các token quan trọng để tính toán self-attention,
+đạt được kết quả gần như tương tự. Trong khi phương pháp
+Preprint. Under review.arXiv:2408.07092v2  [cs.LG]  18 Aug 2024
+
+--- TRANG 2 ---
+của sparse attention có vẻ trực quan, nghiên cứu trước đây đã gặp khó khăn trong việc tìm ra một phương pháp
+sparse attention post-training duy trì độ chính xác cao trong khi hiệu quả về mặt runtime.
+Thách thức chính trong post-training sparse attention nằm ở việc xác định chính xác và hiệu quả
+các token quan trọng. Một phương pháp ngây thơ bao gồm việc tính toán toàn bộ ma trận trọng số
+attention và sau đó sắp xếp các token dựa trên trọng số attention tích lũy. Mặc dù phương pháp này
+có thể xác định chính xác các token quan trọng, nó không thể cung cấp tăng tốc runtime, vì nó yêu cầu
+tính toán toàn bộ ma trận trọng số attention, đó chính xác là bước chúng ta muốn tránh. Các nghiên cứu
+trước đã đề xuất nhiều phương pháp khác nhau để lựa chọn các token quan trọng; tuy nhiên, các phương pháp
+này hoặc dẫn đến mất mát độ chính xác đáng kể hoặc không thể đạt được tăng tốc wall-clock thực tế.
+Đáng chú ý, H2O (Zhang et al., 2024) sử dụng một chiến lược động duy trì một cache kích thước cố định
+nhỏ của các token quan trọng. Do kích thước hạn chế của nó, nó phải loại bỏ nhiều token. Vì nó không
+thể dự đoán các token quan trọng trong tương lai, nó thường vô tình loại bỏ chúng, dẫn đến giảm độ
+chính xác. SparQ (Ribar et al., 2023), ngược lại, giữ lại tất cả các token và lựa chọn động các token
+quan trọng tại mỗi bước. Tuy nhiên, thiết kế của nó không đạt được tăng tốc mong muốn và phát sinh
+overhead bộ nhớ bổ sung đáng kể. Tóm lại, việc thiết kế một phương pháp hiệu quả có khả năng xác định
+chính xác các token quan trọng vẫn là một thách thức đáng kể.
+Chúng tôi đề xuất "Double Sparsity," một phương pháp tận dụng cả token sparsity và channel sparsity
+để đạt được post-training sparse attention chính xác và hiệu quả. Token sparsity đề cập đến phương pháp
+sparse attention được đề cập ở trên (Zhang et al., 2024), sử dụng chỉ các token quan trọng để tính toán
+self-attention. Channel sparsity, một phương pháp mới chúng tôi giới thiệu, lựa chọn các token quan trọng
+tại runtime bằng cách sử dụng các kênh đặc trưng quan trọng. Khái niệm chính của chúng tôi là trong khi
+token sparsity có tính động cao, channel sparsity thể hiện hành vi tương đối tĩnh, cho phép chúng tôi
+xác định và lựa chọn các kênh quan trọng thông qua calibration offline. Channel sparsity tĩnh này do đó
+cung cấp một phương tiện hiệu quả để đạt được token sparsity động tại runtime. Dựa trên khái niệm này,
+chúng tôi đã khám phá cẩn thận cách lựa chọn các kênh quan trọng dựa trên thống kê từ calibration offline.
+Hơn nữa, một khi chúng ta có thể nhanh chóng xác định các token quan trọng cho lớp hiện tại, chúng tôi
+mở rộng quá trình này bằng cách dự đoán các token quan trọng của lớp tiếp theo. Chúng tôi đạt được điều
+này bằng cách sử dụng sự tương tự embedding giữa các lớp liền kề. Phương pháp này cho phép chúng tôi
+offload toàn bộ KV cache vào bộ nhớ host và prefetch chỉ các token quan trọng vào bộ nhớ GPU, giảm
+đáng kể dung lượng bộ nhớ GPU.
+Được thể hiện trong Hình 1, chúng tôi chứng minh rằng Double Sparsity có thể đạt được cả1
+16token sparsity và
+một1
+16channel sparsity đồng thời, trong khi chỉ phát sinh mất mát độ chính xác không đáng kể trên một
+loạt rộng các benchmark, bao gồm language modeling, question answering, và retrieval tasks. Sparsity
+trực tiếp dẫn đến việc giảm truy cập bộ nhớ và tăng tốc runtime. Double Sparsity tăng tốc phép toán
+attention lên đến 14.1×tại mức sparsity1
+16trên NVIDIA A10G và A100G GPU, tiếp cận gần giới hạn
+trên tăng tốc lý thuyết. Nó tăng tốc suy luận end-to-end cho nhiều workload khác nhau lên đến 1.9×.
+Khi bật offloading, nó đạt được throughput decoding cao hơn 16.3×so với các giải pháp dựa trên
+offloading state-of-the-art tại độ dài sequence 256K.
+2 Nền tảng
+2.1 Khái niệm cơ bản về Self-Attention và Ký hiệu
+Tính toán Attention là một trong những nút thắt cổ chai chính trong Suy luận LLM, đặc biệt khi độ dài
+sequence lớn (Tay et al., 2022). Điều này được gây ra bởi độ phức tạp tính toán bậc hai của nó.
+Gọidhbiểu thị head dimension, và Sbiểu thị số lượng token. Chúng tôi sử dụng bước decoding làm
+ví dụ để minh họa tính toán self-attention. Mỗi token mang ba tensor để nhúng thông tin của nó,
+được gọi là query, key, và value. Trong một lớp attention, gọi q∈Rdhđại diện cho
+tensor query cho input token, K∈RS×dhđại diện cho tensor key cho tất cả token, và V∈RS×dh
+đại diện cho tensor value cho tất cả token. Attention được thu được thông qua công thức được hiển thị dưới đây:
+y=softmaxq·KT
+√dh
+·V
+2
+
+--- TRANG 3 ---
+2.2 Post-training Sparse Attention
+Trong công trình này, chúng tôi giới thiệu thuật ngữ "post-training sparse attention," tương tự như "post-training
+quantization." Post-training sparse attention đề cập đến các kỹ thuật khai thác sparsity vốn có của mô hình,
+chẳng hạn như token-level sparsity, để tăng tốc tính toán attention mà không yêu cầu training bổ sung.
+Trong lĩnh vực LLMs, nhiều công trình đã sử dụng post-training sparse attention, bao gồm H2O,
+StreamingLLM (Xiao et al., 2024) và SparQ. Tuy nhiên, các phương pháp này đi kèm với những hạn chế
+đáng kể, đặt ra những thách thức nghiêm trọng cho post-training sparse attention.
+3 Thách thức trong Post-Training Sparse Attention
+Trong phần này, chúng tôi thảo luận về nghiên cứu trước đây về post-training sparse attention, xác định
+các thách thức và thiếu sót đã ngăn cản các phương pháp này đạt được tiềm năng đầy đủ của chúng.
+Thêm related work được bao gồm trong Phần 7.
+3.1 Retrieval Accuracy
+Một trong những vấn đề thách thức nhất đối với post-training sparse attention là duy trì retrieval accuracy.
+Chẳng hạn, StreamingLLM loại bỏ các token trước đó, trong khi H2O có chọn lọc bỏ các token dựa trên
+điểm attention trước đó. Mặc dù việc loại bỏ token có thể tăng tốc tính toán, việc loại trừ này dẫn đến
+mất thông tin quan trọng, có thể làm tổn hại đến retrieval accuracy của mô hình. Như được nhấn mạnh
+trong Jelassi et al. (2024), vấn đề này là cố hữu đối với các kỹ thuật dựa vào việc loại bỏ token,
+thúc đẩy việc khám phá các phương pháp sparse attention bảo tồn KV cache hoàn chỉnh.
+3.2 Hardware Friendliness
+Đạt được tăng tốc wall-clock đặt ra thách thức lớn hơn trong khi duy trì retrieval accuracy của mô hình,
+đặc biệt vì một số kỹ thuật post-training sparse attention không thân thiện với phần cứng. Chẳng hạn,
+SparQ giữ lại KV cache hoàn chỉnh và tính toán attention có chọn lọc trên một tập con của KV cache
+dựa trên query. Phương pháp này về mặt lý thuyết cho phép tăng tốc trong khi duy trì độ chính xác.
+Tuy nhiên, phương pháp lựa chọn kênh và token của SparQ dẫn đến truy cập bộ nhớ không liên tục,
+gây ra L1/L2 cache miss đáng kể và lãng phí băng thông GPU với truy cập bộ nhớ 128-byte tiêu chuẩn.
+Mặc dù được thiết kế để tăng tốc xử lý, SparQ chỉ đạt được tăng tốc khiêm tốn 1.3 lần trong tính toán
+attention. Do đó, việc phát triển một thuật toán đảm bảo các mẫu truy cập bộ nhớ liên tục và tránh lựa chọn
+động các kênh để tăng tốc attention trong khi bảo tồn độ chính xác là rất quan trọng.
+3.3 Memory Usage
+Các phương pháp bảo tồn KV cache hoàn chỉnh vốn dĩ yêu cầu tiêu thụ bộ nhớ GPU đáng kể. Để giảm
+thiểu nhu cầu bộ nhớ nặng, phương pháp FlexGen (Sheng et al., 2023b) offload KV cache của mỗi lớp
+vào GPU chỉ trong giai đoạn tính toán. Tuy nhiên, một thách thức đáng kể phát sinh vì FlexGen cần
+offload KV cache hoàn chỉnh, và overhead giao tiếp có thể ảnh hưởng drastically đến hiệu suất hệ thống
+tổng thể. Xem xét rằng các token được chọn chỉ chiếm một phần nhỏ của tất cả token, thời gian để
+offload các token cụ thể này vào GPU ít hơn đáng kể so với thời gian cần thiết để offload toàn bộ
+KV cache như trong FlexGen. Bằng cách quản lý hiệu quả khi nào và cách dữ liệu được truyền và xử lý,
+có thể giảm đáng kể cả thời gian và overhead bộ nhớ thường liên quan đến việc duy trì KV cache đầy đủ.
+Để giải quyết những thách thức này, chúng tôi đề xuất hai kỹ thuật post-training sparse attention.
+Trong Phần 4, chúng tôi giới thiệu Double Sparsity, tăng tốc attention lên đến 16 ×với tiêu thụ bộ nhớ
+bổ sung tối thiểu. Trong Phần 5, chúng tôi trình bày Double Sparsity-Offload, giảm việc sử dụng bộ nhớ
+xuống 1/16 mà không tăng latency.
+4 Double Sparsity
+Dựa trên những hiểu biết của Phần 3, chúng tôi đề xuất Double Sparsity, một cơ chế post-training sparse
+attention thân thiện với phần cứng và hiệu quả về băng thông. Phương pháp này vượt qua những thách thức
+được nhấn mạnh trong các kỹ thuật post-training sparse attention trước đây bằng cách đảm bảo không mất
+thông tin, vì nó
+3
+
+--- TRANG 4 ---
+Algorithm 1 Double Sparsity Decode
+Require: Q∈Rdh, K∈RS×dh,
+V∈RS×dh, C∈Nr,
+Klabel∈RS×r, r=αdh, k=βS
+Ensure: y
+1:Qlabel←Q[C]
+2:ˆs←Qlabel·Klabel
+3:i←argtopk (ˆs, k)
+4:s←softmax
+Q·KT
+[i,:]√dh
+5:y←s·V[i,:]
+6:return y
+Hình 1: Perplexity của Llama ở các mức
+token-sparsity và channel-sparsity khác nhau.
+Hình 2: Quá trình decoding của Double Sparsity.
+duy trì toàn bộ KV cache . Để tránh cache miss liên quan đến runtime sorting, Double
+Sparsity sử dụng calibration offline để xác định trước các kênh outlier cho mỗi lớp transformer.
+Một label cache nhỏ gọn được sử dụng để lưu trữ các giá trị kênh outlier từ Key cache, tối ưu hóa
+các mẫu truy cập bộ nhớ để tận dụng sở thích của GPU đối với truy cập bộ nhớ liên tục. Algorithm 1
+và Hình 2 minh họa quá trình decoding của Double Sparsity.
+4.1 Offline Calibration
+Offline calibration là một kỹ thuật thường được sử dụng để xác định channel sparsity, đặc biệt hiệu quả
+trong việc xác định các kênh outlier. Ví dụ, AWQ (Lin et al., 2023) sử dụng offline calibration để
+xác định các kênh trọng số quan trọng có tác động đáng kể đến hiệu suất mô hình. Lấy cảm hứng từ
+phương pháp này, chúng tôi sử dụng offline calibration để xác định trước các kênh có ảnh hưởng nhất
+đến điểm attention. Tính toán Attention có thể được biểu diễn dưới dạng A=Q·KT, có thể được chia nhỏ
+thành A=Pdh
+iSitrong đó Si=Qi∗Ki. Do channel sparsity, chỉ một vài Sicó tác động đáng kể đến
+A. Do đó, bằng cách tiến hành offline calibration trên một tập validation nhỏ, chúng ta có thể xác định
+hiệu quả các kênh quan trọng này bằng cách tính toán argmax
+iSi. Hình 7a trong Phụ lục A minh họa
+các kênh outlier được xác định bởi AWQ và Double Sparsity.
+Để xác thực hiệu quả của các kênh outlier được xác định thông qua offline calibration, chúng tôi đã
+tiến hành so sánh trong Phụ lục A giữa các chỉ số kênh outlier được rút ra từ offline calibration và
+những chỉ số được xác định trong quá trình decoding online. Sự chồng lấp đáng kể giữa hai tập hợp
+nhấn mạnh độ tin cậy của các outlier được calibrated offline. Hình 7b minh họa mối quan hệ này.
+Một quan sát từ việc so sánh là khi tỷ lệ vượt quá 0.25, sự chồng lấp đạt 0.95.
+4
+
+--- TRANG 5 ---
+4.2 Forwarding với Label Cache
+Sau khi xác định các chỉ số kênh outlier, việc truy cập chúng một cách hiệu quả trở nên quan trọng.
+Đọc các kênh này trực tiếp từ Key cache có thể dẫn đến truy cập bộ nhớ không liên tục, làm giảm
+đáng kể việc sử dụng băng thông. Để giảm thiểu truy cập bộ nhớ không liên tục, chúng tôi tận dụng
+label cache để lưu trữ các giá trị kênh nặng được xác định trước. Label cache này cho phép truy cập
+bộ nhớ liên tục khi tính toán approximate attention, tránh cần phải truy xuất các phân đoạn không
+liên tục từ Key cache. Trong giai đoạn prefilling, tất cả các giá trị kênh nặng từ Key cache được
+lưu trữ trong label cache; trong giai đoạn decoding, chỉ các giá trị kênh nặng của token mới được
+thêm vào. Vì approximate attention không nhạy cảm với độ chính xác, chúng ta có thể lưu trữ label
+cache ở 4-bit. Phương pháp này cho phép chúng ta duy trì label cache chỉ bằng 1/16 kích thước của
+K cache, tạo điều kiện cho truy cập bộ nhớ liên tục và cải thiện đáng kể tỷ lệ hit của L1/L2 cache,
+từ đó tối ưu hóa tốc độ suy luận và hiệu quả. Trong Phụ lục B.1, một nghiên cứu ablation đã được
+tiến hành để đánh giá tác động của label cache. Kết quả cho thấy label cache tăng tốc decoding
+speed từ 2 đến 4 lần so với cấu hình không có label cache.
+5 Giảm Sử dụng Bộ nhớ GPU với Double Sparsity-Offload
+Dựa trên Double Sparsity, chúng tôi đề xuất kỹ thuật Double Sparsity-Offload để tiếp tục giảm
+overhead bộ nhớ GPU trong các mô hình ngôn ngữ lớn. Phương pháp này giảm đáng kể yêu cầu
+bộ nhớ xuống 1/16 của KV cache gốc. Bằng cách tối ưu hóa việc sử dụng bộ nhớ, Double
+Sparsity-Offload cho phép decoding hiệu quả hơn, đặc biệt với tài nguyên bộ nhớ GPU hạn chế.
+5.1 Prefetching Token với Double Buffer
+Thuật toán Double Sparsity-Offload giới thiệu hệ thống prefetching double buffer trong quá trình
+decoding. KV cache hoàn chỉnh được lưu trữ trên CPU, trong khi GPU chỉ duy trì label cache và
+double buffer. Trong quá trình decoding, mỗi lớp xử lý các embedding của nó thông qua query
+projection của lớp tiếp theo để tạo ra approximate query cho lớp tiếp theo. Approximate query
+này sau đó được sử dụng để tính toán approximate attention của lớp tiếp theo. Trong khi các tính
+toán attention và feed-forward network của lớp hiện tại đang được thực hiện, các token tương ứng
+với kết quả approximate attention cho lớp tiếp theo được offload vào GPU. Việc sử dụng double
+buffering này cho phép chồng lấp mượt mà và hiệu quả của tính toán và truyền bộ nhớ.
+5.2 Phân tích Thực nghiệm: Sự tương tự Embedding giữa các Lớp
+Tính khả thi của thuật toán Double Sparsity-Offload dựa trên mức độ tương tự cao giữa các embedding
+qua các lớp liên tiếp. Để xác thực thực nghiệm giả định này, chúng tôi đã tiến hành phân tích sử dụng
+tập validation Pile, áp dụng cho mô hình Llama-2-7B. Chúng tôi đo cosine similarity của embedding
+giữa mọi hai lớp liên tiếp trong suốt mô hình. Kết quả cho thấy ngoài hai lớp đầu tiên, lớp thứ hai và
+thứ ba, và các lớp cuối cùng (30 và 31), tất cả các cặp lớp khác thể hiện cosine similarity vượt quá
+90%, với phần lớn các lớp hiển thị sự tương tự trên 95%. Những điểm tương tự cao này hỗ trợ tính
+khả thi của việc sử dụng embedding lớp trước để dự đoán query cho các lớp tiếp theo trong Double
+Sparsity-Offload.
+5.3 Phân tích Độ phức tạp
+Để hiểu tăng tốc tiềm năng của Double Sparsity, chúng ta cần phân tích Cache IO-Complexity của nó
+vì các cơ chế attention bị giới hạn bởi băng thông. Double Sparsity có thể được đơn giản hóa thành hai
+bước: tính toán approximate attention và tính toán attention trên ktoken. Về mặt bộ nhớ, tổng truy cập
+bao gồm O(d)byte cho Q,O(S×r)cho label cache, O(2×k×d)cho KV cache, dẫn đến tổng cộng
+O(S×r+ 2×k×d) =O(α×S×d+ 2×β×S×d). Cho rằng giai đoạn approximate attention của
+Double Sparsity không liên quan đến phép toán softmax, nó cho phép tính song song cao so với bước
+tiếp theo. Do đó, độ phức tạp IO tổng thể của Double Sparsity chủ yếu phụ thuộc vào bước sau, có thể
+được xấp xỉ là O(2×β×S×d). Phân tích này cho thấy độ phức tạp thời gian của Double Sparsity phụ
+thuộc tuyến tính vào β, và overhead bộ nhớ bổ sung tỷ lệ thuận với α. Bảng 1 tóm tắt tất cả các công
+trình sparsity được thảo luận, chỉ định overhead, độ phức tạp và tăng tốc của chúng.
+5
+
+--- TRANG 6 ---
+Bảng 1: So sánh các kỹ thuật liên quan đến sparsity. 'SparQ (1xK)' biểu thị lưu trữ một chiều
+của Key cache, trong khi 'SparQ (2xK)' đề cập đến lưu trữ hai chiều của Key cache.
+Method On-device Cache Size Cache IO-Complexity Min βSpeedup
+H2O S×β S ×β 1/5 Yes
+SparQ (1xK) S S ×β 1/8 No
+SparQ (2xK) S×1.5 S×β 1/8 Yes
+AWQ S S 1 Yes
+Double Sparsity S×(1 +α
+2) S×β 1/16 Yes
+Double Sparsity-Offload S×α
+2S×β 1/16 Yes
+Bảng 2: Perplexity của các mô hình ở nhiều mức sparsity khác nhau. Lưu ý những thay đổi tối thiểu
+trong perplexity từ mức sparsity 1 đến 1/16, với khoảng cách hiệu suất đáng kể xuất hiện giữa mức 1/16 và 1/32.
+Sparsity Level
+Model 1 1/2 1/4 1/8 1/16 1/32
+Llama-7B 5.68 5.69 5.69 5.72 5.80 7.66
+Llama-2-7B 5.47 5.48 5.53 5.56 5.76 12.01
+Llama-2-7B (offloading) 5.47 5.48 5.54 5.57 5.86 15.29
+Llama-2-7B-chat 6.94 6.94 6.96 6.92 7.14 14.93
+Llama-2-7B-chat (offloading) 6.94 6.94 6.97 6.92 7.33 20.08
+Mistral-7B 5.25 5.25 5.26 5.27 5.37 14.55
+6 Thực nghiệm
+Trong Phần 6.1, chúng tôi chứng minh rằng cả Double Sparsity và Double Sparsity-Offload duy trì
+hiệu suất mạnh mẽ với cài đặt sparsity 1/16 trên nhiều benchmark khác nhau, bao gồm Wiki-2
+perplexity (Merity et al., 2016), MultifieldQA (Bai et al., 2023), GovReport (Huang et al., 2021),
+TriviaQA (Joshi et al., 2017), và MMLU (Hendrycks et al., 2021). Trong các tác vụ key-value
+retrieval, Double Sparsity vượt trội đáng kể so với các kỹ thuật post-training sparse attention khác.
+Trong Phần 6.2, chúng tôi so sánh Double Sparsity với các triển khai attention và end-to-end
+state-of-the-art. Kết quả cho thấy Double Sparsity đạt được tăng tốc lên đến 16 lần trong các cơ chế
+attention và tăng lên đến hai lần trong tốc độ xử lý end-to-end tổng thể. Ngoài ra, Double
+Sparsity-Offload đạt được tăng tốc 16 lần so với FlexGen Offload.
+6.1 Đánh giá Độ chính xác
+6.1.1 Wiki-2 Perplexity
+Wiki-2 perplexity là một benchmark được rút ra từ các bài viết Wikipedia, cung cấp một bài kiểm tra
+toàn diện với từ vựng rộng và các đặc điểm văn bản xác thực của nó. Điểm số thấp hơn cho thấy
+hiệu suất mô hình tốt hơn. Bảng 2 minh họa những thay đổi trong perplexity qua các mức sparsity
+khác nhau cho mỗi mô hình.
+Để chứng minh hiệu suất của mô hình ở các mức sparsity khác nhau và biện minh cho việc lựa chọn
+mức sparsity 1/16 của chúng tôi, chúng tôi đã xây dựng biểu đồ thanh 3D. Theo Hình 9 trong Phụ lục C,
+một sự thay đổi đáng chú ý trong perplexity được quan sát khi mức sparsity vượt quá 1/16.
+Để xác thực độ mạnh mẽ của Double Sparsity và hiệu quả của mức sparsity 1/16, chúng tôi đã tiến hành
+một loạt nghiên cứu ablation qua nhiều cấu hình mô hình và điều kiện khác nhau. Bảng 3 chứng minh
+hiệu quả của Double Sparsity ở mức sparsity 1/16 qua nhiều kích thước mô hình, cơ chế attention và
+cấu hình MoE khác nhau.
+6.1.2 Long Context Benchmarks
+Chúng tôi đã sử dụng Llama-2-7B để đánh giá hiệu suất của Double Sparsity qua nhiều long context
+benchmark ở nhiều mức sparsity khác nhau, so sánh hiệu quả của nó với StreamingLLM và H2O.
+Như được minh họa trong Hình 3, Double Sparsity duy trì hiệu suất của nó với gần như không có sự
+sụt giảm độ chính xác ở mức sparsity 1/16, vượt trội hơn các kỹ thuật khác.
+6
+
+--- TRANG 7 ---
+Bảng 3: Nghiên cứu ablation trên các mô hình kiến trúc khác nhau với các loại outlier khác nhau ở mức sparsity
+1/16. Lưu ý rằng các mô hình GQA không tương thích với kênh outlier K.
+Model Architecture Original Double Sparsity
+random channel q outlier k outlier qk outlier
+Llama-2-7B Single/MHA 5.47 8.62 6.45 6.61 5.76
+Llama-2-7B-chat Single/MHA 6.94 10.1 7.8 9.44 7.14
+Mistral-7B Single/GQA 5.25 6.06 5.79 N/A 5.37
+Llama-2-70B Single/GQA 3.32 5.15 3.69 N/A 5.17
+Mixtral-8x7B MoE/GQA 3.84 N/A 3.84 N/A 17.3
+Hình 3: Hiệu suất của các kỹ thuật khác nhau qua nhiều mức sparsity cho long context
+benchmarks. 'DS' và 'DS-O' đề cập đến Double Sparsity và Double Sparsity-Offloading. 'Stream' đề cập đến
+Streaming-LLM.
+6.1.3 Key-Value Retrieval
+Benchmark key-value retrieval được thiết kế để đánh giá khả năng in-context retrieval của mô hình.
+Các thực nghiệm của chúng tôi so sánh Double Sparsity với các kỹ thuật post-training sparsity khác,
+bao gồm H2O, StreamingLLM, và RTN quantization (Nagel et al., 2020). Chúng tôi cũng đã kiểm tra
+hiệu suất của Double Sparsity với mô hình Vicuna-7B-16K để quan sát cách độ chính xác thay đổi khi
+độ dài context tăng. Như được hiển thị trong Hình 4, chúng tôi chứng minh rằng Double Sparsity vượt
+trội đáng kể so với các kỹ thuật khác trong các tác vụ key-value retrieval. Đáng chú ý, Double Sparsity
+và Double Sparsity-Offload hiển thị hiệu suất tương đương, nhấn mạnh rằng cơ chế offloading thể hiện
+gần như không có sự suy giảm.
+6.2 Đánh giá Tăng tốc
+6.2.1 Thiết lập
+Hardware. Các thực nghiệm của chúng tôi được tiến hành trên hai loại GPU: A10G và A100-SXM.
+Implementation. Đối với Double Sparsity Attention, chúng tôi đã sử dụng PyTorch để tính toán
+approximate attention và lựa chọn top-k token. Kernel cho attention trên top-k token được thiết kế
+bằng OpenAI Triton. Để kiểm tra end-to-end, chúng tôi đã thay thế cơ chế full attention trong gpt-fast
+(PyTorch, 2023) bằng Double Sparsity Attention của chúng tôi. Đối với Double Sparsity-Offload,
+chúng tôi đã triển khai sao chép bộ nhớ CPU sang GPU không đồng bộ bằng CUDA streams và
+kernel gathering của DGL (Wang et al., 2019).
+Workload. Chúng tôi tập trung vào các tình huống workload cao để đẩy giới hạn của Double Sparsity.
+Điều này bao gồm một loạt batch size từ 4 đến 32 và độ dài sequence từ 1024 đến 16384. Đối với
+Double Sparsity-Offload, chúng tôi mở rộng kiểm tra đến các điều kiện cực đoan trên A100 GPU,
+khám phá độ dài sequence từ 64K đến 256K. Cho rằng KV cache của gpt-fast được pre-allocated,
+throughput tokens-per-second chỉ phụ thuộc vào batch size và độ dài sequence.
+Baseline. Để đánh giá tăng tốc attention, chúng tôi sử dụng 'scaled_dot_product_attention' làm
+baseline của chúng tôi. Triển khai này xếp hạng trong số các cơ chế attention nhanh nhất, phân bổ
+động tính toán giữa các tùy chọn hiệu quả nhất bao gồm FlashAttention-2 (Dao, 2023),
+Memory-Efficient Attention (Lefaudeux et al., 2022), và các kernel hiệu suất tốt nhất từ đội PyTorch.
+Trong đánh giá tốc độ end-to-end của Double Sparsity, gpt-fast phục vụ như baseline, được phân biệt
+là state-of-the-art cho các mô hình Llama trên A100 GPU. Nó cung cấp
+7
+
+--- TRANG 8 ---
+Hình 4: Retrieval accuracy qua nhiều mức sparsity và độ dài context. 'DS' và 'DS-O'
+đề cập đến Double Sparsity và Double Sparsity-Offloading. 'Stream' đề cập đến Streaming-LLM. 'RTN'
+đề cập đến RTN Quantization.
+Hình 5: Latency và speedup của Double Sparsity Attention ở nhiều batch size và độ dài
+sequence khác nhau. 'DS' biểu thị double sparsity attention. 'Flash' biểu thị 'scaled_dot_product_attention',
+đó là nhanh nhất trong FlashAttention-2 và Memory-Efficient Attention.
+latency và throughput đặc biệt thấp vượt trội hơn huggingface transformers gấp mười lần. Để đánh giá
+Double Sparsity-Offload, chúng tôi so sánh nó với FlexGen Offloading, chia sẻ cùng codebase gpt-fast
+và memory footprint.
+Các Thiết lập Khác. Cho trọng tâm của Double Sparsity vào cơ chế attention, cả trọng số và
+activation được đặt ở độ chính xác FP16. Hơn nữa, xem xét những hạn chế do Triton kernel áp đặt
+lên các tùy chọn Torch compile, cả Double Sparsity và gpt-fast đều không sử dụng Torch compiler.
+6.2.2 Tăng tốc Attention Operator
+Hình 5 cung cấp cái nhìn toàn diện về latency và speedup của Double Sparsity so với
+'scaled_dot_product_attention' qua các batch size và độ dài sequence khác nhau. Trên A10G GPU,
+mỗi trường hợp đạt được ít nhất tăng tốc năm lần, với hơn một nửa vượt quá chín lần. Đáng chú ý,
+Double Sparsity đạt được tăng tốc tuyến tính ở độ dài sequence 4096 với batch size lớn. Trên A100 GPU,
+gần như tất cả các trường hợp thấy ít nhất xử lý nhanh gấp bốn lần, với batch lớn hơn đạt tăng tốc
+lên đến mười lần. Tăng tốc lớn hơn cho batch nhỏ hơn trên A10G có thể do thời gian khởi chạy của
+Triton kernel, trở nên đáng kể khi thời gian thực thi kernel trên A100 ngắn.
+6.2.3 Tăng tốc Suy luận End-to-End
+Hình 6 (a)(b) trình bày so sánh throughput giữa Double Sparsity và gpt-fast, được đo bằng token
+per second qua nhiều batch size và độ dài sequence khác nhau. Chúng tôi đã triển khai mô hình
+Llama-2-7B và tối đa hóa việc sử dụng bộ nhớ để đạt được điều kiện workload cao. Kết quả cho thấy
+8
+
+--- TRANG 9 ---
+Hình 6: Throughput (token/s) và speedup của Double Sparsity (Offloading) trong các tình huống end-to-end.
+Double Sparsity mang lại tăng tốc tối thiểu 1.3x qua tất cả các điều kiện được kiểm tra. Trong một số
+tình huống, tăng tốc tiếp cận hai lần, thể hiện hiệu quả tổng thể của Double Sparsity.
+Trong Hình 6 (c)(d), chúng tôi so sánh throughput của Double Sparsity-Offload với FlexGen dưới
+memory footprint bị hạn chế, được đặt ở 1/16 của KV cache đầy đủ cho cả hai phương pháp. Cả hai
+kỹ thuật đều sử dụng double buffer cho sao chép dữ liệu không đồng bộ. Kết quả cho thấy Double
+Sparsity-Offload đạt được tăng tốc 4-8 ×so với FlexGen dưới workload thông thường, và tăng tốc
+16 ×trong các tình huống với văn bản dài từ 64K đến 256K độ dài sequence.
+7 Công trình Liên quan
+Sparse Attention Inference Do overhead đáng kể của các cơ chế attention, nhiều nghiên cứu đã
+tập trung vào khai thác attention sparsity để tăng tốc suy luận. Những nỗ lực này có thể được phân
+loại dưới ba tiêu chí chính: 1) mẫu sparse tĩnh hoặc động; 2) sự hiện diện của token eviction;
+3) tăng tốc pre-filling hoặc decoding. StreamingLLM (Xiao et al., 2024) và LM-Infinite (Han et al.,
+2023) sử dụng mẫu sparse tĩnh với token eviction để tăng tốc decoding. Các phương pháp này đạt được
+tăng tốc suy luận bằng cách chỉ bảo tồn một số lượng nhỏ token ban đầu cùng với token cục bộ.
+H2O (Zhang et al., 2024) và Scissorhands (Liu et al., 2024a) sử dụng mẫu sparse động với token
+eviction cho decoding, chỉ bảo tồn một phần nhỏ của KV cache được gọi là heavy hitter theo điểm
+attention tích lũy, trong khi FastGen (Ge et al., 2024) sử dụng mẫu sparse attention thích ứng cho
+các attention head khác nhau. MInference (Jiang et al., 2024) phục vụ như một phương pháp tăng tốc
+prefilling giữ lại tất cả token. Nó đầu tiên xác định các mẫu sparse trong mô hình, và sau đó tận dụng
+các mẫu được xác định này để tính toán giai đoạn pre-filling. SparQ (Ribar et al., 2023) và Quest
+(Tang et al., 2024) triển khai sparse decoding động trong khi cũng bảo tồn tất cả token. SparQ lọc
+top-k token bằng cách sử dụng heavy channel của query. Quest phân đoạn token thành nhiều page
+và tính toán attention trên top-k page để tạo điều kiện cho quá trình decoding.
+Sparse Attention Training Cũng có nhiều nỗ lực để giảm độ phức tạp attention thông qua training
+(Qiu et al., 2020; Ding et al., 2023; Tay et al., 2020; Chen et al., 2021). Ví dụ, Sparse transformer
+(Child et al., 2019) giảm độ phức tạp xuống O(n√n)bằng cách giới thiệu sparse factorization của
+ma trận attention. Reformer (Kitaev et al., 2019) đạt được độ phức tạp O(nlogn)thông qua
+locality-sensitive hashing. Longformer (Beltagy et al., 2020), BigBard (Zaheer et al., 2020), và
+Linformer (Wang et al., 2020) tiếp tục giảm độ phức tạp xuống tuyến tính. Các kiến trúc attention
+tuyến tính cũng đã được đề xuất trong Katharopoulos et al. (2020).
+Các Tối ưu hóa Attention và Suy luận Khác Mặc dù có những nỗ lực để sparsify tính toán attention,
+có nhiều tối ưu hóa khác cho hiệu quả attention. Các kỹ thuật phổ biến bao gồm quantization và
+compression (Hooper et al., 2024; Liu et al., 2024b; Kang et al., 2024; Nawrot et al., 2024),
+kiến trúc attention hiệu quả như multi-query attention (Shazeer, 2019) và group-query attention
+(Ainslie et al., 2023), và các thuật toán attention memory-efficient (Rabe & Staats, 2021; Dao et al.,
+2022). Các lựa chọn thay thế cho transformer bao gồm sử dụng mô hình state space để loại bỏ cơ chế
+attention (Gu et al., 2021). Các tối ưu hóa suy luận phổ biến khác cho LLM bao gồm batching Yu
+et al. (2022), tối ưu hóa bộ nhớ Sheng et al. (2023b); Kwon et al. (2023); Aminabadi et al. (2022),
+parameter sharing Sheng et al. (2023a); Chen et al. (2023), speculative decoding Stern et al. (2018);
+Leviathan et al. (2023); Miao et al. (2023), scheduling Han et al. (2022); Agrawal et al. (2023);
+Patel et al. (2023); Zhong et al. (2024), quantization Xiao et al. (2023); Lin et al. (2023); Dettmers
+et al. (2022); Frantar et al. (2022), và sparsification Frantar & Alistarh (2023).
+9
+
+--- TRANG 10 ---
+8 Hướng Tương lai và Kết luận
+Hướng Tương lai. Mặc dù đã có tiến bộ với Double Sparsity, vẫn còn một số hạn chế cho thấy
+những hướng nghiên cứu đầy hứa hẹn trong tương lai. Việc chồng lấp hoàn hảo giữa giao tiếp và
+tính toán là thách thức. Nâng cao khả năng không đồng bộ để che giấu overhead giao tiếp trình bày
+một hướng đầy hứa hẹn cho phép tăng tốc đáng kể với memory footprint tối thiểu.
+Kết luận. Trong công trình này, chúng tôi đã giới thiệu Double Sparsity và Double Sparsity-Offload,
+các kỹ thuật post-training sparse attention sáng tạo. Double Sparsity tận dụng offline calibration và
+label cache để đạt được hiệu suất gần như không mất mát qua nhiều benchmark khác nhau ở mức
+sparsity 1/16. Các kiểm tra hiệu suất cho thấy Double Sparsity có thể tăng tốc tính toán attention
+lên đến 16×và đạt được tăng tốc end-to-end 1.9 ×. Double Sparsity-Offload giảm đáng kể việc sử dụng
+bộ nhớ KV Cache xuống 1/16, vượt trội hơn throughput của các kỹ thuật offloading SOTA trước đây
+16 lần.
+Tài liệu tham khảo
+Amey Agrawal, Ashish Panwar, Jayashree Mohan, Nipun Kwatra, Bhargav S Gulavani, và Ra-
+machandran Ramjee. Sarathi: Efficient llm inference by piggybacking decodes with chunked
+prefills. arXiv preprint arXiv:2308.16369 , 2023.
+Joshua Ainslie, James Lee-Thorp, Michiel de Jong, Yury Zemlyanskiy, Federico Lebrón, và Sumit
+Sanghai. Gqa: Training generalized multi-query transformer models from multi-head checkpoints.
+arXiv preprint arXiv:2305.13245 , 2023.
+Reza Yazdani Aminabadi, Samyam Rajbhandari, Minjia Zhang, Ammar Ahmad Awan, Cheng
+Li, Du Li, Elton Zheng, Jeff Rasley, Shaden Smith, Olatunji Ruwase, et al. Deepspeed infer-
+ence: Enabling efficient inference of transformer models at unprecedented scale. arXiv preprint
+arXiv:2207.00032 , 2022.
+Sotiris Anagnostidis, Dario Pavllo, Luca Biggio, Lorenzo Noci, Aurelien Lucchi, và Thomas
+Hofmann. Dynamic context pruning for efficient and interpretable autoregressive transformers.
+Advances in Neural Information Processing Systems , 36, 2024.
+Yushi Bai, Xin Lv, Jiajie Zhang, Hongchang Lyu, Jiankai Tang, Zhidian Huang, Zhengxiao Du,
+Xiao Liu, Aohan Zeng, Lei Hou, Yuxiao Dong, Jie Tang, và Juanzi Li. Longbench: A bilingual,
+multitask benchmark for long context understanding, 2023.
+Iz Beltagy, Matthew E Peters, và Arman Cohan. Longformer: The long-document transformer.
+arXiv preprint arXiv:2004.05150 , 2020.
+Beidi Chen, Tri Dao, Eric Winsor, Zhao Song, Atri Rudra, và Christopher Ré. Scatterbrain:
+Unifying sparse and low-rank attention. Advances in Neural Information Processing Systems , 34:
+17413–17426, 2021.
+Lequn Chen, Zihao Ye, Yongji Wu, Danyang Zhuo, Luis Ceze, và Arvind Krishnamurthy. Punica:
+Multi-tenant lora serving. arXiv preprint arXiv:2310.18547 , 2023.
+Rewon Child, Scott Gray, Alec Radford, và Ilya Sutskever. Generating long sequences with sparse
+transformers. URL https://openai.com/blog/sparse-transformers , 2019.
+Tri Dao. Flashattention-2: Faster attention with better parallelism and work partitioning, 2023.
+Tri Dao, Dan Fu, Stefano Ermon, Atri Rudra, và Christopher Ré. Flashattention: Fast and memory-
+efficient exact attention with io-awareness. Advances in Neural Information Processing Systems ,
+35:16344–16359, 2022.
+Tim Dettmers, Mike Lewis, Younes Belkada, và Luke Zettlemoyer. Gpt3. int8 (): 8-bit matrix
+multiplication for transformers at scale. Advances in Neural Information Processing Systems , 35:
+30318–30332, 2022.
+Jiayu Ding, Shuming Ma, Li Dong, Xingxing Zhang, Shaohan Huang, Wenhui Wang, Nanning
+Zheng, và Furu Wei. Longnet: Scaling transformers to 1,000,000,000 tokens. arXiv preprint
+arXiv:2307.02486 , 2023.
+10
+
+--- TRANG 11 ---
+Elias Frantar và Dan Alistarh. Sparsegpt: Massive language models can be accurately pruned in
+one-shot. In International Conference on Machine Learning , pp. 10323–10337. PMLR, 2023.
+Elias Frantar, Saleh Ashkboos, Torsten Hoefler, và Dan Alistarh. Optq: Accurate quantization
+for generative pre-trained transformers. In The Eleventh International Conference on Learning
+Representations , 2022.
+Suyu Ge, Yunan Zhang, Liyuan Liu, Minjia Zhang, Jiawei Han, và Jianfeng Gao. Model tells
+you what to discard: Adaptive KV cache compression for LLMs. In The Twelfth International
+Conference on Learning Representations , 2024. URL https://openreview.net/forum?id=
+uNrFpDPMyo .
+Google. Gemini: a family of highly capable multimodal models. arXiv preprint arXiv:2312.11805 ,
+2023.
+Albert Gu, Karan Goel, và Christopher Re. Efficiently modeling long sequences with structured
+state spaces. In International Conference on Learning Representations , 2021.
+Chi Han, Qifan Wang, Wenhan Xiong, Yu Chen, Heng Ji, và Sinong Wang. Lm-infinite: Simple
+on-the-fly length generalization for large language models. arXiv preprint arXiv:2308.16137 ,
+2023.
+Mingcong Han, Hanze Zhang, Rong Chen, và Haibo Chen. Microsecond-scale preemption for
+concurrent {GPU-accelerated }{DNN}inferences. In 16th USENIX Symposium on Operating
+Systems Design and Implementation (OSDI 22) , pp. 539–558, 2022.
+Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou, Mantas Mazeika, Dawn Song, và Jacob
+Steinhardt. Measuring massive multitask language understanding. Proceedings of the International
+Conference on Learning Representations (ICLR) , 2021.
+Coleman Hooper, Sehoon Kim, Hiva Mohammadzadeh, Michael W Mahoney, Yakun Sophia Shao,
+Kurt Keutzer, và Amir Gholami. Kvquant: Towards 10 million context length llm inference with
+kv cache quantization. arXiv preprint arXiv:2401.18079 , 2024.
+Luyang Huang, Shuyang Cao, Nikolaus Parulian, Heng Ji, và Lu Wang. Efficient attentions for long
+document summarization, 2021.
+Samy Jelassi, David Brandfonbrener, Sham M Kakade, và Eran Malach. Repeat after me: Trans-
+formers are better than state space models at copying. arXiv preprint arXiv:2402.01032 , 2024.
+Huiqiang Jiang, Yucheng Li, Chengruidong Zhang, Qianhui Wu, Xufang Luo, Surin Ahn, Zhenhua
+Han, Amir H. Abdi, Dongsheng Li, Chin-Yew Lin, Yuqing Yang, và Lili Qiu. Minference
+1.0: Accelerating pre-filling for long-context llms via dynamic sparse attention, 2024. URL
+https://arxiv.org/abs/2407.02490 .
+Mandar Joshi, Eunsol Choi, Daniel Weld, và Luke Zettlemoyer. triviaqa: A Large Scale Distantly
+Supervised Challenge Dataset for Reading Comprehension. arXiv e-prints , art. arXiv:1705.03551,
+2017.
+Hao Kang, Qingru Zhang, Souvik Kundu, Geonhwa Jeong, Zaoxing Liu, Tushar Krishna, và Tuo
+Zhao. Gear: An efficient kv cache compression recipefor near-lossless generative inference of llm.
+arXiv preprint arXiv:2403.05527 , 2024.
+Angelos Katharopoulos, Apoorv Vyas, Nikolaos Pappas, và François Fleuret. Transformers are rnns:
+Fast autoregressive transformers with linear attention. In International conference on machine
+learning , pp. 5156–5165. PMLR, 2020.
+Nikita Kitaev, Lukasz Kaiser, và Anselm Levskaya. Reformer: The efficient transformer. In
+International Conference on Learning Representations , 2019.
+Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph
+Gonzalez, Hao Zhang, và Ion Stoica. Efficient memory management for large language model
+serving with pagedattention. In Proceedings of the 29th Symposium on Operating Systems
+Principles , pp. 611–626, 2023.
+11
+
+--- TRANG 12 ---
+Benjamin Lefaudeux, Francisco Massa, Diana Liskovich, Wenhan Xiong, Vittorio Caggiano, Sean
+Naren, Min Xu, Jieru Hu, Marta Tintore, Susan Zhang, Patrick Labatut, Daniel Haziza, Luca
+Wehrstedt, Jeremy Reizenstein, và Grigory Sizov. xformers: A modular and hackable transformer
+modelling library. https://github.com/facebookresearch/xformers , 2022.
+Yaniv Leviathan, Matan Kalman, và Yossi Matias. Fast inference from transformers via speculative
+decoding. In International Conference on Machine Learning , pp. 19274–19286. PMLR, 2023.
+Ji Lin, Jiaming Tang, Haotian Tang, Shang Yang, Xingyu Dang, và Song Han. Awq: Activation-
+aware weight quantization for llm compression and acceleration. arXiv preprint arXiv:2306.00978 ,
+2023.
+Zichang Liu, Aditya Desai, Fangshuo Liao, Weitao Wang, Victor Xie, Zhaozhuo Xu, Anastasios
+Kyrillidis, và Anshumali Shrivastava. Scissorhands: Exploiting the persistence of importance
+hypothesis for llm kv cache compression at test time. Advances in Neural Information Processing
+Systems , 36, 2024a.
+Zirui Liu, Jiayi Yuan, Hongye Jin, Shaochen Zhong, Zhaozhuo Xu, Vladimir Braverman, Beidi
+Chen, và Xia Hu. Kivi: A tuning-free asymmetric 2bit quantization for kv cache. arXiv preprint
+arXiv:2402.02750 , 2024b.
+Stephen Merity, Caiming Xiong, James Bradbury, và Richard Socher. Pointer sentinel mixture
+models, 2016.
+Xupeng Miao, Gabriele Oliaro, Zhihao Zhang, Xinhao Cheng, Zeyu Wang, Rae Ying Yee Wong,
+Zhuoming Chen, Daiyaan Arfeen, Reyna Abhyankar, và Zhihao Jia. Specinfer: Accelerating
+generative llm serving with speculative inference and token tree verification. arXiv preprint
+arXiv:2305.09781 , 2023.
+Markus Nagel, Rana Ali Amjad, Mart van Baalen, Christos Louizos, và Tijmen Blankevoort. Up or
+down? adaptive rounding for post-training quantization, 2020.
+Piotr Nawrot, Adrian Ła ´ncucki, Marcin Chochowski, David Tarjan, và Edoardo M Ponti. Dynamic
+memory compression: Retrofitting llms for accelerated inference. arXiv preprint arXiv:2403.09636 ,
+2024.
+OpenAI. Gpt-4 technical report. arXiv preprint arXiv:2303.08774 , 2023.
+Pratyush Patel, Esha Choukse, Chaojie Zhang, Íñigo Goiri, Aashaka Shah, Saeed Maleki, và Ricardo
+Bianchini. Splitwise: Efficient generative llm inference using phase splitting. arXiv preprint
+arXiv:2311.18677 , 2023.
+Reiner Pope, Sholto Douglas, Aakanksha Chowdhery, Jacob Devlin, James Bradbury, Jonathan
+Heek, Kefan Xiao, Shivani Agrawal, và Jeff Dean. Efficiently scaling transformer inference.
+Proceedings of Machine Learning and Systems , 5, 2023.
+PyTorch. Accelerating generative ai with pytorch 2.0. https://pytorch.org/blog/
+accelerating-generative-ai-2/ , May 2023.
+Jiezhong Qiu, Hao Ma, Omer Levy, Wen-tau Yih, Sinong Wang, và Jie Tang. Blockwise self-
+attention for long document understanding. In Findings of the Association for Computational
+Linguistics: EMNLP 2020 , pp. 2555–2565, 2020.
+Markus N Rabe và Charles Staats. Self-attention does not need o(n2)memory. arXiv preprint
+arXiv:2112.05682 , 2021.
+Luka Ribar, Ivan Chelombiev, Luke Hudlass-Galley, Charlie Blake, Carlo Luschi, và Douglas Orr.
+Sparq attention: Bandwidth-efficient llm inference. arXiv preprint arXiv:2312.04985 , 2023.
+Noam Shazeer. Fast transformer decoding: One write-head is all you need. arXiv preprint
+arXiv:1911.02150 , 2019.
+Ying Sheng, Shiyi Cao, Dacheng Li, Coleman Hooper, Nicholas Lee, Shuo Yang, Christopher Chou,
+Banghua Zhu, Lianmin Zheng, Kurt Keutzer, Joseph E. Gonzalez, và Ion Stoica. S-lora: Serving
+thousands of concurrent lora adapters. arXiv preprint arXiv:2311.03285 , 2023a.
+12
+
+--- TRANG 13 ---
+Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan Li, Max Ryabinin, Beidi Chen, Percy Liang,
+Christopher Ré, Ion Stoica, và Ce Zhang. Flexgen: High-throughput generative inference of
+large language models with a single gpu. In International Conference on Machine Learning , pp.
+31094–31116. PMLR, 2023b.
+Mitchell Stern, Noam Shazeer, và Jakob Uszkoreit. Blockwise parallel decoding for deep autore-
+gressive models. Advances in Neural Information Processing Systems , 31, 2018.
+Jiaming Tang, Yilong Zhao, Kan Zhu, Guangxuan Xiao, Baris Kasikci, và Song Han. Quest:
+Query-aware sparsity for efficient long-context llm inference, 2024.
+Yi Tay, Dara Bahri, Liu Yang, Donald Metzler, và Da-Cheng Juan. Sparse sinkhorn attention. In
+International Conference on Machine Learning , pp. 9438–9447. PMLR, 2020.
+Yi Tay, Mostafa Dehghani, Dara Bahri, và Donald Metzler. Efficient transformers: A survey. ACM
+Computing Surveys , 55(6):1–28, 2022.
+Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei, Nikolay
+Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, et al. Llama 2: Open foundation
+and fine-tuned chat models. arXiv preprint arXiv:2307.09288 , 2023.
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Łukasz
+Kaiser, và Illia Polosukhin. Attention is all you need. Advances in neural information processing
+systems , 30, 2017.
+Minjie Wang, Da Zheng, Zihao Ye, Quan Gan, Mufei Li, Xiang Song, Jinjing Zhou, Chao Ma,
+Lingfan Yu, Yu Gai, Tianjun Xiao, Tong He, George Karypis, Jinyang Li, và Zheng Zhang.
+Deep graph library: A graph-centric, highly-performant package for graph neural networks. arXiv
+preprint arXiv:1909.01315 , 2019.
+Sinong Wang, Belinda Z Li, Madian Khabsa, Han Fang, và Hao Ma. Linformer: Self-attention with
+linear complexity. arXiv preprint arXiv:2006.04768 , 2020.
+Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu, Julien Demouth, và Song Han. Smoothquant:
+Accurate and efficient post-training quantization for large language models. In International
+Conference on Machine Learning , pp. 38087–38099. PMLR, 2023.
+Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song Han, và Mike Lewis. Efficient streaming
+language models with attention sinks. In The Twelfth International Conference on Learning
+Representations , 2024. URL https://openreview.net/forum?id=NG7sS51zVF .
+Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soojeong Kim, và Byung-Gon Chun. Orca:
+A distributed serving system for {Transformer-Based }generative models. In 16th USENIX
+Symposium on Operating Systems Design and Implementation (OSDI 22) , pp. 521–538, 2022.
+Manzil Zaheer, Guru Guruganesh, Kumar Avinava Dubey, Joshua Ainslie, Chris Alberti, Santiago
+Ontanon, Philip Pham, Anirudh Ravula, Qifan Wang, Li Yang, et al. Big bird: Transformers for
+longer sequences. Advances in neural information processing systems , 33:17283–17297, 2020.
+Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong Chen, Lianmin Zheng, Ruisi Cai, Zhao Song,
+Yuandong Tian, Christopher Ré, Clark Barrett, et al. H2o: Heavy-hitter oracle for efficient
+generative inference of large language models. Advances in Neural Information Processing
+Systems , 36, 2024.
+Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, Xuanzhe Liu, Xin Jin, và Hao
+Zhang. Distserve: Disaggregating prefill and decoding for goodput-optimized large language
+model serving. arXiv preprint arXiv:2401.09670 , 2024.
+13
+
+--- TRANG 14 ---
+A Minh họa Offline Calibration
+Trục x của Hình 7b biểu thị tỷ lệ của các kênh top-k được chọn so với tổng số kênh, trong khi
+trục y định lượng mức độ chồng lấp giữa các outlier offline và online.
+(a) Các kênh Outlier của AWQ và Double Sparsity.
+(b) Tỷ lệ chồng lấp kênh outlier giữa offline
+calibration và online decoding.
+Hình 7: Phân tích calibration Double Sparsity trong việc xác định các kênh outlier
+B Nghiên cứu Ablation
+B.1 Forward không có Label Cache
+Để điều tra tầm quan trọng của label cache trong forward pass của Double Sparsity, chúng tôi đã
+tiến hành thực nghiệm so sánh hiệu suất có và không có label cache. Như được mô tả trong Bảng 4,
+label cache cải thiện đáng kể forward pass, mang lại tăng tốc từ 2 đến 4 lần.
+Bảng 4: Latency so sánh hiệu suất Có và Không có Label Cache.
+Batch Seq Len With Label Cache (ms) Without Label Cache (ms) Speedup
+4 2048 0.165 0.279 1.7
+4 4096 0.181 0.559 3.1
+4 8192 0.504 1.250 2.5
+4 16384 1.550 3.000 1.9
+32 2048 0.467 1.960 4.2
+32 4096 0.983 3.950 4.0
+32 8192 3.600 9.540 2.6
+32 16384 12.600 24.000 1.9
+B.2 Sự tương tự Embedding qua các Lớp
+Hình 8: Cosine similarity trung bình của embedding qua tất cả attention head giữa các lớp 0-1, 1-2,
+2-3, và 3-4 trên tập dữ liệu Pile cho mô hình Llama-2-7B.
+14
+
+--- TRANG 15 ---
+C Minh họa Lựa chọn Perplexity
+Hình 9 sử dụng token-level sparsity làm trục x, channel-level sparsity làm trục y, và giá trị 10-perplexity
+làm trục z, trong đó các thanh cao hơn cho thấy hiệu suất tốt hơn. Một sự thay đổi đột ngột trong
+perplexity được quan sát khi mức sparsity vượt quá 1/16.
+Hình 9: Perplexity của các mô hình ở các mức token-sparsity và channel-sparsity khác nhau. Đáng chú ý,
+các thanh đỏ, đại diện cho mức sparsity 1/16 cho cả token và channel, cho thấy hiệu suất của mô hình
+vẫn phần lớn nhất quán với mô hình gốc ở mức này.
+15
+
+--- TRANG 16 ---
+NeurIPS Paper Checklist
+1.Claims
+Question: Do the main claims made in the abstract and introduction accurately reflect the
+paper's contributions and scope?
+Answer: [Yes]
+Justification: Các khẳng định trong abstract và introduction được xác minh thực nghiệm bởi
+phần thực nghiệm 6.
+Guidelines:
+•The answer NA means that the abstract and introduction do not include the claims
+made in the paper.
+•The abstract and/or introduction should clearly state the claims made, including the
+contributions made in the paper and important assumptions and limitations. A No or
+NA answer to this question will not be perceived well by the reviewers.
+•The claims made should match theoretical and experimental results, and reflect how
+much the results can be expected to generalize to other settings.
+•It is fine to include aspirational goals as motivation as long as it is clear that these goals
+are not attained by the paper.
+2.Limitations
+Question: Does the paper discuss the limitations of the work performed by the authors?
+Answer: [Yes]
+Justification: Các hạn chế và hướng tương lai để giải quyết chúng được thảo luận trong 8.
+Guidelines:
+•The answer NA means that the paper has no limitation while the answer No means that
+the paper has limitations, but those are not discussed in the paper.
+• The authors are encouraged to create a separate "Limitations" section in their paper.
+•The paper should point out any strong assumptions and how robust the results are to
+violations of these assumptions (e.g., independence assumptions, noiseless settings,
+model well-specification, asymptotic approximations only holding locally). The authors
+should reflect on how these assumptions might be violated in practice and what the
+implications would be.
+•The authors should reflect on the scope of the claims made, e.g., if the approach was
+only tested on a few datasets or with a few runs. In general, empirical results often
+depend on implicit assumptions, which should be articulated.
+•The authors should reflect on the factors that influence the performance of the approach.
+For example, a facial recognition algorithm may perform poorly when image resolution
+is low or images are taken in low lighting. Or a speech-to-text system might not be
+used reliably to provide closed captions for online lectures because it fails to handle
+technical jargon.
+•The authors should discuss the computational efficiency of the proposed algorithms
+and how they scale with dataset size.
+•If applicable, the authors should discuss possible limitations of their approach to
+address problems of privacy and fairness.
+•While the authors might fear that complete honesty about limitations might be used by
+reviewers as grounds for rejection, a worse outcome might be that reviewers discover
+limitations that aren't acknowledged in the paper. The authors should use their best
+judgment and recognize that individual actions in favor of transparency play an impor-
+tant role in developing norms that preserve the integrity of the community. Reviewers
+will be specifically instructed to not penalize honesty concerning limitations.
+3.Theory Assumptions and Proofs
+Question: For each theoretical result, does the paper provide the full set of assumptions and
+a complete (and correct) proof?
+Answer: [NA]
+16
+
+--- TRANG 17 ---
+Justification: Chúng tôi không bao gồm kết quả lý thuyết. Tất cả kết quả đều được rút ra từ
+thực nghiệm.
+Guidelines:
+• The answer NA means that the paper does not include theoretical results.
+•All the theorems, formulas, and proofs in the paper should be numbered and cross-
+referenced.
+•All assumptions should be clearly stated or referenced in the statement of any theorems.
+•The proofs can either appear in the main paper or the supplemental material, but if
+they appear in the supplemental material, the authors are encouraged to provide a short
+proof sketch to provide intuition.
+•Inversely, any informal proof provided in the core of the paper should be complemented
+by formal proofs provided in appendix or supplemental material.
+• Theorems and Lemmas that the proof relies upon should be properly referenced.
+4.Experimental Result Reproducibility
+Question: Does the paper fully disclose all the information needed to reproduce the main ex-
+perimental results of the paper to the extent that it affects the main claims and/or conclusions
+of the paper (regardless of whether the code and data are provided or not)?
+Answer: [Yes]
+Justification: Các thiết lập thực nghiệm được mô tả trong Phần 6.1 và Phần 6.2. Mã nguồn
+có sẵn.
+Guidelines:
+• The answer NA means that the paper does not include experiments.
+•If the paper includes experiments, a No answer to this question will not be perceived
+well by the reviewers: Making the paper reproducible is important, regardless of
+whether the code and data are provided or not.
+•If the contribution is a dataset and/or model, the authors should describe the steps taken
+to make their results reproducible or verifiable.
+•Depending on the contribution, reproducibility can be accomplished in various ways.
+For example, if the contribution is a novel architecture, describing the architecture fully
+might suffice, or if the contribution is a specific model and empirical evaluation, it may
+be necessary to either make it possible for others to replicate the model with the same
+dataset, or provide access to the model. In general. releasing code and data is often
+one good way to accomplish this, but reproducibility can also be provided via detailed
+instructions for how to replicate the results, access to a hosted model (e.g., in the case
+of a large language model), releasing of a model checkpoint, or other means that are
+appropriate to the research performed.
+•While NeurIPS does not require releasing code, the conference does require all submis-
+sions to provide some reasonable avenue for reproducibility, which may depend on the
+nature of the contribution. For example
+(a)If the contribution is primarily a new algorithm, the paper should make it clear how
+to reproduce that algorithm.
+(b)If the contribution is primarily a new model architecture, the paper should describe
+the architecture clearly and fully.
+(c)If the contribution is a new model (e.g., a large language model), then there should
+either be a way to access this model for reproducing the results or a way to reproduce
+the model (e.g., with an open-source dataset or instructions for how to construct
+the dataset).
+(d)We recognize that reproducibility may be tricky in some cases, in which case
+authors are welcome to describe the particular way they provide for reproducibility.
+In the case of closed-source models, it may be that access to the model is limited in
+some way (e.g., to registered users), but it should be possible for other researchers
+to have some path to reproducing or verifying the results.
+5.Open access to data and code
+17
+
+--- TRANG 18 ---
+Question: Does the paper provide open access to the data and code, with sufficient instruc-
+tions to faithfully reproduce the main experimental results, as described in supplemental
+material?
+Answer: [Yes]
+Justification: Mã nguồn có sẵn.
+Guidelines:
+• The answer NA means that paper does not include experiments requiring code.
+•Please see the NeurIPS code and data submission guidelines ( https://nips.cc/
+public/guides/CodeSubmissionPolicy ) for more details.
+•While we encourage the release of code and data, we understand that this might not be
+possible, so "No" is an acceptable answer. Papers cannot be rejected simply for not
+including code, unless this is central to the contribution (e.g., for a new open-source
+benchmark).
+•The instructions should contain the exact command and environment needed to run to
+reproduce the results. See the NeurIPS code and data submission guidelines ( https:
+//nips.cc/public/guides/CodeSubmissionPolicy ) for more details.
+•The authors should provide instructions on data access and preparation, including how
+to access the raw data, preprocessed data, intermediate data, and generated data, etc.
+•The authors should provide scripts to reproduce all experimental results for the new
+proposed method and baselines. If only a subset of experiments are reproducible, they
+should state which ones are omitted from the script and why.
+•At submission time, to preserve anonymity, the authors should release anonymized
+versions (if applicable).
+•Providing as much information as possible in supplemental material (appended to the
+paper) is recommended, but including URLs to data and code is permitted.
+6.Experimental Setting/Details
+Question: Does the paper specify all the training and test details (e.g., data splits, hyper-
+parameters, how they were chosen, type of optimizer, etc.) necessary to understand the
+results?
+Answer: [Yes]
+Justification: Các thiết lập thực nghiệm được mô tả trong Phần 6.1 và Phần 6.2. Mã nguồn
+có sẵn. Mã nguồn có sẵn.
+Guidelines:
+• The answer NA means that the paper does not include experiments.
+•The experimental setting should be presented in the core of the paper to a level of detail
+that is necessary to appreciate the results and make sense of them.
+•The full details can be provided either with the code, in appendix, or as supplemental
+material.
+7.Experiment Statistical Significance
+Question: Does the paper report error bars suitably and correctly defined or other appropriate
+information about the statistical significance of the experiments?
+Answer: [Yes]
+Justification: Chúng tôi đo throughput và latency bằng cách chạy một số lượng lớn đủ các
+bài kiểm tra và báo cáo trung bình. Những kết quả này có tính xác định cao, vì vậy chúng tôi
+không bao gồm error bar trong các hình để duy trì sự rõ ràng. Những cải thiện có ý nghĩa
+thống kê.
+Guidelines:
+• The answer NA means that the paper does not include experiments.
+•The authors should answer "Yes" if the results are accompanied by error bars, confi-
+dence intervals, or statistical significance tests, at least for the experiments that support
+the main claims of the paper.
+18
+
+--- TRANG 19 ---
+•The factors of variability that the error bars are capturing should be clearly stated (for
+example, train/test split, initialization, random drawing of some parameter, or overall
+run with given experimental conditions).
+•The method for calculating the error bars should be explained (closed form formula,
+call to a library function, bootstrap, etc.)
+• The assumptions made should be given (e.g., Normally distributed errors).
+•It should be clear whether the error bar is the standard deviation or the standard error
+of the mean.
+•It is OK to report 1-sigma error bars, but one should state it. The authors should
+preferably report a 2-sigma error bar than state that they have a 96% CI, if the hypothesis
+of Normality of errors is not verified.
+•For asymmetric distributions, the authors should be careful not to show in tables or
+figures symmetric error bars that would yield results that are out of range (e.g. negative
+error rates).
+•If error bars are reported in tables or plots, The authors should explain in the text how
+they were calculated and reference the corresponding figures or tables in the text.
+8.Experiments Compute Resources
+Question: For each experiment, does the paper provide sufficient information on the com-
+puter resources (type of compute workers, memory, time of execution) needed to reproduce
+the experiments?
+Answer: [Yes]
+Justification: Các thiết lập thực nghiệm được mô tả trong Phần 6.2. Chúng tôi sử dụng các
+NVIDIA GPU phổ biến để tiến hành thực nghiệm. Mã nguồn có sẵn.
+Guidelines:
+• The answer NA means that the paper does not include experiments.
+•The paper should indicate the type of compute workers CPU or GPU, internal cluster,
+or cloud provider, including relevant memory and storage.
+•The paper should provide the amount of compute required for each of the individual
+experimental runs as well as estimate the total compute.
+•The paper should disclose whether the full research project required more compute
+than the experiments reported in the paper (e.g., preliminary or failed experiments that
+didn't make it into the paper).
+9.Code Of Ethics
+Question: Does the research conducted in the paper conform, in every respect, with the
+NeurIPS Code of Ethics https://neurips.cc/public/EthicsGuidelines ?
+Answer: [Yes]
+Justification: Nghiên cứu tôn trọng NeurIPS Code of Ethics.
+Guidelines:
+•The answer NA means that the authors have not reviewed the NeurIPS Code of Ethics.
+•If the authors answer No, they should explain the special circumstances that require a
+deviation from the Code of Ethics.
+•The authors should make sure to preserve anonymity (e.g., if there is a special consid-
+eration due to laws or regulations in their jurisdiction).
+10.Broader Impacts
+Question: Does the paper discuss both potential positive societal impacts and negative
+societal impacts of the work performed?
+Answer: [NA]
+Justification: Các kỹ thuật được giới thiệu trong bài báo này làm cho việc sử dụng các mô hình
+ngôn ngữ lớn dễ dàng và hiệu quả hơn. Chúng không có tác động xã hội trực tiếp bổ sung
+ngoài tác động xã hội hiện có của các mô hình ngôn ngữ lớn. Tuy nhiên, vì chúng tăng tốc
+việc thực thi LLM, chúng có thể khuếch đại tác động xã hội hiện có của các mô hình này,
+dù tích cực hay tiêu cực.
+19
+
+--- TRANG 20 ---
+Guidelines:
+• The answer NA means that there is no societal impact of the work performed.
+•If the authors answer NA or No, they should explain why their work has no societal
+impact or why the paper does not address societal impact.
+•Examples of negative societal impacts include potential malicious or unintended uses
+(e.g., disinformation, generating fake profiles, surveillance), fairness considerations
+(e.g., deployment of technologies that could make decisions that unfairly impact specific
+groups), privacy considerations, and security considerations.
+•The conference expects that many papers will be foundational research and not tied
+to particular applications, let alone deployments. However, if there is a direct path to
+any negative applications, the authors should point it out. For example, it is legitimate
+to point out that an improvement in the quality of generative models could be used to
+generate deepfakes for disinformation. On the other hand, it is not needed to point out
+that a generic algorithm for optimizing neural networks could enable people to train
+models that generate Deepfakes faster.
+•The authors should consider possible harms that could arise when the technology is
+being used as intended and functioning correctly, harms that could arise when the
+technology is being used as intended but gives incorrect results, and harms following
+from (intentional or unintentional) misuse of the technology.
+•If there are negative societal impacts, the authors could also discuss possible mitigation
+strategies (e.g., gated release of models, providing defenses in addition to attacks,
+mechanisms for monitoring misuse, mechanisms to monitor how a system learns from
+feedback over time, improving the efficiency and accessibility of ML).
+11.Safeguards
+Question: Does the paper describe safeguards that have been put in place for responsible
+release of data or models that have a high risk for misuse (e.g., pretrained language models,
+image generators, or scraped datasets)?
+Answer: [NA]
+Justification: Bài báo này không phát hành tập dữ liệu hoặc mô hình mới, vì vậy điều này
+không áp dụng.
+Guidelines:
+• The answer NA means that the paper poses no such risks.
+•Released models that have a high risk for misuse or dual-use should be released with
+necessary safeguards to allow for controlled use of the model, for example by requiring
+that users adhere to usage guidelines or restrictions to access the model or implementing
+safety filters.
+•Datasets that have been scraped from the Internet could pose safety risks. The authors
+should describe how they avoided releasing unsafe images.
+•We recognize that providing effective safeguards is challenging, and many papers do
+not require this, but we encourage authors to take this into account and make a best
+faith effort.
+12.Licenses for existing assets
+Question: Are the creators or original owners of assets (e.g., code, data, models), used in
+the paper, properly credited and are the license and terms of use explicitly mentioned and
+properly respected?
+Answer: [Yes]
+Justification: Bài báo này sử dụng các mô hình open-weight và tập dữ liệu công khai cho
+thực nghiệm. Việc sử dụng tôn trọng tất cả các giấy phép gốc.
+Guidelines:
+• The answer NA means that the paper does not use existing assets.
+• The authors should cite the original paper that produced the code package or dataset.
+•The authors should state which version of the asset is used and, if possible, include a
+URL.
+• The name of the license (e.g., CC-BY 4.0) should be included for each asset.
+20
+
+--- TRANG 21 ---
+•For scraped data from a particular source (e.g., website), the copyright and terms of
+service of that source should be provided.
+•If assets are released, the license, copyright information, and terms of use in the
+package should be provided. For popular datasets, paperswithcode.com/datasets
+has curated licenses for some datasets. Their licensing guide can help determine the
+license of a dataset.
+•For existing datasets that are re-packaged, both the original license and the license of
+the derived asset (if it has changed) should be provided.
+•If this information is not available online, the authors are encouraged to reach out to
+the asset's creators.
+13.New Assets
+Question: Are new assets introduced in the paper well documented and is the documentation
+provided alongside the assets?
+Answer: [NA]
+Justification: Bài báo này không phát hành tài sản mới.
+Guidelines:
+• The answer NA means that the paper does not release new assets.
+•Researchers should communicate the details of the dataset/code/model as part of their
+submissions via structured templates. This includes details about training, license,
+limitations, etc.
+•The paper should discuss whether and how consent was obtained from people whose
+asset is used.
+•At submission time, remember to anonymize your assets (if applicable). You can either
+create an anonymized URL or include an anonymized zip file.
+14.Crowdsourcing and Research with Human Subjects
+Question: For crowdsourcing experiments and research with human subjects, does the paper
+include the full text of instructions given to participants and screenshots, if applicable, as
+well as details about compensation (if any)?
+Answer: [NA]
+Justification: Bài báo này không liên quan đến crowdsourcing cũng không nghiên cứu với
+con người.
+Guidelines:
+•The answer NA means that the paper does not involve crowdsourcing nor research with
+human subjects.
+•Including this information in the supplemental material is fine, but if the main contribu-
+tion of the paper involves human subjects, then as much detail as possible should be
+included in the main paper.
+•According to the NeurIPS Code of Ethics, workers involved in data collection, curation,
+or other labor should be paid at least the minimum wage in the country of the data
+collector.
+15.Institutional Review Board (IRB) Approvals or Equivalent for Research with Human
+Subjects
+Question: Does the paper describe potential risks incurred by study participants, whether
+such risks were disclosed to the subjects, and whether Institutional Review Board (IRB)
+approvals (or an equivalent approval/review based on the requirements of your country or
+institution) were obtained?
+Answer: [NA]
+Justification: Bài báo này không liên quan đến crowdsourcing cũng không nghiên cứu với
+con người.
+Guidelines:
+•The answer NA means that the paper does not involve crowdsourcing nor research with
+human subjects.
+21
+
+--- TRANG 22 ---
+•Depending on the country in which research is conducted, IRB approval (or equivalent)
+may be required for any human subjects research. If you obtained IRB approval, you
+should clearly state this in the paper.
+•We recognize that the procedures for this may vary significantly between institutions
+and locations, and we expect authors to adhere to the NeurIPS Code of Ethics and the
+guidelines for their institution.
+•For initial submissions, do not include any information that would break anonymity (if
+applicable), such as the institution conducting the review.
+22

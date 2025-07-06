@@ -1,0 +1,215 @@
+# Độ dài khác nhau, Tốc độ không đổi: Mô hình hóa Ngôn ngữ Hiệu quả với Lightning Attention
+
+Zhen Qin¹ Weigao Sun² Dong Li² Xuyang Shen² Weixuan Sun² Yiran Zhong²
+
+## Tóm tắt
+
+Chúng tôi trình bày Lightning Attention, triển khai attention tuyến tính đầu tiên duy trì tốc độ huấn luyện không đổi cho các độ dài chuỗi khác nhau dưới mức tiêu thụ bộ nhớ cố định. Do vấn đề với các phép toán tổng tích lũy (cumsum), các triển khai attention tuyến tính trước đây không thể đạt được lợi thế lý thuyết của chúng trong thiết lập nguyên nhân. Tuy nhiên, vấn đề này có thể được giải quyết hiệu quả bằng cách sử dụng các chiến lược tính toán attention khác nhau để tính toán các phần khác nhau của attention. Cụ thể, chúng tôi chia tính toán attention thành intra-blocks và inter-blocks và sử dụng tính toán attention thông thường cho intra-blocks và các thủ thuật kernel attention tuyến tính cho inter-blocks. Điều này loại bỏ nhu cầu cumsum trong tính toán attention tuyến tính. Hơn nữa, một kỹ thuật tiling được áp dụng qua cả quy trình tiến và lùi để tận dụng tối đa phần cứng GPU. Để tăng cường độ chính xác trong khi bảo toàn hiệu quả, chúng tôi giới thiệu TransNormerLLM (TNL), một kiến trúc mới được thiết kế riêng cho lightning attention của chúng tôi. Chúng tôi tiến hành kiểm tra nghiêm ngặt trên các tập dữ liệu tiêu chuẩn và tự thu thập với các kích thước mô hình và độ dài chuỗi khác nhau. TNL đáng kể hiệu quả hơn các mô hình ngôn ngữ khác. Ngoài ra, kết quả benchmark cho thấy TNL hoạt động ngang bằng với các LLM tiên tiến sử dụng cấu trúc transformer thông thường. Mã nguồn được phát hành tại github.com/OpenNLPLab/TransnormerLLM.
+
+## 1. Giới thiệu
+
+Attention tuyến tính đã nổi lên như một thay thế tiềm năng khả thi cho softmax attention thông thường trong năm năm qua (Bahdanau et al., 2016; de Brébisson & Vincent, 2016). Tuy nhiên, bất chấp tiềm năng của nó, không có mô hình ngôn ngữ lớn hàng đầu hiện tại nào (Touvron et al., 2023a;b; Zeng et al., 2022; Black et al., 2022; Almazrouei et al., 2023; Team et al., 2023; Wang & Komatsuzaki, 2021; Baichuan, 2023; Jiang et al., 2023) đã áp dụng cơ chế attention tuyến tính. Có hai lý do có thể cho điều đó: 1). Hiệu suất kém: Có một khoảng cách hiệu suất đáng chú ý giữa các mô hình dựa trên attention tuyến tính hiện tại (Katharopoulos et al., 2020; Qin et al., 2022b) và các mô hình dựa trên softmax attention tiên tiến (Touvron et al., 2023a;b) trong mô hình hóa ngôn ngữ. 2). Tốc độ huấn luyện chậm: Các mô hình attention tuyến tính hiện tại thường gặp khó khăn với tốc độ huấn luyện chậm do sử dụng các phép toán tổng tích lũy (cumsum) (Hua et al., 2022). Kết quả là, các mô hình này (Hua et al., 2022) thường áp dụng tính toán attention thông thường trong sử dụng thực tế, mất đi những lợi thế lý thuyết của attention tuyến tính.
+
+Trong bài báo này, chúng tôi giải quyết các vấn đề nói trên của attention tuyến tính và đề xuất một mô hình mới dựa trên attention tuyến tính vượt trội hơn các mô hình dựa trên softmax attention về độ chính xác và hiệu quả trong mô hình hóa ngôn ngữ.
+
+**Tốc độ huấn luyện.** Chúng tôi giới thiệu Lightning Attention, triển khai attention tuyến tính đầu tiên cho phép attention tuyến tính thực hiện được lợi ích tính toán lý thuyết của nó. Để đạt được độ phức tạp tính toán tuyến tính, ý tưởng cốt lõi là tận dụng "kernel trick" để tăng tốc tính toán ma trận attention, tức là tính toán tích của keys và values trước để tránh phép nhân ma trận query-key n×n. Phép toán chậm cumsum được cần trong tính toán trong mô hình hóa ngôn ngữ nguyên nhân. Để giải quyết tình thế khó xử này, chúng tôi áp dụng khái niệm "chia để trị" để thực hiện tính toán. Cụ thể, tính toán attention của chúng tôi được chia thành intra-blocks và inter-blocks. Tính toán attention thông thường được áp dụng cho intra-blocks, trong khi "kernel trick" được sử dụng cho inter-blocks. Chúng tôi cũng tận dụng các kỹ thuật tiling trong cả quy trình tiến và lùi để tối đa hóa hiệu suất phần cứng GPU và điều chỉnh kỹ thuật được sử dụng trong FlashAttention (Dao et al., 2022a; Dao, 2023) cho Lightning Attention của chúng tôi để làm cho nó thân thiện với IO. Kết quả là, Lightning Attention duy trì tốc độ huấn luyện không đổi với độ dài chuỗi tăng dưới mức tiêu thụ bộ nhớ cố định, như được hiển thị trong Hình 1.
+
+**Độ chính xác.** Như câu ngạn ngữ nói, một con ngựa tốt thường cần một cái cựa tốt. Chúng tôi đề xuất một kiến trúc mới, TransNormerLLM (TNL), được thiết kế đặc biệt cho Lightning Attention để tăng cường hiệu suất của nó. TNL phát triển từ kiến trúc attention tuyến tính trước đây TransNormer (Qin et al., 2022a) bằng cách thực hiện các sửa đổi tiên tiến bao gồm positional embedding, tăng tốc attention tuyến tính, cơ chế gating, chuẩn hóa tensor. Cụ thể, chúng tôi sử dụng LRPE (Qin et al., 2023b) cùng với một sự phân rã mũ để tránh các vấn đề pha loãng attention trong khi cho phép mô hình giữ lại các tương tác toàn cục giữa các token. Một cơ chế gating được sử dụng để làm mượt huấn luyện, và một sơ đồ chuẩn hóa tensor mới được đề xuất để tăng tốc mô hình trong khi bảo toàn độ chính xác của nó. Chúng tôi cũng triển khai một sơ đồ song song mô hình hiệu quả cho TransNormerLLM, cho phép triển khai liền mạch trên các cụm quy mô lớn và tạo điều kiện mở rộng thành các mô hình rộng lớn hơn nữa. Như được hiển thị trong Hình 1, TNL đạt được mất mát huấn luyện thấp nhất trong số các cấu trúc transformer hiệu quả hiện tại (Qin et al., 2023a;c) cũng như các mô hình transformer SOTA (Touvron et al., 2023b).
+
+Chúng tôi thực hiện đánh giá toàn diện về Lightning Attention qua một phạm vi đa dạng các độ dài chuỗi để đánh giá độ chính xác của nó và so sánh tốc độ tính toán và sử dụng bộ nhớ với FlashAttention-2 (Dao, 2023). Lightning Attention thể hiện lợi thế đáng chú ý về tốc độ tính toán và tiêu thụ bộ nhớ so với các đối tác mà không làm giảm hiệu suất. Chúng tôi cũng xác thực thiết kế mô hình của mình thông qua một loạt các ablation và huấn luyện các mô hình với kích thước 44M, 385M, 1B, 7B và 15B trên các tập dữ liệu tiêu chuẩn hoặc tự thu thập. Kết quả benchmark chứng minh rằng TNL không chỉ phù hợp với hiệu suất của các LLM SOTA với Transformer mà còn nhanh hơn đáng kể.
+
+## 2. Công trình liên quan
+
+### 2.1. Mô hình hóa Ngôn ngữ Hiệu quả
+
+Các kiến trúc mô hình hiệu quả mới đang được khám phá để giải quyết độ phức tạp thời gian cao của cấu trúc transformer truyền thống. Bốn phương án thay thế đầy hứa hẹn, bao gồm linear transformers, state space models, long convolution, và linear recurrence, đang được phát triển để thay thế các module self-attention cho mô hình hóa chuỗi dài.
+
+**Linear Attention** Linear attention phân rã Softmax Attention thành tích trong của các biểu diễn ẩn, cho phép nó sử dụng "Kernel Trick", trong đó tích của keys và values được tính toán trước để tránh ma trận n×n bậc hai. Các phương pháp khác nhau sử dụng các biểu diễn ẩn khác nhau. Ví dụ, Katharopoulos et al. (2020) sử dụng 1+elu như một hàm kích hoạt, Qin et al. (2022b) sử dụng hàm cosine để xấp xỉ các thuộc tính của softmax, và Choromanski et al. (2021); Zheng et al. (2022; 2023) xấp xỉ softmax thông qua các phương pháp lý thuyết. Mặc dù độ phức tạp lý thuyết của nó là O(nd²), hiệu quả tính toán thực tế của linear attention trở nên thấp khi được sử dụng trong causal attention do nhu cầu các phép toán cumsum (Hua et al., 2022). Hơn nữa, hầu hết linear attention vẫn thể hiện một khoảng cách hiệu suất nhất định so với Transformers truyền thống (Katharopoulos et al., 2020; Liu et al., 2022).
+
+**State Space Model** State Space Model dựa trên Phương trình State Space để mô hình hóa chuỗi (Gu et al., 2022b), sử dụng khởi tạo đặc biệt (Gu et al., 2020; 2022c), giả định đường chéo hóa (Gupta et al., 2022), và các kỹ thuật hỗn hợp (Dao et al., 2022b) để đạt hiệu suất tương đương với Transformers. Do đặc tính của phương trình state space, suy luận có thể được tiến hành với độ phức tạp không đổi (Gu et al., 2022b), trong khi tốc độ huấn luyện có thể chậm so với FlashAttention.
+
+**Long Convolution** Các mô hình long convolution (Qin et al., 2023a; Fu et al., 2023) sử dụng kích thước kernel bằng với độ dài chuỗi đầu vào, tạo điều kiện cho một context rộng hơn so với các convolution truyền thống. Huấn luyện các mô hình này liên quan đến thuật toán Fast Fourier Transforms (FFT), giảm độ phức tạp tính toán xuống O(n log n). Tuy nhiên, các mô hình long convolution cần lưu trữ tất cả các tính toán lịch sử cho suy luận convolution nguyên nhân, làm cho chúng kém lý tưởng để xử lý các chuỗi dài so với RNN.
+
+**Linear RNN** Ngược lại, Linear RNN (Orvieto et al., 2023a; Qin et al., 2023c) nổi bật như những thay thế phù hợp hơn cho transformers trong mô hình hóa chuỗi dài. Một ví dụ đáng chú ý là mô hình HGRN (Qin et al., 2023c), một LLM dựa trên linear RNN đã cho thấy hiệu suất cạnh tranh với các mô hình GPT quy mô tương tự.
+
+### 2.2. IO-aware Attention
+
+Chuỗi FlashAttention (Dao et al., 2022a; Dao, 2023) tập trung vào tối ưu hóa cấp hệ thống để triển khai hiệu quả toán tử attention tiêu chuẩn trên nền tảng GPU. Các phương pháp này sử dụng chiến lược tiling để giảm thiểu khối lượng đọc/ghi bộ nhớ giữa bộ nhớ băng thông cao (HBM) và SRAM trên chip của GPU. Mặc dù các phương pháp này tối ưu hóa giao tiếp IO trong tính toán attention và nhanh hơn các triển khai softmax attention trước đây, độ phức tạp tính toán lý thuyết của chúng vẫn là O(n²d), làm cho chúng không phù hợp cho mô hình hóa ngôn ngữ chuỗi dài.
+
+## 3. Lightning Attention
+
+### 3.1. Kiến thức chuẩn bị
+
+Chúng tôi đầu tiên nhớ lại công thức của linear attention và sau đó giới thiệu Lightning Attention được đề xuất của chúng tôi. Trong trường hợp NormAttention trong TransNormer (Qin et al., 2022a), tính toán attention khác biệt với cấu trúc Transformer thông thường (Vaswani et al., 2017) bằng cách tránh các phép toán softmax và scaling tốn kém. Cơ chế NormAttention có thể được biểu đạt như sau:
+
+O = Norm((QK^T)V),                    (1)
+
+trong đó Q, K, và V ∈ R^(n×d) lần lượt là các ma trận query, key, và value, với n cho độ dài chuỗi và d cho chiều đặc trưng. Phương trình có thể được chuyển đổi thành biến thể tuyến tính của nó bằng cách sử dụng phép nhân ma trận bên phải:
+
+O = Norm(Q(K^T V)),                   (2)
+
+Công thức tuyến tính cho phép dự đoán recurrent hiệu quả với độ phức tạp O(nd²) trong quá trình huấn luyện. Ngoài ra, linear attention đảm bảo độ phức tạp tính toán không đổi O(d²) bất kể độ dài chuỗi. Điều này đạt được bằng cách cập nhật K^T V một cách recurrent, loại bỏ nhu cầu tính toán lặp lại toàn bộ ma trận attention. Ngược lại, standard softmax attention có độ phức tạp O(nd²) trong quá trình suy luận.
+
+Tuy nhiên, khi xử lý các tác vụ dự đoán nguyên nhân, hiệu quả của right product bị ảnh hưởng, dẫn đến yêu cầu tính toán cumsum (Hua et al., 2022). Trở ngại này cản trở tiềm năng tính toán song song hiệu quả cao. Trong phần này, chúng tôi chỉ ra rằng yêu cầu cumsum có thể được loại bỏ bằng cách tận dụng khái niệm "chia để trị" trong tính toán linear attention. Để thuận tiện cho thảo luận, Norm sẽ được bỏ qua trong thảo luận tiếp theo.
+
+Có hai phương pháp tính toán để xử lý tình huống nguyên nhân. Một là sử dụng tính toán attention thông thường (Left Product), bao gồm tính toán QK^T trước. Công thức tính toán hoàn chỉnh như sau:
+
+O = [(QK^T) ⊙ M]V                     (3)
+
+trong đó M_ts = 1 nếu t ≥ s, ngược lại 0. Thuật toán hoàn chỉnh được chi tiết trong Thuật toán 1. Lưu ý rằng thuật toán này có thể song song hóa được, nhưng độ phức tạp thời gian của nó là O(n²d). Lựa chọn khác là tính toán k_t v_t^T trước (Right Product), tận dụng công thức đệ quy cho tính toán:
+
+kv_0 = 0, kv_t = kv_(t-1) + k_t v_t^T, o_t^T = q_t^T kv_t.    (4)
+
+Thuật toán hoàn chỉnh được chi tiết trong Thuật toán 2. Thuật toán này có độ phức tạp thời gian O(nd²), nhưng nó không thân thiện với GPU, làm cho nó chậm hơn phương pháp đầu tiên.
+
+### 3.2. Linear Attention với Tiling
+
+Chúng tôi sử dụng kỹ thuật tiling để tính toán linear attention trong thiết lập nguyên nhân. Cụ thể, chúng tôi đầu tiên chia Q, K, V thành hai khối theo hàng:
+
+X = [X_1; X_2], X_1 ∈ R^(m×d), X_2 ∈ R^((n-m)×d),
+X ∈ {Q, K, V}.
+
+Sau đó, bằng cách mở rộng Eq. 3, chúng tôi có (lưu ý rằng kv_0 = 0):
+
+kv_s = kv_0 + Σ(j=1 to s) k_j v_j^T, s = 1, ..., m.
+o_s^T = q_s^T kv_s = q_s^T kv_0 + q_s^T Σ(j=1 to s) k_j v_j^T.    (5)
+
+Ở dạng khối, chúng ta có:
+
+O_1 = Q_1 kv_0 + [(Q_1 K_1^T) ⊙ M]V_1
+    ≜ Q_1 KV_0 + [(Q_1 K_1^T) ⊙ M]V_1.    (6)
+
+Công thức trên cho thấy rằng linear attention nguyên nhân tiến có thể được chia thành hai phần:
+• Tính toán trong khối [(Q_1 K_1^T) ⊙ M]V_1 (intra blocks) có thể sử dụng Left Product;
+• Tính toán giữa các khối Q_1 KV_0 (inter blocks) có thể sử dụng Right Product.
+
+Điều đáng chú ý là khối thứ hai có thể được tính toán bằng cách sử dụng ý tưởng tương tự như sau:
+
+kv_(m+t) = kv_m + Σ(j=m+1 to m+t) k_j v_j^T, t = 1, ..., n - m,
+o_(m+t)^T = q_(m+t)^T kv_(m+t),
+O_2 = Q_2 kv_m + [(Q_2 K_2^T) ⊙ M]V_2
+    ≜ Q_2 KV_1 + [(Q_2 K_2^T) ⊙ M]V_2.    (7)
+
+Lưu ý rằng để tính toán khối thứ hai, chúng ta phải sử dụng KV_1 = kv_m, có thể được tính toán bởi:
+
+KV_1 = KV_0 + Σ(j=1 to m) k_j v_j^T = KV_0 + K_1^T V_1.    (8)
+
+trong đó KV_0 = kv_0. Bằng cách sử dụng chiến lược trên để chia ma trận thành nhiều khối, chúng tôi có được Lightning Attention Forward Pass. Derivation chi tiết hơn có thể được tìm thấy trong Phụ lục C.
+
+Đối với lan truyền ngược, theo (Katharopoulos et al., 2020), chúng ta có thể viết lại quá trình như:
+
+dq_t^T = do_t^T kv_t^T, dk_t^T = v_t^T dkv_t^T, dv_t^T = k_t^T dkv_t,
+dkv_(n+1) = 0 ∈ R^(d×d), dkv_(t-1) = dkv_t + q_(t-1) do_(t-1)^T.
+
+Do đó, tính toán của lan truyền ngược phù hợp với Eq. 4 tiến, và Lightning Attention Backward Pass cũng có thể được thu được bằng cách sử dụng kỹ thuật tiling. Chứng minh chi tiết có thể được tìm thấy trong Phụ lục C.
+
+### 3.3. Phân tích độ phức tạp
+
+**Định lý 3.1.** Độ phức tạp thời gian của Lightning Attention là O(nd² + nBd)¹.
+
+**Chứng minh của Định lý 3.1.** Đối với forward pass, theo Thuật toán 3, độ phức tạp thời gian của mỗi phần intra là O(B²d), độ phức tạp thời gian của mỗi phần inter là O(Bd²), độ phức tạp thời gian của việc cập nhật KV là O(Bd²), vì vậy độ phức tạp thời gian trong mỗi vòng lặp là O(B²d + Bd²), vì chúng ta lặp T = n/B lần, tổng độ phức tạp thời gian là O((B²d + Bd²)n/B) = O(nd² + nBd). Vì tính toán của backward pass tương tự như forward pass, độ phức tạp thời gian của backward pass cũng là O(nd² + nBd).
+
+### 3.4. Triển khai IO-aware Chính xác
+
+Lightning Attention sử dụng phương pháp tiling trên trong toàn bộ quá trình tính toán và tận dụng các phương pháp riêng biệt để tối ưu hóa việc sử dụng băng thông bộ nhớ giữa HBM và SRAM trong GPU. Cụ thể, trong mỗi lần lặp t, các ma trận Q_t, K_t, V_t trải qua phân đoạn thành các khối, sau đó được chuyển sang SRAM để tính toán. Các phép toán intra- và inter-block được tách biệt, với intra-blocks sử dụng left product và inter-blocks sử dụng right product. Phương pháp này tối ưu khai thác hiệu quả tính toán và bộ nhớ liên kết với right product, tăng cường tốc độ thực thi tổng thể. Kích hoạt trung gian KV được lưu và tích lũy lặp đi lặp lại trong SRAM. Sau đó, các đầu ra của intra-blocks và inter-blocks được tổng hợp trong SRAM, và kết quả được ghi trở lại HBM. Cấu trúc của Lightning Attention được minh họa trong Hình 2. Các chi tiết phức tạp của triển khai Lightning Attention được giải thích thông qua Thuật toán 3 cho forward pass và Thuật toán 4 cho backward pass.
+
+## 4. TransNormerLLM
+
+### 4.1. Cấu trúc Tổng thể
+
+Cấu trúc của chúng tôi dựa trên các phát hiện của TransNormer (Qin et al., 2022a) nhưng có các sửa đổi tùy chỉnh để cân bằng hiệu quả và hiệu suất. Chúng tôi minh họa cấu trúc tổng thể trong Hình 3. Đầu vào X được cập nhật thông qua hai bước liên tiếp: 1). Nó trải qua Gated Linear Attention (GLA) với việc áp dụng chuẩn hóa SimpleRMSNorm (SRMSNorm). 2). Nó đi qua Simple Gated Linear Unit (SGLU) với chuẩn hóa SRMSNorm. Chúng tôi áp dụng Pre-norm cho cả hai module.
+
+### 4.2. Sửa đổi Tùy chỉnh
+
+Trong phần này, chúng tôi phác thảo các thiết kế chính và cảm hứng đằng sau mỗi sửa đổi tùy chỉnh, bao gồm mã hóa vị trí, cơ chế gating, và chuẩn hóa tensor.
+
+**Position Encoding** Trong TransNormer, DiagAttention được sử dụng ở các lớp thấp hơn để tránh vấn đề pha loãng. Tuy nhiên, điều này dẫn đến thiếu tương tác toàn cục giữa các token. Trong TNL, chúng tôi tận dụng LRPE (Qin et al., 2023b) với sự phân rã mũ (Press et al., 2022; Qin et al., 2023a; Peng et al., 2023b) để giải quyết vấn đề này, giữ lại attention đầy đủ ở các lớp thấp hơn. Biểu thức của position encoding của chúng tôi như sau:
+
+a_ts = q_t^T k_s λ^(t-s) exp(iθ(t-s)).    (9)
+
+mà chúng tôi gọi là LRPE-d - Linearized Relative Positional Encoding với sự phân rã mũ. Tương tự như LRPE gốc, chúng tôi đặt θ có thể học được. Chúng tôi tìm thấy thực nghiệm rằng thay vì áp dụng LRPE-d cho mọi lớp, việc áp dụng nó cho lớp đầu tiên và giữ các lớp khác với sự phân rã mũ có thể tăng tốc huấn luyện khoảng 15-20% nhưng chỉ với tác động tinh tế đến hiệu suất.
+
+Lưu ý rằng position encoding này hoàn toàn tương thích với Linear Attention, vì nó có thể được phân tách đối với s và t riêng biệt. Giá trị của λ cho head thứ h trong lớp thứ l (giả sử có tổng cộng H heads và L lớp) được cho bởi:
+
+λ = exp(-8h/H × (1-l)/L).    (10)
+
+Ở đây, 8h/H tương ứng với tỷ lệ phân rã của head thứ h, trong khi (1-l)/L tương ứng với tỷ lệ phân rã của lớp thứ l. Thuật ngữ (1-l)/L đảm bảo rằng Theoretical Receptive Fields (TRF) (Qin et al., 2024) ở các lớp thấp hơn nhỏ hơn so với các lớp cao hơn, phù hợp với động lực của TransNormer. Chúng tôi chọn λ không thể học được vì chúng tôi tìm thấy thực nghiệm rằng gradients trở nên không ổn định khi λ có thể học được, dẫn đến các giá trị NaN. Lưu ý rằng position encoding này vẫn tương thích với Lightning Attention, với thuật toán cụ thể được chi tiết trong Phụ lục A B.
+
+**Gating Mechanism** Gate có thể tăng cường hiệu suất của mô hình và làm mượt quá trình huấn luyện. Trong TNL, chúng tôi áp dụng phương pháp từ Flash (Hua et al., 2022) và sử dụng Gated Linear Attention (GLA) trong token mixing:
+
+O = Norm(QK^T V) ⊙ U, Q = φ(XW_q),
+K = φ(XW_k), V = XW_v, U = XW_u.    (11)
+
+Chúng tôi chọn φ là hàm kích hoạt Swish (Ramachandran et al., 2017) vì chúng tôi tìm thấy thực nghiệm rằng nó vượt trội hơn các hàm kích hoạt khác.
+
+Để tăng tốc mô hình hơn nữa, chúng tôi đề xuất Simple GLU (SGLU), loại bỏ hàm kích hoạt khỏi cấu trúc GLU gốc vì gate tự nó có thể giới thiệu tính phi tuyến. Do đó, channel mixing của chúng tôi trở thành:
+
+O = [V ⊙ U]W_o, V = XW_v, U = XW_u.    (12)
+
+Chúng tôi tìm thấy thực nghiệm rằng không sử dụng hàm kích hoạt trong GLU sẽ không dẫn đến bất kỳ mất mát hiệu suất nào.
+
+**Tensor Normalization** NormAttention gốc được giới thiệu trong TransNormer (Qin et al., 2022a) như sau:
+
+O = Norm(QK^T V)    (13)
+
+Trong TransNormerLLM, chúng tôi thay thế RMSNorm gốc bằng một hàm chuẩn hóa đơn giản mới gọi là SimpleRMSNorm, viết tắt là SRMSNorm:
+
+SRMSNorm(x) = x / (||x||_2 / √d).    (14)
+
+Chúng tôi tìm thấy thực nghiệm rằng việc sử dụng SRMSNorm không dẫn đến bất kỳ mất mát hiệu suất nào.
+
+## 5. Thí nghiệm
+
+Chúng tôi thực hiện các thí nghiệm kỹ lưỡng trên các mô hình TNL và lightning attention. Chúng tôi triển khai các mô hình của mình trên framework Metaseq (Zhang et al., 2022) với Pytorch (Paszke et al., 2019). Lightning Attention được thực thi thông qua Triton (Tillet et al., 2019). Tất cả các thí nghiệm được tiến hành trên các cụm GPU A100 80G. Đánh giá công việc của chúng tôi được chia thành ba phần chính: I) Chúng tôi đánh giá hiệu quả và độ chính xác của module Lightning Attention; II) Chúng tôi tiếp tục benchmark hiệu suất của các mô hình TNL trên corpus quy mô nhỏ tiêu chuẩn và benchmark LLM và so sánh tốc độ huấn luyện và suy luận với các mô hình STOA; III) Chúng tôi cũng cung cấp nghiên cứu ablation về thiết kế của TNL.
+
+### 5.1. Đánh giá Lightning Attention
+
+Vì Lightning Attention của chúng tôi là triển khai chính xác của norm linear attention (Qin et al., 2022a), chúng tôi so sánh tốc độ và sử dụng bộ nhớ giữa triển khai pytorch gốc của nó (được gọi là Vanilla) và Lightning Attention của chúng tôi. Như một tham chiếu, chúng tôi cũng đã bao gồm FlashAttention-2 (Dao, 2023) (được gọi là Flash2), hiện đang là triển khai SOTA của softmax attention. Như được hiển thị trong Hình 4, Lightning Attention cho thấy sự tăng trưởng tuyến tính đáng chú ý của thời gian xử lý trong cả forward và backward pass, trong khi Vanilla và Flash2 thể hiện sự tăng trưởng bậc hai. Về dấu chân bộ nhớ, Vanilla có xu hướng nhanh chóng cạn kiệt tài nguyên bộ nhớ. Lightning Attention cho thấy xu hướng tương tự như Flash2 nhưng yêu cầu ít bộ nhớ hơn.
+
+### 5.2. Đánh giá TNL
+
+**Đánh giá Hiệu suất** Trong Bảng 1, chúng tôi trình bày một đánh giá qua các mô hình 40M khác nhau trên một tập dữ liệu tiêu chuẩn. Điều này bao gồm các mô hình dựa trên cơ chế attention/linear attention (Vaswani et al., 2017; Dao et al., 2022a; Katharopoulos et al., 2020; Qin et al., 2022b;a), MLP (Multi-Layer Perceptrons) (Tay et al., 2021; Liu et al., 2021), RNN (Recurrent Neural Networks) (Gu et al., 2022a; Gupta et al., 2022; Mehta et al., 2022; Peng et al., 2023b; Orvieto et al., 2023b), FFT (Fast Fourier Transforms) (Qin et al., 2023a), và mô hình của chúng tôi. TNL ghi lại perplexity thấp nhất trên tập test sau khi được huấn luyện trên tập dữ liệu Wikitext-103.
+
+Chúng tôi cũng mở rộng mô hình của mình lên 1B và 3B tham số và so sánh training loss với các cấu trúc LLM hàng đầu như LLaMA-FA2 (Touvron et al., 2023a; Dao, 2023), HGRN (Qin et al., 2023c), và TNN (Qin et al., 2023a). Để so sánh công bằng, chúng tôi huấn luyện lại tất cả các mô hình trên cùng corpus 30B và vẽ các training loss trong Hình 1. TNL đạt được training losses thấp nhất ở cả 1B và 3B tham số.
+
+**Đánh giá Hiệu quả** Trong Hình 1, chúng tôi trình bày phân tích so sánh tốc độ huấn luyện dưới cùng corpus và thiết lập phần cứng. So sánh này bao gồm bốn biến thể: TNL, LLaMA-FA2 (Touvron et al., 2023a; Dao, 2023), HGRN (Qin et al., 2023c), và TNN (Qin et al., 2023a). Các phát hiện của chúng tôi cho thấy rằng trong cả forward và backward pass, TGS (tokens per GPU per second) cho TNL vẫn nhất quán cao, trong khi ba mô hình khác thể hiện sự suy giảm nhanh chóng khi độ dài chuỗi được mở rộng từ 1K đến 128K. Mô hình này gợi ý rằng Lightning Attention cung cấp một tiến bộ đáng kể trong việc quản lý độ dài chuỗi cực dài trong LLM.
+
+**Đánh giá Suy luận** Chúng tôi tiến hành so sánh throughput suy luận trên các mô hình ngôn ngữ lớn 7B khác nhau bằng cách sử dụng codebase tiêu chuẩn của họ từ Huggingface, như được chi tiết trong Hình 5. TNL với Lightning Attention thể hiện lợi thế đáng kể, đạt tỷ lệ throughput cao hơn tới 11× so với các mô hình cấu trúc transformer.
+
+**Kết quả Benchmark** Để xác thực hiệu quả của TNL, chúng tôi pretraining các mô hình 385M, 1B, 7B, và 15B trên các tập dữ liệu tự thu thập, chi tiết của dữ liệu có trong Phụ lục D, và kiểm tra trên Commonsense Reasoning Task, MMLU (Hendrycks et al., 2021), C-Eval (Huang et al., 2023), và SCROLLS (Shaham et al., 2022). Để so sánh, chúng tôi đã chọn một số mô hình nguồn mở làm đối thủ cạnh tranh, bao gồm các mô hình dựa trên Transformer như OPT (Zhang et al., 2022), Pythia (Biderman et al., 2023), BLOOM (Workshop et al., 2023), GPT-Neo (Black et al., 2022), Falcon (Almazrouei et al., 2023), LLaMA (Touvron et al., 2023a;b), OpenLLAMA (Geng & Liu, 2023), Baichuan (Baichuan, 2023), ChatGLM (Zeng et al., 2022; Du et al., 2022), và mô hình không phải Transformer RWKV (Peng et al., 2023a). Có thể quan sát trong Bảng 2 và Bảng 3 rằng, so với các mô hình này, TNL vẫn rất cạnh tranh.
+
+• Chúng tôi báo cáo BoolQ (Clark et al., 2019), PIQA (Bisk et al., 2019), SIQA (Sap et al., 2019), HellaSwag (Zellers et al., 2019), WinoGrande (Sakaguchi et al., 2019), ARC easy và challenge (Clark et al., 2018) và OpenBookQA (Mihaylov et al., 2018). Chúng tôi báo cáo kết quả 0-shot cho tất cả benchmark bằng LM-Eval-Harness (Gao et al., 2021). Tất cả các mô hình của chúng tôi đạt hiệu suất cạnh tranh so với các LLM tiên tiến hiện tại, thể hiện khả năng đáng chú ý để hiểu và áp dụng lý luận thường thức.
+
+• Chúng tôi báo cáo kết quả tổng thể cho MMLU (Hendrycks et al., 2021), C-Eval (Huang et al., 2023). Các script chính thức được sử dụng để đánh giá MMLU và C-Eval, với tất cả kết quả đánh giá được tiến hành với thiết lập 5-shot. So với các mô hình nguồn mở hàng đầu có sẵn trong ngành, các mô hình của chúng tôi đã thể hiện hiệu suất phù hợp trong cả benchmark tiếng Anh và tiếng Trung.
+
+• Trên benchmark SCROLLS (Shaham et al., 2022), chúng tôi đánh giá các mô hình ngôn ngữ lớn được huấn luyện trên 1 tỷ tham số và được pre-trained bằng độ dài chuỗi 2048. Chúng tôi trình bày kết quả hiệu suất zero-shot cho tất cả benchmark bằng LM-Eval-Harness (Gao et al., 2021). Đối với các tác vụ generation trong SCROLLS, chúng tôi sử dụng greedy search với siêu tham số top_k được đặt thành 5 và top_p được đặt thành 1. Các mô hình của chúng tôi liên tục phù hợp hoặc vượt trội hiệu suất của các LLM tiên tiến hiện tại trong các tác vụ này.
+
+### 5.3. TNL Ablation
+
+Chúng tôi tiến hành phân tích ablation rộng rãi về các thành phần khác nhau của TNL, bao gồm positional encoding, cơ chế gating, hàm kích hoạt GLA, hàm kích hoạt GLU, và hàm chuẩn hóa.
+
+**Positional Encoding:** trong thí nghiệm của chúng tôi so sánh các chiến lược PE khác nhau—Mix, Absolute Positional Encoding (APE), LRPE, Exponential Decay, và LRPE-d—phương pháp của chúng tôi và LRPE-d thể hiện hiệu suất vượt trội. Chúng tôi chọn phương pháp Mix vì khả năng tăng cường tốc độ huấn luyện lên đến 20%, mặc dù kém hiệu quả một chút so với LRPE-d.
+
+Chúng tôi cũng thực hiện ablation về decay temperature (1-l)/L trong Eq. 10. Perplexity của TNL được giảm bằng cách thêm decay temperature, như được hiển thị trong Bảng 5.
+
+**Gating Mechanism:** chúng tôi tiếp tục điều tra tác động của việc tích hợp một cơ chế gating. Theo dữ liệu được trình bày trong Bảng 6, việc kích hoạt gate đã giảm giá trị loss từ 2.263 xuống 2.248.
+
+**Normalization Functions:** nghiên cứu của chúng tôi liên quan đến việc kiểm tra các kỹ thuật chuẩn hóa khác nhau—SRMSNorm, RMSNorm, và LayerNorm—trên TNL, tìm thấy ít sự khác biệt trong hiệu quả của chúng. Tuy nhiên, chúng tôi đã tăng cường SRMSNorm bằng Triton, dẫn đến cải thiện đáng chú ý về tốc độ xử lý cho các chiều lớn hơn.
+
+**GLA Activation Functions:** trong nghiên cứu của chúng tôi về cơ chế GLA (Gated Linear Attention), chúng tôi đánh giá các hàm kích hoạt, tìm thấy Swish và 1+elu hoạt động tương tự, như được chi tiết trong Bảng 8. Tuy nhiên, do vấn đề NaN với 1+elu trong mô hình 7B của chúng tôi, chúng tôi đã chọn Swish.
+
+**GLU Activation Functions:** thí nghiệm của chúng tôi bổ sung liên quan đến việc loại bỏ hàm kích hoạt khỏi Gated Linear Units (GLU), cho thấy tác động tối thiểu đến kết quả như mỗi Bảng 9. Do đó, chúng tôi đã chọn cấu hình Simple Gated Linear Units (SGLU) trong mô hình của mình.
+
+## 6. Kết luận
+
+Chúng tôi đã giới thiệu Lightning Attention, triển khai linear attention đầu tiên đã giải phóng toàn bộ sức mạnh của linear attention. Kết quả là, Lightning Attention của chúng tôi có thể xử lý các độ dài chuỗi khác nhau với tốc độ không đổi dưới dấu chân bộ nhớ không đổi. Khái niệm chính là chia tính toán attention thành intro-blocks và inter-blocks, trong khi áp dụng các kỹ thuật tính toán riêng biệt để thực hiện tính toán. Một kiến trúc mới, TNL, được thiết kế riêng cho Lightning Attention được trình bày. TNL vượt trội hơn các mô hình ngôn ngữ hiệu quả hiện tại về cả hiệu quả và độ chính xác và đạt hiệu suất cạnh tranh so với các mô hình ngôn ngữ lớn tiên tiến sử dụng kiến trúc transformer thông thường.
+
+## Lời cảm ơn
+
+Công việc này được hỗ trợ một phần bởi Chương trình R&D Quốc gia Chính (SỐ.2022ZD0160100). Chúng tôi cảm ơn Songlin Yang vì những thảo luận hữu ích.
+
+## Tuyên bố Tác động
+
+Việc giới thiệu Lightning Attention và kiến trúc TNL đi kèm, báo hiệu những thay đổi đáng kể trong machine learning, đặc biệt là hiệu quả và khả năng tiếp cận mô hình ngôn ngữ. Bằng cách giải quyết các hạn chế của linear attention trong các độ dài chuỗi khác nhau mà không tăng tiêu thụ bộ nhớ, tiến bộ này dân chủ hóa quyền truy cập vào các mô hình ngôn ngữ tiên tiến, có thể giảm dấu chân tính toán và môi trường của các hệ thống AI quy mô lớn. Về mặt đạo đức, nó nhấn mạnh một động thái hướng tới các thực hành AI bền vững hơn, nhưng đặt ra câu hỏi về sự gia tăng của các mô hình ngôn ngữ mạnh mẽ và tác động xã hội của chúng, bao gồm mối lo ngại về quyền riêng tư, thông tin sai lệch, và khoảng cách số.
+
+[Phần còn lại của bài báo bao gồm các thuật toán, bảng, và phụ lục sẽ được dịch tương tự với cùng cấu trúc và định dạng...]

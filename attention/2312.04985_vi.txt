@@ -1,0 +1,199 @@
+# SparQ Attention: Suy luận LLM tiết kiệm băng thông
+
+Luka Ribar* 1Ivan Chelombiev* 2Luke Hudlass-Galley* 1Charlie Blake1Carlo Luschi1Douglas Orr1
+
+## Tóm tắt
+
+Những khó khăn tính toán trong suy luận mô hình ngôn ngữ lớn (LLM) vẫn là một rào cản đáng kể đối với việc triển khai rộng rãi của chúng. Nhu cầu của nhiều ứng dụng hỗ trợ chuỗi đầu vào dài và xử lý chúng trong các lô lớn thường khiến việc tạo token bị nghẽn cổ chai bởi việc truyền dữ liệu. Vì lý do này, chúng tôi giới thiệu SparQ Attention, một kỹ thuật để tăng thông lượng suy luận của LLM bằng cách sử dụng băng thông bộ nhớ hiệu quả hơn trong các tầng attention, thông qua việc lấy có chọn lọc lịch sử được lưu trữ. Kỹ thuật được đề xuất có thể được áp dụng trực tiếp cho các LLM có sẵn trong quá trình suy luận, mà không cần sửa đổi thiết lập tiền huấn luyện hoặc tinh chỉnh bổ sung. Chúng tôi cho thấy rằng SparQ Attention mang lại lên đến 8× tiết kiệm trong việc truyền dữ liệu attention mà không giảm đáng kể độ chính xác, bằng cách đánh giá các mô hình Llama 2 và 3, Mistral, Gemma và Pythia trên nhiều nhiệm vụ downstream.
+
+## 1. Giới thiệu
+
+Các mô hình Transformer được huấn luyện trên kho ngữ liệu văn bản lớn gần đây đã cho thấy hiệu suất đáng chú ý trên các nhiệm vụ xử lý ngôn ngữ tự nhiên phức tạp (Achiam et al., 2023; Touvron et al., 2023). Điều này được quy cho khả năng học trong ngữ cảnh xuất hiện với việc huấn luyện quy mô lớn, cho phép thông tin văn bản tùy ý (ví dụ: hướng dẫn dài, lịch sử trò chuyện, tài liệu liên quan) được kết hợp tại thời điểm suy luận (Wei et al., 2022).
+
+Để tận dụng lợi ích của việc học trong ngữ cảnh, đã có nhu cầu cho LLM hỗ trợ các chuỗi đầu vào ngày càng dài. Tuy nhiên, tối ưu hóa suy luận tiêu chuẩn được sử dụng để hỗ trợ việc học trong ngữ cảnh, bộ nhớ đệm key-value (KV) (Pope et al., 2023), bị hạn chế bởi nhu cầu lấy một lượng lớn dữ liệu từ bộ nhớ khi xử lý các lô chuỗi dài. Điều này lần lượt giới hạn tốc độ tạo token—một metric khả năng sử dụng quan trọng cho LLM.
+
+Điểm nghẽn này có thể được quy cho bản chất tự hồi quy của việc tạo transformer. Đối với mỗi token được tạo, toàn bộ bộ nhớ đệm KV phải được lấy từ bộ nhớ. Kích thước của bộ nhớ đệm KV tăng tuyến tính với độ dài chuỗi, cũng như kích thước lô, do đó khiến việc tạo cho các chuỗi dài được xử lý theo lô ngày càng bị giới hạn bởi băng thông bộ nhớ.
+
+Mặc dù việc lấy bộ nhớ đệm đắt đỏ này ở mỗi bước, các token thường chỉ chú ý đến một phần nhỏ của chuỗi tại một thời điểm (Vig, 2019; Yun et al., 2020). Nếu có thể dự đoán hiệu quả những token nào sẽ có điểm attention cao, hiệu quả băng thông bộ nhớ có thể được tăng đáng kể bằng cách chỉ truyền các cặp key-value của những token có điểm cao.
+
+Dựa trên ý tưởng này, chúng tôi trình bày SparQ Attention, một kỹ thuật để cải thiện đáng kể hiệu quả băng thông bộ nhớ của suy luận transformer. Bằng cách xấp xỉ điểm attention sử dụng một tập con của các thành phần query và key, chúng tôi chỉ lấy những token liên quan nhất cho mỗi bước tạo, giảm lượng dữ liệu được truyền mà không làm giảm chất lượng mô hình.
+
+Chúng tôi cũng cung cấp một tập hợp mới các biến thể nhiệm vụ downstream khó thách thức mà chúng tôi sử dụng để đánh giá SparQ Attention. Chúng dựa trên các nhiệm vụ hiện có, được sửa đổi để đánh giá khả năng của mô hình sử dụng thông tin từ các chuỗi đầu vào dài cho việc tạo đa token. Chúng tôi cho thấy rằng SparQ Attention hoạt động tốt so với các phương pháp tiên tiến khác, cho lên đến 8× nén mà không mất đáng kể độ chính xác. SparQ Attention mạnh mẽ trên các nhiệm vụ và mô hình, được chứng minh bằng việc đánh giá trên Llama 2 và 3, Mistral, Gemma và Pythia. Chúng tôi cũng cung cấp các benchmark được đo trên IPU và GPU, cho thấy lợi ích tính toán thực tế của phương pháp của chúng tôi.
+
+## 2. Nền tảng
+
+Trong phần này, chúng tôi cung cấp một khung làm việc đơn giản để hiểu hiệu quả tính toán của việc tạo chuỗi sử dụng các mô hình transformer (tương tự như mô hình hóa được giới thiệu bởi Kaplan et al. (2020)) và sử dụng nó để thúc đẩy các cơ chế attention tiết kiệm truyền.
+
+**Cường độ số học** Xem xét một đơn vị tính toán có khả năng rA phép toán số học vô hướng mỗi giây được kết nối với bộ nhớ qua giao diện có thể truyền rM phần tử vô hướng mỗi giây. Với khối lượng công việc yêu cầu A phép toán số học và M lần truyền, và giả sử tính toán và truyền dữ liệu đồng thời, cường độ số học được định nghĩa là A/M. Trong suy luận LLM, A chủ yếu là một hàm của kích thước của các phép nhân ma trận trong mô hình, và M phụ thuộc vào các yếu tố khác nhau như kích thước của bộ nhớ đệm KV, kích thước mô hình và kích thước lô. Khi cường độ số học của khối lượng công việc nhỏ hơn tỷ lệ rA/rM, thời gian thực thi bị giới hạn bởi rM, do việc truyền dữ liệu mất nhiều thời gian hơn tính toán trong thiết lập đồng thời.
+
+Cường độ số học của các khối lượng công việc tạo chuỗi điển hình trong các mô hình transformer được hiển thị trong Hình 2, làm nổi bật rằng thời gian thực thi bị ràng buộc bởi băng thông, không phải bị ràng buộc bởi tính toán. Chúng tôi cung cấp phân tích tổng quát hơn về cường độ số học của việc tạo chuỗi trong Phụ lục C, cho thấy nó thường bị ràng buộc băng thông. Một hệ quả của điều này là cách hiệu quả nhất để tăng tốc việc tạo chuỗi transformer là giảm việc truyền dữ liệu.
+
+**Thời gian trong attention** Việc tạo chuỗi với transformer được chi phối bởi hai loại tính toán. Thứ nhất là phép nhân ma trận theo vị trí giữa các activation và tham số. Thứ hai là self-attention dot-product giữa các activation (Vaswani et al., 2017). Giả sử một tầng transformer tiêu chuẩn với chiều mô hình dm, kích thước lô B, độ dài chuỗi S và sử dụng Grouped Query Attention (GQA) (Ainslie et al., 2023) với g đầu grouped-query mỗi đầu key-value (g=1 cho multi-head attention tiêu chuẩn), tỷ lệ truyền dữ liệu liên quan đến attention được cho bởi
+
+Mattn/(Mattn+Mparams) = ρ/(ρ+ 6/B), (1)
+
+trong đó Mparams và Mattn là tổng truyền dữ liệu của tham số và bộ nhớ đệm KV tương ứng, và ρ=S/(gdm) là một biến chúng tôi đã giới thiệu để nắm bắt các siêu tham số mô hình liên quan (xem Phụ lục C). Khi ρ≫6/B (ví dụ, với S hoặc B lớn), attention chi phối việc truyền dữ liệu, vì toàn bộ bộ nhớ đệm KV phải được truyền trong mỗi bước tạo. Xu hướng lý thuyết này được hỗ trợ bởi kết quả thực nghiệm từ các benchmark llama.cpp (Gerganov, 2024) trong Hình 3.
+
+Vì việc truyền dữ liệu là yếu tố giới hạn hiệu suất, và việc truyền attention chi phối khi độ dài chuỗi tăng, cần có các lựa chọn thay thế tiết kiệm truyền cho cơ chế attention tiêu chuẩn.
+
+## 3. Xấp xỉ Attention
+
+Trong phần này, chúng tôi xem xét một số tính chất của phép toán attention cho phép chúng tôi giới thiệu một xấp xỉ chính xác và tiết kiệm băng thông.
+
+Xem xét một đầu query attention đơn với chiều đầu dh, xử lý một chuỗi token đầu vào có độ dài S. Trong quá trình tạo tự hồi quy, đầu ra của đầu attention được tính như:
+
+y = softmax(q·K⊤/√dh)·V (2)
+
+trong đó q là query, và K∈RS×dh và V∈RS×dh là bộ nhớ đệm key và value tương ứng. Khi sử dụng GQA (Ainslie et al., 2023), K và V được chia sẻ trên g đầu query.
+
+Đối với mỗi forward pass, chúng ta cần lấy ma trận key và value từ bộ nhớ, cũng như ghi (nối thêm) các vector k và v cho token hiện tại, cho tổng số phần tử được truyền mỗi đầu attention:
+
+Mdense = 2S dh + 2dh (3)
+
+trong đó số hạng đầu tương ứng với việc đọc bộ nhớ đệm K và V và số hạng thứ hai tương ứng với việc ghi k và v hiện tại vào bộ nhớ. Việc truyền bộ nhớ có thể được biểu diễn tương đương theo byte, tuy nhiên chúng tôi sử dụng các phần tử vô hướng để tách biệt các phương pháp nén bộ nhớ đệm khỏi định dạng số được sử dụng để biểu diễn bộ nhớ đệm.
+
+**Sparsity điểm attention** Đầu tiên, xem xét các điểm attention s∈(0,1)S trong Phương trình (2):
+
+s = softmax(q·K⊤/√dh) (4)
+
+Do hiệu ứng chuẩn hóa của hàm softmax, vector s kết quả là thưa thớt (xem Hình 4a và 4b), tức là chúng ta có thể tìm một mask boolean ms∈{0,1}S tương ứng với k phần tử top-k trong s (k≪S) sao cho:
+
+y1 = (s◦ms)·V ≈ s·V (5)
+
+Kết quả là, chỉ các giá trị vi tương ứng với các phần tử khác không của ms cần được lấy từ bộ nhớ. Tuy nhiên, thuật toán vẫn yêu cầu lấy toàn bộ K từ bộ nhớ để tính các điểm attention s, giới hạn lượng dữ liệu được truyền tối thiểu xuống 1/2 Mdense.
+
+**Phân bổ lại giá trị trung bình** Để cải thiện thêm xấp xỉ trong Phương trình (5), chúng tôi lưu ý một quan sát khác: các vector vi trong chuỗi thể hiện mức độ tự tương quan cao (xem Bảng 1). Do đó, một số hạng hiệu chỉnh bổ sung sử dụng vector giá trị trung bình chạy v̄=1/S ∑Si=1 vi có thể được thêm như sau:
+
+y2 = (s◦ms)·V + (1−s·ms)v̄ (6)
+
+Điều này giới thiệu một overhead tối thiểu bổ sung so với Phương trình (5) do vector trung bình v̄ được cập nhật và ghi lại vào bộ nhớ ở mỗi bước.
+
+**Sparsity Query** Để cải thiện cận dưới về việc truyền bộ nhớ, chúng tôi tiếp tục xem xét việc xấp xỉ hiệu quả mask ms bằng cách tính các điểm attention xấp xỉ ŝ mà không sử dụng toàn bộ ma trận K. Ở đây, chúng tôi xem xét phân phối magnitude của các thành phần của vector query q và quan sát rằng nó có đuôi rất nặng (xem Hình 4c và 4d). Quan sát này cho phép chúng tôi xấp xỉ hiệu quả các điểm attention s bằng cách định nghĩa một mask boolean theo query mq∈{0,1}dh tương ứng với r thành phần top-r của q. Các điểm sau đó được xấp xỉ như:
+
+ŝ = softmax((q◦mq)·K⊤/τ) (7)
+
+trong đó τ là nhiệt độ softmax. Do mask mq, chỉ các thành phần của K tương ứng với các phần tử khác không của mask cần được lấy từ bộ nhớ. Mask top-k mŝ∈{0,1}S sau đó có thể được tính sử dụng ŝ (xem Hình 4e) và đầu ra attention xấp xỉ được thu được như:
+
+y3 = softmax(q·K⊤/√dh + log(mŝ+ε))·V (8)
+
+với ε→0. Một lần nữa, do mask mŝ, chỉ các cặp key-value tương ứng với các phần tử không bị mask cần được lấy từ bộ nhớ.
+
+**Phân bổ lại giá trị trung bình với sparsity query** Như một xem xét cuối cùng, chúng tôi xem xét việc kết hợp cải thiện phân bổ lại giá trị trung bình của Phương trình (6) với phương pháp trong Phương trình (8). Vì chúng ta không có quyền truy cập vào các điểm đầy đủ s, chúng ta tiến hành xấp xỉ tổng có trọng số sử dụng các điểm xấp xỉ trong Phương trình (7). Lưu ý rằng, vì tích dot product query-key chỉ được thực hiện trên r chiều, cần cẩn thận khi chọn nhiệt độ softmax τ thích hợp trong Phương trình (7). Nếu r thành phần được chọn ngẫu nhiên, nhiệt độ thích hợp sẽ là √r. Mặt khác, nếu r thành phần top-r là các phần tử khác không duy nhất của vector query, nhiệt độ thích hợp sẽ vẫn là √dh. Như một sự cân bằng giữa hai cực đoan, chúng tôi đã thấy nhiệt độ sau đây mang lại xấp xỉ tốt (xem Hình 4f):
+
+τ = √(dh‖q◦mq‖1/‖q‖1) (9)
+
+Đầu ra attention cuối cùng sau đó có thể được tính như một tổng có trọng số:
+
+y = αy3 + (1−α)v̄ (10)
+
+trong đó α=mŝ·ŝ là trọng số tương đối của các số hạng top-k.
+
+## 4. SparQ Attention
+
+Theo phân tích trong Phần 3, chúng tôi đề xuất SparQ Attention (xem Hình 5) bao gồm ba bước:
+
+**Bước 1**: Tìm các chỉ số của r thành phần lớn nhất của |q|1 và chỉ lấy K dọc theo các chiều tương ứng với các chỉ số này. Tính các điểm attention xấp xỉ ŝ sử dụng query và key đã cắt.
+
+**Bước 2**: Tìm k vị trí top-k trong các điểm attention xấp xỉ và lấy các vector key và value đầy đủ tương ứng. Tính đầu ra của phép toán attention sử dụng k key và value top-k.
+
+**Bước 3**: Ước tính tổng điểm α được gán cho k vị trí top-k sử dụng các điểm attention xấp xỉ. Sử dụng tổng điểm này để nội suy giữa đầu ra attention từ k vị trí top-k, và một vector giá trị trung bình, v.
+
+Việc truyền bộ nhớ của thuật toán SparQ Attention cho một forward-pass đầu attention đơn:
+
+MSparQ = S r + 2k dh + 4dh (11)
+
+trong đó số hạng đầu tương ứng với việc đọc r hàng của K, số hạng thứ hai tương ứng với việc đọc k cột top-k của K và V và số hạng thứ ba tương ứng với việc truyền liên quan đến việc ghi k và v hiện tại, ngoài việc đọc và ghi v.
+
+Bằng cách thay đổi r và k, chúng ta có thể điều chỉnh tổng lượng dữ liệu được truyền bởi sơ đồ, đánh đổi độ chính xác xấp xỉ cho tốc độ tăng tốc tạo token. Vì thường S≫dh, r là tham số quan trọng nhất kiểm soát tỷ lệ nén truyền dữ liệu MSparQ/Mdense.
+
+**Grouped query attention** Đối với các mô hình sử dụng GQA, các nhóm g query truy cập cùng một đầu KV. Để phù hợp với điều này, chúng tôi sửa đổi Bước 1 để tổng |q| trong mỗi nhóm trước khi chọn r thành phần top-r. Tương tự, Bước 2 được sửa đổi bằng cách tổng các điểm attention xấp xỉ trong mỗi nhóm trước khi chọn k key và value top-k cho mỗi đầu KV. Mặc dù Bước 3 có thể được thực hiện chính xác như trước, chúng tôi thấy rằng các mô hình GQA có được hiệu suất tốt hơn mà không có nó, vì vậy chúng tôi bỏ qua bước này cho Llama 3 và Mistral. Mã đầy đủ có thể được tìm thấy trong Phụ lục B.
+
+## 5. Thí nghiệm
+
+### 5.1. Thiết lập
+
+**Mô hình** Chúng tôi đánh giá phương pháp của mình trên năm biến thể mô hình ngôn ngữ mã nguồn mở được sử dụng rộng rãi: Llama 2 (Touvron et al., 2023), Llama 3 (Meta AI, 2024), Mistral (Jiang et al., 2023), Gemma (Mesnard et al., 2024) và Pythia (Biderman et al., 2023), đánh giá kích thước mô hình lên đến 13 tỷ tham số.2 Tất cả các mô hình đều là transformer chỉ decoder (Radford et al., 2018), được tiền huấn luyện trên mô hình hóa ngôn ngữ nhân quả. Chúng chia sẻ các thành phần kiến trúc tương tự như embedding vị trí quay (Su et al., 2021), trong khi cũng có một số khác biệt đáng chú ý như các cơ chế attention khác nhau (multi-head và grouped query attention), các implementation chuẩn hóa tầng, hàm kích hoạt và thực thi các module song song.
+
+**Nhiệm vụ** Để đánh giá phương pháp của chúng tôi trên một phổ nhiệm vụ NLP liên quan trình bày thách thức cụ thể cho các kỹ thuật attention thưa thớt, thiết lập đánh giá của chúng tôi bao gồm các nhiệm vụ khác nhau yêu cầu truy xuất thông tin và lý luận trên các chuỗi đầu vào dài. Điều này bao gồm trả lời câu hỏi, tóm tắt, perplexity/bits-per-character (BPC), và lặp lại văn bản. Để làm điều này, chúng tôi đã thích ứng các nhiệm vụ downstream tiêu chuẩn và bộ dữ liệu để tạo ra các ví dụ có độ dài chuỗi giữa 1k và 2k token. Để định nghĩa các nhiệm vụ độc lập với các mô hình được chọn, các ví dụ của chúng tôi được chọn để có độ dài chuỗi giữa 4000 và 8000 ký tự, đại khái cho độ dài mong muốn trong token.
+
+Đối với trả lời câu hỏi, chúng tôi sử dụng các bộ dữ liệu SQuAD (Rajpurkar et al., 2016) và TriviaQA (Joshi et al., 2017) trong thiết lập open-book. Để xây dựng các ví dụ SQuAD, chúng tôi bổ sung ngữ cảnh được cung cấp (tức là chuỗi đầu vào SQuAD tiêu chuẩn cần thiết để trả lời câu hỏi) với bảy "ngữ cảnh gây nhầm lẫn" bổ sung từ các câu hỏi không liên quan. Điều này đảm bảo rằng các ví dụ có độ dài chuỗi lớn, trong khi làm cho nhiệm vụ khó hơn vì mô hình cần phân biệt thông tin liên quan từ ngữ cảnh khỏi các đoạn văn không liên quan. Chúng tôi sử dụng SQuAD v1.1, vì nó không bao gồm các câu hỏi không thể trả lời được bao gồm trong SQuAD v2.0, vì chúng tôi nhằm đo lường khả năng của mô hình trích xuất thông tin hữu ích từ bộ nhớ đệm KV. Đối với cả hai nhiệm vụ trả lời câu hỏi, chúng tôi sử dụng độ chính xác khớp chuỗi chính xác làm metric đánh giá. Tóm tắt được đánh giá trên bộ dữ liệu CNN/DailyMail (See et al., 2017) sử dụng điểm ROUGE-L F-score (Lin, 2004) làm metric. Chúng tôi sử dụng bộ dữ liệu WikiText-103 (Merity et al., 2016) với bits per character (BPC) để đánh giá hiệu suất mô hình hóa ngôn ngữ.3 Cuối cùng, chúng tôi xây dựng một nhiệm vụ "Lặp lại văn bản" nhân tạo để đánh giá khả năng của mô hình lặp lại các câu từ ngữ cảnh của nó từng từ. Một nhiệm vụ như vậy có thể thường xuất hiện trong thiết lập đối thoại nơi tác nhân LLM được yêu cầu truy xuất một đoạn văn bản từ ngữ cảnh có thể dài được cung cấp, và có thể thách thức đối với các kỹ thuật attention thưa thớt. Chúng tôi xây dựng các ví dụ sử dụng bộ dữ liệu Tiny-Shakespeare (Karpathy, 2015) bằng cách chia văn bản thành các ngữ cảnh có kích thước thích hợp, nối chúng với các prompt chứa một tập con của ngữ cảnh, và đánh giá độ dài khớp ký tự chính xác đầu ra với phần tiếp theo từ ngữ cảnh.
+
+**Baseline** Chúng tôi xem xét kỹ thuật loại bỏ bộ nhớ đệm H2O (Zhang et al., 2023), attention thưa thớt top-k dưới dạng FlexGen (Sheng et al., 2023), và LM-Infinite, một sơ đồ cửa sổ cục bộ với các token ban đầu được bao gồm được đề xuất bởi Han et al. (2023) làm baseline. Đối với mỗi thí nghiệm, chúng tôi cố định ngân sách truyền bộ nhớ đệm KV k độc lập với độ dài chuỗi. Với H2O, chúng tôi đặt kích thước cửa sổ cục bộ l=k/4 (với 3k/4 heavy hitter), và đối với LM-Infinite chúng tôi luôn bao gồm 16 vị trí đầu tiên (với k−16 vị trí cục bộ). Do cận dưới của tỷ lệ nén của FlexGen là 1/2, chúng tôi không báo cáo kết quả của kỹ thuật trong Bảng 2 và Bảng 3, nhưng kết quả đầy đủ có thể được tìm thấy trong Phụ lục A. Định nghĩa tỷ lệ nén cho mỗi kỹ thuật này có thể được tìm thấy trong Phụ lục G.
+
+### 5.2. Kết quả
+
+Thí nghiệm của chúng tôi bao gồm tám mô hình riêng biệt: Llama 2 với 7 và 13 tỷ tham số, Llama 3 với 8 tỷ tham số, Mistral với 7 tỷ tham số, Gemma với 7 tỷ tham số, và ba mô hình Pythia với 1.4, 2.8 và 6.9 tỷ tham số. Kết quả từ các mô hình lớn nhất được trình bày trong Bảng 2, với kết quả khác trong Hình A1 đến A3.
+
+Chúng tôi quan sát rằng hiệu suất SparQ Attention mạnh mẽ trên tất cả các nhiệm vụ và mô hình được kiểm tra, vì tỷ lệ nén từ 1/2 đến 1/8 có thể đạt được với ít hoặc không mất hiệu suất nhiệm vụ. H2O có thể đạt hiệu suất tốt trên một số nhiệm vụ như TriviaQA và WikiTest-103, mặc dù các nhiệm vụ khác, bao gồm SQuAD và Lặp lại văn bản, thách thức hơn và xuất hiện suy giảm đáng chú ý. Hiệu suất LM-Infinite giảm trên tất cả các nhiệm vụ, chứng minh rằng các nhiệm vụ không cho phép giải pháp tầm thường là loại bỏ chuỗi đầu vào dài.
+
+### 5.3. Mở rộng độ dài chuỗi
+
+Độ dài chuỗi của các ví dụ khác nhau trong các nhiệm vụ chính của chúng tôi thay đổi giữa 1k và 2k token, trong khi nhiều LLM hỗ trợ độ dài chuỗi lớn hơn nhiều so với điều này. Chúng tôi xem xét hai nhiệm vụ để đánh giá cách SparQ Attention hoạt động khi độ dài chuỗi mở rộng.
+
+Nhiệm vụ đầu tiên là một biến thể của SQuAD, tăng cả độ dài chuỗi và độ khó nhiệm vụ bằng cách tăng số lượng ngữ cảnh gây nhầm lẫn có mặt trong prompt, điều này tương tự như việc tăng số lượng tài liệu được truy xuất với hệ thống tạo tăng cường truy xuất (Borgeaud et al., 2022). Chúng tôi kiểm tra SparQ Attention và H2O trong thiết lập này sử dụng Vicuna (Chiang et al., 2023), một hậu duệ của Llama 2 đã được thích ứng cho các chuỗi dài hơn. Cả SparQ Attention và H2O đều được cấu hình để duy trì tỷ lệ nén cố định so với baseline dày đặc (giữ r=32 và sửa đổi k để duy trì nén 1/4). Kết quả trong Hình 6 cho thấy rằng SparQ Attention có thể mở rộng đến các chuỗi lớn, vì nó có thể duy trì hiệu suất lên đến độ dài chuỗi 128k.
+
+Nhiệm vụ thứ hai được đánh giá là needle in a haystack, trong đó một "text needle" được chèn vào ngữ cảnh ở một độ sâu nhất định, và mô hình được giao nhiệm vụ truy xuất thông tin từ needle. Việc thực hiện chính xác nhiệm vụ này mà chúng tôi đã sử dụng được nêu trong Dhinakaran (2024). Chúng tôi so sánh SparQ Attention với H2O và LM-Infinite trên một loạt tỷ lệ nén khác nhau. Kết quả, như được thấy trong Bảng 3 và Hình A4, cho thấy rằng SparQ Attention đạt hiệu suất rất gần với baseline attention dày đặc, ngay cả trong các thiết lập độ thưa thớt cao.
+
+### 5.4. Ablation
+
+**Nén bộ nhớ đệm Key** Bước đầu tiên trong SparQ Attention liên quan đến việc đọc r thành phần của bộ nhớ đệm key để xác định xấp xỉ những key nào mang lại điểm attention cao nhất. Để xem xét sự đánh đổi thực tế của xấp xỉ, chúng tôi xem xét cách SparQ Attention hoạt động khi so sánh với một "oracle" giới hạn trên lý thuyết cung cấp k key chính xác top-k mà không cần bất kỳ truyền dữ liệu nào để tính top-k. Kết quả trong Hình 7a cho thấy rằng SparQ Attention duy trì hiệu suất có thể so sánh với oracle cho một loạt tỷ lệ nén, và đạt hiệu suất cao hơn đáng kể so với sơ đồ nén baseline, trong đó một phép chiếu low rank ngẫu nhiên của K được truyền từ bộ nhớ.
+
+**Nhiệt độ softmax xấp xỉ** Để hỗ trợ thực nghiệm phân tích thống kê của chúng tôi về sự đồng thuận α được hiển thị trong Hình 4f, chúng tôi đánh giá một số thiết lập nhiệt độ khả thi khác nhau, bao gồm căn bậc hai của chiều đầu (τ=√dh), căn bậc hai của rank (τ=√r), và nhiệt độ được đề xuất trong Phương trình (9). Chúng tôi cũng xem xét kịch bản nơi chúng ta không phân bổ lại khối lượng cho giá trị trung bình (α=0), tương ứng với giới hạn của nhiệt độ tiến về 0. Chúng tôi thấy rằng nhiệt độ được đề xuất của chúng tôi hoạt động tốt nhất, như được hiển thị trong Hình 7b.
+
+**Lựa chọn siêu tham số** Việc giảm truyền dữ liệu đạt được bởi SparQ Attention được kiểm soát bởi hai siêu tham số của nó, k và r. Giảm một trong các biến này sẽ cải thiện hiệu quả băng thông, nhưng có thể ảnh hưởng tiêu cực đến hiệu suất nhiệm vụ. Hình 7c cho thấy mối quan hệ giữa k và r trên cả hai yếu tố này. Dựa trên những kết quả này, chúng tôi đề xuất một công thức đơn giản là đặt k=128 và điều chỉnh r để duy trì sự đánh đổi tốt giữa truyền dữ liệu và hiệu suất nhiệm vụ cho một loạt mô hình và nhiệm vụ.
+
+## 6. Benchmarking
+
+Kết quả trên sử dụng mô hình chi phí lý thuyết của tổng truyền bộ nhớ (số phần tử vô hướng được truyền đến và từ bộ nhớ mỗi token), cho phép chúng tôi đánh giá SparQ Attention độc lập với thiết lập phần cứng cụ thể và định dạng số được sử dụng. Để xác thực phát hiện của chúng tôi, chúng tôi đã thực hiện một tập hợp microbenchmark của một phép toán attention riêng lẻ, ngoài các benchmark hiệu suất end-to-end.
+
+SparQ Attention được hưởng lợi từ hai tối ưu hóa. Thứ nhất là lưu trữ K hai lần, trong cả layout dh-contiguous và S-contiguous, vì điều này cho phép một gather (indexing) hiệu quả trên cả hai trục, với chi phí 50% sử dụng bộ nhớ thêm. Tối ưu hóa thứ hai là sử dụng một phép toán gather-then-matmul hợp nhất để tránh ghi kết quả của gather vào bộ nhớ.
+
+### 6.1. Microbenchmarks
+
+Chúng tôi kiểm tra nhiều implementation của baseline và SparQ Attention trên IPU sử dụng giao diện Poplar C++ và GPU sử dụng PyTorch (Paszke et al., 2019). Trong tất cả các trường hợp, chúng tôi sử dụng các tham số shape Llama 2 7B: 32 đầu, dh=128. Các implementation được kiểm tra là: Baseline dày đặc, chọn cái nhanh hơn giữa implementation PyTorch đơn giản và scaleddotproductattention tích hợp, SparQ (Triton), lưu trữ K hai lần và sử dụng các kernel gather-then-matmul hợp nhất được viết bằng Triton (Tillet et al., 2019), SparQ (PyTorch), không có Triton và SparQ (Triton, 1×K), chỉ lưu trữ K trong layout dh-contiguous, không có chi phí bộ nhớ bổ sung. Trong một cấu hình ví dụ chạy trên một IPU đơn từ Bow Pod16, kích thước lô 1, độ dài chuỗi S=16384, baseline dày đặc đạt 40.4 ms/query, trong khi SparQ (r=32, k=128) đạt 5.28ms/query cho tốc độ tăng 7.41× (tốc độ tăng lý thuyết của SparQ là 7.53×). Tốc độ tăng gần hoàn hảo này được đạt được vì attention bị ràng buộc mạnh mẽ bởi bộ nhớ khi sử dụng bộ nhớ từ xa. Ngược lại, baseline chạy trong SRAM cục bộ mất 134µs cho tốc độ tăng 345×, nhưng điều này chỉ có thể đạt được thực tế khi toàn bộ mô hình vừa trong SRAM.
+
+Tốc độ tăng GPU đạt được của chúng tôi được trình bày trong Bảng 4, và xu hướng hiệu suất với độ dài chuỗi được hiển thị trong Hình 8. Sai số chuẩn cho tất cả kết quả được đưa ra là <1% của trung bình. Xem Phụ lục F để biết thêm chi tiết.
+
+Những kết quả microbenchmark này cho thấy rằng lợi ích lý thuyết của SparQ Attention có thể mang lại tốc độ tăng thời gian wall-clock đáng kể trên phần cứng hiện tại. Cần làm việc thêm để hiển thị cải thiện cho kích thước lô nhỏ, và để điều tra các lựa chọn thay thế cho việc lưu trữ K hai lần.
+
+### 6.2. Hiệu suất End-to-End
+
+Ngoài kết quả microbenchmark tích cực, chúng tôi tiếp tục làm nổi bật những cải thiện thực tế mà SparQ Attention mang lại bằng cách benchmark hiệu suất của toàn bộ mô hình Transformer trên cả CPU và GPU, được implement trong llama.cpp và gpt-fast (Meta, 2023) tương ứng.
+
+Trong cả hai trường hợp, chúng tôi đo thời gian cần thiết để tạo một token đơn, cho một độ dài chuỗi hiện có S.
+
+**Benchmarking CPU** Chúng tôi đánh giá hiệu suất benchmarking CPU trên các hệ thống AMD EPYC với bộ nhớ lên đến 256GB. Kết quả, như được thấy trong Hình 9, cho thấy rằng SparQ Attention đạt tốc độ tăng ở tất cả độ dài chuỗi được đánh giá, so với baseline dày đặc. Ở độ dài chuỗi dài nhất được xem xét, SparQ Attention đạt tốc độ tăng 2.5×, thể hiện lợi ích của việc giảm truyền dữ liệu liên quan đến attention.
+
+**Benchmarking GPU** Implementation GPU end-to-end của chúng tôi được đánh giá trên một H100 PCIe đơn với bộ nhớ 80GB. Mặc dù sử dụng bộ nhớ băng thông cao, suy luận GPU vẫn đạt tốc độ tăng end-to-end khi sử dụng SparQ Attention trên độ dài chuỗi khiêm tốn, như được thấy trong Hình 10.
+
+## 7. Công trình liên quan
+
+Các phương pháp attention hiệu quả đã là một lĩnh vực nghiên cứu rất tích cực (Tay et al., 2020b). Các sơ đồ như Sparse Transformers (Child et al., 2019), Combiner (Ren et al., 2021), Longformer (Beltagy et al., 2020), BigBird (Zaheer et al., 2020), Reformer (Kitaev et al., 2020) và Sparse Sinkhorn Attention (Tay et al., 2020a) đã được phát triển để tăng hiệu quả của cơ chế attention bằng cách trích xuất thông tin từ các token nổi bật nhất trong chuỗi hoặc xấp xỉ các bản đồ attention dày đặc. Hai sơ đồ giảm dấu chân bộ nhớ và truyền dữ liệu của phép toán attention, trong khi duy trì độ phức tạp bậc hai là Multi-Query Attention (MQA) (Shazeer, 2019) và Grouped-Query Attention (GQA) (Ainslie et al., 2023) chia sẻ mỗi đầu KV trên nhiều đầu query. Những phương pháp này tạo thành một phần của kiến trúc: chúng phải được implement trong quá trình tiền huấn luyện, mang các sự đánh đổi hiệu suất nhiệm vụ khác nhau, và có thể ảnh hưởng đến chất lượng và tính ổn định của mô hình.
+
+Một lĩnh vực nghiên cứu mới nổi tương tự như SparQ Attention nhằm chỉ thích ứng quy trình suy luận của một mô hình được tiền huấn luyện. Phương pháp đơn giản nhất của loại này là một phần của FlexGen (Sheng et al., 2023), và tính toán điểm attention chính xác, chỉ truy xuất các giá trị liên quan đến điểm top-k. Quá trình này sử dụng toàn bộ bộ nhớ đệm key để tạo ra điểm attention, giới hạn việc giảm tiệm cận của việc truyền bộ nhớ chỉ xuống 50%. LM-Infinite (Han et al., 2023) và StreamingLLM (Xiao et al., 2023) sử dụng một mẫu sparsity cố định bảo tồn các token gần đây nhất và một vài token ban đầu để attention hiệu quả hơn, nhưng không có tính chọn lọc trong việc tra cứu bộ nhớ đệm của chúng.
+
+Các sơ đồ eviction chỉ lưu trữ một tập con của key và value, bằng cách liên tục xóa các token không cung cấp thông tin cho đầu ra tương lai. Bằng cách giảm chính kích thước bộ nhớ đệm, cả lượng bộ nhớ được sử dụng và dữ liệu được truyền đều được giảm. H2O (Zhang et al., 2023), Scissorhands (Liu et al., 2023a) và FastGen (Ge et al., 2024) là ví dụ của các phương pháp eviction như vậy. H2O sử dụng một chính sách eviction tham lam duy trì trong bộ nhớ các token "Heavy Hitter" nổi bật nhất đóng góp nhiều nhất cho điểm attention. Scissorhands xác định và duy trì "token quan trọng" bằng cách đếm khi điểm attention của một token vượt quá ngưỡng tầm quan trọng. FastGen áp dụng heuristic như ngăn chặn eviction của các token đặc biệt và dấu câu, và điều chỉnh chiến lược nén cho từng đầu attention riêng lẻ. Trong khi những phương pháp này giảm dấu chân bộ nhớ của bộ nhớ đệm KV cũng như truyền dữ liệu, chúng cũng dẫn đến mất thông tin vĩnh viễn từ cửa sổ ngữ cảnh, có thể dẫn đến lỗi cho các truy vấn tìm kiếm các phần ít được chú ý của chuỗi.
+
+IceFormer (Mao et al., 2023) sử dụng nhiều thuật toán nearest neighbour xấp xỉ hiện có để xấp xỉ điểm attention của các mô hình được tiền huấn luyện, tập trung vào việc tăng tốc giai đoạn prefill, thay vì tạo. Scatterbrain (Chen et al., 2021) sử dụng các kỹ thuật tương tự, nhưng cho các ứng dụng thị giác máy tính.
+
+Ngoài việc nén bộ nhớ đệm KV, một số phương pháp cố gắng tăng tốc suy luận LLM bằng cách tạo ra sparsity trong các trọng số của mô hình. Deja Vu (Liu et al., 2023c) là một phương pháp thưa thớt theo ngữ cảnh nhằm dự đoán những tham số mô hình nào được yêu cầu sao cho lỗi giữa tính toán đầy đủ và xấp xỉ thưa thớt được tối thiểu hóa. Tương tự, các phương pháp sparsity activation, bao gồm Kurtz et al. (2020) và Mirzadeh et al. (2024), khai thác các giá trị zero được tìm thấy trong activation, thường được tạo ra bởi các hàm kích hoạt ReLU. Kurtz et al. (2020) giới thiệu một hàm ReLU ngưỡng kích hoạt bắt buộc thay thế có thể tạo ra sparsity ở các ngưỡng được chỉ định. Tương tự, Mirzadeh et al. (2024) thay thế các hàm kích hoạt trong LLM bằng ReLU, theo sau bởi tinh chỉnh bổ sung. Những phương pháp này phù hợp nhất cho các chế độ kích thước lô nhỏ và độ dài chuỗi ngắn, nơi suy luận bị nghẽn cổ chai bởi truyền tham số, thay vì bộ nhớ đệm KV, nhưng tương thích với các kỹ thuật attention thưa thớt như SparQ Attention.
+
+Một dòng công việc trực giao tăng hiệu quả băng thông bằng cách nén bộ nhớ đệm KV với định dạng số 4-bit (Liu et al., 2023b; Sheng et al., 2023). Liu et al. (2023a) chứng minh rằng nén 4-bit bổ sung cho các kỹ thuật giảm số lượng phần tử được truyền.
+
+## 8. Kết luận
+
+Trong công trình này, chúng tôi đã trình bày SparQ Attention, một kỹ thuật mới để mở khóa suy luận nhanh hơn cho các LLM được tiền huấn luyện. Kỹ thuật được đề xuất của chúng tôi sửa đổi cơ chế attention để chỉ truy cập các token liên quan từ bộ nhớ đệm KV ở mỗi bước tạo, dẫn đến tiết kiệm truyền dữ liệu đáng kể. Điều này đặc biệt có lợi trong các chế độ độ dài chuỗi dài, nơi tốc độ suy luận thường bị nghẽn cổ chai bởi truyền bộ nhớ thay vì tính toán.
+
+Chúng tôi cũng làm nổi bật lợi thế của việc duy trì toàn bộ bộ nhớ đệm KV trong bộ nhớ cho hiệu suất nhiệm vụ bằng cách so sánh SparQ Attention với các chiến lược phổ biến khác loại bỏ thông tin từ chuỗi đầu vào. Những phương pháp thay thế này dựa vào heuristic hoặc chính sách được định nghĩa trước để xác định những mục nào trong bộ nhớ đệm KV cần loại bỏ, có thể không khái quát hóa trên phạm vi rộng các ứng dụng mà LLM được sử dụng.
+
+Chúng tôi cho thấy rằng SparQ Attention mạnh mẽ trên nhiều nhiệm vụ và mô hình, khiến nó trở thành một kỹ thuật khả thi để giảm thời gian suy luận trong các thiết lập chưa thấy.
+
+## Tuyên bố tác động
+
+Bài báo này trình bày công trình có mục tiêu thúc đẩy lĩnh vực Học máy. Có nhiều hậu quả xã hội tiềm tàng của công trình của chúng tôi, không có gì mà chúng tôi cảm thấy phải được làm nổi bật cụ thể ở đây.
+
+## Lời cảm ơn
+
+Chúng tôi muốn cảm ơn Oscar Key vì đã implement SparQ Attention trên GPU và benchmark hiệu suất end-to-end của nó.
+
+Ngoài ra, chúng tôi cũng muốn cảm ơn Daniel Justus, Paul Balança và Andrew Fitzgibbon vì đầu vào hữu ích và phản hồi về công trình này.

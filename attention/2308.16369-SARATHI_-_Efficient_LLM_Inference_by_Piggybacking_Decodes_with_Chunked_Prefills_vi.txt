@@ -1,0 +1,578 @@
+# SARATHI : Efficient LLM Inference by Piggybacking Decodes with Chunked Prefills
+# Translated from PDF to TXT
+# Source path: /home/admin88/arxiv-downloader/attention/2308.16369.pdf
+# File size: 1312532 bytes
+
+===============================================
+NỘI DUNG TỆP PDF
+===============================================
+
+
+--- TRANG 1 ---
+SARATHI : Suy luận LLM hiệu quả bằng cách gắn kết giải mã với tiền xử lý phân đoạn
+Amey Agrawal *2, Ashish Panwar1, Jayashree Mohan1, Nipun Kwatra1, Bhargav S. Gulavani1, và
+Ramachandran Ramjee1
+1Microsoft Research India
+2Georgia Institute of Technology
+Tóm tắt
+Suy luận Mô hình Ngôn ngữ Lớn (LLM) bao gồm hai giai đoạn riêng biệt – giai đoạn tiền xử lý xử lý lời nhắc đầu vào và giai đoạn giải mã tạo ra các token đầu ra một cách tự hồi quy. Trong khi giai đoạn tiền xử lý hiệu quả bão hòa tính toán GPU ở các kích thước batch nhỏ, giai đoạn giải mã dẫn đến việc sử dụng tính toán thấp vì nó tạo ra một token tại một thời điểm cho mỗi yêu cầu. Thời gian tiền xử lý và giải mã khác nhau cũng dẫn đến mất cân bằng giữa các micro-batch khi sử dụng song song đường ống, gây ra thêm sự không hiệu quả do bong bóng. Chúng tôi trình bày SARATHI để giải quyết những thách thức này. SARATHI sử dụng tiền xử lý phân đoạn, chia một yêu cầu tiền xử lý thành các phần có kích thước bằng nhau, và lô ghép giải mã tối đa, xây dựng một lô sử dụng một phần tiền xử lý duy nhất và điền các vị trí còn lại với các giải mã. Trong quá trình suy luận, phần tiền xử lý bão hòa tính toán GPU, trong khi các yêu cầu giải mã 'gắn kết' và chi phí lên đến một bậc độ lớn ít hơn so với lô chỉ giải mã. Tiền xử lý phân đoạn cho phép xây dựng nhiều lô giải mã tối đa từ một yêu cầu tiền xử lý duy nhất, tối đa hóa độ bao phủ của các giải mã có thể gắn kết. Hơn nữa, thiết kế tính toán đồng nhất của các lô này cải thiện sự mất cân bằng giữa các micro-batch, giảm đáng kể bong bóng đường ống.
+
+Các kỹ thuật của chúng tôi mang lại cải thiện đáng kể trong hiệu suất suy luận trên các mô hình và phần cứng. Đối với mô hình LLaMA-13B trên GPU A6000, SARATHI cải thiện thông lượng giải mã lên đến 10 ×, và tăng tốc thông lượng end-to-end lên đến 1.33 ×. Đối với LLaMa-33B trên GPU A100, chúng tôi đạt được thông lượng end-to-end cao hơn 1.25 × và thông lượng giải mã cao hơn lên đến 4.25×. Khi được sử dụng với song song đường ống trên GPT-3, SARATHI giảm bong bóng 6.29 ×, dẫn đến cải thiện thông lượng end-to-end 1.91 ×.
+
+1 Giới thiệu
+Việc mở rộng quy mô của các mô hình ngôn ngữ [25, 26, 35, 38] đã dẫn đến sự xuất hiện khả năng của chúng [45] trong nhiều tác vụ phức tạp — xử lý ngôn ngữ tự nhiên, hỏi đáp, tạo mã, v.v. Điều này đã dẫn đến sự bùng nổ trong việc sử dụng chúng trên các ứng dụng bao gồm các động cơ hội thoại [2, 4, 5, 38], tìm kiếm [3, 8, 9, 15, 22], trợ lý mã [1, 7, 16], v.v. Việc tính toán GPU đáng kể cần thiết cho suy luận trên các mô hình lớn này, cùng với việc sử dụng rộng rãi của chúng, đã khiến suy luận LLM trở thành khối lượng công việc GPU chủ đạo. Tối ưu hóa suy luận LLM do đó đã trở nên rất quan trọng và đã thấy sự quan tâm đáng kể gần đây [39, 42, 48].
+
+Trong bài báo này, trước tiên chúng tôi phân tích một lý do cơ bản đằng sau hiệu quả thấp của suy luận LLM. Mỗi yêu cầu suy luận LLM trải qua hai giai đoạn – giai đoạn tiền xử lý tương ứng với việc xử lý lời nhắc đầu vào và giai đoạn giải mã tương ứng với việc tạo token tự hồi quy. Giai đoạn tiền xử lý xử lý tất cả các token trong chuỗi đầu vào song song, dẫn đến việc sử dụng GPU cao ngay cả với kích thước batch nhỏ. Ví dụ, trên GPU A6000, đối với mô hình LLaMA-13B, một tiền xử lý với độ dài chuỗi 512 token
+
+*Công việc thực hiện khi thực tập tại Microsoft Research India
+
+Hình 1: Ví dụ lịch trình song song đường ống hai giai đoạn. (a) Trong các giải pháp trước như Orca [48], bong bóng đường ống phổ biến do thời gian tính toán lời nhắc và giải mã khác nhau. Hơn nữa, các giải mã rất không hiệu quả (chi phí giải mã trên mỗi token cao hơn một bậc độ lớn so với Tiền xử lý). (b) SARATHI giảm đáng kể bong bóng đường ống và cho phép các giải mã gắn kết hiệu quả hơn.
+
+1arXiv:2308.16369v1 [cs.LG] 31 Aug 2023
+
+--- TRANG 2 ---
+bão hòa tính toán GPU ngay cả ở kích thước batch chỉ một. Mặt khác, giai đoạn giải mã chỉ xử lý một token duy nhất trong mỗi lần truyền tự hồi quy, dẫn đến việc sử dụng GPU rất thấp ở kích thước batch thấp. Ví dụ, các thí nghiệm của chúng tôi tiết lộ rằng, ở kích thước batch nhỏ, chi phí giải mã trên mỗi token có thể cao tới ∼200 lần chi phí tiền xử lý trên mỗi token. Hơn nữa, vì một yêu cầu chỉ trải qua một lần tiền xử lý duy nhất, nhưng nhiều lần giải mã (một cho mỗi token được tạo), hiệu quả suy luận tổng thể bị ảnh hưởng đáng kể.
+
+Một chiến lược để cải thiện hiệu quả giải mã LLM là tăng kích thước batch bằng cách sử dụng song song mô hình. Trong các máy chủ có kết nối băng thông cao như NVIDIA DGX A100, song song tensor [43] có thể cho phép triển khai LLM trên tối đa 8 GPU, do đó hỗ trợ kích thước batch lớn và giải mã hiệu quả. Pope et al. [39] cho thấy rằng song song tensor có thể được mở rộng quy mô lên đến 256 thiết bị trên các pod TPUv4 chuyên biệt. Tuy nhiên, song song tensor ở quy mô lớn như vậy có thể dẫn đến hiệu suất kém khi các siêu cụm không khả dụng. Trong những trường hợp như vậy, song song đường ống [24, 37] có thể giúp tăng kích thước batch. Do đó, các hệ thống như Orca [48] dựa vào song song đường ống để mở rộng quy mô suy luận LLM và áp dụng giải pháp nổi tiếng là sử dụng micro-batch để giảm thiểu tắc nghẽn hoặc bong bóng đường ống [34]. Tuy nhiên, như chúng tôi cho thấy trong bài báo này, việc lập lịch dựa trên micro-batch tiêu chuẩn vẫn có thể dẫn đến bong bóng đường ống do các đặc điểm độc đáo của suy luận LLM. Cụ thể, suy luận LLM bao gồm hỗn hợp các tiền xử lý có độ dài khác nhau và giải mã. Điều này tạo ra thời gian xử lý khác nhau cho các micro-batch khác nhau, dẫn đến bong bóng đáng kể và lãng phí chu kỳ GPU như được minh họa trong Hình 1(a). Lưu ý rằng bong bóng đầu tiên trong hình là do kích thước lời nhắc khác nhau trong khi bong bóng thứ hai là do không khớp giữa thời gian tính toán lời nhắc và giải mã.
+
+Trong bài báo này, chúng tôi trình bày thiết kế và triển khai SARATHI, một kỹ thuật suy luận LLM hiệu quả. SARATHI sử dụng tiền xử lý phân đoạn và lô ghép giải mã tối đa để giải quyết các vấn đề của 1) giải mã không hiệu quả và 2) bong bóng đường ống. Tiền xử lý phân đoạn chia một yêu cầu tiền xử lý thành các phần có kích thước tính toán bằng nhau. Hơn nữa, SARATHI sử dụng lô ghép giải mã tối đa để xây dựng một lô bằng cách sử dụng một phần tiền xử lý duy nhất và điền phần còn lại của lô với các giải mã. Lô kết hợp này cung cấp các đơn vị công việc vừa bão hòa tính toán vừa đồng nhất, do đó giải quyết các vấn đề của giải mã không hiệu quả và bong bóng đường ống.
+
+Vì các giai đoạn tiền xử lý và giải mã có yêu cầu tính toán khác nhau, thông tin quan trọng của phương pháp chúng tôi là việc trộn các yêu cầu tiền xử lý và giải mã trong một lô duy nhất có thể cho phép việc sử dụng tính toán cao đồng nhất. Tuy nhiên, vì mỗi yêu cầu chỉ có một giai đoạn tiền xử lý duy nhất, tiếp theo là nhiều giai đoạn giải mã (cho mỗi token được tạo), chúng ta sẽ không có đủ yêu cầu tiền xử lý để có thể luôn tạo một lô kết hợp của tiền xử lý và giải mã. Tiền xử lý phân đoạn cho phép chúng ta xây dựng nhiều lô kết hợp từ một yêu cầu tiền xử lý duy nhất, do đó tăng độ bao phủ của các giải mã có thể gắn kết với tiền xử lý. Trong lô kết hợp của chúng tôi, phần tiền xử lý duy nhất đảm bảo việc sử dụng GPU cao, trong khi các yêu cầu giai đoạn giải mã 'gắn kết' cùng. Với tỷ lệ token tiền xử lý-giải mã trung bình cho một ứng dụng LLM, chúng tôi chọn kích thước phần tiền xử lý tối đa hóa hiệu suất tổng thể.
+
+Các lô kết hợp được xây dựng trong SARATHI có yêu cầu tính toán đồng nhất. Do đó, khi được sử dụng với song song đường ống, SARATHI đảm bảo rằng các micro-batch được cân bằng tốt, dẫn đến giảm đáng kể bong bóng đường ống như được hiển thị trong Hình 1(b).
+
+Chúng tôi đánh giá SARATHI trên các mô hình và phần cứng khác nhau — LLaMA-13B trên GPU A6000, LLaMA-33B trên GPU A100, và GPT-3 với đường ống 8 chiều và song song tensor 8 chiều trên một cụm mô phỏng gồm 64 GPU A100. Đối với LLaMA-13B trên A6000, SARATHI cải thiện thông lượng giải mã lên đến 10 × và dẫn đến cải thiện thông lượng end-to-end lên đến 1.33 ×. Tương tự, đối với LLaMA-33B trên A100, thông lượng giải mã của chúng tôi cải thiện 4.25 ×, và dẫn đến cải thiện thông lượng end-to-end 1.25 ×. Khi được sử dụng với song song đường ống, SARATHI giảm bong bóng 6.29×, dẫn đến tăng tốc end-to-end 1.91 ×.
+
+Các đóng góp chính của bài báo chúng tôi bao gồm:
+1. Tiền xử lý phân đoạn cho phép xây dựng các đơn vị công việc bão hòa tính toán và đồng nhất.
+2. Lô ghép giải mã tối đa cho phép các giải mã không hiệu quả 'gắn kết' với các tiền xử lý hiệu quả.
+3. Áp dụng tiền xử lý phân đoạn và lô ghép giải mã tối đa cho song song đường ống để giảm đáng kể bong bóng đường ống.
+4. Đánh giá toàn diện trên nhiều mô hình, phần cứng, và chiến lược song song thể hiện cải thiện thông lượng lên đến 1.91 ×.
+
+2 Bối cảnh
+Trước tiên chúng tôi đưa ra tổng quan về kiến trúc transformer, tiếp theo là thảo luận ngắn gọn về hai giai đoạn của suy luận LLM, và song song đường ống.
+
+2.1 Kiến trúc Transformer
+Hình 2 cho thấy kiến trúc của một khối giải mã transformer. Mỗi khối giải mã bao gồm hai mô-đun chính: tự chú ý và mạng feed-forward (FFN). Các mô-đun này có thể được chia thành sáu phép toán sau: pre-proj, attn, postproj (trong mô-đun chú ý), và ffn_ln1, ffn_ln2 (trong FFN) và các phép toán khác (ví dụ: chuẩn hóa lớp, hàm kích hoạt, kết nối dư, v.v.).
+
+2.2 Các giai đoạn tiền xử lý và giải mã
+Suy luận Transformer bắt đầu với giai đoạn tiền xử lý xử lý tất cả các token đầu vào của một lô nhất định song song. Trong giai đoạn này, đầu vào cho một khối transformer là một tensor X có hình dạng [B,L,H] trong đó B biểu thị kích thước lô, L biểu thị
+
+--- TRANG 3 ---
+Chuẩn hóa lớp Thêm Chuẩn hóa lớp Chú ý FFN Thêm
+WQ , K , V  [ H - > 3 H ] WO [ H - > H ] Dropout Concat Tự Chú ý
+Q
+K
+V Chú ý
+( a )( b )W  [ H - > H 2 ] W  [ H 2 - > H ] Dropout GeLU
+( c ) FFN Khối Giải mã
+
+Hình 2: Kiến trúc cấp cao của một khối giải mã.
+
+độ dài chuỗi của mỗi yêu cầu (tức là số lượng token đầu vào trong truy vấn nhất định), và H là kích thước nhúng của mô hình (ví dụ: 5120 cho LLaMA-13B).
+
+Bảng 1 cho thấy hình dạng của các tensor đầu vào, đầu ra và trọng số của các phép toán khác nhau. Mỗi khối transformer trước tiên tính toán tự chú ý trên một đầu vào X nhất định. Thông thường, chú ý đa đầu được sử dụng, nhưng chúng tôi chỉ xem xét một đầu để đơn giản hóa việc trình bày. Một phép biến đổi tuyến tính preproj trên X (sử dụng các tensor trọng số WQ, WK và WV có hình dạng [H,H]) tạo ra Q, K và V thường được biết đến như truy vấn, khóa và giá trị, mỗi cái có hình dạng [B,L,H]. Bên trong, preproj là một phép nhân ma trận-ma trận duy nhất của X với một tensor trọng số kết hợp có hình dạng [H,3H].
+
+Tiếp theo, phép tính attn trên Q, K và V tạo ra một tensor Y có hình dạng [B,L,H]. Cuối cùng, postproj áp dụng một phép biến đổi tuyến tính trên Y (sử dụng ma trận trọng số Wo có hình dạng [H,H]), trả về một tensor Z có hình dạng [B,L,H].
+
+Tiếp theo, mô-đun FFN thực hiện hai phép nhân ma trận-ma trận theo lô. Trong ffn_ln1, Z được nhân với một tensor trọng số có hình dạng [H,H2] tạo ra một tensor đầu ra có hình dạng [B,L,H2], sau đó được nhân với một tensor trọng số có hình dạng [H2,H] trong ffn_ln2 để xuất ra một tensor có hình dạng [B,L,H]. Ở đây, H2 đề cập đến chiều ẩn thứ hai của mô hình.
+
+Giai đoạn giải mã thực hiện các phép toán giống như tiền xử lý, nhưng chỉ cho token duy nhất được tạo ra trong lần lặp tự hồi quy cuối cùng. Do đó, tensor đầu vào trong giai đoạn giải mã có hình dạng [B,1,H] (trái ngược với [B,L,H] của tiền xử lý). Hơn nữa, phép tính chú ý cho mỗi token mới phụ thuộc vào các tensor khóa (K) và giá trị (V) của tất cả các token trước đó trong cùng một yêu cầu. Để tránh tính toán lại K và V của tất cả các token trong mỗi lần lặp, hầu hết các triển khai lưu trữ các giá trị này trong bộ nhớ GPU - được gọi là bộ nhớ đệm KV. Lưu ý rằng tensor K và V của mỗi token có hình dạng [1,H].
+
+2.3 Suy luận LLM đa GPU
+Khi kích thước mô hình của LLM tăng lên, việc mở rộng chúng thành triển khai đa GPU cũng như đa nút trở nên cần thiết [19, 39]. Hơn nữa, thông lượng suy luận LLM,
+
+Phép toán | Hình dạng của tensor
+-----------|-------------------
+ | Đầu vào | Trọng số | Đầu ra
+preproj | [B,L,H] | [H,H] | [B,L,H]
+attn | [B,L,H] | - | [B,L,H]
+postproj | [B,L,H] | [H,H] | [B,L,H]
+ffn_ln1 | [B,L,H] | [H,H2] | [B,L,H2]
+ffn_ln2 | [B,L,H2] | [H2,H] | [B,L,H]
+
+Bảng 1: Hình dạng của tensor đầu vào, trọng số và đầu ra trong một khối giải mã transformer. B, L và H biểu thị kích thước lô, kích thước nhúng (còn gọi là ẩn) và độ dài chuỗi (L=1 trong quá trình giải mã, ngoại trừ chú ý).
+
+cụ thể là của giai đoạn giải mã bị giới hạn bởi kích thước lô tối đa mà chúng ta có thể đặt vừa trên một GPU. Do đó, hiệu quả suy luận có thể được hưởng lợi từ song song mô hình chia sẻ trọng số mô hình trên nhiều GPU giải phóng bộ nhớ để hỗ trợ kích thước lô lớn hơn. Công việc trước đây đã sử dụng cả song song tensor (TP) [43] (trong nút) và song song đường ống (PP) [6, 46, 48] (trên các nút) cho mục đích này.
+
+TP chia sẻ mỗi lớp trên các GPU tham gia. Điều này chia cả trọng số mô hình và bộ nhớ đệm KV đều trên các GPU worker, dẫn đến mở rộng tuyến tính của kích thước lô trên mỗi GPU. Tuy nhiên, nó đi kèm với chi phí giao tiếp cao do hai phép toán all-reduce trên mỗi lớp – một trong tính toán chú ý và cái kia trong FFN [43]. Hơn nữa, vì các phép toán giao tiếp này nằm trong đường dẫn quan trọng, TP chỉ được ưa thích trong một nút duy nhất được kết nối bởi các kết nối băng thông cao như NVLink. PP chủ yếu được sử dụng để tạo điều kiện cho việc triển khai cross-node cho các mô hình rất lớn, nơi mô hình không thể vừa trong một nút duy nhất.
+
+So với TP, PP chia mô hình theo lớp, nơi mỗi GPU chịu trách nhiệm cho một tập con các lớp. Để giữ tất cả GPU trong 'đường ống' bận rộn, micro-batching được sử dụng. Các micro-batch này di chuyển dọc theo đường ống từ giai đoạn này sang giai đoạn tiếp theo tại mỗi lần lặp. PP có ưu thế về tỷ lệ tính toán-giao tiếp tốt hơn nhiều so với TP, vì chúng ta chỉ cần gửi kích hoạt một lần cho nhiều lớp tính toán. Hơn nữa, PP chỉ yêu cầu giao tiếp thông qua phép toán giao tiếp điểm-điểm, so với các allreduce đắt hơn cần thiết trong TP. Do đó, PP là cách tiếp cận song song mô hình khả thi duy nhất khi kết nối băng thông cao như NVlink không khả dụng ở quy mô cụm. Trong những cài đặt như vậy, việc sử dụng PP có thể giúp tăng kích thước lô tối đa được hỗ trợ trong mỗi nút lên 2-3 ×, do đó cải thiện hiệu quả suy luận LLM.
+
+3 Động lực
+Trong phần này, chúng tôi cho thấy rằng suy luận LLM không hiệu quả vì hai lý do chính: (1) giai đoạn giải mã bị giới hạn bộ nhớ, và (2) việc sử dụng song song đường ống dẫn đến bong bóng đường ống đáng kể cho LLM. Cùng nhau, những yếu tố này dẫn đến việc sử dụng GPU kém cho suy luận LLM.
+
+--- TRANG 4 ---
+1 2 4 812 18
+Kích thước lô 0.00 0.05 0.10 0.15 0.20 0.25 Thời gian (ms) Tiền xử lý
+1 2 4 812 18
+Kích thước lô 0 10 20 30 40 Thời gian (ms) Giải mã
+preproj
+attn
+postproj
+ffn_ln1
+ffn_ln2
+others
+
+Hình 3: Thời gian tiền xử lý và giải mã trên mỗi token với các kích thước lô khác nhau (độ dài chuỗi = 1024) cho LLaMa-13B trên GPU A6000. Tiền xử lý bão hòa tính toán GPU ngay cả ở kích thước lô 1 và dẫn đến thời gian trên mỗi token gần như không đổi trên các kích thước lô. Giải mã không sử dụng đầy đủ tính toán GPU và chi phí cao tới 200 × tiền xử lý cho kích thước lô 1. Chi phí tăng thêm của các toán tử tuyến tính cho giải mã gần như bằng không khi kích thước lô tăng. Chi phí chú ý không được hưởng lợi từ kích thước lô vì nó bị giới hạn bộ nhớ.
+
+3.1 Phân tích Thông lượng Tiền xử lý và Giải mã
+Hình 3 cho thấy chi phí trên mỗi token của từng phép toán transformer trong sáu phép toán (§2.1) cho tiền xử lý và giải mã tại các kích thước lô khác nhau cho độ dài chuỗi cố định (tiền xử lý+giải mã) là 1024. Đầu tiên, chúng tôi quan sát rằng tiền xử lý có chi phí trên mỗi token gần như không đổi trên các kích thước lô khác nhau, cho thấy rằng tiền xử lý bão hòa GPU ngay cả ở kích thước lô 1. Thứ hai, chúng ta thấy rằng giải mã hoạt động rất khác so với tiền xử lý vì chi phí trên mỗi token giảm đáng kể khi kích thước lô tăng. Thứ ba, chúng ta thấy rằng chi phí giải mã trên mỗi token là 200 ×, 100×, và 16.7 × so với tiền xử lý ở kích thước lô 1, 2 và 18, tương ứng. Do đó, rõ ràng là tối ưu hóa giải mã là quan trọng cho suy luận LLM hiệu quả. Cuối cùng, chúng ta thấy rằng các phép toán dưới others đóng góp ít hơn 5% tổng thời gian chạy của khối transformer. Do đó, chúng tôi chỉ tập trung vào tối ưu hóa năm phép toán chính và bỏ qua others.
+
+Hình 4a cho thấy thông lượng của các giai đoạn tiền xử lý và giải mã cho các kích thước lô (B) và độ dài chuỗi (L) khác nhau. Chúng tôi quan sát rằng thông lượng của giai đoạn tiền xử lý bão hòa ở khoảng 180 token/mili giây khi B×L≥512: ví dụ, một yêu cầu tiền xử lý duy nhất có thể đạt thông lượng đỉnh ở L≥512. Ngược lại, thông lượng giải mã tăng tuyến tính với kích thước lô nhỏ. Để hiểu rõ hơn điểm bão hòa của giai đoạn giải mã, chúng tôi profile một lớp duy nhất thay vì 40 lớp của mô hình đầy đủ. Điều này cho phép chúng tôi đặt vừa các lô lớn hơn 40 × trên GPU do dấu chân bộ nhớ giảm của trọng số mô hình và bộ nhớ đệm KV. Chúng tôi thấy rằng giải mã bão hòa ở một lô lớn hơn nhiều (ví dụ: 256 với độ dài chuỗi 1024). Các lô lớn như vậy không khả thi để chạy với mô hình đầy đủ.
+
+Để giải thích hành vi này, chúng tôi profile cường độ số học của các phép toán riêng lẻ: cường độ số học nắm bắt lượng tính toán trên mỗi lần đọc/ghi bộ nhớ có thể được sử dụng để phân biệt giữa các phép toán bị giới hạn tính toán và bị giới hạn bộ nhớ
+
+1 2 4 816 32 64128 256 512
+Kích thước lô 0 20 40 60 80 100 120 140 160 180 200 Thông lượng (token/ms)
+Tiền xử lý
+1 2 4 816 32 64128 256 512
+Kích thước lô 0 20 40 60 80 100 120 140 160 180 200 Thông lượng (token/ms)
+Giải mã
+Độ dài chuỗi: 64
+Độ dài chuỗi: 128
+Độ dài chuỗi: 256
+Độ dài chuỗi: 512
+Độ dài chuỗi: 1024
+
+(a) Thông lượng của một lớp duy nhất của LLaMA-13B trên GPU A6000.
+
+1 2 4 8
+Kích thước lô 0 500 1000 1500 2000 2500 3000 Cường độ số học Tiền xử lý
+1 2 4 8 256
+Kích thước lô 0 50 100 150 200 250 Cường độ số học Giải mã
+preproj
+attn
+postproj
+ffn
+
+(b) Cường độ số học với độ dài chuỗi 1K (trên mỗi yêu cầu).
+
+Hình 4: Tác động của cường độ số học (dưới) lên thông lượng (trên) của tiền xử lý và giải mã cho LLaMA-13B trên GPU A6000.
+
+phép toán. Hình 4b cho thấy cường độ số học của mỗi phép toán riêng biệt cho các giai đoạn tiền xử lý (trái) và giải mã (phải). Như được hiển thị, trong giai đoạn tiền xử lý, tất cả các phép toán có cường độ số học cao, ngay cả ở kích thước lô một. Mặt khác, cường độ số học của các phép toán này giảm hơn hai bậc độ lớn trong giai đoạn giải mã. Chỉ ở kích thước lô rất lớn là 256, giai đoạn giải mã mới bắt đầu trở thành tính toán chuyên sâu. Tuy nhiên, việc mở rộng kích thước lô đến các giá trị cao như vậy là không khả thi do dấu chân KV-cache của mỗi yêu cầu. Ví dụ, chúng ta có thể đặt vừa kích thước lô tối đa là 18 yêu cầu ở độ dài chuỗi 1K cho mô hình LLaMA-13B trên GPU A6000. Do đó, trong phạm vi kích thước lô thực tế ngày nay, giai đoạn giải mã vẫn bị giới hạn bộ nhớ.
+
+Sự khác biệt giữa việc mở rộng thông lượng của hai giai đoạn này xuất phát từ thực tế là giai đoạn tiền xử lý tính toán phép nhân ma trận-ma trận (theo lô) trái ngược với phép nhân vector-ma trận của giai đoạn giải mã. Đã được biết rằng các kernel với cường độ số học trên tỷ lệ FLOPS:MemBandwidth của GPU bị giới hạn tính toán và có thể được thực thi hiệu quả [11]. Ngược lại, các kernel với cường độ số học thấp hơn không sử dụng GPU tốt do bị giới hạn bộ nhớ.
+
+3.2 Bong bóng Đường ống trong Suy luận LLM
+Song song Đường ống (PP) là một chiến lược phổ biến cho việc triển khai cross-node của các mô hình lớn, do chi phí giao tiếp thấp hơn so với Song song Tensor (TP). PP chia mô hình theo lớp, nơi mỗi GPU chịu trách nhiệm cho một tập
+
+--- TRANG 5 ---
+Hình 5: Bong bóng đường ống trong suy luận LLM. Lịch trình cấp lần lặp PP 2 chiều [48] trên 4 yêu cầu (A,B,C,D) cho thấy sự tồn tại của bong bóng đường ống do thời gian thực thi lô không đồng nhất.
+
+con các lớp; so với TP chia sẻ mỗi lớp trên các GPU tham gia. Như đã thảo luận trong §2.3, so với TP, PP có tỷ lệ tính toán-giao tiếp tốt hơn nhiều và không yêu cầu kết nối đắt tiền.
+
+Tuy nhiên, một thách thức với PP là nó tạo ra bong bóng đường ống hoặc các giai đoạn không hoạt động của GPU khi các giai đoạn đường ống tiếp theo phải đợi hoàn thành micro-batch tương ứng trong các giai đoạn trước. Bong bóng đường ống là một vấn đề đã biết trong các công việc huấn luyện, nơi chúng phát sinh giữa các lần truyền tiến và lùi do các giai đoạn trước cần đợi lần truyền lùi đến. Do đó, micro-batching thường được sử dụng trong các công việc huấn luyện PP để phân bổ các bong bóng trên nhiều micro-batch tạo thành một lô [24,34,37].
+
+Không giống như huấn luyện, vì các công việc suy luận chỉ thực hiện lần truyền tiến và không có lần truyền lùi, người ta có thể mong đợi rằng việc sử dụng micro-batch sẽ hoàn toàn tránh được bong bóng đường ống trong quá trình suy luận. Trên thực tế, công việc trước đây về suy luận transformer, chẳng hạn như FasterTransformer [6] và FastServe [46] sử dụng micro-batch và không xem xét vấn đề bong bóng với PP.
+
+Orca [48] gợi ý rằng việc sử dụng lập lịch cấp lần lặp loại bỏ bong bóng trong lập lịch đường ống (xem Hình 8 trong [48]). Tuy nhiên, như chúng tôi cho thấy trong bài báo này, ngay cả với lập lịch cấp lần lặp của các yêu cầu, mỗi micro-batch (hoặc lần lặp) trong suy luận LLM có thể yêu cầu một lượng tính toán khác nhau (và do đó có thời gian thực thi khác nhau), tùy thuộc vào thành phần của token tiền xử lý và giải mã trong micro-batch (xem Hình 5). Chúng tôi xác định ba loại bong bóng trong quá trình suy luận: (1) bong bóng như PB1 xảy ra do số lượng token tiền xử lý khác nhau trong hai micro-batch liên tiếp (2) bong bóng như PB2 xảy ra do thời gian tính toán khác nhau của các giai đoạn tiền xử lý và giải mã khi một giai đoạn theo sau giai đoạn kia, và (3) bong bóng như PB3 xảy ra do sự khác biệt trong thời gian tính toán giải mã giữa các micro-batch vì độ dài ngữ cảnh tích lũy (độ dài bộ nhớ đệm KV) khác nhau trên các yêu cầu. Những bong bóng đường ống này là chu kỳ GPU lãng phí và trực tiếp tương ứng với mất mát trong thông lượng phục vụ với song song đường ống. Nếu chúng ta có thể đảm bảo rằng mỗi micro-batch thực hiện tính toán đồng nhất, chúng ta có thể giảm thiểu những bong bóng đường ống này.
+
+3.3 Những hiểu biết
+Các thí nghiệm của chúng tôi cho thấy rằng các giai đoạn tiền xử lý và giải mã có các mẫu sử dụng tính toán rất khác nhau – tiền xử lý có thể bão hòa tính toán GPU ngay cả với một yêu cầu duy nhất, trong khi giải mã yêu cầu kích thước lô lớn để hiệu quả về tính toán. Tuy nhiên, các lô lớn không thực tế do dấu chân bộ nhớ đệm KV cao của chúng. Việc sử dụng tài nguyên không cân đối như vậy ngụ ý rằng đối với mỗi yêu cầu, có các giai đoạn sử dụng tính toán cao do tiền xử lý hiệu quả, tiếp theo là một đuôi dài có thể có của giải mã không hiệu quả dẫn đến việc sử dụng GPU tổng thể kém. Hơn nữa, sự không đồng nhất trong thời gian tính toán trên các micro-batch dẫn đến bong bóng đường ống, dẫn đến triển khai đa GPU song song đường ống không hiệu quả.
+
+Quan sát này dẫn chúng tôi đến hiểu biết quan trọng rằng có thể xây dựng các lô tính toán chuyên sâu đồng nhất bằng cách (1) cắt một yêu cầu tiền xử lý lớn thành các phần hiệu quả tính toán và đồng nhất nhỏ hơn bằng cách sử dụng tiền xử lý phân đoạn và (2) tạo một lô kết hợp của một phần tiền xử lý và gắn kết giải mã cùng với phần này. Do đó, việc tạo ra các lô đồng nhất và tính toán chuyên sâu như vậy đảm bảo việc sử dụng GPU cao trong suốt, cũng như giảm thiểu bong bóng đường ống trong triển khai đa GPU bằng cách loại bỏ sự biến thiên thời gian chạy trên các micro-batch trong các giai đoạn khác nhau của đường ống.
+
+4 SARATHI : Thiết kế và Triển khai
+Trong phần này, chúng tôi mô tả thiết kế và triển khai của SARATHI, sử dụng hai kỹ thuật - tiền xử lý phân đoạn và lô ghép giải mã tối đa để cải thiện hiệu suất của suy luận LLM.
+
+4.1 Tổng quan
+Các động cơ suy luận thông thường như FasterTransformer [6] thực hiện lập lịch suy luận cấp yêu cầu. Chúng xử lý các lô ở mức độ chi tiết yêu cầu; tức là chúng chọn lô yêu cầu tiếp theo để thực thi trên bản sao mô hình chỉ khi tất cả các yêu cầu trong lô hiện tại hoàn thành. Trong khi điều này giảm độ phức tạp hoạt động của khung lập lịch, nó không hiệu quả trong việc sử dụng tài nguyên. Các yêu cầu ngắn hơn trong một lô phải được đệm để phù hợp với độ dài của yêu cầu dài nhất, và do đó thực hiện công việc lãng phí thay vì thoát sớm. Thay vào đó, lập lịch cấp lần lặp đã được đề xuất trong các hệ thống gần đây hơn như Orca [48], vLLM [20], và HuggingFace TGI [17], nơi tùy thuộc vào kích thước lô được xác định trước b, các yêu cầu có thể động tham gia và thoát khỏi một lô.
+
+Tuy nhiên, các hệ thống lập lịch cấp lần lặp ngày nay không chú ý đến các yêu cầu tạo thành lô, và thời gian thực thi khác nhau giữa các lô. Cụ thể, một lô có thể bao gồm các yêu cầu chỉ trong giai đoạn tiền xử lý, các yêu cầu chỉ trong giai đoạn giải mã, hoặc các yêu cầu hỗn hợp bao gồm một số tiền xử lý và giải mã, với ràng buộc duy nhất là kích thước lô là b mọi lúc. Như đã thảo luận trong §3.3, việc tạo lô như vậy dẫn đến các đơn vị tính toán không đồng nhất, dẫn đến các giai đoạn sử dụng tài nguyên bùng phát, và bong bóng đường ống. SARATHI giải quyết thách thức này bằng cách giới thiệu hai kỹ thuật chính: tiền xử lý phân đoạn và lô ghép giải mã tối đa.
+
+--- TRANG 6 ---
+k0 k1 k2 k3
+q0 1 - - -
+q1 1 1 - -
+q2 1 1 1 -
+q3 1 1 1 1
+
+k0 k1 k2 k3 k4 k5 k6 k7
+q4 1 1 1 1 1 - - -
+q5 1 1 1 1 1 1 - -
+q6 1 1 1 1 1 1 1 -
+q7 1 1 1 1 1 1 1 1
+
+k0 k1 k2 k3 k4 k5 k6 k7 k8 k9 k10 k11
+q8 1 1 1 1 1 1 1 1 1 - - -
+q9 1 1 1 1 1 1 1 1 1 1 - -
+q10 1 1 1 1 1 1 1 1 1 1 1 -
+q11 1 1 1 1 1 1 1 1 1 1 1 1
+
+mặt nạ chú ý trong tiền xử lý phần đầu tiên
+mặt nạ chú ý trong tiền xử lý phần thứ hai
+mặt nạ chú ý trong tiền xử lý phần thứ ba
+
+Hình 6: Ví dụ về cách mặt nạ chú ý được thiết lập trên các lần lặp tiền xử lý phần khác nhau trong SARATHI (q và k đại diện cho token "truy vấn" và "khóa", tương ứng). Mặt nạ chú ý cho v ("giá trị") được thiết lập tương tự.
+
+4.2 Tiền xử lý phân đoạn
+Tiền xử lý phân đoạn là một cơ chế chia tách tiền xử lý dựa trên hai hiểu biết quan trọng. Đầu tiên, đối với một mô hình và GPU nhất định, việc tăng số lượng token tiền xử lý cho thấy lợi ích giảm dần trong thông lượng vượt quá một điểm nhất định như được hiển thị trong Hình 4a. Ví dụ, mô hình Llama-13B đạt thông lượng tiền xử lý đỉnh trên GPU A6000 khi số lượng token tiền xử lý là 512 hoặc cao hơn. Ở kích thước phần 256, chúng ta thấy giảm nhẹ 12.5% trong thông lượng đỉnh. Hơn nữa, khi kích thước của chiều ẩn trong mô hình tăng, kích thước phần cần thiết để bão hòa tính toán GPU giảm; ví dụ, thông lượng của một lớp duy nhất của GPT-3 (kích thước ẩn = 12288) đạt đỉnh ở kích thước phần 256 trên GPU A100. Điều này ngụ ý rằng một lô bão hòa tính toán có thể được hình thành với một phần tiền xử lý được cắt cẩn thận. Thứ hai, trong nhiều tình huống thực tế, kích thước của tiền xử lý khá lớn, dao động từ 1K – 4K trong khối lượng công việc sản xuất, do đó mở ra cánh cửa cho việc chia một yêu cầu tiền xử lý thành các đơn vị tính toán nhỏ hơn.
+
+Triển khai tiền xử lý phân đoạn yêu cầu thiết lập mặt nạ chú ý một cách cẩn thận. Nếu lời nhắc đầu vào của một yêu cầu có kích thước 1K được chia thành bốn phần kích thước 256 token mỗi phần, chúng ta cần đảm bảo rằng các mặt nạ chú ý được thiết lập phù hợp cho mỗi phần tiền xử lý tiếp theo cho đến cuối lời nhắc. Để dễ trình bày, sử dụng ví dụ về kích thước phần bốn, Hình 6 cho thấy cách SARATHI thiết lập mặt nạ chú ý một cách tiến bộ cho mỗi phần liên tiếp của lời nhắc tiền xử lý trong ba lần lặp liên tiếp: mỗi token truy vấn qi có thể nhìn vào các khóa (và giá trị) của tất cả các token đứng trước nó, nhưng không phải những cái theo sau. Thiết lập mặt nạ chú ý theo cách này đảm bảo rằng tính toán tiền xử lý phân đoạn tương đương về mặt toán học với tiền xử lý đầy đủ.
+
+Chi phí của tiền xử lý phân đoạn. Việc cắt đầu vào của một chuỗi tiền xử lý thành nhiều phần nhỏ hơn có hai nguồn chi phí tiềm năng. Đầu tiên, cường độ số học của tính toán tiền xử lý phân đoạn giảm khi kích thước phần trở nên nhỏ hơn. Do đó, các phần nhỏ hơn có thể ảnh hưởng đến hiệu quả tiền xử lý do việc sử dụng GPU thấp. Tuy nhiên, điều này có thể được giải quyết dễ dàng với việc profile một lần thông lượng tiền xử lý cho các kích thước phần khác nhau trên một kết hợp mô hình-phần cứng nhất định và khối lượng công việc dự kiến và một kích thước phần có thể được chọn sao cho thông lượng end-to-end của mô hình được tối đa hóa.
+
+Thứ hai, tiền xử lý phân đoạn tạo ra chi phí nhẹ trong tính toán chú ý do truy cập bộ nhớ lặp lại của bộ nhớ đệm KV của token yêu cầu từ các phần trước. Trong khi mỗi phép toán tiền xử lý phân đoạn cho đến cuối lời nhắc sẽ thực hiện cùng số lượng tính toán cho FFN, kernel chú ý trong mỗi phần tiếp theo sau phần đầu tiên sẽ phải đọc lại tất cả các cặp KV của các token trước đó từ bộ nhớ GPU, như được hiển thị trong Hình 6. Ví dụ, nếu một chuỗi tiền xử lý được chia thành N phần, thì bộ nhớ đệm KV của phần đầu tiên được tải N lần, bộ nhớ đệm KV của phần thứ hai được tải N−1 lần, và cứ thế. Tuy nhiên, chi phí do thời gian chú ý tăng không ảnh hưởng đáng kể đến hiệu quả tiền xử lý end-to-end vì tính toán chú ý là một phần nhỏ của tổng thời gian truyền tiến như được thấy trong Bảng 2. Chúng tôi trình bày phân tích chi tiết về chi phí của tiền xử lý phân đoạn trong §5.4.
+
+4.3 Lô ghép Giải mã Tối đa
+Khai thác lợi ích của tiền xử lý phân đoạn yêu cầu chúng ta xây dựng một cách cẩn thận một lô kết hợp bao gồm hỗn hợp token tiền xử lý và giải mã, để tối đa hóa việc sử dụng tính toán và đảm bảo thời gian tính toán đồng nhất trên tất cả các lô. Chúng tôi đề xuất lô ghép giải mã tối đa để giảm bớt sự mất cân bằng trong việc sử dụng tính toán và bộ nhớ trong lập lịch lặp lại bằng cách khai thác ý tưởng của tiền xử lý phân đoạn.
+
+Trong lô ghép giải mã tối đa, chúng tôi xây dựng một lô bằng cách sử dụng một phần tiền xử lý duy nhất và gắn kết các vị trí còn lại với token giải mã. Lô kết hợp này cung cấp cho chúng ta các đơn vị công việc vừa bão hòa tính toán vừa đồng nhất. Bây giờ chúng tôi thảo luận về cách chúng tôi xây dựng một lô kết hợp để đạt được hiệu quả tối đa.
+
+4.3.1 Gắn kết giải mã với tiền xử lý
+Để gắn kết giải mã với tiền xử lý, chúng ta cần chú ý đến hai điều. Đầu tiên, chúng ta cần xác định kích thước lô tối đa có thể của các giải mã có thể được gắn kết và cũng xác định số lượng token tiền xử lý tạo thành phần tiền xử lý. Thứ hai, để thực sự sử dụng tính toán tiền xử lý bão hòa GPU của lô kết hợp để làm cho các giải mã hiệu quả, chúng ta cần hợp nhất các tính toán phép toán tuyến tính cho phần tiền xử lý và giải mã của lô thành một phép toán duy nhất.
+
+Lô giải mã. Kích thước lô giải mã tối đa được gắn kết với một phần tiền xử lý được xác định dựa trên
+
+--- TRANG 7 ---
+Lược đồ | Phép toán | Tổng | Thời gian trên mỗi token
+Lô ghép | Tuyến tính | Attn | Thời gian | Tiền xử lý | Giải mã
+Chỉ tiền xử lý | 224.8 | 10 | 234.8 | 0.229 | -
+Chỉ giải mã | 44.28 | 5.68 | 49.96 | - | 12.49
+Giải mã tối đa | 223.2 | 15.2 | 238.4 | 0.229 | 1.2
+
+Bảng 2: Thời gian tiền xử lý và giải mã trên mỗi token (tính bằng ms) Đối với LLaMA-13B trên GPU A6000, các hàng cho thấy thời gian phép toán cho 1) yêu cầu chỉ tiền xử lý có kích thước lời nhắc 1024 với kích thước lô 4, 2) lô chỉ giải mã kích thước 4 với độ dài chuỗi 1024, và c) lô hỗn hợp của một tiền xử lý 1021 và 3 giải mã. Lô ghép giải mã tối đa giảm thời gian giải mã trên mỗi token một bậc độ lớn.
+
+bộ nhớ GPU khả dụng (MG), yêu cầu bộ nhớ tham số của mô hình trên mỗi GPU (MS), và độ dài chuỗi tối đa L mà mô hình hỗ trợ. Tổng số token tiền xử lý (P) và giải mã (D) trên mỗi yêu cầu không thể vượt quá độ dài chuỗi tối đa này. Giả sử bộ nhớ cần thiết trên mỗi cặp K và V cho một token là mkv, kích thước lô tối đa cho phép B được xác định như sau
+
+B=⌊MG−MS / L∗mkv⌋
+
+Trong lược đồ cơ sở, các lô chỉ giải mã có thể có kích thước tối đa là B. Trong SARATHI, số lượng giải mã có thể tối đa là B−1 vì chúng gắn kết cùng với một phần tiền xử lý (bộ nhớ đệm KV của tiền xử lý cũng cần ở trong bộ nhớ GPU cho đến khi các lần lặp giải mã tương ứng bắt đầu).
+
+Trong lô ghép giải mã tối đa, chúng tôi hợp nhất tất cả các phép toán tuyến tính, trong khi để các tính toán chú ý cho tiền xử lý và giải mã xảy ra riêng biệt. Phép toán chú ý cho các yêu cầu giải mã được lô ghép cùng nhau, trong khi chú ý trong phần tiền xử lý được xử lý riêng biệt.
+
+Hiệu quả giải mã. Nhớ lại rằng các giai đoạn tiền xử lý và giải mã tuân theo cùng đường dẫn tính toán, tức là các phép toán tuyến tính sử dụng cùng tensor trọng số trong cả giai đoạn tiền xử lý và giải mã. Tuy nhiên, so với tiền xử lý, một lần lặp giải mã chỉ bao gồm một số ít token đầu vào (bằng kích thước lô). Do đó, hầu hết thời gian tính toán trong giải mã cơ sở được dành cho việc lấy trọng số mô hình từ bộ nhớ toàn cục của GPU.
+
+Ngược lại, lô ghép giải mã tối đa tính toán trên các token giải mã bằng cách sử dụng phép nhân ma trận ma trận, bằng cách kết hợp token giải mã với token tiền xử lý trong một phép toán nhân ma trận duy nhất. Điều này, hiệu quả loại bỏ nhu cầu tải trọng số mô hình riêng biệt cho giải mã — tức là một khi trọng số mô hình được lấy cho tiền xử lý, chúng cũng được tái sử dụng cho giải mã. Kết quả là, lô ghép giải mã tối đa chuyển đổi giải mã từ việc ở giai đoạn bị giới hạn bộ nhớ thành việc ở giai đoạn bị giới hạn tính toán. Bằng cách này, giải mã, khi được gắn kết với tiền xử lý đi kèm với chi phí biên trong SARATHI (lưu ý rằng chi phí chú ý vẫn không thay đổi).
+
+Để minh họa các chi phí khác nhau liên quan thông qua một ví dụ, Bảng 2 so sánh thời gian chạy của một lần lặp của lô ghép giải mã tối đa với lược đồ cơ sở tính toán các lần lặp tiền xử lý và giải mã riêng biệt. Với lô ghép cơ sở, một lần lặp chỉ giải mã dành 12.49 mili giây trên mỗi token. Ngược lại, thời gian giải mã trên mỗi token chỉ là 1.2 mili giây với lô ghép giải mã tối đa. Điều này cho thấy rằng việc gắn kết giải mã với tiền xử lý có thể cải thiện thông lượng giải mã lên đến một bậc độ lớn.
+
+4.4 Xác định kích thước phần lý tưởng
+Một cân nhắc thiết kế quan trọng trong SARATHI là cách chọn kích thước phần phù hợp nhất. Một lựa chọn đơn giản là chọn kích thước phần nhỏ nhất bão hòa thông lượng tiền xử lý của mô hình. Tuy nhiên, chúng tôi thấy rằng chiến lược này không phải là hiệu quả nhất trong nhiều trường hợp.
+
+Để chứng minh tầm quan trọng của kích thước phần, chúng tôi giới thiệu ký hiệu đơn giản "tỷ lệ P:D" được tính như tỷ lệ của số lượng token tiền xử lý với số lượng token giải mã trong một lô nhất định. Ví dụ, tỷ lệ P:D là 10 ngụ ý rằng số lượng token tiền xử lý gấp 10 lần số lượng giải mã. Đối với P+D cố định, giá trị tỷ lệ P:D thấp hơn có nghĩa là có nhiều token giải mã trong một lô so với một lô có giá trị tỷ lệ P:D cao hơn.
+
+Kích thước của các phần tiền xử lý trong SARATHI ảnh hưởng đến số lượng giải mã có thể được gắn kết bằng cách sử dụng lô ghép giải mã tối đa. Ví dụ, xem xét kích thước lô bốn yêu cầu (trong đó một yêu cầu ở giai đoạn tiền xử lý và ba ở giai đoạn giải mã) và kích thước phần 128. Một tiền xử lý có kích thước P sau đó sẽ tạo ra P/128 phần tiền xử lý, cho phép P/128 × 3 ≈ P/42 giải mã gắn kết. Do đó, trong trường hợp này, khi tỷ lệ P:D lớn hơn 42, nó cho phép chúng ta chồng chéo tất cả giải mã với tiền xử lý. Tương tự, nếu kích thước phần là 256, thì tất cả giải mã có thể được gắn kết khi tỷ lệ P:D lớn hơn 84. Do đó, kích thước phần thấp hơn có thể giúp gắn kết nhiều token giải mã hơn cho một chuỗi tiền xử lý nhất định.
+
+Lưu ý rằng thời gian giải mã tăng khi tỷ lệ P:D giảm. Do đó, vượt quá một điểm nhất định, tối ưu hóa giải mã trở nên quan trọng hơn việc thực thi tiền xử lý ở hiệu quả đỉnh. Ví dụ, nếu các giai đoạn tiền xử lý và giải mã tiêu thụ lần lượt 10% và 90% tổng thời gian, thì
+
+0 128 256 384 512 640 768 896 1024
+Độ dài chuỗi 0 50 100 150 200 250 Thời gian (ms)
+preproj
+postproj
+ffn
+total compute
+
+Hình 7: Ảnh hưởng của lượng tử hóa tile lên thời gian chạy của một lần lặp LLaMA-13B trên GPU A6000.
+
+--- TRANG 8 ---
+ngay cả chi phí 5× trong tiền xử lý cũng có thể chấp nhận được nếu giải mã có thể được tối ưu hóa 2× hoặc hơn.
+
+Tóm lại, việc xác định kích thước phần phù hợp liên quan đến một sự đánh đổi: các phần nhỏ hơn gắn kết nhiều giải mã hơn nhưng với cái giá là hiệu quả tiền xử lý thấp hơn trong khi các phần lớn hơn hiệu quả về tiền xử lý nhưng gắn kết ít giải mã hơn. Do đó, kích thước phần lý tưởng phụ thuộc vào tỷ lệ P:D dự kiến và sự phân chia giữa thời gian tiền xử lý và giải mã cho một ứng dụng nhất định.
+
+Hiệu ứng lượng tử hóa tile. Ngoài ra, chúng tôi quan sát một chi tiết phức tạp liên quan đến kích thước phần. GPU tính toán matmul bằng cách phân chia các ma trận nhất định thành tile và gán chúng cho các khối luồng khác nhau để tính toán song song. Ở đây, mỗi khối luồng đề cập đến một nhóm luồng và tính toán cùng số lượng phép toán số học. Do đó, matmul đạt được việc sử dụng GPU tối đa khi các chiều ma trận chia hết cho kích thước tile. Nếu không, do lượng tử hóa tile, một số khối luồng thực hiện tính toán ngoại lai (lãng phí) [11].
+
+Lưu ý rằng thời gian tính toán một chuỗi tiền xử lý đột nhiên tăng khi độ dài chuỗi vừa cao hơn một bội số của 128 (kích thước tile trong các thí nghiệm của chúng tôi). Ví dụ, như được hiển thị trong Hình 7, việc tăng gấp đôi độ dài chuỗi từ 128 lên 256 token tăng thời gian lặp 27% — từ 55ms lên 69.8ms. Tuy nhiên, việc thêm chỉ một token nữa làm tăng thời gian lặp lên 92.33ms — mức tăng đáng kể 32% do chỉ một token bổ sung. Điều này cho thấy rằng GPU hiệu quả nhất ở matmul khi độ dài chuỗi là bội số của kích thước tile.
+
+Do đó, việc chọn kích thước phần lý tưởng là quyết định hai mặt. Đầu tiên, chọn kích thước phần dựa trên hiệu quả tiền xử lý mong muốn cho khối lượng công việc nhất định. Tiếp theo, đảm bảo rằng tổng của kích thước phần và số lượng token giải mã gắn kết là bội số của kích thước tile. Điều này đảm bảo rằng chiều ma trận liên quan của các phép toán hợp nhất vẫn là bội số của kích thước tile. Ví dụ, nếu kích thước phần được chọn là 256, kích thước tile là 128, và kích thước lô tối đa cho phép là B, thì kích thước phần tiền xử lý nên là 256 −(B−1).
+
+4.5 Triển khai
+Chúng tôi triển khai SARATHI trên codebase nanoGPT [12] với hỗ trợ cho cả tiền xử lý phân đoạn và lô ghép giải mã tối đa. Để so sánh với lập lịch cấp lần lặp của Orca, chúng tôi sử dụng cơ chế lô ghép hỗn hợp của chúng tôi, không có ràng buộc về số lượng tiền xử lý được phép trên mỗi lô. Điều này đảm bảo rằng không có sự khác biệt trong kết quả giữa cơ sở và SARATHI do sự khác biệt trong triển khai. Để tính toán phép toán chú ý, chúng tôi sử dụng triển khai xformers [21] như trong thiết lập của chúng tôi, nó vượt trội hơn các triển khai chú ý tích hợp sẵn của PyTorch 2.0: tức là chú ý flash, chú ý hiệu quả bộ nhớ, và kernel chú ý toán học. Để tránh phân bổ bộ nhớ cho bộ nhớ đệm KV trong mỗi lần lặp giải mã, chúng tôi phân bổ trước bộ nhớ đệm KV theo độ dài chuỗi tối đa cho mỗi thí nghiệm và cập nhật các cặp KV tương ứng tại chỗ khi cần thiết.
+
+Mô hình | GPU | Số | Bộ nhớ GPU | Chế độ
+         |     | GPU | (GB)      |
+LLaMA-13B | A6000 | 1 | 48 | Triển khai
+LLaMA-33B | A100 | 1 | 80 | Triển khai
+GPT-3 | A100 | 64 | 80 | Mô phỏng
+
+Bảng 3: Các mô hình, GPU, và chế độ đánh giá.
+
+Chúng tôi hỗ trợ các cấu hình mô hình khác nhau trong codebase của chúng tôi để đánh giá SARATHI trên các kết hợp mô hình và phần cứng khác nhau. Ví dụ, để đánh giá LLaMA-13B, chúng tôi đặt số lượng lớp và đầu chú ý thành 40, và kích thước ẩn thành 5120. Đối với LLaMA-33B, chúng tôi sử dụng 60 lớp, 52 đầu chú ý, và kích thước ẩn 6656. Đối với GPT-3, chúng tôi sử dụng 96 lớp, 96 đầu chú ý, và kích thước ẩn 12288. Các cấu hình theo các tham số kiến trúc có sẵn công khai của những mô hình này [10, 14].
+
+5 Đánh giá
+Chúng tôi đánh giá SARATHI trên nhiều mô hình và GPU sử dụng triển khai vật lý cho các thí nghiệm GPU đơn và mô phỏng hướng profile cho các thí nghiệm quy mô lớn như được hiển thị trong Bảng 3. Đánh giá của chúng tôi tìm cách trả lời các câu hỏi sau:
+
+1. Tác động của SARATHI lên thông lượng của giải mã cũng như thông lượng end-to-end của LLM là gì? Ngoài ra, tác động của việc thay đổi độ dài chuỗi, kích thước lô, và tỷ lệ P:D là gì (§5.1)?
+2. SARATHI so sánh như thế nào với các cơ chế lập lịch cấp lần lặp hiện có như Orca (§5.2)?
+3. Tác động của các kỹ thuật của chúng tôi lên bong bóng GPU và thông lượng của các mô hình song song đường ống là gì (§5.3)?
+4. Chi phí của tiền xử lý phân đoạn là gì (§5.4)?
+
+5.1 Đánh giá trên một GPU đơn
+Trong phần này, chúng tôi đo tăng tốc giải mã và thông lượng end-to-end của SARATHI, trên một GPU đơn, so với cơ sở thực thi các giai đoạn tiền xử lý và giải mã riêng biệt thông qua các lô chỉ tiền xử lý và chỉ giải mã. Hơn nữa, chúng tôi kiểm tra tác động của việc thay đổi tỷ lệ P:D (tỷ lệ token tiền xử lý với giải mã), độ dài chuỗi (tổng token trên mỗi yêu cầu —P+D), và kích thước lô lên thông lượng tổng thể.
+
+5.1.1 Tăng tốc giải mã
+Trước tiên chúng tôi cho thấy tác động của các kỹ thuật của chúng tôi lên thông lượng giai đoạn giải mã mà chúng tôi tính toán dựa trên thời gian trung bình dành cho việc giải mã một token. Đối với hệ thống cơ sở, chúng tôi tính thời gian giải mã trung bình trên mỗi token bằng cách chia thời gian xử lý một lần lặp giải mã cho kích thước lô. Trong SARATHI,
+
+--- TRANG 9 ---
+2 4 6 8 10 12 14 16 18
+Kích thước lô 1 2 3 4 5 6 7 8 9 10 Tăng tốc (chỉ giải mã) Độ dài chuỗi: 1K
+Độ dài chuỗi: 2K
+Độ dài chuỗi: 3K
+
+Hình 8: Tăng tốc chỉ giải mã với SARATHI trên GPU A6000 với LLaMA-13B (kích thước phần = 256).
+
+Mô hình | Độ dài | Kích thước | Tỷ lệ | Tăng tốc | Lợi ích
+(GPU) | Chuỗi | Lô | P:D | Giải mã | Thông lượng
+LLaMA-13B | 1K | 6 | 50:1 | 5.45× | 1.33×
+(A6000) | 2K | 6 | 50:1 | 3.26× | 1.26×
+        | 3K | 6 | 50:1 | 2.51× | 1.22×
+LLaMA-33B | 1K | 10 | 28:1 | 3.83× | 1.25×
+(A100) | 2K | 5 | 63:1 | 4.25× | 1.22×
+       | 3K | 3 | 127:1 | 3.51× | 1.14×
+
+Bảng 4: Lợi ích thông lượng đỉnh với SARATHI cho các độ dài chuỗi khác nhau với hai kết hợp mô hình-GPU khác nhau (kích thước phần = 256).
+
+nơi giải mã được gắn kết, đối với một lô với p+d token, trong đó p biểu thị kích thước phần tiền xử lý và d biểu thị kích thước lô giải mã, chúng tôi tìm sự khác biệt trong thời gian chạy giữa lô giải mã tối đa và lô chỉ tiền xử lý có kích thước tiền xử lý p, và quy cho sự khác biệt về thời gian như thời gian giải mã biên cho một lô d yêu cầu. Thời gian giải mã biên này sau đó được sử dụng để tính thời gian giải mã trên mỗi token.
+
+Hình 8 vẽ kết quả cho kích thước phần 256 cho LlaMa-13B trên GPU A6000, khi chúng tôi thay đổi kích thước lô, lên đến giá trị tối đa tương ứng phù hợp, cho ba độ dài chuỗi tiền xử lý khác nhau. Chúng tôi quan sát rằng tiền xử lý phân đoạn cải thiện hiệu quả giải mã lên đến một bậc độ lớn so với cơ sở. Thông lượng giải mã của SARATHI cao hơn do lô ghép giải mã tối đa tính toán token giải mã với phép nhân ma trận, cho phép tái sử dụng trọng số mô hình — cho cả tiền xử lý và giải mã — một khi chúng được lấy từ bộ nhớ toàn cục của GPU.
+
+Chúng tôi quan sát rằng tăng tốc giải mã của chúng tôi giảm khi chúng tôi tăng kích thước lô hoặc độ dài chuỗi. Hành vi này được mong đợi vì các lý do sau: (1) giải mã trong hệ thống cơ sở trở nên hiệu quả hơn khi kích thước lô tăng, và (2) chi phí chú ý tăng bậc hai với độ dài chuỗi: vì tất cả cải thiện của chúng tôi đến từ việc tối ưu hóa các phép toán tuyến tính, chi phí chú ý cao hơn giảm phạm vi cải thiện của chúng tôi. Tuy nhiên, cải thiện thông lượng giải mã của chúng tôi vẫn đáng kể trong tất cả các trường hợp (2.8×−10×).
+
+5.1.2 Lợi ích thông lượng đỉnh với SARATHI
+Bảng 4 cho thấy lợi ích thông lượng đỉnh mà SARATHI đạt được so với cơ sở. Để chứng minh tính tổng quát của các kỹ thuật của chúng tôi, chúng tôi đánh giá SARATHI trên hai kết hợp mô hình-GPU: (1) LLaMA-13B trên GPU A6000 và (2) LLaMA-33B trên GPU A100. Hơn nữa, chúng tôi điều tra lợi ích thông lượng đỉnh với các chuỗi có độ dài khác nhau 1K, 2K và 3K. Bảng 4 cho thấy kích thước lô và tỷ lệ P:D nơi chúng tôi đạt được tăng tốc tối đa.
+
+Trong trường hợp tốt nhất, các kỹ thuật của chúng tôi cải thiện thông lượng end-to-end lên đến 1.33× cho LLaMA-13B và lên đến 1.25× cho LLaMA-33B. Chúng tôi quan sát rằng tăng tốc tương đối cao hơn trên GPU A6000 so với GPU A100. Điều này là do FLOPs/MemBandwidth cao hơn của GPU A100 so với GPU A6000 (≈156 vs. ≈53, bỏ qua bộ nhớ đệm GPU). Do đó, chúng tôi yêu cầu kích thước phần cao hơn trên GPU A100 (hoặc một mô hình với kích thước nhúng cao hơn) để tránh mất hiệu quả tiền xử lý. Tuy nhiên, SARATHI vẫn liên tục vượt trội hơn cơ sở 1.14×-1.25× trên GPU A100. Những kết quả này cho thấy rằng việc gắn kết token giải mã với các phần tiền xử lý hữu ích trên một phạm vi rộng các mô hình và phần cứng. Chúng tôi lưu ý rằng mặc dù chúng tôi cải thiện hiệu quả giải mã lên đến một bậc độ lớn, tăng tốc end-to-end và do đó tiết kiệm tiền tệ trong chi phí suy luận theo thứ tự 25%. Điều này là do kỹ thuật của chúng tôi chỉ cải thiện giải mã chứ không phải tiền xử lý.
+
+5.1.3 Ảnh hưởng của việc thay đổi tỷ lệ P:D
+Trong tiểu mục này, sử dụng các độ dài chuỗi và kích thước phần khác nhau, chúng tôi điều tra ảnh hưởng của việc thay đổi tỷ lệ P:D lên thông lượng suy luận end-to-end để bao phủ một phạm vi rộng các tình huống ứng dụng. Tỷ lệ P:D là một tham số quan trọng cho những thí nghiệm này: tỷ lệ P:D thấp hơn cho thấy rằng một yêu cầu tạo thành nhiều token giải mã hơn so với các yêu cầu khác có tỷ lệ P:D cao hơn. Mặc dù tỷ lệ P:D thấp hơn ngụ ý rằng giải mã sẽ tạo thành một phần lớn hơn của chi phí suy luận và do đó SARATHI sẽ có nhiều diện tích tấn công hơn, tuy nhiên, nó cũng có nghĩa là sẽ có ít phần tiền xử lý hơn để giải mã gắn kết. Sự đánh đổi này dẫn đến một hành vi mà cải thiện từ SARATHI đạt đỉnh ở một tỷ lệ P:D cụ thể và sau đó giảm dần ở hai bên. Chúng tôi thảo luận chi tiết hơn về điều này dưới đây.
+
+Hình 9 vẽ kết quả của các thí nghiệm của chúng tôi. Chúng tôi thấy rằng hiệu quả đỉnh của các kỹ thuật của chúng tôi xảy ra ở các tỷ lệ P:D khác nhau cho các tình huống kích thước phần tiền xử lý và kích thước lô khác nhau. Nếu C là kích thước phần và B là kích thước lô, thì chúng ta có thể cho thấy rằng đỉnh này sẽ xảy ra khi các giải mã gắn kết hoàn hảo với các phần tiền xử lý. Điều này xảy ra khi số lượng phần tiền xử lý (=P/C) giống với số lần lặp giải mã cần thiết (=D/(B−1)), tức là khi P:D=C/(B−1). Ví dụ, sử dụng kích thước phần 256 ở kích thước lô 18, SARATHI đạt được cải thiện thông lượng đỉnh 1.27× ở P:D=14 (≈C/(B−1) =256/17)
+
+--- TRANG 10 ---
+0 20 40 60 80 100 120 140 160 180 200
+Tỷ lệ Tiền xử lý / Giải mã 1.00 1.05 1.10 1.15 1.20 1.25 1.30 1.35 Thông lượng Chuẩn hóa
+Kích thước phần: 128
+Kích thước phần: 256
+Kích thước phần: 512
+
+(a) Độ dài chuỗi = 1K, kích thước lô = 18.
+
+0 20 40 60 80 100 120 140 160 180 200
+Tỷ lệ Tiền xử lý / Giải mã 1.00 1.05 1.10 1.15 1.20 1.25 1.30 1.35 Thông lượng Chuẩn hóa
+Kích thước phần: 128
+Kích thước phần: 256
+Kích thước phần: 512
+
+(b) Độ dài chuỗi = 2K, kích thước lô = 10.
+
+0 20 40 60 80 100 120 140 160 180 200
+Tỷ lệ Tiền xử lý / Giải mã 1.00 1.05 1.10 1.15 1.20 1.25 1.30 1.35 Thông lượng Chuẩn hóa
+Kích thước phần: 128
+Kích thước phần: 256
+Kích thước phần: 512
+
+(c) Độ dài chuỗi = 3K, kích thước lô = 6.
+
+Hình 9: Thông lượng chuẩn hóa (token/ms) cho LLaMa 13B trên GPU A6000 với các độ dài chuỗi, tỷ lệ P:D, và kích thước phần khác nhau.
+
+24681012141618
+Kích thước lô 0 2 4 6 8 10 Thời gian (giây) seq len: 1K, chunk size: 256
+
+2 4 6 8
+Kích thước lô 0 2 4 6 8 10 Thời gian (giây) seq len: 2K, chunk size: 256
+
+2 4 6
+Kích thước lô 0 2 4 6 8 10 Thời gian (giây) seq len: 3K, chunk size: 256
+
+24681012141618
+Kích thước lô 0 2 4 6 8 10 Thời gian (giây) seq len: 1K, chunk size: 512
+
+2 4 6 8
+Kích thước lô 0 2 4 6 8 10 Thời gian (giây) seq len: 2K, chunk size: 512
+
+2 4 6
+Kích thước lô 0 2 4 6 8 10 Thời gian (giây) seq len: 3K, chunk size: 512
+
+preproj attn postproj ffn
+
+Hình 10: Phân tích tổng thời gian dành cho các phép toán khác nhau cho LLaMa 13B trên GPU A6000 với các độ dài chuỗi và kích thước lô khác nhau, sử dụng kích thước phần tiền xử lý 256 (nửa trên) và 512 (nửa dưới). Thanh cam và xanh dương đại diện cho cơ sở và SARATHI, tương ứng.
+
+cho độ dài chuỗi 1K như được hiển thị trong Hình 9a. Sử dụng kích thước phần 512 cho độ dài chuỗi=1K ở kích thước lô 18 cũng cung cấp lợi ích đáng kể lên đến 1.23× ở P:D=28 (≈C/(B−1) =512/17) trong khi lợi ích thấp hơn nhiều với kích thước phần 128. Trong khi các phần nhỏ hơn cung cấp nhiều cơ hội hơn để chồng chéo giải mã, việc chia tiền xử lý thành các phần rất nhỏ dẫn đến cường độ số học thấp hơn tức là matmul ít hiệu quả hơn và chi phí cao hơn (do đọc nhiều lần bộ nhớ đệm KV), dẫn đến hiệu suất end-to-end giảm. Do đó chúng tôi đạt được thông lượng cao hơn nhiều với kích thước phần 256/512 so với kích thước phần nhỏ hơn 128. Lưu ý rằng lợi ích đỉnh xảy ra ở giá trị cao hơn của tỷ lệ P:D khi sử dụng kích thước phần lớn hơn.
+
+Chúng tôi đạt được hiệu suất đỉnh khi suy luận không hoàn toàn bị chi phối bởi tiền xử lý hoặc giải mã (nói cách khác, khi tỷ lệ P:D được cân bằng). Trạng thái như vậy cho phép chúng tôi chồng chéo tiền xử lý và giải mã hiệu quả lâu hơn. Nếu không, SARATHI hoặc hết token tiền xử lý (nếu P:D thấp) hoặc token giải mã (nếu P:D cao). Trong những trường hợp này, SARATHI có thể chuyển sang kích thước phần khác, hoặc hoạt động tương tự như xử lý cơ sở các lô chỉ tiền xử lý hoặc chỉ giải mã. Tuy nhiên, lưu ý rằng bất chấp sự biến thiên này, cải thiện của chúng tôi vẫn khoảng 10% trên một phạm vi lớn các tỷ lệ P:D.
+
+5.1.4 Ảnh hưởng của việc thay đổi kích thước lô và phần
+Trong phần này, chúng tôi đi sâu hơn để điều tra hiệu suất của SARATHI bằng cách thay đổi kích thước lô và kích thước phần cho mỗi độ dài chuỗi. Trong tất cả những thí nghiệm này, chúng tôi tập trung vào các tình huống thực thi nơi tỷ lệ P:D được cân bằng tức là khi P:D=C/(B−1) và tất cả token giải mã được gắn kết hoàn hảo với tiền xử lý. Điều này cho phép chúng tôi đo hiệu suất đỉnh của hệ thống chúng tôi.
+
+Hình 10 cho thấy kết quả cho những thí nghiệm này. Đối với mỗi
+
+--- TRANG 11 ---
+1K 2K 3K
+Độ dài chuỗi 0.0 0.2 0.4 0.6 0.8 1.0 1.2 1.4 1.6 Thông lượng Chuẩn hóa Cơ sở
+Orca (trường hợp xấu nhất) Orca (trường hợp tốt nhất)
+SARATHI
+
+(a) Thay đổi độ dài chuỗi (kích thước phần=256 cho SARATHI). Chúng tôi chọn kích thước lô tối đa phù hợp cho độ dài chuỗi (18, 10 và 6 cho độ dài chuỗi 1K, 2K và 3K, tương ứng)
+
+0 10 20 30 40 50 60 70 80 90 100
+Tỷ lệ Tiền xử lý / Giải mã 1.00 1.05 1.10 1.15 1.20 1.25 1.30 1.35 Thông lượng Chuẩn hóa
+SARATHI (kích thước phần = 128)
+SARATHI (kích thước phần = 256)
+SARATHI (kích thước phần = 512)
+Orca (trường hợp tốt nhất)
+
+(b) Thay đổi tỷ lệ P:D (độ dài chuỗi=1K, kích thước lô=18).
+
+Hình 11: So sánh với bộ lập lịch cấp lần lặp Orca cho LLaMa 13B trên GPU A6000.
+
+cấu hình độ dài chuỗi và kích thước phần, chúng tôi cho thấy ảnh hưởng của việc thay đổi kích thước lô. Hơn nữa, đối với mỗi lần chạy, chúng tôi cũng cho thấy thời gian chạy trên các phép toán khác nhau tức là preproj, attention, postproj, và ffn.
+
+Lưu ý rằng lô ghép giải mã tối đa lô ghép các token tiền xử lý và giải mã trong các phép toán tuyến tính để cải thiện việc sử dụng tính toán. Do đó, các phép toán tuyến tính thấy giảm đáng kể thời gian chạy lên đến 1.6× (xem thời gian chạy ffn trong hàng đầu tiên) so với cơ sở. Tuy nhiên, lưu ý rằng mức độ cải thiện cũng phụ thuộc vào tỷ lệ P:D (nói cách khác, nó phụ thuộc vào phần thời gian nào được dành cho giải mã). Ví dụ, sử dụng kích thước phần 256 tăng gấp đôi số lượng giải mã có thể được gắn kết so với sử dụng 512 như kích thước phần. Do đó, trong các cấu hình tối ưu (P:D=C/(B−1)), đối với kích thước phần 256, giải mã tạo thành một phần cao hơn của tổng thời gian chạy, so với cấu hình tối ưu khi kích thước phần là 512. Do đó, lợi ích thông lượng của chúng tôi cao hơn khi sử dụng kích thước phần 256.
+
+Chúng tôi cũng quan sát rằng các phép toán tuyến tính khác nhau thấy tăng tốc khác nhau khi sử dụng kỹ thuật của chúng tôi. Tính toán tuyến tính trong mô-đun ffn thấy giảm thời gian chạy cao nhất 1.3×-1.6×. Ngược lại, giảm thời gian chạy cho preproj và postproj là 1.05×-1.38×. Đối với kích thước lô nhỏ, chúng tôi thấy rằng hầu hết cải thiện thông lượng là do hiệu quả cao hơn của tính toán ffn trong lô ghép giải mã tối đa.
+
+5.2 So sánh với Lập lịch Cấp Lần lặp
+Trong đánh giá của chúng tôi cho đến nay, chúng tôi đã xem xét một hệ thống cơ sở xử lý các lô chỉ tiền xử lý hoặc chỉ giải mã tại một thời điểm. Đây là cách các framework phổ biến như FasterTransformer triển khai các mô hình transformer. Ngược lại, lập lịch cấp lần lặp của Orca [48] có thể thêm (hoặc loại bỏ) một yêu cầu vào (hoặc từ) một lô đang chạy ở mức độ chi tiết của các lần lặp riêng lẻ.
+
+Lập lịch cấp lần lặp cũng ảnh hưởng đến việc sử dụng GPU: khi các yêu cầu đến hoặc rời đi vào các thời điểm khác nhau, một số tiền xử lý (của các yêu cầu mới đến) tự động chồng chéo với các giải mã (của các yêu cầu đã chạy). Do đó, chúng tôi mong đợi rằng lập lịch cấp lần lặp sẽ làm tốt hơn cơ sở — ít nhất trong một số trường hợp. Tuy nhiên, chúng tôi nhấn mạnh rằng sự chồng chéo giữa các yêu cầu tiền xử lý và giải mã nhiều hơn là một tác dụng phụ trong lập lịch cấp lần lặp và hành vi của nó có thể thay đổi đáng kể tùy thuộc vào kích thước và thời gian đến hoặc rời đi của các yêu cầu. Thậm chí quan trọng hơn, các cách tiếp cận hiện tại đối với lập lịch cấp lần lặp gửi toàn bộ chuỗi đầu vào của một yêu cầu trong một giai đoạn tiền xử lý duy nhất. Điều này hạn chế đáng kể cơ hội gắn kết token giải mã với tiền xử lý.
+
+Để hiểu ảnh hưởng lên thông lượng tổng thể, chúng tôi đánh giá bộ lập lịch cấp lần lặp hiện đại, Orca [48], trong hai tình huống: trường hợp tốt nhất và trường hợp xấu nhất của nó. Trong trường hợp tốt nhất, lập lịch Orca chồng chéo tiền xử lý đầy đủ của một yêu cầu mới với các giải mã đang diễn ra. Trong trường hợp xấu nhất, tất cả các yêu cầu bắt đầu và kết thúc cùng lúc. Trong trường hợp sau, lập lịch Orca hoạt động tương tự như cơ sở trước đây của chúng tôi nơi không có sự chồng chéo giữa việc tính toán token tiền xử lý và giải mã. Lưu ý rằng trong trường hợp trung bình của Orca, có thể có nhiều hơn một tiền xử lý đầy đủ (tương ứng với nhiều yêu cầu) chồng chéo với một số giải mã – điều này sẽ hạn chế thêm khả năng của Orca để gắn kết token giải mã với tiền xử lý.
+
+Hình 11 cho thấy kết quả của chúng tôi cho những thí nghiệm này. Đầu tiên (Hình 11a), chúng tôi cho thấy kết quả cho lựa chọn tối ưu của P:D=C/(B−1), trong đó C=256 và B là kích thước lô tối đa phù hợp cho độ dài chuỗi. Như mong đợi, lập lịch Orca trường hợp xấu nhất hoạt động tương tự như cơ sở. Chúng tôi thấy rằng, đối với độ dài chuỗi nhỏ 1K, lập lịch Orca trường hợp tốt nhất đạt được thông lượng cao hơn 1.11×. Điều này là do sự chồng chéo tình cờ của các yêu cầu tiền xử lý và giải mã trong lịch trình trường hợp tốt nhất. Tuy nhiên, khi độ dài chuỗi tăng, hiệu suất của lập lịch Orca trường hợp tốt nhất giảm gần với cơ sở. Đây là một tạo tác của lựa chọn P:D=C/(B−1) của chúng tôi. Khi chúng tôi tăng độ dài chuỗi, kích thước lô B giảm, dẫn đến P:D tối ưu cao hơn. Vì Orca gửi toàn bộ chuỗi đầu vào như một yêu cầu tiền xử lý duy nhất, P:D cao hơn có nghĩa là nó sớm hết token tiền xử lý, tại thời điểm đó nó xử lý các token giải mã còn lại tương tự như cơ sở, làm cho ngay cả phiên bản trường hợp tốt nhất không hiệu quả. SARATHI liên tục vượt trội với lợi ích thông lượng tổng thể 1.27×, 1.25× và 1.23× cho ba độ dài chuỗi.
+
+Một khía cạnh khác cần xem xét trong lập lịch cấp lần lặp là
+
+--- TRANG 12 ---
+0 20 40 60 80
+Thời gian bong bóng (s) 0.0 0.2 0.4 0.6 0.8 1.0 CDF
+SARATHI
+TP+PP
+
+(a) So sánh thời gian bong bóng
+
+0 2000 4000 6000 8000 10000
+Số yêu cầu 0 500 1000 1500 2000 2500 3000 3500 Thời gian hoàn thành (s) SARATHI
+TP+PP
+TP (8 bản sao)
+
+(b) Thời gian hoàn thành yêu cầu end-to-end
+
+Hình 12: Tác động của SARATHI lên bong bóng đường ống (trên) và thời gian hoàn thành yêu cầu (dưới) cho GPT-3 được triển khai trên DGX A100(s) trong mô phỏng.
+
+ảnh hưởng của độ dài chuỗi biến đổi lên độ trễ yêu cầu. Vì thời gian tiền xử lý tăng với độ dài của chuỗi đầu vào, việc thêm một chuỗi tiền xử lý dài hơn trong một lô đang chạy có thể trì hoãn các giải mã đang diễn ra, điều này lần lượt tăng độ trễ của những yêu cầu đang diễn ra này trong lập lịch Orca. SARATHI tránh điều này do việc sử dụng tiền xử lý phần nhỏ hơn.
+
+Tiếp theo, chúng tôi đánh giá lợi ích thông lượng ở các tỷ lệ P:D khác nhau cho các kích thước phần khác nhau trong Hình 11b. Chúng tôi chỉ xem xét độ dài chuỗi 1K cho thí nghiệm này vì cơ sở Orca trường hợp tốt nhất đạt được hiệu suất tối đa trong chế độ này. Lưu ý rằng lập lịch Orca trường hợp tốt nhất có thể được coi là một trường hợp đặc biệt của SARATHI, nơi kích thước phần, C, được đặt thành độ dài chuỗi tối đa. Như có thể thấy, P:D tối ưu chuyển sang phải khi kích thước phần tăng. SARATHI với kích thước phần 256 hoạt động tốt nhất trong chế độ P:D thấp hơn, đạt lợi ích thông lượng đỉnh 1.27× so với cơ sở. SARATHI với kích thước phần 512 liên tục vượt trội hơn Orca trường hợp tốt nhất và hoạt động tốt nhất tổng thể trong chế độ P:D cao hơn, đạt lợi ích thông lượng đỉnh 1.23×. Để so sánh, Orca trường hợp tốt nhất có lợi ích phẳng hơn nhiều và đạt lợi ích thông lượng đỉnh 1.11× ở P:D cao hơn nhiều.
+
+5.3 Song song Đường ống với SARATHI
+Tiếp theo, chúng tôi đánh giá cách SARATHI giảm bong bóng đường ống trong thiết lập song song đường ống đa GPU và sau đó tác động đến thời gian chạy tổng thể của các công việc suy luận. Đối với thí nghiệm này, chúng tôi báo cáo đánh giá trong môi trường mô phỏng được cẩn thận.
+
+Trước tiên chúng tôi profile thời gian chạy cho mỗi phép toán trong Bảng 1 trong giai đoạn tiền xử lý và giải mã cho các kích thước lô và độ dài chuỗi khác nhau cho mô hình GPT-3 [25]. Chúng tôi profile thêm chi phí giao tiếp mạng để mô phỏng chân thực các thực thi song song tensor và song song đường ống. Cuối cùng, chúng tôi xây dựng một mô hình hồi quy để ngoại suy và dự đoán những giá trị này cho các điểm dữ liệu bị thiếu có thể gặp phải trong quá trình hệ thống phục vụ suy luận mô phỏng trực tuyến. Chúng tôi xác nhận rằng thời gian chạy ước tính bởi trình mô phỏng nằm trong vòng 5% các giá trị thực nghiệm trên hộp DGX A100 8-GPU, 80GB.
+
+Chúng tôi báo cáo kết quả cho việc triển khai trên 64 GPU A100 trên tám máy chủ được kết nối với InfiniBand. Chúng tôi đánh giá ba tình huống; (1) song song tensor 8 chiều (TP) trong một nút với song song đường ống 8 chiều (PP) trên các nút với lập lịch kiểu Orca trường hợp tốt nhất, (2) thiết lập TP-PP giống như trên với lập lịch sử dụng tiền xử lý phân đoạn và lô ghép giải mã tối đa của SARATHI, (3) 8 bản sao song song, mỗi cái với TP 8 chiều, phục vụ đồng thời. Đối với tất cả các tình huống, chúng tôi sử dụng kích thước lô tối đa phù hợp với GPU — đối với TP+PP điều này là 27 và đối với chỉ TP điều này là 11. Tỷ lệ P:D được cố định ở 10 cho mô phỏng này với độ dài chuỗi tối thiểu và tối đa của các yêu cầu được đặt ở 1K và 4K tương ứng. Mỗi yêu cầu có thể có độ dài chuỗi khác nhau được lấy mẫu từ phân phối Zipf (θ=0.4), tuân thủ độ dài chuỗi tối đa. Số lượng token tiền xử lý và giải mã sau đó được tính bằng cách thỏa mãn tỷ lệ P:D mong muốn. Đối với thí nghiệm này, chúng tôi đặt kích thước phần là 256.
+
+Hình 12a vẽ cdf của thời gian bong bóng đường ống trên mỗi yêu cầu. Chúng tôi định nghĩa điều này như tổng thời gian bong bóng cho tất cả các micro-batch trên tất cả các lần lặp cho một yêu cầu nhất định. SARATHI giảm thời gian bong bóng trung vị trên mỗi yêu cầu 6.29×, bằng cách tạo ra các đơn vị công việc tính toán bằng nhau.
+
+Tiếp theo, chúng tôi so sánh thời gian hoàn thành yêu cầu tổng thể cho các tình huống khác nhau trong Hình 12b. Đồ thị này vẽ thời gian hoàn thành một số lượng yêu cầu nhất định (mô phỏng của chúng tôi xem xét tổng cộng 10K yêu cầu). Thực thi TP-PP yêu cầu ít bộ nhớ hơn để lưu trữ tham số so với thiết lập chỉ TP, dẫn đến nhiều chỗ hơn cho bộ nhớ đệm KV. Do đó triển khai TP-PP hỗ trợ kích thước lô cao hơn 2.45× so với triển khai chỉ TP, và tuy nhiên, chúng tôi quan sát rằng thực thi chỉ TP nhanh hơn 1.28× so với TP-PP cơ sở với lập lịch Orca, do bong bóng đường ống lớn trong trường hợp sau. Tuy nhiên, với tiền xử lý phân đoạn và lô ghép giải mã tối đa, thực thi PP được kích hoạt SARATHI được tăng tốc 1.91× so với TP-PP cơ sở, và 1.48× so với thực thi chỉ TP. Do đó, SARATHI làm cho thực thi song song đường ống trở thành một lựa chọn hấp dẫn cho suy luận LLM bằng cách giảm thiểu đáng kể bong bóng đường ống.
+
+5.4 Nghiên cứu Ablation của Tiền xử lý Phân đoạn
+Trong tiểu mục này, chúng tôi đánh giá cách chia một phép tính tiền xử lý đầy đủ thành nhiều phần tiền xử lý nhỏ hơn ảnh hưởng đến hiệu quả của giai đoạn tiền xử lý trong SARATHI. Để định lượng điều này, chúng tôi
+
+--- TRANG 13 ---
+1K 2K 3K
+Độ dài chuỗi 0.0 0.2 0.4 0.6 0.8 1.0 1.2 1.4 Tăng tốc (tiền xử lý-chú ý) 64
+128 192
+256 320
+384 448
+512
+
+(a) Tự chú ý (chỉ tiền xử lý).
+
+1K 2K 3K
+Độ dài chuỗi 0.0 0.2 0.4 0.6 0.8 1.0 1.2 1.4 Tăng tốc (tiền xử lý)
+
+(b) tiền xử lý phân đoạn so với tiền xử lý đầy đủ.
+
+1K 2K 3K
+Độ dài chuỗi 0.0 0.2 0.4 0.6 0.8 1.0 1.2 1.4 Tăng tốc (tổng thể)
+
+(c) Tăng tốc end-to-end cho toàn bộ lô.
+
+Hình 13: Nghiên cứu ablation: Ảnh hưởng của việc thay đổi kích thước phần lên các thành phần khác nhau của hệ thống cho LLaMa 13B trên GPU A6000.
+
+đo thời gian tính toán giai đoạn tiền xử lý cho các độ dài chuỗi khác nhau sử dụng toàn bộ chuỗi cùng một lúc - điều này đại diện cho hiệu suất tiền xử lý cơ sở của chúng tôi. Đối với mỗi chuỗi dài, chúng tôi sau đó tính toán tiền xử lý với tiền xử lý phân đoạn và so sánh thời gian chạy end-to-end của nó với cơ sở. Sự khác biệt giữa hai cái cho thấy chi phí của tiền xử lý phân đoạn.
+
+Phân chia tiền xử lý có hai nguồn chi phí tiềm năng: (1) nó sử dụng kích thước phần nhỏ hơn so với cơ sở có thể làm giảm việc sử dụng GPU, và (2) nó cần tải bộ nhớ đệm KV của mỗi phần nhiều lần, tùy thuộc vào số lượng phần trong một yêu cầu. Do đó, để hiểu đầy đủ chi phí của phân chia tiền xử lý, chúng tôi điều tra những điều sau: (1) tác động của phân chia lên tính toán chú ý cho một lô chỉ tiền xử lý là gì, (2) ảnh hưởng của phân chia lên thời gian chạy tổng thể của lô chỉ tiền xử lý là gì, và (3) thông lượng end-to-end là gì khi tiền xử lý phân đoạn được sử dụng cùng với lô ghép giải mã tối đa. Chúng tôi nghiên cứu những điều này bằng cách thay đổi kích thước phần từ 64 đến 512 như được hiển thị trong Hình 13.
+
+Đầu tiên, chúng tôi quan sát rằng kích thước phần nhỏ hơn có thể thêm chi phí đáng kể, cho cả chú ý và thời gian chạy tiền xử lý tổng thể. Ví dụ, kích thước phần 64 gây ra chi phí 3× cho chú ý (xem Hình 13a) và khoảng 5× (xem Hình 13b) trong thời gian tiền xử lý tổng thể. Như người ta có thể mong đợi, chi phí của tiền xử lý phân đoạn thấp hơn đối với kích thước phần lớn: đây là hiệu ứng kết hợp của việc sử dụng GPU cao hơn và ít lần tải lại bộ nhớ đệm KV hơn với các phần lớn hơn. Nhìn chung, chúng tôi thấy rằng kích thước phần 256 và 512 cung cấp hiệu quả tiền xử lý hợp lý, hạn chế mất mát tính toán tiền xử lý end-to-end trong vòng 20% và 10%, tương ứng.
+
+Thứ hai, SARATHI có thể bù đắp cho một số mất mát trong hiệu quả tiền xử lý bằng cách cải thiện thông lượng giải mã. Ví dụ, chúng ta thấy từ Hình 13c rằng kích thước phần 64 gần như khớp với hiệu suất của cơ sở của chúng tôi mặc dù chậm hơn 5× trong tiền xử lý trong khi kích thước phần 128 mang lại thông lượng cao hơn lên đến 1.16× mặc dù tiền xử lý của nó chậm hơn 2× so với cơ sở, chủ yếu do gắn kết nhiều giải mã hơn. Hiệu ứng lượng tử hóa tile cũng rõ ràng trong Hình 13 khi SARATHI đạt được cải thiện cao hơn trong thông lượng khi kích thước phần là bội số của 128; ví dụ, kích thước phần 256 cho thấy tăng tốc tốt hơn so với 320.
+
+6 Thảo luận
+Trong bài báo này, chúng tôi đã chứng minh toàn diện cách SARATHI cải thiện hiệu suất của suy luận LLM trên một số cấu hình mô hình và phần cứng. Tuy nhiên, có nhiều thách thức yêu cầu điều tra thêm.
+
+Đầu tiên, chúng tôi chỉ tập trung vào một cơ chế lập lịch hiệu quả trong SARATHI để cải thiện thông lượng của suy luận LLM. Tuy nhiên, các triển khai thực tế cần tối ưu hóa cơ sở hạ tầng phục vụ suy luận đồng thời theo nhiều chiều ví dụ: độ trễ, độ trễ xếp hàng, công bằng, v.v. Đáp ứng những mục tiêu này với SARATHI yêu cầu xem xét lại các chính sách lập lịch. Thứ hai, mặc dù chúng tôi cho thấy kích thước phần thích hợp cho một tỷ lệ P:D nhất định, chúng tôi để lại cho công việc tương lai khám phá cách chọn kích thước phần tối ưu vì nó phụ thuộc vào một số yếu tố như phần cứng, đặc điểm mô hình, độ dài chuỗi, và thành phần của token tiền xử lý-giải mã, đặc biệt trong các tình huống nơi tỷ lệ P:D có thể không được biết trước. Thứ ba, chúng tôi đưa ra giả định đơn giản trong bài báo này rằng mỗi yêu cầu trong một lô có cùng số lượng token tiền xử lý và giải mã (ngoại trừ các thí nghiệm mô phỏng) trong khi, trong thế giới thực, độ dài chuỗi có thể thay đổi đáng kể trên các yêu cầu suy luận LLM khác nhau. Cuối cùng, chúng tôi tập trung vào độ dài chuỗi lên đến 3K, và tỷ lệ P:D trong phạm vi 1-200. Chúng tôi tin rằng những điều này đại diện cho nhiều triển khai thực tế. Tuy nhiên, cũng đã có sự quan tâm gia tăng trong việc hỗ trợ các chuỗi rất dài (ví dụ: hàng chục-hàng trăm nghìn [18]). Độ dài chuỗi lớn như vậy có thể đặt ra những thách thức mới vì chi phí chú ý tăng bậc hai với số lượng token. Chúng tôi đang tích cực điều tra những thách thức này.
+
+7 Công việc Liên quan
+Trong phần này, chúng tôi cung cấp tóm tắt ngắn gọn về công việc liên quan theo hai chiều: tối ưu hóa hệ thống và đổi mới mô hình.
+
+--- TRANG 14 ---
+7.1 Tối ưu hóa Hệ thống
+Quản lý bộ nhớ: Trong giải mã tự hồi quy, số lượng token cần được tạo ra cho một yêu cầu nhất định không được biết trước. Do đó, các hệ thống thông thường phân bổ trước bộ nhớ cho bộ nhớ đệm KV dựa trên ước tính bảo thủ của số lượng token tối đa. Gần đây, vLLM đã chỉ ra rằng cách tiếp cận này không hiệu quả và đề xuất một framework — được thúc đẩy bởi trừu tượng bộ nhớ ảo — cho phép phân bổ bộ nhớ tăng dần cho bộ nhớ đệm KV [20]. Điều này giúp cải thiện kích thước lô, đặc biệt khi số lượng token thay đổi đáng kể trên các yêu cầu khác nhau. FlexGen [42] tập trung vào cải thiện thông lượng của suy luận LLM ngoại tuyến trong các tình huống hạn chế tài nguyên ví dụ: chạy một mô hình lớn trên một GPU duy nhất. Hướng tới mục tiêu này, FlexGen sử dụng một sự kết hợp thận trọng của giảm tải bộ nhớ, lượng tử hóa, và lập lịch.
+
+Tối ưu hóa (tự)chú ý: Trong [40], các tác giả đề xuất một thuật toán để giảm yêu cầu bộ nhớ của tự chú ý từ O(n2) thành O(1), đối với độ dài chuỗi. FlashAttention [29] đề xuất một thuật toán dựa trên tiling tăng tốc tính toán chú ý bằng cách giảm thiểu số byte đọc/ghi giữa các cấp độ khác nhau của bộ nhớ GPU. Công việc tiếp theo [28] trên FlashAttention cải thiện thêm nó theo song song và phân chia công việc [28]. Trong các thí nghiệm của chúng tôi, chúng tôi thấy triển khai chú ý hiệu quả bộ nhớ xformers [21] hiệu quả nhất.
+
+Tối ưu hóa cấp kernel: FasterTransformer [6] đề xuất các lớp được tối ưu hóa cho các khối mã hóa và giải mã của transformer. Những điều này dựa trên các tối ưu hóa GPU cấp thấp như hợp nhất kernel. Chúng tôi mong đợi rằng các tối ưu hóa cấp thấp như vậy cũng sẽ có lợi cho SARATHI.
+
+Tối ưu hóa lập lịch: Orca đề xuất một framework lập lịch cấp lần lặp tránh lãng phí tính toán do đệm token được sử dụng trước đây để lô ghép các yêu cầu với độ dài chuỗi khác nhau [48]. Hơn nữa, Orca giảm độ trễ bằng cách trả về phản hồi ngay khi token kết thúc chuỗi của yêu cầu được tạo ra. FastServe đề xuất một framework lập lịch ưu tiên để giảm thiểu thời gian hoàn thành công việc [46]. Một số framework lập lịch khác bao gồm Triton [13] và Clipper [27] tách lớp phục vụ khỏi động cơ thực thi của mô hình. Công việc hiện tại của chúng tôi tập trung vào tối ưu hóa lớp thực thi và có thể được sử dụng với các chính sách lập lịch khác nhau được đề xuất bởi các hệ thống như vậy.
+
+Các tối ưu hóa được đề xuất bởi một số công việc trước đây có thể bổ sung cho các tối ưu hóa của chúng tôi ví dụ: các triển khai chú ý được tối ưu hóa hơn sẽ cho phép mở rộng SARATHI đến độ dài chuỗi dài hơn và phân bổ bộ nhớ động sẽ giúp hỗ trợ kích thước lô lớn hơn và vân vân.
+
+7.2 Đổi mới Mô hình
+Một khối lượng công việc đáng kể xung quanh đổi mới mô hình đã cố gắng giải quyết những thiếu sót của các mô hình ngôn ngữ dựa trên transformer hoặc để thực hiện bước nhảy tiếp theo trong kiến trúc mô hình, vượt ra ngoài transformer. Ví dụ, chú ý đa truy vấn chia sẻ cùng khóa và giá trị trên tất cả các đầu chú ý để giảm kích thước của bộ nhớ đệm KV [41], cho phép kích thước lô lớn hơn. Một số công việc gần đây cũng đã chỉ ra rằng kích thước mô hình có thể được nén đáng kể bằng cách sử dụng lượng tử hóa [30–32,47]. Các mô hình hỗn hợp chuyên gia chủ yếu nhằm giảm số lượng tham số mô hình được kích hoạt trong một lần lặp [23, 33, 36]. Gần đây hơn, các mạng duy trì đã được đề xuất như một người kế thừa cho transformer [44]. Trong công việc này, chúng tôi tập trung vào giải quyết các vấn đề hiệu suất của các mô hình transformer phổ biến nhất từ góc độ GPU. Đổi mới mô hình trực giao với công việc của chúng tôi.
+
+8 Kết luận
+Trong bài báo này, chúng tôi xác định hai lý do chính cho sự không hiệu quả của suy luận LLM: 1) việc sử dụng GPU không tối ưu do thiếu song song và bản chất bị giới hạn bộ nhớ của giai đoạn giải mã, và 2) bong bóng đường ống đáng kể do thời gian tiền xử lý và giải mã không nhất quán trên các lần lặp khác nhau, dẫn đến mất cân bằng micro-batch. Để giải quyết những thách thức này, chúng tôi giới thiệu SARATHI, một cách tiếp cận mới kết hợp tiền xử lý phân đoạn và lô ghép giải mã tối đa. Lô ghép giải mã tối đa cải thiện việc sử dụng GPU bằng cách gắn kết giải mã với tiền xử lý, chuyển đổi giai đoạn giải mã bị giới hạn bộ nhớ thành bị giới hạn tính toán. Tiền xử lý phân đoạn giúp làm cho nhiều tiền xử lý khả dụng hơn để giải mã gắn kết, và cũng cung cấp cho một đơn vị công việc đồng nhất giúp giảm đáng kể bong bóng đường ống. Chúng tôi chứng minh rằng SARATHI dẫn đến cải thiện đáng kể trong thông lượng end-to-end trên các cấu hình mô hình và phần cứng.
+
+--- TRANG 15 ---
+Tài liệu tham khảo
+[1] Amazon codewhisperer. https://aws.amazon.com/codewhisperer/.
+[2] Anthropic claude. https://claude.ai.
+[3] Bing ai. https://www.bing.com/chat.
+[4] Character ai. https://character.ai.
+[5] Chatgpt. https://chat.openai.com.
+[6] Faster Transformer. https://github.com/NVIDIA/FasterTransformer.
+[7] Github copilot. https://github.com/features/copilot.
+[8] Google bard. https://bard.google.com.
+[9] Komo. https://komo.ai/.
+[10] Llama model card. https://huggingface.co/decapoda-research/llama-13b-hf.
+[11] Matrix multiplication background user's guide. https://docs.nvidia.com/deeplearning/performance/dl-performance-matrix-multiplication/index.html.
+[12] nanogpt. https://github.com/karpathy/nanoGPT.
+[13] NVIDIA Triton Inference Server. https://developer.nvidia.com/nvidia-triton-inference-server.
+[14] Openai gpt-3: Understanding the architecture. https://www.theaidream.com/post/openai-gpt-3-understanding-the-architecture.
+[15] Perplexity ai. https://www.perplexity.ai/.
+[16] Replit ghostwriter. https://replit.com/site/ghostwriter.
+[17] Text generation inference. https://huggingface.co/text-generation-inference.
+[18] The Secret Sauce behind 100K context window in LLMs: all tricks in one place. https://blog.gopenai.com/how-to-speed-up-llms-and-use-100k-context-window-all-tricks-in-one-place-ffd40577b4c.
+[19] Using NVIDIA's AI/ML Frameworks for Generative AI on VMware vSphere. https://core.vmware.com/blog/using-nvidias-aiml-frameworks-generative-ai-vmware-vsphere.
+[20] vllm: Easy, fast, and cheap llm serving for everyone. https://github.com/vllm-project/vllm.
+[21] XFORMERS OPTIMIZED OPERATORS. https://facebookresearch.github.io/xformers/components/ops.html.
+[22] You.com. https://you.com/.
+[23] Mikel Artetxe, Shruti Bhosale, Naman Goyal, Todor Mihaylov, Myle Ott, Sam Shleifer, Xi Victoria Lin, Jingfei Du, Srinivasan Iyer, Ramakanth Pasunuru, Giri Anantharaman, Xian Li, Shuohui Chen, Halil Akin, Mandeep Baines, Louis Martin, Xing Zhou, Punit Singh Koura, Brian O'Horo, Jeff Wang, Luke Zettlemoyer, Mona Diab, Zornitsa Kozareva, và Ves Stoyanov. Efficient large scale language modeling with mixtures of experts, 2022.
+[24] Sanjith Athlur, Nitika Saran, Muthian Sivathanu, Ramachandran Ramjee, và Nipun Kwatra. Varuna: scalable, low-cost training of massive deep learning models. Trong Proceedings of the Seventeenth European Conference on Computer Systems, trang 472–487, 2022.
+[25] Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, et al. Language models are few-shot learners. Advances in neural information processing systems, 33:1877–1901, 2020.
+[26] Aakanksha Chowdhery, Sharan Narang, Jacob Devlin, Maarten Bosma, Gaurav Mishra, Adam Roberts, Paul Barham, Hyung Won Chung, Charles Sutton, Sebastian Gehrmann, Parker Schuh, Kensen Shi, Sasha Tsvyashchenko, Joshua Maynez, Abhishek Rao, Parker Barnes, Yi Tay, Noam Shazeer, Vinodkumar Prabhakaran, Emily Reif, Nan Du, Ben Hutchinson, Reiner Pope, James Bradbury, Jacob Austin, Michael Isard, Guy Gur-Ari, Pengcheng Yin, Toju Duke, Anselm Levskaya, Sanjay Ghemawat, Sunipa Dev, Henryk Michalewski, Xavier Garcia, Vedant Misra, Kevin Robinson, Liam Fedus, Denny Zhou, Daphne Ippolito, David Luan, Hyeontaek Lim, Barret Zoph, Alexander Spiridonov, Ryan Sepassi, David Dohan, Shivani Agrawal, Mark Omernick, Andrew M. Dai, Thanumalayan Sankaranarayana Pillai, Marie Pellat, Aitor Lewkowycz, Erica Moreira, Rewon Child, Oleksandr Polozov, Katherine Lee, Zongwei Zhou, Xuezhi Wang, Brennan Saeta, Mark Diaz, Orhan Firat, Michele Catasta, Jason Wei, Kathy Meier-Hellstern, Douglas Eck, Jeff Dean, Slav Petrov, và Noah Fiedel. Palm: Scaling language modeling with pathways. CoRR, abs/2204.02311, 2022.
+[27] Daniel Crankshaw, Xin Wang, Guilio Zhou, Michael J Franklin, Joseph E Gonzalez, và Ion Stoica. Clipper: A {Low-Latency} online prediction serving system. Trong 14th USENIX Symposium on Networked Systems Design and Implementation (NSDI 17), trang 613–627, 2017.
+[28] Tri Dao. Flashattention-2: Faster attention with better parallelism and work partitioning, 2023.
+[29] Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, và Christopher Ré. Flashattention: Fast and memory-efficient exact attention with io-awareness, 2022.
+[30] Tim Dettmers, Mike Lewis, Younes Belkada, và Luke Zettlemoyer. Llm.int8(): 8-bit matrix multiplication for transformers at scale, 2022.
+[31] Tim Dettmers, Artidoro Pagnoni, Ari Holtzman, và Luke Zettlemoyer. Qlora: Efficient finetuning of quantized llms, 2023.
+[32] Elias Frantar, Saleh Ashkboos, Torsten Hoefler, và Dan Alistarh. Gptq: Accurate post-training quantization for generative pre-trained transformers, 2023.
+[33] Haiyang Huang, Newsha Ardalani, Anna Sun, Liu Ke, Hsien-Hsin S. Lee, Anjali Sridhar, Shruti Bhosale, Carole-Jean Wu, và Benjamin Lee. Towards moe deployment: Mitigating inefficiencies in mixture-of-expert (moe) inference, 2023.
+[34] Yanping Huang, Youlong Cheng, Ankur Bapna, Orhan Firat, Dehao Chen, Mia Chen, HyoukJoong Lee, Jiquan Ngiam, Quoc V Le, Yonghui Wu, et al. Gpipe: Efficient training of giant neural networks using pipeline parallelism. Advances in neural information processing systems, 32, 2019.
+[35] Jared Kaplan, Sam McCandlish, Tom Henighan, Tom B. Brown, Benjamin Chess, Rewon Child, Scott Gray, Alec Radford, Jeffrey Wu, và Dario Amodei. Scaling laws for neural language models. CoRR, abs/2001.08361, 2020.
+[36] Jiamin Li, Yimin Jiang, Yibo Zhu, Cong Wang, và Hong Xu. Accelerating distributed MoE training and inference with lina. Trong 2023 USENIX Annual Technical Conference (USENIX ATC 23), trang 945–959, Boston, MA, July 2023. USENIX Association.
+[37] Deepak Narayanan, Aaron Harlap, Amar Phanishayee, Vivek Seshadri, Nikhil R Devanur, Gregory R Ganger, Phillip B Gibbons, và Matei Zaharia. Pipedream: generalized pipeline parallelism for dnn training. Trong Proceedings of the 27th ACM Symposium on Operating Systems Principles, trang 1–15, 2019.
+[38] OpenAI. GPT-4 technical report. CoRR, abs/2303.08774, 2023.
+[39] Reiner Pope, Sholto Douglas, Aakanksha Chowdhery, Jacob Devlin, James Bradbury, Anselm Levskaya, Jonathan Heek, Kefan Xiao, Shivani Agrawal, và Jeff Dean. Efficiently scaling transformer inference, 2022.
+[40] Markus N. Rabe và Charles Staats. Self-attention does not need o(n2) memory, 2022.
+[41] Noam Shazeer. Fast transformer decoding: One write-head is all you need, 2019.
+[42] Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan Li, Max Ryabinin, Daniel Y. Fu, Zhiqiang Xie, Beidi Chen, Clark Barrett, Joseph E. Gonzalez, Percy Liang, Christopher Ré, Ion Stoica, và Ce Zhang. Flexgen: High-throughput generative inference of large language models with a single gpu, 2023.
+[43] Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper, và Bryan Catanzaro. Megatron-lm: Training multi-billion parameter language models using gpu model parallelism. arXiv preprint arXiv:1909.08053, 2019.
+[44] Yutao Sun, Li Dong, Shaohan Huang, Shuming Ma, Yuqing Xia, Jilong Xue, Jianyong Wang, và Furu Wei. Retentive network: A successor to transformer for large language models, 2023.
+[45] Jason Wei, Yi Tay, Rishi Bommasani, Colin Raffel, Barret Zoph, Sebastian Borgeaud, Dani Yogatama, Maarten Bosma, Denny Zhou, Donald Metzler, Ed H. Chi, Tatsunori Hashimoto, Oriol Vinyals, Percy Liang, Jeff Dean, và William Fedus. Emergent abilities of large language models. Trans. Mach. Learn. Res., 2022, 2022.
+[46] Bingyang Wu, Yinmin Zhong, Zili Zhang, Gang Huang, Xuanzhe Liu, và Xin Jin. Fast distributed inference serving for large language models, 2023.
+[47] Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu, Julien Demouth, và Song Han. Smoothquant: Accurate and efficient post-training quantization for large language models, 2023.
+[48] Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soojeong Kim, và Byung-Gon Chun. Orca: A distributed serving system for Transformer-Based generative models. Trong 16th USENIX Symposium on Operating Systems Design and Implementation (OSDI 22), trang 521–538, Carlsbad, CA, July 2022. USENIX Association.
+
+16

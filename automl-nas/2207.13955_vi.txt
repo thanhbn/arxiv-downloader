@@ -1,0 +1,578 @@
+# Tìm kiếm Kiến trúc Mạng nơ-ron trên Transformers Hiệu quả và Hơn thế nữa
+Zexiang Liu1, Dong Li1, Kaiyue Lu1, Zhen Qin1, Weixuan Sun3;1, Jiacheng Xu1, Yiran Zhong1;2*
+1SenseTime Research2Shanghai AI Lab3Australian National University
+
+## Tóm tắt
+Gần đây, nhiều Transformers hiệu quả đã được đề xuất để giảm độ phức tạp tính toán bậc hai của Transformers tiêu chuẩn gây ra bởi cơ chế attention Softmax. Tuy nhiên, hầu hết chúng chỉ đơn giản thay thế Softmax bằng một cơ chế attention hiệu quả mà không xem xét các kiến trúc tùy chỉnh đặc biệt cho attention hiệu quả. Trong bài báo này, chúng tôi lập luận rằng các kiến trúc Transformer vanilla được thiết kế thủ công cho attention Softmax có thể không phù hợp với Transformers hiệu quả. Để giải quyết vấn đề này, chúng tôi đề xuất một framework mới để tìm kiến trúc tối ưu cho Transformers hiệu quả với kỹ thuật tìm kiếm kiến trúc mạng nơ-ron (NAS). Phương pháp được đề xuất được xác thực trên các tác vụ dịch máy và phân loại hình ảnh phổ biến. Chúng tôi quan sát thấy rằng kiến trúc tối ưu của Transformer hiệu quả có lượng tính toán giảm so với Transformer tiêu chuẩn, nhưng độ chính xác tổng quát ít có thể so sánh được. Điều này cho thấy rằng attention Softmax và attention hiệu quả có những khác biệt riêng nhưng không ai trong số chúng có thể đồng thời cân bằng tốt độ chính xác và hiệu quả. Điều này thúc đẩy chúng tôi kết hợp hai loại attention để giảm sự mất cân bằng hiệu suất. Bên cạnh các không gian tìm kiếm thường được sử dụng trong các phương pháp NAS Transformer hiện có, chúng tôi đề xuất một không gian tìm kiếm mới cho phép thuật toán NAS tự động tìm kiếm các biến thể attention cùng với kiến trúc. Các thí nghiệm mở rộng trên WMT'14 En-De và CIFAR-10 chứng minh rằng kiến trúc tìm kiếm của chúng tôi duy trì độ chính xác có thể so sánh với Transformer tiêu chuẩn với hiệu quả tính toán được cải thiện đáng kể.
+
+## 1. Giới thiệu
+Transformers hiệu quả [17, 20, 25, 31] đã đạt được những tiến bộ đáng kể trong những năm gần đây. Chúng giảm độ phức tạp tính toán bậc hai của Transformer tiêu chuẩn [35] bằng cách làm thưa hoặc xấp xỉ attention Softmax theo cách hiệu quả hơn. Hiện tại, cấu hình của mạng hiệu quả, ví dụ như số lượng heads và kích thước embedding đầu vào, được sao chép trực tiếp từ Transformer, điều này có thể không phù hợp với Transformers hiệu quả [25]. Cấu trúc mạng tùy chỉnh cụ thể cho Transformers hiệu quả chưa được nghiên cứu kỹ lưỡng. Tuy nhiên, thiết kế thủ công luôn bao gồm công việc kỹ thuật tốn kém và có thể không tối ưu do thiên kiến của con người [14]. Do đó, trong bài báo này, chúng tôi muốn khám phá cách tự động tìm kiến trúc phù hợp cho Transformers hiệu quả.
+
+*Zexiang Liu, Dong Li, và Kaiyue Lu đóng góp như nhau cho nghiên cứu này. Tác giả liên hệ: Yiran Zhong ( zhongyiran@gmail.com )
+
+(a)Dịch WMT'14 En-De-505101520253035
+7 8 9 10 11 12 13 14BLEU
+FLOPS (G)Transformer *mFormer (của chúng tôi)
+cosFormer *Vanilla Transformer
+Vanilla cosFormer
+
+8486889092949698
+7 7.5 8 8.5 9 9.5 10 10.5 11 11.5Accuracy (%)
+FLOPS (G)mFormer (của chúng tôi)
+Transformer *
+cosFormer *Vanilla Transformer
+Vanilla cosFormer
+
+(b)Phân loại CIFAR -10Hình 1. So sánh hiệu suất về độ chính xác và hiệu quả.
+Các mô hình được đánh dấu bằng "*" là những kiến trúc tối ưu được tìm thấy bởi NAS. Kích thước của hình tròn thể hiện quy mô tham số tương đối trên mỗi tác vụ. Việc sử dụng kết hợp attention Softmax và attention hiệu quả được đề xuất, tức là mFormer, có lợi cho việc cân bằng độ chính xác và hiệu quả. Lưu ý: (a) cosFormer thể hiện BLEU rất thấp trên tác vụ dịch do hội tụ không phù hợp. (b) Vanilla Transformer và cosFormer trong CIFAR-10 có FLOPS nhỏ hơn vì chúng chỉ có 6 lớp, trong khi các mô hình tối ưu đã tìm kiếm (bao gồm cả của chúng tôi) có hơn 10 lớp. Với FLOPS tương tự, của chúng tôi có độ chính xác cao hơn nhiều.
+
+Để đạt được mục tiêu, chúng ta cần (1) chỉ định một Transformer hiệu quả phù hợp làm mục tiêu, và (2) tìm một phương pháp để tự động hóa thiết kế mạng. Đối với điểm đầu tiên, chúng tôi đưa ra tổng quan ngắn gọn về các Transformers hiệu quả hiện có. Về cách xử lý attention Softmax, chúng có thể được phân loại thô như dựa trên mẫu và dựa trên kernel [25]. Các phương pháp dựa trên mẫu làm thưa ma trận attention với các mẫu được định nghĩa trước hoặc có thể học, ví dụ như chia chuỗi đầu vào thành các khối cố định [26], tính attention theo khoảng cách cố định [7], hoặc sử dụng axial attention [15]. Mặc dù độ thưa được tạo ra bởi các mẫu cụ thể có lợi cho việc đơn giản hóa tính toán attention, nó vẫn chịu độ phức tạp bậc hai đối với độ dài đầu vào N [33] và phức tạp để triển khai. Khác biệt, các phương pháp dựa trên kernel nhằm giảm độ phức tạp bậc hai thành tuyến tính (tức là O(N) về cả độ phức tạp thời gian và không gian) [17, 25]. Chúng tái cấu trúc cơ chế self-attention để tránh tính toán rõ ràng ma trận N×N. Hơn nữa, chúng dễ tái tạo hơn trong thực tế. Xem xét các tính chất hấp dẫn của các phương pháp kernel, chúng tôi chọn cosFormer [25], một mô hình dựa trên kernel mới với hiệu suất state-of-the-art trong số các Transformers hiệu quả, làm mục tiêu của chúng tôi. Chúng tôi cố gắng tìm kiếm kiến trúc tùy chỉnh và tối ưu cho nó.
+
+Attention Softmax
+hoặc
+Linear attention Query
+Key
+Value Output Hình 2. Không gian tìm kiếm được đề xuất cho các loại attention. Nó chứa attention Softmax và linear attention (tức là cosFormer attention [25] trong bài báo này). Chúng tôi để mô hình tự động xác định loại attention nào để sử dụng với NAS.
+
+Để tự động hóa thiết kế mạng, chúng tôi tận dụng tìm kiếm kiến trúc mạng nơ-ron (NAS) [11, 23]. Nó đã được sử dụng rộng rãi trong việc tìm kiếm kiến trúc Transformer tiêu chuẩn trong Xử lý Ngôn ngữ Tự nhiên [14, 16, 29, 36, 38] và Thị giác Máy tính [5, 6, 10, 13]. Các nghiên cứu này chủ yếu tập trung vào việc tinh chỉnh không gian tìm kiếm và/hoặc cải thiện thuật toán tìm kiếm. Ví dụ, AutoAttend [14] khám phá các kết nối hiệu quả giữa Query, Key và Value bằng cách tạo các phép toán nguyên thủy cho dữ liệu đầu vào, ví dụ như convolution 1×1 và max pooling 1×3. Evolved Transformer [29] áp dụng tournament selection [27] cho NAS để tạo ra các mô hình ứng viên mạnh mẽ hơn. Tuy nhiên, các phương pháp này chịu chi phí huấn luyện dài và chi phí tìm kiếm lớn vì tất cả các ứng viên cần được tối ưu hóa, đánh giá và xếp hạng. Với mục đích giảm những chi phí này, chúng tôi sử dụng RankNAS [16], một framework NAS hiệu quả mới để tìm kiếm Transformer tiêu chuẩn [35]. Nó có thể tăng tốc đáng kể quá trình tìm kiếm thông qua xếp hạng theo cặp, cắt tỉa không gian tìm kiếm và ràng buộc nhận biết phần cứng.
+
+Với cả Transformer hiệu quả (tức là cosFormer [25]) và thuật toán tìm kiếm (tức là RankNAS [16]), chúng tôi tiến hành một nghiên cứu sơ bộ về NAS dựa trên Transformer hiệu quả thuần túy. Cụ thể, chúng tôi thay thế Softmax bằng linear attention được giới thiệu trong cosFormer, và sau đó tìm kiếm nó với RankNAS. Để điều tra toàn diện kiến trúc tối ưu, chúng tôi thực hiện tìm kiếm trên hai tác vụ đại diện trong lĩnh vực NLP và CV, tức là dịch máy (WMT'14 En-De [4]) và phân loại hình ảnh (CIFAR-10 [19]). Nhìn chung, chúng tôi quan sát thấy rằng cấu trúc tối ưu của cosFormer có ít chi phí tính toán hơn, ví dụ như FLOPS nhỏ hơn như được minh họa trong Hình 1. Tuy nhiên, độ chính xác tổng quát ít có thể so sánh với Transformer tiêu chuẩn (xem trục dọc trong Hình 1). Sự mất cân bằng hiệu suất này giữa độ chính xác và hiệu quả cũng đã được tiết lộ trong các Transformers hiệu quả khác [8, 17, 18, 32, 37].
+
+Xem xét rằng vanilla Softmax attention và linear attention có những khác biệt riêng về hiệu suất, chúng tôi đề xuất sử dụng attention Softmax và linear theo cách kết hợp để có lợi cho việc cân bằng tốt hơn giữa độ chính xác và hiệu quả (được đặt tên là "mFormer"). Hơn nữa, chúng tôi mong đợi mô hình tự động xác định loại attention nào để sử dụng. Để đạt được điều này, chúng tôi giới thiệu một không gian tìm kiếm mới đặc biệt cho attention và kết hợp nó vào framework NAS. Sau khi tìm kiếm lại kiến trúc tối ưu, chúng tôi thấy rằng sự kết hợp của hai loại attention đạt được hiệu suất có thể so sánh với Transformer với hiệu quả được cải thiện đáng kể trên cả hai tác vụ (xem Hình 1).
+
+Tóm lại, chúng tôi đóng góp ba điểm chính:
+
+• Theo hiểu biết tốt nhất của chúng tôi, đây là công trình đầu tiên tìm kiếm kiến trúc tối ưu của Transformers hiệu quả. Chúng tôi sử dụng NAS để tìm kiếm cosFormer, một mô hình hiệu quả đại diện. Các kết quả tìm kiếm đưa ra những hiểu biết mới cho cộng đồng, tức là cách thiết kế các cấu trúc mạng tùy chỉnh, hiệu quả và hữu ích cho Transformers hiệu quả.
+
+• Chúng tôi đề xuất một cách sử dụng attention mới, tức là kết hợp attention Softmax và linear attention trong Transformer, và định nghĩa một không gian tìm kiếm mới cho tìm kiếm attention trong framework NAS. Điều này đẩy việc tìm kiếm Transformer hiện có xa hơn bằng cách cho phép lựa chọn tự động các loại attention phù hợp.
+
+• Attention kết hợp được đề xuất đạt được sự cân bằng tốt hơn giữa độ chính xác và hiệu quả, tức là có hiệu suất có thể so sánh với Transformer tiêu chuẩn trong khi duy trì hiệu quả tốt. Điều này được xác thực trên cả tác vụ dịch máy và phân loại hình ảnh.
+
+## 2. Nghiên cứu liên quan
+
+### 2.1. Transformers hiệu quả
+
+Transformer tiêu chuẩn [35] chịu độ phức tạp thời gian và không gian bậc hai gây ra bởi attention Softmax. Để giảm chi phí tính toán, Transformers hiệu quả
+
+φ(Q) Q
+K^T
+V O N×d
+d×N
+N×d N×N N×d
+
+φ(K)^T
+V O
+N×d d×N
+d×d N×d
+N×d S ×
+××
+
+(a) Softmax attention (b) Linear attention × S Softmax
+Phép nhân ma trận Hình 3. Minh họa về attention. (a) Softmax tính QK^T trước, dẫn đến độ phức tạp bậc hai đối với độ dài chuỗi N. (b) Linear attention phân tách hàm tương tự với hàm kernel và nhân K và V trước. Điều này giảm độ phức tạp bậc hai thành tuyến tính.
+
+hoặc làm thưa hoặc xấp xỉ Softmax theo cách hiệu quả hơn. Làm thưa attention được áp dụng bởi các phương pháp dựa trên mẫu, trong đó ma trận attention được làm thưa với các mẫu được định nghĩa trước hoặc có thể học. [26] chia chuỗi đầu vào thành các khối cố định, để độ phức tạp được giảm từ N² thành B² (B là kích thước khối nhỏ hơn N). Thay vào đó, [22] lấy mẫu con đầu vào thành độ dài cố định. Thay vì điều chỉnh độ dài chuỗi, [3, 7] sử dụng các mẫu strided/dilated để tính attention theo khoảng cách cố định. So với những phương pháp này với một mẫu cố định, sự kết hợp của nhiều mẫu có thể đa dạng hóa độ bao phủ của truy cập attention [33]. Ví dụ, [15] tính attention dọc theo mọi trục của đầu vào, và [7] tổng hợp attention từ cả mẫu strided và local. Để cải thiện hơn nữa chất lượng của các mẫu, việc học các mẫu theo cách hướng dữ liệu đang trở thành xu hướng mới [18, 28, 32]. Lợi ích so với các mẫu cố định là các mẫu có thể học có thể nhóm các token đầu vào chính xác hơn dựa trên mức độ liên quan của token trong khi vẫn duy trì hiệu quả [33]. Tóm lại, các phương pháp dựa trên mẫu có thể tăng cường hiệu quả bằng cách làm thưa attention Softmax. Tuy nhiên, chúng vẫn có độ phức tạp bậc hai, và nó sẽ tăng với độ dài đầu vào trở nên lớn hơn. Ngoài ra, chúng tương đối phức tạp để tái tạo trong thực tế.
+
+Một danh mục chung khác của Transformers hiệu quả dựa trên kernels (hoặc kernel functions), nhằm giảm độ phức tạp từ bậc hai thành tuyến tính. Bằng cách này, Softmax có thể được viết lại với các dạng khác để tránh ma trận attention N×N [33]. Để đạt được điều này, [37] giả định một prior rank thấp trong cấu trúc N×N, và chuyển đổi Key và Value thành một chiều thấp hơn với các lớp projection bổ sung. [24] xấp xỉ Softmax với tích của một chuỗi kernels Gaussian, và thay vào đó, [9] sử dụng kernels Haar. PerFormer [8] sử dụng các đặc trưng ngẫu nhiên trực giao để tạo ra kernels ngẫu nhiên. Linear Transformer [17] tận dụng tính chất kết hợp của tích ma trận, và tái cấu trúc hàm tương tự với phân tách kernel. cosFormer [25] theo chiến lược kernelization này, và sử dụng ReLU [1] làm hàm kernel với cơ chế reweighting cosine bổ sung. Nhìn chung, các phương pháp dựa trên kernel có thể tuyến tính hóa độ phức tạp và hiệu quả tăng cường hiệu quả. Hơn nữa, chúng dễ triển khai hơn các phương pháp dựa trên mẫu.
+
+### 2.2. Tìm kiếm kiến trúc mạng nơ-ron (NAS)
+
+NAS [11, 23] nhằm tự động tìm kiến trúc mạng phù hợp nhất, và đã được áp dụng rộng rãi cho Thị giác Máy tính [5, 6, 10, 13] và Xử lý Ngôn ngữ Tự nhiên [14, 16, 29, 36, 38]. Cốt lõi của NAS là thiết kế một không gian tìm kiếm phù hợp, xếp hạng tất cả các kiến trúc ứng viên được tạo ra từ không gian đó, và tìm cấu trúc tối ưu. Đối với Transformers trong NLP, Evolved Transformer (ET) [29] là công trình tiên phong áp dụng NAS vào tìm kiếm kiến trúc Transformer. Nó định nghĩa một không gian tìm kiếm quy mô lớn, bao gồm các thành phần trong đầu vào, chuẩn hóa, lớp, chiều đầu ra, activations, v.v. Một thuật toán tiến hóa [27] được áp dụng để làm cho việc lựa chọn kiến trúc ổn định và mạnh mẽ hơn, tức là liên tục lựa chọn kiến trúc hứa hẹn nhất dựa trên fitness. Mặc dù ET có thể tìm một cấu trúc tốt hơn và hiệu quả hơn, chi phí tính toán của nó vẫn rất lớn. Điều này là do thuật toán phải bao gồm tất cả các đặc trưng tìm kiếm. Bên cạnh đó, huấn luyện quá trình tiến hóa cũng tốn thời gian.
+
+Các công trình tiếp theo tập trung vào việc cải thiện thuật toán tìm kiếm và/hoặc cắt tỉa không gian tìm kiếm. [41] sử dụng differentiable architecture search (DARTS) [21] bao gồm tất cả các phép toán vào một node (tức là tạo thành một supernet) và tận dụng Softmax cho lựa chọn cụ thể. Phương pháp này giảm bớt nhu cầu huấn luyện riêng lẻ từng mạng ứng viên. [34] phân tách cấu trúc Transformer thành các thành phần nhỏ hơn, và giới thiệu thuật toán tìm kiếm one-shot dựa trên sampling. HAT [36] giới thiệu ràng buộc nhận biết phần cứng để tăng tốc quá trình tìm kiếm. RankNAS [16] coi NAS như một vấn đề xếp hạng theo cặp, điều này tăng tốc đáng kể quá trình tìm kiếm.
+
+Cắt tỉa không gian tìm kiếm, tức là chỉ giữ lại các đặc trưng tìm kiếm quan trọng nhất, là một phương pháp khác để giảm chi phí tìm kiếm. TextNAS [38] chỉ định một không gian tìm kiếm được tùy chỉnh cho biểu diễn văn bản, bao gồm các lớp convolutional, recurrent, pooling và self-attention. Primer [30] sửa đổi không gian tìm kiếm với activations squaring ReLU và các lớp convolutional depth-wise sau Query, Key và Value. AutoAttend [14] tìm kiếm đặc biệt các kết nối giữa QKV. RankNAS [16] đề xuất thuật toán lựa chọn đặc trưng đo lường tầm quan trọng của mỗi đặc trưng và sắp xếp những cái hữu ích nhất để tìm kiếm tiếp. Tóm lại, cắt tỉa không gian tìm kiếm có thể hiệu quả cải thiện hiệu quả tìm kiếm và duy trì hiệu suất tốt.
+
+## 3. NAS trên Transformers Hiệu quả
+
+Trong phần này, trước tiên chúng tôi đưa ra tổng quan ngắn gọn về kiến thức sơ bộ của cosFormer [25] và RankNAS [16]. Sau đó, chúng tôi chỉ định các bước chính của việc áp dụng NAS cho tìm kiếm Transformer hiệu quả và thảo luận về các kết quả chung. Cuối cùng, chúng tôi giới thiệu ý tưởng được đề xuất về việc sử dụng attention kết hợp.
+
+### 3.1. Kiến thức sơ bộ
+
+#### 3.1.1 cosFormer
+
+Cho Query Q ∈ ℝ^(N×d), Key K ∈ ℝ^(N×d), và Value V ∈ ℝ^(N×d) (d là chiều đặc trưng của mỗi head), Transformer tiêu chuẩn [35] tạo ra đầu ra O ∈ ℝ^(N×d) bằng cách nhân attention QK được chuẩn hóa với V, tức là,
+
+O = σ(QK^T)V; (1)
+
+trong đó σ là hàm tương tự, ví dụ như Softmax trong Transformer. Việc tính toán QK^T ∈ ℝ^(N×N) dẫn đến độ phức tạp bậc hai đối với độ dài chuỗi N (xem Hình 3(a)).
+
+Tuyến tính hóa attention có thể giảm độ phức tạp từ bậc hai thành tuyến tính [17, 25]. Điều này đạt được bằng cách phân tách hàm tương tự và nhân K và V trước, tức là,
+
+σ(QK^T)V = (φ(Q)φ(K)^T)V = φ(Q)(φ(K)^TV); (2)
+
+trong đó φ là hàm kernel chuyển đổi Q và K thành các biểu diễn ẩn. Trong trường hợp này, độ phức tạp O(N²d) giảm xuống O(Nd²). Thường thì chúng ta luôn có N ≫ d, vì vậy O(N²d) ≈ O(N²) và O(Nd²) ≈ O(N), tạo ra độ phức tạp tuyến tính.
+
+Về bản chất, người ta nhận ra rằng hàm tương tự nên là non-negative và non-linear [17, 25]. Tính non-negative tăng cường các đặc trưng tương quan tích cực, và [25] đạt được điều này bằng cách trực tiếp sử dụng hàm ReLU [1], tức là ReLU(x) = max(0; x). Tính non-linear tập trung các đặc trưng liên quan nhất được tổng hợp và ổn định hóa huấn luyện [2, 12]. Để đạt được điều này, [25] giới thiệu thêm cơ chế reweighting dựa trên cosine sao cho các token gần nhau được khuyến khích có kết nối attention cao hơn. Công thức toàn bộ là
+
+O_i = ∑_{j=1}^N (ReLU(Q_i) ⊙ ReLU(K_j)^T cos(2πij/N))V_j: (3)
+
+Ở đây để đơn giản, chúng tôi bỏ qua số hạng chuẩn hóa. Phương trình 3 có thể được viết lại dưới dạng tuyến tính trong Phương trình 2, và chúng tôi giới thiệu người đọc đến bài báo gốc [25] để biết thêm chi tiết.
+
+#### 3.1.2 RankNAS
+
+Các phương pháp NAS thông thường [14, 29, 38] phải đánh giá hiệu suất của mọi mạng ứng viên để xếp hạng, điều này tốn thời gian đặc biệt khi không gian tìm kiếm lớn. RankNAS được đề xuất gần đây [16] có thể hiệu quả giảm chi phí huấn luyện với ba điểm khác biệt sau:
+
+1. Xếp hạng theo cặp. Thay vì sắp xếp tất cả kiến trúc ứng viên, RankNAS coi NAS như một vấn đề xếp hạng theo cặp. Tức là, một phân loại nhị phân được tiến hành cho mỗi cặp ứng viên, và nhãn được đơn giản hóa thành "correctly ordered" hoặc "incorrectly ordered" theo hiệu suất ước tính của chúng.
+
+2. Cắt tỉa không gian tìm kiếm. RankNAS cắt tỉa không gian tìm kiếm bằng cách chỉ chứa các đặc trưng quan trọng nhất có tác động lớn đến hiệu suất.
+
+3. Tìm kiếm nhận biết phần cứng. Ngoài tìm kiếm tiêu chuẩn dựa trên losses, RankNAS cũng tận dụng ràng buộc phần cứng, tức là ước tính độ trễ và loại bỏ 10% mô hình nhanh nhất và chậm nhất.
+
+Xem xét hiệu quả tốt của RankNAS, chúng tôi lấy nó làm framework NAS của chúng tôi. Thêm chi tiết kỹ thuật có thể tìm thấy trong [16].
+
+### 3.2. RankNAS trên cosFormer
+
+#### 3.2.1 Không gian tìm kiếm
+
+Không gian tìm kiếm nguyên thủy của chúng tôi được áp dụng từ RankNAS, chứa các đặc trưng cơ bản bao gồm kích thước embedding, số lượng lớp encoder/decoder, số lượng heads, và chiều của mạng feed-forward (xem Hình 4). Chúng tôi cũng thực hiện sửa đổi tương ứng cho không gian theo từng tác vụ. Định nghĩa chi tiết được giới thiệu trong Phần 4.1.
+
+Embedding Size
+Layer Num
+Self-Attn Head Num
+Self-Attention Type
+FFN Dimension Embedding Size
+Layer Num
+Self-Attn Head Num
+Self-Attention Type
+FFN Dimension Cross-Attn Head Num
+Cross-Attention Type Encoder Decoder Hình 4. Không gian tìm kiếm trong bài báo này. Các khối màu xanh là đặc trưng nguyên thủy trong tìm kiếm Transformer, và các khối màu xám biểu thị tìm kiếm loại attention được đề xuất.
+
+#### 3.2.2 Các bước chính
+
+Chúng tôi thay thế tất cả Softmax bằng cosFormer attention, và theo RankNAS [16] cho quá trình tìm kiếm. Một supernet chứa tất cả các kiến trúc có thể được huấn luyện trước tiên. Sau đó, dữ liệu loss và latency được thu thập riêng biệt và xếp hạng. Dựa trên các ràng buộc loss và latency, các đặc trưng quan trọng nhất được lựa chọn, tức là cắt tỉa không gian tìm kiếm. Thuật toán tiến hóa được thực hiện trên không gian tìm kiếm được tinh chỉnh, và kiến trúc tối ưu được sắp xếp. Cuối cùng, chúng tôi huấn luyện lại mạng tối ưu từ đầu.
+
+#### 3.2.3 Thảo luận
+
+Để so sánh, chúng tôi cũng lặp lại các bước trên với Transformer tiêu chuẩn [35] chỉ với attention Softmax. Để đơn giản, chúng tôi ký hiệu kiến trúc tối ưu của cosFormer là "cosFormer*", và của Transformer là "Transformer*". Từ Hình 1, chúng tôi thấy rằng trên cả hai tác vụ, cosFormer* thể hiện hiệu quả tốt hơn Transformer* (FLOPS nhỏ hơn) với quy mô tham số có thể so sánh, nhưng độ chính xác tổng quát ít cạnh tranh hơn. Chúng tôi đặt tên cho hiện tượng này là sự mất cân bằng giữa độ chính xác và hiệu quả, điều này cũng đã được quan sát thấy trong các Transformers hiệu quả khác [8, 17, 18, 32, 37].
+
+Về mặt attention, lợi thế của Softmax về độ chính xác được liên kết với khả năng "áp đặt ràng buộc phân phối phân loại trên điểm liên quan query-context" [40]. Ràng buộc này có hai tính chất thiết yếu: (1) dense coverage, tức là chú ý đến mọi đặc trưng với query [35]; và (2) non-linear concentration, tức là trọng số lớn hơn chỉ được gán cho các đặc trưng liên quan hơn [2, 12, 25]. Mặc dù có các tính chất hữu ích, chúng ta cũng nên chú ý rằng hạn chế chính của Softmax là độ phức tạp tính toán cao, như đã phân tích trong Phần 3.1.
+
+Để giảm chi phí tính toán, Transformers hiệu quả hoặc làm thưa ma trận Softmax (dựa trên mẫu) hoặc thay thế nó bằng các hàm kernel khác (dựa trên kernel). Mặc dù các phương pháp dựa trên mẫu giữ lại công thức Softmax, chúng thường sử dụng các mẫu cố định, ít toàn diện, linh hoạt và mạnh mẽ hơn [40]. Các phương pháp kernel tính đến tất cả các đặc trưng, nhưng tính non-linear ít mạnh mẽ hơn trong việc tập trung các đặc trưng liên quan, ví dụ như cosFormer [25] tập trung nhiều hơn vào tính cục bộ để thông tin liên quan ở khoảng cách xa có thể không được tổng hợp tốt. Những xấp xỉ hiệu quả này không thể bao gồm đầy đủ hai tính chất nói trên của Softmax, vì vậy độ chính xác của chúng có thể bị ảnh hưởng tiêu cực. Chỉ một vài mô hình [25, 39, 40] đôi khi đạt được độ chính xác cải thiện so với Transformer [35] trên một số tác vụ hoặc thiết lập cụ thể, nhưng hiệu suất của chúng không nhất quán tốt hơn trong tất cả các trường hợp. Do đó, vẫn còn thách thức đối với Transformers hiệu quả để xấp xỉ Softmax hiệu quả và giảm sự mất cân bằng hiệu suất.
+
+### 3.3. Attention kết hợp như một đặc trưng tìm kiếm mới
+
+Xem xét rằng attention Softmax và linear attention có những khác biệt riêng nhưng không thể đồng thời cân bằng tốt độ chính xác và hiệu quả, chúng tôi đề xuất sử dụng hai loại attention theo cách kết hợp. Tức là, attention Softmax hoặc linear attention chỉ xuất hiện trong các lớp nhất định, và chúng tôi để mô hình tự động xác định vị trí lớp của chúng với NAS. Để đạt được điều này, chúng tôi định nghĩa một không gian tìm kiếm mới, tức là loại attention, bao gồm attention Softmax và linear attention (tức là cosFormer attention [25]). Chúng tôi lặp lại các bước chính sau khi kết hợp không gian tìm kiếm mới, và đặt tên kiến trúc tối ưu là "mFormer".
+
+Hình 1 chứng minh rằng mFormer có sự cân bằng tốt hơn giữa độ chính xác và hiệu quả trên cả tác vụ phân loại hình ảnh và dịch máy. Đánh giá chi tiết có thể tìm thấy trong phần tiếp theo.
+
+Cần lưu ý rằng trong NAS Transformer, việc định nghĩa một đặc trưng tìm kiếm mới thường yêu cầu áp đặt các ràng buộc bổ sung để ngăn nó khỏi đưa vào nội dung tìm kiếm dư thừa hoặc không liên quan [14, 29]. Ngược lại, tùy chọn attention của chúng tôi (chỉ chứa hai loại) có thể được nhúng trực tiếp vào không gian tìm kiếm mà không cần xem xét bất kỳ ràng buộc nào. Điều này có lợi cho việc triển khai và deployment thuận tiện.
+
+## 4. Thí nghiệm
+
+### 4.1. Cài đặt thí nghiệm
+
+#### 4.1.1 Bộ dữ liệu
+
+Dịch máy: Chúng tôi sử dụng bộ dữ liệu WMT'14 En-De [4] chứa 4.5M cặp câu. Việc chia training, validation và test giống hệt với [16, 36], tức là WMT'16 cho training, Newstest2013 cho validation, và Newstest2014 cho test. Phân loại hình ảnh: Chúng tôi tận dụng bộ dữ liệu CIFAR-10 [19], bao gồm 60K hình ảnh 32×32 trong 10 lớp. Chúng tôi sử dụng chia chính thức cho training (50K) và test (10K).
+
+#### 4.1.2 Định nghĩa không gian tìm kiếm
+
+Các đặc trưng nguyên thủy
+(từ RankNAS [16])
+Enc Layer Num 6
+Enc Emb Dim 768, 1024
+Enc FFN Dim 2048, 3072, 4096, 5120
+Enc Head Num 4, 8, 16
+Dec Layer Num 1, 2, 3, 4, 5, 6
+Dec Emb Dim 768, 1024
+Dec FFN Dim 2048, 3072, 4096, 5120
+Dec Head Num 4, 8, 16
+En-De Head Num 4, 8, 16
+En-De Connect 1, 2, 3
+
+Đặc trưng được đề xuất
+Enc Self-Attn Softmax, Linear
+Dec Self-Attn Softmax, Linear
+En-De Cross-Attn Softmax, Linear
+
+Bảng 1. Không gian tìm kiếm cho dịch WMT'14 En-De.
+
+Dịch máy: Không gian tìm kiếm cho WMT'14 En-De được áp dụng từ RankNAS [16], như được liệt kê trong Bảng 1. Số lượng lớp encoder được đặt là 6, phù hợp với [16, 36]. "En-De Connect" đại diện cho số lượng lớp encoder được chú ý đến decoder, ví dụ 2 có nghĩa là hai lớp encoder cuối cùng được liên quan đến việc tính encoder-decoder cross-attention. Tìm kiếm attention được đề xuất bao gồm attention Softmax và linear attention (tức là cosFormer attention [25]). Lưu ý rằng trong thực tế, chúng tôi không bao gồm tìm kiếm loại attention trong decoder self-attention và encoder-decoder cross-attention. Điều này là do chúng tôi thực nghiệm thấy rằng việc sử dụng linear attention vào các lớp decoder sẽ dẫn đến hội tụ không phù hợp và hiệu suất kém*.
+
+Các đặc trưng nguyên thủy
+(từ [6])
+Enc Layer Num 12, 13, 14
+Enc Emb Dim 320. 384, 448
+Enc FFN Dim 672, 896, 1344, 1568, 1792
+Enc Head Num 5, 6, 7
+
+Đặc trưng được đề xuất
+Enc Self-Attn Softmax, Linear
+
+Bảng 2. Không gian tìm kiếm cho phân loại CIFAR-10.
+
+Phân loại hình ảnh: Đối với CIFAR-10, chúng tôi theo thiết lập trong [6], tức là chỉ sử dụng phần encoder và xây dựng không gian tìm kiếm nguyên thủy trong Bảng 2.
+
+#### 4.1.3 Cấu hình huấn luyện
+
+Chúng tôi thực hiện tất cả thí nghiệm trên card GPU A100 với cùng số bước huấn luyện như RankNAS [16]. Trên tác vụ phân loại hình ảnh, các hình ảnh CIFAR-10 trước tiên được lấy mẫu xuống với các lớp convolutional thành 14×14, và sau đó được làm phẳng thành vector 1D với 256 phần tử [6]. Vector này là đầu vào cho Transformer.
+
+#### 4.1.4 Chỉ số đánh giá
+
+Đối với hiệu quả trong cả hai tác vụ, chúng tôi tính FLOPS (floating point operations per second). Đối với độ chính xác, chúng tôi đo BLEU (bilingual evaluation understudy) cho dịch với beam 4 và length penalty 0.6. Mô hình được kiểm tra với trung bình mười checkpoint cuối cùng. Độ chính xác của CIFAR-10 được đánh giá bằng cách tính phần trăm hình ảnh được phân loại chính xác. Cả hai chỉ số đều được triển khai với mã nguồn trong [16] và đo trên card Nvidia Tesla A100.
+
+*Chúng tôi giới thiệu người đọc đến tài liệu bổ sung để biết thêm chi tiết.
+
+### 4.2. So sánh kiến trúc tối ưu trong dịch máy
+
+Từ Bảng 5, các kiến trúc được tìm kiếm của cosFormer* và Transformer* hiệu quả hơn trong khi giữ độ chính xác có thể so sánh với các mô hình vanilla. Nó xác thực hiệu quả của NAS. Chúng tôi so sánh các kiến trúc tối ưu dưới đây chi tiết.
+
+#### 4.2.1 Cấu trúc mạng
+
+Kiến trúc tối ưu được tìm kiếm của cosFormer [25] được minh họa trong Bảng 3. Để so sánh, chúng tôi cũng báo cáo kết quả tìm kiếm của Transformer [35]. Mặc dù có kích thước embedding giống hệt nhau trong cả encoder và decoder, cosFormer* có cấu trúc nhẹ hơn, ví dụ như ít lớp decoder hơn, chiều FFN encoder nhỏ hơn và số head decoder ít hơn. Nó ngụ ý rằng cấu trúc tối ưu của cosFormer* có xu hướng "shallow và thin".
+
+Chiều FFN. Hình 5(a) và (c) hiển thị các chiều FFN trong encoder và decoder tương ứng. Chúng tôi vẽ các đường cong xu hướng với hàm polynomial fitting để hình dung tốt hơn các thay đổi. Chiều FFN tổng thể của cosFormer* nhỏ hơn Transformer*. Cụ thể hơn, các chiều lớn hơn được yêu cầu trong các lớp trên của encoder trong cosFormer*. Cả cosFormer* và Transformer* đều có xu hướng có chiều nhỏ hơn trong các lớp cuối của decoder.
+
+Số head. Chúng tôi vẽ số head trong Hình 5(b)(d)(e). Nhìn chung, cosFormer* yêu cầu số lượng head nhỏ hơn.
+
+En-De Connect. Từ Hình 5(f), chúng tôi quan sát thấy rằng decoder trong cả hai mô hình chỉ chú ý đến lớp cuối cùng của encoder, tức là thu được thông tin cross chỉ từ khối encoder cuối cùng.
+
+Tham số. cosFormer* có ít hơn 12.6M tham số so với Transformer*.
+
+#### 4.2.2 Độ chính xác
+
+Trên tập test WMT'14 En-De, cosFormer* thể hiện BLEU cực kỳ kém†. Nó phản ánh hạn chế của linear attention trong việc đạt được độ chính xác có thể so sánh với Transformer.
+
+Chúng tôi cũng điều tra tầm quan trọng của mỗi đặc trưng đối với độ chính xác, được đo bởi RankNAS [16]. Top-5 đặc trưng được xếp hạng là:
+
+• cosFormer*: En-De Connect, Dec Layer Num, En-De Head Num, Dec FFN Dim, Dec Head Num.
+
+Transformer*  cosFormer*  mFormer (của chúng tôi)
+Kiến trúc được tìm kiếm
+Enc Layer Num 3 6 6
+Enc Emb Dim 1024 1024 1024
+Enc FFN Dim AVG 3925 3413 3072
+Enc Head Num AVG 8 8 10.67
+Dec Layer Num 3 2 2
+Dec Emb Dim 1024 1024 1024
+Dec FFN Dim AVG 3755 4096 3584
+Dec Head Num AVG 13 10 16
+En-De Head Num AVG 13 6 4
+En-De Connect AVG 1 1 1
+
+Kết quả tìm kiếm
+#Parameters (M) 92.38 79.98 75.59
+FLOPS (G) 9.86 8.32 8.08
+BLEU 28.34 3.05 25.79
+
+Bảng 3. Kiến trúc được tìm kiếm và kết quả trên dịch máy. "AVG" có nghĩa là giá trị trung bình.
+
+(a) Chiều FFN encoder (b) Số head encoder
+(c) Chiều FFN decoder (d) Số head decoder
+(e) Số head En-De (f) En-De Connect
+
+15002500350045005500
+1 2_m 3 4_m 5 6FFN Dim
+Encoder Layer Transformer* cosFormer* mFormer
+
+271217
+1 2_m 3 4_m 5 6Head Num
+Encoder Layer Transformer* cosFormer* mFormer
+
+15002500350045005500
+1 2 3FFN Dim
+Decoder Layer Transformer* cosFormer* mFormer
+
+271217
+1 2 3Head Num
+Decoder Layer Transformer* cosFormer* mFormer
+
+271217
+1 2 3En-De Head Num
+Decoder Layer Transformer* cosFormer* mFormer
+
+0.511.5
+1 2 3En-De Connect
+Decoder Layer Transformer* cosFormer* mFormer
+
+Hình 5. Các đặc trưng được tìm kiếm chi tiết trên WMT'14 En-De. Các lớp với linear attention được thêm hậu tố "_m". Các đường đứt nét phản ánh xu hướng thay đổi.
+
+• Transformer*: Dec Layer Num, En-De Head Num, Dec FFN Dim, Dec Head Num, Enc FFN Dim.
+
+Do đó, khi thiết kế kiến trúc cho Transformer hiệu quả, chúng ta cần tập trung nhiều hơn vào tương tác encoder-decoder, ví dụ như số lượng lớp encoder để chú ý và các head cross-attention. Cả cosFormer* và Transformer* cũng nhạy cảm với số lớp decoder, nhưng hiệu suất tốt nhất không nhất thiết cần số lượng lớp lớn nhất.
+
+†Nó có hội tụ không phù hợp, và chúng tôi đang liên lạc với các tác giả của [25] để xử lý vấn đề này.
+
+#### 4.2.3 Hiệu quả
+
+Rõ ràng, cosFormer* hiệu quả hơn, tức là FLOPS của nó là 8.32G trong khi của Transformer* là 9.86G. Sự khác biệt này chủ yếu do cấu trúc tối ưu phức tạp hơn của Transformer*. Attention Softmax cũng tăng chi phí tính toán, điều này sẽ được chi tiết trong Phần 4.5.
+
+Top-5 đặc trưng được xếp hạng về hiệu quả là:
+
+• cosFormer*: Dec Layer Num, En-De Head Num, En-De Connect, Enc FFN Dim, Dec Head Num.
+
+• Transformer*: Dec Layer Num, Dec Head Num, Enc Head Num, Enc FFN Dim, Dec FFN Dim.
+
+Rõ ràng rằng số lượng lớp decoder có tác động lớn nhất đến hiệu quả. Đối với Transformer hiệu quả, tương tác encoder-decoder cũng đóng vai trò thiết yếu trong việc xác định chi phí tính toán. Ngược lại, hiệu quả của Transformer* ít nhạy cảm hơn với tương tác cross.
+
+#### 4.2.4 Tóm tắt
+
+Chúng tôi tóm tắt các gợi ý thực nghiệm để thiết kế kiến trúc phù hợp cho Transformer hiệu quả trong dịch máy: (1) Ít lớp decoder hơn; (2) Tập trung nhiều hơn vào tương tác encoder-decoder. Các lớp encoder để chú ý và số lượng head encoder-decoder không nhất thiết phải quá lớn; (3) Chiều FFN encoder quan trọng hơn đối với hiệu quả trong khi chiều FFN decoder quan trọng hơn đối với độ chính xác.
+
+### 4.3. So sánh kiến trúc tối ưu trong phân loại hình ảnh
+
+Các cấu trúc tối ưu của cosFormer* và Transformer* vượt trội đáng kể so với các phiên bản vanilla của chúng về độ chính xác (xem Bảng 5), điều này tiếp tục xác minh sự cần thiết và hữu ích của NAS. FLOPS lớn hơn vì các mô hình vanilla chỉ có 6 lớp encoder. Chúng tôi so sánh các cấu trúc tối ưu dưới đây.
+
+#### 4.3.1 Cấu trúc mạng
+
+Bảng 4 hiển thị các kiến trúc tối ưu của cosFormer [25] và Transformer [35]. Rõ ràng, Transformer* có nhiều lớp hơn, kích thước embedding nhỏ hơn, và chiều FFN trung bình nhỏ hơn so với cosFormer*. Từ góc độ chung, cosFormer* thích cấu trúc "shallow và wide" trong khi kiến trúc tối ưu của Transformer* có xu hướng "deep và thin".
+
+Transformer*  cosFormer*  mFormer (của chúng tôi)
+Kiến trúc được tìm kiếm
+Enc Layer Num 14 12 12
+Enc Emb Dim 384 448 384
+Enc FFN Dim AVG 1328 1419 1232
+Enc Head Num AVG 6.86 6.25 6.33
+
+Kết quả tìm kiếm
+#Parameters (M) 24.26 24.31 19.31
+FLOPS (G) 10.90 9.55 8.39
+Accuracy (%) 95.10 88.40 93.59
+
+Bảng 4. So sánh kiến trúc tối ưu và hiệu suất trên phân loại hình ảnh CIFAR-10. "AVG" có nghĩa là giá trị trung bình.
+
+60011001600
+1 2 3_m 4 5 6 7_m 8 9 10 11_m 12 13 14FFN Dim
+Encoder Layer Transformer* cosFormer* mFormer*
+
+45678
+1 2 3_m 4 5 6 7_m 8 9 10 11_m 12 13 14Head Num
+Encoder Layer Transformer* cosFormer* mFormer*
+
+(a) Chiều FFN (b) Số head
+
+Hình 6. Các đặc trưng được tìm kiếm chi tiết trong phân loại hình ảnh. Các lớp với linear attention được thêm hậu tố "_m". Các đường đứt nét phản ánh xu hướng thay đổi.
+
+Chiều FFN. Hình 6(a) hiển thị các chiều FFN trong các lớp khác nhau. Từ đường cong xu hướng, chúng tôi quan sát thấy rằng cosFormer* có chiều FFN tương đối nhỏ hơn trong các lớp trung gian. Khác biệt, chiều nhỏ hơn ở các lớp đầu trong Transformer*.
+
+Số head. Số lượng head trong các lớp encoder được vẽ trong Hình 6(b). cosFormer* thường có nhiều head hơn trong các lớp đầu và trên. Ngược lại, số head trong Transformer* không thay đổi quá nhiều và giá trị của chúng lớn.
+
+Tham số. cosFormer* và Transformer* có quy mô tham số tương tự, tức là ~24M.
+
+#### 4.3.2 Độ chính xác
+
+Trên tập test CIFAR-10, cosFormer* đạt được độ chính xác 88.4%, bị vượt qua bởi Transformer* (95.10%) khoảng 7.6%.
+
+Theo tầm quan trọng đối với độ chính xác, các đặc trưng được xếp hạng bởi RankNAS [16] là:
+
+• cosFormer*: Layer Num, FFN Dim, Emb Dim, Head Num.
+
+• Transformer*: FFN Dim, Head Num, Emb Dim, Layer Num.
+
+Rõ ràng, số lượng lớp có tác động lớn nhất đến độ chính xác của cosFormer*. Tương tự như trường hợp trong dịch máy, cosFormer* không chọn số lượng lớp lớn nhất.
+
+#### 4.3.3 Hiệu quả
+
+FLOPS của cosFormer* là 7.01G, tốt hơn đáng kể so với Transformer* (10.9G) 36%. Nó tiết lộ lợi thế của linear attention của cosFormer* về hiệu quả. Các đặc trưng quan trọng liên quan đến hiệu quả là:
+
+• cosFormer*: Layer Num, Emb Dim, Head Num, FFN Dim.
+
+• Transformer*: Layer Num, FFN Dim, Head Num, Emb Dim.
+
+Tương tự như kết luận trong dịch máy, số lượng lớp trong phân loại hình ảnh cũng liên quan nhiều nhất đến hiệu quả. Mô hình hiệu quả ưu tiên sử dụng ít lớp hơn, điều này tiếp tục giảm gánh nặng tính toán.
+
+#### 4.3.4 Tóm tắt
+
+Chúng tôi đưa ra tóm tắt ngắn gọn về cách thiết kế phù hợp Transformer hiệu quả trong phân loại hình ảnh: (1) Ít lớp hơn; (2) Chiều FFN nhỏ hơn trong các lớp trung gian với kích thước embedding hơi lớn hơn; (3) Số head nhỏ hơn trong các lớp trung gian.
+
+### 4.4. Kết quả của chúng tôi sử dụng attention kết hợp
+
+#### 4.4.1 Dịch máy
+
+Bảng 3 hiển thị cấu trúc tối ưu và hiệu suất của mFormer của chúng tôi. Nhìn chung, mFormer "shallow và thin", có ít tham số nhất và FLOPS nhỏ nhất trong ba mô hình tối ưu. Linear attention tồn tại trong Lớp 2 và 4 trong encoder, và tất cả các lớp encoder/decoder khác giữ lại attention Softmax.
+
+Trong mFormer, các chiều FFN trong encoder trải qua thay đổi "up-and-down", tức là các lớp đầu dựa vào kích thước FFN nhỏ hơn. Số lượng head trong encoder có xu hướng nhỏ hơn trong các lớp trung gian. Các đặc trưng chính trong decoder của mFormer nhất quán có số lượng không lớn hơn hai cái khác, ngoại trừ số head trong lớp decoder đầu tiên lớn hơn của cosFormer*.
+
+Về mặt hiệu suất, mFormer đạt được BLEU có thể so sánh với Transformer* với ít hơn 18% tham số và FLOPS nhỏ hơn 18%. Nó cũng vượt trội đáng kể so với cosFormer* về độ chính xác với hiệu quả hơi tốt hơn. Kết quả cho thấy rằng việc sử dụng kết hợp attention có thể hiệu quả tạo điều kiện giảm sự mất cân bằng giữa độ chính xác và hiệu quả.
+
+#### 4.4.2 Phân loại hình ảnh
+
+Chúng tôi hiển thị kiến trúc tối ưu của mFormer được đề xuất trong Bảng 4. Trực quan, cấu trúc của chúng tôi "shallow và thin", phù hợp với quan sát trong dịch máy. Điều này cũng được phản ánh bởi quy mô tham số, tức là chúng tôi có khoảng 20% ít tham số hơn hai cái khác. Linear attention tồn tại trong Lớp 3, 7 và 11 (chiếm 25%), và các loại attention còn lại trong các lớp khác đều là Softmax. Các chiều FFN lớn trong các lớp đầu, và có xu hướng "down-up-down" trong các lớp tiếp theo. Các thay đổi của số head dường như tỷ lệ nghịch với chiều FFN, tức là chiều FFN lớn hơn thường tương ứng với số head nhỏ hơn.
+
+Đáng chú ý, mFormer vượt trội hơn cosFormer* một khoảng lớn về độ chính xác (5.19 phần trăm) trong khi duy trì hiệu quả tốt, tức là nó chỉ có nhiều hơn 1.38G FLOPS so với cosFormer*. Hơn nữa, nó đạt được hiệu suất có thể so sánh với Transformer* về độ chính xác (cái sau chỉ vượt qua chúng tôi 1.51 phần trăm) nhưng hiệu quả hơn đáng kể (FLOPS của chúng tôi nhỏ hơn Transformer* 2.51G, tức là 23%). Nó chứng minh rằng việc sử dụng attention kết hợp có thể đạt được sự cân bằng tốt hơn giữa độ chính xác và hiệu quả trên tác vụ phân loại hình ảnh.
+
+### 4.5. Nghiên cứu loại bỏ về các loại attention
+
+Vì tìm kiếm attention được giới thiệu mới trong framework NAS, chúng tôi nghiên cứu đặc biệt ảnh hưởng của mỗi loại attention trong các kiến trúc tối ưu. Điều này để xác thực (1) hiệu quả của attention kết hợp được đề xuất trong việc cân bằng độ chính xác và hiệu quả, và (2) sự khác biệt vốn có giữa attention Softmax và linear trong hiệu suất. Kết quả trên dịch máy và phân loại hình ảnh được báo cáo trong Bảng 5.
+
+#### 4.5.1 Tất cả attention Softmax
+
+Trước tiên chúng tôi thống nhất attention kết hợp và linear attention trong các kiến trúc tối ưu của mFormer và cosFormer* với Softmax. Đối với mFormer của chúng tôi, độ chính xác được cải thiện nhẹ nhưng FLOPS trở nên lớn hơn, cho thấy rằng độ chính xác tốt hơn luôn đi kèm với hy sinh hiệu quả. Sự mất cân bằng hiệu suất này rõ ràng hơn khi chúng tôi thay thế tất cả linear attention trong cosFormer* bằng Softmax, trong đó độ chính xác được tăng cường đáng kể với hiệu quả tính toán bị suy giảm nhiều. Đáng chú ý, mô hình của chúng tôi có thể đạt được độ chính xác có thể so sánh với hiệu suất với tất cả Softmax và duy trì hiệu quả thỏa đáng mà không giảm quá nhiều.
+
+#### 4.5.2 Tất cả linear attention
+
+Trong bước này, chúng tôi thay thế attention kết hợp trong mFormer và attention Softmax trong Transformer* đồng nhất với linear attention. Chúng tôi nhận thấy giảm hiệu suất đáng kể về độ chính xác trên cả hai tác vụ. Nó chứng minh khả năng ít cạnh tranh hơn của linear attention trong việc tạo ra kết quả chính xác. Tuy nhiên, sau khi thay thế, tăng hiệu quả đáng kể, điều này tiếp tục cho thấy lợi thế của Transformer hiệu quả trong việc giảm chi phí tính toán. Việc sử dụng kết hợp attention có lợi cho việc đạt được cả độ chính xác và hiệu quả có thể so sánh.
+
+#Parameters (M) FLOPS (G) BLEU/Accuracy (%)
+Dịch máy
+mFormer 75.59 8.085 25.79
+mFormer (all linear) 75.59 8.081 3.53
+mFormer (all Softmax) 75.59 8.09 27.95
+Vanilla cosFormer [25] 213.00 13.39 Null
+cosFormer* 79.78 8.32 3.05
+cosFormer* (all Softmax) 79.78 8.34 27.83
+Vanilla Transformer [35] 213.00 12.7 28.4
+Transformer* 92.38 9.86 28.34
+Transformer* (all linear) 92.38 9.84 3.47
+
+Phân loại hình ảnh
+mFormer 19.31 8.39 93.59
+mFormer (all linear) 19.23 7.55 83.49
+mFormer (all Softmax) 19.33 8.67 94.35
+Vanilla cosFormer [25] 19.34 7.60 87.13
+cosFormer* 24.31 9.55 88.40
+cosFormer* (all Softmax) 24.42 10.66 94.80
+Vanilla Transformer [35] 19.31 8.07 88.70
+Transformer* 24.26 10.90 95.10
+Transformer* (all linear) 24.14 9.48 81.82
+
+Bảng 5. Nghiên cứu loại bỏ về các loại attention.
+
+## 5. Kết luận
+
+Trong bài báo này, chúng tôi sử dụng NAS để tìm kiến trúc tối ưu của Transformers hiệu quả (tức là cosFormer [25]). Các kiến trúc được tìm kiếm tiết lộ rằng các cấu trúc tối ưu của Transformer hiệu quả tương đối nhẹ hơn so với Transformer tiêu chuẩn, ví dụ như quy mô tham số giảm và FLOPS được cải thiện. Điều này cung cấp những hiểu biết hữu ích cho cộng đồng về thiết kế phù hợp của Transformers hiệu quả. Tuy nhiên, độ chính xác tổng quát của các mô hình hiệu quả ít cạnh tranh hơn. Dựa trên quan sát này, chúng tôi đề xuất một cách sử dụng attention mới, tức là sử dụng linear attention và Softmax theo cách kết hợp trong mỗi lớp. Kiến trúc tối ưu được tìm kiếm thể hiện độ chính xác có thể so sánh với Transformer và duy trì hiệu quả tốt như Transformer hiệu quả. Phương pháp được đề xuất cung cấp một hướng mới trong nghiên cứu Transformer, tức là tận dụng cả attention Softmax và linear. Trong công việc tương lai của chúng tôi, chúng tôi sẽ nghiên cứu attention kết hợp trên các mô hình pretrain quy mô lớn cũng như các tác vụ downstream khác.
+
+## Tài liệu tham khảo
+
+[1] Abien Fred Agarap. Deep learning using rectified linear units (relu). arXiv preprint arXiv:1803.08375, 2018. 3, 4
+
+[2] Titsias RC AUEB et al. One-vs-each approximation to softmax for scalable estimation of probabilities. Advances in Neural Information Processing Systems, 29, 2016. 4, 5
+
+[3] Iz Beltagy, Matthew E Peters, and Arman Cohan. Longformer: The long-document transformer. arXiv preprint arXiv:2004.05150, 2020. 3
+
+[4] Ondřej Bojar, Christian Buck, Christian Federmann, Barry Haddow, Philipp Koehn, Johannes Leveling, Christof Monz, Pavel Pecina, Matt Post, Herve Saint-Amand, et al. Findings of the 2014 workshop on statistical machine translation. In Proceedings of the ninth workshop on statistical machine translation, pages 12–58, 2014. 2, 6
+
+[5] Boyu Chen, Peixia Li, Chuming Li, Baopu Li, Lei Bai, Chen Lin, Ming Sun, Junjie Yan, and Wanli Ouyang. Glit: Neural architecture search for global and local image transformer. In Proceedings of the IEEE/CVF International Conference on Computer Vision, pages 12–21, 2021. 2, 3
+
+[6] Minghao Chen, Houwen Peng, Jianlong Fu, and Haibin Ling. Autoformer: Searching transformers for visual recognition. In Proceedings of the IEEE/CVF International Conference on Computer Vision, pages 12270–12280, 2021. 2, 3, 5, 6
+
+[7] Rewon Child, Scott Gray, Alec Radford, and Ilya Sutskever. Generating long sequences with sparse transformers. arXiv preprint arXiv:1904.10509, 2019. 2, 3
+
+[8] Krzysztof Choromanski, Valerii Likhosherstov, David Dohan, Xingyou Song, Andreea Gane, Tamas Sarlos, Peter Hawkins, Jared Davis, David Belanger, Lucy Colwell, et al. Masked language modeling for proteins via linearly scalable long-context transformers. arXiv preprint arXiv:2006.03555, 2020. 2, 3, 5
+
+[9] Krzysztof Choromanski, Valerii Likhosherstov, David Dohan, Xingyou Song, Andreea Gane, Tamas Sarlos, Peter Hawkins, Jared Davis, Afroz Mohiuddin, Lukasz Kaiser, et al. Rethinking attention with performers. arXiv preprint arXiv:2009.14794, 2020. 3
+
+[10] Mingyu Ding, Xiaochen Lian, Linjie Yang, Peng Wang, Xiaojie Jin, Zhiwu Lu, and Ping Luo. Hr-nas: searching efficient high-resolution neural architectures with lightweight transformers. In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition, pages 2982–2992, 2021. 2, 3
+
+[11] Thomas Elsken, Jan Hendrik Metzen, and Frank Hutter. Neural architecture search: A survey. The Journal of Machine Learning Research, 20(1):1997–2017, 2019. 2, 3
+
+[12] Bolin Gao and Lacra Pavel. On the properties of the softmax function with application in game theory and reinforcement learning. arXiv preprint arXiv:1704.00805, 2017. 4, 5
+
+[13] Chengyue Gong, Dilin Wang, Meng Li, Xinlei Chen, Zhicheng Yan, Yuandong Tian, Vikas Chandra, et al. Nasvit: Neural architecture search for efficient vision transformers with gradient conflict aware supernet training. In International Conference on Learning Representations, 2021. 2, 3
+
+[14] Chaoyu Guan, Xin Wang, and Wenwu Zhu. Autoattend: Automated attention representation search. In International Conference on Machine Learning, pages 3864–3874. PMLR, 2021. 1, 2, 3, 4, 5
+
+[15] Jonathan Ho, Nal Kalchbrenner, Dirk Weissenborn, and Tim Salimans. Axial attention in multidimensional transformers. arXiv preprint arXiv:1912.12180, 2019. 2, 3
+
+[16] Chi Hu, Chenglong Wang, Xiangnan Ma, Xia Meng, Yinqiao Li, Tong Xiao, Jingbo Zhu, and Changliang Li. RankNAS: Efficient neural architecture search by pairwise ranking. In Proceedings of the 2021 Conference on Empirical Methods in Natural Language Processing, pages 2469–2480, Online and Punta Cana, Dominican Republic, Nov. 2021. Association for Computational Linguistics. 2, 3, 4, 5, 6, 8, 13
+
+[17] Angelos Katharopoulos, Apoorv Vyas, Nikolaos Pappas, and François Fleuret. Transformers are rnns: Fast autoregressive transformers with linear attention. In International Conference on Machine Learning, pages 5156–5165. PMLR, 2020. 1, 2, 3, 4, 5
+
+[18] Nikita Kitaev, Lukasz Kaiser, and Anselm Levskaya. Reformer: The efficient transformer. In International Conference on Learning Representations, 2020. 2, 3, 5
+
+[19] Alex Krizhevsky, Geoffrey Hinton, et al. Learning multiple layers of features from tiny images. 2009. 2, 6
+
+[20] Juho Lee, Yoonho Lee, Jungtaek Kim, Adam Kosiorek, Seungjin Choi, and Yee Whye Teh. Set transformer: A framework for attention-based permutation-invariant neural networks. In International Conference on Machine Learning, pages 3744–3753. PMLR, 2019. 1
+
+[21] Hanxiao Liu, Karen Simonyan, and Yiming Yang. Darts: Differentiable architecture search. arXiv preprint arXiv:1806.09055, 2018. 3
+
+[22] Peter J Liu, Mohammad Saleh, Etienne Pot, Ben Goodrich, Ryan Sepassi, Lukasz Kaiser, and Noam Shazeer. Generating wikipedia by summarizing long sequences. arXiv preprint arXiv:1801.10198, 2018. 3
+
+[23] Yuqiao Liu, Yanan Sun, Bing Xue, Mengjie Zhang, Gary G Yen, and Kay Chen Tan. A survey on evolutionary neural architecture search. IEEE transactions on neural networks and learning systems, 2021. 2, 3
+
+[24] Hao Peng, Nikolaos Pappas, Dani Yogatama, Roy Schwartz, Noah Smith, and Lingpeng Kong. Random feature attention. In International Conference on Learning Representations, 2021. 3
+
+[25] Zhen Qin, Weixuan Sun, Hui Deng, Dongxu Li, Yunshen Wei, Baohong Lv, Junjie Yan, Lingpeng Kong, and Yiran Zhong. cosformer: Rethinking softmax in attention. In International Conference on Learning Representations, 2022. 1, 2, 3, 4, 5, 6, 8, 9, 10, 13
+
+[26] Jiezhong Qiu, Hao Ma, Omer Levy, Scott Wen-tau Yih, Sinong Wang, and Jie Tang. Blockwise self-attention for long document understanding. arXiv preprint arXiv:1911.02972, 2019. 2, 3
+
+[27] Esteban Real, Alok Aggarwal, Yanping Huang, and Quoc V Le. Regularized evolution for image classifier architecture search. In Proceedings of the aaai conference on artificial intelligence, volume 33, pages 4780–4789, 2019. 2, 3
+
+[28] Aurko Roy, Mohammad Saffar, Ashish Vaswani, and David Grangier. Efficient content-based sparse attention with routing transformers. Transactions of the Association for Computational Linguistics, 9:53–68, 2021. 3
+
+[29] David So, Quoc Le, and Chen Liang. The evolved transformer. In International Conference on Machine Learning, pages 5877–5886. PMLR, 2019. 2, 3, 4, 5
+
+[30] David R So, Wojciech Mańke, Hanxiao Liu, Zihang Dai, Noam Shazeer, and Quoc V Le. Primer: Searching for efficient transformers for language modeling. arXiv preprint arXiv:2109.08668, 2021. 3
+
+[31] Weixuan Sun, Zhen Qin, Hui Deng, Jianyuan Wang, Yi Zhang, Kaihao Zhang, Nick Barnes, Stan Birchfield, Lingpeng Kong, and Yiran Zhong. Vicinity vision transformer. arXiv preprint arXiv:2206.10552, 2022. 1
+
+[32] Yi Tay, Dara Bahri, Liu Yang, Donald Metzler, and Da-Cheng Juan. Sparse sinkhorn attention. In International Conference on Machine Learning, pages 9438–9447. PMLR, 2020. 2, 3, 5
+
+[33] Yi Tay, Mostafa Dehghani, Dara Bahri, and Donald Metzler. Efficient transformers: A survey. arXiv preprint arXiv:2009.06732, 2020. 2, 3
+
+[34] Henry Tsai, Jayden Ooi, Chun-Sung Ferng, Hyung Won Chung, and Jason Riesa. Finding fast transformers: One-shot neural architecture search by component composition. arXiv preprint arXiv:2008.06808, 2020. 3
+
+[35] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Łukasz Kaiser, and Illia Polosukhin. Attention is all you need. Advances in neural information processing systems, 30, 2017. 1, 2, 4, 5, 6, 8, 9
+
+[36] Hanrui Wang, Zhanghao Wu, Zhijian Liu, Han Cai, Ligeng Zhu, Chuang Gan, and Song Han. Hat: Hardware-aware transformers for efficient natural language processing. In Annual Conference of the Association for Computational Linguistics, 2020. 2, 3, 6
+
+[37] Sinong Wang, Belinda Z Li, Madian Khabsa, Han Fang, and Hao Ma. Linformer: Self-attention with linear complexity. arXiv preprint arXiv:2006.04768, 2020. 2, 3, 5
+
+[38] Yujing Wang, Yaming Yang, Yiren Chen, Jing Bai, Ce Zhang, Guinan Su, Xiaoyu Kou, Yunhai Tong, Mao Yang, and Lidong Zhou. Textnas: A neural architecture search space tailored for text representation. In Proceedings of the AAAI Conference on Artificial Intelligence, volume 34, pages 9242–9249, 2020. 2, 3, 4
+
+[39] Manzil Zaheer, Guru Guruganesh, Kumar Avinava Dubey, Joshua Ainslie, Chris Alberti, Santiago Ontanon, Philip Pham, Anirudh Ravula, Qifan Wang, Li Yang, et al. Big bird: Transformers for longer sequences. Advances in Neural Information Processing Systems, 33:17283–17297, 2020. 5
+
+[40] Biao Zhang, Ivan Titov, and Rico Sennrich. Sparse attention with linear units. arXiv preprint arXiv:2104.07012, 2021. 5
+
+[41] Yuekai Zhao, Li Dong, Yelong Shen, Zhihua Zhang, Furu Wei, and Weizhu Chen. Memory-efficient differentiable transformer architecture search. arXiv preprint arXiv:2105.14669, 2021. 3
+
+## Tài liệu Bổ sung
+
+### 6. Chi tiết Huấn luyện
+
+Chúng tôi chỉ định chi tiết huấn luyện của các tác vụ dịch máy và phân loại hình ảnh dưới đây. Đối với những cái không được liệt kê, chúng tôi sử dụng thiết lập mặc định trong RankNAS [16].
+
+#### 6.1. Dịch máy
+
+• max relative length: 8
+• optimizer: adam
+• adam betas: (0.9, 0.998)
+• weight decay: 0.1
+• max tokens: 4400
+• criterion: label smoothed cross entropy
+• label smoothing: 0.1
+• min learning rate: 10^-9
+• max update: 200000
+• warmup updates: 4000
+• lr scheduler: inverse sqrt
+• lr: 0.0007
+• warmup init lr: 10^-7
+• max lr: 1
+
+#### 6.2. Phân loại hình ảnh
+
+• max relative length: 14
+• optimizer: adam
+• adam betas: (0.9, 0.998)
+• weight decay: 0.05
+• max tokens: 100000
+• criterion: label smoothed cross entropy
+• label smoothing: 0.1
+• min learning rate: 10^-7
+• max update: 140000
+• max sentences: 64
+• warmup updates: 976
+• lr scheduler: cosine
+• lr: 10^-6
+• warmup init lr: 10^-6
+• max lr: 10^-3
+
+### 7. Tầm quan trọng Đặc trưng trong mFormer
+
+Với RankNAS [16], chúng tôi có thể biết tầm quan trọng của mỗi đặc trưng khi tìm kiếm mFormer được đề xuất.
+
+#### 7.1. Dịch máy
+
+Top 5 đặc trưng liên quan đến độ chính xác là: Dec Layer Num, En-De Head Num, En-De Head Num, Enc Attn Type, và Dec FFN Dim. Tương tự như Transformer*, đặc trưng quan trọng nhất là số lượng lớp decoder. Trong cấu trúc tối ưu của chúng tôi, con số này là 2, cho thấy rằng hiệu suất tốt nhất không nhất thiết cần nhiều lớp. Bên cạnh đó, tương tác encoder-decoder cũng có tác động lớn đến độ chính xác, đòi hỏi thiết kế cẩn thận. Loại attention được đề xuất cũng quan trọng, tiếp tục xác thực hiệu quả của tìm kiếm attention.
+
+Top 5 đặc trưng liên quan đến hiệu quả là: Dec Layer Num, Dec Head Num, En-De Connect, En-De Head Num, và Enc FFN Dim. Một lần nữa, số lượng lớp decoder có tác động lớn nhất đến hiệu quả. Lưu ý rằng loại attention được đề xuất không có mặt ở đây, điều này là do nó chỉ tồn tại trong encoders với 6 lớp và tăng hiệu quả do đó không rất lớn.
+
+#### 7.2. Phân loại hình ảnh
+
+Top 5 đặc trưng liên quan đến độ chính xác là: Enc Attn Type, Enc Layer Num, Enc FFN Dim, Enc Head Num, và Enc Embed Dim. Top 5 đặc trưng liên quan đến hiệu quả là: Enc Layer Num, Enc Attn Type, Enc Embed Dim, Enc Head Num, và Enc FFN Dim.
+
+Rõ ràng, trên tác vụ này, loại attention của chúng tôi đóng vai trò quan trọng trong cả độ chính xác và hiệu quả, điều này xác minh tốt hiệu quả của việc sử dụng kết hợp attention.
+
+### 8. Linear Attention trong Decoders
+
+Trên tác vụ dịch máy, khi chúng tôi đặt linear attention trong các lớp decoder, các giá trị BLEU đều là 0 (tương ứng với ba trường hợp: 1) chỉ decoder self attention, 2) chỉ encoder-decoder attention, và 3) cả hai). Chúng tôi cũng thấy rằng các câu đầu ra có vấn đề "repeater", tức là lặp lại một từ duy nhất nhiều lần. Chúng tôi chưa tìm ra lý do cụ thể cho vấn đề này, và chúng tôi đang liên lạc với các tác giả trong [25]. Chúng tôi suy luận rằng lý do tiềm năng là tính cục bộ trong cosFormer attention [25] có thể phù hợp hơn cho việc hợp nhất đặc trưng trong encoders.

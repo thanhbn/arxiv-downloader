@@ -1,0 +1,253 @@
+# Các mô hình ngôn ngữ attention tuyến tính đơn giản cân bằng sự đánh đổi recall-throughput
+
+Simran Arora* 1Sabri Eyuboglu* 1Michael Zhang* 1Aman Timalsina2Silas Alberti1Dylan Zinsley2
+James Zou1Atri Rudra2Christopher Ré1
+
+Tóm tắt
+
+Nghiên cứu gần đây đã chỉ ra rằng các mô hình ngôn ngữ dựa trên attention vượt trội trong khả năng recall, khả năng căn cứ các sinh ra vào các token đã thấy trước đó trong ngữ cảnh. Tuy nhiên, hiệu quả của các mô hình dựa trên attention bị nghẽn cổ chai trong quá trình suy luận bởi việc tiêu thụ bộ nhớ tích cực của KV-cache. Trong công trình này, chúng tôi khám phá liệu chúng ta có thể cải thiện hiệu quả mô hình ngôn ngữ (ví dụ bằng cách giảm tiêu thụ bộ nhớ) mà không ảnh hưởng đến recall. Bằng cách áp dụng thí nghiệm và lý thuyết cho một tập hợp rộng các kiến trúc, chúng tôi xác định một sự đánh đổi chính giữa kích thước trạng thái của mô hình và khả năng recall. Chúng tôi chỉ ra rằng các giải pháp thay thế hiệu quả cho attention (ví dụ H3, Mamba, RWKV) duy trì một trạng thái tái diễn có kích thước cố định, nhưng gặp khó khăn với recall. Chúng tôi đề xuất BASED một kiến trúc đơn giản kết hợp attention tuyến tính và attention cửa sổ trượt. Bằng cách thay đổi kích thước cửa sổ BASED và chiều feature của attention tuyến tính, chúng ta có thể điều chỉnh kích thước trạng thái và duyệt qua biên Pareto của đường cong đánh đổi recall-memory, khôi phục chất lượng đầy đủ của attention ở một đầu và kích thước trạng thái nhỏ của các lựa chọn thay thế attention ở đầu kia. Chúng tôi huấn luyện các mô hình ngôn ngữ lên đến 1.3b tham số và chỉ ra rằng BASED phù hợp với các mô hình sub-quadratic mạnh nhất (ví dụ Mamba) về perplexity và vượt trội hơn chúng trên các tác vụ thực tế đòi hỏi recall cao 10.36 điểm accuracy. Chúng tôi tiếp tục phát triển các thuật toán IO-aware cho phép BASED cung cấp throughput cao hơn 24× so với FlashAttention-2 khi sinh 1024 token sử dụng các mô hình 1.3b tham số. Nhìn chung, BASED mở rộng biên Pareto của không gian đánh đổi throughput-recall vượt ra ngoài các kiến trúc trước đó.
+
+*Đóng góp ngang nhau1Stanford University2University of Buffalo.
+Liên hệ với: Simran Arora <simarora@stanford.edu>,
+Sabri Eyuboglu <eyuboglu@stanford.edu>, Michael Zhang
+<mzhang20@stanford.edu>.
+
+Proceedings of the 2nd Efficient Systems for Foundation Models
+Workshop at the International Conference on Machine Learning
+(ICML), Vienna, Austria. PMLR 235, 2024. Copyright 2024 by
+the author(s).
+
+## 1. Giới thiệu
+
+Việc lựa chọn sequence mixer (ví dụ attention, convolution) trong một mô hình ngôn ngữ ảnh hưởng đến cả chất lượng và hiệu quả của nó (Arora et al., 2023a; Vaswani et al., 2017). Nghiên cứu trước đây chỉ ra rằng attention vượt trội trong recall, khả năng căn cứ các sinh ra vào các token đã thấy trước đó (Olsson et al., 2022; Arora et al., 2023a). Mặt khác, throughput của các mô hình dựa trên attention bị nghẽn cổ chai trong quá trình huấn luyện bởi độ phức tạp tính toán bậc hai và trong quá trình suy luận bởi việc tiêu thụ bộ nhớ tích cực. Câu hỏi tự nhiên là: liệu chúng ta có thể cải thiện tốc độ thực tế và việc sử dụng bộ nhớ của các mô hình ngôn ngữ mà không ảnh hưởng đến chất lượng?
+
+Gần đây, một số kiến trúc đã được đề xuất cho phép throughput cao hơn đáng kể trong khi cạnh tranh với attention về perplexity (Wang et al., 2022; Gu and Dao, 2023; Yang et al., 2023; Poli et al., 2023; Peng et al., 2023). Tuy nhiên, các metric thô như perplexity tổng thể có thể che giấu những khác biệt quan trọng trong chất lượng mô hình. Ví dụ, nghiên cứu gần đây chỉ ra rằng một lớp kiến trúc cụ thể, gated-convolutions, mặc dù có độ phức tạp scaling sub-quadratically theo độ dài sequence, nhưng về mặt tiệm cận kém hiệu quả hơn attention trong việc thực hiện recall (Arora et al., 2023a). Dựa trên phân tích này, chúng tôi đánh giá một lớp kiến trúc rộng hơn trên các tác vụ thực tế đòi hỏi recall cao và chỉ ra attention cải thiện so với một lựa chọn thay thế không có attention hiện đang phổ biến, Mamba, 32.2 điểm accuracy (Bảng 1).
+
+Được thúc đẩy bởi những quan sát này, chúng tôi khám phá biên Pareto của sự đánh đổi giữa các mô hình có recall cao và throughput cao. Chúng tôi đánh giá một loạt kiến trúc trên một tác vụ associative recall tổng hợp phổ biến (Arora et al., 2023a; Fu et al., 2023a; Olsson et al., 2022). Vì throughput sinh bị nghẽn cổ chai bởi tiêu thụ bộ nhớ, chúng tôi thay đổi các siêu tham số (ví dụ chiều mô hình) ảnh hưởng đến kích thước của trạng thái tái diễn trong quá trình sinh và chứng minh một sự đánh đổi cơ bản recall-memory áp dụng cho các lớp kiến trúc (Hình 2). Attention thực hiện associative recall hoàn hảo, nhưng trạng thái tái diễn (tức KV-cache) tăng tuyến tính theo độ dài sequence. Sliding window
+
+[Footnote 1: Ví dụ về các tác vụ đòi hỏi recall cao bao gồm trích xuất thông tin, đọc hiểu, tóm tắt và sinh code. Những tác vụ này đòi hỏi sử dụng thông tin trong ngữ cảnh (trái ngược với thông tin đã ghi nhớ) trong quá trình sinh.]
+
+attention (SWA) có thể giới hạn kích thước của trạng thái tái diễn với chi phí là recall tầm xa kém hơn (Jiang et al., 2023). Tuy nhiên, Mamba, một kiến trúc SSM được đề xuất gần đây mở rộng biên Pareto vượt ra ngoài SWA. Điều này đặt ra câu hỏi: liệu có những mô hình khác, có lẽ đơn giản hơn, cũng có thể mở rộng biên Pareto?
+
+Để giảm tiêu thụ bộ nhớ, chúng tôi xem xét sử dụng hai kỹ thuật đơn giản: SWA và linear attention xấp xỉ softmax. Kết quả của chúng tôi về language modeling (Bảng 1) và thí nghiệm recall tổng hợp (Hình 1, giữa) cho thấy không có primitive nào một mình đủ để điều hướng biên Pareto.
+
+1. Chúng tôi thấy rằng linear attention một mình gặp khó khăn trong việc giải quyết associative recall (Hình 1, giữa). Chúng tôi đưa ra giả thuyết rằng điều này là do linear attention thiếu độ chính xác để thực hiện các phép dịch chuyển và so sánh token cục bộ (Fu et al., 2023a; Arora et al., 2023a).
+
+2. Trong sliding window attention, phạm vi associative recall bị giới hạn bởi chiều rộng của các cửa sổ (Hình 1, giữa). Khi chúng ta tăng kích thước cửa sổ, trạng thái tái diễn tăng tuyến tính và có ảnh hưởng phi tuyến đến tốc độ trong quá trình huấn luyện và suy luận song song (Hình 1, trái).
+
+Chúng tôi kết hợp hai kỹ thuật này thành một kiến trúc duy nhất, mà chúng tôi gọi là BASED (Hình 1, phải). Chúng tôi thấy rằng SWA và linear attention bổ sung cho nhau, cho phép BASED mở rộng biên pareto của sự đánh đổi recall-memory (Hình 2). Chúng tôi nghi ngờ rằng (1) bộ nhớ tái diễn lớn của linear attention có thể giúp mô hình hóa các tương tác token tầm xa trong sequence và (2) SWA xử lý các phép dịch chuyển cục bộ chính xác cần thiết để thực hiện associative recall.
+
+Để làm cho BASED cạnh tranh với các mô hình attention SoTA (Dao, 2023) và tái diễn (Gu and Dao, 2023) theo các metric wall-clock và throughput, chúng tôi giới thiệu một số tối ưu hóa IO-aware.
+
+1. Mặc dù có lợi ích hiệu quả về mặt lý thuyết, các triển khai linear attention thường chậm hơn so với các triển khai attention được tối ưu hóa tốt (Dao et al., 2022). Để làm cho attention của chúng tôi cạnh tranh về thời gian wall-clock thực tế và sử dụng bộ nhớ, chúng tôi cung cấp các thuật toán CUDA hiệu quả phần cứng cho prefill sinh linear attention (Thuật toán 1) và decoding (Thuật toán 2).
+
+Trong BASED, chúng tôi chỉ ra rằng xấp xỉ Taylor bậc 2 của softmax như feature map của linear attention là hiệu quả phần cứng. Với độ dài sequence N và chiều head d, điều này một cách ngây thơ đòi hỏi độ phức tạp thời gian và không gian O(Nd³) (Zhang et al., 2024; Keles et al., 2023). So với baseline, thuật toán của chúng tôi giảm di chuyển dữ liệu từ HBM (bộ nhớ chậm truy cập) đến SRAM (bộ nhớ nhanh truy cập) O(Nd²) byte và từ SRAM đến register O(Nd³) byte (Mục 5).
+
+2. Sliding window attention khai thác tensor core, các đơn vị chuyên biệt trên GPU hiện đại để thực hiện phép nhân ma trận (GEMM). Trong khi các kiến trúc trước đây sử dụng kích thước cửa sổ lớn (ví dụ 4096 cho Mistral-7B (Jiang et al., 2023)), chúng tôi đề xuất sử dụng các cửa sổ nhỏ 64−128, được hướng dẫn bởi thuộc tính phần cứng. Kích thước cửa sổ 64−128 giữ cho tensor core hoạt động Hình 1 (trái).
+
+Trong thí nghiệm, chúng tôi chỉ ra rằng BASED cạnh tranh về chất lượng với các baseline Transformer++ mạnh (Touvron et al., 2023) và SoTA sub-quadratic trong các mô hình lên đến 1.3Bn tham số trên language modeling trên ngôn ngữ Pile, mô hình hóa DNA, và LM Eval Harness (Gao et al., 2023). Ngoài ra, BASED vượt trội hơn một kiến trúc sub-quadratic mạnh, Mamba, trên phần associative recall của Pile và trong các tác vụ downstream đòi hỏi recall cao 10.36 điểm accuracy. Về hiệu quả, BASED cho phép throughput cao hơn tới 24× so với triển khai FlashAttention-2 mạnh trên sinh. Code cho công trình này được cung cấp tại: https://github.com/HazyResearch/based.
+
+## 2. Kiến thức cơ bản và Công trình liên quan
+
+Chúng tôi thảo luận về công trình liên quan chính trong mục này và cung cấp thảo luận mở rộng trong Phụ lục A.
+
+**Attention** Primitive mô hình hóa ngôn ngữ de facto, softmax attention (Vaswani et al., 2017) nhận input x∈R^(N×d) có độ dài N và chiều head d, và tính toán output y∈R^(N×d) qua softmax trên các phép chiếu q,k,v = xW_q,xW_k,xW_v, tức là,
+
+y_i = (∑_{j=1}^i exp(q_i^T k_j/√d)v_j) / (∑_{m=1}^i exp(q_i^T k_m/√d))     (1)
+
+trong trường hợp nhân quả với W_q,W_k,W_v∈R^(d×d) là các ma trận có thể học. Trong khi hiệu quả trong recall (Arora et al., 2023a) và hiệu quả để huấn luyện (Eq 1 có thể song song hóa trên GPU và O(N) trong bộ nhớ với những tiến bộ gần đây (Dao et al., 2022)), attention vẫn đắt cho sinh. Với mỗi output mới y_n, chúng ta cần nd phép toán trên một KV-cache đang tăng của {k_i,v_i}_{i=1}^{n-1} trước đó. Điều này dẫn đến tiêu thụ bộ nhớ lớn hơn và throughput thấp hơn cho các sequence dài hơn.
+
+**Efficient attention** Nhiều công trình do đó cố gắng cải thiện hiệu quả của attention mà không hy sinh chất lượng. Sparse attention giảm yêu cầu thời gian và bộ nhớ của attention bằng cách chỉ attend trên các mẫu stride cụ thể hoặc cửa sổ trượt cục bộ (Parmar et al., 2018; Child et al., 2019; Beltagy et al., 2020). Trong khi được phổ biến thêm trong các mô hình ngôn ngữ lớn (Mistral, Jiang et al. (2023)), các công trình trước đây hoặc kém hiệu suất so với full attention với các mẫu sparse không thể nắm bắt tương tác dày đặc, hoặc sử dụng kích thước cửa sổ lớn vẫn cho phép KV-cache lớn và hiệu quả kém tiếp theo.
+
+Trong khi đó, linear attention thay thế softmax trong attention tiêu chuẩn bằng các hàm kernel thay thế (Katharopoulos et al., 2020a; Choromanski et al., 2020; 2021; Qin et al., 2022a; Keles et al., 2023). Bằng cách loại bỏ exp(q^T k) để ủng hộ các tích feature map dot-product φ(q)^T φ(k), các phương pháp này sử dụng tính kết hợp tích ma trận để tính attention trong thời gian và không gian O(Nd²) (Katharopoulos et al., 2020b). Hơn nữa, chúng cho phép một góc nhìn tái diễn cho bộ nhớ không đổi và thời gian O(1) mỗi token sinh (Kasai et al., 2021; Schlag et al., 2021). Tuy nhiên, các feature map linear attention hiện tại hoặc thất bại trong việc khớp attention tiêu chuẩn về recall hoặc vẫn đắt để tính toán (Zhang et al., 2024). Linear attention chậm hơn về thời gian wall-clock so với các triển khai attention được tối ưu hóa (Dao et al., 2022).
+
+Dòng công trình nghiên cứu cách kết hợp sparse và linear attention thành một lớp duy nhất cũng liên quan chặt chẽ đến công trình của chúng tôi (Zaheer et al., 2020; Beltagy et al., 2020; Chen et al., 2021a; Zeng et al., 2022).
+
+**Attention alternatives** Cuối cùng, nhiều mô hình sử dụng các sequence mixer không có attention như state-space model (SSM) (Gu et al., 2021; Sun et al., 2023), gated convolution (Fu et al., 2023a; Poli et al., 2023) và input-dependent recurrence (Peng et al., 2023; Gu and Dao, 2023) để cạnh tranh hiệu suất attention trong khi cải thiện hiệu quả của nó. Tuy nhiên, trong khi các mô hình gần đây như vậy có thể khớp attention về perplexity tổng thể, nghiên cứu sâu hơn cho thấy chúng có thể kém hiệu suất so với Transformer trên các tác vụ như recall và in-context learning (Arora et al., 2023a; Akyürek et al., 2024).
+
+## 3. Không có bữa trưa miễn phí: Đánh đổi Memory-Recall
+
+Trong mục này, chúng tôi chứng minh một sự đánh đổi cơ bản giữa tiêu thụ bộ nhớ của mô hình trong quá trình suy luận (tức kích thước trạng thái tái diễn của nó) và khả năng thực hiện recall. Chúng tôi sử dụng sự kết hợp của thí nghiệm trên dữ liệu tổng hợp và phân tích lý thuyết.
+
+• **Nghiên cứu thực nghiệm về sự đánh đổi memory-recall**: Trong Mục 3.1, chúng tôi đánh giá một số lớp kiến trúc phổ biến (ví dụ Mamba, Hyena) trên một tác vụ associative recall tổng hợp, thay đổi các siêu tham số ảnh hưởng đến kích thước trạng thái tái diễn của mô hình (Hình 2). Trong mỗi lớp kiến trúc, chúng tôi quan sát một sự đánh đổi rõ ràng: kích thước trạng thái tái diễn càng lớn, recall càng tốt. Tuy nhiên, với một kích thước trạng thái tái diễn cố định, hiệu suất không nhất quán giữa các kiến trúc. Chúng tôi quan sát rằng một số sequence mixer rơi xuống dưới biên Pareto. Điều này thúc đẩy thiết kế các sequence mixer có thể mở rộng biên Pareto.
+
+• **Giới hạn dưới về bộ nhớ cần thiết cho recall**: Trong Mục 3.2, chúng tôi giới hạn dưới kích thước trạng thái tái diễn cần thiết để thực hiện recall chính xác với bất kỳ mô hình tái diễn nào Định lý F.6. Phân tích này củng cố các quan sát thực nghiệm của chúng tôi về sự đánh đổi throughput-recall.
+
+### 3.1. Nghiên cứu thực nghiệm về sự đánh đổi memory-recall
+
+**Thiết lập.** Chúng tôi sử dụng một tác vụ AR tổng hợp gọi là Multi-Query Associative Recall (MQAR) (Arora et al., 2023a) để chứng minh sự đánh đổi. Trong tác vụ này, các sequence input bao gồm một số cặp key-value theo sau bởi các query. Với một query cho trước, mô hình phải recall cặp key-value tương ứng từ trước đó trong sequence để dự đoán token tiếp theo. Ví dụ, output đúng cho input dưới đây sẽ là 4, 6, 1, 2, 3:
+
+A 4 B 3 C 6 F 1
+Key-Value E 2→A ? C ? F ?
+Query E ? B ?
+
+Chúng tôi huấn luyện trên các sequence có độ dài 256 token chứa từ 4 đến 64 cặp key-value. Trong quá trình đánh giá, chúng tôi đo accuracy trên các sequence có độ dài 1,024 token chứa từ 4 đến 256 cặp key-value.
+
+Chúng tôi huấn luyện và đánh giá sáu sequence mixer: attention (Vaswani et al., 2017), sliding window attention (Beltagy et al., 2020), Mamba (Gu and Dao, 2023), H3 (Fu et al., 2023a), Hyena (Poli et al., 2023), và BASED. Với mỗi cái, chúng tôi thay đổi các siêu tham số ảnh hưởng đến tiêu thụ bộ nhớ trong quá trình suy luận. Chúng tôi so sánh accuracy MQAR thay đổi như thế nào với kích thước trạng thái tái diễn và Phụ lục E.1 chứa chi tiết về cách tính kích thước trạng thái.
+
+Hình 2 và 3 có thể được tái tạo hoặc mở rộng cho các kiến trúc mới sử dụng các script được cung cấp tại https://github.com/HazyResearch/zoology.
+
+**Kết quả** Trong Hình 2, chúng tôi chứng minh một sự đánh đổi cơ bản giữa kích thước trạng thái tái diễn và accuracy trên MQAR áp dụng trong và giữa các lớp kiến trúc. Trong mỗi lớp kiến trúc (ví dụ các mô hình H3), việc tăng kích thước trạng thái tái diễn hầu như luôn dẫn đến cải thiện accuracy. Giữa các lớp kiến trúc, chúng ta cũng thấy một sự đánh đổi. Attention đạt được accuracy recall hoàn hảo, nhưng kích thước trạng thái tái diễn của nó tăng theo độ dài của sequence. Các lớp kiến trúc khác như Mamba và H3 thừa nhận các mô hình với trạng thái tái diễn nhỏ hơn nhiều, nhưng những mô hình này có khả năng recall hạn chế.
+
+Với một trạng thái tái diễn cố định, không phải tất cả kiến trúc đều có cùng khả năng recall. Trong số các kiến trúc được đề xuất trong công trình trước đây, Mamba sử dụng tốt nhất ngân sách bộ nhớ hạn chế. Đáng chú ý, các kiến trúc có góc nhìn tích chập (ví dụ Hyena và H3) rơi xuống dưới biên Pareto. Kiến trúc được đề xuất của chúng tôi, BASED (được giới thiệu trong Mục 4), mở rộng biên Pareto vượt ra ngoài Mamba. Bằng cách thay đổi các siêu tham số xác định kích thước trạng thái của nó (ví dụ chiều feature và chiều mô hình), chúng ta có thể điều hướng mượt mà sự đánh đổi giữa các mô hình hiệu quả và các mô hình tiêu thụ bộ nhớ với khả năng recall cao.
+
+### 3.2. Phân tích lý thuyết
+
+Phân tích lý thuyết của chúng tôi cung cấp thêm hiểu biết về các quan sát thực nghiệm được mô tả ở trên. Trước tiên, sử dụng kết quả từ lý thuyết độ phức tạp giao tiếp, chúng tôi chỉ ra rằng khả năng recall của bất kỳ mô hình nhân quả nào (ví dụ Mamba, Attention) bị giới hạn bởi kích thước trạng thái tái diễn của nó (Định lý F.12 trong Phụ lục F).
+
+**Định lý 3.1.** Bất kỳ mô hình tái diễn nào phụ thuộc nhân quả vào input u∈{0,1}^(N×d) đòi hỏi Ω(N)-bit trong kích thước trạng thái để giải quyết MQAR.
+
+Kết quả này cho thấy rằng sự đánh đổi quan sát được trong Hình 2 là cơ bản, không phải một artifact của các quirk kiến trúc.
+
+Tiếp theo, chúng tôi tập trung vào gated-convolution, một lớp rộng các kiến trúc được xây dựng từ gating và convolution (ví dụ H3, Hyena, RWKV v4). Để tiến bộ trong việc phân tích lý thuyết tập hợp rộng các đề xuất gated convolution, công trình trước đây phát triển một gated-convolution chuẩn, được gọi là BaseConv có thể chứng minh mô phỏng bất kỳ kiến trúc nào được xây dựng từ các primitive gating và convolution.
+
+Dựa trên công trình này, chúng tôi chỉ ra rằng BaseConv không thể giải quyết MQAR trong số lớp không đổi (Định lý F.19 và Định lý F.29 trong Phụ lục F).
+
+**Định lý 3.2.** Cho một sequence input u∈{0,1}^(3N×d), trong đó N và d biểu thị độ dài sequence và chiều head, tương ứng, một mô hình BaseConv độc lập dữ liệu cần log(2d)-lớp để giải quyết MQAR với d = log₂(c), trong đó c biểu thị kích thước từ vựng.
+
+**Nhận xét 3.3.** Với một lớp mã hóa input khái quát hóa mã hóa one-hot được gọi là mã hóa p-hot (Định nghĩa F.22), BaseConv phụ thuộc input cần ít nhất ⌊log(2p)⌋-lớp để giải quyết MQAR với d = p·ᵖ√c.
+
+Kết quả trên không mạnh khi c≪N, mà chúng tôi chứng minh một giới hạn dưới bổ sung (Định lý F.14 trong Phụ lục F):
+
+**Định lý 3.4.** Cho một input u∈{0,1}^(N×d) cho MQAR với bất kỳ mã hóa nào sao cho log c ≤ d ≤ 2(log N)^(1-ε) với ε > 0, và c token có thể từ từ vựng với c ≤ N, một mô hình BaseConv độc lập dữ liệu với các tham số mô hình nhận O(log N) bit cần Ω(ε log log N) lớp để giải quyết AR.
+
+Ngược lại, Arora et al. (2023a) chỉ ra rằng attention giải quyết MQAR trong số lớp không đổi. Kết quả này giúp giải thích tại sao các kiến trúc gated-convolution (H3 và Hyena) trong Hình 2 nằm dưới biên Pareto được thiết lập bởi các kiến trúc mới hơn.
+
+Lưu ý rằng Định lý 3.2 và Định lý 3.4 ngụ ý rằng chúng ta cần Ω(max(log log c, log log N)) nhiều lớp BaseConv để giải quyết MQAR. Người ta có thể tự hỏi liệu chúng ta có thể cải thiện giới hạn dưới này. Trong Định lý F.30, chúng tôi chỉ ra rằng đây là giới hạn dưới tốt nhất có thể bằng cách chỉ ra rằng với các setting nhất định, O(max(log log c, log log N)) lớp BaseConv là đủ để giải quyết MQAR.
+
+Cuối cùng, chúng tôi chỉ ra rằng chúng ta có thể mô phỏng linear attention (Katharopoulos et al., 2020a), nền tảng của BASED, sử dụng BaseConv (Arora et al., 2023a) với một poly-log blowup trong số lớp (Mệnh đề F.8 trong Phụ lục F), chỉ ra hiệu quả tương đối của linear attention so với các kiến trúc gated-convolution.
+
+## 4. Kiến trúc BASED
+
+Trong mục này, chúng tôi giới thiệu BASED. Mục tiêu của chúng tôi trong việc thiết kế kiến trúc này là chứng minh cách chúng ta có thể điều hướng biên Pareto của sự đánh đổi memory-recall sử dụng các khối xây dựng kiến trúc được biết đến.
+
+Softmax attention vượt trội trong recall, nhưng vì trạng thái tái diễn của nó, KV-cache, tăng không hạn chế theo độ dài sequence, nó bị mắc kẹt trong góc phần tư trên bên phải của Hình 2. Chúng tôi nghiên cứu hai cách tiếp cận đơn giản để hạn chế kích thước trạng thái tái diễn của attention: linear attention và sliding window attention. Kích thước trạng thái tái diễn của linear attention (tức attention không có softmax) không tăng theo độ dài sequence và có thể được điều chỉnh bằng cách thay đổi các siêu tham số đơn giản (Katharopoulos et al., 2020a). Với sliding window attention, chúng ta giới hạn kích thước trạng thái tái diễn bằng chiều rộng của cửa sổ.
+
+Tuy nhiên, các thí nghiệm của chúng tôi về language modeling thực tế (Bảng 6) và associative recall tổng hợp (Hình 1 giữa) cho thấy không có primitive nào một mình đủ để điều hướng biên pareto. Linear attention thiếu độ chính xác để thực hiện các phép dịch chuyển và so sánh token cục bộ (Fu et al., 2023b; Arora et al., 2023a). Trong sliding window attention, phạm vi associative recall bị giới hạn bởi chiều rộng của các cửa sổ (Hình 2, giữa). Khi chúng ta tăng kích thước cửa sổ, trạng thái tái diễn tăng tuyến tính và có ảnh hưởng phi tuyến đến tốc độ trong quá trình huấn luyện và suy luận song song (Hình 2, trái).
+
+BASED kết hợp (1) linear attention xấp xỉ softmax được áp dụng toàn cục và (2) attention softmax chính xác được áp dụng cục bộ trong các cửa sổ trượt nhỏ (Hình 1, phải). Điều này cho phép chúng ta sử dụng softmax attention trong các cửa sổ trượt đáng ngạc nhiên nhỏ (ví dụ 64−128 token) khôi phục 90.8% accuracy recall của full softmax attention với độ trễ 1e-5× của nó.
+
+### 4.1. Taylor Linear Attention
+
+Bằng cách xấp xỉ softmax attention sử dụng các feature map tuyến tính, chúng ta có thể hạn chế kích thước trạng thái tái diễn trong khi duy trì tương tác token toàn cục (tức mỗi token phụ thuộc vào mọi token trước nó trong sequence).
+
+Katharopoulos et al. (2020a); Tsai et al. (2019); Choromanski et al. (2020) chỉ ra rằng chúng ta có thể chọn một feature map φ:R^d→R^d̃ sao cho φ(q_i)^T φ(k_j) ≈ exp(q_i^T k_j/√d).
+
+Chúng ta sau đó có thể viết lại công thức cho softmax attention trong Phương trình (1) như
+
+(∑_{j=1}^i φ(q_i)^T φ(k_j)v_j) / (φ(q_i)∑_{j=1}^i φ(k_j)) = (φ(q_i)∑_{j=1}^i φ(k_j)^T v_j) / (φ(q_i)∑_{j=1}^i φ(k_j))     (2)
+
+trong đó mỗi query attend đến mọi key quá khứ trong độ phức tạp thời gian và không gian O(Nd²). Hơn nữa, Katharopoulos et al. (2020b) chỉ ra rằng linear attention có một trạng thái tái diễn kích thước cố định trong quá trình sinh. Đặt s_i = ∑_{j=1}^i φ(k_j)^T v_j và z_i = ∑_{j=1}^i φ(k_j)^T là một "KV-state" và "K-state" tương ứng, chúng ta có thể tính Phương trình (2) như
+
+s_i = s_{i-1} + φ(k_i)^T v_i, z_i = z_{i-1} + φ(k_i)^T,
+y_i = φ(q_i)s_i / φ(q_i)z_i     (3)
+
+trong đó s_i ∈ R^{d×d̃} và z_i ∈ R^d̃.
+
+**Feature map.** Để xấp xỉ exp(q_i^T k_j/√d), chúng tôi sử dụng feature map chuỗi Taylor bậc 2, chọn φ:R^d→R^{d²} sao cho
+
+φ(q_i)^T φ(k_j) = 1 + q_i^T k_j + (q_i^T k_j)²/2     (4)
+
+Trong khi Zhang et al. (2024) lưu ý rằng việc chọn một feature map với d̃ = d² dẫn đến linear attention với độ phức tạp thời gian và không gian O(Nd³) và trạng thái tái diễn lớn có kích thước O(d³), chúng ta có thể đánh đổi hiệu quả cho khả năng recall bằng cách chiếu query và key đến các chiều nhỏ hơn tức W_q, W_k ∈ R^{d×d'} với d' = 16. Bằng cách thay đổi d' chúng ta điều chỉnh kích thước trạng thái tái diễn.
+
+Việc lựa chọn feature map ảnh hưởng như thế nào đến sự đánh đổi memory-recall? Công trình trước đây chứng minh hiệu suất mạnh của feature map Taylor trên associative recall (Zhang et al., 2024). Dựa trên phân tích này, chúng tôi đánh giá một tập hợp rộng các feature map (φ_{ReLU}(x) = max(x,0), φ_{PosELU}(x) = ELU(x) + 1, φ_{Square}(x) = x², φ_{Identity}(x) = x, φ_{CosFormer} như định nghĩa trong (Qin et al., 2022a), và φ_{Performer} như định nghĩa trong (Choromanski et al., 2020)) sử dụng thiết lập thí nghiệm được mô tả trong Mục 3.1. Trong Hình 3 (trên), chúng tôi vẽ đồ thị các đường cong đánh đổi memory-recall cho các feature map này. Feature map chuỗi Taylor, cùng với các feature map φ_{PosELU} và φ_{ReLU} đơn giản, nằm ở biên Pareto. Một lợi thế của feature map Taylor so với các lựa chọn thay thế này là nó mở rộng kích thước trạng thái tái diễn (cải thiện khả năng recall) mà không thay đổi số lượng tham số. Như được hiển thị trong Hình 3 (dưới), feature map chuỗi Taylor đòi hỏi ít tham số hơn so với các lựa chọn thay thế để đạt được khả năng recall cao. Phân tích này và các ablation trong Bảng 6 thông báo quyết định của chúng tôi sử dụng xấp xỉ Taylor, mặc dù các feature map đơn giản khác cũng có thể hiệu quả.
+
+### 4.2. Local Exact Attention với Small Sliding Windows
+
+Để mô hình hóa hiệu quả các tương tác cục bộ tinh vi, BASED sử dụng sliding window attention (SWA) với kích thước cửa sổ được đặt ở bội số nhỏ của 16 (lên đến 64 token). Tương tự như các triển khai (nhân quả) trước đây (Child et al., 2019; Beltagy et al., 2020), với kích thước cửa sổ w mỗi query q_i chỉ attend đến các key quá khứ {k_{i-w+1}, ..., k_i}. Điều này cho phép độ phức tạp thời gian và không gian O(Nw) cho scaling tuyến tính theo độ dài sequence N, với một KV-cache kích thước w cho sinh bộ nhớ không đổi.
+
+Tuy nhiên, không giống như SWA trước đây giữ w ở kích thước 256 (Parmar et al., 2018) đến 4096 (Jiang et al., 2023), BASED chỉ sử dụng w ≤ 128 để khai thác tốt nhất GPU hiện đại. Trong Mục 5, chúng tôi thảo luận cách cửa sổ "Tensor core-aware" này (TCWINDOW) đạt được độ trễ 1e-5× so với các cửa sổ w = 4096 trong các LLM hiện đại (ví dụ Mistral 7B (Jiang et al., 2023)).
+
+Trong khi TCWINDOW nhỏ cho phép attention cục bộ và chính xác nhanh, nó đặt ra thách thức cho mô hình hóa tầm xa. Với chỉ w = 64, cho mỗi lớp của w = 4096 Mistral sliding window attention chúng ta sẽ cần 64 lớp BASED để đạt được cùng receptive field. Kiểm soát độ sâu mô hình và độ dài sequence, Hình 2 thực sự chỉ ra w nhỏ hơn giảm tuyến tính accuracy associative recall.
+
+Linear attention toàn cục của BASED được mô tả ở trên vượt qua việc thiếu mô hình hóa tầm xa được trình bày với w thấp.
+
+Cuối cùng, chúng tôi thấy rằng bao gồm các lớp gated convolution với convolution ngắn (ví dụ kích thước filter 3) mang lại lợi ích bổ sung so với chỉ sử dụng các lớp TCWINDOW. Convolution ngắn có thể giúp thực hiện các phép dịch chuyển cục bộ, chính xác cho so sánh token vì chúng hoạt động trên toàn bộ sequence, trong khi TCWINDOW thì không. Các mixer cục bộ này có thể bổ sung cho nhau.
+
+Chi tiết kiến trúc bổ sung cho BASED được thảo luận trong Phụ lục C và việc lai ghép các lớp được sử dụng trong thí nghiệm được cung cấp trong Bảng 7. Chúng tôi bao gồm các ablation của các lựa chọn kiến trúc trong Bảng 6 và đánh giá chất lượng và hiệu quả tổng thể của BASED trong Mục 6.
+
+## 5. Triển khai hiệu quả
+
+Trong mục này chúng tôi tập trung vào hiệu quả của BASED. Một triển khai ngây thơ chậm hơn so với các triển khai attention tiêu chuẩn hiệu quả nhất (được hiển thị trong Hình 4) vì nó đòi hỏi lượng lớn di chuyển bộ nhớ độ trễ cao. Chúng tôi trước tiên mô tả kiến thức cơ bản về mô hình thực thi GPU và phân cấp bộ nhớ. Chúng tôi tiếp theo trình bày baseline và các thuật toán hardware-aware của chúng tôi cho linear attention trong Mục 5.2 và cho sliding window attention trong Phụ lục B.2.2.
+
+### 5.1. Kiến thức cơ bản
+
+Các hoạt động GPU, hoặc kernel, được thực thi bởi nhiều thread song song. Các streaming multiprocessor GPU khởi chạy các thread block ở cấp phần mềm. Các block này được chia thành các warp (ví dụ 32 thread) được gán cho các core ở cấp phần cứng. Các thread cần đọc input vào register của chúng để thực hiện tính toán và viết output. Thời gian cần để đọc và viết được gọi là chi phí IO.
+
+Các hoạt động có thể bị giới hạn bởi bộ nhớ hoặc tính toán, tùy thuộc vào thời gian để tải dữ liệu so với thực hiện tính toán trên dữ liệu đã tải. Trong việc thiết kế các thuật toán IO-aware của chúng tôi, chúng tôi muốn khai thác hai thuộc tính chính của GPU hiện đại. Thứ nhất, các đơn vị tensor core (đơn vị nhân ma trận nhanh) đạt tốc độ 312 TFLOP/s so với 19 TFLOP/s cho các core nhân ma trận không. Thứ hai, GPU đối mặt với một phân cấp bộ nhớ với lượng lớn bộ nhớ chậm truy cập và lượng nhỏ hơn bộ nhớ nhanh truy cập. Ví dụ, phân cấp trên GPU NVIDIA 80GB A100 hiện đại là: 80GB HBM với băng thông 2 TB/s, 80MB bộ nhớ đệm L2, 192KB bộ nhớ đệm L1 / bộ nhớ chia sẻ (được triển khai qua SRAM) với băng thông 19 TB/s mỗi SM, và 256 KB register file mỗi SM (NVIDIA, 2022). Bộ nhớ register là riêng tư cho một thread đang thực thi, vì vậy các thread cần viết vào bộ nhớ chia sẻ để giao tiếp dữ liệu với các thread khác trong block. Để giảm chi phí IO, một nguyên tắc chính là hợp nhất nhiều hoạt động trên cùng một phần dữ liệu trong khi nó ở trong bộ nhớ nhanh trước khi viết nó trở lại bộ nhớ chậm.
+
+### 5.2. Taylor Exponential Linear Attention
+
+Mặc dù có hiệu quả lý thuyết, các triển khai linear attention phổ biến kém hiệu quả hơn so với các triển khai softmax attention được tối ưu hóa tốt khi đo bằng thời gian wall-clock thực tế và sử dụng bộ nhớ (Dao et al., 2022). Chúng tôi tiếp theo trình bày các thuật toán hardware-aware để làm cho Taylor linear attention hiệu quả. Chúng tôi tập trung vào hai hoạt động: (1) prefill (mục này), tương ứng với việc xử lý prompt trong quá trình sinh hoặc forward pass trong quá trình huấn luyện, và (2) dự đoán token tiếp theo trong quá trình sinh (Phụ lục B), cũng đòi hỏi cập nhật trạng thái ẩn tái diễn.
+
+Trong mục này, chúng tôi gọi kích thước batch là B, số head là H, chiều head là d, độ dài sequence là N và chiều feature là d', theo Mục 4. Để dễ ký hiệu, đặt D = 1 + d' + d'² trong mục này. Chi tiết bổ sung cho các thuật toán này có trong Phụ lục B.
+
+**Triển khai Baseline** Triển khai ngây thơ được chi tiết trong Phụ lục B chỉ sử dụng kernel CUDA để tính tích causan dot product giữa các phép chiếu q,k,v (Vyas et al., 2020), nhưng tính các feature map trong python (không IO-aware). Điều này không hiệu quả với tính toán cần thiết cho việc tính toán feature map.
+
+**Phân tích** Trong chi phí IO tổng thể, bỏ qua các phép chiếu input và output trong lớp linear attention, quy trình này đòi hỏi 2BHND byte để viết q,k được featurized vào HBM. Trong quá trình tích causan dot product, điều này đòi hỏi 2BHND + BHNd byte để đọc các tile q,k,v và BHNd byte để viết kết quả. Trong suốt quá trình tính toán, O(BHNDd) byte (lưu ý đây là hình dạng KV state trong forward pass) được đọc vào và ra khỏi register thread vào SRAM để cập nhật output đang chạy và KV state với băng thông 19TB/s.
+
+**Thuật toán** Kernel của chúng tôi tính cả feature map và causan dot product, được chi tiết trong Thuật toán 1. Ở đây chúng tôi mô tả các hiểu biết chính. Thứ nhất, để xử lý tính nhân quả trong tính toán dot-product, cho mỗi tile của output y_i ∈ R^{16×d}, chúng tôi chia tách tính toán như được hiển thị, trong đó q_i,k_i,v_i cũng bây giờ là các tile của 16 token, được xử lý song song bởi kernel.
+
+y_i = Causal(q_i^T k_i)v_i + q_i ∑_{j=0}^{i-1}(k_j v_j)
+
+trong đó số hạng đầu sử dụng góc nhìn attention bậc hai và đòi hỏi áp dụng mặt nạ nhân quả. Số hạng thứ hai sử dụng góc nhìn tuyến tính và tính nhân quả của nó đã được xử lý.
+
+Thứ hai KV-state lớn, ∑_{j=0}^{i-1}(k_j v_j), ∈ R^{D×d}, cần được lưu trữ khi chúng ta lặp qua các tile độ dài-16. Bằng cách phân chia giữa các worker (warp), chúng ta có thể lưu trữ state trong register thread (bộ nhớ nhanh nhất). Việc phân chia bị hạn chế bởi (1) mỗi warp có số lượng hạn chế thread và (2) các warp không thể truy cập bộ nhớ thread của các warp khác.
+
+**Phân tích** Trong chi phí IO, một lần nữa bỏ qua các phép chiếu input và output trong lớp linear attention, quy trình của chúng tôi đòi hỏi 2BHNd' byte để đọc q, k và 2BHNd byte để đọc v và viết output y giữa HBM và SRAM. Nhìn chung, thuật toán của chúng tôi tránh trong HBM O(2BHND) byte trong di chuyển dữ liệu HBM đến SRAM. Chúng tôi cải thiện thêm so với baseline bằng cách lưu trữ KV-state trong register để tránh O(BHNDd) byte trong di chuyển dữ liệu SRAM đến register.
+
+Các benchmark end-to-end cho BASED được triển khai với các thuật toán IO-aware này được cung cấp trong Mục 6. Các micro-benchmark cho mỗi kernel so với các triển khai baseline được cung cấp trong Phụ lục B.
+
+## 6. Kết quả
+
+Trong mục này, chúng tôi trình bày kết quả cho các tuyên bố sau:
+
+1. **Language modeling tổng thể.** Chúng tôi đánh giá các kiến trúc trong pretraining trên Pile (Gao et al., 2020) và trên các benchmark hiểu ngôn ngữ tự nhiên tiêu chuẩn. Chúng tôi thấy BASED khớp hoặc vượt trội so với các kiến trúc sub-quadratic trước đây qua các setting này.
+
+2. **Language modeling recall.** BASED thu hẹp khoảng cách với attention trên phần associative recall đầy thách thức của corpus Pile (xem Bảng 1). Chúng tôi áp dụng các mô hình pretrained này zero-shot cho một bộ tác vụ đòi hỏi recall cao (ví dụ trích xuất thông tin, QA), chỉ ra rằng BASED vượt trội hệ thống so với Mamba với lề lớn (10.36 điểm accuracy tại 1.3b tham số và 50b token).
+
+3. **Generation throughput.** Triển khai IO-aware của chúng tôi về sinh tái diễn trong Based cho phép tăng tốc 40−60% so với FlashAttention-2 và Mamba cho prefill tại độ dài sequence 4k và throughput cao hơn tới 24× cho sinh tại 4k và throughput cao hơn tới 24× cho sinh.
+
+**Baseline** Chúng tôi so sánh với một số baseline chính ở quy mô 360m và 1.3b tham số, lên đến 50b token huấn luyện. Chúng tôi trước tiên xem xét Transformer++, Transformer với các cải tiến hiện đại như rotary encoding (Su et al., 2023) và gated linear unit (Touvron et al., 2023). Chúng tôi sau đó xem xét một lớp kiến trúc hiệu quả phổ biến được xây dựng từ gating và long-convolution primitive bao gồm Hyena (Poli et al., 2023), RWKV (Peng et al., 2023), và H3 (Fu et al., 2023a). Chúng tôi cuối cùng so sánh với Mamba gần đây phổ biến (Gu and Dao, 2023) và Gated Linear Attention (Yang et al., 2023) các kiến trúc tái diễn tuyến tính với cập nhật trạng thái tái diễn phụ thuộc input. Chúng tôi cung cấp cho mỗi kiến trúc các cải tiến Transformer++ khi liên quan và sử dụng các triển khai được cung cấp bởi công trình trước đây trong quá trình huấn luyện.
+
+BASED kết hợp các sequence mixer cục bộ và toàn cục quen thuộc để đạt được chất lượng cao. Chúng tôi huấn luyện BASED như một hybrid của ≈20% linear attention, ≈20% sliding window attention, và ≈60% gated convolution layer như được thảo luận trong Phụ lục E.1. Trái ngược với các baseline gần đây, BASED không đòi hỏi bất kỳ decay phụ thuộc input nào.
+
+### 6.1. Đánh giá Language Modeling
+
+**Benchmark Language Modeling** Chúng tôi pretrain các mô hình ngôn ngữ từ đầu ở hai quy mô tham số (360m và 1.3b tham số) trên Pile (Gao et al., 2020). Mỗi mô hình thấy cùng token dữ liệu pretraining theo cùng thứ tự. Dữ liệu Pile được tokenize sử dụng GPT-2 BPE tokenizer (Radford et al., 2019). Chúng tôi đo perplexity trên Pile và báo cáo kết quả trong Bảng 1 và chi tiết thí nghiệm tiếp theo được cung cấp trong Phụ lục E.1.
+
+Chúng tôi cũng đánh giá các mô hình pretrained trên các benchmark downstream hiểu ngôn ngữ tự nhiên chính sử dụng LM Eval Harness (SuperGLUE, ARC, PIQA, WinoGrande, HellaSwag, LAMBADA). Một phân tích chi tiết về các tác vụ và metric có thể được tìm thấy trong Phụ lục D.
+
+Trong cả pretraining và trên các tác vụ downstream, BASED liên tục cạnh tranh với các baseline Transformer++ và Mamba mạnh nhất. Trong khi các metric tổng thể này hữu ích, chúng tôi tiếp theo chuyển sang phân tích tinh vi về khả năng recall và in-context learning trên dữ liệu thực tế.
+
+**Đánh giá Recall** Chúng tôi đánh giá các mô hình pretrained của chúng tôi trên một bộ tác vụ in-context learning được chọn để kiểm tra khả năng recall downstream trong Bảng 1. Các tác vụ này rơi vào ba danh mục: (1) **Real-world AR** Ngoài điểm perplexity, chúng tôi chia các dự đoán token tiếp theo trên Pile để hiểu chất lượng AR của mỗi kiến trúc (Phụ lục E.1). (2) **Information extraction (IE)** SWDE và FDA là các benchmark IE tài liệu bán cấu trúc và không cấu trúc phổ biến tương ứng (Wu et al., 2021; Deng et al., 2022; Arora et al., 2023b). SWDE có HTML cho 8 trang web Movie và 5 University (ví dụ IMDB, US News) và chú thích cho 8-274 thuộc tính mỗi trang web (ví dụ thời gian chạy Movie), và (3) **Question answering từ các đoạn văn trong ngữ cảnh.**
+
+Chúng tôi thấy BASED vượt trội so với các kiến trúc sub-quadratic baseline qua các đánh giá này, thu hẹp khoảng cách với Transformer++. Các xu hướng này theo dõi kết quả MQAR tổng hợp từ Mục 3.1. Chúng tôi tiếp tục quan sát rằng khi chúng ta huấn luyện lâu hơn (nhiều token hơn), các cải thiện từ BASED so với Mamba tăng (từ 3.9 đến 9.0 điểm trung bình ở quy mô 360m và từ 9.0 đến 10.4 điểm ở quy mô 1.3b).
+
+**Ablation Chất lượng** Trong Bảng 6, chúng tôi ablate các feature map, chiều feature, và chiều sliding window và convolution sử dụng cùng setting Pile như các thí nghiệm trước đây. Trong feature map, chúng tôi xem xét thay thế xấp xỉ Taylor bằng CosFormer (Qin et al., 2022a) hoặc Performer (Choromanski et al., 2020), và thay đổi kích thước state sử dụng phép chiếu tuyến tính. Chúng tôi quan sát với kích thước state lớn hơn, CosFormer thu hẹp khoảng cách với Taylor map mặc dù lưu ý các phép chiếu tăng số lượng tham số. Trong chiều feature, chúng tôi thấy 24 và 32 cung cấp lợi nhuận giảm dần. Thảo luận tiếp theo có trong Phụ lục E.1.
+
+### 6.2. Benchmark Hiệu quả
+
+Chúng tôi benchmark throughput của BASED, có và không có các thuật toán IO-Aware được đề xuất của chúng tôi (Mục 5, Hình 4). Chúng tôi xem xét cả forward pass / generation prefill và các giai đoạn dự đoán token tiếp theo. Thí nghiệm được chạy sử dụng GPU H100 NVIDIA và lấy trung bình qua 20 lần lặp lại.
+
+**Benchmark end-to-end** Sử dụng triển khai hiệu quả của chúng tôi (Mục 5), BASED đạt được prefill nhanh hơn 56% so với FlashAttention-2 (Dao, 2023) và nhanh hơn 44% so với Mamba tại độ dài sequence 4k và 1.3b tham số (nhanh hơn 28% so với FlashAttention-2 và nhanh hơn 76% so với Mamba tại 360m tham số). Chúng tôi thấy rằng sinh token tiếp theo, không có prefill, cung cấp throughput cao hơn 24× (token/giây) so với triển khai FlashAttention-2 được tối ưu hóa cao và đạt được 95% throughput của kiến trúc tái diễn Mamba tại kích thước batch 128 và 1.3b tham số (throughput cao hơn 98% so với FlashAttention-2 và throughput cao hơn 118% so với Mamba tại 360m tham số). Tất cả benchmark trên một GPU NVIDIA H100 duy nhất, sử dụng CUDA cache graph trong dự đoán token tiếp theo (NVIDIA, 2019).
+
+Trong Hình 4, chúng tôi cũng bao gồm kết quả cho triển khai baseline của BASED sử dụng kernel CUDA Fast Transformer phổ biến để tính causan dot product (Vyas et al., 2020) (được thảo luận trong Mục 5). Kernel tùy chỉnh được giới thiệu trong công trình của chúng tôi mở khóa hiệu quả của BASED.
+
+**Micro benchmark** Vì kiến trúc BASED end-to-end là một kiến trúc hybrid, chúng tôi cung cấp micro benchmark của các kernel riêng lẻ so với các triển khai baseline chính trong Phụ lục B. Kernel có thể truy cập tại: https://github.com/HazyResearch/ThunderKittens.
+
+## 7. Kết luận
+
+Công trình này xác định một sự đánh đổi cơ bản giữa recall, một kỹ năng quan trọng cho in-context learning, và throughput thông qua lý thuyết và thí nghiệm. Attention thực hiện recall hoàn hảo, nhưng đòi hỏi duy trì một KV cache tăng theo độ dài sequence. Như một lựa chọn thay thế, chúng tôi đề xuất kiến trúc BASED, kết hợp hai kỹ thuật đơn giản – attention tinh vi cục bộ và linear attention tầm xa qua xấp xỉ Taylor của hàm exponential softmax – là sub-quadratic trong quá trình huấn luyện và cho phép một góc nhìn suy luận tái diễn hiệu quả. Để cho phép hiệu quả wall clock, chúng tôi giới thiệu các thuật toán IO-aware cho suy luận Taylor linear attention dẫn đến BASED thực hiện sinh nhanh hơn tới 24× so với FlashAttention-2 tại quy mô tham số 1.3b (sinh 1024 token, kích thước batch 128). Ngoài việc cạnh tranh trong perplexity tổng thể, BASED vượt trội so với các kiến trúc sub-quadratic trước đây trong chất lượng recall 10.36 điểm accuracy trung bình. Nhìn chung, kết quả của chúng tôi chỉ ra rằng BASED mở rộng biên Pareto của không gian đánh đổi recall-throughput vượt ra ngoài các kiến trúc trước đây.
+
+## Lời cảm ơn
+
+Chúng tôi cảm ơn Benjamin Spector, Dylan Zinsley, Songlin Yang, Daniel Fu, Jessica Grogan, Eric Nguyen, Michael Wornow, Alyssa Unell, và Gautam Machiraju vì phản hồi và thảo luận hữu ích của họ trong công trình này. Chúng tôi cảm ơn phòng thí nghiệm Hazy Research và Together AI vì hỗ trợ công trình này. Chúng tôi biết ơn sự hỗ trợ của NIH dưới Số U54EB020405 (Mobilize), NSF dưới Số CCF2247015 (Hardware-Aware), CCF1763315 (Beyond Sparsity), CCF1563078 (Volume to Velocity), và 1937301 (RTML); US DEVCOM ARL dưới Số W911NF-23-2-0184 (Long-context) và W911NF-21-2-0251 (Interactive Human-AI Teaming); ONR dưới Số N000142312633 (Deep Signal Processing), N000141712266 (Unifying Weak Supervision), N000142012480 (Non-Euclidean Geometry), và N000142012275 (NEPTUNE); Stanford HAI dưới Số 247183; NXP, Xilinx, LETI-CEA, Intel, IBM, Microsoft, NEC, Toshiba, TSMC, ARM, Hitachi, BASF, Accenture, Ericsson, Qualcomm, Analog Devices, Google Cloud, Salesforce, Total, chương trình HAI-GCP Cloud Credits for Research, Stanford Data Science Initiative (SDSI), và các thành viên của dự án Stanford DAWN: Facebook, Google, và VMWare. Chính phủ Hoa Kỳ được ủy quyền tái tạo và phân phối bản in cho mục đích Chính phủ bất chấp bất kỳ ghi chú bản quyền nào trên đó. Bất kỳ ý kiến, phát hiện, và kết luận hoặc khuyến nghị nào được thể hiện trong tài liệu này là của các tác giả và không nhất thiết phản ánh quan điểm, chính sách, hoặc sự xác nhận, được thể hiện rõ ràng hoặc ngụ ý, của NIH, ONR, hoặc Chính phủ Hoa Kỳ. Nghiên cứu của AR được hỗ trợ bởi tài trợ NSF CCF#2247014.
+
+## Tuyên bố Tác động
+
+Bài báo này trình bày công trình có mục tiêu thúc đẩy lĩnh vực Machine Learning. Chúng tôi dự định BASED hỗ trợ giảm chi phí machine learning và mở khóa các khả năng mới. Có nhiều hậu quả xã hội tiềm năng của công trình chúng tôi, không có gì chúng tôi cảm thấy phải được nêu bật cụ thể ở đây. Thảo luận chi tiết về rủi ro sử dụng và phát triển LLM có trong Bommasani et al. (2021); Weidinger et al. (2021).
+
+## Tài liệu tham khảo
+
+[Danh sách tài liệu tham khảo giữ nguyên định dạng gốc]

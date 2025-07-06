@@ -1,0 +1,377 @@
+# SARATHI : Suy luận LLM hiệu quả bằng cách gắn kết các lần giải mã với các prefill được chia khối
+
+Amey Agrawal *2, Ashish Panwar1, Jayashree Mohan1, Nipun Kwatra1, Bhargav S. Gulavani1, và
+Ramachandran Ramjee1
+1Microsoft Research India
+2Georgia Institute of Technology
+
+## Tóm tắt
+
+Suy luận Mô hình Ngôn ngữ Lớn (LLM) bao gồm hai giai đoạn riêng biệt – giai đoạn prefill xử lý prompt đầu vào và giai đoạn decode tạo ra các token đầu ra một cách tự hồi quy. Trong khi giai đoạn prefill sử dụng hiệu quả tính toán GPU ở kích thước batch nhỏ, giai đoạn decode dẫn đến sử dụng tính toán thấp vì nó tạo ra một token tại một thời điểm cho mỗi yêu cầu. Thời gian prefill và decode thay đổi cũng dẫn đến mất cân bằng giữa các micro-batch khi sử dụng pipeline-parallelism, dẫn đến sự kém hiệu quả hơn do các bong bóng.
+
+Chúng tôi trình bày SARATHI để giải quyết những thách thức này. SARATHI sử dụng chunked-prefills, chia một yêu cầu prefill thành các khối có kích thước bằng nhau, và decode-maximal batching, xây dựng một batch sử dụng một khối prefill duy nhất và điền các slot còn lại với các decode. Trong quá trình suy luận, khối prefill bão hòa tính toán GPU, trong khi các yêu cầu decode 'gắn kết' và có chi phí thấp hơn đến một bậc độ lớn so với một batch chỉ decode. Chunked-prefills cho phép xây dựng nhiều batch decode-maximal từ một yêu cầu prefill duy nhất, tối đa hóa phạm vi bao phủ của các decode có thể gắn kết.
+
+Hơn nữa, thiết kế tính toán đồng nhất của các batch này cải thiện sự mất cân bằng giữa các micro-batch, giảm đáng kể các bong bóng pipeline.
+
+Các kỹ thuật của chúng tôi mang lại những cải tiến đáng kể trong hiệu suất suy luận trên các mô hình và phần cứng. Đối với mô hình LLaMA-13B trên GPU A6000, SARATHI cải thiện thông lượng decode lên đến 10×, và tăng tốc thông lượng end-to-end lên đến 1.33×. Đối với LLaMa-33B trên GPU A100, chúng tôi đạt được thông lượng end-to-end cao hơn 1.25× và thông lượng decode cao hơn lên đến 4.25×. Khi được sử dụng với pipeline parallelism trên GPT-3, SARATHI giảm bong bóng đi 6.29×, dẫn đến cải tiến thông lượng end-to-end là 1.91×.
+
+## 1 Giới thiệu
+
+Việc mở rộng quy mô của các mô hình ngôn ngữ [25, 26, 35, 38] đã dẫn đến sự xuất hiện các khả năng của chúng [45] trong nhiều tác vụ phức tạp — xử lý ngôn ngữ tự nhiên, trả lời câu hỏi, tạo mã, v.v. Điều này đã dẫn đến sự bùng nổ trong việc sử dụng chúng trên các ứng dụng bao gồm các công cụ hội thoại [2, 4, 5, 38], tìm kiếm [3, 8, 9, 15, 22], trợ lý mã [1, 7, 16], v.v.
+
+Việc tính toán GPU đáng kể cần thiết cho suy luận trên các mô hình lớn này, cùng với việc sử dụng rộng rãi của chúng, đã làm cho suy luận LLM trở thành khối lượng công việc GPU chủ đạo. Tối ưu hóa suy luận LLM do đó đã trở nên rất quan trọng và đã thấy sự quan tâm đáng kể gần đây [39, 42, 48].
+
+*Công việc được thực hiện với tư cách thực tập sinh tại Microsoft Research India
+
+**Hình 1:** Ví dụ về lịch trình pipeline song song hai giai đoạn. (a) Trong các giải pháp trước đây như Orca [48], các bong bóng pipeline thường xuyên do thời gian tính toán prompt và decode thay đổi. Hơn nữa, các decode rất kém hiệu quả (chi phí decode mỗi token cao hơn hàng bậc độ so với Prefill). (b) SARATHI giảm đáng kể các bong bóng pipeline và cho phép các decode gắn kết hiệu quả hơn.
+
+Trong bài báo này, trước tiên chúng tôi phân tích một lý do cơ bản đằng sau hiệu quả thấp của suy luận LLM. Mỗi yêu cầu suy luận LLM trải qua hai giai đoạn – một giai đoạn prefill tương ứng với việc xử lý prompt đầu vào và một giai đoạn decode tương ứng với việc tạo token tự hồi quy.
+
+Giai đoạn prefill xử lý tất cả các token trong chuỗi đầu vào song song, dẫn đến việc sử dụng GPU cao ngay cả với kích thước batch nhỏ. Ví dụ, trên GPU A6000, đối với mô hình LLaMA-13B, một prefill với độ dài chuỗi 512 token
+
+1arXiv:2308.16369v1 [cs.LG] 31 Aug 2023
+
+bão hòa tính toán GPU ngay cả ở kích thước batch chỉ là một. Mặt khác, giai đoạn decode chỉ xử lý một token duy nhất trong mỗi lần truyền tự hồi quy, dẫn đến việc sử dụng GPU rất thấp ở kích thước batch thấp. Ví dụ, các thí nghiệm của chúng tôi tiết lộ rằng, ở kích thước batch nhỏ, chi phí decode mỗi token có thể cao tới ~200 lần chi phí prefill mỗi token. Hơn nữa, vì một yêu cầu chỉ trải qua một lần truyền prefill duy nhất, nhưng nhiều lần truyền decode (một cho mỗi token được tạo), hiệu quả suy luận tổng thể bị ảnh hưởng đáng kể.
+
+Một chiến lược để cải thiện hiệu quả decode LLM là tăng kích thước batch bằng cách sử dụng model parallelism. Trong các máy chủ có kết nối băng thông cao như NVIDIA DGX A100, tensor-parallelism [43] có thể cho phép triển khai LLM trên tối đa 8 GPU, do đó hỗ trợ kích thước batch lớn và decode hiệu quả. Pope et al. [39] cho thấy rằng tensor parallelism có thể được mở rộng tới 256 thiết bị trên các pod TPUv4 chuyên biệt.
+
+Tuy nhiên, tensor-parallelism ở quy mô lớn như vậy có thể dẫn đến hiệu suất kém khi các hyper-cluster không có sẵn. Trong những trường hợp như vậy, pipeline parallelism [24, 37] có thể giúp tăng kích thước batch. Do đó, các hệ thống như Orca [48] dựa vào pipeline parallelism để mở rộng suy luận LLM và áp dụng giải pháp nổi tiếng của việc sử dụng micro-batch để giảm thiểu các bong bóng hoặc stall pipeline [34]. Tuy nhiên, như chúng tôi chỉ ra trong bài báo này, việc lập lịch dựa trên micro-batch tiêu chuẩn vẫn có thể dẫn đến các bong bóng pipeline do các đặc tính độc đáo của suy luận LLM.
+
+Cụ thể, suy luận LLM bao gồm một hỗn hợp của các prefill có độ dài thay đổi và các decode. Điều này tạo ra thời gian xử lý thay đổi cho các micro-batch khác nhau, dẫn đến các bong bóng đáng kể và các chu kỳ GPU lãng phí như được minh họa trong Hình 1(a). Lưu ý rằng bong bóng đầu tiên trong hình là do kích thước prompt thay đổi trong khi bong bóng thứ hai là do sự không khớp giữa thời gian tính toán prompt và decode.
+
+Trong bài báo này, chúng tôi trình bày thiết kế và triển khai của SARATHI, một kỹ thuật suy luận LLM hiệu quả. SARATHI sử dụng chunked-prefills và decode-maximal batching để giải quyết các vấn đề về 1) decode kém hiệu quả và 2) bong bóng pipeline.
+
+Chunked-prefills chia một yêu cầu prefill thành các khối có kích thước tính toán bằng nhau. Hơn nữa, SARATHI sử dụng decode-maximal batching để xây dựng một batch bằng cách sử dụng một khối prefill duy nhất và điền phần còn lại của batch với các decode. Batch hybrid này cung cấp các đơn vị công việc vừa bão hòa tính toán vừa đồng nhất, do đó giải quyết các vấn đề về decode kém hiệu quả và bong bóng pipeline.
+
+Vì các giai đoạn prefill và decode có các yêu cầu tính toán khác nhau, insight chính của phương pháp chúng tôi là việc trộn các yêu cầu prefill và decode trong một batch duy nhất có thể cho phép sử dụng tính toán cao một cách đồng nhất. Tuy nhiên, vì mỗi yêu cầu chỉ có một giai đoạn prefill duy nhất, theo sau bởi nhiều giai đoạn decode (cho mỗi token được tạo), chúng ta sẽ không có đủ yêu cầu prefill để có thể luôn tạo ra một batch hybrid của prefill và decode. Chunked-prefills cho phép chúng ta xây dựng nhiều batch hybrid từ một yêu cầu prefill duy nhất, do đó tăng phạm vi bao phủ của các decode có thể gắn kết với một prefill. Trong batch hybrid của chúng tôi, khối prefill duy nhất đảm bảo sử dụng GPU cao, trong khi các yêu cầu giai đoạn decode 'gắn kết' cùng. Cho một tỷ lệ token prefill-to-decode trung bình cho một ứng dụng LLM, chúng tôi chọn kích thước khối prefill tối đa hóa hiệu suất tổng thể.
+
+Các batch hybrid được xây dựng trong SARATHI có yêu cầu tính toán đồng nhất. Do đó, khi được sử dụng với pipeline parallelism, SARATHI đảm bảo rằng các micro-batch được cân bằng tốt, dẫn đến việc giảm đáng kể các bong bóng pipeline như được hiển thị trong Hình 1(b).
+
+Chúng tôi đánh giá SARATHI trên các mô hình và phần cứng khác nhau — LLaMA-13B trên GPU A6000, LLaMA-33B trên GPU A100, và GPT-3 với pipeline 8-way và tensor parallelism 8-way trên một cluster mô phỏng gồm 64 GPU A100.
+
+Đối với LLaMA-13B trên A6000, SARATHI cải thiện thông lượng decode lên đến 10× và dẫn đến cải thiện thông lượng end-to-end lên đến 1.33×. Tương tự, đối với LLaMA-33B trên A100, thông lượng decode của chúng tôi cải thiện 4.25×, và dẫn đến cải thiện thông lượng end-to-end 1.25×. Khi được sử dụng với pipeline parallelism, SARATHI giảm bong bóng đi 6.29×, dẫn đến tăng tốc end-to-end là 1.91×.
+
+Các đóng góp chính của bài báo chúng tôi bao gồm:
+
+1. Chunked-prefills cho phép xây dựng các đơn vị công việc bão hòa tính toán và đồng nhất.
+
+2. Decode-maximal batching cho phép các decode kém hiệu quả 'gắn kết' với các prefill hiệu quả.
+
+3. Áp dụng chunked-prefills và decode-maximal batching vào pipeline parallelism để giảm đáng kể các bong bóng pipeline.
+
+4. Đánh giá toàn diện trên nhiều mô hình, phần cứng và chiến lược parallelism cho thấy cải thiện thông lượng lên đến 1.91×.
+
+## 2 Bối cảnh
+
+Trước tiên chúng tôi đưa ra tổng quan về kiến trúc transformer, theo sau là một cuộc thảo luận ngắn gọn về hai giai đoạn của suy luận LLM và pipeline parallelism.
+
+### 2.1 Kiến trúc Transformer
+
+Hình 2 hiển thị kiến trúc của một khối transformer decoder. Mỗi khối decoder bao gồm hai module chính: self-attention và feed-forward network (FFN). Các module này có thể được chia thành sáu phép toán sau: preproj, attn, postproj (trong module attention), và ffn_ln1, ffn_ln2 (trong FFN) và others (ví dụ, layer normalization, activation functions, residual connections, v.v.).
+
+### 2.2 Các giai đoạn prefill và decode
+
+Suy luận Transformer bắt đầu với giai đoạn prefill xử lý tất cả các token đầu vào của một batch nhất định song song. Trong giai đoạn này, đầu vào cho một khối transformer là một tensor X có hình dạng [B,L,H] trong đó B biểu thị kích thước batch, L biểu thị
+
+**Hình 2:** Kiến trúc cấp cao của một khối decoder.
+
+độ dài chuỗi của mỗi yêu cầu (tức là số lượng token đầu vào trong truy vấn nhất định), và H là kích thước embedding của mô hình (ví dụ, 5120 cho LLaMA-13B).
+
+Bảng 1 hiển thị các hình dạng của tensor đầu vào, đầu ra và trọng số của các phép toán khác nhau. Mỗi khối transformer trước tiên tính toán self-attention trên một đầu vào X nhất định. Thông thường, multi-head attention được sử dụng, nhưng chúng tôi chỉ xem xét một head để đơn giản trong trình bày. Một phép biến đổi tuyến tính preproj trên X (sử dụng các tensor trọng số WQ, WK và WV có hình dạng [H,H]) tạo ra Q, K và V thường được biết đến là queries, keys và values, mỗi cái có hình dạng [B,L,H]. Bên trong, preproj là một phép nhân ma trận-ma trận duy nhất của X với tensor trọng số kết hợp có hình dạng [H,3H].
+
+Tiếp theo, tính toán attn trên Q, K và V tạo ra một tensor Y có hình dạng [B,L,H]. Cuối cùng, postproj áp dụng một phép biến đổi tuyến tính trên Y (sử dụng ma trận trọng số Wo có hình dạng [H,H]), trả về một tensor Z có hình dạng [B,L,H].
+
+Tiếp theo, module FFN thực hiện hai phép nhân ma trận-ma trận theo batch. Trong ffn_ln1, Z được nhân với một tensor trọng số có hình dạng [H,H2] tạo ra một tensor đầu ra có hình dạng [B,L,H2], sau đó được nhân với tensor trọng số có hình dạng [H2,H] trong ffn_ln2 để đầu ra tensor có hình dạng [B,L,H]. Ở đây, H2 đề cập đến chiều ẩn thứ hai của mô hình.
+
+Giai đoạn decode thực hiện các phép toán giống như prefill, nhưng chỉ cho token duy nhất được tạo ra trong lần lặp tự hồi quy cuối cùng. Do đó, tensor đầu vào trong giai đoạn decode có hình dạng [B,1,H] (trái ngược với [B,L,H] của prefill). Hơn nữa, tính toán attention cho mỗi token mới phụ thuộc vào các tensor key (K) và value (V) của tất cả các token trước đó trong cùng một yêu cầu. Để tránh tính toán lại K và V của tất cả các token trong mỗi lần lặp, hầu hết các triển khai cache các giá trị này trong bộ nhớ GPU - được gọi là KV cache. Lưu ý rằng các tensor K và V của mỗi token có hình dạng [1,H].
+
+### 2.3 Suy luận LLM Multi-GPU
+
+Khi kích thước mô hình của LLM tăng lên, việc mở rộng chúng thành các triển khai multi-GPU cũng như multi-node trở nên cần thiết [19, 39]. Hơn nữa, thông lượng suy luận LLM,
+
+| **Phép toán** | **Hình dạng của tensor** |
+|---|---|
+| | **Đầu vào** | **Trọng số** | **Đầu ra** |
+| preproj | [B,L,H] | [H,H] | [B,L,H] |
+| attn | [B,L,H] | - | [B,L,H] |
+| postproj | [B,L,H] | [H,H] | [B,L,H] |
+| ffn_ln1 | [B,L,H] | [H,H2] | [B,L,H2] |
+| ffn_ln2 | [B,L,H2] | [H2,H] | [B,L,H] |
+
+**Bảng 1:** Hình dạng của các tensor đầu vào, trọng số và đầu ra trong một khối transformer decoder. B, L và H biểu thị kích thước batch, kích thước embedding (aka hidden) và độ dài chuỗi (L=1 trong quá trình decode, ngoại trừ attention).
+
+cụ thể là của giai đoạn decode bị giới hạn bởi kích thước batch tối đa mà chúng ta có thể đặt vừa trên một GPU. Do đó hiệu quả suy luận có thể được hưởng lợi từ model-parallelism chia các trọng số mô hình trên nhiều GPU giải phóng bộ nhớ để hỗ trợ kích thước batch lớn hơn. Công việc trước đây đã sử dụng cả tensor-parallelism (TP) [43] (trong node) và pipeline-parallelism (PP) [6, 46, 48] (giữa các node) cho mục đích này.
+
+TP chia mỗi lớp trên các GPU tham gia. Điều này chia cả trọng số mô hình và KV cache đều trên các GPU worker, dẫn đến việc mở rộng tuyến tính của kích thước batch mỗi GPU. Tuy nhiên, nó đi kèm với chi phí giao tiếp cao do hai phép toán all-reduce mỗi lớp – một trong tính toán attention và cái khác trong FFN [43]. Hơn nữa, vì các phép toán giao tiếp này nằm trong đường dẫn quan trọng, TP chỉ được ưa chuộng trong một node duy nhất được kết nối bởi các kết nối băng thông cao như NVLink. PP chủ yếu được sử dụng để tạo điều kiện cho các triển khai cross-node cho các mô hình rất lớn, nơi mô hình không thể vừa trong một node duy nhất.
+
+So với TP, PP chia mô hình theo lớp, nơi mỗi GPU chịu trách nhiệm cho một tập hợp con của các lớp. Để giữ tất cả GPU trong 'pipeline' bận rộn, micro-batching được sử dụng. Các micro-batch này di chuyển dọc theo pipeline từ giai đoạn này sang giai đoạn tiếp theo tại mỗi lần lặp. PP có lợi thế của tỷ lệ tính toán-giao tiếp tốt hơn nhiều so với TP, vì chúng ta chỉ cần gửi activations một lần cho nhiều lớp tính toán. Hơn nữa, PP chỉ yêu cầu giao tiếp qua phép toán giao tiếp point-to-point, so với các allreduce đắt tiền hơn cần thiết trong TP. Do đó, PP là cách tiếp cận model-parallelism khả thi duy nhất khi kết nối băng thông cao như NVlink không có sẵn ở quy mô cluster. Trong các thiết lập như vậy, việc sử dụng PP có thể giúp tăng kích thước batch tối đa được hỗ trợ trong mỗi node lên 2-3×, do đó cải thiện hiệu quả suy luận LLM.
+
+## 3 Động lực
+
+Trong phần này, chúng tôi cho thấy rằng suy luận LLM kém hiệu quả vì hai lý do chính: (1) giai đoạn decoding bị giới hạn bởi bộ nhớ, và (2) việc sử dụng pipeline parallelism dẫn đến các bong bóng pipeline đáng kể cho LLM. Cùng nhau, những yếu tố này dẫn đến việc sử dụng GPU kém cho suy luận LLM.
+
+**Hình 3:** Thời gian prefill và decode mỗi token với các kích thước batch khác nhau (độ dài chuỗi = 1024) cho LLaMa-13B trên GPU A6000. Prefill bão hòa tính toán GPU ngay cả ở kích thước batch là 1 và dẫn đến thời gian mỗi token gần như không đổi qua các kích thước batch. Decode không sử dụng hết tính toán GPU và có thể tốn gấp 200× prefill ở kích thước batch 1. Chi phí gia tăng của các toán tử tuyến tính cho decode gần như bằng không khi kích thước batch tăng. Chi phí attention không được hưởng lợi từ kích thước batch vì nó bị giới hạn bởi bộ nhớ.
+
+### 3.1 Phân tích Thông lượng Prefill và Decode
+
+Hình 3 hiển thị chi phí mỗi token của mỗi trong sáu phép toán transformer (§2.1) cho prefill và decode ở các kích thước batch khác nhau cho độ dài chuỗi cố định (prefill+decode) là 1024. Đầu tiên, chúng tôi quan sát rằng prefill có chi phí mỗi token gần như không đổi qua các kích thước batch khác nhau, cho thấy rằng prefill bão hòa GPU ngay cả ở kích thước batch là 1. Thứ hai, chúng ta thấy rằng decode hoạt động rất khác so với prefill vì chi phí mỗi token giảm đáng kể khi kích thước batch tăng. Thứ ba, chúng ta thấy rằng chi phí decode mỗi token là 200×, 100× và 16.7× so với prefill ở kích thước batch 1, 2 và 18, tương ứng. Do đó, rõ ràng rằng tối ưu hóa decode là quan trọng cho suy luận LLM hiệu quả. Cuối cùng, chúng ta thấy rằng các phép toán dưới others đóng góp ít hơn 5% tổng thời gian chạy của khối transformer. Do đó, chúng tôi chỉ tập trung vào tối ưu hóa năm phép toán chính và bỏ qua others.
+
+Hình 4a hiển thị thông lượng của các giai đoạn prefill và decode cho các kích thước batch (B) và độ dài chuỗi (L) khác nhau. Chúng tôi quan sát rằng thông lượng của giai đoạn prefill bão hòa ở khoảng 180 token/millisecond khi B×L≥512: ví dụ, một yêu cầu prefill duy nhất có thể đạt được thông lượng đỉnh ở L≥512. Ngược lại, thông lượng decode tăng tuyến tính với kích thước batch nhỏ. Để hiểu rõ hơn điểm bão hòa của giai đoạn decode, chúng tôi profile một lớp duy nhất thay vì 40 lớp của mô hình đầy đủ. Điều này cho phép chúng tôi đặt vừa các batch lớn hơn 40× trên GPU do dung lượng bộ nhớ giảm của trọng số mô hình và KV cache. Chúng tôi thấy rằng decode bão hòa ở batch lớn hơn nhiều (ví dụ, 256 với độ dài chuỗi 1024). Các batch lớn như vậy không khả thi để chạy với mô hình đầy đủ.
+
+Để giải thích hành vi này, chúng tôi profile cường độ số học của các phép toán riêng lẻ: cường độ số học nắm bắt lượng tính toán trên mỗi lần đọc/ghi bộ nhớ có thể được sử dụng để phân biệt giữa các phép toán bị giới hạn bởi tính toán và bị giới hạn bởi bộ nhớ
+
+**Hình 4:** Tác động của cường độ số học (dưới) lên thông lượng (trên) của prefill và decode cho LLaMA-13B trên GPU A6000.
+
+phép toán. Hình 4b hiển thị cường độ số học của mỗi phép toán riêng biệt cho giai đoạn prefill (trái) và decode (phải). Như được hiển thị, trong giai đoạn prefill, tất cả các phép toán có cường độ số học cao, ngay cả ở kích thước batch là một. Mặt khác, cường độ số học của các phép toán này giảm hơn hai bậc độ lớn trong giai đoạn decode. Chỉ ở kích thước batch rất lớn là 256, giai đoạn decode bắt đầu trở nên tính toán-intensive. Tuy nhiên, việc mở rộng kích thước batch đến các giá trị cao như vậy là không khả thi do dung lượng KV-cache của mỗi yêu cầu. Ví dụ, chúng ta có thể đặt vừa kích thước batch tối đa là 18 yêu cầu ở độ dài chuỗi 1K cho mô hình LLaMA-13B trên GPU A6000. Do đó, trong phạm vi kích thước batch thực tế ngày nay, giai đoạn decode vẫn bị giới hạn bởi bộ nhớ.
+
+Sự khác biệt giữa việc mở rộng thông lượng của hai giai đoạn này bắt nguồn từ thực tế là giai đoạn prefill tính toán các phép nhân ma trận-ma trận (theo batch) trái ngược với các phép nhân vector-ma trận của giai đoạn decode. Điều đã biết rằng các kernel có cường độ số học trên tỷ lệ FLOPS:MemBandwidth của GPU bị giới hạn bởi tính toán và có thể được thực thi hiệu quả [11]. Ngược lại, các kernel với cường độ số học thấp hơn không thể sử dụng GPU tốt do bị giới hạn bởi bộ nhớ.
+
+### 3.2 Bong bóng Pipeline trong Suy luận LLM
+
+Pipeline Parallelism (PP) là một chiến lược phổ biến cho triển khai cross-node của các mô hình lớn, do chi phí giao tiếp thấp hơn so với Tensor Parallelism (TP). PP chia mô hình theo lớp, nơi mỗi GPU chịu trách nhiệm cho một tập hợp con của các lớp; so với TP chia mỗi lớp trên các GPU tham gia. Như đã thảo luận trong §2.3, so với TP, PP có tỷ lệ tính toán-giao tiếp tốt hơn nhiều và không yêu cầu các kết nối đắt tiền.
+
+Tuy nhiên, một thách thức với PP là nó giới thiệu các bong bóng pipeline hoặc các khoảng thời gian không hoạt động của GPU khi các giai đoạn pipeline tiếp theo phải chờ đợi việc hoàn thành micro-batch tương ứng trong các giai đoạn trước. Bong bóng pipeline là một vấn đề đã biết trong các công việc training, nơi chúng phát sinh giữa các lần truyền tiến và lùi do các giai đoạn trước cần phải chờ đợi lần truyền lùi đến. Micro-batching do đó thường được sử dụng trong các công việc PP training để phân bổ các bong bóng trên nhiều micro-batch tạo thành một batch [24,34,37].
+
+Khác với training, vì các công việc suy luận chỉ thực hiện các lần truyền tiến và không có lần truyền lùi, người ta có thể mong đợi rằng việc sử dụng micro-batch sẽ hoàn toàn tránh được các bong bóng pipeline trong quá trình suy luận. Thực tế, công việc trước đây về suy luận transformer, như FasterTransformer [6] và FastServe [46] sử dụng micro-batch và không xem xét vấn đề bong bóng với PP.
+
+Orca [48] gợi ý rằng việc sử dụng lập lịch iteration-level loại bỏ các bong bóng trong lập lịch pipeline (xem Hình 8 trong [48]). Tuy nhiên, như chúng tôi chỉ ra trong bài báo này, ngay cả với lập lịch iteration-level của các yêu cầu, mỗi micro-batch (hoặc iteration) trong suy luận LLM có thể yêu cầu một lượng tính toán khác nhau (và do đó có thời gian thực thi thay đổi), tùy thuộc vào thành phần của các token prefill và decode trong micro-batch (xem Hình 5). Chúng tôi xác định ba loại bong bóng trong quá trình suy luận: (1) các bong bóng như PB1 xảy ra do số lượng token prefill thay đổi trong hai micro-batch liên tiếp (2) các bong bóng như PB2 xảy ra do thời gian tính toán khác nhau của các giai đoạn prefill và decode khi một giai đoạn theo sau giai đoạn khác, và (3) các bong bóng như PB3 xảy ra do sự khác biệt trong thời gian tính toán decode giữa các micro-batch vì độ dài ngữ cảnh tích lũy (độ dài KV cache) thay đổi giữa các yêu cầu. Các bong bóng pipeline này là các chu kỳ GPU lãng phí và trực tiếp tương ứng với mất mát trong thông lượng phục vụ với pipeline parallelism. Nếu chúng ta có thể đảm bảo rằng mỗi micro-batch thực hiện tính toán đồng nhất, chúng ta có thể giảm thiểu các bong bóng pipeline này.
+
+**Hình 5:** Bong bóng pipeline trong suy luận LLM Một lịch trình iteration-level PP 2-way [48] trên 4 yêu cầu (A,B,C,D) cho thấy sự tồn tại của các bong bóng pipeline do thời gian thực thi batch không đồng nhất.
+
+### 3.3 Insights
+
+Các thí nghiệm của chúng tôi cho thấy rằng các giai đoạn prefill và decode có các mẫu sử dụng tính toán rất khác nhau – prefill có thể bão hòa tính toán GPU ngay cả với một yêu cầu duy nhất, trong khi decode yêu cầu kích thước batch lớn để có hiệu quả tính toán. Tuy nhiên các batch lớn không thực tế do dung lượng KV cache cao của chúng. Việc sử dụng tài nguyên không cân xứng như vậy ngụ ý rằng đối với mỗi yêu cầu, có các giai đoạn sử dụng tính toán cao do prefill hiệu quả, theo sau bởi một đuôi dài có thể có của các decode kém hiệu quả dẫn đến việc sử dụng GPU tổng thể kém. Hơn nữa, sự không đồng nhất trong thời gian tính toán giữa các micro-batch dẫn đến các bong bóng pipeline, dẫn đến các triển khai pipeline parallel multi-GPU kém hiệu quả.
+
+Quan sát này dẫn chúng tôi đến insight chính của chúng tôi rằng có thể xây dựng các batch tính toán-intensive đồng nhất bằng cách (1) cắt một yêu cầu prefill lớn thành các khối hiệu quả tính toán và đồng nhất nhỏ hơn bằng cách sử dụng chunked-prefills và (2) tạo ra một batch hybrid của một khối prefill và piggybacking decode cùng với khối này. Do đó, việc tạo ra các batch đồng nhất và tính toán-intensive như vậy đảm bảo sử dụng GPU cao xuyên suốt, cũng như giảm thiểu các bong bóng pipeline trong các triển khai multi-GPU bằng cách loại bỏ phương sai thời gian chạy giữa các micro-batch trong các giai đoạn khác nhau của pipeline.
+
+## 4 SARATHI: Thiết kế và Triển khai
+
+Trong phần này, chúng tôi mô tả thiết kế và triển khai của SARATHI, sử dụng hai kỹ thuật - chunked-prefills và decode-maximal batching để cải thiện hiệu suất của suy luận LLM.
+
+### 4.1 Tổng quan
+
+Các engine suy luận thông thường như FasterTransformer [6] thực hiện lập lịch suy luận ở cấp độ yêu cầu. Chúng xử lý các batch ở granularity yêu cầu; tức là chúng chọn batch tiếp theo của các yêu cầu để thực thi trên bản sao mô hình chỉ khi tất cả các yêu cầu trong batch hiện tại hoàn thành. Trong khi điều này giảm độ phức tạp hoạt động của khung lập lịch, nó kém hiệu quả trong việc sử dụng tài nguyên. Các yêu cầu ngắn hơn trong một batch phải được padding để khớp với độ dài của yêu cầu dài nhất, và do đó thực hiện công việc lãng phí thay vì thoát sớm. Thay vào đó, lập lịch iteration-level đã được đề xuất trong các hệ thống gần đây hơn như Orca [48], vLLM [20], và HuggingFace TGI [17], nơi tùy thuộc vào kích thước batch được xác định trước b, các yêu cầu có thể động vào và ra khỏi một batch.
+
+Tuy nhiên, các hệ thống lập lịch iteration-level ngày nay không chú ý đến các yêu cầu tạo thành batch, và thời gian thực thi thay đổi giữa các batch. Cụ thể, một batch có thể bao gồm các yêu cầu chỉ trong giai đoạn prefill, các yêu cầu chỉ trong giai đoạn decode, hoặc các yêu cầu hỗn hợp bao gồm một vài prefill và decode, với ràng buộc duy nhất là kích thước batch là b mọi lúc. Như đã thảo luận trong §3.3, việc tạo thành batch như vậy dẫn đến các đơn vị tính toán không đồng nhất, dẫn đến các giai đoạn sử dụng tài nguyên bùng nổ, và các bong bóng pipeline. SARATHI giải quyết thách thức này bằng cách giới thiệu hai kỹ thuật chính: chunked-prefills và decode-maximal batching.
+
+### 4.2 Chunked-prefills
+
+Chunked-prefills là một cơ chế chia tách prefill dựa trên hai insight chính. Đầu tiên, đối với một mô hình và GPU nhất định, việc tăng số lượng token prefill cho thấy lợi nhuận giảm dần trong thông lượng vượt quá một điểm nhất định như được hiển thị trong Hình 4a. Ví dụ, mô hình Llama-13B đạt được thông lượng prefill đỉnh trên GPU A6000 khi số lượng token prefill là 512 hoặc cao hơn. Ở kích thước khối 256, chúng ta thấy việc giảm nhẹ 12.5% trong thông lượng đỉnh. Hơn nữa, khi kích thước của chiều ẩn trong mô hình tăng, kích thước khối cần thiết để bão hòa tính toán GPU giảm; ví dụ, thông lượng của một lớp duy nhất của GPT-3 (kích thước ẩn = 12288) đạt đỉnh ở kích thước khối 256 trên GPU A100. Điều này ngụ ý rằng một batch bão hòa tính toán có thể được tạo thành với một khối prefill được cắt cẩn thận. Thứ hai, trong nhiều tình huống thực tế, kích thước của prefill khá lớn, từ 1K – 4K trong các khối lượng công việc sản xuất, do đó mở ra cánh cửa cho việc chunking một yêu cầu prefill thành các đơn vị tính toán nhỏ hơn.
+
+Triển khai chunked-prefills yêu cầu thiết lập cẩn thận attention mask. Nếu input prompt của một yêu cầu có kích thước 1K được chia thành bốn khối có kích thước 256 token mỗi khối, chúng ta cần đảm bảo rằng các attention mask được thiết lập phù hợp cho mỗi khối prefill tiếp theo cho đến khi kết thúc prompt. Để dễ trình bày, sử dụng ví dụ về kích thước khối là bốn, Hình 6 hiển thị cách SARATHI từng bước thiết lập attention mask cho mỗi khối liên tiếp của một prefill prompt trong ba lần lặp liên tiếp: mỗi query token qi có thể nhìn vào các key (và value) của tất cả các token đứng trước nó, nhưng không phải những cái theo sau. Thiết lập attention mask theo cách này đảm bảo rằng tính toán chunked-prefills tương đương về mặt toán học với prefill đầy đủ.
+
+**Hình 6:** Ví dụ về cách attention mask được thiết lập qua các lần lặp prefill khối khác nhau trong SARATHI (q và k đại diện cho các token "query" và "key", tương ứng). Attention mask cho v ("values") được thiết lập tương tự.
+
+**Overhead của chunked-prefills.** Việc cắt input của một chuỗi prefill thành nhiều khối nhỏ hơn có hai nguồn overhead tiềm năng. Đầu tiên, cường độ số học của tính toán chunked-prefills giảm khi kích thước khối trở nên nhỏ hơn. Do đó, các khối nhỏ hơn có thể ảnh hưởng đến hiệu quả prefill do sử dụng GPU thấp. Tuy nhiên, điều này có thể được giải quyết dễ dàng bằng một lần profiling thông lượng prefill cho các kích thước khối khác nhau trên một tổ hợp mô hình-phần cứng nhất định và các khối lượng công việc mong đợi và có thể chọn kích thước khối sao cho thông lượng end-to-end của mô hình được tối đa hóa.
+
+Thứ hai, chunked-prefills gây ra overhead nhẹ trong tính toán attention do truy cập bộ nhớ lặp lại của KV cache của các token của yêu cầu từ các khối trước. Trong khi mỗi phép toán chunked-prefills cho đến khi kết thúc prompt sẽ thực hiện cùng số lượng tính toán cho FFN, kernel attention trong mỗi khối tiếp theo sau khối đầu tiên sẽ phải đọc lại tất cả các cặp KV của các token trước đó từ bộ nhớ GPU, như được hiển thị trong Hình 6. Ví dụ, nếu một chuỗi prefill được chia thành N khối, thì KV cache của khối đầu tiên được tải N lần, KV cache của khối thứ hai được tải N−1 lần, và cứ thế. Tuy nhiên, overhead do thời gian attention tăng không ảnh hưởng đáng kể đến hiệu quả prefill end-to-end vì tính toán attention là một phần nhỏ của tổng thời gian forward pass như được thấy trong Bảng 2. Chúng tôi trình bày một phân tích chi tiết về các overhead của chunked-prefills trong §5.4.
+
+### 4.3 Decode-Maximal Batching
+
+Việc khai thác lợi ích của chunked-prefills yêu cầu chúng ta xây dựng cẩn thận một batch hybrid bao gồm một hỗn hợp của các token prefill và decode, để tối đa hóa sử dụng tính toán và đảm bảo thời gian tính toán đồng nhất qua tất cả các batch. Chúng tôi đề xuất decode-maximal batching để giảm thiểu sự mất cân bằng trong sử dụng tính toán và bộ nhớ trong lập lịch lặp bằng cách khai thác ý tưởng của chunked-prefills.
+
+Trong decode-maximal batching, chúng tôi xây dựng một batch bằng cách sử dụng một khối prefill duy nhất và piggybacking các slot còn lại với các token decode. Batch hybrid này cung cấp cho chúng ta các đơn vị công việc vừa bão hòa tính toán vừa đồng nhất. Bây giờ chúng tôi thảo luận về cách chúng tôi xây dựng một batch hybrid để đạt được hiệu quả tối đa.
+
+#### 4.3.1 Piggybacking decode với prefill
+
+Để piggyback decode với một prefill, chúng ta cần chăm sóc hai điều. Đầu tiên, chúng ta cần xác định kích thước batch tối đa có thể của các decode có thể được piggybacked và cũng xác định số lượng token prefill tạo thành khối prefill. Thứ hai, để thực sự sử dụng tính toán prefill bão hòa GPU của batch hybrid để làm cho các decode hiệu quả, chúng ta cần fuse các tính toán phép toán tuyến tính cho khối prefill và decode của batch thành một phép toán duy nhất.
+
+**Decode batch.** Kích thước batch decode tối đa để được piggybacked với một khối prefill được xác định dựa trên bộ nhớ GPU có sẵn (MG), yêu cầu bộ nhớ tham số của mô hình mỗi GPU (MS), và độ dài chuỗi tối đa L mà mô hình hỗ trợ. Tổng của các token prefill (P) và decode (D) mỗi yêu cầu không thể vượt quá độ dài chuỗi tối đa này. Giả sử bộ nhớ cần thiết cho mỗi cặp K và V cho một token là mkv, kích thước batch tối đa cho phép B được xác định như sau:
+
+B = ⌊(MG−MS)/(L∗mkv)⌋
+
+Trong scheme baseline, các batch chỉ decode có thể có kích thước tối đa là B. Trong SARATHI, số lượng decode có thể tối đa là B−1 vì chúng piggyback cùng với một khối prefill (KV cache của prefill cũng cần phải ở trong bộ nhớ GPU cho đến khi các lần lặp decode tương ứng của nó bắt đầu).
+
+Trong decode-maximal batching, chúng tôi fuse tất cả các phép toán tuyến tính, trong khi để các tính toán attention cho prefill và decode xảy ra riêng biệt. Phép toán attention cho các yêu cầu decode được batch lại với nhau, trong khi attention trong khối prefill được xử lý riêng biệt.
+
+**Hiệu quả Decode.** Nhớ lại rằng các giai đoạn prefill và decode tuân theo cùng đường dẫn tính toán, tức là các phép toán tuyến tính sử dụng các tensor trọng số giống nhau trong cả giai đoạn prefill và decode. Tuy nhiên, so với prefill, một lần lặp decode chỉ bao gồm một vài token đầu vào (bằng kích thước batch). Do đó, hầu hết thời gian tính toán trong baseline decoding được dành cho việc lấy trọng số mô hình từ bộ nhớ global của GPU. Ngược lại, decode-maximal batching tính toán trên các token decode sử dụng các phép nhân ma trận ma trận, bằng cách kết hợp các token decode với các token prefill trong một phép toán nhân ma trận duy nhất. Điều này, một cách hiệu quả loại bỏ nhu cầu tải trọng số mô hình riêng biệt cho decoding — tức là một khi trọng số mô hình được lấy cho prefill, chúng cũng được tái sử dụng cho decoding. Kết quả là, decode-maximal batching chuyển đổi decoding từ việc ở trong giai đoạn bị giới hạn bởi bộ nhớ sang việc ở trong giai đoạn bị giới hạn bởi tính toán. Theo cách này, các decode, khi được piggybacked với prefill đi kèm với chi phí biên trong SARATHI (lưu ý rằng chi phí attention vẫn không thay đổi).
+
+Để minh họa các chi phí khác nhau liên quan thông qua một ví dụ, Bảng 2 so sánh runtime của một lần lặp decode-maximal batching với scheme baseline tính toán các lần lặp prefill và decode riêng biệt. Với baseline batching, một lần lặp chỉ decode tiêu tốn 12.49 millisecond mỗi token. Ngược lại, thời gian decode mỗi token chỉ là 1.2 millisecond với decode-maximal batching. Điều này cho thấy rằng piggybacking decode với prefill có thể cải thiện thông lượng decode lên đến một bậc độ lớn.
+
+| **Scheme Batching** | **Phép toán** | | **Tổng Thời gian** | **Mỗi token** |
+|---|---|---|---|---|
+| | **Tuyến tính** | **Attn** | | **Prefill** | **Decode** |
+| Chỉ Prefill | 224.8 | 10 | 234.8 | 0.229 | - |
+| Chỉ Decode | 44.28 | 5.68 | 49.96 | - | 12.49 |
+| Decode-maximal | 223.2 | 15.2 | 238.4 | 0.229 | 1.2 |
+
+**Bảng 2:** Thời gian prefill và decode mỗi token (tính bằng ms) Đối với LLaMA-13B trên GPU A6000, các hàng hiển thị thời gian phép toán cho 1) các yêu cầu chỉ prefill có kích thước prompt 1024 của kích thước batch 4, 2) kích thước batch chỉ decode là 4 với độ dài chuỗi 1024, và c) một batch hỗn hợp của một prefill 1021 duy nhất và 3 decode. Decode-maximal batching giảm thời gian decode mỗi token đi một bậc độ lớn.
+
+### 4.4 Xác định kích thước khối lý tưởng
+
+Một cân nhắc thiết kế quan trọng trong SARATHI là cách chọn kích thước khối phù hợp nhất. Một lựa chọn đơn giản là chọn kích thước khối nhỏ nhất bão hòa thông lượng prefill của mô hình. Tuy nhiên, chúng tôi thấy rằng chiến lược này không phải là hiệu quả nhất trong nhiều trường hợp.
+
+Để chứng minh tầm quan trọng của kích thước khối, chúng tôi giới thiệu một ký hiệu đơn giản "tỷ lệ P:D" được tính là tỷ lệ của số lượng token prefill với số lượng token decode trong một batch nhất định. Ví dụ, tỷ lệ P:D là 10 ngụ ý rằng số lượng token prefill là 10 lần so với decode. Đối với một P+D cố định, giá trị tỷ lệ P:D thấp hơn có nghĩa là có nhiều token decode hơn trong một batch so với một batch có giá trị tỷ lệ P:D cao hơn.
+
+Kích thước của các khối prefill trong SARATHI ảnh hưởng đến số lượng decode có thể được piggybacked bằng decode-maximal batching. Ví dụ, xem xét kích thước batch là bốn yêu cầu (trong đó một yêu cầu ở giai đoạn prefill và ba ở giai đoạn decode) và kích thước khối là 128. Một prefill có kích thước P sau đó sẽ tạo ra P/128 prefill-chunk, cho phép P/128 × 3 ≈ P/42 decode piggyback. Do đó, trong trường hợp này, khi tỷ lệ P:D lớn hơn 42, nó cho phép chúng ta overlap tất cả decode với prefill. Tương tự, nếu kích thước khối là 256, thì tất cả decode có thể được piggybacked khi tỷ lệ P:D lớn hơn 84. Do đó, kích thước khối thấp hơn có thể giúp piggyback nhiều token decode hơn cho một chuỗi prefill nhất định.
+
+Lưu ý rằng thời gian decoding tăng khi tỷ lệ P:D giảm. Do đó, vượt quá một điểm nhất định, việc tối ưu hóa decode trở nên quan trọng hơn việc thực thi prefill ở hiệu quả đỉnh. Ví dụ, nếu các giai đoạn prefill và decode tiêu thụ 10% và 90% tổng thời gian, tương ứng, thì ngay cả overhead 5× trong prefill cũng có thể chấp nhận được nếu các decode có thể được tối ưu hóa 2× hoặc hơn.
+
+Tóm lại, việc xác định kích thước khối phù hợp liên quan đến một sự đánh đổi: các khối nhỏ hơn piggyback nhiều decode hơn nhưng với cái giá của hiệu quả prefill thấp hơn trong khi các khối lớn hơn hiệu quả prefill nhưng piggyback ít decode hơn. Do đó, kích thước khối lý tưởng phụ thuộc vào tỷ lệ P:D mong đợi và sự phân chia giữa thời gian prefill và decode cho một ứng dụng nhất định.
+
+**Hiệu ứng tile quantization.** Ngoài ra, chúng tôi quan sát một chi tiết phức tạp liên quan đến kích thước khối. GPU tính toán matmul bằng cách phân vùng các ma trận nhất định thành các tile và gán chúng cho các thread block khác nhau để tính toán song song. Ở đây, mỗi thread block đề cập đến một nhóm thread và tính toán cùng số lượng phép toán số học. Do đó, matmul đạt được sử dụng GPU tối đa khi các chiều ma trận chia hết cho kích thước tile. Nếu không, do tile quantization, một số thread block thực hiện tính toán ngoại lai (lãng phí) [11].
+
+**Hình 7:** Hiệu ứng của tile quantization trên runtime của một lần lặp LLaMA-13B trên GPU A6000.
+
+Lưu ý rằng thời gian để tính toán một chuỗi prefill đột ngột tăng khi độ dài chuỗi chỉ cao hơn một bội số của 128 (kích thước tile trong các thí nghiệm của chúng tôi). Ví dụ, như được hiển thị trong Hình 7, việc tăng gấp đôi độ dài chuỗi từ 128 lên 256 token tăng thời gian lặp 27% — từ 55ms lên 69.8ms. Tuy nhiên, việc thêm chỉ một token nữa tăng thời gian lặp lên 92.33ms — một sự tăng đáng kể 32% do chỉ một token bổ sung. Điều này cho thấy rằng GPU hiệu quả nhất ở matmul khi độ dài chuỗi là bội số của kích thước tile.
+
+Do đó, việc chọn kích thước khối lý tưởng là một quyết định hai mặt. Đầu tiên, chọn kích thước khối dựa trên hiệu quả prefill mong muốn cho khối lượng công việc nhất định. Tiếp theo, đảm bảo rằng tổng của kích thước khối và số lượng token decode piggybacked là bội số của kích thước tile. Điều này đảm bảo rằng chiều ma trận liên quan của các phép toán fused vẫn là bội số của kích thước tile. Ví dụ, nếu kích thước khối được chọn là 256, kích thước tile là 128, và kích thước batch tối đa cho phép là B, thì kích thước khối prefill nên là 256 − (B−1).
+
+### 4.5 Triển khai
+
+Chúng tôi triển khai SARATHI trên codebase nanoGPT [12] với hỗ trợ cả chunked-prefills và decode-maximal batching. Để so sánh với lập lịch iteration-level của Orca, chúng tôi sử dụng cơ chế mixed batching của chúng tôi, không có ràng buộc về số lượng prefill được phép mỗi batch. Điều này đảm bảo rằng không có sự khác biệt trong kết quả giữa baseline và SARATHI do sự khác biệt trong triển khai. Để tính toán phép toán attention, chúng tôi sử dụng triển khai xformers [21] vì trong thiết lập của chúng tôi, nó vượt trội hơn các triển khai attention tích hợp của PyTorch 2.0: tức là flash attention, memory-efficient attention, và các kernel math attention. Để tránh phân bổ bộ nhớ cho KV cache trong mỗi lần lặp decode, chúng tôi pre-allocate KV cache theo độ dài chuỗi tối đa cho mỗi thí nghiệm và cập nhật các cặp KV tương ứng tại chỗ khi cần thiết.
+
+| **Mô hình** | **GPU** | **Số GPU** | **Bộ nhớ mỗi GPU (GB)** | **Chế độ** |
+|---|---|---|---|---|
+| LLaMA-13B | A6000 | 1 | 48 | Triển khai |
+| LLaMA-33B | A100 | 1 | 80 | Triển khai |
+| GPT-3 | A100 | 64 | 80 | Mô phỏng |
+
+**Bảng 3:** Mô hình, GPU và chế độ đánh giá.
+
+Chúng tôi hỗ trợ các cấu hình mô hình khác nhau trong codebase của chúng tôi để đánh giá SARATHI trên các tổ hợp mô hình và phần cứng khác nhau. Ví dụ, để đánh giá LLaMA-13B, chúng tôi đặt số lượng lớp và attention head thành 40, và kích thước ẩn thành 5120. Đối với LLaMA-33B, chúng tôi sử dụng 60 lớp, 52 attention head, và kích thước ẩn là 6656. Đối với GPT-3, chúng tôi sử dụng 96 lớp, 96 attention head, và kích thước ẩn là 12288. Các cấu hình theo các tham số kiến trúc có sẵn công khai của các mô hình này [10, 14].
+
+## 5 Đánh giá
+
+Chúng tôi đánh giá SARATHI trên nhiều mô hình và GPU khác nhau sử dụng các triển khai vật lý cho các thí nghiệm GPU đơn và mô phỏng dựa trên profile cho các thí nghiệm quy mô lớn như được hiển thị trong Bảng 3. Đánh giá của chúng tôi tìm cách trả lời các câu hỏi sau:
+
+1. Tác động của SARATHI lên thông lượng của decode cũng như thông lượng end-to-end của LLM là gì? Ngoài ra, tác động của việc thay đổi độ dài chuỗi, kích thước batch và tỷ lệ P:D là gì (§5.1)?
+
+2. SARATHI so sánh như thế nào với các cơ chế lập lịch iteration-level hiện có như Orca (§5.2)?
+
+3. Tác động của các kỹ thuật của chúng tôi lên bong bóng GPU và thông lượng của các mô hình pipeline-parallel là gì (§5.3)?
+
+4. Các overhead của chunked-prefills là gì (§5.4)?
+
+### 5.1 Đánh giá trên GPU Đơn
+
+Trong phần này, chúng tôi đo tăng tốc decode và thông lượng end-to-end của SARATHI, trên GPU đơn, so với baseline thực thi các giai đoạn prefill và decode riêng biệt qua các batch chỉ prefill và chỉ decode. Hơn nữa, chúng tôi kiểm tra các hiệu ứng của việc thay đổi tỷ lệ P:D (tỷ lệ của token prefill với decode), độ dài chuỗi (tổng token mỗi yêu cầu —P+D), và kích thước batch trên thông lượng tổng thể.
+
+#### 5.1.1 Tăng tốc decode
+
+Trước tiên chúng tôi hiển thị tác động của các kỹ thuật của chúng tôi lên thông lượng giai đoạn decode mà chúng tôi tính toán dựa trên thời gian trung bình dành cho decoding một token. Đối với hệ thống baseline, chúng tôi tính toán thời gian decode trung bình mỗi token bằng cách chia thời gian để xử lý một lần lặp decode cho kích thước batch. Trong SARATHI,
+
+**Hình 8:** Tăng tốc chỉ decode với SARATHI trên GPU A6000 với LLaMA-13B (kích thước khối = 256).
+
+| **Mô hình (GPU)** | **Độ dài Chuỗi** | **Kích thước Batch** | **Tỷ lệ P:D** | **Tăng tốc Decode** | **Tăng Thông lượng** |
+|---|---|---|---|---|---|
+| LLaMA-13B (A6000) | 1K | 6 | 50:1 | 5.45× | 1.33× |
+| | 2K | 6 | 50:1 | 3.26× | 1.26× |
+| | 3K | 6 | 50:1 | 2.51× | 1.22× |
+| LLaMA-33B (A100) | 1K | 10 | 28:1 | 3.83× | 1.25× |
+| | 2K | 5 | 63:1 | 4.25× | 1.22× |
+| | 3K | 3 | 127:1 | 3.51× | 1.14× |
+
+**Bảng 4:** Tăng thông lượng đỉnh với SARATHI cho các độ dài chuỗi khác nhau với hai tổ hợp mô hình-GPU khác nhau (kích thước khối = 256).
+
+nơi các decode được piggybacked, cho một batch với p+d token, trong đó p biểu thị kích thước khối prefill và d biểu thị kích thước batch decode, chúng tôi tìm sự khác biệt trong runtime giữa batch decode-maximal và batch chỉ prefill có kích thước prefill p, và gán sự khác biệt thời gian là thời gian decode biên cho một batch d yêu cầu. Thời gian decode biên này sau đó được sử dụng để tính toán thời gian decode mỗi token.
+
+Hình 8 vẽ kết quả cho kích thước khối 256 cho LlaMa-13B trên GPU A6000, khi chúng tôi thay đổi kích thước batch, lên đến giá trị tối đa tương ứng mà vừa, cho ba độ dài chuỗi prefill khác nhau. Chúng tôi quan sát rằng chunked-prefills cải thiện hiệu quả decode lên đến một bậc độ lớn so với baseline. Thông lượng decode của SARATHI cao hơn do decode-maximal batching tính toán các token decode với matrix-multiplication, cho phép tái sử dụng trọng số mô hình — cho cả prefill và decode — một khi chúng được lấy từ bộ nhớ global của GPU.
+
+Chúng tôi quan sát rằng tăng tốc decode của chúng tôi giảm khi chúng tôi tăng kích thước batch hoặc độ dài chuỗi. Hành vi này được mong đợi vì những lý do sau: (1) decode trong hệ thống baseline trở nên hiệu quả hơn khi kích thước batch tăng, và (2) chi phí attention tăng theo bậc hai với độ dài chuỗi: vì tất cả các cải tiến của chúng tôi đến từ việc tối ưu hóa các phép toán tuyến tính, chi phí attention cao hơn giảm phạm vi cải tiến của chúng tôi. Tuy nhiên, cải thiện thông lượng decode của chúng tôi vẫn đáng kể trong tất cả các trường hợp (2.8×−10×).
+
+#### 5.1.2 Tăng thông lượng đỉnh với SARATHI
+
+Bảng 4 hiển thị tăng thông lượng đỉnh mà SARATHI đạt được so với baseline. Để chứng minh tính tổng quát của các kỹ thuật của chúng tôi, chúng tôi đánh giá SARATHI trên hai tổ hợp mô hình-GPU: (1) LLaMA-13B trên GPU A6000 và (2) LLaMA-33B trên GPU A100. Hơn nữa, chúng tôi điều tra tăng thông lượng đỉnh với các chuỗi thay đổi có độ dài 1K, 2K và 3K. Bảng 4 hiển thị các kích thước batch và tỷ lệ P:D nơi chúng tôi đạt được tăng tốc tối đa.
+
+Trong trường hợp tốt nhất, các kỹ thuật của chúng tôi cải thiện thông lượng end-to-end lên đến 1.33× cho LLaMA-13B và lên đến 1.25× cho LLaMA-33B. Chúng tôi quan sát rằng tăng tốc tương đối cao hơn trên GPU A6000 so với GPU A100. Điều này là do tỷ lệ FLOP/MemBandwidth cao hơn của GPU A100 so với GPU A6000 (≈156 vs. ≈53, bỏ qua cache GPU). Do đó, chúng tôi yêu cầu kích thước khối cao hơn trên GPU A100 (hoặc mô hình với kích thước embedding cao hơn) để tránh mất hiệu quả prefill. Tuy nhiên, SARATHI vẫn nhất quán vượt trội hơn baseline 1.14×-1.25× trên GPU A100. Những kết quả này cho thấy rằng piggybacking token decode với các khối prefill hữu ích trên một phạm vi rộng của mô hình và phần cứng. Chúng tôi lưu ý rằng mặc dù chúng tôi cải thiện hiệu quả decode lên đến một bậc độ lớn, các tăng tốc end-to-end và lần lượt tiết kiệm tiền bạc trong chi phí suy luận ở mức 25%. Điều này là vì kỹ thuật của chúng tôi chỉ cải thiện decode chứ không phải prefill.
+
+#### 5.1.3 Hiệu ứng của việc thay đổi tỷ lệ P:D
+
+Trong phần này, sử dụng các độ dài chuỗi và kích thước khối khác nhau, chúng tôi điều tra hiệu ứng của việc thay đổi tỷ lệ P:D lên thông lượng suy luận end-to-end để bao phủ một phạm vi rộng của các tình huống ứng dụng. Tỷ lệ P:D là một tham số quan trọng cho các thí nghiệm này: tỷ lệ P:D thấp hơn cho thấy rằng một yêu cầu tạo thành nhiều token decode hơn so với các yêu cầu khác có tỷ lệ P:D cao hơn. Mặc dù tỷ lệ P:D thấp hơn ngụ ý rằng decode sẽ tạo thành một phần lớn hơn của chi phí suy luận và do đó SARATHI sẽ có nhiều diện tích tấn công hơn, tuy nhiên, nó cũng có nghĩa là sẽ có ít khối prefill hơn để piggybacking decode. Sự đánh đổi này dẫn đến một hành vi mà cải tiến từ SARATHI đạt đỉnh ở một tỷ lệ P:D cụ thể và sau đó giảm dần ở hai bên. Chúng tôi thảo luận chi tiết hơn về điều này dưới đây.
+
+Hình 9 vẽ kết quả của các thí nghiệm của chúng tôi. Chúng tôi thấy rằng hiệu quả đỉnh của các kỹ thuật của chúng tôi xảy ra ở các tỷ lệ P:D khác nhau cho các tình huống kích thước khối prefill và kích thước batch khác nhau. Nếu C là kích thước khối và B là kích thước batch, thì chúng ta có thể chỉ ra rằng đỉnh này sẽ xảy ra khi các decode hoàn hảo piggyback với các khối prefill. Điều này xảy ra khi số lượng khối prefill (= P/C) giống với số lần lặp decode cần thiết (= D/(B−1)), tức là khi P:D = C/(B−1). Ví dụ, sử dụng kích thước khối 256 ở kích thước batch 18, SARATHI đạt được cải thiện thông lượng đỉnh 1.27× ở P:D = 14 (≈ C/(B−1) = 256/17)
+
+**Hình 9:** Thông lượng được chuẩn hóa (token/ms) cho LLaMa 13B trên GPU A6000 với các độ dài chuỗi, tỷ lệ P:D và kích thước khối khác nhau.
+
+cho độ dài chuỗi 1K như được hiển thị trong Hình 9a. Sử dụng kích thước khối 512 cho độ dài chuỗi=1K ở kích thước batch 18 cũng cung cấp tăng đáng kể lên đến 1.23× ở P:D = 28 (≈ C/(B−1) = 512/17) trong khi tăng thấp hơn nhiều với kích thước khối 128. Trong khi các khối nhỏ hơn cung cấp nhiều cơ hội hơn để overlap decode, việc chia prefill thành các khối rất nhỏ dẫn đến cường độ số học thấp hơn tức là matmul kém hiệu quả hơn và overhead cao hơn (do nhiều lần đọc KV cache), dẫn đến hiệu suất end-to-end giảm. Do đó chúng tôi có được thông lượng cao hơn nhiều với kích thước khối 256/512 so với kích thước khối nhỏ hơn là 128. Lưu ý rằng tăng đỉnh xảy ra ở giá trị cao hơn của tỷ lệ P:D khi sử dụng kích thước khối lớn hơn.
+
+Chúng tôi đạt được hiệu suất đỉnh khi suy luận không hoàn toàn bị chi phối bởi prefill hoặc decode (nói cách khác, khi tỷ lệ P:D được cân bằng). Trạng thái như vậy cho phép chúng tôi overlap prefill và decode hiệu quả trong thời gian dài hơn. Nếu không, SARATHI hoặc hết token prefill (nếu P:D thấp) hoặc token decode (nếu P:D cao). Trong những trường hợp này, SARATHI có thể chuyển sang kích thước khối khác, hoặc hoạt động tương tự như baseline tiêu chuẩn xử lý các batch chỉ prefill hoặc chỉ decode. Tuy nhiên, lưu ý rằng bất chấp sự thay đổi này, các cải tiến của chúng tôi vẫn khoảng 10% trên một phạm vi lớn của tỷ lệ P:D.
+
+#### 5.1.4 Hiệu ứng của việc thay đổi kích thước batch và khối
+
+Trong phần này, chúng tôi đi sâu hơn để điều tra hiệu suất của SARATHI bằng cách thay đổi kích thước batch và kích thước khối cho mỗi độ dài chuỗi. Trong tất cả các thí nghiệm này, chúng tôi tập trung vào các tình huống thực thi nơi tỷ lệ P:D được cân bằng tức là khi P:D = C/(B−1) và tất cả token decode được hoàn hảo piggybacked với prefill. Điều này cho phép chúng tôi đo hiệu suất đỉnh của hệ thống chúng tôi.
+
+Hình 10 hiển thị kết quả cho các thí nghiệm này. Cho mỗi
+
+**Hình 10:** Phân tích tổng thời gian dành cho các phép toán khác nhau cho LLaMa 13B trên GPU A6000 với các độ dài chuỗi và kích thước batch thay đổi, sử dụng kích thước khối prefill 256 (nửa trên) và 512 (nửa dưới). Thanh màu cam và xanh dương đại diện cho baseline và SARATHI, tương ứng.
+
+cấu hình độ dài chuỗi và kích thước khối, chúng tôi hiển thị hiệu ứng của việc thay đổi kích thước batch. Hơn nữa, cho mỗi lần chạy, chúng tôi cũng hiển thị runtime qua các phép toán khác nhau tức là preproj, attention, postproj, và ffn.
+
+Lưu ý rằng decode-maximal batching batch các token prefill và decode trong các phép toán tuyến tính để cải thiện sử dụng tính toán. Do đó, các phép toán tuyến tính thấy việc giảm runtime đáng kể lên đến 1.6× (xem runtime ffn trong hàng đầu tiên) so với baseline. Tuy nhiên, lưu ý rằng mức độ cải tiến cũng phụ thuộc vào tỷ lệ P:D (nói cách khác, nó phụ thuộc vào phần thời gian nào được dành cho decode). Ví dụ, sử dụng kích thước khối 256 tăng gấp đôi số lượng decode có thể được piggybacked so với sử dụng 512 làm kích thước khối. Do đó, trong các cấu hình tối ưu (P:D = C/(B−1)), cho kích thước khối 256, decode tạo thành một phần cao hơn của tổng runtime, so với cấu hình tối ưu khi kích thước khối là 512. Do đó, tăng thông lượng của chúng tôi cao hơn khi sử dụng kích thước khối 256.
+
+Chúng tôi cũng quan sát rằng các phép toán tuyến tính khác nhau thấy các tăng tốc khác nhau sử dụng kỹ thuật của chúng tôi. Tính toán tuyến tính trong module ffn thấy việc giảm runtime cao nhất là 1.3×-1.6×. Ngược lại, việc giảm runtime cho preproj và postproj là 1.05×-1.38×. Đối với kích thước batch nhỏ, chúng tôi thấy rằng hầu hết cải thiện thông lượng là do hiệu quả cao hơn của tính toán ffn trong decode-maximal batching.
+
+### 5.2 So sánh với Lập lịch Iteration-level
+
+Trong đánh giá của chúng tôi cho đến nay, chúng tôi đã xem xét một hệ thống baseline xử lý các batch chỉ prefill hoặc chỉ decode tại một thời điểm. Đây là cách các framework phổ biến như FasterTransformer triển khai các mô hình transformer. Ngược lại, lập lịch iteration-level của Orca [48] có thể thêm (hoặc xóa) một yêu cầu vào (hoặc từ) một batch đang chạy ở granularity của các lần lặp riêng lẻ.
+
+Lập lịch iteration-level cũng ảnh hưởng đến việc sử dụng GPU: khi các yêu cầu đến hoặc khởi hành vào các thời điểm khác nhau, một số prefill (của các yêu cầu mới đến) tự động overlap với các decode (của các yêu cầu đã chạy). Do đó, chúng tôi mong đợi rằng lập lịch iteration-level sẽ làm tốt hơn baseline — ít nhất trong một số trường hợp. Tuy nhiên, chúng tôi nhấn mạnh rằng sự overlap giữa các yêu cầu prefill và decode là một side-effect hơn trong lập lịch iteration-level và hành vi của nó có thể thay đổi đáng kể tùy thuộc vào kích thước và thời gian đến hoặc khởi hành của các yêu cầu. Thậm chí quan trọng hơn, các cách tiếp cận hiện tại đối với lập lịch iteration-level gửi toàn bộ chuỗi đầu vào của một yêu cầu trong một giai đoạn prefill duy nhất. Điều này hạn chế đáng kể cơ hội piggybacking token decode với prefill.
+
+Để hiểu hiệu ứng lên thông lượng tổng thể, chúng tôi đánh giá scheduler iteration-level tiên tiến, Orca [48], trong hai tình huống: trường hợp tốt nhất và tệ nhất của nó. Trong trường hợp tốt nhất, lập lịch Orca overlap prefill đầy đủ của một yêu cầu mới với các decode đang diễn ra. Trong trường hợp tệ nhất, tất cả các yêu cầu bắt đầu và kết thúc cùng lúc. Trong trường hợp sau, lập lịch Orca hoạt động tương tự như baseline trước đây của chúng tôi nơi không có overlap giữa tính toán của các token prefill và decode. Lưu ý rằng trong trường hợp trung bình của Orca, có thể có nhiều hơn một prefill đầy đủ (tương ứng với nhiều yêu cầu) overlapping với một số decode – điều này sẽ hạn chế hơn nữa khả năng của Orca để piggyback token decode với prefill.
+
+**Hình 11:** So sánh với scheduler iteration-level Orca cho LLaMa 13B trên GPU A6000.
+
+Hình 11 hiển thị kết quả của chúng tôi cho các thí nghiệm này. Đầu tiên (Hình 11a), chúng tôi hiển thị kết quả cho lựa chọn tối ưu của P:D = C/(B−1), trong đó C = 256 và B là kích thước batch tối đa vừa cho độ dài chuỗi. Như mong đợi, lập lịch Orca trường hợp tệ nhất hoạt động tương tự như baseline. Chúng tôi thấy rằng, cho độ dài chuỗi nhỏ là 1K, lập lịch Orca trường hợp tốt nhất đạt được thông lượng cao hơn 1.11×. Điều này là do sự overlapping ngẫu nhiên của các yêu cầu prefill và decode trong lịch trình trường hợp tốt nhất. Tuy nhiên, khi độ dài chuỗi tăng, hiệu suất của lập lịch Orca trường hợp tốt nhất giảm gần với baseline. Đây là một artifact của lựa chọn P:D = C/(B−1) của chúng tôi. Khi chúng tôi tăng độ dài chuỗi, kích thước batch B giảm, dẫn đến P:D tối ưu cao hơn. Vì Orca gửi toàn bộ chuỗi đầu vào như một yêu cầu prefill duy nhất, P:D cao hơn có nghĩa là nó sớm hết token prefill, tại thời điểm đó nó xử lý các token decode còn lại tương tự như baseline, làm cho ngay cả phiên bản trường hợp tốt nhất cũng kém hiệu quả. SARATHI nhất quán vượt trội với tăng thông lượng tổng thể là 1.27×, 1.25× và 1.23× cho ba độ dài chuỗi.
+
+Một khía cạnh khác cần xem xét trong lập lịch iteration-level là hiệu ứng của độ dài chuỗi thay đổi lên độ trễ yêu cầu. Vì thời gian prefill tăng với độ dài của chuỗi đầu vào, việc thêm một chuỗi prefill dài hơn trong một batch đang chạy có thể làm chậm các decode đang diễn ra, điều này lần lượt tăng độ trễ của các yêu cầu đang diễn ra này trong lập lịch Orca. SARATHI tránh điều này do việc sử dụng các khối prefill nhỏ hơn.
+
+Tiếp theo, chúng tôi đánh giá tăng thông lượng ở các tỷ lệ P:D khác nhau cho các kích thước khối khác nhau trong Hình 11b. Chúng tôi chỉ xem xét độ dài chuỗi 1K cho thí nghiệm này vì baseline Orca trường hợp tốt nhất đạt được hiệu suất tối đa trong chế độ này. Lưu ý rằng lập lịch Orca trường hợp tốt nhất có thể được coi là một trường hợp đặc biệt của SARATHI, nơi kích thước khối, C, được đặt thành độ dài chuỗi tối đa. Như có thể thấy, P:D tối ưu chuyển sang phải khi kích thước khối tăng. SARATHI với kích thước khối 256 hoạt động tốt nhất trong các chế độ P:D thấp hơn, đạt đến tăng thông lượng đỉnh 1.27× so với baseline. SARATHI với kích thước khối 512 nhất quán vượt trội hơn Orca trường hợp tốt nhất và hoạt động tốt nhất tổng thể trong chế độ P:D cao hơn, đạt đến tăng thông lượng đỉnh 1.23×. Để so sánh, Orca trường hợp tốt nhất có tăng phẳng hơn nhiều và đạt đến tăng thông lượng đỉnh 1.11× ở P:D cao hơn nhiều.
+
+### 5.3 Pipeline Parallelism với SARATHI
+
+Tiếp theo, chúng tôi đánh giá cách SARATHI giảm bong bóng pipeline trong thiết lập pipeline-parallel multi-GPU và sau đó ảnh hưởng đến runtime tổng thể của các công việc suy luận. Cho thí nghiệm này, chúng tôi báo cáo các đánh giá trong một môi trường được mô phỏng cẩn thận.
+
+**Hình 12:** Tác động của SARATHI lên bong bóng pipeline (trên) và thời gian hoàn thành yêu cầu (dưới) cho GPT-3 được triển khai trên DGX A100(s) trong mô phỏng.
+
+Trước tiên chúng tôi profile runtime cho mỗi phép toán trong Bảng 1 trong giai đoạn prefill và decode cho các kích thước batch và độ dài chuỗi khác nhau cho mô hình GPT-3 [25]. Chúng tôi tiếp tục profile chi phí giao tiếp mạng để mô phỏng trung thực các thực thi tensor-parallel và pipeline-parallel. Cuối cùng, chúng tôi xây dựng một mô hình hồi quy để ngoại suy và dự đoán các giá trị này cho các điểm dữ liệu bị thiếu có thể gặp phải trong một hệ thống phục vụ suy luận mô phỏng trực tuyến. Chúng tôi xác nhận rằng các runtime ước tính bởi simulator nằm trong phạm vi 5% của các giá trị thực nghiệm trên hộp DGX 8-GPU, 80GB A100.
+
+Chúng tôi báo cáo kết quả cho triển khai trên 64 GPU A100 trên tám máy chủ được kết nối với InfiniBand. Chúng tôi đánh giá ba tình huống; (1) 8-way tensor-parallel (TP) trong một node với 8-way pipeline-parallel (PP) qua các node với lập lịch kiểu Orca trường hợp tốt nhất, (2) thiết lập TP-PP giống như trên với lập lịch sử dụng chunked-prefills và decode-maximal batching của SARATHI, (3) 8 bản sao song song, mỗi cái với 8-way TP, phục vụ đồng thời. Cho tất cả các tình huống, chúng tôi sử dụng kích thước batch tối đa vừa GPU — cho TP+PP đây là 27 và cho TP only đây là 11. Tỷ lệ P:D được cố định ở 10 cho mô phỏng này với độ dài chuỗi tối thiểu và tối đa của các yêu cầu được đặt thành 1K và 4K tương ứng. Mỗi yêu cầu có thể có độ dài chuỗi khác nhau được lấy mẫu từ phân phối Zipf (θ = 0.4), tuân thủ độ dài chuỗi tối đa. Số lượng token prefill và decode sau đó được tính toán bằng cách thỏa mãn tỷ lệ P:D mong muốn. Cho thí nghiệm này, chúng tôi đặt kích thước khối thành 256.
+
+Hình 12a vẽ cdf của thời gian bong bóng pipeline mỗi yêu cầu. Chúng tôi định nghĩa điều này là tổng thời gian bong bóng cho tất cả các micro-batch qua tất cả các lần lặp cho một yêu cầu nhất định. SARATHI giảm thời gian bong bóng trung vị mỗi yêu cầu đi 6.29×, bằng cách tạo ra các đơn vị công việc tính toán bằng nhau.
+
+Tiếp theo, chúng tôi so sánh thời gian hoàn thành yêu cầu tổng thể cho các tình huống khác nhau trong Hình 12b. Đồ thị này vẽ thời gian để hoàn thành một số lượng yêu cầu nhất định (mô phỏng của chúng tôi xem xét tổng cộng 10K yêu cầu). Thực thi TP-PP yêu cầu ít bộ nhớ hơn để lưu trữ tham số so với thiết lập TP-only, dẫn đến nhiều chỗ hơn cho KV cache. Do đó triển khai TP-PP hỗ trợ kích thước batch cao hơn 2.45× so với triển khai TP-only, và tuy nhiên, chúng tôi quan sát rằng thực thi TP-only nhanh hơn 1.28× so với TP-PP baseline với lập lịch Orca, do các bong bóng pipeline lớn trong trường hợp sau. Tuy nhiên, với chunked-prefills và decode-maximal batching, thực thi PP được kích hoạt bởi SARATHI được tăng tốc 1.91× so với TP-PP baseline, và 1.48× so với thực thi TP-only. Do đó, SARATHI làm cho thực thi pipeline parallel trở thành một lựa chọn hấp dẫn cho suy luận LLM bằng cách giảm thiểu đáng kể các bong bóng pipeline.
+
+### 5.4 Nghiên cứu Ablation của Chunked-prefills
+
+Trong phần này, chúng tôi đánh giá cách chia một tính toán prefill đầy đủ thành nhiều khối prefill nhỏ hơn ảnh hưởng đến hiệu quả của giai đoạn prefill trong SARATHI. Để định lượng điều này, chúng tôi
+
+**Hình 13:** Nghiên cứu ablation: Hiệu ứng của việc thay đổi kích thước khối lên các thành phần khác nhau của hệ thống cho LLaMa 13B trên GPU A6000.
+
+đo thời gian để tính toán giai đoạn prefill cho các độ dài chuỗi khác nhau sử dụng toàn bộ chuỗi cùng một lúc - điều này đại diện cho hiệu suất prefill baseline của chúng tôi. Cho mỗi chuỗi dài, sau đó chúng tôi tính toán prefill với chunked-prefills và so sánh runtime end-to-end của nó với baseline. Sự khác biệt giữa hai cái cho thấy overhead của chunked-prefills.
+
+Prefill chunking có hai nguồn overhead tiềm năng: (1) nó sử dụng kích thước khối nhỏ hơn so với baseline có thể làm giảm việc sử dụng GPU, và (2) nó cần tải KV cache của mỗi khối nhiều lần, tùy thuộc vào số lượng khối trong một yêu cầu. Do đó, để hiểu đầy đủ overhead của prefill chunking, chúng tôi điều tra những điều sau: (1) tác động của chunking lên tính toán attention cho một batch chỉ prefill là gì, (2) hiệu ứng của chunking lên runtime tổng thể của batch chỉ prefill là gì, và (3) thông lượng end-to-end là gì khi chunked-prefills được sử dụng cùng với decode-maximal batching. Chúng tôi nghiên cứu những điều này bằng cách thay đổi kích thước khối từ 64 đến 512 như được hiển thị trong Hình 13.
+
+Đầu tiên, chúng tôi quan sát rằng các kích thước khối nhỏ hơn có thể thêm overhead đáng kể, cho cả attention và runtime prefill tổng thể. Ví dụ, kích thước khối 64 phát sinh overhead 3× cho attention (xem Hình 13a) và khoảng 5× (xem Hình 13b) trong thời gian prefill tổng thể. Như người ta có thể mong đợi, overhead của chunked-prefills thấp hơn cho các kích thước khối lớn: đây là hiệu ứng kết hợp của việc sử dụng GPU cao hơn và ít lần reload KV cache hơn với các khối lớn hơn. Tổng thể, chúng tôi thấy rằng các kích thước khối 256 và 512 cung cấp hiệu quả prefill hợp lý, hạn chế mất mát tính toán prefill end-to-end trong phạm vi 20% và 10%, tương ứng.
+
+Thứ hai, SARATHI có thể bù đắp một số mất mát trong hiệu quả prefill bằng cách cải thiện thông lượng decode. Ví dụ, chúng ta thấy từ Hình 13c rằng kích thước khối 64 gần như khớp với hiệu suất của baseline của chúng tôi bất chấp việc chậm hơn 5× trong prefill trong khi kích thước khối 128 mang lại thông lượng cao hơn lên đến 1.16× bất chấp prefill của nó chậm hơn 2× so với baseline, chủ yếu do piggybacking nhiều decode hơn. Hiệu ứng tile-quantization cũng rõ ràng trong Hình 13 vì SARATHI đạt được cải thiện cao hơn trong thông lượng khi kích thước khối là bội số của 128; ví dụ, kích thước khối 256 cho thấy tăng tốc tốt hơn so với 320.
+
+## 6 Thảo luận
+
+Trong bài báo này, chúng tôi đã chứng minh toàn diện cách SARATHI cải thiện hiệu suất của suy luận LLM trên một số cấu hình mô hình và phần cứng. Tuy nhiên, có nhiều thách thức cần điều tra thêm.
+
+Đầu tiên, chúng tôi chỉ tập trung vào một cơ chế lập lịch hiệu quả trong SARATHI để cải thiện thông lượng của suy luận LLM. Tuy nhiên, các triển khai thực tế cần tối ưu hóa một cơ sở hạ tầng phục vụ suy luận đồng thời theo nhiều chiều ví dụ, độ trễ, độ trễ hàng đợi, công bằng, v.v. Đáp ứng các mục tiêu này với SARATHI yêu cầu xem xét lại các chính sách lập lịch. Thứ hai, mặc dù chúng tôi chỉ ra kích thước khối phù hợp cho một tỷ lệ P:D nhất định, chúng tôi để lại cho công việc tương lai khám phá cách chọn kích thước khối tối ưu vì nó phụ thuộc vào một số yếu tố như phần cứng, đặc tính mô hình, độ dài chuỗi, và thành phần của các token prefill-decode, đặc biệt trong các tình huống mà tỷ lệ P:D có thể không được biết trước. Thứ ba, chúng tôi đưa ra một giả định đơn giản trong bài báo này rằng mỗi yêu cầu trong một batch có cùng số lượng token prefill và decode (ngoại trừ các thí nghiệm mô phỏng) trong khi, trong thế giới thực, độ dài chuỗi có thể thay đổi đáng kể giữa các yêu cầu suy luận LLM khác nhau. Cuối cùng, chúng tôi tập trung vào độ dài chuỗi lên đến 3K, và tỷ lệ P:D trong phạm vi 1-200. Chúng tôi tin rằng những điều này đại diện cho nhiều triển khai thực tế. Tuy nhiên, cũng có sự quan tâm tăng lên trong việc hỗ trợ các chuỗi rất dài (ví dụ, hàng chục-hàng trăm nghìn [18]). Các độ dài chuỗi lớn như vậy có thể đặt ra những thách thức mới vì chi phí attention tăng theo bậc hai với số lượng token. Chúng tôi đang tích cực điều tra những thách thức này.
+
+## 7 Công việc Liên quan
+
+Trong phần này, chúng tôi cung cấp một tóm tắt ngắn gọn về công việc liên quan theo hai chiều: tối ưu hóa hệ thống và đổi mới mô hình.
+
+### 7.1 Tối ưu hóa Hệ thống
+
+**Quản lý bộ nhớ:** Trong decoding tự hồi quy, số lượng token cần được tạo ra cho một yêu cầu nhất định không được biết trước. Do đó, các hệ thống thông thường pre-allocate bộ nhớ cho KV cache dựa trên một ước tính bảo thủ về số lượng token tối đa. Gần đây, vLLM đã chỉ ra rằng cách tiếp cận này kém hiệu quả và đề xuất một framework — được thúc đẩy bởi trừu tượng bộ nhớ ảo — cho phép phân bổ bộ nhớ gia tăng cho KV cache [20]. Điều này giúp cải thiện kích thước batch, đặc biệt khi số lượng token thay đổi đáng kể giữa các yêu cầu khác nhau. FlexGen [42] tập trung vào việc cải thiện thông lượng của suy luận LLM offline trong các tình huống hạn chế tài nguyên ví dụ, chạy một mô hình lớn trên một GPU duy nhất. Hướng tới mục tiêu này, FlexGen sử dụng một kết hợp khôn ngoan của memory offloading, quantization, và lập lịch.
+
+**Tối ưu hóa (self-)attention:** Trong [40], các tác giả đề xuất một thuật toán để giảm yêu cầu bộ nhớ của self-attention từ O(n2) thành O(1), đối với độ dài chuỗi. FlashAttention [29] đề xuất một thuật toán dựa trên tiling tăng tốc tính toán attention bằng cách giảm thiểu số byte đọc/ghi giữa các cấp độ khác nhau của bộ nhớ GPU. Công việc tiếp theo [28] trên FlashAttention đã cải thiện nó thêm theo parallelism và phân vùng công việc [28]. Trong các thí nghiệm của chúng tôi, chúng tôi thấy triển khai attention hiệu quả bộ nhớ xformers [21] là hiệu quả nhất.
+
+**Tối ưu hóa cấp kernel:** FasterTransformer [6] đề xuất các lớp được tối ưu hóa cho các khối encoder và decoder của transformer. Những điều này dựa trên các tối ưu hóa GPU cấp thấp như kernel fusion. Chúng tôi mong đợi rằng các tối ưu hóa cấp thấp như vậy sẽ có lợi bằng nhau cho SARATHI.
+
+**Tối ưu hóa lập lịch:** Orca đề xuất một framework lập lịch iteration-level tránh lãng phí tính toán do token padding được sử dụng trước đây để batch các yêu cầu với độ dài chuỗi khác nhau [48]. Hơn nữa, Orca giảm độ trễ bằng cách trả về phản hồi ngay khi token end-of-sequence của yêu cầu được tạo ra. FastServe đề xuất một framework lập lịch preemptive để giảm thiểu thời gian hoàn thành công việc [46]. Một số framework lập lịch khác bao gồm Triton [13] và Clipper [27] tách lớp phục vụ khỏi engine thực thi của mô hình. Công việc hiện tại của chúng tôi tập trung vào tối ưu hóa lớp thực thi và có thể được sử dụng với các chính sách lập lịch khác nhau được đề xuất bởi các hệ thống như vậy.
+
+Các tối ưu hóa được đề xuất bởi một số công việc trước đây có thể bổ sung cho các tối ưu hóa của chúng tôi ví dụ, các triển khai attention được tối ưu hóa hơn sẽ cho phép mở rộng SARATHI đến độ dài chuỗi dài hơn và phân bổ bộ nhớ động sẽ giúp hỗ trợ kích thước batch lớn hơn và như vậy.
+
+### 7.2 Đổi mới Mô hình
+
+Một thân công việc đáng kể xung quanh các đổi mới mô hình đã cố gắng giải quyết các thiếu sót của các mô hình ngôn ngữ dựa trên transformer hoặc để thực hiện bước nhảy tiếp theo trong kiến trúc mô hình, vượt ra ngoài transformer. Ví dụ, multi-query attention chia sẻ cùng key và value qua tất cả các attention head để giảm kích thước của KV cache [41], cho phép kích thước batch lớn hơn. Một số công việc gần đây cũng đã chỉ ra rằng kích thước mô hình có thể được nén đáng kể bằng quantization [30–32,47]. Các mô hình mixture-of-expert nhằm chủ yếu vào việc giảm số lượng tham số mô hình được kích hoạt trong một lần lặp [23, 33, 36]. Gần đây hơn, retentive network đã được đề xuất như một người kế thừa transformer [44]. Trong công việc này, chúng tôi tập trung vào việc giải quyết các vấn đề hiệu suất của các mô hình transformer phổ biến nhất từ góc độ GPU. Các đổi mới mô hình trực giao với công việc của chúng tôi.
+
+## 8 Kết luận
+
+Trong bài báo này, chúng tôi xác định hai lý do chính cho sự kém hiệu quả của suy luận LLM: 1) sử dụng GPU không tối ưu do thiếu parallelism và bản chất bị giới hạn bởi bộ nhớ của giai đoạn decode, và 2) các bong bóng pipeline đáng kể do thời gian prefill và decode không nhất quán qua các lần lặp khác nhau, dẫn đến mất cân bằng micro-batch. Để giải quyết những thách thức này, chúng tôi giới thiệu SARATHI, một cách tiếp cận mới kết hợp chunked-prefills và decode-maximal batching. Decode-maximal batching cải thiện việc sử dụng GPU bằng cách piggybacking decode với prefill, chuyển đổi giai đoạn decode bị giới hạn bởi bộ nhớ thành bị giới hạn bởi tính toán. Chunked-prefills giúp làm cho nhiều prefill có sẵn hơn cho decode để piggyback, và cũng cung cấp một đơn vị công việc đồng nhất giúp giảm đáng kể các bong bóng pipeline. Chúng tôi chứng minh rằng SARATHI dẫn đến những cải tiến đáng kể trong thông lượng end-to-end qua các cấu hình mô hình và phần cứng.

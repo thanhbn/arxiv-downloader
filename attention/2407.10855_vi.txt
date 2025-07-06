@@ -1,0 +1,78 @@
+# Weighted Grouped Query Attention trong Transformers
+Sai Sena Chinnakonduru†, Astarag Mohapatra†
+Đại học Indiana Bloomington
+saischin@iu.edu, astmohap@iu.edu
+
+## Tóm tắt
+Cơ chế attention tạo thành các khối nền tảng cho các mô hình ngôn ngữ transformer. Các phương pháp gần đây cho thấy rằng việc mở rộng quy mô mô hình đạt được hiệu suất ở mức con người. Tuy nhiên, với nhu cầu ngày càng tăng về mở rộng quy mô và các ràng buộc về bộ nhớ phần cứng, chi phí suy luận của các mô hình này vẫn cao. Để giảm thời gian suy luận, Multi-Query Attention (MQA) và Grouped-Query Attention (GQA) đã được đề xuất trong (Shazeer, 2019) và (Ainslie et al., 2023) tương ứng.
+
+Trong bài báo này, chúng tôi đề xuất một biến thể của Grouped-Query Attention, được gọi là Weighted Grouped-Query Attention (WGQA). Chúng tôi đã giới thiệu các tham số có thể học mới cho mỗi key và value head trong các khối attention của bộ giải mã T5, cho phép mô hình lấy trung bình có trọng số trong quá trình fine-tuning. Mô hình của chúng tôi đạt được trung bình 0.53% cải thiện so với GQA, và hiệu suất hội tụ về traditional Multi-head attention (MHA) mà không có thêm chi phí trong quá trình suy luận. Chúng tôi đánh giá việc giới thiệu các tham số này và việc fine-tuning tiếp theo thông báo cho mô hình về cơ chế nhóm trong quá trình training, từ đó nâng cao hiệu suất. Ngoài ra, chúng tôi chứng minh các quy luật tỷ lệ trong phân tích của mình bằng cách so sánh kết quả giữa kiến trúc T5-small và T5-base.
+
+## 1 Giới thiệu
+Tại cốt lõi của các mô hình ngôn ngữ nằm một mô hình transformer tự hồi quy (Vaswani et al., 2023) tạo ra một token tại một thời điểm dựa trên chuỗi đầu vào và chuỗi token đầu ra trước đó mà nó đã tạo ra cho đến nay. Đây là một quá trình tuần tự, và khối lượng công việc bị giới hạn bởi bộ nhớ (Kwon et al., 2023). Khi chúng ta mở rộng quy mô mô hình, chi phí suy luận trở nên đắt đỏ vì chúng ta cần tải mô hình vào VRAM GPU của mình. Bài báo transformer gốc ra mắt năm 2017 và được training trên GPU P100 với hiệu suất double-precision 5.3 TFLOPs và bộ nhớ 16 GB, so với GPU hiện tại, A100, có bộ nhớ GPU 80 GB và 9.7 TFLOPs cho fp64. Đã có sự gia tăng đáng kể về khả năng tính toán của GPU, chỉ với sự gia tăng khiêm tốn về bộ nhớ.
+
+Trong bài báo ZeRO (Rajbhandari et al., 2020), các tác giả đã chứng minh rằng GPT-2 (Radford et al., 2019), có 1.5B tham số, cần 3 GB bộ nhớ cho các trọng số của nó, và nó không thể được training trên bộ nhớ 32 GB do dấu chân bộ nhớ bổ sung của các activation và gradient. Điều này cũng đặt ra thách thức trong việc fine-tuning tham số đầy đủ của các mô hình này vì yêu cầu bộ nhớ tăng theo cấp số nhân (Lv et al., 2024).
+
+Các mô hình hiện đại có tham số cao hơn đáng kể, điều này cũng làm tăng chi phí suy luận. Theo một ước tính gần đây, xử lý một yêu cầu mô hình ngôn ngữ lớn (LLM) có thể đắt hơn 10× so với một truy vấn tìm kiếm Google Dastin 2023. Do tính chất tuần tự của các mô hình tự hồi quy, khối lượng công việc cần tải mô hình vào bộ nhớ và lưu trữ các KV head dựa trên các token được tạo ra cho đến nay. Ngoài ra, một số kỹ thuật giải mã, như beam search (Freitag và Al-Onaizan, 2017), có thể tiêu thụ thêm không gian bộ nhớ bằng cách lưu trữ các KV head cho các đường dẫn khác nhau và có thể dẫn đến phân mảnh bộ nhớ liền kề (Kwon et al., 2023). Do đó, để giải quyết khối lượng công việc bị giới hạn bởi bộ nhớ, các tác giả của bài báo về MQA và GQA đã đề xuất nhóm các query head và tổng hợp các key-value head sau pre-training, theo sau bởi uptraining với 5-10% các bước pre-training và sau đó supervised fine-tuning trên một tác vụ downstream. Phương pháp này dẫn đến hiệu suất hội tụ với MHA trong khi hiệu quả hơn về bộ nhớ. Trong bài báo này, chúng tôi đề xuất một cách tham số hóa để tổng hợp các key-value head (WGQA) thay vì phương pháp heuristic lấy trung bình theo phần tử của các key và value head tương ứng. Chúng tôi cũng khám phá các phương tiện tổng hợp khác nhau để phân tích xem một vài tham số bổ sung trong quá trình training có dẫn đến kết quả tốt hơn hay không. Các quy luật tỷ lệ có hiệu lực trong phân tích của chúng tôi, vì sự khác biệt hiệu suất giữa GQA thông thường và triển khai của chúng tôi mở rộng khi kích thước tham số tăng.
+
+## 2 Công trình liên quan
+Công trình này tập trung vào việc đạt được hiệu suất tốt hơn so với GQA và MQA, tương tự như các phương pháp pruning mô hình, ngoại trừ việc chúng tôi tổng hợp các lớp pruning. Những loại công trình này cải thiện băng thông bộ nhớ và khai thác tốc độ tính toán của GPU. (Pope et al., 2022) cho thấy rằng MQA hữu ích cho training và suy luận đầu vào dài do chi phí bộ nhớ giảm.
+
+Có các kỹ thuật khác để cải thiện chi phí băng thông bộ nhớ từ keys và values. Quantization (Dettmers et al., 2022); (Frantar et al., 2023) giảm kích thước của các tham số và activation mô hình bằng cách sử dụng độ chính xác INT8 hoặc bfloat16, thay vì float32. Có các kỹ thuật fine-tuning hiệu quả tham số (PeFT) khác, LoRA ((Hu et al., 2021)), phân tách các projection head thành một chiều thấp hơn và sau đó tính toán các bước gradient, theo sau bởi việc soạn lại ma trận trọng số đầy đủ cho cập nhật gradient. QLoRA ((Dettmers et al., 2023)) tăng cường LoRA bằng cách quantize các ma trận trọng số tĩnh, điều này làm giảm thêm dấu chân bộ nhớ.
+
+Tất cả các mô hình chỉ decoder hiện có như Llama (Touvron et al., 2023), Mistral (Jiang et al., 2023), Qwen (Bai et al., 2023) và OLMo (Groeneveld et al., 2024) đang sử dụng grouped query attention thay vì multi-head attention để giảm dấu chân bộ nhớ. Trong khảo sát của chúng tôi, triển khai của chúng tôi là một cách mới lạ để nhóm các key và value head phụ thuộc vào dữ liệu và mang lại hiệu suất tốt hơn.
+
+## 3 Phương pháp
+Module attention trong kiến trúc transformer có ba thành phần chính, query, key và value mỗi cái có một chiều (d, d), trong đó d là độ dài embedding token. Trong Multi-head attention cho h số lượng head, các ma trận projection có chiều (d,d/h), biến đổi các embedding đầu vào (n, d), trong đó n là độ dài chuỗi của văn bản đầu vào, thành h projection mỗi cái có chiều (d,d/h), theo sau bởi concatenation để có được Q, K và V. Sau đó điểm attention tự là:
+
+score = softmax(QK^T/√d)V (1)
+
+Trong grouped query attention, query head được chia thành G nhóm, giảm số lượng key-value head bằng một hệ số h/G. Do đó, các chiều projection để có được Q, K và V là (n, d, d), (n, dG/h, dG/h) và (n, dG/h, dG/h) tương ứng cho kích thước batch bằng 1. Đối với GQA, G=h/2 và đối với MQA, G=1. Module WGQA thêm các tham số scalar hoặc vector bổ sung tùy thuộc vào cấu hình cho key-value head cho (w1,k, w2,k...wh,k) và (w1,v, w2,v...wh,v).
+
+K = [w1k⊙K1 + w2k⊙K2 ... w(h-1)k⊙Kh-1 + whk⊙Kh] (2)
+
+Các ma trận K và V đã sửa đổi được cắm vào Eq 1 để tính toán attention. Có 2h tham số bổ sung cho weighted GQA (WGQA), 2d/h (COLWGQA) cho các vector trọng số cho các cột, và 2d (ROWWGQA) cho các vector trọng số cho các hàng trong mỗi lớp attention. Các tham số có thể học này được nhân với các key và value head như được hiển thị trong hình 1. Các trọng số được tiêm được khởi tạo với giá trị trung bình của số lượng head trong một nhóm hoặc một phân phối Gaussian chuẩn ngẫu nhiên. Điều này không thêm chi phí bổ sung nào trong quá trình suy luận, vì chúng tôi scale các key-value head sử dụng các trọng số đã học sau quá trình fine-tuning.
+
+## 4 Chi tiết triển khai
+
+### 4.1 Cấu hình
+Chúng tôi chạy các thí nghiệm của mình trên các mô hình T5-small và T5-base được triển khai sử dụng Hugging Face transformers. Tất cả các mô hình được khởi tạo với các trọng số đã pre-trained và fine-tuned trên các tập dữ liệu cụ thể sử dụng optimizer AdamW với tốc độ học ban đầu 0.001 và scheduled linear decay. Nhóm key-value head chỉ được áp dụng cho các khối decoder self-attention và cross-attention, như được đề cập trong bài báo gốc (Ainslie et al., 2023).
+
+### 4.2 Dữ liệu và Fine-tuning
+Chúng tôi fine-tuned và đánh giá các mô hình của mình sử dụng các tập dữ liệu CNN/Daily Mail, WMT 2014 German-English translation, và Multi-news. Chúng tôi chỉ sử dụng 500k hàng để fine-tuning tập dữ liệu WMT 2014 do tài nguyên tính toán hạn chế. Chúng tôi training tất cả các mô hình của mình trong 3 epoch với kích thước batch là 8 cho các tác vụ tóm tắt và kích thước batch là 32 cho tác vụ dịch thuật. Chúng tôi sử dụng độ dài đầu vào là 512 và độ dài đầu ra là 256 cho các tác vụ CNN/Daily Mail và WMT. Đối với tác vụ tóm tắt Multi-news, chúng tôi sử dụng độ dài đầu vào là 2048 và độ dài đầu ra là 512 theo cấu hình trong (Ainslie et al., 2023). Chúng tôi sử dụng 4 GPU V100 cho tất cả các thí nghiệm của mình.
+
+### 4.3 Thí nghiệm
+Chúng tôi chạy tất cả các thí nghiệm được hiển thị trong bảng 1 với T5-base, và với T5-small chúng tôi chỉ chạy một vài thí nghiệm trên CNN daily mail như được hiển thị trong bảng 2.
+
+1. **Weighted Grouped-Query Attention**: Trong phương pháp này, các tham số mới, một giá trị scalar duy nhất cho mỗi key, và một value head trong các khối attention của decoder được sử dụng. Một tổng có trọng số sau đó được lấy trong quá trình forward propagation, cho phép mô hình học các tham số này trong quá trình fine-tuning.
+
+2. **Grouped-Query Attention**: Trong GQA, các key và value head trong các khối attention của decoder được mean pooled để tạo thành G nhóm (Ainslie et al., 2023), sau đó được fine-tuned.
+
+3. **Multi-Query Attention**: MQA liên quan đến việc mean pooling tất cả các key-value head trong các khối attention của decoder để tạo thành một key-value head duy nhất được chia sẻ trên tất cả các query head.
+
+4. **Weighted Multi-Query Attention**: Nó tương tự như Weighted Grouped Query Attention, nhưng ở đây chúng tôi chỉ nhóm thành một key và value head duy nhất.
+
+5. **Row-wise Weighted Grouped-Query Attention**: Ở đây thay vì trọng số scalar, chúng tôi giới thiệu một vector cột có kích thước d cho mỗi key và value head, được sử dụng để scale các trọng số dọc theo mỗi hàng như được hiển thị trong hình 1.
+
+6. **Column wise Weighted Grouped-Query Attention**: Trong này, thay vì trọng số scalar, chúng tôi giới thiệu một vector hàng có kích thước kvdim cho mỗi key và value head, được sử dụng để scale các trọng số dọc theo mỗi cột như được hiển thị trong hình 1.
+
+Đối với tất cả các cấu hình weighted grouped query attention, chúng tôi thực hiện hai loại thí nghiệm khác nhau trong cách khởi tạo trọng số cho các tham số bổ sung được giới thiệu - khởi tạo các tham số bổ sung với trọng số của kvheads/h và khởi tạo ngẫu nhiên. Lý do đằng sau việc khởi tạo với kvheads/h là nó tương đương với việc bắt đầu với Grouped Query Attention được mean pooled.
+
+## 5 Kết quả và Thảo luận
+
+Tổng hợp có trọng số hoạt động tốt hơn GQA trong tất cả các thí nghiệm của chúng tôi. Điểm ROUGE (Ganesan, 2018) cải thiện từ 43.5 (GQA) lên 43.7 (WGQA) và 43.8 (COLWGQA) cho tập dữ liệu tóm tắt multi-news. Tương tự, đối với CNN/Daily Mail, điểm R1 cải thiện từ 41.7 (GQA) lên 41.9 (WGQA), và đối với tác vụ downstream dịch thuật trong WMT14 chúng tôi báo cáo điểm Bleu (Saadany và Orăsan, 2021), hiệu suất cải thiện từ 26.1 (GQA) lên 26.3 (WGQA) (Bảng 1). Trong giai đoạn fine-tuning, số lượng tham số tăng từ GQA bằng 576 cho WGQA, 36,864 cho COLWGQA dựa trên cột, và 442,368 cho ROWWGQA dựa trên hàng. WGQA hoạt động tốt với sự đánh đổi tham số và hiệu suất trên các tập dữ liệu.
+
+Khởi tạo trọng số với trung bình của số lượng head trong một nhóm hoạt động tốt hơn đáng kể so với khởi tạo Gaussian ngẫu nhiên trên tất cả các tập dữ liệu. Ngoài ra, WMQA, là phiên bản có trọng số của MQA, hoạt động tốt hơn MQA và tiếp cận hiệu suất của GQA. Điều này có thể dẫn đến việc tiết kiệm tham số nhiều hơn nữa. Chúng tôi xác thực kết quả của mình với các quy luật tỷ lệ bằng cách kiểm tra các mô hình của mình trên một kiến trúc nhỏ hơn, T5-small, cho tập dữ liệu CNN/Daily Mail (Bảng 2). Do đó, việc tăng kích thước mô hình dẫn đến các metric đánh giá tốt hơn, và chúng tôi tin rằng các mô hình lớn hơn sẽ mở rộng khoảng cách hiệu suất giữa WGQA và GQA.
+
+Để kiểm tra xem các trọng số đã học trong cấu hình WGQA có khác với những trọng số trong cấu hình GQA hay không, chúng tôi đã tiến hành phân tích thống kê. Chúng tôi nhóm các key và value head của mô hình WGQA theo các trọng số đã học và tính toán mean absolute loss cho mỗi lớp. Trong các khối attention, chúng tôi tính toán trung bình cho mỗi head riêng biệt và quan sát rằng các trọng số khác nhau đáng kể, với mean absolute difference tập trung quanh 0.1 như được hiển thị trong hình 2. Giá trị p, 1e−6 nhỏ hơn mức ý nghĩa 0.05, bác bỏ giả thuyết null về mean absolute difference bằng không.
+
+## 6 Kết luận
+Bài báo này tập trung vào việc cải thiện thuật toán GQA bằng cách giới thiệu một cách mới lạ để tổng hợp các KV head. Từ các quy luật tỷ lệ, chúng ta có thể ngoại suy rằng hiệu suất sẽ cải thiện với kích thước mô hình, và các mô hình hội tụ vào các không gian tham số khác nhau, như được hiển thị trong biểu đồ mean absolute. Với sự phổ biến của mô hình decoder dựa trên GQA trong các Mô hình Ngôn ngữ Lớn, kỹ thuật này có thể hỗ trợ trong việc xây dựng các mô hình chính xác hơn với chi phí scale tuyến tính các trọng số chỉ trong quá trình training.
+
+## 7 Hạn chế và Công việc tương lai
+Đối với các tác vụ tóm tắt, chúng tôi sử dụng điểm ROUGE, không phải là một metric lý tưởng và nó không đưa ra toàn bộ bức tranh để xác thực sự gia tăng hiệu suất của chúng tôi. Do tài nguyên tính toán hạn chế, chúng tôi không pre-train mô hình của mình từ đầu hoặc fine-tune trên các tập dữ liệu và mô hình lớn hơn, điều này sẽ cho kết quả tốt hơn để so sánh.
+
+Trong GQA, các grouped key value head được lặp lại để phù hợp với chiều của query head. Trong tương lai, chúng ta có thể giới thiệu các tham số có thể lặp lại các key value head một cách động. Cụ thể, trong các mô hình Grouped Query như Llama (Touvron et al., 2023) và OpenELM (Mehta et al., 2024), thay vì chia sẻ các key và value head, chúng tôi đề xuất nhân chúng với trọng số để tạo ra các head riêng biệt. Phương pháp này sẽ cho phép mô hình phân biệt giữa các head, có thể nâng cao hiệu suất. Ngoài ra, chúng tôi mục tiêu triển khai này sử dụng các mô hình chỉ decoder, đây là chuẩn mực hiện tại trong các mô hình ngôn ngữ.
+
+## Tài liệu tham khảo
+[Danh sách tài liệu tham khảo được giữ nguyên như trong bản gốc]
