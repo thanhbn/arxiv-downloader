@@ -1,0 +1,239 @@
+# Mở rộng Cửa sổ Ngữ cảnh của LLM với 100 Mẫu
+Yikai Zhang1,2,3 Junlong Li1,3 Pengfei Liu1,2,3∗
+1Đại học Giao thông Thượng Hải 2Phòng thí nghiệm Trí tuệ Nhân tạo Thượng Hải
+3Phòng thí nghiệm Nghiên cứu AI Sinh tạo (GAIR)
+
+## Tóm tắt
+Các Mô hình Ngôn ngữ Lớn (LLM) được biết đến với khả năng ngoại suy hạn chế vượt ra khỏi cửa sổ ngữ cảnh được tiền huấn luyện, làm hạn chế ứng dụng của chúng trong các tác vụ xuôi dòng với đầu vào dài. Các nghiên cứu gần đây đã tìm cách mở rộng cửa sổ ngữ cảnh của LLM bằng cách sửa đổi rotary position embedding (RoPE), một phương pháp mã hóa vị trí phổ biến được áp dụng bởi các LLM nổi tiếng như LLaMA, PaLM và GPT-NeoX. Tuy nhiên, các công trình trước đó như Position Interpolation (PI) và YaRN tốn nhiều tài nguyên và thiếu các thí nghiệm so sánh để đánh giá khả năng ứng dụng của chúng. Trong công trình này, chúng tôi xác định nhu cầu vốn có của entropy attention của LLM (tức là entropy thông tin của điểm số attention) để duy trì sự ổn định và giới thiệu một mở rộng mới cho RoPE kết hợp việc điều chỉnh tần số cơ sở của RoPE và chia tỷ lệ các logit attention để giúp LLM thích ứng hiệu quả với cửa sổ ngữ cảnh lớn hơn. Chúng tôi xác thực tính ưu việt của phương pháp trong cả hiệu suất tinh chỉnh và độ bền vững trên các kích thước cửa sổ ngữ cảnh khác nhau trên các tác vụ đòi hỏi ngữ cảnh khác nhau. Đáng chú ý, phương pháp của chúng tôi mở rộng cửa sổ ngữ cảnh của LLaMA-2-7B-Chat lên 16,384 chỉ với 100 mẫu và 6 bước huấn luyện, thể hiện hiệu quả phi thường. Cuối cùng, chúng tôi cũng khám phá cách thành phần dữ liệu và chương trình huấn luyện ảnh hưởng đến việc mở rộng cửa sổ ngữ cảnh cho các tác vụ xuôi dòng cụ thể, đề xuất tinh chỉnh LLM với các cuộc trò chuyện dài như một điểm khởi đầu tốt. Chúng tôi phát hành mã nguồn và dữ liệu SFT tại https://github.com/GAIR-NLP/Entropy-ABF .
+
+## 1 Giới thiệu
+Các Mô hình Ngôn ngữ Lớn (LLM) thường được tiền huấn luyện với kích thước cửa sổ ngữ cảnh được định nghĩa trước. Ví dụ, LLaMA 2 (Touvron et al., 2023b) được tiền huấn luyện trên các chuỗi 4,096 token. Khi vượt quá cửa sổ ngữ cảnh được tiền huấn luyện, hiệu suất của LLM có xu hướng giảm chủ yếu do khả năng ngoại suy độ dài hạn chế của các phương pháp mã hóa vị trí của chúng (Kazemnejad et al., 2023). Cửa sổ ngữ cảnh hạn chế ảnh hưởng đến tính thực tế của LLM cho các tác vụ đòi hỏi ngữ cảnh ngày càng tăng như học few-shot (Brown et al., 2020), tóm tắt tài liệu dài (Huang et al., 2021) và hoàn thành mã cấp repository (Liu et al., 2023). Do đó, có nhu cầu cấp thiết để mở rộng cửa sổ ngữ cảnh của LLM.
+
+Để đáp ứng nhu cầu cấp bách này, các công trình gần đây đã chứng kiến tiến bộ trong việc mở rộng cửa sổ ngữ cảnh trong cả các tình huống được tinh chỉnh và không được tinh chỉnh bằng cách mở rộng Rotary Position Embedding (RoPE) (Su et al., 2021), một phương pháp mã hóa vị trí được sử dụng rộng rãi được áp dụng bởi các LLM tiên tiến như LLaMA (Touvron et al., 2023a,b), PaLM (Chowdhery et al., 2023; Anil et al., 2023) và GPT-NeoX (Black et al., 2022). Ví dụ, Position Interpolation (PI) (kaiokendev, 2023; Chen et al., 2023) chia tỷ lệ tuyến tính xuống các chỉ số vị trí của token đầu vào và đạt được kết quả tinh chỉnh cải thiện. NTK-Aware scaling (bloc97, 2023b) và adjusted base frequency (ABF) (Xiong et al., 2023) sửa đổi tần số cơ sở của RoPE, dẫn đến kết quả nâng cao trong các tình huống tinh chỉnh và không tinh chỉnh tương ứng. NTK-By-Parts scaling (bloc97, 2023a) xử lý các chiều khác nhau một cách khác nhau và báo cáo kết quả tinh chỉnh thậm chí tốt hơn. Gần đây hơn, YaRN (Peng et al., 2023) đề xuất chia tỷ lệ các logit attention do hiệu ứng có lợi của nó đối với perplexity mô hình hóa ngôn ngữ. Họ kết hợp kỹ thuật này với NTK-By-Parts scaling và báo cáo hiệu suất ngữ cảnh dài tốt nhất trong số các phương pháp mở rộng RoPE hiện có.
+
+Tuy nhiên, cơ sở lý luận cơ bản đằng sau hiệu quả của thao tác chia tỷ lệ của YaRN vẫn được hiểu kém. Trong nghiên cứu này, chúng tôi cung cấp một diễn giải về kỹ thuật này bằng cách phân tích hiệu ứng của nó trong việc ổn định entropy thông tin của điểm số attention của mô hình. Thông qua phân tích của chúng tôi, chúng tôi giới thiệu phương pháp mở rộng RoPE của riêng mình được gọi là "entropy-aware ABF", kết hợp ABF với việc sử dụng tinh vi scalar attention động.
+
+Hơn nữa, mặc dù hiệu quả được báo cáo riêng lẻ của các phương pháp mở rộng RoPE trước đó, có thiếu phân tích so sánh toàn diện nơi các phương pháp khác nhau được đặt trong cùng một bệ thử đánh giá. Nghiên cứu này cũng giải quyết khoảng trống này bằng cách trả lời ba câu hỏi chính liên quan đến việc mở rộng cửa sổ ngữ cảnh trong các ứng dụng thực tế: (1) Phương pháp nào thể hiện hiệu suất tinh chỉnh có giám sát tốt nhất trên các tác vụ xuôi dòng đòi hỏi ngữ cảnh? (2) Mỗi phương pháp có thể sử dụng hiệu quả dữ liệu huấn luyện như thế nào? (3) Các mô hình được huấn luyện với những phương pháp này có hiệu suất mạnh mẽ trên các kích thước cửa sổ ngữ cảnh khác nhau không?
+
+Để trả lời các câu hỏi trên, chúng tôi tiến hành thí nghiệm trên một tập hợp đa dạng các tác vụ đòi hỏi ngữ cảnh từ LongBench (Bai et al., 2023), thao tác lượng dữ liệu huấn luyện và độ dài prompt để đánh giá các mô hình được tinh chỉnh trên các chiều khác nhau. Kết quả thí nghiệm chứng minh rằng các mô hình được huấn luyện với phương pháp của chúng tôi vượt qua tất cả đường cơ sở trong hiệu suất tinh chỉnh ngữ cảnh dài và cũng duy trì hiệu suất mạnh mẽ trên các kích thước cửa sổ ngữ cảnh khác nhau. Đáng chú ý, chỉ với 100 cuộc trò chuyện dài từ ShareGPT (Chiang et al., 2023) và 6 bước huấn luyện, sử dụng bốn GPU A100 trong khoảng 6 phút, phương pháp của chúng tôi tạo ra một mô hình với hiệu suất thành thạo trên 12 tác vụ đòi hỏi ngữ cảnh được chọn. Cuối cùng, chúng tôi khám phá ảnh hưởng của thành phần dữ liệu và chương trình huấn luyện đối với việc mở rộng cửa sổ ngữ cảnh cho một tác vụ xuôi dòng ngữ cảnh dài nhất định, đề xuất tinh chỉnh mô hình trên các cuộc trò chuyện ShareGPT dài như một điểm khởi đầu tốt.
+
+## 2 Kiến thức cơ bản
+
+**Rotary Position Embedding (RoPE)** Cho một chỉ số vị trí m∈[1, c] và một vector nhúng x:= [x0, x1, . . . , x d−1]⊤, trong đó d là chiều của mỗi đầu attention, RoPE xem xét mỗi cặp phần tử dọc theo chiều đặc trưng của vector nhúng như các số phức và mã hóa thông tin vị trí bằng cách xoay chúng. Hàm có giá trị vector phức f(x, m) được định nghĩa bởi RoPE như sau:
+
+f(x, m) = 
+(x0+ ix1)eimθ1,
+(x2+ ix3)eimθ2,
+. . . ,
+(xd−2+ ixd−1)eimθd/2
+(1)
+
+i :=√−1 là đơn vị ảo và θj=b−2j/d, trong đó b biểu thị tần số cơ sở của RoPE và được đặt mặc định là 10,000.
+
+Trong ứng dụng, RoPE được áp dụng cho cả query và key embedding thông qua phương trình sau:
+
+f(x, m) = 
+x0
+x1
+x2
+x3
+...
+xd−2
+xd−1
+⊗
+cos(mθ0)
+cos(mθ0)
+cos(mθ1)
+cos(mθ1)
+...
+cos(mθ(d−1)/2)
+cos(mθ(d−1)/2)
++
+−x1
+x0
+−x3
+x2
+...
+−xd−1
+xd−2
+⊗
+sin(mθ0)
+sin(mθ0)
+sin(mθ1)
+sin(mθ1)
+...
+sin(mθ(d−1)/2)
+sin(mθ(d−1)/2)
+(2)
+
+Các thành phần cơ bản của RoPE là một chuỗi các hệ số lượng giác, mỗi hệ số mã hóa thông tin vị trí của các tần số khác nhau.
+
+Chúng tôi biểu diễn các hệ số lượng giác này với hàm sau để xác định duy nhất RoPE và các biến thể của nó:
+
+h(m, b, t ) =√t∗cos(m b2j d) hoặc√t∗sin(m b2j d) (3)
+
+trong đó m là chỉ số vị trí của token query, b là tần số cơ sở cho RoPE, và t là hệ số chia tỷ lệ cho logit attention. Lưu ý rằng √t được sử dụng trong phương trình vì quá trình xoay RoPE xử lý cả query và key embedding.
+
+Trước khi giới thiệu các phương pháp mở rộng RoPE cho phép mở rộng cửa sổ ngữ cảnh tốt hơn, chúng tôi định nghĩa hệ số chia tỷ lệ ngữ cảnh s=c′/c, đó là tỷ số giữa cửa sổ ngữ cảnh mục tiêu c′ và cửa sổ ngữ cảnh được tiền huấn luyện c. Nó đặc biệt hữu ích cho những phương pháp mở rộng RoPE theo kích thước cửa sổ ngữ cảnh mục tiêu nhất định.
+
+**Position Interpolation (PI)** PI (Chen et al., 2023; kaiokendev, 2023) nội suy tuyến tính chỉ số vị trí đầu vào m thành m/s để nó nằm trong kích thước cửa sổ ngữ cảnh gốc. Chen et al. (2023) chứng minh rằng tinh chỉnh trực tiếp LLaMA (Touvron et al., 2023a) với cửa sổ ngữ cảnh mở rộng dẫn đến cải thiện tối thiểu, vì cửa sổ ngữ cảnh hiệu quả của mô hình chỉ tăng từ 2,048 lên 2560 sau 10,000 bước huấn luyện trên các chuỗi có độ dài 8,192. Ngược lại, PI thành công trong việc mở rộng cửa sổ ngữ cảnh của LLaMA lên 32,768 chỉ với 1,000 bước huấn luyện.
+
+**NTK-Aware** NTK-Aware scaling (bloc97, 2023b) giả thuyết rằng nội suy tất cả các chiều một cách bình đẳng, như được thực hiện bởi PI, có thể dẫn đến mất thông tin tần số cao. Do đó, NTK-Aware scaling giới thiệu một chiến lược nội suy phi tuyến bằng cách điều chỉnh tần số cơ sở b của RoPE thành bd/(d−2). Sửa đổi này chia tỷ lệ các thành phần tần số thấp của RoPE ở mức độ tương tự như PI, trong khi chỉ thay đổi nhẹ các thành phần tần số cao để tránh làm xáo trộn thông tin tần số cao. NTK-Aware mở rộng kích thước cửa sổ ngữ cảnh của mô hình mà không cần huấn luyện. Tuy nhiên, phương pháp này không thể hưởng lợi nhiều như PI từ việc huấn luyện bổ sung trên các chuỗi dài hơn như được đề xuất bởi (Peng et al., 2023).
+
+**NTK-By-Parts** NTK-By-Parts (bloc97, 2023a) cho rằng việc kéo giãn tất cả các thành phần RoPE bằng hệ số chia tỷ lệ s hoặc một biến đổi cơ sở dẫn đến các token embedding gần nhau hơn, cản trở LLM khỏi việc nắm bắt hiệu quả các mối quan hệ cục bộ giữa các token liền kề. Để giải quyết vấn đề này, NTK-By-Parts chia tỷ lệ θ(j) bởi hệ số (1−γ(j))/s+γ(j), với γ(j) được gán 0 cho tần số cao, 1 cho tần số thấp, và một hằng số được xác định trước trong khoảng từ 0 đến 1 cho tần số trung gian. Theo (Peng et al., 2023), phương pháp này hoạt động tốt hơn PI và NTK-Aware scaling cho cả mô hình được tinh chỉnh và không được tinh chỉnh.
+
+**YaRN** Yarn (Peng et al., 2023) quan sát thực nghiệm rằng việc giới thiệu nhiệt độ t để chia tỷ lệ logit attention trước hàm softmax cải thiện hiệu suất mô hình hóa ngôn ngữ của mô hình. Họ tìm thấy giá trị tối ưu √t= 0.1 ln s+ 1 bằng cách khớp đường cong perplexity thấp nhất so với các hệ số chia tỷ lệ ngữ cảnh s khác nhau. Họ kết hợp phát hiện của mình với NTK-By-Parts scaling và gọi phương pháp này là YaRN (Yet another RoPE extensioN method). YaRN báo cáo hiệu suất ngữ cảnh dài tốt nhất trên các tác vụ mô hình hóa ngôn ngữ trong số các phương pháp hiện có.
+
+**Adjusted Base Frequency (ABF)** ABF (Xiong et al., 2023) đơn giản thay đổi tần số cơ sở của RoPE thành 50,000. Cả phân tích lý thuyết và thí nghiệm được tiến hành để xác thực hiệu quả của phương pháp này. Xiong et al. (2023) chứng minh rằng ABF tối thiểu hóa khoảng cách của các vector nhúng của nó từ những vector sử dụng RoPE gốc, giúp tận dụng kết quả tiền huấn luyện. Họ xác thực thực nghiệm hiệu quả của ABF bằng cách cho thấy perplexity thấp hơn trên các tác vụ mô hình hóa ngôn ngữ và cửa sổ ngữ cảnh hiệu quả dài hơn trong tác vụ truy xuất câu đầu tiên.
+
+Bảng 1 làm nổi bật sự khác biệt giữa RoPE và các biến thể của nó bằng cách chỉ định các m, b, và t khác nhau mà chúng sử dụng trong Phương trình 3 và liệu chúng có yêu cầu huấn luyện bổ sung cho việc mở rộng cửa sổ ngữ cảnh hay không:
+
+| Phương pháp | m | b | t | Huấn luyện Bổ sung |
+|-------------|---|---|---|-------------------|
+| RoPE | m | 10,000 | 1 | - |
+| PI | m/s | 10,000 | 1 | tiền huấn luyện tiếp tục |
+| NTK-Aware | m | 10,000^(d−2/d) | 1 | - |
+| NTK-By-Parts | ((1−γ(j))/s+γ(j))m | 10,000 | 1 | tiền huấn luyện tiếp tục |
+| YaRN | ((1−γ(j))/s+γ(j))m | 10,000 | 0.1ln(s) + 1 | tiền huấn luyện tiếp tục |
+| ABF | m | 500,000 | 1 | tiền huấn luyện tiếp tục |
+
+Bảng 1: Tổng quan về Rotary Position Embedding (RoPE) và các biến thể được biểu diễn bởi Phương trình 3.
+
+## 3 Phương pháp đề xuất
+
+YaRN (Peng et al., 2023) giới thiệu hệ số chia tỷ lệ t trên logit attention dựa trên bằng chứng thực nghiệm cho thấy hiệu ứng có lợi của nó đối với perplexity mô hình hóa ngôn ngữ. Tuy nhiên, cơ sở lý luận cơ bản đằng sau kỹ thuật này vẫn được hiểu kém. Trong phần này, chúng tôi trước tiên giới thiệu một diễn giải về kỹ thuật này, điều này thúc đẩy phương pháp của chúng tôi.
+
+### 3.1 Diễn giải Hệ số Chia tỷ lệ của YaRN
+
+Trong cơ chế attention của mô hình Transformer (Vaswani et al., 2017), hàm Softmax buộc điểm số attention được gán cho các token ngữ cảnh phải tổng bằng một trong khi đồng thời ngăn không cho bất kỳ điểm số riêng lẻ nào trở thành không. Do đó, với số lượng token đầu vào tăng lên, LLM về mặt lý thuyết sẽ phân phối nhiều attention hơn trên nhiều token hơn và dẫn đến sự gia tăng trong cái mà chúng tôi gọi là "entropy attention", điều này định lượng tính ngẫu nhiên trong phân phối điểm số attention và được tính toán bằng phương trình sau:
+
+attention_entropy = Σi pi ln pi (4)
+
+trong đó pi là điểm số attention được gán cho các token ngữ cảnh.
+
+Để xác thực hiệu ứng lý thuyết nói trên, chúng tôi đã sử dụng LLaMA-2-7B-Chat (Touvron et al., 2023b) để xử lý 128 tài liệu được chọn ngẫu nhiên từ tập dữ liệu Pile (Gao et al., 2020). Chúng tôi thu thập điểm số attention được gán cho các token ngữ cảnh cho các token query ở các vị trí đầu vào khác nhau để mô phỏng số lượng token ngữ cảnh khác nhau. Sau đó, chúng tôi tính toán entropy thông tin cho các điểm số attention này trên các lớp mô hình khác nhau thông qua Phương trình 4. Entropy attention trung bình kết quả trên các tài liệu được lấy mẫu ngẫu nhiên của chúng tôi được trực quan hóa trong Hình 1.
+
+[Hình 1: Trực quan hóa entropy attention trung bình cho các token query ở các vị trí đầu vào khác nhau trong mô hình LLaMA-2-7B-chat trên 128 tài liệu được chọn từ tập dữ liệu Pile-arXiv (Gao et al., 2020). "Uniform" đại diện cho phân phối điểm số attention đồng đều, tương ứng với attention_entropy = ln n với n biểu thị số lượng token ngữ cảnh.]
+
+Một cách phản trực giác, chỉ có hai lớp mô hình đầu tiên thể hiện sự gia tăng ổn định trong entropy attention. Thú vị là, chúng tôi thậm chí quan sát thấy rằng entropy attention của tất cả các lớp tiếp theo vẫn remarkably tương tự khi số lượng token ngữ cảnh tăng từ 1,024 lên 2,048.
+
+Phát hiện này về việc LLM duy trì entropy attention ổn định trong các lớp mô hình tiếp theo khi các token ngữ cảnh được nhân đôi trực tiếp dẫn chúng tôi đến giả định rằng việc có một mức độ bất biến về độ dài nhất định trong entropy attention trong những lớp này là một đặc điểm vốn có quan trọng của LLM để hoạt động đúng cách. Khi mô hình hóa các chuỗi dài hơn so với giai đoạn tiền huấn luyện, LLM có thể không tập trung tốt, dẫn đến sự sụt giảm hiệu suất. Nhờ hàm mũ trong Softmax, việc chia tỷ lệ logit attention làm giảm entropy attention, từ đó giải thích tại sao nó dẫn đến cải thiện trong các tác vụ mô hình hóa ngôn ngữ khi mô hình hóa đầu vào dài như được quan sát trong YaRN (Peng et al., 2023).
+
+### 3.2 Nguyên tắc Thiết kế
+
+Các công trình trước đây đã khám phá các hệ số chia tỷ lệ khác nhau trên logit attention với các động cơ khác nhau. Chiang và Cholak (2022) chia tỷ lệ logit attention bởi log n, với n đại diện cho độ dài của chuỗi huấn luyện dài nhất, để tăng cường khả năng ngoại suy của mô hình trong các tác vụ xuôi dòng như dịch máy.
+
+Gần đây hơn, YaRN (Peng et al., 2023) giới thiệu hệ số chia tỷ lệ t= 0.1 ln s+ 1 bằng cách khớp đường cong perplexity thấp nhất trong các tác vụ mô hình hóa ngôn ngữ. Họ kết hợp những hệ số chia tỷ lệ này với NTK-By-Parts scaling và quan sát hiệu suất tinh chỉnh ngữ cảnh dài được cải thiện trên các tác vụ mô hình hóa ngôn ngữ.
+
+ReRoPE (Su, 2023) sử dụng hệ số chia tỷ lệ động có tính đến số lượng token ngữ cảnh cho mỗi vị trí đầu vào: t= log(c/m), trong đó c biểu thị kích thước cửa sổ ngữ cảnh được tiền huấn luyện và m đại diện cho chỉ số vị trí của token đầu vào. Bằng cách giới thiệu hệ số chia tỷ lệ này trong giai đoạn tiền huấn luyện, ReRoPE thể hiện khả năng ngoại suy tăng cường trong các tác vụ mô hình hóa ngôn ngữ, điều này cũng được quan sát trong YaRN.
+
+Chúng tôi đề xuất "entropy-aware ABF" với các nguyên tắc thiết kế sau:
+
+(1). **Chia tỷ lệ Attention Động**: Cả PI và YaRN đều sử dụng hệ số chia tỷ lệ không đổi cho tất cả vị trí đầu vào, điều này có thể kéo dãn quá mức logit attention ở các vị trí phía trước và cản trở khả năng ngoại suy của mô hình đến các chuỗi dài hơn. Thay vì sử dụng hệ số chia tỷ lệ không đổi, chúng tôi đề xuất sử dụng hệ số động như ReRoPE có tính đến số lượng token ngữ cảnh cho mỗi vị trí đầu vào. Điều này cho phép mô hình điều chỉnh trọng số attention một cách linh hoạt hơn dựa trên mức độ ngẫu nhiên trong phân phối điểm số attention.
+
+(2). **Phụ thuộc vào Lớp**: Tất cả các công trình hiện tại áp dụng scalar một cách không phân biệt cho tất cả các lớp mô hình. Tuy nhiên, dựa trên quan sát của chúng tôi trong Hình 1 rằng hai lớp đầu tiên luôn thể hiện mô hình attention gần như đồng đều và chỉ các lớp sau thể hiện xu hướng duy trì sự tập trung, chúng tôi đề xuất không can thiệp vào hai lớp đầu tiên để phù hợp với đặc điểm vốn có của mô hình.
+
+(3). **Tạo điều kiện cho Mở rộng Cửa sổ Ngữ cảnh**: Hơn nữa, chúng tôi giả thuyết rằng việc học cách duy trì sự tập trung khi xử lý các chuỗi dài là quan trọng đối với việc mở rộng cửa sổ ngữ cảnh, và việc chia tỷ lệ logit attention có thể đóng vai trò như một thiên kiến quy nạp tạo điều kiện cho quá trình này. Điều này thúc đẩy chúng tôi kết hợp "chia tỷ lệ logit attention" với ABF trong giai đoạn tinh chỉnh có giám sát. Để tận dụng kết quả tiền huấn luyện, chúng tôi cũng đề xuất tránh sửa đổi logit attention trong cửa sổ ngữ cảnh được tiền huấn luyện bằng cách đặt giới hạn dưới cho t.
+
+Hệ số chia tỷ lệ cuối cùng t của chúng tôi được mô tả dưới đây:
+
+t = {
+1, nếu chỉ số lớp là 0 hoặc 1
+max(log(c/i),1), ngược lại
+}
+
+## 4 Thí nghiệm
+
+Để phân tích khả năng ứng dụng thực tế của các phương pháp mở rộng RoPE khác nhau, chúng tôi kiểm tra hiệu suất ngữ cảnh dài của các mô hình được huấn luyện với những phương pháp này trên các tác vụ được chọn từ LongBench (Bai et al., 2023) và trả lời ba câu hỏi nghiên cứu mà chúng tôi đề xuất trong Phần 1 bằng cách điều chỉnh lượng dữ liệu huấn luyện và kích thước cửa sổ ngữ cảnh. Cuối cùng, chúng tôi cũng khám phá thành phần dữ liệu hiệu quả và chương trình huấn luyện về việc mở rộng cửa sổ ngữ cảnh cho các tác vụ xuôi dòng nhất định.
+
+### 4.1 Thiết lập Chung
+
+**Biến thể Mô hình** Chúng tôi sử dụng LLaMA-2-7B-Chat (Touvron et al., 2023b) vì tính phổ biến của nó. Chúng tôi chỉ sửa đổi RoPE trong khi để nguyên kiến trúc mô hình.
+
+**Huấn luyện** Các công trình trước đây (Chen et al., 2023; Xiong et al., 2023; Peng et al., 2023) áp dụng chương trình huấn luyện tương tự bằng cách trước tiên tiền huấn luyện tiếp tục mô hình LLaMA cơ sở để thích ứng với position embedding đã sửa đổi và sau đó tinh chỉnh trên các tác vụ xuôi dòng ngữ cảnh dài mục tiêu. Ngược lại, chúng tôi đề xuất tinh chỉnh có giám sát trực tiếp Mô hình Chat để đánh giá khả năng ứng dụng thực tế của các phương pháp mở rộng RoPE khác nhau. Chúng tôi mở rộng cửa sổ ngữ cảnh của LLaMA-2-7B-Chat lên 16k với các thiết lập huấn luyện chi tiết có sẵn trong Phụ lục A.
+
+**Dữ liệu SFT** Chúng tôi tuyển chọn một tập dữ liệu gồm 3.5k cuộc trò chuyện dài từ ShareGPT (Chiang et al., 2023). Theo pipeline làm sạch dữ liệu trong (Zheng et al., 2023), chúng tôi chỉ giữ các cuộc trò chuyện tiếng Anh, loại trừ những cuộc trò chuyện có ít hơn 10,000 token, và chia các cuộc trò chuyện dài hơn để chúng tôi có độ dài chuỗi tối đa là 16,384 token.
+
+**Đánh giá** Các công trình hiện tại chủ yếu đánh giá hiệu quả của các phương pháp mở rộng RoPE thông qua việc kiểm tra các mô hình được tiền huấn luyện tiếp tục trên các tác vụ mô hình hóa ngôn ngữ và tác vụ tổng hợp. Ví dụ, YaRN (Chen et al., 2023) đánh giá điểm số perplexity và hiệu suất mô hình trên tác vụ passkey-retrieval (Mohtashami và Jaggi, 2023) để định lượng hiệu suất ngữ cảnh dài của mô hình. Tuy nhiên, các tác vụ tổng hợp như passkey retrieval lệch lạc nhiều so với các tình huống thực tế trong khi các tác vụ mô hình hóa ngôn ngữ cũng đã được chứng minh là một metric cơ bản không thể đảm bảo thành công trong các tác vụ xuôi dòng như được đề xuất bởi (Pal et al., 2023; Sun et al., 2021). Trong công trình này, chúng tôi phân tích hiệu suất ngữ cảnh dài của các mô hình với cửa sổ ngữ cảnh mở rộng trên các tác vụ được chọn từ LongBench (Bai et al., 2023). Đánh giá của chúng tôi bao gồm 12 tác vụ từ bốn danh mục: QA tài liệu đơn, QA đa tài liệu, tóm tắt, và học few-shot để đảm bảo đánh giá toàn diện khả năng ngữ cảnh dài của mô hình. Chúng tôi cố ý loại trừ các tác vụ tổng hợp và tác vụ hoàn thành mã từ LongBench vì các tác vụ tổng hợp lệch lạc nhiều so với các tình huống thực tế, và các tác vụ hoàn thành mã có xung đột hiệu suất với khả năng tuân theo hướng dẫn chung được học từ các cuộc trò chuyện ShareGPT, như được đề xuất bởi (Dong et al., 2023).
+
+### 4.2 Đo lường Hiệu suất Ngữ cảnh Dài
+
+Để trả lời câu hỏi nghiên cứu "(1) Phương pháp nào thể hiện hiệu suất tinh chỉnh có giám sát tốt nhất trên các tác vụ xuôi dòng đòi hỏi ngữ cảnh?", chúng tôi tinh chỉnh LLaMA-7B-Chat trên 3.5k cuộc trò chuyện dài và đánh giá hiệu suất ngữ cảnh dài của chúng trên LongBench.
+
+Bảng 2 minh họa hiệu suất của mỗi phương pháp, với một số kết quả được báo cáo từ bài báo LongBench (Bai et al., 2023). Chúng tôi làm nổi bật các quan sát chính của chúng tôi ở đây:
+
+[Bảng 2: Kết quả thí nghiệm trên các tác vụ được chọn từ LongBench. Tên mô hình có dấu sao ở cuối được báo cáo từ bài báo LongBench. Chúng tôi đặt tên các mô hình được huấn luyện theo phương pháp mở rộng RoPE của chúng.]
+
+1) **Tinh chỉnh mô hình trên dữ liệu cuộc trò chuyện dài là hiệu quả cho việc mở rộng cửa sổ ngữ cảnh.** Cả LongChat-v1.5-7B-32k và Vicuna-v1.5-7B-16k đều là các mô hình ngữ cảnh dài mã nguồn mở được mở rộng với PI (Chen et al., 2023) thông qua tinh chỉnh trên lượng lớn dữ liệu cuộc trò chuyện. Ví dụ, LongChat-v1.5-7B-32 được tinh chỉnh trên 80k cuộc trò chuyện. Bằng cách tinh chỉnh mô hình chỉ trên các cuộc trò chuyện dài, mô hình dựa trên PI được nhân bản của chúng tôi vượt trội hơn các phiên bản mã nguồn mở, xác nhận hiệu quả của việc tinh chỉnh mô hình trên các cuộc trò chuyện dài.
+
+2) **PI mang lại kết quả tinh chỉnh ngữ cảnh dài tốt hơn so với YaRN.** Trong khi NTK-By-Parts và YaRN có perplexity thấp hơn trong các tác vụ mô hình hóa ngôn ngữ, PI có hiệu suất tinh chỉnh tốt hơn trên các tác vụ xuôi dòng ngữ cảnh dài liên quan nhiều hơn đến các tình huống thực tế. Phát hiện này củng cố kết luận của (Pal et al., 2023; Sun et al., 2021) rằng perplexity mô hình hóa ngôn ngữ là một metric cơ bản không thể đảm bảo thành công trong các tác vụ xuôi dòng. Chúng tôi giả thuyết rằng trong khi scalar của YaRN hiệu quả cho các tác vụ mô hình hóa ngôn ngữ, tính chất không đổi của nó có thể ảnh hưởng đến hiệu suất mô hình trên các tác vụ xuôi dòng.
+
+3) **Các mô hình dựa trên ABF vượt qua các phương pháp khác với margin đáng kể.** Cả ABF và phương pháp của chúng tôi đều thể hiện hiệu suất tinh chỉnh vượt trội nhất quán trên tất cả 12 tác vụ ngữ cảnh dài, chứng minh hiệu quả của việc điều chỉnh tần số cơ sở của RoPE thành một con số lớn (ví dụ 50,000).
+
+### 4.3 Đo lường Hiệu quả Dữ liệu
+
+Hiệu quả dữ liệu là một đặc điểm thiết yếu của các phương pháp mở rộng RoPE trong thực tế mở rộng cửa sổ ngữ cảnh, xét cả sự khan hiếm của dữ liệu huấn luyện dài và chi phí cao của việc huấn luyện trên các chuỗi dài. Trong phần này, chúng tôi khám phá câu hỏi nghiên cứu "(2) Mỗi phương pháp có thể sử dụng hiệu quả dữ liệu huấn luyện như thế nào?" bằng cách huấn luyện mô hình tương ứng trên 32, 100, 1k và 3.5k cuộc trò chuyện. Kết quả được vẽ trong Hình 2, và kết quả chi tiết cho mỗi tác vụ ở Bảng 5.
+
+[Hình 2: Hiệu suất Ngữ cảnh Dài của các Phương pháp Mở rộng RoPE với Lượng Dữ liệu Huấn luyện Khác nhau]
+
+Chúng tôi làm nổi bật các quan sát chính của chúng tôi dưới đây:
+
+1) **Các phương pháp dựa trên ABF nhất quán hưởng lợi từ việc tăng dữ liệu huấn luyện.** Trong khi tất cả các phương pháp mở rộng RoPE thể hiện hiệu suất cải thiện với dữ liệu huấn luyện tăng, việc tăng hiệu suất có vẻ biên cho PI, NTK-By-Parts và Yarn khi lượng dữ liệu tăng từ 1K lên 3.5K. Chỉ các phương pháp dựa trên ABF nhất quán thể hiện lợi ích hiệu suất.
+
+2) **Entropy-Aware ABF thể hiện hiệu quả dữ liệu phi thường.** Đáng chú ý, chỉ với 100 mẫu huấn luyện và 6 bước huấn luyện, phương pháp của chúng tôi đạt được hiệu suất ngữ cảnh dài cạnh tranh chỉ chậm biên so với phương pháp ABF được huấn luyện trên 3.5K mẫu. Không xem xét chi phí của việc tinh chỉnh trên các tác vụ xuôi dòng, PI (Chen et al., 2023) tiền huấn luyện tiếp tục LLaMA-7B (Touvron et al., 2023a) trong 1,000 bước với batch size 64, YaRN (Peng et al., 2023) áp dụng 250 bước tiền huấn luyện tiếp tục với cùng batch size. Thực hành mã nguồn mở như Longchat (Li* et al., 2023) sử dụng 80k cuộc trò chuyện từ ShareGPT cho instruction tuning. Công trình của chúng tôi chứng minh hiệu quả đáng kể của entropy-aware ABF trong việc mở rộng cửa sổ ngữ cảnh, yêu cầu ít hơn 2% tài nguyên huấn luyện được sử dụng bởi các phương pháp hiện có.
+
+Chúng tôi cũng quan sát thấy rằng khoảng cách hiệu suất từ ABF đến phương pháp của chúng tôi đang giảm với sự gia tăng dữ liệu huấn luyện. Hiện tượng này phù hợp với giả thuyết của chúng tôi trong Phần 3.2 rằng trong khi khả năng duy trì sự tập trung trên các đầu vào dài có thể được học từ việc huấn luyện trên nhiều dữ liệu hơn, phương pháp của chúng tôi đóng vai trò như một thiên kiến quy nạp tạo điều kiện cho quá trình học.
+
+### 4.4 Đo lường Độ bền vững trên các Cửa sổ Ngữ cảnh
+
+Một thuộc tính mong muốn cho các phương pháp mở rộng RoPE, khi được áp dụng trong các thiết lập mở rộng cửa sổ ngữ cảnh thực tế, là các mô hình được tinh chỉnh sử dụng những phương pháp này nên duy trì hiệu suất của chúng trên cửa sổ ngữ cảnh gốc, đồng thời cũng thể hiện một mức độ khả năng ngoại suy nhất định vượt ra ngoài độ dài được tinh chỉnh.
+
+Để trả lời câu hỏi nghiên cứu "(3) Các mô hình được huấn luyện với những phương pháp này có hiệu suất mạnh mẽ trên các kích thước cửa sổ ngữ cảnh khác nhau không?", chúng tôi theo LongBench (Bai et al., 2023) để đánh giá các mô hình trên các kích thước cửa sổ ngữ cảnh khác nhau bằng cách cắt ngắn prompt từ giữa khi độ dài tác vụ vượt quá kích thước cửa sổ ngữ cảnh được chỉ định.
+
+Kết quả được mô tả trong Hình 3. Trong khi có vẻ như có lợi ích hiệu suất cho PI, NTK-By-Parts và Yarn khi kích thước ngữ cảnh được mở rộng từ 4k lên 8k, hiệu suất của chúng giảm khi ngữ cảnh được mở rộng thêm lên 16k, thể hiện sự bất lực trong việc tận dụng cửa sổ ngữ cảnh tinh chỉnh đầy đủ. Ngược lại, ABF và phương pháp đề xuất của chúng tôi nhất quán có lợi từ cửa sổ ngữ cảnh lớn hơn trong độ dài tinh chỉnh. Hơn nữa, entropy-aware ABF là phương pháp duy nhất có thể duy trì hiệu suất khi ngoại suy trực tiếp lên 32k.
+
+[Hình 3: Hiệu suất Ngữ cảnh Dài của các Phương pháp Mở rộng RoPE với Kích thước Cửa sổ Ngữ cảnh Khác nhau]
+
+### 4.5 Khám phá Dữ liệu Huấn luyện và Chương trình Tối ưu
+
+Trong phần này, chúng tôi khám phá dữ liệu huấn luyện và chương trình hiệu quả cho việc mở rộng cửa sổ ngữ cảnh trên các tác vụ nhất định. Một cân nhắc quan trọng trong thực tế là liệu các mẫu huấn luyện trong domain dài có không thể thiếu để đạt được thành công trong việc mở rộng cửa sổ ngữ cảnh cho một tác vụ xuôi dòng cụ thể. Cụ thể, chúng tôi hỏi liệu chỉ các mẫu huấn luyện trong domain ngắn có thể vẫn mang lại lợi ích trong các tình huống mà các mẫu dài hơn vắng mặt, điều này thường xảy ra. Để trả lời các câu hỏi trên, chúng tôi tiến hành thí nghiệm với các chương trình huấn luyện khác nhau trên GovReport (Huang et al., 2021), một tác vụ tóm tắt ngữ cảnh dài được sử dụng rộng rãi, và Longchat-Line-Retrieval (Li* et al., 2023), một tác vụ truy xuất tổng hợp.
+
+Chúng tôi đánh giá cả tác vụ dài (hơn 8,092 token) và tác vụ ngắn (trong vòng 4,096 token) để đảm bảo hiệu suất của mô hình trong cửa sổ ngữ cảnh gốc trong khi đánh giá hiệu suất ngữ cảnh dài của chúng. Khi dữ liệu huấn luyện là các mẫu trong domain, chúng tôi huấn luyện mô hình trong 4 epoch với batch size 8 và đánh giá với epoch tốt nhất trên tập validation. Khi dữ liệu huấn luyện là 1,000 cuộc trò chuyện ShareGPT, mô hình được huấn luyện trong hai epoch với batch size 32 và đánh giá ở epoch thứ hai.
+
+Kết quả được hiển thị trong Bảng 3. Chúng tôi kết luận rằng việc huấn luyện mô hình trên các mẫu trong domain ngắn tạo ra kết quả tối ưu dưới mức, nhưng bắt đầu từ mô hình được tinh chỉnh trên 1,000 cuộc trò chuyện ShareGPT mang lại kết quả tương đương với những mô hình được tinh chỉnh trên các mẫu trong domain dài, điều này đề xuất một điểm khởi đầu tốt cho việc mở rộng cửa sổ ngữ cảnh trong thực tế.
+
+Có thể lạ là tác vụ line-retrieval cho thấy hiệu suất cực kỳ kém khi được tinh chỉnh từ mô hình Chat trên các mẫu dài. Chúng tôi quy cho điều này là việc huấn luyện không đủ của phương pháp chúng tôi vì câu trả lời cho tác vụ line retrieval là ngắn, và chúng tôi chỉ tính toán loss trên các token phản hồi của mô hình trong quá trình instruction tuning.
+
+[Bảng 3: Hiệu suất trên hai tác vụ xuôi dòng với các chương trình huấn luyện khác nhau. GR-S: GovReport-Short. GR-L: GovReport-Long. LR-S: Line Retrieval-Short. LR-L: LineRetrieval-Long. Trong cột đầu tiên, Share1k có nghĩa là kết quả tinh chỉnh của mô hình 7B Chat trên 1,000 cuộc trò chuyện ShareGPT. Short có nghĩa là kết quả tinh chỉnh của mô hình 7B chat trên các mẫu trong domain ngắn. Trong cột thứ hai, None có nghĩa là mô hình được kiểm tra trực tiếp. Short có nghĩa là các mẫu trong domain ngắn. Long có nghĩa là các mẫu trong domain dài.]
+
+## 5 Công trình Liên quan
+
+Nghiên cứu mở rộng đã được thực hiện để tăng cường khả năng ngữ cảnh dài của các mô hình transformer (Vaswani et al., 2017) bằng cách vượt qua hai trở ngại nổi bật: độ phức tạp thời gian và không gian bậc hai của cơ chế attention (Vaswani et al., 2017) và sự bất lực của mã hóa vị trí để tổng quát hóa vượt ra ngoài cửa sổ ngữ cảnh được tiền huấn luyện.
+
+**Transformer Hiệu quả hơn** Cơ chế attention vanilla trong kiến trúc Transformer được biết đến với độ phức tạp thời gian và không gian bậc hai, điều này đặt ra yêu cầu tài nguyên đáng kể cho các mô hình transformer khi xử lý đầu vào dài. Các công trình khác nhau đã tập trung vào việc chinh phục vấn đề độ phức tạp và đề xuất Transformer hiệu quả hơn. Sparse transformer (Child et al., 2019; Ye et al., 2019; Kitaev et al., 2020; Beltagy et al., 2020; Ainslie et al., 2020; Zaheer et al., 2020; Ding et al., 2023) thay thế cơ chế attention đầy đủ gốc bằng phiên bản thưa thớt để làm cho tính toán hiệu quả hơn. Linear transformer (Wang et al., 2020; Katharopoulos et al., 2020; Choromanski et al., 2020), thay vì buộc cơ chế attention phải chú ý đến ít token hơn, đề xuất một cách tiếp cận thay thế bằng cách tận dụng nhân ma trận hạng thấp hoặc tích chấm tuyến tính của các bản đồ đặc trưng kernel để xấp xỉ cơ chế attention gốc, đạt được độ phức tạp thời gian tuyến tính. Trong khi đó, các mô hình tăng cường truy xuất (Guu et al., 2020; Lewis et al., 2020; Wu et al., 2022; Bulatov et al., 2023; Tworkowski et al., 2023) tích hợp truy xuất với attention. Trong thời gian suy luận, những mô hình này tránh mô hình hóa trực tiếp đầu vào dài bằng cách truy xuất thông tin từ bộ nhớ ngoài lưu trữ các cặp key-value trước đó.
+
+Trong khi nghiên cứu trước đây chủ yếu tập trung vào việc giảm FLOP, nút cổ chai của suy luận transformer trên phần cứng tính toán hiện đại đã chuyển sang overhead từ truy cập bộ nhớ (IO). Multi-query attention (MQA)(Shazeer, 2019) và grouped-query attention (GQA)(Ainslie et al., 2023), ví dụ, giải quyết chi phí băng thông bộ nhớ liên quan đến việc tải các tensor "keys" và "values" lớn trong cơ chế multi-head attention bằng cách đề xuất sử dụng ít đầu "key" và "value" hơn. Đáng chú ý, GQA được sử dụng trong LLaMA2 (Touvron et al., 2023b). Ngoài ra, FlashAttention (Dao et al., 2022; Dao, 2023) giới thiệu một cách tiếp cận attention chính xác nhận biết IO sử dụng tiling để giảm IO bộ nhớ.
+
+**Mã hóa Vị trí Có thể Tổng quát hóa** Do tính chất song song của cơ chế attention, các mô hình transformer yêu cầu các phương pháp mã hóa vị trí (PE) để tạo điều kiện cho việc tích hợp thông tin vị trí. Transformer gốc sử dụng mã hóa vị trí sinusoidal, tạo thành PE tuyệt đối và thể hiện khả năng tổng quát hóa hạn chế. Sau đó, cách tiếp cận này được tinh chỉnh thành phiên bản có thể học (Gehring et al., 2017), như được áp dụng bởi các kiến trúc mô hình ngôn ngữ như GPT-3 (Brown et al., 2020). Tuy nhiên, sự thích ứng này hoàn toàn làm tổn hại khả năng ngoại suy của các phương pháp mã hóa vị trí. Sự ra đời của PE tương đối (Shaw et al., 2018) về mặt lý thuyết hỗ trợ độ dài đầu vào vô hạn. Tuy nhiên, mặc dù có những tiến bộ gần đây trong PE tương đối, như T5 relative PE (Raffel et al., 2020), RoPE (Su et al., 2021), xPOS (Sun et al., 2022), và ALiBi (Press et al., 2021), đã được chứng minh bởi (Kazemnejad et al., 2023) rằng tất cả những phương pháp này đều thất bại khi ngoại suy đáng kể vượt ra ngoài cửa sổ ngữ cảnh được tiền huấn luyện.
+
+## 6 Kết luận
+
+Tóm lại, thông qua việc diễn giải nhu cầu vốn có của LLM để duy trì sự tập trung khi xử lý các chuỗi dài, chúng tôi đề xuất entropy-aware ABF bằng cách kết hợp ABF với scalar được áp dụng tinh vi chia tỷ lệ logit attention. Phương pháp đề xuất của chúng tôi hiệu quả mở rộng cửa sổ ngữ cảnh của các LLM dựa trên RoPE, giải quyết các hạn chế của chúng khi đối mặt với các tác vụ đòi hỏi ngữ cảnh với chi phí tối thiểu. Chúng tôi chứng minh thực nghiệm tính ưu việt của phương pháp trong cả kết quả tinh chỉnh và độ bền vững trên các kích thước cửa sổ ngữ cảnh khác nhau trên các tác vụ đòi hỏi ngữ cảnh khác nhau. Quan trọng là, phương pháp của chúng tôi thể hiện hiệu quả dữ liệu phi thường so với các phương pháp khác, tạo ra một mô hình ngữ cảnh dài thành thạo trên LongBench chỉ với 100 mẫu và 6 bước huấn luyện, ít hơn 2% tài nguyên huấn luyện được sử dụng bởi các công trình trước đây. Cuối cùng, chúng tôi cung cấp những hiểu biết có giá trị về việc mở rộng cửa sổ ngữ cảnh cho các tác vụ xuôi dòng cụ thể, đề xuất huấn luyện trên các cuộc trò chuyện ShareGPT dài như một điểm khởi đầu tốt.
+
+## Lời cảm ơn
+
+Chúng tôi muốn cảm ơn Zhengbao Jiang vì sự tham gia của anh ấy trong các cuộc thảo luận ban đầu. Chúng tôi cảm ơn Fan Nie và Fan Zhou vì lời khuyên vô giá của họ trong suốt quá trình viết bài.
+
+## Tài liệu tham khảo
+
+[Danh sách tài liệu tham khảo được giữ nguyên như bản gốc]
+
+## A Chi tiết Huấn luyện
+
+Mô hình được huấn luyện trên 4 GPU NVIDIA A100 với DeepSpeed (Rasley et al., 2020), ZeRO (Rajbhandari et al., 2020; Ren et al., 2021) Stage 3, gradient-checkpointing (Chen et al., 2016), và FlashAttention (Dao et al., 2022; Dao, 2023). Chúng tôi cũng sử dụng độ chính xác tính toán hỗn hợp BF16 và TF32 để tăng tốc thêm.
+
+Tất cả các mô hình được tinh chỉnh sử dụng AdamW Optimizer (Loshchilov và Hutter, 2017) với β1= 0.9 và β2= 0.95 trong hai epoch, tính toán loss chỉ trên token phản hồi. Chúng tôi sử dụng bộ lập lịch học tỷ cosine, đặt tỷ lệ học đỉnh là 2e-5, và weight decay là 0.1. Để huấn luyện trên 3.5k cuộc trò chuyện, chúng tôi sử dụng batch size 128 và 10 bước khởi động. Chúng tôi sử dụng batch size 32 và 0 bước khởi động cho ít dữ liệu huấn luyện hơn. Nếu không được nêu rõ, chúng tôi mặc định sử dụng 3.5k cuộc trò chuyện ShareGPT cho instruction tuning.
+
+## B Kết quả Thí nghiệm Bổ sung
+
+[Các bảng kết quả chi tiết được giữ nguyên như bản gốc]

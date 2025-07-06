@@ -1,0 +1,247 @@
+# TRAMS: Lựa chọn Bộ nhớ Không cần Huấn luyện cho Mô hình Ngôn ngữ Tầm xa
+
+Haofei Yu♡∗, Cunxiang Wang♣†, Yue Zhang♣, Wei Bi♢‡
+♡Viện Công nghệ Ngôn ngữ, Đại học Carnegie Mellon, Hoa Kỳ
+♣Trường Kỹ thuật, Đại học Westlake, Trung Quốc♢Phòng thí nghiệm AI Tencent, Trung Quốc
+haofeiy@cs.cmu.edu ,{wangcunxiang, zhangyue}@westlake.edu.cn ,
+victoriabi@tencent.com
+
+## Tóm tắt
+Kiến trúc Transformer là quan trọng đối với nhiều mô hình AI, nhưng nó vẫn gặp thách thức trong việc mô hình hóa ngôn ngữ tầm xa. Mặc dù một số kiến trúc transformer cụ thể đã được thiết kế để giải quyết các vấn đề về phụ thuộc tầm xa, các phương pháp hiện có như Transformer-XL bị ảnh hưởng bởi tỷ lệ cao các bộ nhớ không hiệu quả. Trong nghiên cứu này, chúng tôi trình bày một chiến lược cắm và chạy, được gọi là Lựa chọn Bộ nhớ Không cần Huấn luyện (TRAMS), lựa chọn các token tham gia vào tính toán attention dựa trên một chỉ số đơn giản. Chiến lược này cho phép chúng tôi giữ lại các token có khả năng có điểm attention cao với các truy vấn hiện tại và bỏ qua những token khác. Chúng tôi đã thử nghiệm phương pháp của mình trên benchmark cấp từ (WikiText-103) và benchmark cấp ký tự (enwik8), và kết quả cho thấy cải thiện mà không cần huấn luyện bổ sung hoặc thêm tham số bổ sung.
+
+## 1 Giới thiệu
+Các mô hình dựa trên Transformer (Kenton và Toutanova, 2019; Liu et al., 2019; Raffel et al., 2020; Lan et al., 2019; Brown et al., 2020) đã đạt được hiệu suất đáng chú ý trong vài năm qua. Thành phần chính của các kiến trúc mô hình này là cơ chế attention (Vaswani et al., 2017). Tuy nhiên, thiết kế attention ban đầu gặp khó khăn trong việc xử lý hiệu quả các chuỗi dài, điều này trở nên đặc biệt có vấn đề trong các tình huống như dịch thuật cấp tài liệu (Werlen et al., 2018; Kim et al., 2019) và tạo văn bản quy mô lớn (Zhou et al., 2023), vì chi phí tính toán thời gian và không gian của nó tăng bậc hai với độ dài chuỗi (Tay et al., 2022). Yếu tố chính cho độ phức tạp tính toán cao này có thể được truy nguyên về phép nhân giữa các truy vấn và khóa được sử dụng trong mô-đun attention. Nói chung, độ phức tạp thời gian cho tính toán là O(N²d) nếu một mô hình transformer với d chiều được thiết lập với đầu vào gồm N token.
+
+Để giải quyết nút thắt tính toán này, nhiều nỗ lực đã được thực hiện. Hướng nghiên cứu đầu tiên là tìm một biểu thức hiệu quả mới để tính điểm attention. Mặc dù có những tiến bộ, các phương pháp này thường làm giảm hiệu suất, do đó mở đường cho các giải pháp thay thế. Các kiến trúc hiệu quả cung cấp biểu thức gần đúng của attention đã được khám phá rộng rãi (Wang et al., 2020; Peng et al., 2022b,a; Choromanski et al., 2021; Zheng et al., 2022b,a). Hướng nghiên cứu thứ hai là giữ nguyên biểu thức tính toán và sử dụng cấu trúc bên ngoài như hàm hash (Kitaev et al., 2019; Daras et al., 2020), phân cụm (Roy et al., 2021; Vyas et al., 2020) và bộ chọn bộ nhớ (Pietruszka et al., 2022; Dai et al., 2019; Bertsch et al., 2023; Sukhbaatar et al., 2021, 2019; Child et al., 2019) để tìm tập con phù hợp của các truy vấn và khóa trong chuỗi dài cho tính toán attention.
+
+Công trình của chúng tôi thuộc về danh mục thứ hai, trong đó chúng tôi đề xuất một cơ chế lựa chọn bộ nhớ không cần huấn luyện để chọn các token phù hợp cho tính toán attention. Cụ thể, chúng tôi tập trung vào đẩy kiến trúc Transformer-XL (Dai et al., 2019) đến một vị trí tốt hơn bằng cách chọn các token chất lượng cao hơn bên trong bộ nhớ của nó. Dựa trên điều tra ban đầu của chúng tôi, chúng tôi xây dựng một tập con bộ nhớ bằng cách chọn 50% bộ nhớ có giá trị attention lớn nhất và duy trì cùng hiệu suất. Điều này cho thấy rằng một phần lớn thông tin trong bộ nhớ không được sử dụng đầy đủ. Điều này thúc đẩy chúng tôi khám phá các phương pháp tốt hơn để tối ưu hóa việc sử dụng bộ nhớ.
+
+Như minh họa trong Hình 1, chúng tôi đề xuất một phương pháp Lựa chọn Bộ nhớ Không cần Huấn luyện (TRAMS) có thể được cắm trực tiếp vào các mô hình ngôn ngữ tầm xa dựa trên bộ nhớ và giảm độ phức tạp thời gian của việc tính toán ma trận attention. Thông qua các thí nghiệm trên hai tập dữ liệu benchmark mô hình ngôn ngữ, cụ thể là WikiText-103 cấp từ (Merity et al., 2016) và enwik8 cấp ký tự (Mahoney, 2011), chúng tôi đạt được cải thiện trong hiệu suất của mô hình, được chứng minh bằng việc giảm 0.19 perplexity (ppl) trong WikiText-103 và giảm 0.017 trong bits-per-character (bpc) trong enwik8. Theo hiểu biết của chúng tôi, chúng tôi là những người đầu tiên thiết kế một phương pháp lựa chọn bộ nhớ không cần huấn luyện dựa trên kiến trúc Transformer-XL.¹
+
+## 2 Phương pháp
+
+### 2.1 Định nghĩa Vấn đề
+Chúng tôi sử dụng h∈R^(N×d) để biểu diễn các trạng thái ẩn đầu vào cho mô-đun attention, o∈R^(N×d) để biểu diễn các trạng thái ẩn đầu ra cho mô-đun attention, m∈R^(M×d) để biểu diễn các trạng thái ẩn bộ nhớ được sử dụng trong tính toán attention. Chúng tôi sử dụng W_Q, W_K, W_V để biểu diễn ma trận chiếu có thể huấn luyện trong mô-đun attention. Chúng tôi định nghĩa d cho chiều của mô hình, M cho kích thước bộ nhớ, và N cho kích thước đầu vào. Quá trình tính toán attention có thể được viết chính thức là o = Attn(h,m).
+
+Với các ký hiệu trên, vấn đề lựa chọn bộ nhớ có thể được định nghĩa là chọn một tập con của bộ nhớ trạng thái ẩn m̃ từ bộ nhớ m mang lại sự khác biệt tối thiểu cho đầu ra lớp transformer nhưng với kích thước bộ nhớ nhỏ hơn.
+
+m̃* = arg min_(m̃⊂m) ||Attn(h,m̃) - Attn(h,m)||     (1)
+
+### 2.2 Công thức lại Attention
+
+**Attention Chuẩn** Trong một mô hình ngôn ngữ tăng cường bộ nhớ, cơ chế attention chuẩn (Vaswani et al., 2017) giữa các trạng thái ẩn đầu vào và các trạng thái ẩn bộ nhớ có thể được viết là:
+
+Attn(h,m) = softmax(QK^T/√d)V     (2)
+
+trong đó Q = hW_Q là tích của các trạng thái ẩn token đích h và ma trận chiếu truy vấn W_Q; K = mW_K là tích của các trạng thái ẩn token bộ nhớ m và ma trận chiếu khóa W_K; V = mW_V cũng là tích của các trạng thái ẩn token bộ nhớ m và ma trận chiếu giá trị W_V.
+
+**Attention Unlimiformer** Khác với cách tính điểm attention nổi tiếng, Unlimiformer (Bertsch et al., 2023) đề xuất một cách viết lại để tính phần tích vô hướng của cross-attention trong kiến trúc encoder-decoder:
+
+QK^T = (h_d W_Q)(h_e W_K)^T
+     = (h_d W_Q W_K^T)h_e^T     (3)
+
+trong đó h_e là trạng thái ẩn encoder và h_d là trạng thái ẩn decoder. Điều này cho phép Unlimiformer tránh lập chỉ mục các khóa cho mỗi đầu và lớp riêng biệt và tránh lưu trữ các giá trị trong một chỉ mục riêng biệt từ các khóa trong giai đoạn tìm kiếm và truy xuất dựa trên kNN, làm cho nó hiệu quả hơn.
+
+**Attention TRAMS** Mặc dù chúng tôi không cần lưu trữ hoặc lập chỉ mục bất kỳ khóa hoặc giá trị nào cho phương pháp của mình, attention Unlimiformer thúc đẩy chúng tôi chuyển thông tin hữu ích hơn cho các khóa bằng cách công thức lại attention và cho phép chúng tôi thực hiện lựa chọn bộ nhớ hiệu quả hơn chỉ dựa trên các khóa được công thức lại.
+
+Chúng tôi có thể tính công thức attention này theo thứ tự khác nhưng duy trì cùng kết quả:
+
+QK^T = (hW_Q)(mW_K)^T
+     = (h)(mW_K W_Q^T)^T     (4)
+
+Do đó, chúng tôi định nghĩa Q' = h là truy vấn được công thức lại cho biểu thức attention này và K' = mW_K W_Q^T là các khóa được công thức lại cho attention. Với công thức này, chúng tôi chuyển tất cả thông tin tham số liên quan đến attention lên các vector khóa được công thức lại.
+
+### 2.3 Không gian Ẩn Transformer
+
+Vì h là đầu vào của lớp transformer hiện tại và cũng là đầu ra của lớp transformer trước đó, nó là kết quả của thao tác Layernorm của lớp cuối. Chúng tôi có thể định nghĩa trung bình theo tọa độ của h là μ và độ lệch chuẩn theo tọa độ của h là σ. Các biểu thức có thể được viết là:
+
+μ = (1/d)∑(i=1 to d)h_i ≈ 0, σ = √((1/d)∑(i=1 to d)(h_i - μ)²) ≈ 1     (5)
+
+Vì giá trị trung bình cho các trạng thái ẩn h xấp xỉ bằng không, chúng tôi có thể xác nhận các vector trạng thái ẩn gần như trực giao với vector 1⃗ và chuẩn L2 của các trạng thái ẩn xấp xỉ √d.
+
+Với xấp xỉ này, chúng tôi có thể mở rộng điểm attention được công thức lại của mình là:
+
+Q'K'^T = (h)(mW_K W_Q^T)^T
+        = ||Q'|| · ||K'|| · cos⟨Q',K'⟩
+        ≈ √d · ||K'|| · cos⟨Q',K'⟩     (6)
+
+trong đó ||Q'|| đại diện cho chuẩn L2 của Q' và ||K'|| đại diện cho chuẩn L2 của K'. Dựa trên Hình 2, chúng tôi thấy rằng chuẩn truy vấn được công thức lại ||Q'|| có phân phối sắc nét hơn nhiều so với chuẩn khóa ||K'||, cho thấy chuẩn truy vấn được công thức lại có thể được xấp xỉ bằng một yếu tố hằng số.
+
+### 2.4 Lựa chọn Bộ nhớ Không cần Huấn luyện (TRAMS)
+
+Mục tiêu của chúng tôi cho lựa chọn bộ nhớ là khôi phục điểm attention hoàn chỉnh với càng ít token bộ nhớ càng tốt. Vấn đề này tương đương với việc tìm tập con của các token bộ nhớ có điểm attention cao nhất với các truy vấn. Chúng tôi đề xuất một phương pháp heuristic để thực hiện lựa chọn cấp token cho mỗi lớp và mỗi đầu dựa trên một chỉ số độc lập với bộ nhớ trong phần này.
+
+Có hai thành phần quan trọng để tính điểm attention sau khi xấp xỉ ||Q'|| bằng một yếu tố hằng số: chuẩn của các khóa được công thức lại ||K'|| và các góc giữa các khóa và truy vấn được công thức lại arccos⟨Q',K'⟩, điều này được chứng minh trong Khandelwal et al. (2019). Thông thường, chúng tôi tin rằng arccos⟨Q',K'⟩ là yếu tố quan trọng hơn nói chung. Tuy nhiên, nếu chúng tôi sử dụng thứ hạng của giá trị điểm attention cho tất cả các cặp truy vấn và khóa làm thứ hạng ground-truth, dựa trên Hình 3, chúng tôi phát hiện thực nghiệm rằng các thứ hạng dựa trên chuẩn khóa và các thứ hạng dựa trên góc tạo ra điểm tương quan Spearman gần nhau khi chỉ lấy 1% điểm attention cao nhất vào tài khoản. Do đó, nó cho thấy rằng chúng tôi có thể xếp hạng các token bộ nhớ của mình chỉ dựa trên ||K'|| để đạt được hiệu suất tương đối tốt khi chúng tôi mong muốn 1% điểm attention hàng đầu với các truy vấn trong bộ nhớ của chúng tôi thay vì tất cả.
+
+Ngoài ra, chúng tôi phát hiện rằng chỉ dựa vào một chuẩn lớn là không đủ như một ràng buộc. Cụ thể, các khóa gần với 1⃗ hơn có xu hướng tạo ra điểm attention cao hơn. Để giải quyết điều này, chúng tôi giới thiệu một chỉ số kết hợp: s = cos⟨K',1⃗⟩||K'||. Chỉ số này cho phép chúng tôi xác định các token có thể tạo ra điểm attention cao khi được ghép nối với truy vấn phù hợp (do giá trị cao của ||K'||) và điểm thấp khi được ghép nối với truy vấn không phù hợp (do mức độ trực giao cao với không gian truy vấn dựa trên cos⟨K',1⃗⟩). Điều này là do tính gần trực giao với không gian truy vấn, như được biểu thị bởi một góc nhỏ với 1⃗, là trực giao với không gian truy vấn.
+
+## 3 Thí nghiệm
+
+Chúng tôi giới thiệu các phương pháp so sánh và báo cáo kết quả chính và phân tích về các biến thể attention khác nhau cho suy luận trong phần này. Chi tiết tập dữ liệu cho các benchmark WikiText-103 và enwik8 và chi tiết chỉ số đánh giá của chúng được bao gồm trong Phụ lục A. Chi tiết của mô hình mà chúng tôi xây dựng lựa chọn bộ nhớ có thể được thấy trong Phụ lục B.
+
+| WikiText-103 |  |  |  |  |
+|---|---|---|---|---|
+| Model | M | m | n | PPL (↓) |
+| Transformer+RPE | - | - | - | 29.14 |
+| Transformer-XL | - | 200 | 64 | 24.17 |
+| TRAMS | 400 | 200 | 64 | 23.98 |
+
+| enwik8 |  |  |  |  |
+|---|---|---|---|---|
+| Model | M | m | n | bpc (↓) |
+| Transformer+RPE | - | - | - | 1.240 |
+| Transformer-XL | - | 200 | 64 | 1.215 |
+| TRAMS | 400 | 200 | 64 | 1.198 |
+
+Bảng 1: Hiệu suất mô hình trên tập dữ liệu WikiText-103 cấp từ và tập dữ liệu enwik8 cấp ký tự.
+
+### 3.1 Các Phương pháp So sánh
+
+**Transformer+RPE** (Vaswani et al., 2017): baseline transformer vanilla với relative position embedding giống như Transformer-XL. Do đó, sự khác biệt duy nhất giữa mô hình này và Transformer-XL là các bộ nhớ bổ sung. Thông tin thêm liên quan đến relative position embedding có thể được thấy trong Phụ lục C.
+
+**Transformer-XL** (Dai et al., 2019): một kiến trúc được thiết kế cụ thể cho mô hình ngôn ngữ tầm xa. Nó bao gồm relative position embedding và bộ nhớ tái diễn cho mỗi lớp. Các slot bộ nhớ được lấp đầy bằng các trạng thái ẩn từ các bước thời gian trước đó.
+
+### 3.2 Cài đặt Thí nghiệm
+
+Chúng tôi so sánh các phương pháp của mình với Transformer-XL (Dai et al., 2019) dưới cùng kích thước bộ nhớ (m=200) cho tính toán attention. Đối với độ dài token đầu vào n cho cả hai mô hình, chúng tôi giữ giống như trong (Dai et al., 2019) (n=64). Ngoài ra, quá trình lựa chọn bộ nhớ được thực hiện trên một pool bộ nhớ với kích thước M. Mô hình của chúng tôi và Transformer-XL chia sẻ các tham số mô hình nhưng có các chiến lược suy luận khác nhau.
+
+### 3.3 Kết quả Chính
+
+Các kết quả chính của tập dữ liệu WikiText-103 và enwik8 được hiển thị trong Bảng 1. Mà không cần huấn luyện bổ sung hoặc tham số bổ sung, chúng tôi đạt được cải thiện 0.19 trong perplexity và cải thiện 0.017 cho bit-per-character với cơ chế TRAMS của chúng tôi. Chúng tôi thực hiện p-test bằng cách suy luận trên nhiều checkpoint mô hình và chứng minh rằng kết quả của chúng tôi có ý nghĩa thống kê (p < 0.05).
+
+## 4 Thảo luận
+
+**TRAMS có dễ bị ảnh hưởng bởi việc lựa chọn siêu tham số không?** Có ba siêu tham số trong TRAMS: kích thước pool bộ nhớ M mà TRAMS có thể chọn từ đó; kích thước bộ nhớ được chọn m được sử dụng trong quá trình forward; và kích thước token đầu vào n được tham gia vào cả quá trình backward và forward.
+
+Từ nghiên cứu ablation về M, Hình 4 gợi ý một phạm vi tối ưu giữa 300 đến 400 cho kích thước pool bộ nhớ. Ngoài phạm vi này, việc mở rộng pool bộ nhớ thường dẫn đến việc lựa chọn các token không liên quan, làm xấu đi hiệu suất của chúng tôi.
+
+Về m, Hình 5 cho thấy rằng TRAMS chứng kiến sự giảm đáng kể trong perplexity khi kích thước bộ nhớ được chọn khoảng 25%. Việc chọn một phần lớn hơn không mang lại cải thiện thêm. Điều này phù hợp với Hình 3, nơi TRAMS xuất sắc bằng cách tập trung vào 10% kết quả hàng đầu.
+
+Cuối cùng, trong nghiên cứu về n, Hình 6 cho thấy rằng khi độ dài token đích giảm, hiệu quả của lựa chọn bộ nhớ được cải thiện.
+
+**Chi phí suy luận so với Transformer-XL là gì?** Vì không có phần huấn luyện trong mô hình của chúng tôi, chúng tôi tập trung thảo luận về chi phí suy luận. So với Transformer-XL, mô hình của chúng tôi yêu cầu lưu trữ một pool bộ nhớ lớn hơn để thực hiện lựa chọn bộ nhớ. Do đó, chi phí bộ nhớ của phương pháp chúng tôi sẽ lớn hơn. Khi nói đến chi phí thời gian, mô hình của chúng tôi có thêm các thao tác tính toán chuẩn token bộ nhớ, các thao tác sắp xếp bộ nhớ, và các thao tác lựa chọn bộ nhớ cho mỗi lớp. Các thao tác bổ sung này yêu cầu thêm thời gian suy luận. Bảng 2 cho thấy chi phí bộ nhớ GPU và thời gian wall-clock cho baseline Transformer-XL và mô hình của chúng tôi. Mô hình của chúng tôi yêu cầu sử dụng bộ nhớ GPU nhiều hơn một chút và khoảng 50% thời gian suy luận bổ sung cho lựa chọn bộ nhớ.
+
+| Model | Peak GPU Mem (MB) | Wall-clock Time (s) |
+|---|---|---|
+| Transformer-XL | 3529 | 33.27 |
+| TRAMS | 3719 | 49.55 |
+
+Bảng 2: Kết quả về việc sử dụng bộ nhớ GPU đỉnh và thời gian suy luận wall-clock trên WikiText-103.
+
+**TRAMS hưởng lợi như thế nào từ lựa chọn bộ nhớ?** Lựa chọn bộ nhớ giúp mô hình chọn các token có điểm attention cao hơn với các truy vấn, do đó tăng mức sử dụng bộ nhớ trung bình. Về mặt định lượng, phương pháp của chúng tôi cải thiện xác suất attention trung bình 24.25% cho cùng kích thước bộ nhớ so với Transformer-XL.
+
+**Mỗi lớp có cùng tầm quan trọng không?** Dựa trên Hình 7, chúng tôi cho thấy nghiên cứu ablation khi áp dụng lựa chọn bộ nhớ trên mỗi lớp trong khi giữ nguyên các lớp khác. Có sự giảm quan sát được khi chúng tôi áp dụng lựa chọn bộ nhớ trên các lớp sâu hơn bắt đầu từ Lớp 13 trong khi chúng tôi không quan sát ảnh hưởng rõ ràng khi áp dụng lựa chọn bộ nhớ trên các lớp nông.
+
+## 5 Nghiên cứu Trường hợp
+
+Để hiểu loại ngữ cảnh nào nên được chọn, chúng tôi cung cấp một ví dụ trường hợp để hiểu cụ thể loại token nào trong bộ nhớ sẽ được chọn. Dựa trên Bảng 3, chúng tôi có thể thấy rằng hầu hết các token bộ nhớ được chọn là các từ tần suất thấp. Những từ tần suất thấp như "John" trong bộ nhớ sẽ có lợi cho việc dự đoán "John" trong chuỗi đích.
+
+| Memory Sequence Segment |
+|---|
+| ...Simon Stephens , which was performed in 2001 at the Royal Court Theatre. He had a guest role in the television series Judge **John** Deed in 2002. In 2004 Boulter landed a role as "Craig" in the episode "Teddy's Story" of the television series The Long Firm; he starred alongside actors Mark Strong and Derek Jacobi. He was cast in the 2005 theatre productions of the Philip Ridley play Mercury Fur, which was performed at the Drum Theatre in Plymouth and the <unk> Chocolate Factory in London. He was directed by **John** Tiffany and starred alongside Ben **Whishaw** , Shane Zaza, Harry Kent, Fraser Ayres, Sophie Stanton, and Dominic Hall. <eos> In 2006, Boulter starred alongside **Whishaw** in the play Citizenship written by Mark Ravenhill ... |
+
+| Target Sequence Segment |
+|---|
+| He appeared in the television series Judge **John** Deed in 2002 ... |
+
+Bảng 3: Nghiên cứu trường hợp cho lựa chọn bộ nhớ từ WikiText-103. **text** cho thấy rằng từ này trong chuỗi bộ nhớ được chọn và sử dụng trong forward pass. **text** cho thấy rằng từ này trong chuỗi đích hưởng lợi từ bộ nhớ.
+
+## 6 Kết luận
+
+Trong công trình này, chúng tôi công thức hóa vấn đề lựa chọn bộ nhớ trong kiến trúc transformer và công thức lại quá trình tính toán attention để có được các truy vấn và khóa tự định nghĩa của chúng tôi. Sau đó, chúng tôi đề xuất một chỉ số độc lập với truy vấn sử dụng các trạng thái ẩn bộ nhớ để thực hiện một bộ chọn bộ nhớ không cần huấn luyện. Các thí nghiệm của chúng tôi cho thấy rằng phương pháp này cung cấp một phương tiện đơn giản nhưng hiệu quả để xác định các token bộ nhớ có giá trị. Khám phá các chiến lược lựa chọn bộ nhớ tối ưu cho các mô hình ngôn ngữ lớn là một hướng nghiên cứu đầy hứa hẹn cho tương lai. Ngoài ra, việc tích hợp các tham số có thể huấn luyện vào các mô hình này như các bộ chọn bộ nhớ trình bày một hướng thú vị khác cho công việc tương lai.
+
+## Hạn chế
+
+Nghiên cứu của chúng tôi có một số hạn chế chính. Đầu tiên, chúng tôi hiện đang tập trung vào kiến trúc Transformer-XL, nhưng có nhiều mô hình khác với các kích thước khác nhau mà chúng tôi chưa thử. Điều này cho thấy rằng các phát hiện của chúng tôi có thể bị hạn chế đối với kiến trúc transformer điển hình. Thứ hai, phương pháp của chúng tôi có nhiều siêu tham số bao gồm M, m, và n. Việc điều chỉnh chúng có thể thay đổi đáng kể mức độ hoạt động tốt của mô hình chúng tôi. Do đó cần có sự hiệu chuẩn cẩn thận, và người ta phải thận trọng để đạt được sự cân bằng và đạt được hiệu suất mong muốn, điều này có thể tốn thời gian và đắt đỏ về mặt tính toán.
+
+## Tuyên bố Đạo đức
+
+Không có rủi ro tiềm ẩn được công nhận.
+
+## Tài liệu tham khảo
+
+Amanda Bertsch, Uri Alon, Graham Neubig, và Matthew R Gormley. 2023. Unlimiformer: Long-range transformers with unlimited length input. arXiv preprint arXiv:2305.01625.
+
+Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, et al. 2020. Language models are few-shot learners. Advances in neural information processing systems, 33:1877–1901.
+
+Rewon Child, Scott Gray, Alec Radford, và Ilya Sutskever. 2019. Generating long sequences with sparse transformers. arXiv preprint arXiv:1904.10509.
+
+Krzysztof Choromanski, Haoxian Chen, Han Lin, Yuanzhe Ma, Arijit Sehanobish, Deepali Jain, Michael S Ryoo, Jake Varley, Andy Zeng, Valerii Likhosherstov, et al. 2021. Hybrid random features. arXiv preprint arXiv:2110.04367.
+
+Zihang Dai, Zhilin Yang, Yiming Yang, Jaime G Carbonell, Quoc Le, và Ruslan Salakhutdinov. 2019. Transformer-xl: Attentive language models beyond a fixed-length context. In Proceedings of the 57th Annual Meeting of the Association for Computational Linguistics, pages 2978–2988.
+
+Giannis Daras, Nikita Kitaev, Augustus Odena, và Alexandros G Dimakis. 2020. Smyrf-efficient attention using asymmetric clustering. Advances in Neural Information Processing Systems, 33:6476–6489.
+
+Jacob Devlin Ming-Wei Chang Kenton và Lee Kristina Toutanova. 2019. Bert: Pre-training of deep bidirectional transformers for language understanding. In Proceedings of NAACL-HLT, pages 4171–4186.
+
+Urvashi Khandelwal, Omer Levy, Dan Jurafsky, Luke Zettlemoyer, và Mike Lewis. 2019. Generalization through memorization: Nearest neighbor language models. In International Conference on Learning Representations.
+
+Yunsu Kim, Duc Thanh Tran, và Hermann Ney. 2019. When and why is document-level context useful in neural machine translation? In Proceedings of the Fourth Workshop on Discourse in Machine Translation (DiscoMT 2019), pages 24–34.
+
+Diederik P Kingma và Jimmy Ba. 2014. Adam: A method for stochastic optimization. arXiv preprint arXiv:1412.6980.
+
+Nikita Kitaev, Lukasz Kaiser, và Anselm Levskaya. 2019. Reformer: The efficient transformer. In International Conference on Learning Representations.
+
+Zhenzhong Lan, Mingda Chen, Sebastian Goodman, Kevin Gimpel, Piyush Sharma, và Radu Soricut. 2019. Albert: A lite bert for self-supervised learning of language representations. In International Conference on Learning Representations.
+
+Yinhan Liu, Myle Ott, Naman Goyal, Jingfei Du, Mandar Joshi, Danqi Chen, Omer Levy, Mike Lewis, Luke Zettlemoyer, và Veselin Stoyanov. 2019. Roberta: A robustly optimized bert pretraining approach. arXiv preprint arXiv:1907.11692.
+
+Matt Mahoney. 2011. Large text compression benchmark.
+
+Stephen Merity, Caiming Xiong, James Bradbury, và Richard Socher. 2016. Pointer sentinel mixture models. In International Conference on Learning Representations.
+
+Hao Peng, Jungo Kasai, Nikolaos Pappas, Dani Yogatama, Zhaofeng Wu, Lingpeng Kong, Roy Schwartz, và Noah A Smith. 2022a. Abc: Attention with bounded-memory control. In Proceedings of the 60th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pages 7469–7483.
+
+Hao Peng, Nikolaos Pappas, Dani Yogatama, Roy Schwartz, Noah Smith, và Lingpeng Kong. 2022b. Random feature attention. In International Conference on Learning Representations.
+
+Michał Pietruszka, Łukasz Borchmann, và Łukasz Garncarek. 2022. Sparsifying transformer models with trainable representation pooling. In Proceedings of the 60th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pages 8616–8633.
+
+Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan Narang, Michael Matena, Yanqi Zhou, Wei Li, và Peter J Liu. 2020. Exploring the limits of transfer learning with a unified text-to-text transformer. The Journal of Machine Learning Research, 21(1):5485–5551.
+
+Aurko Roy, Mohammad Saffar, Ashish Vaswani, và David Grangier. 2021. Efficient content-based sparse attention with routing transformers. Transactions of the Association for Computational Linguistics, 9:53–68.
+
+Sainbayar Sukhbaatar, Édouard Grave, Piotr Bojanowski, và Armand Joulin. 2019. Adaptive attention span in transformers. In Proceedings of the 57th Annual Meeting of the Association for Computational Linguistics, pages 331–335.
+
+Sainbayar Sukhbaatar, Da Ju, Spencer Poff, Stephen Roller, Arthur Szlam, Jason Weston, và Angela Fan. 2021. Not all memories are created equal: Learning to forget by expiring. In International Conference on Machine Learning, pages 9902–9912. PMLR.
+
+Yi Tay, Mostafa Dehghani, Dara Bahri, và Donald Metzler. 2022. Efficient transformers: A survey. ACM Computing Surveys, 55(6):1–28.
+
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Łukasz Kaiser, và Illia Polosukhin. 2017. Attention is all you need. Advances in neural information processing systems, 30.
+
+Apoorv Vyas, Angelos Katharopoulos, và François Fleuret. 2020. Fast transformers with clustered attention. Advances in Neural Information Processing Systems, 33:21665–21674.
+
+Sinong Wang, Belinda Z Li, Madian Khabsa, Han Fang, và Hao Ma. 2020. Linformer: Self-attention with linear complexity. arXiv preprint arXiv:2006.04768.
+
+Lesly Miculicich Werlen, Dhananjay Ram, Nikolaos Pappas, và James Henderson. 2018. Document-level neural machine translation with hierarchical attention networks. In Proceedings of the 2018 Conference on Empirical Methods in Natural Language Processing, pages 2947–2954.
+
+Lin Zheng, Chong Wang, và Lingpeng Kong. 2022a. Linear complexity randomized self-attention mechanism. In International Conference on Machine Learning, pages 27011–27041. PMLR.
+
+Lin Zheng, Jianbo Yuan, Chong Wang, và Lingpeng Kong. 2022b. Efficient attention via control variates. In The Eleventh International Conference on Learning Representations.
+
+Wangchunshu Zhou, Yuchen Eleanor Jiang, Peng Cui, Tiannan Wang, Zhenxin Xiao, Yifan Hou, Ryan Cotterell, và Mrinmaya Sachan. 2023. Recurrentgpt: Interactive generation of (arbitrarily) long text. arXiv preprint arXiv:2305.13304.
+
+## A Tập dữ liệu và Chỉ số Đánh giá
+
+**WikiText-103** (Merity et al., 2016) là một benchmark mô hình ngôn ngữ cấp từ thường được sử dụng. Nó có độ dài trung bình 3.6 nghìn token mỗi bài viết và bao gồm 28 nghìn bài viết Wikipedia. Tập dữ liệu cấp từ này có kích thước từ vựng khoảng 260K. Chúng tôi sử dụng cùng cài đặt tiền xử lý dữ liệu trong Dai et al. (2019) cho tập dữ liệu này. Chúng tôi sử dụng perplexity làm chỉ số của mình.
+
+**Enwik8** (Mahoney, 2011) là một benchmark mô hình ngôn ngữ cấp ký tự. Tập dữ liệu này chứa 100M ký tự Wikipedia chưa được xử lý. Tập train, tập dev, và tập test bao gồm 80M, 10M, và 10M ký tự tương ứng. enwik8 không có giai đoạn tiền xử lý và được sử dụng trực tiếp. bpc (bit per character) được định nghĩa là chỉ số đánh giá và chúng tôi báo cáo kết quả trên cả tập dev và tập test.
+
+## B Cấu hình Huấn luyện
+
+Vì chúng tôi thực hiện các thí nghiệm suy luận dựa trên một mô hình đã được huấn luyện, chúng tôi huấn luyện riêng biệt hai mô hình Transformer-XL cho WikiText-103 và enwik8. Đối với giai đoạn huấn luyện, chúng tôi sử dụng Adam (Kingma và Ba, 2014) để tối ưu hóa với batch size=60, learning rate=2.5e-4, target length=150, memory length=150, và một cosine scheduler không có các bước warmup.
+
+Khi nói đến một tập dữ liệu khác, chúng tôi sử dụng kiến trúc Transformer-XL khác. Đối với WikiText-103, chúng tôi sử dụng kiến trúc transformer 16 lớp với 10 head, 410 hid dim, 0.1 dropout ratio, 0.0 attention dropout ratio, 2100 inner dim, và cơ chế adaptive softmax. Đối với enwik8, chúng tôi đề xuất kiến trúc transformer 12 lớp với 8 head, 512 hid dim, 0.1 dropout ratio, 0.0 attention dropout ratio, và 2048 inner dim. Cả hai mô hình đều được huấn luyện trong 350K bước.
+
+Batch size=10 và target length=150 được cố định cho tất cả các thí nghiệm suy luận để tránh so sánh không công bằng. Tất cả các thí nghiệm bao gồm huấn luyện và suy luận được thực hiện sử dụng 4 GPU 2080Ti. Phải mất 280 giờ GPU để huấn luyện checkpoint mô hình enwik8. Phải mất 61 giờ GPU để huấn luyện checkpoint mô hình WikiText-103.
+
+## C Relative Position Embedding
+
+Về mã hóa vị trí, chúng tôi duy trì cùng kết quả với Transformer-XL. Các mã hóa vị trí bao gồm các tham số có thể học R_{i-j}, u, và v. Thông thường, R_{i-j} được dẫn xuất từ một mạng r có thể học được bao gồm trong mô hình. Lợi thế của việc sử dụng thiết kế này khi tính điểm attention là nó tránh sự nhầm lẫn tạm thời gây ra bởi việc lập chỉ mục cùng một vị trí và xem xét khoảng cách tương đối giữa hai token. Công thức cho tính toán điểm attention với relative position embedding có thể được viết là:
+
+A^{xl}_{i,j} = X_i^T W_q^T W_k^E X_j + X_i^T W_q^T W_k^R R_{i-j} + u^T W_k^E X_j + v^T W_k^R R_{i-j}     (7)
+
+Hơn nữa, sau khi thực hiện các nghiên cứu ablation về relative position embedding, chúng tôi phát hiện rằng R_{i-j} đóng góp nhiều nhất cho kết quả và u, v chỉ có ảnh hưởng nhỏ đến hiệu suất cuối cùng. Sự tồn tại của R_{i-j} dẫn đến phân phối xác suất attention giảm theo cấp số nhân liên quan đến một vị trí bộ nhớ. Kết quả là, chúng tôi dựa lựa chọn bộ nhớ của mình trên A^{xl}_{i,j} bao gồm thông tin vị trí thay vì X_i^T W_q^T W_k^E X_j thuần túy.
+
+Cần lưu ý, tất cả các khái niệm liên quan đến qK đều được trang bị position embedding thay vì một tích vô hướng đơn giản.
+
+¹ Mã nguồn cho bài báo này có sẵn tại https://github.com/lwaekfjlk/TRAMS.

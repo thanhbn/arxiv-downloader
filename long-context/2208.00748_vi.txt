@@ -1,0 +1,268 @@
+# Hiệu quả hiểu văn bản dài với các mô hình văn bản ngắn
+Maor Ivgi Uri Shaham Jonathan Berant
+Trường Khoa học Máy tính Blavatnik, Đại học Tel-Aviv
+{maor.ivgi,uri.shaham,joberant}@cs.tau.ac.il
+
+## Tóm tắt
+Các mô hình ngôn ngữ (LM) được huấn luyện trước dựa trên Transformer có mặt khắp nơi trong hiểu ngôn ngữ tự nhiên, nhưng không thể được áp dụng cho các chuỗi dài như truyện, bài báo khoa học và tài liệu dài, do độ phức tạp bậc hai của chúng. Mặc dù đã có vô số biến thể transformer hiệu quả được đề xuất, chúng thường dựa trên các triển khai tùy chỉnh đòi hỏi việc huấn luyện trước đắt đỏ từ đầu. Trong công trình này, chúng tôi đề xuất SLED: SLiding-Encoder và Decoder, một phương pháp đơn giản để xử lý các chuỗi dài tái sử dụng và tận dụng các LM được huấn luyện trước cho văn bản ngắn đã được kiểm nghiệm. Cụ thể, chúng tôi phân chia đầu vào thành các khối chồng lấp, mã hóa từng khối với một bộ mã hóa LM văn bản ngắn và sử dụng bộ giải mã được huấn luyện trước để kết hợp thông tin qua các khối (fusion-in-decoder). Chúng tôi minh họa thông qua các thí nghiệm có kiểm soát rằng SLED cung cấp một chiến lược khả thi cho việc hiểu văn bản dài và đánh giá phương pháp của chúng tôi trên SCROLLS, một benchmark với bảy bộ dữ liệu trên nhiều tác vụ hiểu ngôn ngữ khác nhau. Chúng tôi thấy rằng SLED có khả năng cạnh tranh với các mô hình chuyên biệt lớn hơn tới 50 lần và đòi hỏi một bước huấn luyện trước chuyên dụng và đắt đỏ.
+
+## 1 Giới thiệu
+Các mô hình ngôn ngữ được huấn luyện trước dựa trên Transformer (Vaswani et al., 2017; Devlin et al., 2019; Lewis et al., 2020; Raffel et al., 2020b; Brown et al., 2020) đã thành công rộng rãi trên tất cả các lĩnh vực hiểu ngôn ngữ tự nhiên (NLU). Tuy nhiên, việc áp dụng chúng trên các văn bản dài (như truyện, kịch bản, hoặc bài báo khoa học) là cấm kỵ do độ phức tạp bậc hai của chúng trong độ dài đầu vào. Để thu hẹp khoảng cách này, các công trình gần đây đã phát triển các biến thể transformer hiệu quả hơn (Kitaev et al., 2020a; Beltagy et al., 2020; Zaheer et al., 2020a; Guo et al., 2022) và áp dụng chúng trên
+
+[Số tham số từ 100M đến 20B được hiển thị trên biểu đồ với điểm SCROLLS]
+
+Hình 1: Điểm SCROLLS của các mô hình (Shaham et al., 2022) như một hàm của số lượng tham số. Việc cắm các LM được huấn luyện trước hiện có vào khung SLED cải thiện đáng kể điểm SCROLLS của chúng (mũi tên từ vòng tròn xanh đến sao cam). Tam giác xám chỉ ra các mô hình với huấn luyện trước chuyên dụng để nắm bắt các phụ thuộc tầm xa. BART large-SLED có khả năng cạnh tranh với LongT5 base(Guo et al., 2022) và UL2 (Tay et al., 2022b) (có nhiều tham số hơn 50 lần), và chậm hơn một chút so với các mô hình LongT5 lớn hơn.
+
+các tác vụ hiểu ngôn ngữ tầm xa (Mehta et al., 2022; Shaham et al., 2022).
+
+Tuy nhiên, hầu hết các transformer hiệu quả sử dụng kiến trúc chuyên biệt với các triển khai tùy chỉnh không được đảm bảo mở rộng tốt như transformer vanilla (Tay et al., 2022a). Hơn nữa, chúng đòi hỏi một bước huấn luyện trước đắt đỏ và không khai thác các LM được huấn luyện trước sẵn có được huấn luyện cho văn bản ngắn. Cho đến nay, hiệu suất của chúng trên văn bản dài chưa phù hợp với thành công của các đối tác tầm ngắn.
+
+Trong công trình này, chúng tôi trình bày SLED: SLiding-Encoder và Decoder, một phương pháp đơn giản nhưng mạnh mẽ để áp dụng các mô hình encoder-decoder được huấn luyện trước sẵn có trên các bài toán văn bản dài, với phụ thuộc thời gian và không gian tuyến tính. Cụ thể (xem Hình 2), chúng tôi phân chia các tài liệu dài thành các khối token chồng lấp có độ dài không đổi và mã hóa từng khối độc lập với một
+
+arXiv:2208.00748v3 [cs.CL] 27 Dec 2022
+
+--- TRANG 2 ---
+bộ mã hóa đã được huấn luyện trước. Sau đó, một bộ giải mã được huấn luyện trước chú ý đến tất cả các biểu diễn đầu vào được ngữ cảnh hóa để tạo ra đầu ra. Giả định chính của chúng tôi là các token đầu vào có thể được ngữ cảnh hóa thông qua môi trường xung quanh cục bộ của chúng (sử dụng LM văn bản ngắn), và bất kỳ lý luận toàn cục xuyên khối nào có thể được xử lý bởi bộ giải mã, tương tự như fusion-in-decoder (FiD) (Izacard and Grave, 2021). Phương pháp của chúng tôi có thể dễ dàng áp dụng cho bất kỳ LM encoder-decoder được huấn luyện trước nào như T5 (Raffel et al., 2020b) và BART (Lewis et al., 2020) (nhưng không áp dụng được cho các mô hình chỉ có decoder (Brown et al., 2020) hoặc chỉ có encoder (Liu et al., 2019; Conneau et al., 2020)).
+
+Chúng tôi đánh giá SLED trên một loạt các tác vụ hiểu ngôn ngữ. Để chứng thực tính đầy đủ của SLED cho xử lý văn bản, chúng tôi thực hiện các thí nghiệm có kiểm soát trên các phiên bản được sửa đổi của SQuAD 1.1 (Rajpurkar et al., 2016) và HotpotQA (Yang et al., 2018) để chỉ ra rằng SLED có thể (a) tìm thông tin liên quan được nhúng trong một chuỗi văn bản dài và (b) kết hợp thông tin từ các khối được mã hóa riêng biệt.
+
+Đánh giá chính của chúng tôi là trên SCROLLS, một benchmark được phát hành gần đây bao gồm 7 tác vụ tầm xa trên Hỏi đáp (QA), Tóm tắt, và Suy luận Ngôn ngữ Tự nhiên (NLI). Chúng tôi chỉ ra (Hình 1) rằng việc lấy một mô hình encoder-decoder được huấn luyện trước, như BART (Lewis et al., 2020) hoặc T5 (Raffel et al., 2020b), và nhúng nó vào khung SLED dẫn đến cải thiện hiệu suất đáng kể (trung bình 6 điểm trên các mô hình). Hơn nữa, hiệu suất của BART large -SLED có thể so sánh với LongT5 base(Guo et al., 2022), một mô hình được huấn luyện trước đặc biệt để xử lý các phụ thuộc tầm xa, và vượt qua UL2 (Tay et al., 2022b), chứa nhiều tham số hơn 50 lần. Quan trọng là, các mô hình dựa trên SLED có thể sử dụng bất kỳ LM được huấn luyện trước trong tương lai nào ngay lập tức mà không cần huấn luyện trước bổ sung để cải thiện hiệu suất hơn nữa.
+
+Do tính đơn giản của nó, SLED cũng có thể được sử dụng như một công cụ chẩn đoán để phân tích các benchmark tầm xa. Chúng tôi phân tích bảy bộ dữ liệu trong SCROLLS qua lăng kính của SLED và chỉ ra bộ dữ liệu nào yêu cầu đầu vào được ngữ cảnh hóa với các token từ xa. Cụ thể, chúng tôi thấy rằng trong các tác vụ QA và NLI, việc ngữ cảnh hóa tương đối cục bộ là đủ cho hiệu suất cao.
+
+Mặc dù SLED tương tự như FiD từ quan điểm kỹ thuật, việc sử dụng FiD trong quá khứ đã tập trung xung quanh hỏi đáp miền mở (Izacard and Grave, 2021), nơi các đoạn văn không liên quan được mã hóa độc lập một cách tự nhiên. Ở đây, chúng tôi kiểm tra fusion-in-decoder trên các tài liệu dài, nơi việc mã hóa cục bộ các khối là một giả định mô hình hóa cần được kiểm tra. Trong công trình gần đây, Vig et al. (2022) đã đề xuất một kiến trúc tương tự để giải quyết các đầu vào dài từ QMSum (Zhong et al., 2021), nhưng không phân tích nó một cách có hệ thống. Chúng tôi chuẩn hóa phương pháp này lần đầu tiên, và phân tích rộng rãi hiệu quả của FiD để mã hóa các tài liệu dài trên nhiều tác vụ.
+
+Tóm lại, những đóng góp chính của chúng tôi là:
+
+1. Chúng tôi trình bày SLED, một phương pháp đơn giản và hiệu quả để xử lý các văn bản dài tận dụng các LM encoder-decoder sẵn có dựa trên fusion-in-decoder.
+
+2. Chúng tôi chứng minh hiệu quả của SLED trong cả thí nghiệm có kiểm soát, cũng như trên benchmark SCROLLS, dẫn đến kết quả cạnh tranh so với các mô hình chuyên biệt bao gồm tới 50 lần tham số.
+
+3. Chúng tôi sử dụng SLED như một công cụ chẩn đoán để phân tích các tính chất tầm xa của các bộ dữ liệu trong benchmark SCROLLS.
+
+4. Chúng tôi cung cấp một triển khai mã nguồn mở của SLED,¹ được tích hợp liền mạch vào thư viện Transformers (Wolf et al., 2020).
+
+## 2 Bối cảnh
+Các tiến bộ gần đây trong xử lý ngôn ngữ tự nhiên phần lớn được thúc đẩy bởi kiến trúc transformer (Vaswani et al., 2017). Một thành phần cốt lõi của transformer là lớp self-attention nơi mỗi token đầu vào "chú ý" đến mọi token khác để tạo ra biểu diễn được ngữ cảnh hóa của nó. Điều này dẫn đến phụ thuộc thời gian và không gian bậc hai w.r.t. độ dài của đầu vào, hạn chế khả năng của transformer trong việc xử lý các chuỗi dài.
+
+Hạn chế văn bản dài này đã kích thích sự quan tâm rộng rãi trong việc phát triển các biến thể transformer hiệu quả. Một họ phương pháp nổi bật dựa trên sparse attention, nơi mỗi token chú ý đến một số lượng token khác không đổi, vượt qua phụ thuộc bậc hai. Các token thường chú ý đến môi trường xung quanh cục bộ của chúng (Zaheer et al., 2020a; Beltagy et al., 2020; Ainslie et al., 2020; Gupta and Berant, 2020) hoặc đến các token tương tự về mặt ngữ nghĩa (Kitaev et al., 2020b; Roy et al.,
+
+¹https://github.com/Mivg/SLED
+
+--- TRANG 3 ---
+Hình 2: Tổng quan về SLED. (a) Các token đầu vào (t1;...;tn) được chia thành C khối chồng lấp có độ dài c (ở đây, c=4). Mỗi khối được tạo thành từ P:=αc/2 token đệm ngữ cảnh ở cạnh phải và trái của khối, và (1−α)c token khối hiệu quả ở giữa (ở đây, α=0.5; P=1). (b) Chúng tôi thêm tiền tố các token tiền tố (p1;...;pm) vào mỗi khối (m≪n). (c) Mỗi khối được mã hóa độc lập sử dụng bộ mã hóa xương sống đã được huấn luyện trước Menc. (d) Chúng tôi thu thập các token khối hiệu quả được mã hóa (màu vàng) và loại bỏ các token đệm ngữ cảnh (màu hồng) (e) Chúng tôi truyền đầu vào được mã hóa cho bộ giải mã để tạo chuỗi đầu ra cuối cùng (o1;...;ok).
+
+2021). Hơn nữa, một số lượng token toàn cục không đổi chú ý đến và được chú ý bởi tất cả các token đầu vào thường được thêm vào mỗi lớp con attention.
+
+Các phân tích gần đây (Xiong et al., 2022a) đã chỉ ra rằng các sparse transformer với attention cục bộ có khả năng cạnh tranh với các biến thể khác trên nhiều tác vụ hiểu ngôn ngữ.
+
+Phương pháp của chúng tôi, SLED, thuộc họ các biến thể attention cục bộ. Tuy nhiên, không giống như công trình trước đó, SLED tái sử dụng và mở rộng các mô hình encoder-decoder tầm ngắn hiện có, và không yêu cầu huấn luyện trước chuyên biệt hoặc triển khai CUDA chuyên dụng.
+
+Trong hầu hết các biến thể attention cục bộ, ví dụ LED (Beltagy et al., 2020), attention là cục bộ mỗi lớp, nhưng trường tiếp nhận của các token tăng qua các lớp. Trong SLED, mà chúng tôi mô tả tiếp theo, các token có quyền truy cập vào cùng số lượng token, độc lập với độ sâu của lớp, cho phép song song hóa tốt hơn. Để khảo sát về các họ transformer hiệu quả, xem Tay et al. (2020). Để so sánh sâu về SLED và LED, chúng tôi tham khảo Phụ lục B.
+
+## 3 Phương pháp
+Trong công trình này, chúng tôi đề xuất một phương pháp đơn giản để tránh độ phức tạp bậc hai của transformer, được thúc đẩy bởi giả định Cục bộ hóa thông tin:
+
+Trong kiến trúc encoder-decoder, bộ mã hóa có thể ngữ cảnh hóa hiệu quả các token đầu vào chỉ với ngữ cảnh cục bộ, để lại các phụ thuộc tầm xa được xử lý bởi bộ giải mã.
+
+SLED dựa vào giả định mô hình hóa này để mã hóa các khối ngắn hơn một cách độc lập và thực hiện kết hợp thông tin trong bộ giải mã (Izacard and Grave, 2021). Chúng tôi bây giờ mô tả mô hình SLED chi tiết.
+
+**Đầu vào** SLED sử dụng một mô hình encoder-decoder được huấn luyện trước M như một xương sống. SLED nhận một tài liệu được token hóa có độ dài n (hình vuông xanh trong Hình 2), và một tiền tố được token hóa ngắn tùy chọn có độ dài m≪n, thường đại diện cho một câu hỏi về tài liệu, một hướng dẫn để thực hiện một số tác vụ tạo sinh, hoặc một giả thuyết (hình vuông cam trong Hình 2). Không giống như các tiền tố tĩnh đặc thù tác vụ (ví dụ, "tóm tắt"), SLED cũng hỗ trợ các tiền tố đặc thù mẫu là một phần của đầu vào (ví dụ, câu hỏi trong các bộ dữ liệu QA).
+
+**Các bước** SLED tuân theo các bước sau:
+
+(a) Các token tài liệu được chia thành C khối có độ dài c (Trong Hình 2, c=4). Các token (1−α)c ở giữa trong mỗi khối được ngữ cảnh hóa từ cả trái và phải bởi P:=αc/2 token, trong đó α∈[0,0.5] (α=0.5 trong Hình 2). Chúng tôi gọi những token giữa này là khối hiệu quả, vì chúng sẽ tạo thành đầu ra của bộ mã hóa, và gọi các token ở mỗi bên là đệm ngữ cảnh.
+
+(b) Mỗi khối được thêm tiền tố bởi các token tiền tố (tùy chọn) (Hình 2(b)).
+
+(c) Mỗi khối được mã hóa độc lập, sử dụng bộ mã hóa xương sống Menc (xem Hình 2(c)).
+
+(d) Để tạo ra một biểu diễn được ngữ cảnh hóa cho mỗi token, chúng tôi chỉ giữ từ mỗi khối những
+
+--- TRANG 4 ---
+token từ khối hiệu quả, và nối chúng lại (Hình 2(d)).
+
+(e) Để cung cấp cho bộ giải mã quyền truy cập vào các token tiền tố, chúng tôi mã hóa các token tiền tố bằng Menc, và thêm tiền tố kết quả vào biểu diễn được ngữ cảnh hóa (khối ngoài cùng bên trái trong Hình 2(a)-(d)).
+
+(f) Cuối cùng, chúng tôi tạo ra đầu ra với bộ giải mã xương sống, Mdec, sử dụng cross-attention tiêu chuẩn trên m+n token được mã hóa (Hình 2(e)).
+
+SLED yêu cầu xử lý một số trường hợp biên, cụ thể là xử lý khối đầu tiên và cuối cùng không có ngữ cảnh hai chiều. Chúng tôi tham khảo Phụ lục A cho các chi tiết này.
+
+**Độ phức tạp của SLED** SLED chia một đầu vào có độ dài n thành C khối có kích thước c. Vì α∈[0,0.5], nó theo sau rằng C∈[2n/c,2n/c]. Mặc dù độ phức tạp mã hóa mỗi khối là bậc hai trong c do self-attention, c≪n là hằng số và do đó phụ thuộc bộ nhớ và tính toán là tuyến tính trong n.² Cụ thể, độ phức tạp để mã hóa đầu vào với một mô hình có l lớp attention là:
+
+O(lc²·2n/c) = O(lcn).
+
+Giải mã được thực hiện như đề xuất bởi Vaswani et al. (2017), do đó yêu cầu O(nk+k²) bộ nhớ. Giả định độ dài chuỗi đầu ra không đổi k≪n, điều này vẫn tuyến tính trong n.
+
+## 4 Hiệu quả của Fusion in Decoder
+Như đã đề cập (§3), SLED dựa vào giả định rằng các khối có thể được mã hóa độc lập và việc kết hợp qua chúng có thể được ủy thác cho bộ giải mã (giả định Cục bộ hóa thông tin). Điều này tương tự như phương pháp Fusion-in-Decoder, được giới thiệu bởi Izacard and Grave (2021) cho hỏi đáp miền mở (ODQA). Tuy nhiên, ở đó, encoder-decoder nhận một tập hợp các đoạn văn độc lập và cần tạo ra một câu trả lời thường có thể được trích xuất từ một đoạn văn duy nhất. Ở đây, chúng tôi mở rộng phạm vi của FiD bằng cách áp dụng nó trên một đầu vào duy nhất, dài và mạch lạc có thể yêu cầu ngữ cảnh hóa toàn cục.
+
+Để chứng minh tính khả thi của FiD cho các tác vụ ngôn ngữ văn bản dài, chúng tôi thiết kế hai thí nghiệm có kiểm soát định lượng mức độ mà FiD có thể thực hiện hai thao tác ở trung tâm của xử lý văn bản dài. Thứ nhất, FiD có thể tìm "kim trong đống cỏ khô" hay không, tức là định vị một đoạn thông tin ngắn được nhúng trong văn bản dài, bỏ qua thông tin không liên quan. Thứ hai, FiD có thể "ghép mảnh ghép" và kết hợp hai mảnh thông tin được mã hóa độc lập khi tạo ra đầu ra hay không.
+
+²Chúng tôi giả định độ dài tiền tố (m) là không đáng kể và do đó tác động của nó đến độ phức tạp tiệm cận là không đáng kể.
+
+### 4.1 Kim trong đống cỏ khô
+Để kiểm tra xem SLED có thể bỏ qua văn bản không liên quan và định vị một mảnh thông tin duy nhất hay không, chúng tôi biến SQuAD 1.1 (Rajpurkar et al., 2016) thành một tác vụ sequence-to-sequence với đầu vào dài. SQuAD là một bộ dữ liệu hỏi đáp, nơi cho một cặp câu hỏi-đoạn văn, mục tiêu là tạo ra câu trả lời (nằm trong đoạn văn). Cho mỗi cặp câu hỏi-đoạn văn, chúng tôi lấy mẫu ngẫu nhiên 9 đoạn văn khác từ bộ dữ liệu và nối chúng để tạo thành một tài liệu dài.³ Sau đó chúng tôi tinh chỉnh và đánh giá các mô hình trong hai cài đặt: a) Yếu tố gây nhiễu có thứ tự: đoạn văn vàng là đoạn đầu tiên, và tất cả các yếu tố gây nhiễu khác được nối sau nó. b) Yếu tố gây nhiễu được trộn: chúng tôi trộn ngẫu nhiên thứ tự của tất cả các đoạn văn để câu trả lời có thể ở bất kỳ đâu trong tài liệu đầu vào. Vì đây là tác vụ QA, tiền tố là câu hỏi.
+
+Chúng tôi sử dụng BART base (Lewis et al., 2020) làm mô hình xương sống M của chúng tôi trong suốt §4, và so sánh SLED với một BART base oracle chỉ được cung cấp đoạn văn vàng mà không có đoạn văn gây nhiễu. Đây là một thiết lập oracle vì BART base có thể nhận 1.024 token làm đầu vào và tất cả các đoạn văn vàng đều ngắn hơn. Nếu SLED có thể phù hợp với hiệu suất oracle, chúng ta có thể suy ra rằng thực sự bộ giải mã có thể tìm kim trong đống cỏ khô. Ngoài ra, chúng tôi so sánh SLED với BART base chỉ được cung cấp 1K token đầu tiên và với LED (Beltagy et al., 2020), sử dụng attention thưa cục bộ, tương tự như SLED (LED có cùng xương sống BART base). Tuy nhiên, như đã giải thích trong §2, trường tiếp nhận của các lớp LED tăng tuyến tính với số lượng lớp, và do đó thông tin có thể được kết hợp trong bộ mã hóa, không giống như SLED nơi việc kết hợp xuyên khối phải được ủy thác cho bộ giải mã. Cuối cùng, đối với các tác vụ QA, LED định nghĩa các token câu hỏi là token toàn cục, và như một kiểm tra độ chính xác bổ sung, chúng tôi đánh giá LEDL, tức là một mô hình LED cục bộ nơi không có token toàn cục được sử dụng. Đối với cả LED và SLED, chúng tôi sử dụng kích thước khối c=256.
+
+³Chúng tôi chỉ xem xét các đoạn văn không nằm trong tài liệu vàng và không chứa câu trả lời vàng.
+
+--- TRANG 5 ---
+[Biểu đồ hiển thị kết quả F1 trên bộ dữ liệu SQuAD 1.1 được sửa đổi]
+
+Hình 3: Kết quả F1 trên đánh giá tập phát triển SQuAD 1.1 được sửa đổi của chúng tôi (Rajpurkar et al., 2016): (a) đường ngang cho hiệu suất của một BART base oracle chỉ được cung cấp đoạn văn vàng. SLED phù hợp với hiệu suất oracle trong cả thiết lập có thứ tự và trộn (xem văn bản). LED có hiệu suất hơi kém SLED trong thiết lập trộn. Cả BART (chỉ được cung cấp 1K token đầu tiên) và LED không có token toàn cục (LEDL) đều có hiệu suất kém trong thiết lập trộn. (b) Các phép loại bỏ về kiến trúc của SLED, xem §4.3 để biết chi tiết.
+
+**Kết quả** Hình 3(a) cho thấy kết quả đánh giá trên tập phát triển. SLED gần như phù hợp với hiệu suất của BART base oracle không được cung cấp bất kỳ đoạn văn gây nhiễu nào, đạt điểm F1 là 87.6 so với F1 oracle là 88.1 (đường ngang trong hình). LED cũng đạt hiệu suất cao (nhưng thấp hơn SLED trong thiết lập trộn), cho thấy cả hai mô hình học cách bỏ qua thông tin gây nhiễu và tìm kim trong đống cỏ khô. Như mong đợi, cả LEDL và BART đều gặp phải sự sụt giảm đáng kể về hiệu suất khi các đoạn văn được trộn, vì đoạn văn vàng không được ngữ cảnh hóa với câu hỏi.
+
+### 4.2 Ghép mảnh ghép
+Chúng tôi bây giờ xác minh rằng SLED có thể kết hợp các mảnh thông tin từ các khối khác nhau. Để làm điều này, chúng tôi sửa đổi HotpotQA (Yang et al., 2018), một bộ dữ liệu hỏi đáp đa bước, trong đó mỗi
+
+[Biểu đồ hiển thị kết quả F1 trên bộ dữ liệu HotpotQA]
+
+Hình 4: Kết quả F1 trên tập phát triển HotpotQA của chúng tôi (Yang et al., 2018). (a) SLED đạt F1 gần với BART base oracle (đường ngang), vượt trội hơn một mô hình có quyền truy cập vào đoạn văn chứa câu trả lời ("đoạn văn thứ hai"). Điều này cho thấy SLED kết hợp thông tin từ hai khối một cách hiệu quả. Xem văn bản để giải thích thêm về từng mô hình. (b) Các phép loại bỏ về kiến trúc của SLED, xem §4.3 để biết chi tiết.
+
+câu hỏi dựa vào hai mảnh thông tin (nằm trong các đoạn văn khác nhau). Mặc dù trong thiết lập gốc, mỗi đầu vào trong HotpotQA có hai đoạn văn vàng và 8 đoạn văn gây nhiễu, chúng tôi chỉ bao gồm hai đoạn văn vàng trong các thí nghiệm của mình. Để đảm bảo SLED và LED mã hóa hai mảnh thông tin liên quan trong các khối riêng biệt, chúng tôi đặt kích thước khối là c=128.
+
+Tương tự như §4.1, chúng tôi so sánh SLED với BART base oracle với attention đầy đủ trên 1.024 token,⁴ với LED, và với LEDL. Cuối cùng, công trình trước đã chỉ ra rằng nhiều ví dụ trong HotpotQA có thể được trả lời chỉ với quyền truy cập vào đoạn văn vàng "thứ hai", chứa câu trả lời (Jiang and Bansal, 2019). Do đó, chúng tôi cũng đánh giá một mô hình BART chỉ được cung cấp đoạn văn thứ hai.
+
+**Kết quả** Hình 4(a) cho thấy rằng thực sự, bộ giải mã của SLED có thể kết hợp thông tin từ hai khối được mã hóa riêng biệt một cách hiệu quả, đạt F1 là 76.5, hơi thấp hơn F1 oracle là 78.6. Đáng chú ý, SLED vượt trội đáng kể so với mô hình BART có quyền truy cập vào toàn bộ đoạn văn thứ hai, cho thấy thông tin được kết hợp bởi bộ giải mã. LED có hiệu suất hơi tốt hơn SLED, nhưng khi bị từ chối quyền truy cập vào token toàn cục (LEDL), hiệu suất của nó giảm mạnh. Điều này cho thấy rằng trường tiếp nhận lớn của các lớp LED sâu không đủ cho việc kết hợp thông tin và tương tác giữa câu hỏi và văn bản là quan trọng cho bộ giải mã.
+
+Tóm lại, hai thí nghiệm có kiểm soát của chúng tôi cho thấy SLED có thể thực hiện các thao tác truy xuất và kết hợp thông tin, là nền tảng cho các tác vụ ngôn ngữ văn bản dài.
+
+⁴Tất cả các ví dụ có 1.024 token, bao gồm cả tiền tố.
+
+### 4.3 Các phép loại bỏ của các lựa chọn thiết kế
+Chúng tôi tận dụng thiết lập thí nghiệm có kiểm soát để điều tra thêm các thành phần của SLED.
+
+**Hiệu quả của bộ mã hóa** Mặc dù §4.2 cho thấy SLED có thể kết hợp các mảnh thông tin riêng biệt trong bộ giải mã, không rõ ràng mức độ cần thiết của việc ngữ cảnh hóa cục bộ. Để kiểm tra xem liệu có thể tất cả việc kết hợp xảy ra trong bộ giải mã hay không, chúng tôi tinh chỉnh SLED với kích thước khối c=1, sao cho các token đầu vào không quan sát bất kỳ ngữ cảnh nào trong bộ mã hóa. Như có thể thấy trong thanh ngoài cùng bên trái trong Hình 3(b) và Hình 4(b), việc loại bỏ ngữ cảnh hóa cục bộ dẫn đến hiệu suất kém, minh họa tầm quan trọng của việc ngữ cảnh hóa cục bộ.
+
+**Ngữ cảnh hóa các khối với tiền tố** Như đã giải thích, SLED không sử dụng token toàn cục, mà thay vào đó ngữ cảnh hóa mỗi khối với một tiền tố được thêm vào. Để xác minh tính cần thiết của nó, chúng tôi tinh chỉnh một mô hình SLED xem tiền tố như một khối khác và không thêm nó vào các khối tài liệu.⁵ Thanh thứ hai trong Hình 3(b) và Hình 4(b) cho thấy sự sụt giảm đáng kể về hiệu suất cho tất cả các thiết lập, cho thấy tiền tố được cần trong quá trình mã hóa.
+
+Như mong đợi, thực tế không có sự khác biệt giữa các thiết lập Có thứ tự và Trộn trong Hình 3(b). Ngược lại, LEDL tương tự về khái niệm (do thiếu token toàn cục) cho thấy sự sụt giảm đáng kể khi các đoạn văn được trộn. Điều này cho thấy hiệu quả có thể của trường tiếp nhận tăng trong LED, nhưng chỉ khi đoạn văn vàng tương đối gần với tiền tố.
+
+**Mã hóa tiền tố** Sau khi chỉ ra tiền tố quan trọng cho bộ mã hóa, chúng tôi hỏi liệu bộ giải mã có cần quyền truy cập trực tiếp vào tiền tố hay thông tin liên quan từ tiền tố có thể được truyền vào các biểu diễn khối. Để kiểm tra điều đó, chúng tôi tinh chỉnh SLED như thường lệ, nhưng loại bỏ các token tiền tố khỏi biểu diễn cuối cùng được cung cấp cho bộ giải mã. Thanh ngoài cùng bên phải trong Hình 3(b) và Hình 4(b) cho thấy việc cung cấp cho bộ giải mã các biểu diễn tiền tố tạo ra ít sự khác biệt nếu có, cho thấy rằng thực sự bộ mã hóa có thể truyền thông tin quan trọng từ tiền tố vào các token tài liệu được mã hóa.
+
+⁵Chúng tôi thêm đệm có mặt nạ sau tiền tố để đảm bảo việc chia khối của tài liệu vẫn giống hệt.
+
+## 5 Thí nghiệm
+Chúng tôi đánh giá SLED trên SCROLLS (Shaham et al., 2022), một benchmark được đề xuất gần đây để đánh giá hiểu văn bản dài. SCROLLS chứa bảy bộ dữ liệu bao gồm ba tác vụ hiểu ngôn ngữ khác nhau:
+
+1. **Tóm tắt**: GovReport (Huang et al., 2021) là một tác vụ tóm tắt trên các báo cáo từ Dịch vụ Nghiên cứu Quốc hội; SummScreenFD (Chen et al., 2022) là một bộ dữ liệu tóm tắt trên các kịch bản TV; QMSum (Zhong et al., 2021) là một bộ dữ liệu tóm tắt dựa trên truy vấn trên bản ghi cuộc họp từ các lĩnh vực khác nhau. Mặc dù GovReport và SummScreenFD không chứa tiền tố, đối với QMSum chúng tôi xem truy vấn là tiền tố.
+
+2. **Hỏi đáp (QA)**: Qasper (Dasigi et al., 2021) là một benchmark QA chứa câu hỏi về các bài báo NLP; NarrativeQA (Kočiský et al., 2018) chứa câu hỏi về toàn bộ sách và kịch bản phim; QuALITY (Pang et al., 2022) là một bộ dữ liệu QA trắc nghiệm về sách và bài báo. Đối với tất cả các bộ dữ liệu QA, chúng tôi đặt câu hỏi làm tiền tố. Đối với QuALITY, chúng tôi xem bốn lựa chọn trả lời là một phần của câu hỏi.
+
+3. **Suy luận ngôn ngữ tự nhiên**: ContractNLI (Koreeda and Manning, 2021) chứa các giả thuyết pháp lý ngắn (được đặt làm tiền tố) và các tài liệu pháp lý làm tiền đề. Các mô hình được giao nhiệm vụ dự đoán liệu tiền đề có kéo theo, mâu thuẫn hay trung lập w.r.t. giả thuyết.
+
+Đối với mỗi tác vụ, chúng tôi sử dụng các chỉ số đánh giá chính thức được định nghĩa trong SCROLLS, dựa trên các chỉ số từ các bộ dữ liệu gốc.
+
+### 5.1 Cài đặt
+Chúng tôi đánh giá SLED với cả BART (Lewis et al., 2020) và T5 (Raffel et al., 2020b) làm mô hình xương sống. Đối với mỗi mô hình xương sống, chúng tôi so sánh hiệu suất với SLED, có thể xử lý các chuỗi dài, so với các mô hình xương sống đơn lẻ được cung cấp 1.024 token đầu tiên. Để so sánh, chúng tôi cũng tinh chỉnh LED base. Trong tất cả các thí nghiệm SLED và LED, chúng tôi sử dụng độ dài chuỗi tối đa 16K token và kích thước khối 256 để cho phép đánh giá công bằng.
+
+Đối với mỗi cặp mô hình-bộ dữ liệu, chúng tôi chạy điều chỉnh siêu tham số (chi tiết trong Phụ lục C) dựa trên
+
+--- TRANG 7 ---
+tập phát triển. Ngoài ra, chúng tôi gửi các dự đoán được tạo ra trên tập kiểm tra đến bảng xếp hạng SCROLLS,⁶ và so sánh với hiệu suất được báo cáo của các mô hình khác tại thời điểm gửi.
+
+### 5.2 Kết quả
+Bảng 1 báo cáo kết quả trên các tập phát triển và kiểm tra SCROLLS. Việc lấy các LM được huấn luyện trước tầm ngắn như BART và T5 và đưa chúng vào khung SLED cho phép chúng xử lý các tài liệu dài một cách hiệu quả, cải thiện điểm SCROLLS trung bình 4.8-7 điểm. Xem xét BART base-SLED, chúng ta thấy cải thiện lớn so với LED base (33.6→35.4), và hiệu suất cạnh tranh trên nhiều tác vụ so với LongT5 base và UL2. Hơn nữa, việc thêm SLED vào BART large dẫn đến một mô hình hiệu suất cao với kết quả có thể so sánh với LongT5 base và vượt trội UL2, mặc dù số lượng tham số lớn của UL2 (lớn hơn 50 lần), và không cần huấn luyện trước đắt đỏ hướng tới các tác vụ tầm xa. Hiệu suất của BART large-SLED thấp hơn một chút so với các mô hình LongT5 lớn hơn.
+
+Ngoại trừ QuALITY, SLED cải thiện đáng kể hiệu suất trên tất cả các tác vụ so với các mô hình xương sống tương ứng. Tất cả các bộ dữ liệu tóm tắt (GovReport, SummScreenFD và QMSum) cho thấy những cải thiện ấn tượng lên tới 35% so với điểm số cơ sở của chúng, trên tất cả các chỉ số (Rouge-1/Rouge-2/Rouge-L (Lin, 2004)) và cho tất cả ba mô hình xương sống. Tương tự, trên ContractNLI (Koreeda and Manning, 2021) chúng ta thấy những cải thiện tương đối lớn. Vì hiệu suất của các mô hình cơ sở đã cao, sự thúc đẩy về hiệu suất này càng có ý nghĩa hơn. Cuối cùng, các bộ dữ liệu QA Qasper và NarrativeQA cho thấy những cải thiện lớn nhất, cải thiện trung bình 60%.
+
+**QuALITY** Trái ngược hoàn toàn với các bộ dữ liệu khác là bộ dữ liệu QA trắc nghiệm QuALITY (Pang et al., 2022). Mặc dù hiệu suất của BART large-SLED cao hơn ngẫu nhiên, nó hầu như không cải thiện hiệu suất của mô hình xương sống (BART large), quan sát chỉ 1K token đầu tiên, với xu hướng tương tự trong các mô hình xương sống khác. Phân tích điểm số kiểm tra trong Bảng 1, chúng ta thấy rằng việc tăng kích thước mô hình liên tục cải thiện hiệu suất (lên tới 46% exact match), nhưng việc tăng độ dài đầu vào có tác động không đáng kể. Vì độ chính xác của con người được báo cáo trên QuALITY cao (93.5%), điều này gợi ý rằng QuALITY có thể yêu cầu lý luận thông thức và kiến thức vắng mặt từ các mô hình có số lượng tham số thấp hơn.
+
+**Tóm tắt** Chúng tôi đã chỉ ra rằng việc lấy các LM được huấn luyện trước sẵn có và nhúng chúng vào SLED dẫn đến hiệu suất cạnh tranh trên SCROLLS. Quan trọng là, bất kỳ LM được huấn luyện trước trong tương lai nào cũng có thể dễ dàng được cắm vào SLED, mà không cần một bước huấn luyện trước đắt đỏ.
+
+### 5.3 Phân tích bộ dữ liệu
+Tính đơn giản và mô-đun của SLED cho phép nó được sử dụng như một công cụ hữu ích cho phân tích bộ dữ liệu. Cụ thể, chúng tôi có thể thay đổi kích thước khối, c, và số lượng token, n, trên các bộ dữ liệu để phân tích a) các mảnh thông tin liên quan riêng lẻ cục bộ như thế nào, và b) chúng nằm cách bao xa trong tài liệu.
+
+**Cục bộ hóa thông tin** SLED dựa vào giả định rằng thông tin có thể được ngữ cảnh hóa cục bộ tại thời điểm mã hóa. Để phân tích tính cục bộ, chúng tôi thay đổi kích thước khối, c, định nghĩa cửa sổ attention, và đo tác động lên các bộ dữ liệu SCROLLS với độ dài đầu vào 16K. Hình 5 cho thấy kết quả của thí nghiệm này, nơi trục y cho thấy cải thiện tương đối so với BART base trên một chỉ số mục tiêu như một hàm của kích thước khối c cho tất cả các bộ dữ liệu. Chúng tôi quan sát rằng trong tất cả các bộ dữ liệu, kích thước khối hoạt động tốt nhất tương đối nhỏ (lên tới 256), và việc tăng c thêm thậm chí làm tổn hại hiệu suất trong một số trường hợp. Tuy nhiên, các bộ dữ liệu tóm tắt cho thấy cải thiện hiệu suất lớn hơn nhiều khi tăng c lên đến ngưỡng đó. Điều này trùng khớp với một giả thuyết phổ biến rằng QA và NLI yêu cầu ngữ cảnh tương đối cục bộ, và do đó việc tăng c có thể thêm nhiễu và làm tổn hại tối ưu hóa, trong khi tóm tắt có thể yêu cầu một cái nhìn thông tin cấp cao hơn.
+
+**Khoảng cách từ đầu tài liệu** Chúng tôi bây giờ phân tích liệu thực sự toàn bộ tài liệu có được yêu cầu cho các tác vụ trong SCROLLS bằng cách thay đổi độ dài tài liệu tối đa, n. Hình 6 cho thấy kết quả của thí nghiệm này, nơi trục y cho thấy cải thiện tương đối của BART base-SLED so với BART base như một hàm của n token đầu tiên từ tài liệu (kích thước khối c=256). Như mong đợi, tất cả các bộ dữ liệu (ngoại trừ QuALITY) cho thấy cải thiện hiệu suất đơn điệu thô với n. Điều này cho thấy rằng (a) SLED có thể hiệu quả
+
+⁶https://www.scrolls-benchmark.com/leaderboard
+
+--- TRANG 8 ---
+[Bảng 1: Kết quả chính trên benchmark SCROLLS được trình bày với các cột cho các mô hình khác nhau và hàng cho các bộ dữ liệu, hiển thị điểm số phát triển và kiểm tra]
+
+sử dụng tất cả thông tin trong một chuỗi dài⁷ (lên tới 16K token), và rằng (b) việc quan sát toàn bộ đầu vào từ SCROLLS cải thiện hiệu suất.
+
+### 5.4 Tác động của đệm ngữ cảnh
+Trong tất cả các thí nghiệm cho đến nay, chúng tôi đã sử dụng giá trị đệm bảo thủ α=0.5, dẫn đến kích thước khối hiệu quả c/2 và c/4 token đệm ngữ cảnh ở mỗi bên. Vì cả bộ nhớ và quan trọng hơn, số lượng lần chuyển tiếp qua bộ mã hóa đều tuyến tính với số lượng khối, một câu hỏi tự nhiên là cần bao nhiêu đệm và chồng lấp để đạt kết quả thỏa đáng.
+
+Để khám phá điều này, chúng tôi tinh chỉnh BART base-SLED trên tất cả sáu bộ dữ liệu mà SLED cho thấy cải thiện so với mô hình cơ sở (tức là tất cả các bộ dữ liệu ngoại trừ QuALITY), thay đổi giá trị α, và cố định c=256. Bảng 2 cho thấy kết quả của thí nghiệm này, nơi chúng tôi so sánh cải thiện tương đối so với BART base trên các giá trị α khác nhau.
+
+Như mong đợi, việc giảm hệ số đệm và do đó số lượng khối giảm thời gian huấn luyện. Khi α=0.05, huấn luyện có thể nhanh hơn tới 2 lần so với α=0.5 vì số lượng khối giảm xuống gần một nửa. Hơn nữa, cải thiện tương đối (tức là cải thiện so với cơ sở) thường gần hoặc thậm chí cao hơn với ít đệm hơn (có thể do mã hóa tốt hơn hoặc tối ưu hóa ổn định hơn). Tuy nhiên, không có giá trị α duy nhất nào liên tục đánh bại lựa chọn bảo thủ α=0.5. Cụ thể, trong tất cả sáu bộ dữ liệu, việc đặt α=0.5 dẫn đến hiệu suất top-2, thường với biên độ lớn và không bao giờ kém hơn đáng kể so với kết quả tốt nhất. Do đó, chúng tôi kết luận rằng người ta có thể cải thiện hiệu quả và hiệu suất của SLED bằng cách điều chỉnh siêu tham số α để có hành vi tối ưu w.r.t. một tác vụ cụ thể, và chúng tôi cố định α=0.5 trong các thí nghiệm của mình.
+
+Hơn nữa, Bảng 2 chứng minh tầm quan trọng của việc có các khối ít nhất một phần chồng lấp. Trong tất cả sáu bộ dữ liệu, việc sử dụng các khối không chồng lấp (α=0) dẫn đến sự sụt giảm ít nhất 10% cải thiện so với thiết lập tốt nhất, nơi trong một số trường hợp khoảng cách này tăng lên hơn 50%. Điều này hỗ trợ giả thuyết của chúng tôi rằng việc chia khối đầu vào không có chồng lấp có thể dẫn đến mất thông tin quan trọng.
+
+⁷Đối với ContractNLI, độ dài của hơn 95% các ví dụ được token hóa nhỏ hơn 8K.
+
+--- TRANG 9 ---
+[Hình 5: Biểu đồ cho thấy cải thiện tương đối của BART base-SLED so với BART base khi thay đổi kích thước khối SLED]
+
+[Hình 6: Biểu đồ cho thấy cải thiện tương đối của BART base-SLED so với BART base khi thay đổi độ dài đầu vào]
+
+## 6 Công trình liên quan
+
+**Transformer hiệu quả** Nhiều biến thể attention hiệu quả đã được đề xuất trong những năm gần đây, để giảm bớt độ phức tạp bậc hai của dense attention (Tay et al., 2020; Fournier et al., 2021). Trong số đó có việc phân cụm vector thành các bucket riêng biệt, tính toán attention chỉ trong mỗi bucket (Kitaev et al., 2020a), chỉ chú ý đến một số lượng cố định các vector ẩn (Ma et al., 2021), sử dụng các đặc trưng ngẫu nhiên để xấp xỉ ma trận attention (Choromanski et al., 2021; Peng et al., 2021), và sử dụng phân tích nhân tử hạng thấp (Wang et al., 2020). Mặc dù đạt hiệu suất đáng kính khi tinh chỉnh các mô hình này trên benchmark Long Range Arena (Tay et al., 2021), nhiều trong số chúng chưa được chứng minh hoạt động tốt như một xương sống cho các mô hình ngôn ngữ được huấn luyện trước. Thực tế, công trình gần đây (Xiong et al., 2022b) trên các mô hình chỉ có encoder đã thấy nhiều mô hình không vượt trội hơn một cửa sổ trượt attention cục bộ đơn giản trên các tác vụ ngôn ngữ downstream. Chúng tôi thảo luận các phương pháp như vậy tiếp theo.
+
+**Các biến thể sparse attention** Một giải pháp phổ biến và đơn giản để cho phép các mô hình dựa trên attention xử lý các chuỗi dài là sử dụng attention cục bộ, nơi mỗi token chú ý đến một cửa sổ cục bộ xung quanh nó. Longformer (Beltagy et al., 2020), GMAT (Gupta and Berant, 2020), và ETC (Ainslie et al., 2020) sử dụng các cửa sổ ngắn của attention đầy đủ, kết hợp với attention đầy đủ đến một số lượng nhỏ các token đầu vào toàn cục được định nghĩa trước. BigBird (Zaheer et al., 2020b) chia sẻ các đặc trưng cục bộ và toàn cục, và thêm vào đó lấy mẫu ngẫu nhiên các token để chú ý đến. Cuối cùng, LongT5 được đề xuất gần đây (Guo et al., 2022) mở rộng T5 (Raffel et al., 2020a) với các thành phần attention cục bộ và toàn cục dựa trên ETC, giảm bớt nhu cầu chỉ định thủ công các token toàn cục. Trong công trình này, chúng tôi chứng minh rằng một cửa sổ trượt đơn giản với các mô hình sẵn có mà không có bất kỳ sửa đổi nào là một giải pháp thay thế mạnh mẽ cho nhiều tác vụ tạo sinh yêu cầu xử lý tài liệu dài.
+
+**Ngoài transformer** Như một giải pháp thay thế cho transformer để xử lý các chuỗi dài, Gu et al. (2021) đã đề xuất kiến trúc Structured State Space
+
+--- TRANG 10 ---
+[Bảng 2: Cải thiện tương đối của BART base-SLED so với BART base khi thay đổi tỷ lệ phần trăm đệm]
+
+(S4) cho thấy những cải thiện đáng kể so với transformer trên benchmark LRA (Tay et al., 2021). Các mô hình không gian trạng thái hiện là một lĩnh vực nghiên cứu tích cực (Gupta, 2022; Mehta et al., 2022), nhưng hiệu quả của chúng trên các tác vụ hiểu ngôn ngữ tầm xa chưa được kiểm tra.
+
+**Fusion-in-Decoder** Izacard and Grave (2021) đã đề xuất mã hóa nhiều đoạn văn độc lập riêng biệt, và nối các mã hóa trước giai đoạn giải mã. Mặc dù có bằng chứng thực nghiệm khuyến khích (Amouyal et al., 2022; Yavuz et al., 2022), chúng tôi là người đầu tiên (theo hiểu biết của chúng tôi) phân tích tính khả thi và hạn chế của FiD trong một thiết lập có kiểm soát. Quan trọng là, chúng tôi kiểm tra FiD trên các tác vụ tầm xa trên một tài liệu dài duy nhất, thay vì một tập hợp các đoạn văn độc lập.
+
+**Mô hình được huấn luyện trước với cửa sổ trượt** Việc bao bọc một bộ mã hóa BERT trong một cửa sổ trượt đã được đề xuất bởi Cui and Hu (2021) trong bối cảnh một kiến trúc chuyên biệt cho tóm tắt. Wang et al. (2019) đã chỉ ra rằng việc trượt BERT qua văn bản cải thiện hiệu suất trên một số bộ dữ liệu QA. Trong công trình này, chúng tôi đề xuất một phương pháp cửa sổ trượt có thể dễ dàng được cắm vào bất kỳ mô hình encoder-decoder hiện có nào mà không có tham số bổ sung hoặc huấn luyện đặc thù tác vụ, và chỉ ra hiệu quả của nó cho hiểu văn bản tầm xa. Tương tự nhất với SLED, là phương pháp SEGENCđược đề xuất bởi Vig et al. (2022). Bằng cách chia các đầu vào từ QMSum thành các khối chồng lấp, mã hóa chúng riêng biệt, và sau đó thực hiện FiD (sử dụng hai biểu diễn cho mỗi token đầu vào), các tác giả đã có thể đạt kết quả state-of-the-art. Tuy nhiên, Vig et al. (2022) tập trung vào tóm tắt và không thực hiện phân tích có hệ thống về loại kiến trúc này.
+
+## 7 Hạn chế
+Chúng tôi trình bày SLED như một phương pháp đơn giản và hiệu quả để mở rộng khả năng của các mô hình văn bản ngắn được huấn luyện trước cho các tác vụ văn bản dài. Mặc dù có hiệu suất thực nghiệm ấn tượng trên SCROLLS, SLED gặp phải hai bất lợi có thể hạn chế khả năng áp dụng của nó cho một số tác vụ tầm xa.
+
+**Đầu ra dài** Để có được độ phức tạp tuyến tính, SLED giả định độ dài đầu ra k là hằng số. Điều này là do bộ giải mã sử dụng self-attention bậc hai trên đầu ra, bên cạnh cross-attention O(nk) giữa đầu ra và đầu vào. Mặc dù hầu hết các tác vụ văn bản dài hiện tại tuân theo giả định này, các tác vụ trong tương lai, như báo cáo học thuật hoặc viết kịch bản, có thể yêu cầu tạo văn bản dài. Hạn chế này không độc quyền với SLED và ảnh hưởng đến các transformer tầm xa khác bao gồm LongT5 và LED. Ngoài tinh chỉnh, điều này cũng ảnh hưởng đến huấn luyện trước các mô hình trên đầu vào dài với các loss tự giám sát như span-corruption (Raffel et al., 2020b) hoặc denoising (Lewis et al., 2020), yêu cầu bộ giải mã xử lý một đầu ra tuyến tính với độ dài của đầu vào.
+
+**Giải quyết đồng tham chiếu và lưu giữ sự thật** Một giả định ở trung tâm của SLED là giả định Cục bộ hóa thông tin. Khi văn bản đầu vào dài, giả định này có thể bị phá vỡ nếu cần giải quyết thực thể từ xa hoặc kiến thức thực tế. Ví dụ, một chương trong sách có thể đề cập "họ đang đi vào phòng" khi kiến thức về phòng nào hoặc ai đã đi được đặt ở vài chương trước. Trong những trường hợp như vậy, bộ mã hóa được sử dụng bởi SLED sẽ không thể truy cập thông tin này, chuyển nhiều trách nhiệm hơn cho bộ giải mã và giảm hiệu quả của mã hóa ngữ cảnh. Tương tự, trong các câu hỏi đa bước (Yang et al., 2018), chú ý đến một phần của ngữ cảnh là cần thiết để hiểu đầy đủ câu hỏi và mã hóa chính xác một mảnh thông tin thứ hai. Vì bộ mã hóa sẽ không có quyền truy cập vào ngữ cảnh đầu tiên dẫn đến hiểu câu hỏi tốt hơn, ở đây cũng vậy nhiều trách nhiệm hơn được ủy thác cho bộ giải mã.
+
+## 8 Kết luận
+Trong công trình này, chúng tôi trình bày SLED, một phương pháp đơn giản để mô hình hóa văn bản dài trượt một bộ mã hóa tầm ngắn được huấn luyện trước qua một tài liệu đầu vào dài
+
+--- TRANG 11 ---
+và sau đó tạo ra đầu ra bằng cách chú ý đến các token được mã hóa. Chúng tôi chỉ ra SLED có thể thực hiện các thao tác cốt lõi quan trọng cho hiểu văn bản dài, như tìm các mảnh thông tin liên quan và kết hợp chúng tại thời điểm giải mã, và chứng minh hiệu suất cạnh tranh trên benchmark SCROLLS so với các mô hình lớn hơn và các mô hình sử dụng bước huấn luyện trước chuyên dụng và đắt đỏ.
+
+Một trong những đặc điểm hấp dẫn nhất của SLED là nó có thể dễ dàng được sử dụng với bất kỳ LM tầm ngắn được huấn luyện trước nào. Do đó, bất kỳ mô hình encoder-decoder trong tương lai nào cũng có thể được cắm linh hoạt vào nó để đạt được những cải thiện hiệu suất hơn nữa trên SCROLLS, một số tác vụ của nó, hoặc bất kỳ tác vụ tầm xa nào khác.
+
+Chúng tôi mở mã nguồn SLED và hy vọng nó khuyến khích cộng đồng nghiên cứu dễ dàng mở rộng sang đầu vào dài hơn và đẩy ranh giới khả năng áp dụng của các mô hình NLU trong các trường hợp sử dụng thực tế.
+
+## Lời cảm ơn
+Nghiên cứu này được hỗ trợ một phần bởi Sáng kiến Yandex cho Học máy, Học bổng Shashua, Quỹ Len Blavatnik và gia đình Blavatnik, và Hội đồng Nghiên cứu Châu Âu (ERC) theo chương trình nghiên cứu và đổi mới Horizons 2020 của Liên minh Châu Âu (grant ERC DELPHI 802800). Chúng tôi cũng muốn cảm ơn biên tập viên hành động và các nhà đánh giá ẩn danh vì những gợi ý và phản hồi sâu sắc của họ. Công trình này được hoàn thành trong việc thực hiện một phần cho bằng Tiến sĩ của tác giả đầu tiên.
+
+## A Chi tiết triển khai SLED
+Mặc dù §3 chi tiết phương pháp của SLED, nó bỏ qua việc xử lý các token biên để ngắn gọn. Mã hóa c/2 token đầu vào đầu tiên và cuối cùng yêu cầu sự chú ý đặc biệt, vì chúng thiếu ngữ cảnh hai chiều. Để bảo tồn càng nhiều điểm chung giữa các khối, tất cả (2−α)c/2 token đầu tiên được xem là token khối hiệu quả trong khối đầu tiên. Để tính đến các token cuối cùng, khối cuối cùng sẽ luôn bắt đầu tại token tn−c+1 để nó chứa chính xác c token, và các token khối hiệu quả của nó sẽ được định nghĩa là tất cả các token không phải là một phần của bất kỳ khối hiệu quả trước đó nào.
+
+## B Chunking vs. local-attention
+Cả LED và SLED đều là các mô hình tầm xa được xây dựng trên cùng một mô hình văn bản ngắn (BART), và sử dụng attention cục bộ. Tuy nhiên, SLED dựa vào chunking, trong khi LED sử dụng attention cục bộ mỗi lớp. Trong phần này, chúng tôi bây giờ thảo luận chi tiết hơn về mối quan hệ giữa hai phương pháp.
+
+**Triển khai** Một trong những ưu điểm lớn nhất của SLED là nó không phụ thuộc vào mô hình encoder-decoder xương sống, và có thể mở rộng bất kỳ mô hình hiện có nào mà không có overhead triển khai bổ sung. Ngược lại, cơ chế attention trong Longformer, và sau đó là LED, được triển khai bởi Beltagy et al. (2020) với một kernel CUDA chuyên biệt được kết hợp với kiến trúc và triển khai của BART. Điều này làm cho LED hiệu quả hơn, nhưng việc mở rộng nó sang các kiến trúc mới phát sinh overhead kỹ thuật đáng kể. Điều này là do LED sử dụng attention cửa sổ cục bộ "đường chéo" qua các lớp, mà một triển khai ngây thơ là không hiệu quả. Ngược lại, SLED sử dụng chunking, cho phép đơn giản bao bọc một mô hình encoder-decoder hiện có.
+
+**Ngữ cảnh hóa** Sự khác biệt đáng kể nhất giữa LED và SLED từ quan điểm khái niệm là cơ chế ngữ cảnh hóa của chúng. Trong khi SLED chia đầu vào thành các khối (chồng lấp) và mã hóa từng khối độc lập, LED thực hiện attention cục bộ mỗi lớp. Điều này dẫn đến một trường tiếp nhận hiệu quả tăng tuyến tính với độ sâu bộ mã hóa, có thể cho phép nó thực hiện ngữ cảnh hóa "toàn cục" hơn. Kết quả của chúng tôi trong §4 gợi ý rằng ngữ cảnh hóa toàn cục như vậy là có lợi, và một kết luận tương tự có thể đạt được khi quan sát rằng LED base, sử dụng tất cả các token tiền tố là token toàn cục, vượt trội hơn LEDSCROLLS base, chỉ sử dụng một token duy nhất cho ngữ cảnh hóa toàn cục.
+
+**Thông tin vị trí** Cơ chế chunking của SLED có nghĩa là nó sử dụng mã hóa vị trí của mô hình cơ bản độc lập trong mỗi khối, và do đó không phụ thuộc vào kỹ thuật nhúng vị trí được sử dụng bởi mô hình xương sống. Hơn nữa, nó có thể cho phép SLED tổng quát hóa sang độ dài đầu vào tùy ý. Ngược lại, LED sử dụng embeddings tuyệt đối của BART, nhân đôi chúng 16 lần để hỗ trợ các chuỗi dài 16K. Điều này hạn chế khả năng tổng quát hóa sang đầu vào dài hơn, và có thể tạo ra yêu cầu về số lượng mẫu đầu vào dài đáng kể để điều chỉnh đúng những tham số mới đó (Shaham et al., 2022). Điều này rõ ràng trong Bảng 1 khi so sánh điểm số kiểm tra của LED base với BART base-SLED và xem xét số lượng
+
+--- TRANG 12 ---
+mẫu huấn luyện. Trong NarrativeQA và GovReport, chứa 71K và 19K mẫu tương ứng, LED có thể so sánh với SLED và thậm chí hơi vượt trội trên một số chỉ số. Trong ContractNLI (10K ví dụ), nó làm hơi tệ hơn. Trong tất cả các bộ dữ liệu khác, nơi dữ liệu huấn luyện nhỏ, LED tệ hơn đáng kể so với SLED.
+
+**Độ phức tạp** Chúng tôi đã phân tích phân tích độ phức tạp của bộ mã hóa SLED (§3), là O(lcn). Một phân tích tương tự của LED cho thấy rằng trong mỗi lớp, LED xem xét O(n) cửa sổ có độ dài c, nơi trong mỗi cửa sổ chỉ có token giữa chú ý đến vùng lân cận cục bộ của nó, dẫn đến độ phức tạp bộ nhớ O(lcn) cũng vậy.
+
+Tuy nhiên, do việc sử dụng chồng lấp và self-attention đầy đủ trong mỗi khối của SLED, việc mã hóa của SLED có thể yêu cầu nhiều bộ nhớ hơn 2 lần so với LED khi α=0.5.
+
+## C Chi tiết thí nghiệm
+Thiết lập thí nghiệm của chúng tôi dựa trên kho lưu trữ chính thức SCROLLS.⁸ Các đầu vào và phần chia của bộ dữ liệu vẫn như được đề xuất bởi các tác giả của SCROLLS cũng như số epoch được đề xuất cho mỗi bộ dữ liệu. Để thực hiện lựa chọn mô hình, cho mỗi cặp mô hình-bộ dữ liệu, chúng tôi tinh chỉnh 9 mô hình với lập lịch tốc độ học LINEAR, bộ tối ưu AdamW với các cài đặt mặc định, và đặt tốc độ học là một trong {2e-5, 5e-5, 1e-4} và kích thước batch hiệu quả là một trong {8, 16, 32}. Warmup được cố định ở 10% và weight decay ở 0.01. Tất cả mã, dữ liệu, yêu cầu môi trường python, siêu tham số và script cần thiết để tái tạo kết quả của chúng tôi sẽ được công khai khi xuất bản.
+
+⁸https://github.com/tau-nlp/scrolls
+
+## Tài liệu tham khảo
+[Phần tài liệu tham khảo tiếp tục với tất cả các trích dẫn được dịch sang tiếng Việt...]

@@ -1,0 +1,1556 @@
+# LLoCO: Học Ngữ Cảnh Dài Offline
+Sijun Tan*, Xiuyu Li*, Shishir Patil, Ziyang Wu, Tianjun Zhang,
+Kurt Keutzer, Joeseph E. Gonzalez, Raluca Ada Popa
+UC Berkeley
+{sijuntan,xiuyu}@berkeley.edu
+
+Tóm tắt
+Xử lý ngữ cảnh dài vẫn là một thách thức
+đối với các mô hình ngôn ngữ lớn (LLMs) do
+chi phí tính toán và bộ nhớ bậc hai của
+cơ chế self-attention và kích thước KV cache
+đáng kể trong quá trình sinh. Chúng tôi đề xuất
+LLoCO, một phương pháp mới để giải quyết
+vấn đề này bằng cách học ngữ cảnh offline
+thông qua nén ngữ cảnh và tinh chỉnh hiệu quả
+tham số trong miền với LoRA. Phương pháp
+của chúng tôi cho phép LLM tạo ra một biểu
+diễn súc tích của ngữ cảnh gốc và truy xuất
+thông tin liên quan một cách hiệu quả để trả
+lời câu hỏi chính xác. Phương pháp của chúng
+tôi mở rộng cửa sổ ngữ cảnh hiệu quả của mô
+hình LLaMA2-7B 4k token để xử lý lên đến
+128k token. Chúng tôi đánh giá phương pháp
+của mình trên một số bộ dữ liệu hỏi-đáp ngữ
+cảnh dài, chứng minh rằng LLoCO vượt trội
+đáng kể so với học trong ngữ cảnh trong khi
+sử dụng ít hơn 30× token trong quá trình suy
+luận. LLoCO đạt được tăng tốc lên đến 7.62×
+trong quá trình suy luận và thông lượng cao
+hơn 11.52× trong quá trình tinh chỉnh, giảm
+đáng kể chi phí trả lời câu hỏi tài liệu dài.
+Điều này làm cho nó trở thành một giải pháp
+hứa hẹn cho xử lý ngữ cảnh dài hiệu quả.¹
+
+1 Giới thiệu
+Các mô hình ngôn ngữ lớn (LLMs) đã chứng minh
+hiệu suất đáng chú ý trên một loạt các nhiệm vụ
+(Touvron et al., 2023; Jiang et al., 2023a).
+Nhiều nhiệm vụ này yêu cầu LLMs hiểu và lý luận
+về ngữ cảnh dài. Ví dụ, trả lời câu hỏi tài liệu là
+một trong những ứng dụng phổ biến nhất của
+LLMs, nơi mô hình được trình bày với một tài liệu
+làm ngữ cảnh và được yêu cầu phản hồi các câu
+hỏi liên quan hoặc tóm tắt văn bản. Những tài liệu
+này có thể từ các bài viết dài đến toàn bộ cuốn
+sách, có thể vượt quá giới hạn cửa sổ ngữ cảnh
+của LLMs. Do đó, có một xu hướng gia tăng trong
+cả học thuật và công nghiệp để nâng cao khả năng
+của LLMs xử lý ngữ cảnh dài hơn một cách hiệu
+quả (Chen et al., 2023b; Jiang et al., 2023a; Peng
+et al., 2024; Chen et al., 2024). Nhu cầu này đã
+thúc đẩy sự đổi mới giữa các nhà cung cấp LLM
+như OpenAI và Anthropic để phát triển các mô
+hình có thể xử lý các văn bản ngày càng dài bao
+gồm vài nghìn token.
+
+*Đóng góp bằng nhau
+¹Mã nguồn của chúng tôi có sẵn công khai tại https://github.com/
+jeffreysijuntan/lloco.
+
+Bất chấp tiến bộ ấn tượng được thực hiện bởi
+các nhà cung cấp mô hình LLM, việc mở rộng
+các mô hình này để khéo léo quản lý ngữ cảnh
+mở rộng vẫn là một thách thức to lớn, cả về
+mặt kỹ thuật và tài chính. Do cơ chế self-attention,
+các LLMs dựa trên transformer gánh chịu chi phí
+tính toán và bộ nhớ bậc hai khi độ dài chuỗi tăng.
+Nhiều nhiệm vụ ngữ cảnh dài yêu cầu tái sử dụng
+cùng một ngữ cảnh nhiều lần, điều này gây ra chi
+phí độ trễ bổ sung và chi phí đáng kể, vì hầu hết
+các LLMs thương mại hoạt động trên mô hình
+định giá gắn trực tiếp với số token được xử lý.
+Ví dụ, một lần chạy suy luận với một tài liệu có
+100k token sẽ tốn 1.5 USD trên Claude 3 Opus²
+và 1 USD trên GPT-4-turbo³.
+
+Trực giao với những nỗ lực thú vị của việc mở
+rộng giới hạn cửa sổ ngữ cảnh, nghiên cứu của
+chúng tôi giới thiệu một chiến lược sáng tạo để
+giải quyết thách thức ngữ cảnh dài. Chúng tôi đề
+xuất một phương pháp nơi thông tin ngữ cảnh
+được cô đọng offline thông qua tinh chỉnh, cho
+phép mô hình cung cấp các phản hồi chính xác
+trong quá trình suy luận với các biểu diễn ngữ
+cảnh được sắp xếp hợp lý. Để minh họa ý tưởng
+của chúng tôi, hãy xem xét một phép tương tự:
+hình dung một LLM như một sinh viên chuẩn bị
+cho kỳ thi, nơi chúng tôi, các nhà nghiên cứu, là
+người thi cung cấp tài liệu học tập và câu hỏi.
+Học trong ngữ cảnh truyền thống với toàn bộ ngữ
+cảnh hoặc Sinh Tăng cường Truy xuất (RAG)
+giống như một kỳ thi mở sách, nơi LLM có quyền
+truy cập vào tất cả tài liệu khi trả lời câu hỏi. Ngược
+
+²https://www.anthropic.com/api
+³https://openai.com/pricing
+
+--- TRANG 2 ---
+Ví dụ ngữ cảnh dài…….Người dùng: Vui lòng tóm tắt bài viết.Trợ lý: Bài viết này nói về …
+………Ví dụ ngữ cảnh dài…….Người dùng: Vui lòng tóm tắt bài viết.Trợ lý: Bài viết này nói về ………Bộ Giải Mã LLMBộ Mã Hóa Ngữ CảnhBộ Giải Mã LLMLoRA
+
+Hình 1: Kiến trúc của LLM thông thường (trái) so với LLoCO (phải). Trong LLMs thông thường, ngữ cảnh dài được thêm
+trực tiếp vào prompt. Ngược lại, LLoCO đầu tiên xử lý những ngữ cảnh này thông qua bộ mã hóa ngữ cảnh. Các embedding
+token tóm tắt kết quả sau đó được đặt trước prompt của LLM, ngắn hơn đáng kể. LLoCO
+thực hiện tinh chỉnh hướng dẫn trên embeddings của các nhóm tài liệu mục tiêu sử dụng module LoRA. Điều này căn chỉnh
+không gian embedding của LLM với các embeddings tóm tắt trong khi giữ nguyên cả LLM và bộ mã hóa ngữ cảnh.
+
+lại, phương pháp của chúng tôi giống như một kỳ
+thi bán đóng sách, nơi LLM không thể mang toàn
+bộ cuốn sách nhưng được phép mang một tờ ghi
+chép. Để xuất sắc trong kỳ thi, sinh viên phải 1)
+học tập hiệu quả để chưng cất một tờ ghi chép
+súc tích nhưng thông tin phong phú, và 2) truy
+xuất thông tin liên quan một cách hiệu quả từ tờ
+ghi chép để trả lời câu hỏi thi chính xác. Cụ thể,
+1) Làm thế nào chúng ta có thể huấn luyện một
+mô hình để tạo ra một biểu diễn compact của
+ngữ cảnh gốc mà LLM có thể diễn giải và sử
+dụng hiệu quả? 2) Làm thế nào để cho phép LLM
+thành thạo điều hướng và trích xuất các chi tiết
+phù hợp từ biểu diễn này trong quá trình suy luận?
+
+Về câu hỏi đầu tiên, chúng tôi thấy công thức
+này gần giống với hướng nghiên cứu hiện có về
+nén ngữ cảnh. Các nghiên cứu trước đây (Chevalier
+et al., 2023; Mu et al., 2023; Ge et al., 2023;
+Yen et al., 2024) đã đề xuất các bộ nén nhằm
+chưng cất tinh túy của văn bản gốc thành các biểu
+diễn compact được căn chỉnh với LLMs. Công
+trình của chúng tôi chủ yếu tập trung vào câu hỏi
+thứ hai – chúng tôi đã quan sát thấy rằng bất chấp
+tiến bộ trong nén ngữ cảnh, LLMs thường gặp
+khó khăn trong việc đọc chính xác những "tờ ghi
+chép" như vậy và có xu hướng ảo giác khi áp
+dụng chúng để trả lời truy vấn. Để giải quyết vấn
+đề này, chúng tôi sử dụng tinh chỉnh hiệu quả
+tham số trong miền trực tiếp trên ngữ cảnh được
+nén (tờ ghi chép) mà không thay đổi nội dung
+của nó, điều này cải thiện đáng kể khả năng của
+LLM trích xuất và sử dụng thông tin từ những
+biểu diễn nén này một cách chính xác. Bằng cách
+này, chúng ta có thể điều khiển LLM xử lý ngữ
+cảnh dài hiệu quả và chính xác hơn. Phương pháp
+này cho phép chúng tôi mở rộng cửa sổ ngữ cảnh
+hiệu quả của mô hình LLaMA2-7B 4k lên xử lý
+lên đến 128k token. Hơn nữa, chúng tôi đạt được
+kết quả tiên tiến có thể sánh bằng hoặc thậm chí
+vượt qua hiệu suất của mô hình LLaMA2-7B-32k
+với toàn bộ ngữ cảnh trên các benchmark ngữ
+cảnh dài, trong khi sử dụng ít hơn 30× token.
+
+Hiểu biết này đã dẫn chúng tôi giới thiệu LLoCO,
+một pipeline học ngữ cảnh offline thông qua sự
+kết hợp của nén ngữ cảnh và tinh chỉnh hiệu quả
+tham số. Nó bao gồm ba giai đoạn: tiền xử lý,
+tinh chỉnh và phục vụ. Đầu tiên, chúng tôi tiền
+xử lý các tài liệu thành "tờ ghi chép". Sau đó,
+chúng tôi sử dụng Thích Ứng Hạng Thấp (LoRA)
+(Hu et al., 2022) để thực hiện tinh chỉnh hiệu quả
+tham số trên những "tờ ghi chép" này theo nhóm.
+Đối với thiết kế hệ thống phục vụ, chúng tôi sử
+dụng một bộ truy xuất RAG tiêu chuẩn để truy
+xuất tài liệu nén cũng như module LoRA liên quan
+nhất, và áp dụng chúng vào LLM để suy luận.
+Những đóng góp của công trình chúng tôi có thể
+được tóm tắt như sau:
+
+•Chúng tôi giới thiệu một phương pháp mới để
+mô hình hóa ngữ cảnh dài hiệu quả bằng cách
+kết hợp nén ngữ cảnh với tinh chỉnh hướng
+dẫn. Phương pháp của chúng tôi mở rộng cửa
+sổ ngữ cảnh của mô hình LLaMA2-7B 4k
+để xử lý lên đến 128k token, đạt được hiệu
+suất vượt trội đáng kể so với học trong ngữ
+cảnh trong khi sử dụng ít hơn 30× token.
+
+•Chúng tôi đề xuất LLoCO, một framework mới
+kết hợp nén ngữ cảnh, truy xuất và tinh chỉnh
+hiệu quả tham số. Pipeline này có thể được
+triển khai để tăng tốc đáng kể và giảm chi phí
+trả lời câu hỏi tài liệu dài. Với ngữ cảnh nén
+trong quá trình suy luận và tinh chỉnh hướng
+
+dẫn, chúng tôi chứng minh rằng LLoCO đạt
+được tăng tốc 7.62× so với độ trễ suy luận,
+và thông lượng cao hơn 11.52× so với tinh
+chỉnh trên ngữ cảnh gốc.
+
+2 Công trình liên quan
+
+LLMs ngữ cảnh dài Gần đây, đã có những nỗ
+lực để tăng kích thước cửa sổ ngữ cảnh của LLMs
+một cách hiệu quả với việc tiếp tục tiền huấn luyện
+hoặc tinh chỉnh. Một hướng nghiên cứu tập trung
+vào việc mở rộng Rotary Position Embeddings
+(RoPE) (Su et al., 2021), đạt được ngữ cảnh dài
+hơn lên đến 128k (Chen et al., 2023b, 2024; Peng
+et al., 2024). Mistral (Jiang et al., 2023a) đề xuất
+sliding window attention chỉ chú ý đến một phần
+token từ lớp trước, giảm tính toán và cho phép
+tiền huấn luyện với ngữ cảnh dài đến 30k. Tuy
+nhiên, vì sinh tự hồi quy trong LLMs chủ yếu bị
+giới hạn bởi bộ nhớ (Kwon et al., 2023), việc lưu
+trữ KV cache của ngữ cảnh dài hơn làm chậm suy
+luận và yêu cầu VRAM GPU lớn.
+
+Nén ngữ cảnh Một chủ đề liên quan chặt chẽ là
+nén ngữ cảnh, nhằm huấn luyện một bộ nén tổng
+quát có thể nén bất kỳ prompt đầu vào nào. GIST
+(Mu et al., 2023), AutoCompressor (Chevalier
+et al., 2023), và ICAE (Ge et al., 2023) tinh chỉnh
+LLMs theo cách "soft prompt-tuning", hoặc áp
+dụng regularization cụ thể trong attention masks
+hoặc sử dụng "memory tokens" chuyên dụng để
+nén ngữ cảnh thành embeddings với độ dài ngắn
+hơn đáng kể. Họ LLMLingua (Jiang et al., 2023c,b;
+Pan et al., 2024) đề xuất một framework có ý
+thức về câu hỏi để nén prompts bằng ngôn ngữ
+tự nhiên cho các API LLM hộp đen. Một hướng
+nghiên cứu khác sử dụng nén KV cache bằng
+cách loại bỏ (Zhang et al., 2024b; Xiao et al.,
+2024; Li et al., 2024; Tang et al., 2024), chỉ giữ
+lại các keys và values thông tin cho sinh trong
+quá trình suy luận, hoặc lượng tử hóa (Sheng et
+al., 2023b; Liu et al., 2024c; Hooper et al., 2024).
+Tuy nhiên, những phương pháp trước đó nhằm
+nén bất kỳ đầu vào nào, thường gây ra sụt giảm
+hiệu suất nhanh chóng khi tỷ lệ nén vượt quá
+một giới hạn nhất định (ví dụ 4×), đặc biệt đối
+với văn bản ngoài phân phối. Ngoài ra, những
+phương pháp này có thể yêu cầu triển khai kernel
+tùy chỉnh để đạt được tăng tốc thời gian thực,
+hạn chế việc sử dụng thực tế. Ngược lại, công
+trình của chúng tôi tập trung vào nén cực kỳ của
+các tài liệu trong phân phối, đạt được lên đến 30×
+nén mà không cần kernel tùy chỉnh.
+
+Sinh Tăng cường Truy xuất Truy xuất nâng cao
+hiệu suất của LLMs trong các nhiệm vụ chuyên
+sâu kiến thức như trả lời câu hỏi với tài liệu dài
+hoặc trong miền mở. Các kỹ thuật RAG hiệu quả
+cả trong các kịch bản tinh chỉnh và khi áp dụng
+cho LLMs hiện có (Guu et al., 2020; Lewis et al.,
+2020; Zhang et al., 2024a), và đã thấy nhiều tiến
+bộ gần đây, nhấn mạnh việc cải thiện tích hợp
+kiến thức bên ngoài, hỗ trợ truy vấn rộng hơn,
+và nâng cao độ rõ ràng nội dung (Jiang et al.,
+2023d; Schick et al., 2023; Asai et al., 2023).
+Bất chấp hiệu suất được cải thiện từ truy xuất,
+các thách thức vẫn còn về mặt hiệu quả thời
+gian chạy (Mallen et al., 2022) và lọc hiệu quả
+các phần không liên quan (Shi et al., 2023b; Xu
+et al., 2024). Phương pháp đề xuất của chúng tôi
+mở ra cơ hội mới để nắm bắt thông tin quan trọng
+đồng thời đảm bảo sinh hiệu quả.
+
+Tinh chỉnh Hiệu quả Tham số Một nhóm phương
+pháp (Hu et al., 2022; Lester et al., 2021; Shi et
+al., 2023a; Liu et al., 2024b) đóng băng phần lớn
+trọng số mô hình và chỉ cập nhật một tập con
+nhỏ để tinh chỉnh các mô hình lớn một cách hiệu
+quả. LoRA (Hu et al., 2022) là một trong những
+kỹ thuật được áp dụng rộng rãi nhất, và những
+tiến bộ gần đây (Sheng et al., 2023a; Chen et al.,
+2023a) đã tập trung vào nâng cao hiệu suất hệ
+thống để triển khai các adaptor LoRA. Đặc biệt,
+Sheng et al. (2023a) đã đạt được việc triển khai
+hàng nghìn instance LoRA trên một GPU NVIDIA
+A100 duy nhất. LLoCO, sử dụng LoRA để tinh
+chỉnh, có thể hưởng lợi từ những cải tiến đó để
+triển khai các adaptor LoRA một cách hiệu quả
+trong các kịch bản ngữ cảnh dài.
+
+3 Phương pháp
+
+3.1 Tổng quan Kiến trúc
+
+Hình 1 minh họa kiến trúc LLoCO được đề xuất
+của chúng tôi, bao gồm hai thành phần: một bộ
+mã hóa ngữ cảnh và một bộ giải mã LLM. Trong
+một LLM tinh chỉnh hướng dẫn điển hình, các
+prompts có thể được phân loại thành prompts
+hệ thống, người dùng và trợ lý. Prompt hệ thống
+chứa các hướng dẫn nhiệm vụ và quy tắc mà
+LLM nên tuân theo, cũng như các ngữ cảnh liên
+quan. Prompt người dùng là một câu hỏi được
+người dùng đặt ra, và prompt trợ lý là câu trả
+lời được LLM sinh ra. Thông tin ngữ cảnh trong
+prompt hệ thống có thể bao gồm lịch sử tương
+tác của người dùng hoặc các tài liệu liên quan
+đến câu hỏi của người dùng. Những ngữ cảnh
+này có thể trở nên rất dài, có thể vượt quá giới
+hạn cửa sổ ngữ cảnh của LLM.
+
+Để vượt qua giới hạn cửa sổ ngữ cảnh, chúng
+tôi đề xuất sử dụng một bộ mã hóa ngữ cảnh để
+nén các ngữ cảnh dài gốc thành một biểu diễn
+compact hơn nhiều. Bộ mã hóa ngữ cảnh tự nó
+là một mô hình ngôn ngữ nhận một chuỗi token
+làm đầu vào và xuất ra một chuỗi token embeddings.
+Những token embeddings đầu ra này, mà chúng
+tôi gọi là summary embeddings, nên ngắn hơn
+đáng kể so với ngữ cảnh gốc. Các summary
+embeddings sau đó được đặt trước bộ giải mã
+LLM và phục vụ như prompt hệ thống của LLM.
+Prompt của người dùng được xử lý bình thường
+thông qua tokenizer của bộ giải mã LLM, và
+LLM sinh ra câu trả lời (prompt trợ lý) có điều
+kiện trên summary embeddings và prompts
+người dùng.
+
+Trong thiết kế của chúng tôi, bộ mã hóa ngữ
+cảnh có thể là bất kỳ mô hình nào có khả năng
+tạo ra một biểu diễn compact được căn chỉnh với
+bộ giải mã LLM. Các summary embeddings có
+thể được xem như các pseudo-words trong không
+gian text embedding của bộ giải mã LLM, đại
+diện cho các khái niệm trừu tượng hoặc tóm tắt.
+Cho các thí nghiệm của chúng tôi, chúng tôi chọn
+AutoCompressor cho LLaMA2-7B (Chevalier et
+al., 2023), một bộ nén ngữ cảnh được tinh chỉnh
+trên LLaMA2-7B với khả năng kép để sinh ra
+summary tokens từ ngữ cảnh dài và thực hiện
+hoàn thành văn bản có điều kiện trên summary
+tokens. Bộ nén nhóm tài liệu thành các chunk
+1536 token và nén đệ quy mỗi chunk thành 50
+summary embeddings. Để đảm bảo căn chỉnh
+giữa summary embeddings và bộ giải mã LLM,
+chúng tôi chọn LLaMA2-7B làm bộ giải mã LLM
+nhưng sử dụng trọng số tinh chỉnh của AutoCompressor
+làm trọng số mô hình.
+
+Mặc dù có các bộ nén khác có sẵn cho LLaMA2-7B
+(Ge et al., 2023; Mu et al., 2023), chúng tôi thấy
+AutoCompressor phù hợp nhất cho các trường
+hợp sử dụng dự định của chúng tôi vì nó có thể
+1) hỗ trợ nén ngữ cảnh rất dài do quy trình huấn
+luyện đệ quy của nó, và 2) đạt được tỷ lệ nén tuyệt
+vời 30:1. Chúng tôi xem việc xây dựng các bộ
+mã hóa ngữ cảnh (bộ nén) là một hướng nghiên
+cứu quan trọng và trực giao. Phát triển các bộ
+mã hóa ngữ cảnh hiệu quả và universal hơn theo
+cách hợp lý có thể nâng cao hơn nữa hiệu quả
+và hiệu suất của LLoCO, biểu thị công việc tương
+lai quan trọng.
+
+3.2 Pipeline cho Học Ngữ cảnh Offline
+
+Pipeline của LLoCO bao gồm hai giai đoạn chính:
+giai đoạn tiền xử lý và giai đoạn tinh chỉnh. Chúng
+tôi cũng phác thảo giai đoạn phục vụ cho triển
+khai thực tế trong thiết kế hệ thống.
+
+Tiền xử lý Đầu tiên, chúng tôi sử dụng giai đoạn
+tiền xử lý tận dụng bộ mã hóa ngữ cảnh của chúng
+tôi để xử lý các tài liệu gốc. Vì AutoCompressor
+được sử dụng làm bộ mã hóa ngữ cảnh của chúng
+tôi, chúng tôi tuân theo thực hành của nó là chia
+các tài liệu thành các chunk 1536 token và truyền
+chúng qua bộ mã hóa ngữ cảnh. Bộ mã hóa ngữ
+cảnh xuất ra 50 summary embeddings cho mỗi
+chunk một cách đệ quy, với mỗi embedding có
+chiều 4096.
+
+Giai đoạn tiền xử lý của chúng tôi được thiết kế
+để có thể mở rộng, cho phép tích hợp liền mạch
+vào hệ thống sinh tăng cường truy xuất (RAG)
+cho QA tài liệu. Trong một hệ thống RAG điển
+hình, tiền xử lý bao gồm việc xây dựng một cơ
+sở dữ liệu vector để lập chỉ mục một tập hợp
+các tài liệu, nơi các tài liệu được chia thành các
+đoạn, và mỗi đoạn được liên kết với một key—
+một sentence embedding được tạo bởi một mô
+hình text embedding. Thiết kế của LLoCO cho
+phép summary token embeddings được lưu trữ
+cùng với các đoạn gốc trong cơ sở dữ liệu vector,
+được lập chỉ mục bởi cùng một passage key.
+
+Tinh chỉnh Trong giai đoạn tinh chỉnh, trước tiên
+chúng tôi phân đoạn các tài liệu thành nhóm dựa
+trên loại của chúng (ví dụ, bài báo học thuật, tin
+tức) hoặc các nhiệm vụ mà người dùng muốn thực
+hiện (ví dụ, QA, tóm tắt). Đối với mỗi nhóm tài
+liệu, chúng tôi thực hiện tinh chỉnh hiệu quả tham
+số sử dụng adaptor LoRA. Dữ liệu tinh chỉnh có
+thể là các cặp hướng dẫn trong miền được cung
+cấp bởi nhà cung cấp mô hình. Nếu bộ dữ liệu
+như vậy không tồn tại, nó cũng có thể được tạo
+ra sử dụng các kỹ thuật self-instruct (Wang et al.,
+2022) hoặc chưng cất từ một mô hình mạnh hơn
+như GPT-4. Ở cuối quá trình tinh chỉnh, chúng
+tôi thu được một adaptor LoRA được tinh chỉnh
+cho mỗi nhóm tài liệu. Trong thiết kế hệ thống
+cơ sở dữ liệu vector, mỗi entry đoạn sẽ bao gồm
+một định danh cho module LoRA tương ứng. Ngoài
+ra, một cơ sở dữ liệu riêng biệt sẽ được thiết lập
+để lưu trữ tất cả adaptors.
+
+Cụ thể, với summary tokens X_m và các cặp
+hướng dẫn {X¹_q, X¹_a, ..., X^L_q, X^L_a} có độ
+dài L cho nhóm tài liệu g, chúng tôi nhằm tối đa
+hóa xác suất sinh ra X_a được định nghĩa như:
+
+p(X_a|X_m, X_q) = ∏^L_{i=1} p_{θ_g}(X^i_a|X_m, X^i_q) (1)
+
+trong đó θ_g biểu thị trọng số LoRA cho nhóm g.
+
+Phục vụ Chúng tôi cũng thiết kế giai đoạn phục
+vụ có thể được mở rộng tự nhiên cho hệ thống
+RAG, nơi chúng tôi tận dụng bộ truy xuất RAG
+tiêu chuẩn để truy xuất các tài liệu liên quan,
+nhưng thay vào đó đặt trước các embeddings nén
+của những tài liệu này vào bộ giải mã LLM. Ngoài
+ra, chúng tôi áp dụng module LoRA liên quan
+nhất vào mô hình. Độc giả có thể tham khảo Phụ
+lục E để biết thêm chi tiết.
+
+4 Thí nghiệm
+
+Trong phần thí nghiệm, chúng tôi nhằm điều tra
+các khía cạnh sau của LLoCO: (1) hiệu quả của
+nó trong việc hiểu ngữ cảnh dài nén, (2) mức độ
+mà summary embeddings có thể bảo toàn thông
+tin cần thiết, và (3) cải thiện hiệu quả trên chi
+phí hệ thống liên quan.
+
+Bộ dữ liệu Chúng tôi chọn bốn bộ dữ liệu dành
+riêng cho các nhiệm vụ trả lời câu hỏi— QuALITY
+(Pang et al., 2021), Qasper (Dasigi et al., 2021),
+NarrativeQA (Kočiský et al., 2018), và HotpotQA
+(Yang et al., 2018)—cùng với một bộ cho tóm tắt,
+QMSum (Zhong et al., 2021). Tất cả các bộ dữ
+liệu đều có tài liệu dài làm ngữ cảnh. Đối với tất
+cả các bộ dữ liệu, chúng tôi sử dụng tập validation
+của chúng để đánh giá. Chúng tôi tuân theo các
+metric chính thức cho mỗi bộ dữ liệu. Đối với
+QuALITY, chúng tôi báo cáo điểm exact match
+(EM). Đối với QMSum, chúng tôi báo cáo trung
+bình nhân của điểm ROUGE. Đối với các bộ dữ
+liệu còn lại (Qasper, NarrativeQA, và HotpotQA),
+chúng tôi báo cáo điểm F1. Chi tiết thêm về những
+bộ dữ liệu này có thể được tìm thấy trong Phụ
+lục B.
+
+Cấu hình Mô hình Trong nghiên cứu này, chúng
+tôi xem xét hai mô hình cơ sở. Đầu tiên là LLaMA2-
+7B-chat gốc (Touvron et al., 2023), có cửa sổ
+ngữ cảnh 4096 token. Thứ hai là Longchat-7b-
+v1.5-32k (Li et al., 2023), một mô hình LLaMA2
+được tinh chỉnh với cửa sổ ngữ cảnh mở rộng
+32,000 token thông qua nội suy vị trí. Từ giờ,
+chúng tôi sẽ sử dụng LLaMA2-7B-4k để chỉ mô
+hình trước và LLaMA2-7B-32k để ký hiệu mô
+hình sau. Trừ khi được chỉ định khác, chúng tôi
+đặt hạng LoRA thành 8 cho các thí nghiệm của
+chúng tôi. Tất cả các mô hình LLoCO được tinh
+chỉnh trên AutoCompressor, bản thân nó được
+tinh chỉnh trên LLaMA2-7B.
+
+4.1 QA Tài liệu Dài
+
+Để đánh giá hiệu quả của LLoCO trên các bộ dữ
+liệu ngữ cảnh dài nói trên, chúng tôi xem xét các
+kịch bản sau:
+
+1. LLaMA-2-7B-4k/32k/128k với Ngữ cảnh
+Gốc. Đây là thiết lập baseline nơi chúng tôi
+cung cấp cho LLMs tài liệu chân lý cơ sở.
+Chúng tôi cắt bớt các tài liệu nếu độ dài của
+chúng vượt quá giới hạn cửa sổ ngữ cảnh.
+
+2. LLaMA-2-7B-4k/32k với Truy xuất. Truy
+xuất là một phương pháp nén baseline tiêu
+chuẩn cho trả lời câu hỏi tài liệu dài. Đối với
+mỗi tài liệu, chúng tôi chia nó thành các đoạn
+512 token và sử dụng Contriever (Izacard et
+al., 2021) để truy xuất top 5 đoạn từ tài liệu
+này và nối chúng để tạo thành ngữ cảnh.
+
+3. AutoCompressor. Trong thiết lập này, chúng
+tôi sử dụng AutoCompressor (Chevalier et al.,
+2023) để nén ngữ cảnh thành summary embeddings
+và đặt trước chúng vào LLM, mà không thực
+hiện bất kỳ tinh chỉnh trong miền nào, tương
+đương với việc sử dụng nó ngay lập tức. AutoCompressor
+nén một chunk 1536 token thành 50 summary
+tokens, dẫn đến cửa sổ ngữ cảnh hiệu quả
+khoảng 128k token. Chúng tôi không cắt bớt
+ngữ cảnh trừ khi nó vượt quá giới hạn này.
+
+4. LLoCO (của chúng tôi). LLoCO là hệ thống
+được đề xuất của chúng tôi cho trả lời câu
+hỏi tài liệu dài. Đối với mỗi bộ dữ liệu chúng
+tôi đánh giá, chúng tôi thực hiện tinh chỉnh
+hướng dẫn sử dụng các cặp trả lời câu hỏi
+từ tập huấn luyện. Trong cả tinh chỉnh và
+suy luận, chúng tôi đặt trước summary embeddings
+của tài liệu chân lý cơ sở tương ứng vào LLM.
+Chúng tôi không cắt bớt ngữ cảnh trừ khi nó
+vượt quá giới hạn cửa sổ ngữ cảnh 128k.
+
+Kết quả của chúng tôi được tóm tắt trong Bảng 1.
+Khi AutoCompressor được sử dụng mà không
+có tinh chỉnh trong miền, hiệu suất của nó đôi
+khi không bằng baseline nơi không có ngữ cảnh
+nào được thêm vào. Tuy nhiên, bằng cách kết
+hợp nén và tinh chỉnh, LLoCO vượt trội đáng kể
+so với baseline trên tất cả các bộ dữ liệu, sử dụng
+ít hơn 30× token.
+
+Đối với các bộ dữ liệu QuALITY, Qasper, QMSum,
+và HotpotQA, hầu hết các mẫu phù hợp trong
+giới hạn 32k token của mô hình LLaMA2-7B-32k
+mà không cần cắt bớt. Ở đây, LLoCO không có
+lợi thế ngữ cảnh dài hơn nhưng vẫn sử dụng ít
+hơn 30× token so với baseline trong khi đạt được
+hiệu suất tốt hơn. Điều này cho thấy tinh chỉnh
+trong miền nâng cao khả năng của mô hình diễn
+giải embeddings nén và trả lời câu hỏi. Thống kê
+độ dài chuỗi chi tiết trong Bảng 6 trong Phụ lục B.
+
+Đối với bộ dữ liệu NarrativeQA, độ dài tài liệu
+trung bình là 84,770 token, vượt quá giới hạn
+ngữ cảnh LLaMA2-7B-32k. LLoCO nén những
+ngữ cảnh này xuống khoảng 2,600 token, cho
+phép sử dụng ngữ cảnh toàn diện để trả lời câu
+
+--- TRANG 6 ---
+Thiết lập Ctx Size τ QuA QAS QM NQA HQA Avg.
+LLaMA2-7B
+4k w. Original Context 4k 1x 40.45 16.67 14.62 14.42 32.47 23.44
+32k w. Original Context 32k 1x 38.88 21.72 14.58 16.76 31.58 24.70
+128k w. Original Context 128k 1x 33.89 20.38 13.88 28.22 27.69 24.81
+Phương pháp Nén
+LLaMA2-7B-4k w. Retrieval 4k 1.6x 38.73 18.29 14.33 22.28 27.95 24.31
+LLaMA2-7B-32k w. Retrieval 32k 12.8x 36.48 24.92 15.40 19.32 22.32 23.68
+AutoCompressor 128k 30x 33.51 15.03 12.53 11.66 21.01 18.75
+LLoCO w. Full Context (của chúng tôi) 128k 30x 41.51 29.01 16.68 28.34 37.83 30.67
+
+Bảng 1: Kết quả thí nghiệm trên các bộ dữ liệu QA tài liệu dài. τ biểu thị tỷ lệ nén. Đối với LLaMA2-7B-
+4k/32k với truy xuất, tỷ lệ nén được tính bằng cách chia giới hạn cửa sổ ngữ cảnh của mô hình (4k/32k) cho
+độ dài của các đoạn được truy xuất, được cố định ở 2560 token.
+
+hỏi. Để đánh giá tác động của độ dài ngữ cảnh
+và đảm bảo so sánh công bằng, chúng tôi tiến
+hành nghiên cứu ablation với hai cấu hình mới:
+(1) tài liệu được cắt bớt xuống 32k token trước
+khi nén và tinh chỉnh LLoCO trên embeddings
+kết quả, và (2) thử nghiệm một LLaMA2-7B khác
+được mở rộng cho cửa sổ ngữ cảnh 128k với khả
+năng ngữ cảnh dài tiên tiến từ (Fu et al., 2024).
+Kết quả của chúng tôi trong Bảng 2 cho thấy
+LLoCO hoạt động tốt hơn LLaMA-7B ở cả độ
+dài ngữ cảnh 32k và 128k.
+
+Thiết lập NQA
+LLaMA2-7B-32k (Li et al., 2023) 16.76
+LLoCO-32k 27.99
+LLaMA2-7B-128k (Fu et al., 2024) 28.22
+LLoCO-128k 28.34
+
+Bảng 2: Tác động của độ dài ngữ cảnh trên NarrativeQA.
+
+4.2 Nghiên cứu Ablation
+
+Trong phần này, chúng tôi trình bày các nghiên
+cứu ablation so sánh LLoCO dưới các thiết lập
+khác nhau, bao gồm tinh chỉnh LLaMA với ngữ
+cảnh gốc và đánh giá các tỷ lệ nén khác nhau.
+Các nghiên cứu bổ sung, như khám phá các bộ
+mã hóa ngữ cảnh thay thế, được cung cấp trong
+Phụ lục D.
+
+Tinh chỉnh LLaMA với Ngữ cảnh Gốc Một câu
+hỏi thú vị là tinh chỉnh LoRA hoạt động tốt như
+thế nào trên ngữ cảnh gốc không nén, và điều
+đó so sánh như thế nào với phương pháp của
+LLoCO. Để điều tra điều này, chúng tôi tiến hành
+các thí nghiệm tinh chỉnh bổ sung trên LLaMA2-
+7B-4k/32k, nơi chúng tôi thêm ngữ cảnh gốc
+không nén như một system prompt trong quá
+trình tinh chỉnh. Những mô hình này được tinh
+chỉnh theo cùng thiết lập như LLoCO. Chúng tôi
+không khám phá tác động của việc tinh chỉnh
+LLaMA2-7B-128k với ngữ cảnh không nén do
+hạn chế về tài nguyên tính toán.
+
+Như được hiển thị trong Bảng 3, cả LLaMA-7B-
+4k và LLaMA-7B-32k đều thể hiện cải thiện hiệu
+suất đáng chú ý sau khi tinh chỉnh, với mức tăng
+2.88% và 6.62% tương ứng. Bất chấp những cải
+thiện này, hiệu suất của LLoCO vẫn có thể so
+sánh với mô hình LLaMA-7B-32k được tinh chỉnh.
+Phát hiện này cho thấy rằng tinh chỉnh trong ngữ
+cảnh nén cũng hiệu quả như tinh chỉnh trong ngữ
+cảnh gốc. So với tinh chỉnh ngữ cảnh đầy đủ, bước
+tinh chỉnh của LLoCO nhanh hơn đáng kể và tiết
+kiệm chi phí hơn do sử dụng ngữ cảnh ngắn hơn
+đáng kể (xem 4.5). Điều này làm cho LLoCO trở
+thành một giải pháp tinh chỉnh thực tế hơn cho
+các nhiệm vụ trả lời câu hỏi tài liệu dài.
+
+Khám phá Tác động của Tỷ lệ Nén Trong nghiên
+cứu ablation này, chúng tôi đánh giá LLoCO dưới
+các tỷ lệ nén khác nhau để phân tích tác động của
+chúng lên hiệu suất. Thiết lập LLoCO gốc, được
+điều chỉnh từ AutoCompressor, áp dụng tỷ lệ nén
+30x, giảm 1536 token xuống 50 token. Để khám
+phá tác động của các tỷ lệ khác nhau, chúng tôi
+cũng nén 1024 token và 2048 token thành 50 token,
+tương ứng với tỷ lệ nén 20x và 40x. Chúng tôi
+đánh giá những cấu hình này trên các bộ dữ liệu
+QuALITY, QMSum, và NarrativeQA, với kết quả
+được trình bày trong Hình 2.
+
+Phát hiện của chúng tôi cho thấy hiệu suất vẫn
+tương đối ổn định qua các tỷ lệ nén khác nhau,
+với cả tỷ lệ 20x và 30x đều nhất quán vượt trội
+40x trên tất cả các bộ dữ liệu. Thú vị là, tỷ lệ 30x
+hoạt động ngang bằng với, và đôi khi
+
+--- TRANG 7 ---
+20 30 40
+Tỷ lệ Nén (x)1520253035404550Hiệu suất
+LLoCO với Tỷ lệ Nén Khác nhau
+QMSum
+NarrativeQA
+QuALITY
+
+Hình 2: Tác động của tỷ lệ nén lên hiệu suất của LLoCO.
+
+tốt hơn một chút so với tỷ lệ 20x. Chúng tôi cho
+rằng điều này do bộ mã hóa ngữ cảnh (AutoCompressor)
+ban đầu được tối ưu hóa cho thiết lập 30x, cho
+phép nó duy trì hiệu suất cao ngay cả ở tỷ lệ nén
+cao hơn.
+
+4.3 Đánh giá trên LongBench
+
+Chúng tôi tiếp tục đánh giá LLoCO trên LongBench
+(Bai et al., 2023), bao gồm 6 nhiệm vụ phụ. Cho
+rằng ứng dụng chính của LLoCO là trả lời câu
+hỏi tài liệu và tóm tắt, đánh giá của chúng tôi tập
+trung vào các nhiệm vụ SingleDoc QA, MultiDoc
+QA, và Summarization. Có sự chồng chéo với
+một số bộ dữ liệu (ví dụ Qasper, QMSum) chúng
+tôi đã đánh giá trong Phần 4.1. Tuy nhiên, các
+tập validation khác nhau vì LongBench lấy mẫu
+một tập con cụ thể của các ví dụ cho mỗi bộ dữ
+liệu. Chúng tôi đã đảm bảo nghiêm ngặt rằng
+LongBench không có bất kỳ câu hỏi nào chồng
+chéo với những câu được sử dụng trong huấn
+luyện LLoCO, do đó hoàn toàn loại bỏ bất kỳ
+rủi ro rò rỉ dữ liệu nào. Để đạt được hiệu suất
+tốt nhất của LLoCO, chúng tôi chọn các adaptor
+LoRA được điều chỉnh cho từng danh mục/bộ
+dữ liệu cụ thể trong đánh giá của chúng tôi.
+Cụ thể, đối với các nhiệm vụ SingleDoc, chúng
+tôi sử dụng NQA LLoCO và Qasper LLoCo cho
+các nhiệm vụ NQA và QAS, tương ứng. Đối với
+MultiField-En (MFE) (Bai et al., 2023), chúng
+tôi sử dụng GPT-4-turbo để tạo ra các cặp trả
+lời câu hỏi từ các tài liệu huấn luyện và tinh chỉnh
+LLoCO sử dụng những cặp này. Đối với các nhiệm
+vụ MultiDoc, chúng tôi sử dụng LLoCO được
+tinh chỉnh kết hợp từ Phần D, hoạt động tốt cho
+tất cả các nhiệm vụ. Đối với các nhiệm vụ Summarization,
+chúng tôi tạo ra một bộ dữ liệu huấn luyện bằng
+cách kết hợp toàn bộ dữ liệu huấn luyện QMSum
+(Zhong et al., 2021) với 5,000 ví dụ được lấy
+mẫu ngẫu nhiên từ dữ liệu huấn luyện Multi-News
+(Fabbri et al., 2019). Sau đó chúng tôi tinh chỉnh
+LLoCO trên bộ dữ liệu kết hợp này.
+
+Kết quả đánh giá của chúng tôi cho thấy LLoCO
+vượt trội so với các baseline trên 5 trong số 9 bộ
+dữ liệu. Đặc biệt, LLoCO xuất sắc trong nhiệm
+vụ MultiDoc QA, đạt được kết quả tốt hơn nhiều
+trên tất cả ba bộ dữ liệu. LLoCO cũng chứng minh
+hiệu suất tương đương trong hai bộ dữ liệu (MultiNews,
+Qasper), nhưng kém hơn trong các bộ dữ liệu
+GovReport (Huang et al., 2021) và MultiField-En.
+Bộ dữ liệu GovReport là một nhiệm vụ tóm tắt
+yêu cầu mô hình tạo ra một tóm tắt một trang.
+Chúng tôi thấy rằng LLoCO không hoạt động tốt
+khi nội dung được tạo ra dài, hiện tại đây là một
+hạn chế của phương pháp chúng tôi. Hiệu suất
+thấp hơn trên bộ dữ liệu MultiField-En có thể
+được quy cho việc dữ liệu ngoài phân phối so
+với dữ liệu huấn luyện của chúng tôi, vì bộ dữ
+liệu này không cung cấp bất kỳ ví dụ huấn luyện
+nào. Bất chấp những hạn chế này, điểm trung
+bình của LLoCO trên tất cả các bộ dữ liệu cao
+hơn so với baseline LLaMA2, làm nổi bật hiệu
+quả tổng thể của phương pháp chúng tôi.
+
+4.4 Needle In A Haystack
+
+Chúng tôi tiếp tục điều tra khả năng thành thạo
+của LLoCO trong việc truy xuất thông tin qua
+các vị trí khác nhau của cửa sổ ngữ cảnh với độ
+dài thay đổi sử dụng nhiệm vụ nổi tiếng Needle
+In A Haystack (gkamradt, 2023). Điều chỉnh điều
+này cho pipeline của chúng tôi, chúng tôi ngẫu
+nhiên chọn một bài viết dài vượt quá 32k token
+từ bộ dữ liệu NarrativeQA làm "haystack". Bài
+viết này được sử dụng để thử nghiệm mô hình
+LLoCO, đã được tinh chỉnh trên bộ dữ liệu này
+như đã thảo luận trong Phần 4.1.
+
+Single Fixed Needle Đánh giá ban đầu của chúng
+tôi tập trung vào một kịch bản đơn giản: việc
+chèn một "needle" cố định nhất quán. Hình 3 cho
+thấy LLoCO của chúng tôi thành công truy xuất
+needle trong ∼80% qua tất cả các kích thước ngữ
+cảnh được thử nghiệm, cho thấy hiệu suất mạnh
+mẽ không có suy giảm ở ngữ cảnh dài hơn, trong
+khi LLaMA2-7B-32k thể hiện hiệu quả thấp hơn
+đáng kể trong nhiệm vụ này.
+
+Random Needles Ngoài ra, chúng tôi kiểm tra
+khả năng của LLoCO trong một kịch bản phức
+tạp hơn bằng cách sử dụng một "needle" duy nhất
+trong mỗi thử nghiệm. Theo (Liu et al., 2024a),
+chúng tôi ngẫu nhiên chọn một thành phố được
+chỉ định để phục vụ như needle cho mỗi vị trí.
+Chúng tôi nâng cao mô hình NQA LLoCO thông
+qua tinh chỉnh liên tục với một bộ dữ liệu tổng
+hợp quy mô nhỏ bao gồm các thành phố không
+gặp phải trong quá trình đánh giá. Hình 4 tiết
+lộ rằng mặc dù mô hình được tinh chỉnh NQA
+gặp khó khăn ban đầu, việc tinh chỉnh thêm với
+pipeline LLoCO nâng cao đáng kể tỷ lệ thành
+công lên ∼80%. Sự cải thiện này
+
+--- TRANG 8 ---
+Thiết lập QuA QAS QM NQA HQA Avg.
+LLaMA2-7B-4k 40.45 16.67 14.62 14.42 32.47 23.44
+LLaMA2-7B-32k 38.88 21.72 14.58 16.76 31.58 24.70
+LLaMA2-7B-4k w. Finetuning 35.00 17.80 15.49 21.41 41.89 26.32 (+2.88%)
+LLaMA2-7B-32k w. Finetuning 40.12 29.71 16.36 28.72 41.68 31.32 (+6.62%)
+LLoCO 41.51 29.01 16.68 28.34 37.83 30.67
+
+Bảng 3: So sánh LLoCO với các baseline LLaMA-7B sau tinh chỉnh trong miền.
+
+SingleDoc MultiDoc Summarization
+NQA QAS MFE HQA WMQA MSQ Gov QMS MNews Avg.
+LLaMA-2-7B-4k 18.7 19.2 36.8 25.4 32.8 9.4 27.3 20.8 25.8 24.0
+LLaMA-2-7B-32k 16.9 27.7 41.4 32.5 20.6 9.7 30.8 22.7 26.4 25.4
+LLoCO 23.1 26.1 26.3 46.2 35.6 27.3 17.6 23.4 25.0 27.8
+
+Bảng 4: Kết quả đánh giá trên LongBench cho SingleDoc, MultiDoc và Summarization. Số liệu cho LLaMA-2-
+7B-4k/32k được lấy từ repository chính thức của LongBench (THUDM, 2023)
+
+gạch dưới hiệu quả của phương pháp chúng tôi
+trong việc xử lý nhiệm vụ Needle In A Haystack.
+
+4.5 Độ trễ Suy luận
+
+Trong phần này, chúng tôi đánh giá cải thiện độ
+trễ suy luận của phương pháp LLoCO. Các thí
+nghiệm được chạy trên một GPU A100-80G-SXM
+và một GPU RTX A6000, cả hai với batch size
+1 và số token sinh ra được đặt thành 16. Chúng
+tôi đo độ trễ per-token với các kích thước ngữ
+cảnh khác nhau. Như minh họa trong Hình 5,
+LLoCO đạt được tăng tốc lên đến 7.62× trên A100
+và 7.19× trên A6000 khi so sánh với baseline
+LLaMA2-7B không có nén, dưới điều kiện ngữ
+cảnh giống hệt nhau. Trong khi baseline vượt
+quá giới hạn VRAM GPU cho các chuỗi dài hơn
+32k token, LLoCO duy trì sinh hiệu quả cho các
+chuỗi lên đến 128k token. Đáng chú ý, LLoCO
+đạt được độ trễ 4k của baseline cho các chuỗi
+dài hơn 16× (64k) trên A100 và 32× dài hơn
+(128k) trên A6000. Hơn nữa, LLoCO có thể xử
+lý các chuỗi 32k trên A6000 nhanh như 4k của
+baseline trên A100.
+
+Chúng tôi bổ sung đo cải thiện thông lượng tinh
+chỉnh của LLoCO so với tinh chỉnh LLaMA với
+ngữ cảnh gốc, nơi LLoCO đạt được thông lượng
+cao hơn lên đến 11.52×. Kết quả chi tiết có thể
+được tìm thấy trong Phụ lục C.
+
+5 Kết luận
+
+Chúng tôi đề xuất LLoCO, một paradigm mới
+giải quyết thách thức ngữ cảnh dài bằng cách tiền
+xử lý ngữ cảnh trước suy luận thông qua tinh chỉnh
+hiệu quả tham số. Phương pháp của chúng tôi
+mở rộng cửa sổ ngữ cảnh hiệu quả của mô hình
+LLaMA2-7B với kích thước ngữ cảnh 4k token
+để xử lý lên đến 128k token. Đánh giá trên các
+benchmark ngữ cảnh dài mở rộng cho thấy LLoCO
+vượt trội đáng kể so với học trong ngữ cảnh trong
+khi sử dụng ít hơn 30× token trong quá trình suy
+luận, làm cho nó trở thành một giải pháp hứa hẹn
+cho xử lý ngữ cảnh dài hiệu quả.
+
+6 Hạn chế
+
+Một hạn chế của công trình chúng tôi là bộ mã
+hóa ngữ cảnh gắn liền với một mô hình LLM cụ
+thể. Nó nén ngữ cảnh gốc thành một biểu diễn
+được căn chỉnh với mô hình. Do đó, đối với một
+mô hình khác, một bộ mã hóa ngữ cảnh riêng biệt
+phải được huấn luyện để đảm bảo căn chỉnh.
+Huấn luyện một bộ mã hóa ngữ cảnh như AutoCompressor
+cho LLaMA2-7B tốn kém, yêu cầu khoảng 15
+tỷ token dữ liệu. Mặt khác, các nghiên cứu như
+Morris et al. (2023) cho thấy rằng văn bản gốc
+có thể được phục hồi từ sentence embeddings,
+cho thấy khả năng xây dựng các context embeddings
+dễ dàng và có thể phục hồi universal. Phát triển
+một bộ mã hóa ngữ cảnh model-agnostic có thể
+thích ứng với các mô hình khác nhau mà không
+cần huấn luyện bổ sung đặt ra một thách thức
+quan trọng và một lĩnh vực hứa hẹn cho nghiên
+cứu tương lai.
+
+Trong pipeline của LLoCO, chúng tôi tách các
+tài liệu thành nhóm và tinh chỉnh một adapter
+LoRA cho mỗi nhóm. Trong một pipeline RAG
+tiêu chuẩn, top k tài liệu liên quan đến truy vấn
+của người dùng được truy xuất.
+
+--- TRANG 9 ---
+100044447889113331477818222216672511128556320000%
+11%
+22%
+33%
+44%
+56%
+67%
+78%
+89%
+100%Phần trăm Độ sâuLLaMA2-7B-32k
+10004444788911333147781822221667251112855632000LLoCO
+246810
+Điểm
+Giới hạn TokenHình 3: Nhiệm vụ truy xuất needle cố định. Bài viết được lấy mẫu ("haystack") bắt đầu với " Mary, ..., một cô gái
+nhẹ nhàng, thời trang... ", và một needle liên quan ngữ cảnh được tuyển chọn như " Nhà thiết kế thời trang
+yêu thích của Mary là Coco Chanel khi cô ấy còn là thiếu niên. Ai là nhà thiết kế thời trang yêu thích
+của Mary khi cô ấy còn là thiếu niên? "
+
+100044447889113331477818222216672511128556320000%
+11%
+22%
+33%
+44%
+56%
+67%
+78%
+89%
+100%Phần trăm Độ sâuLLoCO (w/o finetuning)
+10004444788911333147781822221667251112855632000LLoCO (with finetuning)
+0246810
+Điểm
+Giới hạn Token
+
+Hình 4: Truy xuất needle ngẫu nhiên với các cặp từ-thành phố.
+
+7.19x7.62x
+
+Hình 5: Độ trễ giải mã per-token end-to-end (ms)
+trên GPU A100 và A6000. LLaMA2 không có nén
+hết VRAM cho các chuỗi 64k và 128k trên A100,
+và cho các chuỗi 32k trên A6000.
+
+Tuy nhiên, những k tài liệu này có thể đến từ các
+nhóm khác nhau, mỗi nhóm tương ứng với một
+adapter LoRA khác nhau, và chúng ta chỉ có thể
+áp dụng một adapter tại một thời điểm, đây là
+một hạn chế. Một hướng tương lai hấp dẫn sẽ là
+điều tra việc kết hợp nhiều adapter LoRA đồng
+thời để nâng cao hơn nữa hiệu suất QA.
+
+Có sự khác biệt trong hiệu quả của LLoCO qua
+các bộ dữ liệu và nhiệm vụ khác nhau. Như được
+hiển thị trong Phần 4.3 và 4.4, hiệu suất của
+chúng tôi trên GovReport và MultiField-En không
+vượt qua các baseline, và chúng tôi không đạt
+được kết quả hoàn hảo trên nhiệm vụ Needle-In-
+A-Haystack. Chúng tôi quy những vấn đề này
+cho các hạn chế của chất lượng dữ liệu huấn luyện
+và khả năng của bộ mã hóa ngữ cảnh và mô hình
+cơ sở LLaMA2. Chúng tôi tin rằng cải thiện những
+thành phần này sẽ giải quyết những thiếu sót này.
+
+Lời cảm ơn Chúng tôi cảm ơn Michael Luo, Sheng
+Shen, Chenglei Si và Siyuan Zhuang vì những
+bình luận và thảo luận hữu ích của họ. Chúng
+tôi cũng cảm ơn BAIR, Berkeley Deep Drive, Intel
+Corporation, và NVIDIA vì đã hỗ trợ nghiên cứu
+này, cũng như Hyperbolic Labs⁴ vì đã cung cấp
+cơ sở hạ tầng AI cho các thí nghiệm của chúng tôi.
+
+⁴https://www.hyperbolic.xyz/
+
+--- TRANG 10 ---
+Tài liệu tham khảo
+
+Akari Asai, Zeqiu Wu, Yizhong Wang, Avirup Sil, and
+Hannaneh Hajishirzi. 2023. Self-rag: Learning to
+retrieve, generate, and critique through self-reflection.
+arXiv preprint arXiv: 2310.11511 .
+
+Yushi Bai, Xin Lv, Jiajie Zhang, Hongchang Lyu,
+Jiankai Tang, Zhidian Huang, Zhengxiao Du, Xiao
+Liu, Aohan Zeng, Lei Hou, et al. 2023. Longbench:
+A bilingual, multitask benchmark for long context
+understanding. arXiv preprint arXiv:2308.14508 .
+
+Lequn Chen, Zihao Ye, Yongji Wu, Danyang Zhuo, Luis
+Ceze, and Arvind Krishnamurthy. 2023a. Punica:
+Multi-Tenant LoRA Serving.
+
+Shouyuan Chen, Sherman Wong, Liangjian Chen, and
+Yuandong Tian. 2023b. Extending context window
+of large language models via positional interpolation.
+arXiv preprint arXiv: 2306.15595 .
+
+Yukang Chen, Shengju Qian, Haotian Tang, Xin Lai,
+Zhijian Liu, Song Han, and Jiaya Jia. 2024. Lon-
+gloRA: Efficient fine-tuning of long-context large
+language models. In The Twelfth International Con-
+ference on Learning Representations .
+
+Alexis Chevalier, Alexander Wettig, Anirudh Ajith,
+and Danqi Chen. 2023. Adapting language
+models to compress contexts. arXiv preprint
+arXiv:2305.14788 .
+
+Pradeep Dasigi, Kyle Lo, Iz Beltagy, Arman Cohan,
+Noah A Smith, and Matt Gardner. 2021. A dataset of
+information-seeking questions and answers anchored
+in research papers. arXiv preprint arXiv:2105.03011 .
+
+Alexander R. Fabbri, Irene Li, Tianwei She, Suyi Li, and
+Dragomir R. Radev. 2019. Multi-news: a large-scale
+multi-document summarization dataset and abstrac-
+tive hierarchical model. Preprint , arXiv:1906.01749.
+
+Yao Fu, Rameswar Panda, Xinyao Niu, Xiang Yue, Han-
+naneh Hajishirzi, Yoon Kim, and Hao Peng. 2024.
+Data engineering for scaling language models to 128k
+context. arXiv preprint arXiv:2402.10171 .
+
+Tao Ge, Jing Hu, Lei Wang, Xun Wang, Si-Qing Chen,
+and Furu Wei. 2023. In-context Autoencoder for
+Context Compression in a Large Language Model.
+arXiv preprint . ArXiv:2307.06945 [cs].
+
+gkamradt. 2023. Needle in a haystack - pressure testing
+llms. [Accessed 26-03-2024].
+
+Kelvin Guu, Kenton Lee, Z. Tung, Panupong Pasu-
+pat, and Ming-Wei Chang. 2020. Realm: Retrieval-
+augmented language model pre-training. Interna-
+tional Conference on Machine Learning .
+
+Coleman Hooper, Sehoon Kim, Hiva Mohammadzadeh,
+Michael W. Mahoney, Yakun Sophia Shao, Kurt
+Keutzer, and Amir Gholami. 2024. Kvquant:
+Towards 10 million context length llm inference
+with kv cache quantization. arXiv preprint arXiv:
+2401.18079 .
+
+Edward J. Hu, Yelong Shen, Phillip Wallis, Zeyuan
+Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang, and
+Weizhu Chen. 2022. Lora: Low-rank adaptation of
+large language models. In The Tenth International
+Conference on Learning Representations .
+
+Chengsong Huang, Qian Liu, Bill Yuchen Lin, Tianyu
+Pang, Chao Du, and Min Lin. 2023. Lorahub: Effi-
+cient cross-task generalization via dynamic lora com-
+position. arXiv preprint arXiv: 2307.13269 .
+
+Luyang Huang, Shuyang Cao, Nikolaus Parulian, Heng
+Ji, and Lu Wang. 2021. Efficient attentions for
+long document summarization. arXiv preprint
+arXiv:2104.02112 .
+
+Gautier Izacard, Mathilde Caron, Lucas Hosseini, Se-
+bastian Riedel, Piotr Bojanowski, Armand Joulin,
+and Edouard Grave. 2021. Unsupervised dense infor-
+mation retrieval with contrastive learning.
+
+Albert Q. Jiang, Alexandre Sablayrolles, Arthur Men-
+sch, Chris Bamford, Devendra Singh Chaplot, Diego
+de las Casas, Florian Bressand, Gianna Lengyel, Guil-
+laume Lample, Lucile Saulnier, Lélio Renard Lavaud,
+Marie-Anne Lachaux, Pierre Stock, Teven Le Scao,
+Thibaut Lavril, Thomas Wang, Timothée Lacroix,
+and William El Sayed. 2023a. Mistral 7b. arXiv
+preprint arXiv: 2310.06825 .
+
+Huiqiang Jiang, Qianhui Wu, , Xufang Luo, Dongsheng
+Li, Chin-Yew Lin, Yuqing Yang, and Lili Qiu. 2023b.
+Longllmlingua: Accelerating and enhancing llms
+in long context scenarios via prompt compression.
+ArXiv preprint , abs/2310.06839.
+
+Huiqiang Jiang, Qianhui Wu, Chin-Yew Lin, Yuqing
+Yang, and Lili Qiu. 2023c. Llmlingua: Compressing
+prompts for accelerated inference of large language
+models. In Proceedings of the 2023 Conference on
+Empirical Methods in Natural Language Processing .
+Association for Computational Linguistics.
+
+Zhengbao Jiang, Frank F. Xu, Luyu Gao, Zhiqing Sun,
+Qian Liu, Jane Dwivedi-Yu, Yiming Yang, Jamie
+Callan, and Graham Neubig. 2023d. Active retrieval
+augmented generation. Conference on Empirical
+Methods in Natural Language Processing .
+
+Tomáš Ko ˇcisk`y, Jonathan Schwarz, Phil Blunsom, Chris
+Dyer, Karl Moritz Hermann, Gábor Melis, and Ed-
+ward Grefenstette. 2018. The narrativeqa reading
+comprehension challenge. Transactions of the Asso-
+ciation for Computational Linguistics , 6:317–328.
+
+Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying
+Sheng, Lianmin Zheng, Cody Hao Yu, Joseph Gon-
+zalez, Hao Zhang, and Ion Stoica. 2023. Efficient
+memory management for large language model serv-
+ing with pagedattention. In Proceedings of the 29th
+Symposium on Operating Systems Principles , pages
+611–626.
+
+Brian Lester, Rami Al-Rfou, and Noah Constant. 2021.
+The power of scale for parameter-efficient prompt
+tuning. In Proceedings of the 2021 Conference on
+
+--- TRANG 11 ---
+Empirical Methods in Natural Language Processing ,
+pages 3045–3059, Online and Punta Cana, Domini-
+can Republic. Association for Computational Lin-
+guistics.
+
+Patrick Lewis, Ethan Perez, Aleksandara Piktus, Fabio
+Petroni, Vladimir Karpukhin, Naman Goyal, Hein-
+rich Kuttler, M. Lewis, Wen tau Yih, Tim Rock-
+täschel, Sebastian Riedel, and Douwe Kiela. 2020.
+Retrieval-augmented generation for knowledge-
+intensive nlp tasks. Neural Information Processing
+Systems .
+
+Dacheng Li, Rulin Shao, Anze Xie, Ying Sheng, Lian-
+min Zheng, Joseph Gonzalez, Ion Stoica, Xuezhe Ma,
+and Hao Zhang. 2023. How long can context length
+of open-source LLMs truly promise? In NeurIPS
+2023 Workshop on Instruction Tuning and Instruction
+Following .
+
+Yuhong Li, Yingbing Huang, Bowen Yang, Bharat
+Venkitesh, Acyr Locatelli, Hanchen Ye, Tianle Cai,
+Patrick Lewis, and Deming Chen. 2024. Snapkv:
+Llm knows what you are looking for before genera-
+tion. arXiv preprint arXiv:2404.14469 .
+
+Hao Liu, Wilson Yan, Matei Zaharia, and Pieter Abbeel.
+2024a. World model on million-length video and lan-
+guage with blockwise ringattention. arXiv preprint
+arXiv: 2402.08268 .
+
+Shih-Yang Liu, Chien-Yi Wang, Hongxu Yin, Pavlo
+Molchanov, Yu-Chiang Frank Wang, Kwang-Ting
+Cheng, and Min-Hung Chen. 2024b. Dora: Weight-
+decomposed low-rank adaptation. arXiv preprint
+arXiv:2402.09353 .
+
+Zirui Liu, Jiayi Yuan, Hongye Jin, Shaochen Zhong,
+Zhaozhuo Xu, Vladimir Braverman, Beidi Chen, and
+Xia Hu. 2024c. KIVI: A tuning-free asymmetric
+2bit quantization for KV cache. In International
+Conference on Machine Learning .
+
+Alex Mallen, Akari Asai, Victor Zhong, Rajarshi Das,
+Hannaneh Hajishirzi, and Daniel Khashabi. 2022.
+When not to trust language models: Investigating
+effectiveness of parametric and non-parametric mem-
+ories. Annual Meeting of the Association for Compu-
+tational Linguistics .
+
+John X. Morris, V olodymyr Kuleshov, Vitaly Shmatikov,
+and Alexander M. Rush. 2023. Text embeddings
+reveal (almost) as much as text. In Conference on
+Empirical Methods in Natural Language Processing .
+
+Jesse Mu, Xiang Lisa Li, and Noah D. Goodman. 2023.
+Learning to compress prompts with gist tokens. Neu-
+ral Information Processing Systems .
+
+Mohammed Muqeeth, Haokun Liu, Yufan Liu, and
+Colin Raffel. 2024. Learning to route among spe-
+cialized experts for zero-shot generalization. arXiv
+preprint arXiv: 2402.05859 .
+
+Zhuoshi Pan, Qianhui Wu, Huiqiang Jiang, Menglin Xia,
+Xufang Luo, Jue Zhang, Qingwei Lin, Victor Ruhle,
+Yuqing Yang, Chin-Yew Lin, H. Vicky Zhao, Lili Qiu,
+and Dongmei Zhang. 2024. LLMLingua-2: Data dis-
+tillation for efficient and faithful task-agnostic prompt
+compression. ArXiv preprint , abs/2403.12968.
+
+Richard Yuanzhe Pang, Alicia Parrish, Nitish Joshi,
+Nikita Nangia, Jason Phang, Angelica Chen, Vishakh
+Padmakumar, Johnny Ma, Jana Thompson, He He,
+and Sam Bowman. 2021. Quality: Question answer-
+ing with long input texts, yes! North American
+Chapter of the Association for Computational Lin-
+guistics .
+
+Bowen Peng, Jeffrey Quesnelle, Honglu Fan, and Enrico
+Shippole. 2024. YaRN: Efficient context window ex-
+tension of large language models. In The Twelfth
+International Conference on Learning Representa-
+tions .
+
+Timo Schick, Jane Dwivedi-Yu, Roberto Dessì, Roberta
+Raileanu, Maria Lomeli, Luke Zettlemoyer, Nicola
+Cancedda, and Thomas Scialom. 2023. Toolformer:
+Language models can teach themselves to use tools.
+Neural Information Processing Systems .
+
+Ying Sheng, Shiyi Cao, Dacheng Li, Coleman
+Hooper, Nicholas Lee, Shuo Yang, Christopher
+Chou, Banghua Zhu, Lianmin Zheng, Kurt Keutzer,
+Joseph E. Gonzalez, and Ion Stoica. 2023a. S-LoRA:
+Serving Thousands of Concurrent LoRA Adapters.
+arXiv preprint . ArXiv:2311.03285 [cs].
+
+Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuo-
+han Li, Max Ryabinin, Beidi Chen, Percy Liang,
+Christopher Ré, Ion Stoica, and Ce Zhang. 2023b.
+Flexgen: High-throughput generative inference of
+large language models with a single gpu. In Inter-
+national Conference on Machine Learning , pages
+31094–31116. PMLR.
+
+Baifeng Shi, Siyu Gai, Trevor Darrell, and Xin Wang.
+2023a. Toast: Transfer learning via attention steering.
+arXiv preprint arXiv: 2305.15542 .
+
+Freda Shi, Xinyun Chen, Kanishka Misra, Nathan
+Scales, David Dohan, E. Chi, Nathanael Scharli, and
+Denny Zhou. 2023b. Large language models can be
+easily distracted by irrelevant context. International
+Conference on Machine Learning .
+
+Jianlin Su, Yu Lu, Shengfeng Pan, Bo Wen, and Yunfeng
+Liu. 2021. Roformer: Enhanced transformer with
+rotary position embedding. NEUROCOMPUTING .
+
+Jiaming Tang, Yilong Zhao, Kan Zhu, Guangxuan Xiao,
+Baris Kasikci, and Song Han. 2024. Quest: Query-
+aware sparsity for efficient long-context llm inference.
+International Conference on Machine Learning .
+
+THUDM. 2023. Longbench: A benchmark for long-
+range language models. https://github.com/
+THUDM/LongBench .
+
+--- TRANG 12 ---
+Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier
+Martinet, Marie-Anne Lachaux, Timothée Lacroix,
+Baptiste Rozière, Naman Goyal, Eric Hambro,
+Faisal Azhar, et al. 2023. Llama: Open and effi-
+cient foundation language models. arXiv preprint
+arXiv:2302.13971 .
+
+Yizhong Wang, Yeganeh Kordi, Swaroop Mishra, Al-
+isa Liu, Noah A Smith, Daniel Khashabi, and Han-
+naneh Hajishirzi. 2022. Self-instruct: Aligning lan-
+guage models with self-generated instructions. arXiv
+preprint arXiv:2212.10560 .
+
+Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song
+Han, and Mike Lewis. 2024. Efficient streaming lan-
+guage models with attention sinks. In The Twelfth
+International Conference on Learning Representa-
+tions .
+
+Fangyuan Xu, Weijia Shi, and Eunsol Choi. 2024. RE-
+COMP: Improving retrieval-augmented LMs with
+context compression and selective augmentation. In
+The Twelfth International Conference on Learning
+Representations .
+
+Zhilin Yang, Peng Qi, Saizheng Zhang, Yoshua Ben-
+gio, William W Cohen, Ruslan Salakhutdinov, and
+Christopher D Manning. 2018. Hotpotqa: A dataset
+for diverse, explainable multi-hop question answer-
+ing.arXiv preprint arXiv:1809.09600 .
+
+Howard Yen, Tianyu Gao, and Danqi Chen. 2024. Long-
+context language modeling with parallel context en-
+coding. arXiv preprint arXiv:2402.16617 .
+
+Tianjun Zhang, Shishir G Patil, Naman Jain, Sheng
+Shen, Matei Zaharia, Ion Stoica, and Joseph E Gon-
+zalez. 2024a. Raft: Adapting language model to do-
+main specific rag. arXiv preprint arXiv:2403.10131 .
+
+Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong
+Chen, Lianmin Zheng, Ruisi Cai, Zhao Song, Yuan-
+dong Tian, Christopher Ré, Clark Barrett, Zhangyang
+Wang, and Beidi Chen. 2024b. H2o: Heavy-hitter
+oracle for efficient generative inference of large lan-
+guage models. Advances in Neural Information Pro-
+cessing Systems , 36.
+
+Ming Zhong, Da Yin, Tao Yu, Ahmad Zaidi, Mutethia
+Mutuma, Rahul Jha, Ahmed Hassan Awadallah, Asli
+Celikyilmaz, Yang Liu, Xipeng Qiu, et al. 2021.
+Qmsum: A new benchmark for query-based multi-
+domain meeting summarization. arXiv preprint
+arXiv:2104.05938 .
+
+--- TRANG 13 ---
+A Cài đặt Thí nghiệm Mở rộng
+
+Trong phần này, chúng tôi cung cấp chi tiết về
+cài đặt thí nghiệm của chúng tôi trong văn bản
+chính. Đối với các thí nghiệm được trình bày trong
+Mục 4.1, chúng tôi tóm tắt cài đặt siêu tham số
+trong Bảng 5. Chúng tôi sử dụng tất cả các mẫu
+từ split train của mỗi bộ dữ liệu để tinh chỉnh,
+ngoại trừ HotpotQA, từ đó chúng tôi ngẫu nhiên
+chọn 20,000 mẫu từ split train của nó. Tất cả các
+thí nghiệm tinh chỉnh được tiến hành với 4 hoặc
+8 GPU NVIDIA RTX A6000 hoặc GPU A100-80G-SXM.
+
+B Chi tiết Thêm về Bộ dữ liệu
+
+Ở đây chúng tôi cung cấp mô tả chi tiết hơn về
+5 bộ dữ liệu chính được sử dụng để đánh giá:
+
+•QuALITY (Pang et al., 2021) là một bộ dữ
+liệu trả lời câu hỏi trắc nghiệm trên ngữ cảnh
+dài. Nó chứa 150 bài viết với độ dài trung
+bình 5000 token, với tổng cộng 6737 câu hỏi.
+Bộ dữ liệu này đặc biệt phù hợp để đánh giá
+các mô hình trong thiết lập ngữ cảnh dài.
+
+•Qasper (Dasigi et al., 2021) là một bộ dữ liệu
+để trả lời câu hỏi về các bài báo nghiên cứu
+NLP, có nguồn từ Semantic Scholar Open
+Research Corpus. Nó bao gồm các loại câu
+hỏi khác nhau, từ giải thích chi tiết đến câu
+trả lời có/không đơn giản, dựa trên các tài
+liệu được cung cấp.
+
+•QMSum (Zhong et al., 2021) có các bản tóm
+tắt và bản ghi từ các cuộc họp qua nhiều
+lĩnh vực khác nhau, bao gồm học thuật và
+công nghiệp, tập trung vào tóm tắt dựa trên
+truy vấn. Người tham gia được giao nhiệm
+vụ cô đọng bản ghi đối thoại dựa trên các
+truy vấn cụ thể.
+
+•NarrativeQA (Kočiský et al., 2018) là một
+bộ dữ liệu trả lời câu hỏi được lấy từ văn
+bản hoàn chỉnh của sách từ Project Gutenberg
+và kịch bản phim từ nhiều nguồn khác nhau.
+Thách thức ở đây bao gồm việc tạo ra một
+câu trả lời súc tích từ các văn bản dài và có
+thể không có thứ tự từ sách.
+
+•HotpotQA (Yang et al., 2018)) là một bộ dữ
+liệu dựa trên Wikipedia thách thức người
+dùng rút ra câu trả lời thông qua lý luận đa
+bước qua nhiều tài liệu, có nhiều loại câu
+hỏi vượt ra ngoài các cơ sở kiến thức cụ thể.
+
+Chúng tôi bổ sung cung cấp thống kê của năm
+bộ dữ liệu này trong Bảng 6.
+
+C Thông lượng Tinh chỉnh
+
+Chúng tôi đánh giá thông lượng tinh chỉnh cho
+cả LLoCO và LLaMA2-7B-32k với ngữ cảnh gốc
+trên bộ dữ liệu NarrativeQA, chủ yếu bao gồm
+các mẫu vượt quá 32k token. Chúng tôi so sánh
+baseline 7B 32k được tinh chỉnh trên 8 A100 và
+LLoCO của chúng tôi được tinh chỉnh trên cả 8
+A100 và 8 A6000, tất cả với batch size per-device
+là 1 và batch size toàn cục là 32, sử dụng 4 bước
+tích lũy gradient. Đối với tinh chỉnh baseline 7B
+32k, các mẫu hơn 32k token được cắt bớt xuống
+32k.
+
+Hình 5 cho thấy LLoCO của chúng tôi đạt được
+thông lượng 11.52× và 6.82× trên A100 và A6000,
+tương ứng. Điều này làm nổi bật rằng LLoCO
+không chỉ đạt được kết quả cạnh tranh, mà còn
+cải thiện hiệu suất với hiệu quả cao hơn nhiều
+so với tinh chỉnh baseline với toàn bộ ngữ cảnh
+(như được hiển thị trong Phần 4.2).
+
+Thông lượng Tinh chỉnh NarrativeQA
+Mẫu Huấn luyện / s 0.00 1.50 3.00 4.50 6.00
+3.29 6.55 64 0.483
+
+LLaMA-A100 LLoCO-A100 LLoCO-A6000
+
+Hình 6: Mẫu per giây khi tinh chỉnh trên NarrativeQA
+cho LLaMA2-7B-32k không có nén và LLoCO.
+
+D Nghiên cứu Ablation Bổ sung
+
+Tinh chỉnh Hướng dẫn Kết hợp Trong các thí
+nghiệm trước đây của chúng tôi, chúng tôi tinh
+chỉnh LLoCO trên mỗi bộ dữ liệu riêng biệt. Trong
+nghiên cứu ablation này, chúng tôi điều tra hiệu
+suất của LLoCO khi chúng tôi kết hợp tất cả dữ
+liệu huấn luyện và tinh chỉnh một mô hình tổng
+quát. Để cân bằng bộ dữ liệu, chúng tôi lấy mẫu
+10,000 ví dụ từ NarrativeQA và HotpotQA và sử
+dụng tất cả ví dụ từ ba bộ dữ liệu khác để tạo
+thành tập huấn luyện cuối cùng của chúng tôi.
+
+Như được hiển thị trong Bảng 7, LLoCO với
+tinh chỉnh kết hợp vượt qua các phương pháp
+baseline trên tất cả
+
+--- TRANG 14 ---
+Siêu tham số QuA QAS QM NQA HQA
+Hạng LoRA r 8
+Optimizer AdamW
+Weight Decay 0.00
+Learning Rate 2 ×10⁻⁵
+LR Scheduler cosine annealing
+Batch Size 8 8 8 32 32
+Warmup Ratio 0.04
+Epoch 3 3 3 1 3
+
+Bảng 5: Cài đặt siêu tham số của các thí nghiệm.
+
+QuA QAS QM NQA HQA
+# mẫu 2086 1726 272 5878 7405
+# bài viết duy nhất 115 273 35 115 7306
+Số từ trung bình 4122 3572 10422 51925 952
+Số từ tối đa 5967 14640 24573 353480 2694
+Độ dài token tối đa 9953 24205 34478 556249 4000
+
+Bảng 6: Thống kê của các bộ dữ liệu. Độ dài token tối đa được đếm sử dụng tokenizer của LLaMA2-7B.
+
+các bộ dữ liệu ngoại trừ QMSum. Hiệu suất thấp
+hơn trên QMSum có thể được quy cho việc nó là
+một nhiệm vụ tóm tắt ưa chuộng các câu trả lời
+dài hơn, chi tiết hơn, nhưng quá trình tinh chỉnh
+kết hợp có thể chuyển hướng hành vi của LLM
+về phía tạo ra các câu trả lời ngắn hơn, tập trung
+hơn, có thể không tối ưu cho nhiệm vụ tóm tắt.
+
+So với tinh chỉnh trong miền, tinh chỉnh kết hợp
+thường cho hiệu suất thấp hơn, ngoại trừ QuALITY.
+Các câu hỏi QuALITY phụ thuộc nhiều vào khả
+năng lý luận của LLM, trong khi các bộ dữ liệu
+khác chủ yếu tập trung vào khả năng của LLM
+truy xuất thông tin liên quan từ ngữ cảnh dài.
+Chúng tôi giả thuyết rằng việc tinh chỉnh bổ sung
+trên các bộ dữ liệu đa dạng nâng cao khả năng
+của LLM lý luận về ngữ cảnh dài, dẫn đến cải
+thiện hiệu suất trên QuALITY. Nhìn chung, phương
+pháp tinh chỉnh kết hợp chứng minh tiềm năng
+chuyển giao kiến thức qua các nhiệm vụ khác nhau.
+
+Khám phá các Bộ Mã hóa Ngữ cảnh khác Theo
+mặc định, LLoCO sử dụng AutoCompressor làm
+bộ mã hóa ngữ cảnh của nó. Tuy nhiên, LLoCO
+cung cấp sự linh hoạt trong việc lựa chọn bộ mã
+hóa ngữ cảnh và không giới hạn ở một phương
+pháp duy nhất. Trong nghiên cứu ablation này,
+chúng tôi đánh giá LLoCO sử dụng một phương
+pháp nén ngữ cảnh tiên tiến khác, ICAE (Ge et
+al., 2023), làm bộ mã hóa ngữ cảnh cho LLoCO.
+Vì ICAE được huấn luyện trên ngữ cảnh lên đến
+4096 token, chúng tôi cắt bớt đầu vào xuống độ
+dài này, dẫn đến embeddings nén 128 token, theo
+phương pháp được nêu trong bài báo gốc.
+
+Kết quả của chúng tôi trong Bảng 8 cho thấy
+ICAE hoạt động tương đương với LLaMA2-7B-4K
+qua các benchmark, trong khi đạt được tỷ lệ nén
+40x. Điều này làm nổi bật rằng pipeline được đề
+xuất của chúng tôi, kết hợp nén ngữ cảnh với
+PEFT, không bị hạn chế ở AutoCompressor và
+có thể được tổng quát hóa cho các bộ mã hóa
+ngữ cảnh khác.
+
+Tuy nhiên, vẫn còn khoảng cách hiệu suất đáng
+chú ý giữa ICAE và LLoCO. Một hạn chế chính
+của ICAE là không thể mở rộng cửa sổ ngữ cảnh
+vượt quá 4K token, làm cho nó trở thành một lựa
+chọn ít phù hợp hơn so với AutoCompressor làm
+bộ mã hóa ngữ cảnh cho phương pháp của chúng tôi.
+
+E Giai đoạn Phục vụ của LLoCO
+
+Phục vụ Trong một hệ thống RAG truyền thống,
+khi người dùng đặt câu hỏi, hệ thống sử dụng
+một bộ truy xuất để lấy top k tài liệu/đoạn liên
+quan từ cơ sở dữ liệu vector và nối chúng vào
+prompt để phục vụ như ngữ cảnh liên quan.
+
+Trong Hình 7, chúng tôi minh họa pipeline phục
+vụ của LLoCO. Trong một RAG tiêu chuẩn, bộ
+truy xuất tính toán text embedding cho mỗi đoạn,
+và sử dụng nó làm key để truy xuất các đoạn liên
+quan đến
+
+--- TRANG 15 ---
+Thiết lập QuA QAS QM NQA HQA Avg.
+LLoCO w. Separate Finetuning 41.51 29.01 16.68 28.34 37.82 30.67
+LLoCO w. Combined Finetuning 47.07 24.95 12.77 27.93 35.55 29.65
+
+Bảng 7: So sánh LLoCO với tinh chỉnh trong miền và tinh chỉnh kết hợp.
+
+Tài liệu Đã Tiền xử lý
+Tài liệu
+Prompt của người dùng
+
+Thêm summary embeddings của top K tài liệu
+Bộ Truy xuất
+LoRA
+Áp dụng module LoRA liên quan nhất
++
+Cơ sở dữ liệu LoRA
+…
+Bộ Giải mã LLM
+Bộ Mã hóa Ngữ cảnh
+
+Hình 7: Giai đoạn phục vụ của pipeline LLoCO.
+
+Thiết lập QuA QAS QM NQA
+LLaMA2-7B-4k 40.45 16.67 14.62 14.42
+ICAE 36.5 16.14 15.69 17.38
+LLoCO 41.51 29.01 16.68 28.34
+
+Bảng 8: So sánh LLoCO với ICAE (Ge et al., 2023)
+
+truy vấn người dùng. Chúng tôi sử dụng cùng text
+embedding làm key, nhưng thay vào đó truy xuất
+token embeddings nén của các đoạn, và đặt trước
+nó vào bộ giải mã LLM. Ngoài ra, hệ thống tìm
+kiếm adaptor LoRA tương ứng trong cơ sở dữ
+liệu và áp dụng nó vào bộ giải mã LLM. Áp dụng
+adaptor LoRA gây ra chi phí tối thiểu cho hệ
+thống (Hu et al., 2022). Bằng cách tận dụng công
+trình gần đây về phục vụ nhiều adaptor LoRA
+(Sheng et al., 2023a; Chen et al., 2023a), chúng
+tôi có thể song song hóa việc phục vụ adaptor
+LoRA và đồng thời phục vụ các yêu cầu cho tài
+liệu liên quan đến hàng nghìn adaptor LoRA trên
+một GPU duy nhất.
+
+Trong hệ thống hiện tại của chúng tôi, chúng tôi
+giả định rằng tất cả các đoạn được truy xuất từ
+cơ sở dữ liệu vector cho một truy vấn người dùng
+nhất định thuộc về cùng một nhóm tài liệu, cho
+phép chúng tôi sử dụng một adaptor LoRA chuyên
+dụng duy nhất. Tuy nhiên, LLoCO có thể được
+mở rộng để xử lý các trường hợp mà các đoạn
+được truy xuất trải dài nhiều nhóm tài liệu. Ví
+dụ, việc thiết kế các thuật toán để lựa chọn động
+adaptor LoRA liên quan nhất dựa trên đa số các
+tài liệu được truy xuất hoặc cân bằng đóng góp
+của các adaptor khác nhau theo mức liên quan
+của chúng đến truy vấn (Muqeeth et al., 2024)
+là khả thi. Một hướng nghiên cứu thú vị và trực
+giao khác là khám phá việc kết hợp nhiều module
+LoRA cùng nhau (Huang et al., 2023), và chúng
+tôi để dành nó như công việc tương lai.
+
+F So sánh với Công trình Đồng thời
+
+CEPE (Yen et al., 2024) và SnapKV (Li et al.,
+2024) là hai công trình đồng thời cũng đề xuất
+các phương pháp cho nén ngữ cảnh. Chúng tôi
+cung cấp so sánh với chúng trong phần này.
+
+Thiết lập QuA QAS QM (ROUGE-L) NQA
+CEPE (chính thức) 30.2 20.5 19.6 21.9
+CEPE (tái tạo) 26.40 20.54 19.38 20.33
+LLoCO 41.51 29.01 20.92 28.34
+
+Bảng 9: So sánh LLoCO với CEPE (Yen et al., 2024)
+
+So sánh với CEPE Tương tự như LLoCO, CEPE
+yêu cầu huấn luyện một encoder để tạo ra embeddings
+cho ngữ cảnh. Trong quá trình suy luận, CEPE
+sử dụng cross-attention để tích hợp những embeddings
+này vào bộ giải mã LLM gốc. Sự khác biệt chính
+là CEPE áp dụng encoder tại runtime, cho phép
+nó xử lý ngữ cảnh song song, do đó tăng tốc quá
+trình suy luận. Ngược lại, LLoCO thực hiện mã
+hóa ngữ cảnh offline, truy xuất các embeddings
+đã tiền xử lý trong quá trình suy luận.
+
+Để so sánh với CEPE, chúng tôi đánh giá mô hình
+của họ (dựa trên LLaMA2-7B-Chat) trên QuaLITY,
+Qasper, QMSum, và NarrativeQA. Chúng tôi trình
+bày hai bộ kết quả: hiệu suất đánh giá chính thức
+được cung cấp bởi CEPE, và kết quả tái tạo của
+chúng tôi, thu được bằng cách chạy mã công khai
+có sẵn của họ trên những bộ dữ liệu này.
+
+Như được hiển thị trong Bảng 9, LLoCO vượt
+trội so với CEPE trên tất cả các bộ dữ liệu. Lưu
+ý rằng đối với bộ dữ liệu QMSum, CEPE cung
+cấp điểm ROUGE-L, trong khi LLoCO cung cấp
+trung bình nhân của điểm ROUGE-1, ROUGE-2,
+và ROUGE-L làm metric của chúng tôi. Chúng
+tôi lấy điểm ROUGE-L của LLoCO ở đây để so
+sánh công bằng.
+
+So sánh với SnapKV So với LLoCO và CEPE
+(Yen et al., 2024), yêu cầu tinh chỉnh trước một
+encoder, SnapKV là một phương pháp nén KV
+cache không cần tinh chỉnh. Hiểu biết chính đằng
+sau SnapKV là chỉ một tập con nhỏ token trong
+prompt là quan trọng (những token mà các token
+khác chú ý đến), cho phép loại bỏ các token ít
+quan trọng hơn.
+
+Vì cả LLoCO và SnapKV đều cung cấp kết quả
+đánh giá trên LongBench, chúng tôi cung cấp so
+sánh cạnh nhau về hiệu suất của chúng. Chúng
+tôi trích xuất kết quả của SnapKV sử dụng LLaMa2-
+7B-32k (LongChat) làm mô hình cơ sở và so sánh
+chúng với kết quả của chúng tôi. SnapKV cung
+cấp ba thiết lập (1024, 2048, và 4096 token), và
+chúng tôi sử dụng kết quả tốt nhất của họ để so sánh.
+
+Bảng 10 minh họa rằng nhìn chung, LLoCO và
+SnapKV cho thấy hiệu suất tương đương qua các
+nhiệm vụ. LLoCO vượt trội so với SnapKV trên
+năm bộ dữ liệu, trong khi SnapKV dẫn đầu trên
+bốn bộ. Không giống như SnapKV, nén token đầu
+vào thành độ dài cố định (1024, 2048, 4096),
+LLoCO áp dụng tỷ lệ nén 30x nhất quán, cho
+phép nén lên đến 128k token thành 4096 token.
+Điều này thường dẫn đến tỷ lệ nén cao hơn so
+với SnapKV trên LongBench.
+
+SingleDoc MultiDoc Summarization
+NQA QAS MFE HQA WMQA MSQ Gov QMS MNews Avg.
+SnapKV 20.7 29.3 42.2 34.0 24.9 14.2 28.6 23.1 26.5 27.1
+LLoCO 23.1 26.1 26.3 46.2 35.6 27.3 17.6 23.4 25.0 27.8
+
+Bảng 10: So sánh giữa LLoCO và SnapKV (Li et al., 2024) trên LongBench (THUDM, 2023)

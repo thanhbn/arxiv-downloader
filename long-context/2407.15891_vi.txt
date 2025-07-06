@@ -1,0 +1,296 @@
+# RAZOR ATTENTION : NÉN KV CACHE HIỆU QUẢ
+THÔNG QUA CÁC ĐẦU TRUY XUẤT
+MỘT BẢN THẢO
+
+Hanlin Tang *1, Yang Lin1, Jing Lin1, Qingsen Han1, Shikuan Hong1, Yiwu Yao1, và Gongyi Wang1
+1Huawei Technologies Co., Ltd
+
+TÓM TẮT
+Nhu cầu bộ nhớ và tính toán của Key-Value (KV) cache đặt ra những thách thức đáng kể cho việc triển khai các mô hình ngôn ngữ ngữ cảnh dài. Các phương pháp trước đây cố gắng giảm thiểu vấn đề này bằng cách loại bỏ có chọn lọc các token, điều này xóa bỏ không thể hoàn tác thông tin quan trọng có thể cần thiết cho các truy vấn trong tương lai. Trong bài báo này, chúng tôi đề xuất một kỹ thuật nén mới cho KV cache bảo tồn tất cả thông tin token. Nghiên cứu của chúng tôi tiết lộ rằng: i) Hầu hết các đầu attention chủ yếu tập trung vào ngữ cảnh cục bộ; ii) Chỉ một số ít đầu, được ký hiệu là các đầu truy xuất, có thể chú ý đến tất cả các token đầu vào. Những quan sát chính này thúc đẩy chúng tôi sử dụng chiến lược caching riêng biệt cho các đầu attention. Do đó, chúng tôi đề xuất RazorAttention, một thuật toán nén KV cache không cần huấn luyện, duy trì cache đầy đủ cho những đầu truy xuất quan trọng này và loại bỏ các token xa trong các đầu không phải truy xuất. Hơn nữa, chúng tôi giới thiệu một cơ chế mới liên quan đến "token bù trừ" để phục hồi thêm thông tin trong các token bị loại bỏ. Các đánh giá mở rộng trên một tập hợp đa dạng các mô hình ngôn ngữ lớn (LLM) chứng minh rằng RazorAttention đạt được việc giảm kích thước KV cache hơn 70% mà không có tác động đáng chú ý đến hiệu suất. Ngoài ra, RazorAttention tương thích với FlashAttention, biến nó thành một giải pháp hiệu quả và cắm-và-chạy giúp tăng cường hiệu quả suy luận LLM mà không có overhead hoặc huấn luyện lại mô hình gốc.
+
+1 Giới thiệu
+
+Các mô hình ngôn ngữ lớn (LLM) ngữ cảnh dài đã cải thiện đáng kể khả năng xử lý ngôn ngữ tự nhiên trên các nhiệm vụ đa dạng. Tuy nhiên, sự tăng trưởng của Key-Value (KV) cache dưới độ dài đầu vào tăng lên đã trở thành nút thắt cổ chai chính cho việc triển khai. Đã có nhiều nghiên cứu trước đây được thiết kế để giảm bớt vấn đề này bằng cách nén kích thước KV cache, bao gồm quantization [1–3], token-dropping [4, 5], local attention [6, 7], v.v.
+
+[Hình 1: RazorAttention đạt được hiệu suất tương đương với mô hình gốc, ngay cả khi nén 70% KV cache. Để chứng minh điều này, chúng tôi đã thử nghiệm Llama2-13B-64K [8] trên benchmark Needle in A Haystack [9].]
+
+Một hướng chính cho nén KV cache là trực tiếp loại bỏ các token được coi là không quan trọng cho đến nay [4,5,11,12]. Những phương pháp này về bản chất giả định rằng các token được coi là không quan trọng sẽ không cần thiết trong các truy vấn tương lai, điều này không đúng trong các tình huống thực tế. Ví dụ, người dùng có thể yêu cầu thông tin không trực tiếp phù hợp với chủ đề chính của văn bản đã xử lý, hoặc tham gia vào cuộc trò chuyện nhiều vòng truy vấn các phân đoạn khác nhau từ ngữ cảnh. Trong những trường hợp này, các phương pháp loại bỏ token dựa trên tầm quan trọng có thể dẫn đến suy giảm hiệu suất đáng kể vì thông tin thực tế được yêu cầu bởi truy vấn có thể bị loại bỏ nếu được coi là không quan trọng (xem ví dụ của chúng tôi về Qwen1.5-7B-Chat [13] trong Hình 2). Điều này dẫn chúng tôi đặt ra một câu hỏi quan trọng:
+
+"Liệu chúng ta có thể tìm cách giảm kích thước KV cache mà không mất thông tin ngữ nghĩa?"
+
+Trong nghiên cứu này, chúng tôi giải quyết vấn đề này từ một góc nhìn mới. Nghiên cứu của chúng tôi tiết lộ rằng tồn tại một cơ chế "truy xuất và xử lý" trong LLM khi xử lý ngữ cảnh dài. Cụ thể hơn, LLM có thể nhớ lại chính xác thông tin được truy vấn từ đầu vào dài thông qua một nhóm đầu attention nhất định, mà chúng tôi ký hiệu là "đầu truy xuất" (xem Phần 3.3 để biết định nghĩa). Những đầu này có khả năng tập trung hầu hết trọng số attention của chúng vào thông tin liên quan (đối với các truy vấn) và tăng xác suất đầu ra cho những từ đó. Một phát hiện quan trọng khác là các đầu không phải truy xuất chủ yếu tập trung vào ngữ cảnh cục bộ hoặc attention sink [5], có nghĩa là những đầu này không thể sử dụng hiệu quả tất cả thông tin ngữ nghĩa từ đầu vào. Dựa trên những phát hiện quan trọng này, chúng tôi giả thuyết rằng LLM chạy quy trình lý luận trên cơ sở "truy xuất và xử lý". Nghĩa là, mô hình đầu tiên sử dụng các đầu truy xuất để thu thập thông tin liên quan, sau đó các đầu không phải truy xuất để xử lý thông tin đã truy xuất và tạo ra phản hồi cuối cùng. Điều này thúc đẩy chúng tôi thiết kế các chiến lược caching riêng biệt cho các đầu khác nhau: Đối với các đầu truy xuất, chúng tôi giữ KV cache không thay đổi; đối với các đầu còn lại, chúng tôi chỉ cache các token gần đây và attention sink.
+
+Ngoài điều này, chúng tôi nhận thấy rằng vẫn tồn tại một khoảng cách độ chính xác nhất định khi chúng tôi trực tiếp loại bỏ tất cả các token xa trong các đầu không phải truy xuất. Do đó, đối với những đầu không phải truy xuất này, chúng tôi đã thiết kế một "token bù trừ" để nén cache bị loại bỏ thành một token, và chứng minh rằng sự suy giảm độ chính xác do KV cache bị cắt ngắn được cải thiện thêm với token bù trừ này. Với các đầu truy xuất và token bù trừ, chúng tôi chứng minh rằng thuật toán của chúng tôi, cụ thể là RazorAttention, có thể nén thành công 70% KV cache mà không có suy giảm hiệu suất đáng chú ý như được minh họa trong Hình 1.
+
+Cuối cùng nhưng không kém phần quan trọng, các phương pháp loại bỏ token dựa trên tầm quan trọng trước đây không thể được kết hợp với FlashAttention do sự phụ thuộc của chúng vào trọng số attention để tính điểm tầm quan trọng, khiến chúng không thực tế để triển khai vì FlashAttention là một trong những thành phần quan trọng nhất trong suy luận ngữ cảnh dài. RazorAttention giải quyết vấn đề này vì nó không sử dụng bản đồ attention làm chỉ số. Tiêu chí pruning theo đầu hoàn toàn tương thích với FlashAttention, và overhead tính toán của token bù trừ là không đáng kể. Do đó RazorAttention có thể đạt được tăng tốc suy luận đáng kể khi so sánh với các phương pháp trước đây.
+
+Theo hiểu biết tốt nhất của chúng tôi, RazorAttention là thuật toán giảm token đầu tiên không cần huấn luyện đạt được việc giảm KV cache gần như không mất mát 3X. Chúng tôi đã đánh giá RazorAttention trên các mô hình bao gồm Qwen [13], Llama-2 [14], Llama-3 [15] và Baichuan [16] trên các nhiệm vụ ngữ cảnh dài để chứng minh hiệu quả của nó. Đóng góp của chúng tôi có thể được tóm tắt như sau:
+
+• Chúng tôi phân tích có hệ thống động lực attention của Transformer dưới đầu vào dài. Nghiên cứu của chúng tôi tiết lộ rằng chỉ một số ít đầu truy xuất có thể nhớ lại thông tin từ toàn bộ đầu vào trong khi các đầu còn lại chủ yếu tập trung vào ngữ cảnh cục bộ.
+
+• Chúng tôi giới thiệu một thuật toán mới, cụ thể là RazorAttention, có khả năng giảm kích thước KV cache 70% với tác động tối thiểu đến hiệu suất cho ngữ cảnh từ 8K đến 100K token. Chúng tôi đã thiết kế một chỉ số chính xác và không cần dữ liệu để phân bổ tất cả các đầu truy xuất, cùng với chiến lược bù trừ lỗi để bù đắp mất mát thông tin do KV cache bị cắt ngắn.
+
+• RazorAttention giới thiệu overhead không đáng kể trong nén và tương thích với FlashAttention, biến nó thành một giải pháp hiệu quả và cắm-và-chạy tăng cường hiệu quả suy luận LLM mà không cần huấn luyện hoặc overhead đáng kể. Các thí nghiệm mở rộng chứng minh rằng RazorAttention có thể được áp dụng hiệu quả cho các mô hình và nhiệm vụ khác nhau.
+
+2 Nghiên cứu liên quan
+
+Khi độ dài sequence tăng lên, mức tiêu thụ bộ nhớ của KV cache mở rộng nhanh chóng, có thể vượt quá kích thước của chính các tham số mô hình. Điều này dẫn đến nhu cầu cấp thiết về nén KV cache, đặc biệt trong các tình huống với bộ nhớ GPU hạn chế. Một hướng là thiết kế kiến trúc không phải Transformer, như Mamba [17], Mamba2 [18], Infini-Transformer [19], RWKV [20] và Griffin [21]. Tuy nhiên, trong bài báo này chúng tôi tập trung vào việc giảm KV cache cho các Transformer điển hình, đây là cấu trúc mô hình được sử dụng rộng rãi nhất. Dưới đây chúng tôi giới thiệu một số phương pháp tiếp cận cho nén KV cache.
+
+Quantization Quantization là một phương pháp tiếp cận cổ điển nhưng hiệu quả cho nén mạng nơ-ron. Trong lĩnh vực LLM Quantization, trong khi thách thức outlier thu hút sự chú ý lớn [22–24] để giải quyết, việc áp dụng của nó trên KV cache thường được coi như một sản phẩm phụ của quantization activation. Tuy nhiên, có một số nghiên cứu đáng chú ý chứng minh giá trị của quantization KV cache. FlexGen, Atom và QServe [1–3] đã thiết kế cẩn thận các pipeline quantization sử dụng nén KV cache để tăng thông lượng suy luận tổng thể. KVQuant [25] tích hợp một số kỹ thuật để giảm thiểu lỗi quantization KV và KIVI [26] đẩy giới hạn về phía 2-bit. Bên cạnh các phương pháp post-training, LLM-QAT [27] cung cấp một quy trình distillation không cần dữ liệu để phục hồi thêm hiệu suất của mô hình.
+
+Token-dropping Các phương pháp token-dropping giả định rằng không phải tất cả các cặp key-value đều cần thiết trong tính toán self-attention, vì vậy việc sử dụng bộ nhớ có thể được tiết kiệm bằng cách xác định và loại bỏ KV cache không quan trọng. StreamingLLM [5] sử dụng công nghệ sliding window, chỉ bảo tồn các cặp KV của attention sink token và những cặp trong sliding window, từ đó giảm footprint bộ nhớ và ổn định hiệu suất mô hình. H2O [4] là một trong những tiên phong sử dụng điểm attention để đánh giá tầm quan trọng của mỗi token, theo sau bởi chiến lược eviction chọn lọc tham lam cache với điểm số cao hơn. Scissorhands [11] và một trong những nghiên cứu mới nhất SnapKV [12] sử dụng ý tưởng tương tự bằng cách thu hẹp phạm vi tính toán để xem xét điểm attention liên quan đến thông tin gần đây. Dựa trên đó, PyramidKV và PyramidInfer [28,29] phân tích các mẫu tập trung attention và giảm thêm KV cache trong các lớp sau. Hơn nữa, các nỗ lực nghiên cứu đã được thực hiện để hiểu KV cache từ các góc độ khác nhau: FastGen [30] chú ý đến các token đặc biệt và dấu câu, SubGen [31] nghiên cứu khả năng phân cụm của key embedding và CORM [32] phát hiện mối tương quan mạnh giữa các token của hàng xóm gần.
+
+Non-MHA Attention Một danh mục khác tập trung vào việc giảm KV cache bằng cách chia sẻ cache giữa các đầu attention. MQA [33] sử dụng tích cực một đầu KV duy nhất cho tất cả các đầu, trong khi GQA [34] đề xuất một số lượng trung gian của các đầu để cân bằng sự đánh đổi giữa tốc độ suy luận và chất lượng đầu ra. Hơn nữa, MLA [35] trình bày một phương pháp caching mới bằng cách low-ranking KV cache của tất cả các đầu thành không gian latent đơn.
+
+Thuật toán của chúng tôi được thúc đẩy bởi ý tưởng từ [36], nơi các tác giả nhận thấy rằng có những nhóm đầu attention nhất định, được ký hiệu là induction head, có thể nhớ lại hiệu quả thông tin được truy vấn từ đầu vào. Nghiên cứu gần đây [37] cũng xác nhận tính chất này dưới đầu vào mở rộng. Đây là nghiên cứu đầu tiên đề xuất tiêu chí pruning theo đầu cho nén KV cache dựa trên khả năng diễn giải của cơ chế attention.
+
+3 Phương pháp luận
+
+Trong phần này, chúng tôi giới thiệu các thành phần chính của RazorAttention. Chúng tôi đầu tiên áp dụng RazorAttention cho các mô hình sử dụng ALiBi [38] positional embedding (được ký hiệu là mô hình ALiBi) để cung cấp hiểu biết trực quan về các đầu truy xuất và không phải truy xuất. Sau đó, chúng tôi chứng minh rằng các mô hình sử dụng RoPE [39] positional embedding (được ký hiệu là mô hình RoPE) cũng thể hiện đặc tính quan trọng này, tiết lộ rằng KV cache trong các mô hình RoPE cũng có thể được nén hiệu quả với mất mát độ chính xác tối thiểu.
+
+3.1 RazorAttention cho mô hình ALiBi
+
+Đối với các mô hình ALiBi, đầu attention thứ h tính điểm attention theo
+Sm→n(q;k) = qmk⊺n − lh(m−n), (1)
+trong đó qm là tensor query tại vị trí thứ m, kn là tensor key tại vị trí thứ n, lh là slope đặc trưng cho đầu, Sm→n(q;k) là điểm attention. Lưu ý rằng (m≥n) được đảm bảo bởi tính nhân quả của attention.
+
+Trong tình huống mà lh(m−n) chiếm ưu thế đáng kể so với qmk⊺n, attention giữa qm và kn sẽ giảm về không, có nghĩa là đóng góp của bất kỳ token nào được định vị xa hơn n trở nên không đáng kể cho đầu ra tại vị trí m. Định lý sau đây hình thức hóa quan sát này.
+
+Định lý 1. Cho một đầu attention tính điểm attention như per (1), với bất kỳ ϵ∈(0,1), trọng số attention từ qm đến kn có thể được giới hạn trên bởi:
+Attnm→n(q;k) = exp (Sm→n(q;k)) / Σm n=0 exp (Sm→n(q;k)) ≤ ϵ, ∀n < m − C0,
+Lh := 2‖WQhWKh‖2 √‖γ‖2+‖b‖2 − log(ϵ) / lh. (2)
+
+Ở đây WQh và WKh là các ma trận query và key của đầu attention thứ h, γ và b là weight và bias cho lớp LayerNorm trước attention (b=0 cho RMSNorm [40]), và ‖ · ‖2 biểu thị l2-norm của ma trận. Lh có thể được xem như phạm vi tầm nhìn của đầu. Chứng minh chi tiết có thể được tìm thấy trong Phụ lục A.
+
+Định lý (1) chỉ ra rằng khi khoảng cách giữa qm và kn vượt quá C0, trọng số attention giữa hai token này giảm xuống dưới ϵ. Khi ϵ đủ nhỏ (ví dụ: 0.1%), các token xa áp đặt ảnh hưởng tối thiểu lên đầu ra cuối cùng và do đó có thể bị loại bỏ. Dựa trên nguyên tắc này, các mô hình ALiBi điều chỉnh động kích thước KV cache cho mỗi đầu. Chúng tôi đầu tiên tính phạm vi attention hiệu quả Lh, và chỉ giữ Lh token gần đây trong KV cache, vì bất kỳ token nào xa hơn Lh áp đặt trọng số attention không quá ϵ, chúng ta có thể loại bỏ chúng một cách an toàn để nén.
+
+Do đó, đối với các mô hình ALiBi, các đầu truy xuất là những đầu có Lh lớn hơn, trong khi các đầu không phải truy xuất có tầm nhìn attention Lh nhỏ hơn.
+
+3.2 RazorAttention cho mô hình RoPE
+
+Đối với các mô hình RoPE, mỗi đầu attention tính điểm attention theo
+Sm→n(q;k) = qmk⊺n, qm = Rmq, kn = Rnk (3)
+trong đó qm và kn là trạng thái query và key sau biến đổi rotary, Rm và Rn là các ma trận rotary tại vị trí m và n (xem [39] để biết chi tiết). Mặc dù RoPE embedding không vốn dĩ gợi ý attention suy giảm tầm xa, các phát hiện thực nghiệm của chúng tôi chỉ ra rằng đa số các đầu attention duy trì phạm vi attention hạn chế. Đáng chú ý, chỉ khoảng 15% các đầu, mà chúng tôi gọi là đầu truy xuất, có khả năng sử dụng hiệu quả thông tin tầm xa trong khi các đầu còn lại chỉ tập trung vào ngữ cảnh cục bộ. Như được hiển thị trong Bảng 1, một sự giảm đáng kể về độ chính xác 16% được quan sát khi kích thước KV cache bị giảm cho những đầu truy xuất này. Ngược lại, việc loại bỏ token xa trong các đầu không phải truy xuất dẫn đến suy giảm hiệu suất tương đối nhỏ 1.5%.
+
+Dựa trên những phát hiện trên, chúng tôi trực tiếp giảm KV cache cho tất cả các đầu không phải truy xuất. Hiệu suất của mô hình hầu hết được duy trì như được hiển thị trong Bảng 1. Tuy nhiên, một khoảng cách độ chính xác đáng chú ý vẫn còn, chỉ ra rằng một số thông tin vẫn đang bị mất. Hơn nữa, kết quả thử nghiệm trên Needle in a Haystack cho thấy suy giảm hiệu suất rõ ràng ngay cả khi chúng tôi bảo vệ KV cache của các đầu truy xuất (xem kết quả ablation của chúng tôi trong Hình 6). Để cải thiện thêm hiệu suất, chúng tôi đã thiết kế một cách nhẹ và hiệu quả để nén thông tin trong token bị loại bỏ thành "token bù trừ".
+
+Token bù trừ được định nghĩa là
+k̂ = 1/Nd Σm∈{D} km, v̂ = 1/Nd Σm∈{D} vm. (4)
+
+Đầu bảo vệ | Tất cả | Đầu truy xuất | Đầu ngẫu nhiên | Không có
+MultiFieldQA-en | 46.94% | 45.48% | 40.7% | 40.81%
+
+Bảng 1: Chúng tôi bảo vệ KV cache trong các nhóm đầu attention khác nhau trong khi chỉ giữ 4K token gần đây trong phần còn lại. Bảo vệ KV cache trong các đầu truy xuất có thể duy trì hầu hết hiệu suất của LLM, trong khi bảo vệ các đầu ngẫu nhiên không mang lại lợi ích hiệu suất. Điều này rõ ràng chỉ ra rằng hầu hết các đầu attention chỉ sử dụng ngữ cảnh cục bộ và chỉ các đầu truy xuất có thể sử dụng tất cả thông tin ngữ cảnh một cách cơ bản.
+
+Ở đây k̂, v̂ là các token bù trừ cho KV cache bị loại bỏ, {D} chứa các chỉ số của các token bị loại bỏ và Nd là số lượng token bị loại bỏ. Sau đó, chúng tôi loại bỏ các token bị loại bỏ và tăng cường KV cache với token bù trừ k̂ và v̂, trong đó {K, V} là KV cache của token còn lại sau biến đổi rotary. Ký hiệu KV cache nén là {K,k̂} và {V,v̂}, đầu ra attention của token hiện tại tuân theo
+
+Attn(qm,{K,k̂},{V,v̂}) = (Nd exp(qmk̂⊺)v̂ + Σn∉{D} exp(qmk⊺n)vn) / (Nd exp(qmk̂⊺) + Σn∉{D} exp(qmk⊺n)). (5)
+
+Trong Hình 3(a) chúng tôi cung cấp một ví dụ minh họa về RazorAttention cho các mô hình RoPE. Với token bù trừ, độ chính xác được cải thiện thêm, làm cho RazorAttention gần như không mất mát ngay cả khi loại bỏ 70% KV cache trong các đầu không phải truy xuất. Dưới đây chúng tôi giới thiệu cách chúng tôi xác định nhóm đầu truy xuất.
+
+[Hình 3: Trong Hình 3(a) chúng tôi trình bày minh họa về cách RazorAttention nén KV cache. Đối với các đầu truy xuất, chúng tôi duy trì cache đầy đủ để giữ lại thông tin của tất cả token. Đối với các đầu không phải truy xuất, chúng tôi trực tiếp loại bỏ token xa và nén các token bị loại bỏ thành token bù trừ có KV cache được ký hiệu là {k̂,v̂}. Trong Hình 3(b) chúng tôi cung cấp ví dụ minh họa về echo head và induction head. Token hiện tại là "B" và token được tạo là "C". Trong trường hợp này, echo head sẽ chủ yếu chú ý đến token "B" trong khi induction head chủ yếu chú ý đến token "C" trong ngữ cảnh trước đó.]
+
+3.3 Xác định các đầu truy xuất
+
+Đối với các mô hình ALiBi, phạm vi attention có thể được xác định trực tiếp qua (2) và KV cache có thể được loại bỏ tương ứng. Tuy nhiên, đối với các mô hình RoPE, các đầu truy xuất cần được xác định theo cách tinh vi hơn. Nghiên cứu của chúng tôi tiết lộ rằng hai nhóm đầu là cần thiết trong việc xử lý ngữ cảnh dài, vì vậy cả hai chúng đều nên được bao gồm như các đầu truy xuất như được nêu dưới đây.
+
+• Echo head: Đầu có xu hướng chú ý trở lại token trước đó (được gọi là echo token) giống hệt token hiện tại.
+
+• Induction head: Đầu có xu hướng chú ý đến token trước đó (cụ thể là induction token) ngay lập tức được kế tiếp bởi token hiện tại. Về cơ bản nó chú ý đến token sắp tới cũng tồn tại trong ngữ cảnh trước đó.
+
+Trong Hình 3(b) chúng tôi trình bày một ví dụ minh họa giải thích echo head và induction head. Để xác định các đầu truy xuất, chúng tôi tạo K (ví dụ, K = 2500) token ngẫu nhiên, lặp lại những token này 4 lần, sau đó sử dụng nó làm đầu vào của mô hình. Thiết kế này giảm thiểu sự phụ thuộc ngữ nghĩa giữa các token, từ đó cho phép quan sát rõ ràng hơn về hành vi của echo và induction head.
+
+Cài đặt siêu tham số
+Độ dài buffer | max(4000, N/5)
+Bảo vệ induction head | top 14%
+Bảo vệ echo head | top 1%
+Số lượng sink token | 4
+
+Bảng 2: Cài đặt siêu tham số chung cho các thí nghiệm trong bài báo, dẫn đến nén KV cache 3.125x dưới đầu vào ngữ cảnh dài.
+
+[Bảng 3: So sánh hiệu suất của RazorAttention và các thuật toán nén khác trên các LLM khác nhau trên LongBench. Lưu ý rằng hiệu suất của Llama3-8B-Instruct trên TREC và LSHT không áp dụng được (gần bằng 0), do đó chúng tôi không bao gồm kết quả của chúng trên Llama3-8B.]
+
+Tiếp theo, chúng tôi tính điểm echo (trọng số attention đến echo token) và điểm induction (trọng số attention đến induction token) của tất cả các từ trên tất cả các đầu. Việc chọn lọc các đầu truy xuất bao gồm top-14% đầu attention có điểm induction cao nhất và top-1% đầu attention có điểm echo cao nhất (xem Bảng 2). Lưu ý rằng mặc dù chúng tôi chỉ sử dụng ít echo head hơn nhiều so với retrieval head, nghiên cứu của chúng tôi chỉ ra rằng cả hai đầu đều quan trọng cho hiệu suất truy xuất của LLM (xem Phần 4.3 cho kết quả ablation).
+
+Với các đầu truy xuất được xác định, chúng tôi giới thiệu RazorAttention cho mô hình RoPE trong Thuật toán 1.
+
+Thuật toán 1 RazorAttention cho mô hình RoPE
+Đầu vào: Tập đầu không phải truy xuất {H}, KV cache gốc (sau biến đổi rotary) {K, V}, tỷ lệ nén C, ngưỡng nén S0, số lượng sink token N0.
+1: for đầu không phải truy xuất h ∈ {H} do
+2: Tính độ dài buffer Lh = max(S0, N/C), ở đây N là số lượng token trong đầu.
+3: Chỉ giữ Lh token gần đây gần đầu ra và N0 sink token đầu tiên, loại bỏ các token còn lại và nén chúng thành token bù trừ theo (4).
+4: end for
+5: Các đầu không phải truy xuất tính attention theo (5), trong khi các đầu truy xuất tuân theo attention gốc.
+Đầu ra: Token đầu ra được tạo.
+
+4 Thí nghiệm
+
+Một loạt LLM được phát hành gần đây được chọn để xác thực đề xuất của chúng tôi, bao gồm Qwen [13], Llama2 [14], Llama3 [15] và Baichuan [16]. Các mô hình được chọn được đánh giá trên Longbench [10] và Needle In A Haystack [9] để chứng minh khả năng của chúng trong hoàn cảnh ngữ cảnh dài. Các thí nghiệm được tiến hành trên NVIDIA GeForce RTX 4090 (24GB). Chúng tôi sẽ đầu tiên xác thực hiệu quả của đề xuất của chúng tôi trên các nhiệm vụ khác nhau, tiếp theo là nghiên cứu ablation của mỗi thành phần trong thiết kế thuật toán của chúng tôi. Trừ khi được nêu rõ ràng, chúng tôi sử dụng RazorAttention với các siêu tham số như trong Bảng 2. Chúng tôi sử dụng H2O [4] và StreamingLLM [5] để so sánh. Lưu ý rằng chúng tôi không bao gồm SnapKV [12] làm baseline vì nó giả định rằng truy vấn được biết trước khi nén, điều này không đúng trong các trường hợp chung hoặc trong cuộc trò chuyện nhiều vòng nơi người dùng có thể truy vấn thông tin khác nhau từ ngữ cảnh (như đã thảo luận trong Phần 1).
+
+4.1 Đánh giá LongBench
+
+Trong Bảng 3 chúng tôi trình bày kết quả của các thuật toán khác nhau trên LongBench [10], cung cấp đánh giá toàn diện để đánh giá khả năng liên quan đến ngữ cảnh dài của LLM. Chúng tôi sử dụng Qwen1.5-7B và Qwen1.5-72B để thử nghiệm vì chúng là mô hình RoPE với độ dài ngữ cảnh 32K. Chúng tôi cũng bao gồm Llama3-8B để xác thực hiệu suất của RazorAttention trên các mô hình GQA. Chúng tôi chọn Baichuan2-13B để chứng minh hiệu quả của RazorAttention trên các mô hình ALiBi. Có thể thấy rằng RazorAttention đạt được hiệu suất vượt trội trên tất cả các mô hình so với StreamingLLM và H2O. Kết quả thuyết phục chỉ ra rằng RazorAttention có thể đạt được hiệu suất tương đương như baseline không nén, ngay cả dưới tỷ lệ nén 3X.
+
+Hơn nữa, chúng tôi thử nghiệm Llama3-8B-Instruct như một instance GQA nơi mỗi 4 đầu attention chia sẻ một tập KV cache duy nhất. Do đó, chúng tôi coi các đầu attention trong một nhóm là tất cả truy xuất nếu một hoặc nhiều đầu thỏa mãn tính chất inductive hoặc echoing. Kết quả trong Bảng 3 rõ ràng chứng minh rằng RazorAttention vẫn hoạt động cho các mô hình GQA.
+
+[Hình 4: So sánh hiệu suất của RazorAttention và các thuật toán nén khác trên Llama2-7b-80K, Needle In A Haystack. Lưu ý rằng H2O không tương thích với FlashAttention nên chúng tôi gặp lỗi OOM khi thử nghiệm trên sequence dài hơn, và hiệu suất của nó đã trở nên không thể sử dụng trong trường hợp này.]
+
+4.2 Đánh giá Needle In A Haystack
+
+Trong Hình 4 chúng tôi trình bày kết quả trên Needle In A Haystack. Chúng tôi sử dụng Llama2-7B-80K từ [8] vì độ dài ngữ cảnh của mô hình này là 80K. Không giống như H2O, có hiệu suất bị suy giảm nghiêm trọng dưới đầu vào dài, RazorAttention vẫn có thể nhớ lại chính xác thông tin được truy vấn. Đây là bằng chứng mạnh mẽ chứng minh rằng RazorAttention có thể giữ lại tất cả thông tin ngữ nghĩa trong ngữ cảnh gốc, trong khi các phương pháp dựa trên tầm quan trọng không tránh khỏi loại bỏ thông tin có thể hữu ích trong các truy vấn tương lai.
+
+4.3 Nghiên cứu Ablation
+
+Dưới đây chúng tôi trình bày kết quả ablation của RazorAttention, và chứng minh rằng thiết kế thuật toán và cấu hình được chọn một cách tối ưu để đạt được tỷ lệ nén cao hơn với suy giảm hiệu suất có thể chấp nhận.
+
+[Hình 5: Thêm 1% echo head có thể tăng cường đáng kể hiệu suất truy xuất của RazorAttention trên Llama2-7B-80k.]
+
+4.3.1 Tầm quan trọng của Echo Head
+
+Mặc dù chúng tôi chỉ bao gồm 1% echo head trong RazorAttention, chúng tôi nhận thấy rằng nhóm đầu này khá cần thiết trong việc truy xuất thông tin dưới ngữ cảnh dài như được hiển thị trong Hình 5. Một lời giải thích có thể là induction head phụ thuộc vào sự tồn tại của echo head như đã thảo luận trong [36].
+
+4.3.2 Số lượng Induction Head
+
+Để xác định số lượng tối ưu của induction head để sử dụng trong RazorAttention, trong Bảng 4 chúng tôi trình bày độ chính xác của RazorAttention dưới số lượng induction head khác nhau. Kết quả cho thấy rằng độ chính xác cải thiện liên tục với số lượng induction head tăng lên. Chúng tôi quyết định bao gồm 14% induction head để đạt được sự cân bằng tối ưu giữa tỷ lệ nén và hiệu suất mô hình.
+
+Scheme bảo vệ | Điểm
+1% Echo + 5% Induction Head | 69.54%
+1% Echo + 8% Induction Head | 78.40%
+1% Echo + 11% Induction Head | 84.55%
+1% Echo + 14% Induction Head | 86.59%
+Baseline | 87.05%
+
+Bảng 4: Qwen1.5-7B-Chat sử dụng RazorAttention với số lượng đầu được bảo vệ khác nhau, thử nghiệm trên Needle in A Haystack.
+
+[Hình 6: Token bù trừ là quan trọng để phục hồi mất mát thông tin do KV cache bị cắt ngắn.]
+
+4.3.3 Tầm quan trọng của Token bù trừ
+
+Trong Hình 6, được chứng minh rõ ràng rằng token bù trừ là quan trọng cho hiệu suất của RazorAttention. Các token bù trừ đã nén thành công hầu hết thông tin từ các token bị loại bỏ, từ đó duy trì độ chính xác cao ngay cả với việc giảm KV cache đáng kể.
+
+5 Kết luận
+
+Trong bài báo này, chúng tôi đề xuất RazorAttention, một thuật toán nén KV cache mới, thành công đạt được tỷ lệ nén 3X cho các mô hình sử dụng RoPE hoặc ALiBi embedding. Không giống như các phương pháp loại bỏ token dựa trên tầm quan trọng trước đây mà không tránh khỏi loại bỏ thông tin ngữ nghĩa, RazorAttention bảo tồn tất cả thông tin ngữ nghĩa trong các đầu truy xuất. Chúng tôi chứng minh rằng các token xa có thể được nén hiệu quả thành token bù trừ trong các đầu không phải truy xuất. Hơn nữa, tiêu chí pruning theo đầu của chúng tôi hoàn toàn tương thích với FlashAttention, biến RazorAttention thành phương pháp nén cắm-và-chạy tăng tốc suy luận của LLM dưới ngữ cảnh mở rộng. Các thí nghiệm của chúng tôi chứng minh rằng RazorAttention có thể đạt được hiệu suất tương đương với mô hình gốc và vượt trội hơn các phương pháp trước đây trong cả độ chính xác và hiệu quả.
+
+6 Hạn chế
+
+Tuy nhiên, vẫn còn những hạn chế nhất định trong nghiên cứu của chúng tôi. Câu hỏi đầu tiên là tại sao các đầu attention trong LLM lại hoạt động khác nhau như vậy và các đầu truy xuất hoạt động như thế nào dưới đầu vào dài. Thách thức thứ hai nằm ở việc đạt được tỷ lệ nén cao hơn. Mặc dù chúng tôi đã thành công giảm KV cache 70%, chúng tôi tin rằng con số này có thể được cải thiện thêm. Hơn nữa, mặc dù chúng tôi đã thử nghiệm thuật toán của mình trên một số mô hình, cấu hình tối ưu trên các mô hình khác có thể khác nhau, có nghĩa là chúng tôi có thể cần nhiều hơn hoặc ít hơn các đầu truy xuất trong các trường hợp khác nhau. Những chủ đề này khá quan trọng và chúng tôi sẽ tiếp tục nghiên cứu chúng trong công việc tương lai.
+
+Tài liệu tham khảo
+
+[1] Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan Li, Max Ryabinin, Beidi Chen, Percy Liang, Christopher Re, Ion Stoica, và Ce Zhang. FlexGen: High-throughput generative inference of large language models with a single GPU. Trong Andreas Krause, Emma Brunskill, Kyunghyun Cho, Barbara Engelhardt, Sivan Sabato, và Jonathan Scarlett, biên tập, Proceedings of the 40th International Conference on Machine Learning, tập 202 của Proceedings of Machine Learning Research, trang 31094–31116. PMLR, 23–29 Jul 2023.
+
+[2] Yilong Zhao, Chien-Yu Lin, Kan Zhu, Zihao Ye, Lequn Chen, Size Zheng, Luis Ceze, Arvind Krishnamurthy, Tianqi Chen, và Baris Kasikci. Atom: Low-bit quantization for efficient and accurate llm serving, 2024.
+
+[3] Yujun Lin, Haotian Tang, Shang Yang, Zhekai Zhang, Guangxuan Xiao, Chuang Gan, và Song Han. Qserve: W4a8kv4 quantization and system co-design for efficient llm serving, 2024.
+
+[4] Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong Chen, Lianmin Zheng, Ruisi Cai, Zhao Song, Yuandong Tian, Christopher Re, Clark Barrett, Zhangyang Wang, và Beidi Chen. H2o: Heavy-hitter oracle for efficient generative inference of large language models. Trong Thirty-seventh Conference on Neural Information Processing Systems, 2023.
+
+[5] Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song Han, và Mike Lewis. Efficient streaming language models with attention sinks, 2024.
+
+[6] Albert Q. Jiang, Alexandre Sablayrolles, Arthur Mensch, Chris Bamford, Devendra Singh Chaplot, Diego de las Casas, Florian Bressand, Gianna Lengyel, Guillaume Lample, Lucile Saulnier, Lélio Renard Lavaud, Marie-Anne Lachaux, Pierre Stock, Teven Le Scao, Thibaut Lavril, Thomas Wang, Timothée Lacroix, và William El Sayed. Mistral 7b, 2023.
+
+[7] Rewon Child, Scott Gray, Alec Radford, và Ilya Sutskever. Generating long sequences with sparse transformers, 2019.
+
+[8] Yao Fu, Rameswar Panda, Xinyao Niu, Xiang Yue, Hannaneh Hajishirzi, Yoon Kim, và Hao Peng. Data engineering for scaling language models to 128k context, 2024.
+
+[9] gkamradt. Needle In A Haystack - Pressure Testing LLMs, 2023.
+
+[10] Yushi Bai, Xin Lv, Jiajie Zhang, Hongchang Lyu, Jiankai Tang, Zhidian Huang, Zhengxiao Du, Xiao Liu, Aohan Zeng, Lei Hou, Yuxiao Dong, Jie Tang, và Juanzi Li. Longbench: A bilingual, multitask benchmark for long context understanding, 2023.
+
+[11] Zichang Liu, Aditya Desai, Fangshuo Liao, Weitao Wang, Victor Xie, Zhaozhuo Xu, Anastasios Kyrillidis, và Anshumali Shrivastava. Scissorhands: Exploiting the persistence of importance hypothesis for llm kv cache compression at test time, 2023.
+
+[12] Yuhong Li, Yingbing Huang, Bowen Yang, Bharat Venkitesh, Acyr Locatelli, Hanchen Ye, Tianle Cai, Patrick Lewis, và Deming Chen. Snapkv: Llm knows what you are looking for before generation, 2024.
+
+[13] Jinze Bai, Shuai Bai, Yunfei Chu, Zeyu Cui, Kai Dang, Xiaodong Deng, Yang Fan, Wenbin Ge, Yu Han, Fei Huang, Binyuan Hui, Luo Ji, Mei Li, Junyang Lin, Runji Lin, Dayiheng Liu, Gao Liu, Chengqiang Lu, Keming Lu, Jianxin Ma, Rui Men, Xingzhang Ren, Xuancheng Ren, Chuanqi Tan, Sinan Tan, Jianhong Tu, Peng Wang, Shijie Wang, Wei Wang, Shengguang Wu, Benfeng Xu, Jin Xu, An Yang, Hao Yang, Jian Yang, Shusheng Yang, Yang Yao, Bowen Yu, Hongyi Yuan, Zheng Yuan, Jianwei Zhang, Xingxuan Zhang, Yichang Zhang, Zhenru Zhang, Chang Zhou, Jingren Zhou, Xiaohuan Zhou, và Tianhang Zhu. Qwen technical report, 2023.
+
+[14] Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei, Nikolay Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, Dan Bikel, Lukas Blecher, Cristian Canton Ferrer, Moya Chen, Guillem Cucurull, David Esiobu, Jude Fernandes, Jeremy Fu, Wenyin Fu, Brian Fuller, Cynthia Gao, Vedanuj Goswami, Naman Goyal, Anthony Hartshorn, Saghar Hosseini, Rui Hou, Hakan Inan, Marcin Kardas, Viktor Kerkez, Madian Khabsa, Isabel Kloumann, Artem Korenev, Punit Singh Koura, Marie-Anne Lachaux, Thibaut Lavril, Jenya Lee, Diana Liskovich, Yinghai Lu, Yuning Mao, Xavier Martinet, Todor Mihaylov, Pushkar Mishra, Igor Molybog, Yixin Nie, Andrew Poulton, Jeremy Reizenstein, Rashi Rungta, Kalyan Saladi, Alan Schelten, Ruan Silva, Eric Michael Smith, Ranjan Subramanian, Xiaoqing Ellen Tan, Binh Tang, Ross Taylor, Adina Williams, Jian Xiang Kuan, Puxin Xu, Zheng Yan, Iliyan Zarov, Yuchen Zhang, Angela Fan, Melanie Kambadur, Sharan Narang, Aurelien Rodriguez, Robert Stojnic, Sergey Edunov, và Thomas Scialom. Llama 2: Open foundation and fine-tuned chat models, 2023.
+
+[15] AI@Meta. Llama 3 model card. 2024.
+
+[16] Baichuan. Baichuan 2: Open large-scale language models. arXiv preprint arXiv:2309.10305, 2023.
+
+[17] Albert Gu và Tri Dao. Mamba: Linear-time sequence modeling with selective state spaces, 2024.
+
+[18] Tri Dao và Albert Gu. Transformers are ssms: Generalized models and efficient algorithms through structured state space duality, 2024.
+
+[19] Tsendsuren Munkhdalai, Manaal Faruqui, và Siddharth Gopal. Leave no context behind: Efficient infinite context transformers with infini-attention, 2024.
+
+[20] Bo Peng, Eric Alcaide, Quentin Anthony, Alon Albalak, Samuel Arcadinho, Stella Biderman, Huanqi Cao, Xin Cheng, Michael Chung, Matteo Grella, Kranthi Kiran GV, Xuzheng He, Haowen Hou, Jiaju Lin, Przemyslaw Kazienko, Jan Kocon, Jiaming Kong, Bartlomiej Koptyra, Hayden Lau, Krishna Sri Ipsit Mantri, Ferdinand Mom, Atsushi Saito, Guangyu Song, Xiangru Tang, Bolun Wang, Johan S. Wind, Stanislaw Wozniak, Ruichong Zhang, Zhenyuan Zhang, Qihang Zhao, Peng Zhou, Qinghua Zhou, Jian Zhu, và Rui-Jie Zhu. Rwkv: Reinventing rnns for the transformer era, 2023.
+
+[21] Soham De, Samuel L. Smith, Anushan Fernando, Aleksandar Botev, George Cristian-Muraru, Albert Gu, Ruba Haroun, Leonard Berrada, Yutian Chen, Srivatsan Srinivasan, Guillaume Desjardins, Arnaud Doucet, David Budden, Yee Whye Teh, Razvan Pascanu, Nando De Freitas, và Caglar Gulcehre. Griffin: Mixing gated linear recurrences with local attention for efficient language models, 2024.
+
+[22] Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu, Julien Demouth, và Song Han. SmoothQuant: Accurate and efficient post-training quantization for large language models. Trong Andreas Krause, Emma Brunskill, Kyunghyun Cho, Barbara Engelhardt, Sivan Sabato, và Jonathan Scarlett, biên tập, Proceedings of the 40th International Conference on Machine Learning, tập 202 của Proceedings of Machine Learning Research, trang 38087–38099. PMLR, 23–29 Jul 2023.
+
+[23] Xiuying Wei, Yunchen Zhang, Xiangguo Zhang, Ruihao Gong, Shanghang Zhang, Qi Zhang, Fengwei Yu, và Xianglong Liu. Outlier suppression: Pushing the limit of low-bit transformer language models. Trong S. Koyejo, S. Mohamed, A. Agarwal, D. Belgrave, K. Cho, và A. Oh, biên tập, Advances in Neural Information Processing Systems, tập 35, trang 17402–17414. Curran Associates, Inc., 2022.
+
+[24] Xiuying Wei, Yunchen Zhang, Yuhang Li, Xiangguo Zhang, Ruihao Gong, Jinyang Guo, và Xianglong Liu. Outlier suppression+: Accurate quantization of large language models by equivalent and optimal shifting and scaling, 2023.
+
+[25] Coleman Hooper, Sehoon Kim, Hiva Mohammadzadeh, Michael W. Mahoney, Yakun Sophia Shao, Kurt Keutzer, và Amir Gholami. Kvquant: Towards 10 million context length llm inference with kv cache quantization, 2024.
+
+[26] Zirui Liu, Jiayi Yuan, Hongye Jin, Shaochen Zhong, Zhaozhuo Xu, Vladimir Braverman, Beidi Chen, và Xia Hu. Kivi: Plug-and-play 2bit kv cache quantization with streaming asymmetric quantization. 2023.
+
+[27] Zechun Liu, Barlas Oguz, Changsheng Zhao, Ernie Chang, Pierre Stock, Yashar Mehdad, Yangyang Shi, Raghuraman Krishnamoorthi, và Vikas Chandra. Llm-qat: Data-free quantization aware training for large language models. arXiv preprint arXiv:2305.17888, 2023.
+
+[28] Zefan Cai., Yichi Zhang, Bofei Gao, Tianyu Liu, Keming Lu, Wayne Xiong, Yue Dong, Baobao Chang, Junjie Hu, và Wen Xiao. Pyramidkv: Dynamic kv cache compression based on pyramidal information funneling, 2024.
+
+[29] Dongjie Yang, XiaoDong Han, Yan Gao, Yao Hu, Shilin Zhang, và Hai Zhao. Pyramidinfer: Pyramid kv cache compression for high-throughput llm inference, 2024.
+
+[30] Suyu Ge, Yunan Zhang, Liyuan Liu, Minjia Zhang, Jiawei Han, và Jianfeng Gao. Model tells you what to discard: Adaptive kv cache compression for llms, 2024.
+
+[31] Amir Zandieh, Insu Han, Vahab Mirrokni, và Amin Karbasi. Subgen: Token generation in sublinear time and memory, 2024.
+
+[32] Jincheng Dai, Zhuowei Huang, Haiyun Jiang, Chen Chen, Deng Cai, Wei Bi, và Shuming Shi. Sequence can secretly tell you what to discard, 2024.
+
+[33] Noam Shazeer. Fast transformer decoding: One write-head is all you need, 2019.
+
+[34] Joshua Ainslie, James Lee-Thorp, Michiel de Jong, Yury Zemlyanskiy, Federico Lebrón, và Sumit Sanghai. Gqa: Training generalized multi-query transformer models from multi-head checkpoints, 2023.
+
+[35] DeepSeek-AI, Aixin Liu, Bei Feng, Bin Wang, Bingxuan Wang, Bo Liu, Chenggang Zhao, Chengqi Dengr, Chong Ruan, Damai Dai, Daya Guo, Dejian Yang, Deli Chen, Dongjie Ji, Erhang Li, Fangyun Lin, Fuli Luo, Guangbo Hao, Guanting Chen, Guowei Li, H. Zhang, Hanwei Xu, Hao Yang, Haowei Zhang, Honghui Ding, Huajian Xin, Huazuo Gao, Hui Li, Hui Qu, J. L. Cai, Jian Liang, Jianzhong Guo, Jiaqi Ni, Jiashi Li, Jin Chen, Jingyang Yuan, Junjie Qiu, Junxiao Song, Kai Dong, Kaige Gao, Kang Guan, Lean Wang, Lecong Zhang, Lei Xu, Leyi Xia, Liang Zhao, Liyue Zhang, Meng Li, Miaojun Wang, Mingchuan Zhang, Minghua Zhang, Minghui Tang, Mingming Li, Ning Tian, Panpan Huang, Peiyi Wang, Peng Zhang, Qihao Zhu, Qinyu Chen, Qiushi Du, R. J. Chen, R. L. Jin, Ruiqi Ge, Ruizhe Pan, Runxin Xu, Ruyi Chen, S. S. Li, Shanghao Lu, Shangyan Zhou, Shanhuang Chen, Shaoqing Wu, Shengfeng Ye, Shirong Ma, Shiyu Wang, Shuang Zhou, Shuiping Yu, Shunfeng Zhou, Size Zheng, T. Wang, Tian Pei, Tian Yuan, Tianyu Sun, W. L. Xiao, Wangding Zeng, Wei An, Wen Liu, Wenfeng Liang, Wenjun Gao, Wentao Zhang, X. Q. Li, Xiangyue Jin, Xianzu Wang, Xiao Bi, Xiaodong Liu, Xiaohan Wang, Xiaojin Shen, Xiaokang Chen, Xiaosha Chen, Xiaotao Nie, Xiaowen Sun, Xiaoxiang Wang, Xin Liu, Xin Xie, Xingkai Yu, Xinnan Song, Xinyi Zhou, Xinyu Yang, Xuan Lu, Xuecheng Su, Y. Wu, Y. K. Li, Y. X. Wei, Y. X. Zhu, Yanhong Xu, Yanping Huang, Yao Li, Yao Zhao, Yaofeng Sun, Yaohui Li, Yaohui Wang, Yi Zheng, Yichao Zhang, Yiliang Xiong, Yilong Zhao, Ying He, Ying Tang, Yishi Piao, Yixin Dong, Yixuan Tan, Yiyuan Liu, Yongji Wang, Yongqiang Guo, Yuchen Zhu, Yuduan Wang, Yuheng Zou, Yukun Zha, Yunxian Ma, Yuting Yan, Yuxiang You, Yuxuan Liu, Z. Z. Ren, Zehui Ren, Zhangli Sha, Zhe Fu, Zhen Huang, Zhen Zhang, Zhenda Xie, Zhewen Hao, Zhihong Shao, Zhiniu Wen, Zhipeng Xu, Zhongyu Zhang, Zhuoshu Li, Zihan Wang, Zihui Gu, Zilin Li, và Ziwei Xie. Deepseek-v2: A strong, economical, and efficient mixture-of-experts language model, 2024.
+
+[36] Catherine Olsson, Nelson Elhage, Neel Nanda, Nicholas Joseph, Nova DasSarma, Tom Henighan, Ben Mann, Amanda Askell, Yuntao Bai, Anna Chen, Tom Conerly, Dawn Drain, Deep Ganguli, Zac Hatfield-Dodds, Danny Hernandez, Scott Johnston, Andy Jones, Jackson Kernion, Liane Lovitt, Kamal Ndousse, Dario Amodei, Tom Brown, Jack Clark, Jared Kaplan, Sam McCandlish, và Chris Olah. In-context learning and induction heads, 2022.
+
+[37] Wenhao Wu, Yizhong Wang, Guangxuan Xiao, Hao Peng, và Yao Fu. Retrieval head mechanistically explains long-context factuality, 2024.
+
+[38] Ofir Press, Noah A. Smith, và Mike Lewis. Train short, test long: Attention with linear biases enables input length extrapolation, 2022.
+
+[39] Jianlin Su, Yu Lu, Shengfeng Pan, Ahmed Murtadha, Bo Wen, và Yunfeng Liu. Roformer: Enhanced transformer with rotary position embedding, 2023.
+
+[40] Biao Zhang và Rico Sennrich. Root mean square layer normalization, 2019.
+
+A Phụ lục: Chứng minh Định lý 1
+
+Dưới đây chúng tôi đầu tiên đưa ra giới hạn trên cho tích của các query và key, sau đó chỉ ra rằng trọng số attention sẽ giảm về không khi bias vị trí lớn hơn đáng kể so với giới hạn trên đó.
+
+Chứng minh. Vì chúng ta có q = WQhx và k = WKhx trong đó x là đầu vào của khối Attention, điều này dẫn đến
+qk⊺ = xWQhWKhx⊺ ≤ ‖WQhWKh‖2‖x‖2. (6)
+
+Vì x được đạt được sau LayerNorm, có nghĩa là
+x = γ ⊙ (x̂ − µ)/σ + b,
+µ = 1/d Σd i=1 x̂i, σ = √(1/d Σd i=1 (x̂i − µ)²).
+
+Ở đây x̂ là đầu vào của LayerNorm, d là chiều của nó và x̂i là chiều thứ i của x̂. Phương trình trên dẫn đến
+‖x‖2 = ‖γ ⊙ (x̂ − µ)/σ + b‖2 ≤ 2‖γ ⊙ (x̂ − µ)/σ‖2 + 2‖b‖2 ≤ 2‖γ‖2 + 2‖b‖2. (7)
+
+Kết hợp (6) và (7) chúng ta có
+qk⊺ ≤ ‖WQhWKh‖2√(2‖γ‖2 + 2‖b‖2) (8)
+
+Để đưa ra giới hạn trên cho trọng số attention, chúng ta có
+Attnm→n(q;k) = exp(Sm→n(q;k)) / Σm n=0 exp(Sm→n(q;k))
+= exp(qk⊺ − lh(m−n)) / Σm n=0 exp(Sm→n(q;k))
+≤ exp(qk⊺ − lh(m−n)) / exp(Sn→n(q;k))
+≤ exp(qk⊺ − lh(m−n)) / exp(qq⊺)
+≤ exp(qk⊺ − lh(m−n))
+= exp(qk⊺) / exp(lh(m−n)).
+
+Do đó để đảm bảo Attnm→n(q;k) ≤ ε, tương đương với log(Attnm→n(q;k)) ≤ log(ε), chúng ta cần
+log(Attnm→n(q;k)) ≤ qk⊺ − lh(m−n) ≤ log(ε)
+
+Đưa (8) vào phương trình trên, chúng ta có
+‖WQhWKh‖2√(2‖γ‖2 + 2‖b‖2) − lh(m−n) ≤ log(ε),
+
+điều này cho chúng ta
+m−n ≥ (2‖WQhWKh‖2√(‖γ‖2+‖b‖2) − log(ε)) / lh.
+
+Trong trường hợp này, chúng ta có
+Attnm→n(q;k) ≤ ε.

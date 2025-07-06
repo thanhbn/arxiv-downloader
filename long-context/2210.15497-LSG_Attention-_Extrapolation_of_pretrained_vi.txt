@@ -1,0 +1,347 @@
+# LSG Attention: Ngoại suy các Transformer được huấn luyện trước cho các chuỗi dài
+
+Charles Condevaux
+CHROME
+University of Nîmes, France
+charles.condevaux@unimes.fr
+
+Sébastien Harispe
+EuroMov Digital Health in Motion,
+Univ Montpellier, IMT Mines Ales, France
+sebastien.harispe@mines-ales.fr
+
+## Tóm tắt
+
+Các mô hình Transformer đạt được hiệu suất tối ưu trên một loạt các tác vụ NLP. Tuy nhiên, chúng gặp phải một hạn chế nghiêm trọng do cơ chế self-attention, gây ra độ phức tạp O(n²) đối với độ dài chuỗi. Để giải quyết hạn chế này, chúng tôi giới thiệu kiến trúc LSG dựa trên attention Cục bộ, Thưa thớt và Toàn cục. Chúng tôi chỉ ra rằng LSG attention nhanh, hiệu quả và cạnh tranh trong các tác vụ phân loại và tóm tắt trên các tài liệu dài. Thú vị là, nó cũng có thể được sử dụng để điều chỉnh các mô hình được huấn luyện trước hiện có để ngoại suy hiệu quả đến các chuỗi dài hơn mà không cần huấn luyện bổ sung. Cùng với việc giới thiệu cơ chế LSG attention, chúng tôi đề xuất các công cụ để huấn luyện các mô hình mới và điều chỉnh các mô hình hiện có dựa trên cơ chế này.
+
+## 1 Giới thiệu
+
+Các mô hình Transformer [1] ngày nay là tối ưu trong nhiều lĩnh vực, và đặc biệt trong NLP nơi chúng được sử dụng trong các mô hình ngôn ngữ tổng quát, và để giải quyết thành công một số tác vụ cụ thể như tóm tắt tài liệu, dịch máy và xử lý giọng nói để kể một vài ví dụ [2,3]. Nền tảng của các mô hình Transformer là cơ chế Attention được sử dụng để xây dựng lặp đi lặp lại các biểu diễn phức tạp phụ thuộc ngữ cảnh của các phần tử chuỗi, ví dụ như tokens, bằng cách tổng hợp động các biểu diễn trước đó của các phần tử này. Sử dụng self-attention, một dạng Attention phổ biến, điều này được thực hiện bằng cách tính toán các điểm attention đầy đủ xác định cách mỗi biểu diễn phần tử trước đó sẽ đóng góp vào việc xây dựng biểu diễn mới của một phần tử. Xem xét một chuỗi n phần tử, việc tính toán các điểm attention do đó có độ phức tạp O(n²) điều này trở thành rào cản khi các chuỗi lớn phải được xử lý.
+
+Hơn nữa, trong bối cảnh hiện tại nơi một số lượng lớn các mô hình dựa trên full attention đã được huấn luyện trên các tập dữ liệu và tác vụ khác nhau, chúng tôi cũng quan tâm đến việc ngoại suy các mô hình đó đến các chuỗi dài hơn bằng cách đơn giản thay thế full attention bằng các cơ chế attention mới sau huấn luyện. Các mô hình được huấn luyện trước phổ biến (ví dụ BERT, RoBERTa) thực sự được biết là hoạt động kém khi được ngoại suy đến các chuỗi có độ dài vượt quá 512 tokens được xem xét trong quá trình huấn luyện. Điều này là do bản chất của cơ chế attention ảnh hưởng lớn đến khả năng ngoại suy: full attention thường thất bại trong việc ngoại suy, ngay cả khi xem xét các điều chỉnh hậu hoc, ví dụ thêm hằng số trong ma trận điểm [4], sử dụng một positional embedding tương đối [5] hoặc nhân đôi positional embedding [6]. Việc định nghĩa các cơ chế attention mới có thể thay thế hiệu quả full attention trong các mô hình được huấn luyện trước không có khả năng xử lý các chuỗi dài ban đầu sẽ tránh được các chi phí do việc huấn luyện các mô hình ngôn ngữ lớn từ đầu.
+
+Các đóng góp chính của bài báo này là:
+
+1. LSG (Local Sparse Global) attention, một phương pháp O(n) hiệu quả để xấp xỉ self-attention cho việc xử lý các chuỗi dài, được giới thiệu.¹
+
+2. Các kết quả chứng minh rằng LSG nhanh, hiệu quả và cạnh tranh trên các tác vụ phân loại và tóm tắt được áp dụng cho các tài liệu dài được trình bày. Cũng được chỉ ra rằng LSG có thể điều chỉnh và ngoại suy các mô hình được huấn luyện trước hiện có không dựa trên LSG, với ít hoặc không cần huấn luyện bổ sung.
+
+3. Một quy trình và các công cụ đồng hành được đề xuất để chuyển đổi các mô hình và checkpoints hiện có khác nhau (BERT, RoBERTa, DistilBERT, BART) từ HuggingFace sang biến thể LSG của chúng.²
+
+So với một số đóng góp nhằm giảm độ phức tạp của self-attention được giới thiệu sau đây, một trọng tâm cụ thể được đưa ra trong công trình của chúng tôi về việc ngoại suy các mô hình Transformer hiện có, tức là tái sử dụng, đến các chuỗi dài hơn.
+
+## 2 Các công trình liên quan
+
+Một số đóng góp đã được dành cho việc tối ưu hóa cơ chế Attention. Bốn loại phương pháp có thể được phân biệt trong tài liệu: (i) các mô hình hồi quy như Transformers-XL [7] và Compressive Transformers [8] duy trì một bộ nhớ về kích hoạt quá khứ ở mỗi lớp để bảo tồn thông tin ngữ cảnh tầm xa; (ii) các mô hình dựa trên phân tích nhân tố hoặc kernels nhằm nén các ma trận điểm attention, như Linformer [9] hoặc Performer [10]; (iii) các mô hình dựa trên clustering như Reformer [11] động xác định các mẫu attention đủ điều kiện (tức là nơi attention có thể được thực hiện); và (iv) các mô hình dựa trên các mẫu attention cố định hoặc thích ứng, ví dụ Longformer [6] hoặc Big Bird [12].
+
+Các phương pháp hồi quy xử lý chuỗi lặp đi lặp lại bằng cách duy trì một bộ nhớ để cho phép các phụ thuộc tầm xa. Chúng thường gặp phải các hạn chế do các quy trình lan truyền tiến và lan truyền ngược cụ thể, chậm và khó thực hiện. Ngoài ra, một trong những hướng nghiên cứu chính để giảm độ phức tạp của Attention do đó là thực hiện thưa thớt bằng cách hạn chế số lượng phần tử mà các biểu diễn mới sẽ dựa trên, tức là giảm số lượng phần tử có điểm attention khác không. Phương pháp này được thúc đẩy bởi quan sát về các mẫu vị trí toàn cục hoặc phụ thuộc dữ liệu của các điểm attention khác không tùy thuộc vào tác vụ [13].
+
+Tính thưa thớt của các điểm attention trong cơ chế Attention truyền thống thực sự được ghi chép trong tài liệu. Chẳng hạn, đã được chỉ ra rằng trong thực tế, full attention có xu hướng tăng trọng số cho các phần tử gần trong trung bình, đặc biệt đối với MLM, dịch máy và các tác vụ seq-to-seq nói chung [14]. Hơn nữa, theo các phân tích về việc sử dụng multi-head full attention trên các tác vụ cụ thể, ví dụ dịch máy, nhiều head học các mẫu đơn giản tương tự [15]. Các mẫu dư thừa như vậy có thể được mã hóa cứng triển khai các mẫu vị trí cố định, cuối cùng theo cách phụ thuộc vào tác vụ.
+
+Hai phương pháp chính được thảo luận trong tài liệu để triển khai thưa thớt: các mẫu cố định hoặc thích ứng dựa trên việc các điểm attention có được tính toán xem xét (1) các phần tử được xác định trước cố định dựa trên vị trí của chúng trong chuỗi, hay (2) các phần tử được chọn từ một quy trình nhất định. Ví dụ, [16] đã chỉ ra rằng các convolution O(n) cố định có thể hoạt động cạnh tranh trong dịch máy. Longformer đề xuất một phương pháp O(n) thay thế dựa trên các mẫu trượt và toàn cục [6]. Trong bối cảnh xử lý hình ảnh, âm thanh và văn bản, [13] đề xuất sparse Transformer, một mô hình O(n√n) dựa trên phân tích thưa thớt của ma trận attention dựa trên các sơ đồ attention 2D được phân tích cụ thể. Tuy nhiên, các phương pháp này ngăn cản việc sử dụng các mẫu động phụ thuộc vào tác vụ. Xem xét các mẫu thích ứng, [16] cũng giới thiệu dynamic convolutions như một sự thay thế độ phức tạp O(n) cho self-attention. Các kernel xác định tầm quan trọng của các phần tử ngữ cảnh được chỉ định tại thời điểm suy luận thay vì được cố định sau huấn luyện. Một ví dụ khác là Reformer [11], một phương pháp O(nlogn) dựa trên locality-sensitive hashing (LSH) dựa trên các phép chiếu ngẫu nhiên.
+
+Theo cách ngang, một số tác giả, được thúc đẩy một cách rõ ràng hoặc ngầm định bởi bản chất tổng hợp của ngôn ngữ đã nghiên cứu các phương pháp có cấu trúc trong đó các chuỗi con (tức là các khối) được xử lý độc lập và sau đó được tổng hợp. Điều này nhằm triển khai một bộ nhớ động cục bộ hoặc toàn cục để xem xét các phụ thuộc gần đến tầm xa. [17] giới thiệu một phương pháp blockwise để giảm độ phức tạp bậc hai do các chuỗi lớn trong các kiến trúc encoder-decoder. [18] đề xuất một chunkwise attention trong đó attention được thực hiện theo cách blockwise, thích ứng chia chuỗi thành các chunk nhỏ trên đó soft attention được tính toán. Ý tưởng này cũng được sử dụng trong Transformer-XL [7].
+
+[19] đề xuất một cơ chế masked block self-attention trong đó toàn bộ chuỗi được chia thành các khối, để tiếp tục 1) áp dụng self-attention intra-block để mô hình hóa các ngữ cảnh cục bộ, để tiếp tục 2) áp dụng self-attention inter-block để nắm bắt các phụ thuộc tầm xa. Một phương pháp như vậy cho phép triển khai một số dạng kết nối giữa tất cả các vị trí qua nhiều bước mà không bị hạn chế bởi các giới hạn full attention. Điều này cũng có thể đạt được bằng các kỹ thuật phân tích nhân tố, ví dụ [13]. Gần đây hơn, các tác giả đã đề xuất các cơ chế global attention mã hóa thông tin liên quan đến các khối mà attention dựa trên [20, 21, 22].
+
+Bài báo này trình bày LSG (Local, Sparse and Global) attention dựa trên block local attention để nắm bắt ngữ cảnh cục bộ, sparse attention để nắm bắt ngữ cảnh mở rộng và global attention để cải thiện luồng thông tin. Trái ngược với công trình trước đây chủ yếu tập trung vào việc định nghĩa các mô hình mới, cơ chế LSG Attention được đề xuất là agnostic mô hình và nhằm tạo điều kiện điều chỉnh các mô hình hiện có (được huấn luyện trước) để chúng có thể được sử dụng trên các chuỗi dài.
+
+## 3 LSG Attention
+
+LSG attention dựa trên hai điểm chính. Giả định rằng cục bộ, một token cần nắm bắt thông tin mức thấp do đó attention dày đặc được ưa thích. Mặt khác, khi ngữ cảnh tăng lên, thông tin mức cao hơn là đủ. Điều này dẫn đến nhu cầu kết nối với một số lượng hạn chế các token theo các quy tắc lựa chọn và tính toán cụ thể. Phương pháp LSG dựa trên 3 thành phần: block local attention để nắm bắt ngữ cảnh cục bộ, sparse attention để nắm bắt ngữ cảnh mở rộng và global attention để cải thiện luồng thông tin. Một so sánh với các mẫu attention của Big Bird và Longformer được hiển thị trong Hình 1.
+
+LSG Big Bird Longformer
+Hình 1: Các mẫu Attention
+
+### 3.1 Local Attention
+
+Longformer phụ thuộc vào một cửa sổ trượt có độ dài cố định để thực hiện local attention. Tuy nhiên, phương pháp này khó tối ưu hóa và phải dựa vào một kernel CUDA tùy chỉnh để có hiệu quả tính toán. Để cải thiện tốc độ huấn luyện và suy luận tổng thể, chúng tôi tận dụng một quy trình dựa trên khối tương tự như Big Bird. Chuỗi được chia thành nb chunk không chồng chéo có kích thước bt. Đối với một khối nhất định, mỗi token chú ý đến các token bên trong khối, cũng như đến các token trong các khối trước và sau. Trong cấu hình này, cửa sổ local attention không đối xứng vì một token có thể kết nối tới 2bt-1 token ở bên trái hoặc bên phải.
+
+### 3.2 Sparse Attention
+
+Các kết nối thưa thớt được sử dụng để mở rộng ngữ cảnh cục bộ bằng cách chọn một tập hợp bổ sung các token theo một tập hợp các quy tắc. Các token này có thể được chọn trực tiếp dựa trên một metric cụ thể hoặc sử dụng một số tính toán như phương pháp pooling. Trong phương pháp được đề xuất, mỗi attention head có thể xử lý các sparse token khác nhau một cách độc lập. Sparse attention cũng dựa trên một cấu trúc khối nơi việc lựa chọn thưa thớt được thực hiện bên trong mỗi khối. Năm tiêu chí thay thế có thể được sử dụng trong LSG.
+
+**Head-wise strided** Lấy cảm hứng từ mô hình Hepos [23], một mẫu lựa chọn cố định được định nghĩa. Mỗi attention head sẽ chú ý đến một tập hợp các token theo một stride cụ thể được định nghĩa là hệ số sparsify f. Hình 2 hiển thị mẫu lựa chọn.
+
+Head 1
+Head 2Block
+Sequence
+Hình 2: Lựa chọn head-wise strided với stride là 2.
+
+**Head-wise block strided** Mẫu lựa chọn này tương tự như mẫu trước nhưng chọn các token liên tiếp thay thế. Hình 2 hiển thị mẫu lựa chọn.
+
+Head 1
+Head 2Block
+Sequence
+Hình 3: Lựa chọn block strided với stride là 2.
+
+**Average pooling** Một cách đơn giản để giảm độ dài chuỗi. Sau khi chia chuỗi thành các khối, các sparse token được tính toán bằng average pooling. Đối với một khối có kích thước bt và hệ số sparsify f, chúng tôi pool bên trong mỗi khối với một cửa sổ f và một stride f để tạo ra bt/f token.
+
+**Max norm** Mục tiêu của phương pháp dựa trên norm là chọn các token có khả năng được weighted cao nhất trong ma trận điểm. Việc tìm những key này một cách hiệu quả là khó khăn trong thực tế nên chúng tôi sử dụng một metric đơn giản và xác định. Đối với một query và một key q,k ∈ Rd, chúng ta có thể viết:
+
+qk^T = cos(θ)||q||||k||
+
+Trong tình huống này dấu cos(θ) là không xác định. Tuy nhiên, nếu nó dương và ||k|| cao, key sẽ có khả năng thống trị softmax bất kể query. Sau khi chia chuỗi thành các khối, chúng tôi chọn bên trong mỗi khối và mỗi head bt/f token có key norm cao nhất.
+
+**LSH Clustering** Phương pháp này là một phương pháp không xác định vì nó dựa trên thuật toán LSH [24]. Đối với mỗi khối, bt/f cluster được xây dựng bằng một vòng LSH duy nhất. Để có c = bt/f hash và cho một đầu vào x ∈ Rd, một ma trận ngẫu nhiên R ∈ Rd×c/2 được tạo, sao cho
+
+h(x) = arg max([xR; -xR])
+
+với [a;b] là sự nối của hai vector. Sử dụng ma trận key làm đầu vào, mỗi token bên trong khối nhận được một chỉ số cluster từ h(x). Các token bên trong một cluster được lấy trung bình.
+
+**Tính toán** Để giảm chi phí tính toán, mẫu attention được thiết kế để tính toán mỗi kết nối một lần. Để làm điều này, các local và sparse token được chọn sao cho không có sự chồng chéo giữa chúng trong quá trình tính toán attention. Mỗi query được kết nối với 3 khối local và 2 khối sparse của các key. Độ dài ngữ cảnh tối đa (khoảng cách giữa hai key) sau đó bằng 3×bt + 2×bt/f. Việc nối các local và sparse key được hiển thị trong Hình 4. Đối với causal attention, khối local thứ ba và khối sparse thứ hai có thể bị bỏ qua trong quá trình tính toán.
+
+ab Sparse context Sparse context
+ab Sequence
+Local context
+Hình 4: Các ngữ cảnh local và sparse với kích thước khối là 2 và hệ số sparsity là 4. Các query a và b sẽ chú ý đến 6 local key và 4 sparse key.
+
+### 3.3 Global Attention
+
+Các global token cải thiện luồng thông tin bên trong mô hình. Chúng chú ý đến mọi token trên toàn chuỗi và tất cả các token chú ý đến chúng. Thay vì chọn một tập hợp con của các token và định nghĩa chúng là global, chúng được thêm vào trước chuỗi và được huấn luyện bằng ma trận embedding riêng của chúng, do đó số lượng của chúng là một siêu tham số bổ sung. Khi một mô hình được chuyển đổi sang phiên bản LSG của nó, global token đầu tiên được khởi tạo là tổng của token [CLS] (hoặc <s>) và vị trí đầu tiên từ positional embedding. Các global token khác được khởi tạo là tổng của token [MASK] (hoặc <mask>) và các vị trí khác từ positional embedding.
+
+### 3.4 Positional Embedding
+
+Cần thiết phải sửa đổi ma trận positional embedding để tái sử dụng các mô hình hiện có để xử lý các chuỗi dài. Tương tự như các tác giả của Longformer [6], thay vì khởi tạo ngẫu nhiên các vị trí mới, ma trận ban đầu được nhân đôi và nối cho đến khi đạt được độ dài chuỗi tối đa mong muốn.
+
+## 4 Thí nghiệm
+
+Mô hình LSG được triển khai trong PyTorch và nhằm thực hiện ngoại suy mô hình bằng cách thay thế full attention bằng LSG attention trong các kiến trúc khác nhau của thư viện HuggingFace. Trong các thí nghiệm, checkpoint RoBERTa-base chính thức cho các tác vụ phân loại và checkpoint BART-base cho các tác vụ tóm tắt được ngoại suy bằng LSG attention. Tất cả các metric được báo cáo cho tập test trừ trường hợp chỉ có tập validation. Chúng tôi sử dụng batch size 32, learning rate giảm tuyến tính, dropout rate 0.10 và optimizer Adam (0.9, 0.999) [25] cho các thí nghiệm phân loại và tóm tắt. Một thí nghiệm so sánh một số xấp xỉ attention để ngoại suy RoBERTa trong một tác vụ MLM được thảo luận đầu tiên vì nó được sử dụng để hạn chế số lượng các lựa chọn thay thế được kiểm tra, và do đó giảm chi phí của các đánh giá được đề xuất. Tất cả các thí nghiệm được chạy trên GPU NVIDIA Quadro RTX 8000 48Gb.
+
+### 4.1 Ngoại suy RoBERTa trên MLM
+
+Một bài kiểm tra đơn giản trên tác vụ MLM được thực hiện để kiểm tra khả năng của một cơ chế attention để ngoại suy một mô hình đến các chuỗi dài hơn mà không cần huấn luyện bổ sung. Để làm điều này, một mô hình RoBERTa-base được xem xét và hai thí nghiệm được tiến hành. Đầu tiên, full attention được thay thế bằng các loại attention khác nhau (kernel, factorization, local, fixed pattern) và mỗi mô hình được đánh giá trên các chuỗi có cùng độ dài như những chuỗi được xem xét trong quá trình huấn luyện RoBERTa ban đầu (512 token). Đối với thí nghiệm thứ hai, khả năng ngoại suy của chúng đến các chuỗi 4,096 token mà không cần huấn luyện bổ sung được kiểm tra (positional embedding được nhân đôi 8 lần).
+
+Một mẫu ngẫu nhiên từ Wikipedia + BookCorpus + CC_News được sử dụng; BPC và độ chính xác MLM được báo cáo trong Bảng 1. Tác giả của RoBERTa báo cáo mất mát BPC là 1.880; chúng tôi có được mất mát tương đương là 1.881 trên mẫu ngẫu nhiên này.
+
+Chỉ có Longformer, Big Bird và LSG attention có thể đạt được BPC cạnh tranh trong khi xử lý các chuỗi có cùng độ dài như những chuỗi được xem xét trong quá trình huấn luyện RoBERTa ban đầu. Các phương pháp khác như Linformer, Performer hoặc Reformer đòi hỏi MLM fine-tuning bổ sung để tận dụng một checkpoint hiện có. Có thể thấy rằng RoBERTa thất bại trong việc ngoại suy đến các chuỗi dài hơn (+2.454 BPC), điều này làm nổi bật rằng full attention không phù hợp cho ngoại suy. Kết quả của Longformer và Big Bird attention cho thấy khả năng của các phương pháp này để thực hiện một số dạng ngoại suy. Do đó, chúng tôi hạn chế so sánh của mình với hai phương pháp này để giảm chi phí thử nghiệm của chúng tôi.
+
+### 4.2 Các tác vụ phân loại
+
+Để đánh giá sự liên quan của LSG, chúng tôi so sánh phương pháp của mình với các kiến trúc mô hình phổ biến có thể xử lý các chuỗi dài với số lượng tham số tương tự. Các thí nghiệm được thực hiện trên Longformer [6], Big Bird [12] và trên tất cả các loại sparse attention với kích thước khối là 128 và hệ số sparsify là 4. Tất cả các mô hình được fine-tune trên các tập dữ liệu IMDb, ArXiv, Patent, Scotus, EcthrA và EcthrB được trình bày dưới đây.
+
+#### 4.2.1 Tập dữ liệu
+
+Các tập dữ liệu có sẵn trên HuggingFace hub, xem Phụ lục D, ví dụ thống kê chi tiết trong Bảng 15.
+
+**IMDb** [29] tác vụ phân loại phân tích cảm xúc nhị phân từ các đánh giá phim.
+
+**ArXiv** [30] tập hợp các tài liệu từ ArXiv nơi mục tiêu là dự đoán một chủ đề từ 11 lớp có sẵn. Vì không có phân chia chính thức, một phân chia ngẫu nhiên được tạo ra gồm 28K, 2.5K và 2.5K tài liệu cho train, validation và test.
+
+**Patent** [31] tập con của tập dữ liệu tóm tắt Big Patent. Tác vụ được định nghĩa lại là một tác vụ phân loại nơi mục tiêu là dự đoán danh mục bằng sáng chế sử dụng toàn bộ tài liệu (9 lớp). Một phân chia ngẫu nhiên gồm 25K, 5K và 5K tài liệu cho train, validation và test được tạo ra.
+
+Một số lĩnh vực cụ thể rất phụ thuộc vào việc xử lý các chuỗi dài, ví dụ lĩnh vực pháp lý trong đó các câu có xu hướng dài và phức tạp. Để chứng minh khả năng của LSG attention trong việc tận dụng các mô hình được huấn luyện trước trong những trường hợp như vậy, ba tập dữ liệu sau được chọn từ LexGlue [32], một benchmark tập trung vào các tài liệu pháp lý. Các tác vụ nơi đầu vào trung bình dài hơn đáng kể so với 512 token đã được chọn.
+
+**Scotus** Cho một ý kiến tòa án, tác vụ là dự đoán lĩnh vực vấn đề liên quan trong số 14 lựa chọn.
+
+**ECtHRa và ECtHRb** Mục tiêu là dự đoán những điều khoản nào của Tòa án Nhân quyền Châu Âu (ECHR) đã bị vi phạm (nếu có) từ mô tả trường hợp: tác vụ multi-label (10 + 1 nhãn).
+
+#### 4.2.2 Thiết lập huấn luyện và kiến trúc
+
+Để có một so sánh công bằng giữa các mô hình và kiến trúc, fine-tuning được thực hiện với cùng learning rate, số bước (hoặc epoch) và batch size. Để chỉ ra rằng LSG attention tương thích với các kiến trúc khác nhau, các tác vụ LexGlue cũng được chạy với LEGAL-BERT [33] được chuyển đổi sang phiên bản LSG của nó bằng các công cụ chuyển đổi được cung cấp.
+
+#### 4.2.3 Kết quả
+
+Chúng tôi báo cáo tất cả kết quả thí nghiệm trong Bảng 2. Chúng tôi quan sát thấy rằng LSG cạnh tranh với các mô hình Longformer và Big Bird với các chuỗi đầu vào lên đến 4096 token. Một sự khác biệt lớn nằm ở chính việc triển khai vì mô hình LSG nhanh gấp đôi để huấn luyện trên những độ dài này mà không có chi phí bộ nhớ bổ sung; khía cạnh này được thảo luận trong Phần 5.
+
+Trên các tác vụ Patent, ECtHRa và ECtHRb, khả năng xử lý các chuỗi dài hơn cải thiện đáng kể các F-measure so với một mô hình RoBERTa vanilla (full attention). Chúng tôi cũng quan sát thấy rằng mô hình Big Bird nói chung hơi kém hơn so với đối tác của nó trừ tập dữ liệu ECtHRb. Điều này có thể đến từ cơ chế attention ngẫu nhiên có thể đòi hỏi các bước huấn luyện bổ sung. Các mô hình LSG-LSH và Big Bird bị ảnh hưởng bởi tính ngẫu nhiên trong quá trình suy luận, do đó hiệu suất của chúng có thể khác nhau giữa các lần chạy.
+
+Việc ngoại suy LEGAL-BERT với LSG để xử lý các chuỗi dài hơn cải thiện dự đoán; hành vi này được mong đợi và đã được quan sát bởi các tác giả của benchmark LexGlue. Việc lựa chọn sparse attention có khả năng cụ thể cho từng tác vụ. Việc chỉ sử dụng local attention với kích thước khối lớn cũng là một lựa chọn khả thi. Vai trò của các global token không được thảo luận ở đây vì chúng tôi chỉ sử dụng một cho tất cả các thí nghiệm. Chúng tôi chỉ ra trong phần tiếp theo với các tác vụ tóm tắt tính hữu ích của các token như vậy.
+
+### 4.3 Các tác vụ tóm tắt
+
+Tất cả các thí nghiệm tóm tắt được chạy sử dụng learning rate 8e-5, warmup 10%, length penalty 2.0 và beam size 5 cho beam search. Tập validation được sử dụng để chọn độ dài generation tối đa. Chúng tôi chọn đánh giá các mô hình của mình trên các tác vụ tóm tắt nơi đầu vào dài hơn đáng kể so với 1k token. Chúng tôi fine-tune mô hình của mình trên các tập dữ liệu ArXiv, PubMed, MultiNews và MediaSum mà chúng tôi trình bày dưới đây trong tương ứng 6, 8, 12 và 6 epoch cho đầu vào độ dài 4,096.
+
+#### 4.3.1 Tập dữ liệu
+
+Các tập dữ liệu tiếp theo có sẵn trên HuggingFace hub, xem Phụ lục D.
+
+**ArXiv và Pubmed** [34] là các tập hợp tài liệu từ ArXiv và Pubmed; mục tiêu là tạo ra một abstract sử dụng một tài liệu làm đầu vào.
+
+**MultiNews** [35] liên quan đến việc tạo ra các tóm tắt được viết bởi con người từ các tập hợp tài liệu tin tức.
+
+**MediaSum** [36] bao gồm việc sử dụng các bản ghi phỏng vấn từ phương tiện CNN và NPR để tạo ra một tóm tắt.
+
+Chúng tôi báo cáo thống kê chi tiết trong Bảng 15 trong Phụ lục D. Độ dài trung bình và phân vị 90% của tất cả các tài liệu và tóm tắt sử dụng dấu phân cách khoảng trắng được báo cáo. Lưu ý rằng các abstract ArXiv dài hơn đáng kể trong tập huấn luyện (trung bình 300) so với trong các tập validation và test (trung bình 173). Hầu hết các mô hình tóm tắt bị giới hạn ở đầu vào 1,000 token, do đó chúng không thể xử lý một tài liệu đầy đủ để tạo ra một tóm tắt.
+
+#### 4.3.2 Thiết lập huấn luyện và kiến trúc
+
+Chúng tôi đầu tiên chuyển đổi mô hình BART-base [37] sang phiên bản LSG của nó bằng cách thay thế full attention trong phần encoder và thêm các global token. Mô hình sau đó được fine-tune trên đầu vào độ dài 4,096 và được đánh giá. Để giảm chi phí tính toán, các thí nghiệm trên đầu vào độ dài 16,384 được khởi động warm từ các thí nghiệm độ dài 4,096 sử dụng script chuyển đổi. Mô hình sau đó được fine-tune trong một epoch duy nhất nếu cần thiết sử dụng các tham số huấn luyện tương tự. Chúng tôi đề xuất 3 thiết lập cho độ dài 16,384.
+
+Đầu tiên chúng tôi đánh giá mô hình với ngoại suy thuần túy từ độ dài 4,096 (không có huấn luyện bổ sung). Trong thiết lập thứ hai, chúng tôi ngoại suy và thêm 64 global token mà chúng tôi chọn fine-tune. Trong thiết lập cuối cùng, chúng tôi ngoại suy, chúng tôi thêm 64 global token và chúng tôi fine-tune toàn bộ mô hình.
+
+Ngoại suy được thực hiện bằng cách nối 4 bản sao của ma trận positional embedding (4×4096).
+
+So với tài liệu hiện có, mô hình khá nhỏ và một chuỗi đầu vào 16384 token có thể vừa trên một GPU 48Gb trong quá trình huấn luyện mà không cần dựa vào gradient-checkpointing. Kích thước của các mô hình tóm tắt khác nhau từ tài liệu được báo cáo trong Bảng 3.
+
+#### 4.3.3 Kết quả
+
+LSG-BART được so sánh với các mô hình tối ưu bằng cách báo cáo kết quả từ các bài báo tương ứng của chúng. Chúng tôi sử dụng các metric đánh giá ROUGE-1, ROUGE-2 và ROUGE-L làm điểm so sánh.
+
+Như được hiển thị trong Bảng 4, 5, 6 và 7, phương pháp của chúng tôi có thể đạt được hiệu suất cạnh tranh với kích thước hạn chế mà không cần huấn luyện trước một mô hình mới từ đầu. Yếu tố quan trọng thứ hai là khả năng của phương pháp này để cải thiện metric từ đầu vào độ dài 4.096 đến 16.384 mà không cần fine-tuning bổ sung, điều này đặc biệt đúng trên các tập dữ liệu ArXiv và PubMed có các chuỗi đầu vào dài nhất. Fine tuning các global token bổ sung tiếp tục cải thiện metric trong khi hạn chế chi phí và thời gian huấn luyện so với một mô hình được tune đầy đủ.
+
+Trên tập dữ liệu ArXiv (Bảng 4), độ dài generation sequence tối đa là 320 token được chọn, phương pháp của chúng tôi cạnh tranh với mọi kích thước của mô hình LongT5. Tuy nhiên, các tác giả chỉ ra rằng họ đã sử dụng greedy generation thay vì beam search, do đó kết quả của họ có khả năng bị đánh giá thấp.
+
+Trên tập dữ liệu PubMed (Bảng 5), độ dài generation sequence tối đa là 512 token được chọn, phương pháp của chúng tôi gần với các mô hình Hepos cũng dựa trên BART. LongT5 tốt hơn đáng kể ở đây và sự khác biệt này có thể liên quan đến cách mô hình này được huấn luyện trước và tập dữ liệu được sử dụng cho điều này.
+
+Trên tập dữ liệu MultiNews (Bảng 6), độ dài generation sequence tối đa là 320 token được chọn, phương pháp của chúng tôi lại gần với các mô hình LongT5. Trong khi ngoại suy cải thiện metric, fine-tuning bổ sung có tác động tiêu cực. Vì tập dữ liệu này khá nhỏ (45K ví dụ, 1,400 bước), fine-tuning một epoch duy nhất không đủ để mô hình hội tụ đúng cách, cần huấn luyện lâu hơn.
+
+Trên tập dữ liệu MediaSum (Bảng 7), độ dài generation sequence tối đa là 128 token được chọn. Phương pháp của chúng tôi gần với mô hình LongT5-base một lần nữa. Tập dữ liệu này có đầu vào ngắn nhất, do đó việc xử lý tối đa 16,384 token có tác động biên lề đến hiệu suất.
+
+Kết quả bổ sung sử dụng các loại sparse attention khác nhau được chi tiết trong Phụ lục C.
+
+## 5 Chi tiết triển khai
+
+Các triển khai được đề xuất hoàn toàn dựa trên những triển khai của HuggingFace trong đó các global token được thêm vào trước chuỗi và lớp attention được thay thế bằng phiên bản hiệu quả của nó; các yếu tố khác không được sửa đổi.
+
+Để cải thiện hiệu quả, các đầu vào được chia thành các khối. Mỗi khối query được kết nối với 3 khối local key, 2 khối sparse key và với tất cả global key. Do đó đối với head h, query, key và value có hình dạng Qh ∈ R^(nb×bt×dh) và Kh,Vh ∈ R^(nb×(5bt+g)×dh) với nb là số khối, bt là kích thước khối, dh là kích thước head và g là số global token. Định dạng này cải thiện tốc độ tính toán như được hiển thị trong Bảng 8. Global attention được tính toán độc lập.
+
+## 6 Kết luận
+
+Chúng tôi đã trình bày LSG attention, một thay thế O(n) hiệu quả mới cho cơ chế full attention dựa trên local, sparse và global attention. Kết quả của chúng tôi trên các tác vụ MLM, phân loại và tóm tắt cho thấy rằng LSG là một sự thay thế cạnh tranh cho full attention cho các Transformer được huấn luyện trước để ngoại suy hiệu quả đến các chuỗi đầu vào dài. Chúng tôi cũng đề xuất một triển khai tối ưu của cơ chế LSG attention trên HuggingFace, cải thiện tốc độ huấn luyện bằng hệ số 2 mà không có chi phí bộ nhớ bổ sung so với các mô hình Longformer và Big Bird. Bằng cách cung cấp một công cụ chuyển đổi để tận dụng các mô hình và checkpoint hiện có (BERT, RoBERTa, DistilBERT, BART), phương pháp được đề xuất loại bỏ nhu cầu huấn luyện lại tốn kém các mô hình hiện có để xử lý các chuỗi dài.
+
+### Hạn chế
+
+Mặc dù công cụ chuyển đổi được đề xuất cho phép chuyển đổi các checkpoint hiện có của các mô hình thường được sử dụng, ngày nay cần thiết phải triển khai lại phương pháp cho mỗi kiến trúc do thiếu tính đồng nhất của các triển khai HuggingFace (chưa có wrapper). Do đó việc bảo trì có thể là một vấn đề lâu dài để đảm bảo tương thích. Tuy nhiên chúng tôi cung cấp các ví dụ triển khai cũng như tài liệu để dễ dàng quy trình chuyển đổi.
+
+Liên quan đến attention được đề xuất, việc lựa chọn sparse attention vẫn là một siêu tham số bổ sung cụ thể cho từng tác vụ. Không có quy tắc ngón tay cái để chọn loại sparse, kích thước khối và hệ số sparsity. Vai trò của các global token cũng có thể tranh luận. Việc sử dụng chúng có thể làm chậm tốc độ huấn luyện và hội tụ. Trong thực tế, tác động của các token này là tích cực nếu mô hình được huấn luyện một số bước đủ.
+
+Mặc dù phương pháp cho phép một mô hình hiện có được tái sử dụng mà không cần phải huấn luyện trước từ đầu và giảm thời gian của các giai đoạn fine-tuning, độ phức tạp vẫn tuyến tính với độ dài của đầu vào. Điều này không loại bỏ chi phí năng lượng cần thiết để triển khai các mô hình Transformer.
+
+### Lời cảm ơn
+
+Công trình này đã được hưởng lợi từ grant LAWBOT (ANR-20-CE38-0013) và tài nguyên HPC của IDRIS (phân bổ 2022-AD011011309R2) được thực hiện bởi GENCI.
+
+### Tài liệu tham khảo
+
+[1] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Łukasz Kaiser, và Illia Polosukhin. Attention is all you need. Advances in neural information processing systems, 30, 2017.
+
+[2] Jacob Devlin, Ming-Wei Chang, Kenton Lee, và Kristina Toutanova. Bert: Pre-training of deep bidirectional transformers for language understanding. arXiv preprint arXiv:1810.04805, 2018.
+
+[3] Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan Narang, Michael Matena, Yanqi Zhou, Wei Li, Peter J Liu, et al. Exploring the limits of transfer learning with a unified text-to-text transformer. J. Mach. Learn. Res., 21(140):1–67, 2020.
+
+[4] Ofir Press, Noah A. Smith, và Mike Lewis. Train short, test long: Attention with linear biases enables input length extrapolation. arXiv:2108.12409, 2021.
+
+[5] Peter Shaw, Jakob Uszkoreit, và Ashish Vaswani. Self-attention with relative position representations. In Proceedings of the 2018 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies, Volume 2 (Short Papers), pages 464–468, New Orleans, Louisiana, jun 2018. Association for Computational Linguistics.
+
+[6] Iz Beltagy, Matthew E. Peters, và Arman Cohan. Longformer: The long-document transformer. arXiv:2004.05150, 2020.
+
+[7] Zihang Dai, Zhilin Yang, Yiming Yang, Jaime Carbonell, Quoc V Le, và Ruslan Salakhutdinov. Transformer-xl: Attentive language models beyond a fixed-length context. arXiv preprint arXiv:1901.02860, 2019.
+
+[8] Jack W Rae, Anna Potapenko, Siddhant M Jayakumar, và Timothy P Lillicrap. Compressive transformers for long-range sequence modelling. arXiv preprint arXiv:1911.05507, 2019.
+
+[9] Sinong Wang, Belinda Z. Li, Madian Khabsa, Han Fang, và Hao Ma. Linformer: Self-attention with linear complexity. CoRR, abs/2006.04768, 2020.
+
+[10] Krzysztof Choromanski, Valerii Likhosherstov, David Dohan, Xingyou Song, Andreea Gane, Tamas Sarlos, Peter Hawkins, Jared Davis, Afroz Mohiuddin, Lukasz Kaiser, David Belanger, Lucy Colwell, và Adrian Weller. Rethinking attention with performers. arXiv:2009.14794, 2021.
+
+[11] Nikita Kitaev, Lukasz Kaiser, và Anselm Levskaya. Reformer: The efficient transformer. CoRR, abs/2001.04451, 2020.
+
+[12] Manzil Zaheer, Guru Guruganesh, Kumar Avinava Dubey, Joshua Ainslie, Chris Alberti, Santiago Ontanon, Philip Pham, Anirudh Ravula, Qifan Wang, Li Yang, et al. Big bird: Transformers for longer sequences. Advances in Neural Information Processing Systems, 33, 2020.
+
+[13] Rewon Child, Scott Gray, Alec Radford, và Ilya Sutskever. Generating long sequences with sparse transformers. arXiv preprint arXiv:1904.10509, 2019.
+
+[14] Kevin Clark, Urvashi Khandelwal, Omer Levy, và Christopher D Manning. What does bert look at? an analysis of bert's attention. arXiv preprint arXiv:1906.04341, 2019.
+
+[15] Alessandro Raganato, Yves Scherrer, và Jörg Tiedemann. Fixed encoder self-attention patterns in transformer-based machine translation. arXiv preprint arXiv:2002.10260, 2020.
+
+[16] Felix Wu, Angela Fan, Alexei Baevski, Yann N Dauphin, và Michael Auli. Pay less attention with lightweight and dynamic convolutions. arXiv preprint arXiv:1901.10430, 2019.
+
+[17] Denny Britz, Melody Y Guan, và Minh-Thang Luong. Efficient attention using a fixed-size memory representation. arXiv preprint arXiv:1707.00110, 2017.
+
+[18] Chung-Cheng Chiu và Colin Raffel. Monotonic chunkwise attention. arXiv preprint arXiv:1712.05382, 2017.
+
+[19] Tao Shen, Tianyi Zhou, Guodong Long, Jing Jiang, và Chengqi Zhang. Bi-directional block self-attention for fast and memory-efficient sequence modeling. arXiv preprint arXiv:1804.00857, 2018.
+
+[20] Joshua Ainslie, Santiago Ontanon, Chris Alberti, Vaclav Cvicek, Zachary Fisher, Philip Pham, Anirudh Ravula, Sumit Sanghai, Qifan Wang, và Li Yang. Etc: Encoding long and structured inputs in transformers. arXiv preprint arXiv:2004.08483, 2020.
+
+[21] Xingxing Zhang, Furu Wei, và Ming Zhou. Hibert: Document level pre-training of hierarchical bidirectional transformers for document summarization. arXiv preprint arXiv:1905.06566, 2019.
+
+[22] Qipeng Guo, Xipeng Qiu, Pengfei Liu, Yunfan Shao, Xiangyang Xue, và Zheng Zhang. Star-transformer. arXiv preprint arXiv:1902.09113, 2019.
+
+[23] Luyang Huang, Shuyang Cao, Nikolaus Parulian, Heng Ji, và Lu Wang. Efficient attentions for long document summarization. In Proceedings of the 2021 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies, pages 1419–1436, Online, jun 2021. Association for Computational Linguistics.
+
+[24] Alexandr Andoni, Piotr Indyk, Thijs Laarhoven, Ilya P. Razenshteyn, và Ludwig Schmidt. Practical and optimal LSH for angular distance. CoRR, abs/1509.02897, 2015.
+
+[25] Diederik P. Kingma và Jimmy Ba. Adam: A method for stochastic optimization, 2014.
+
+[26] Yinhan Liu, Myle Ott, Naman Goyal, Jingfei Du, Mandar Joshi, Danqi Chen, Omer Levy, Mike Lewis, Luke Zettlemoyer, và Veselin Stoyanov. Roberta: A robustly optimized BERT pretraining approach. CoRR, abs/1907.11692, 2019.
+
+[27] Angelos Katharopoulos, Apoorv Vyas, Nikolaos Pappas, và François Fleuret. Transformers are rnns: Fast autoregressive transformers with linear attention. CoRR, abs/2006.16236, 2020.
+
+[28] Zhuoran Shen, Mingyuan Zhang, Shuai Yi, Junjie Yan, và Haiyu Zhao. Factorized attention: Self-attention with linear complexities. CoRR, abs/1812.01243, 2018.
+
+[29] Andrew L. Maas, Raymond E. Daly, Peter T. Pham, Dan Huang, Andrew Y. Ng, và Christopher Potts. Learning word vectors for sentiment analysis. In Proceedings of the 49th Annual Meeting of the Association for Computational Linguistics: Human Language Technologies, pages 142–150, Portland, Oregon, USA, jun 2011. Association for Computational Linguistics.
+
+[30] Jun He, Liqun Wang, Liu Liu, Jiao Feng, và Hao Wu. Long document classification from local word glimpses via recurrent attention learning. IEEE Access, 7:40707–40718, 2019.
+
+[31] Eva Sharma, Chen Li, và Lu Wang. Bigpatent: A large-scale dataset for abstractive and coherent summarization. In Proceedings of the 57th Annual Meeting of the Association for Computational Linguistics, pages 2204–2213, Florence, Italy, jul 2019. Association for Computational Linguistics.
+
+[32] Ilias Chalkidis, Abhik Jana, Dirk Hartung, Michael Bommarito, Ion Androutsopoulos, Daniel Martin Katz, và Nikolaos Aletras. Lexglue: A benchmark dataset for legal language understanding in english. In Proceedings of the 60th Annual Meeting of the Association for Computational Linguistics, Dubln, Ireland, 2022.
+
+[33] Ilias Chalkidis, Manos Fergadiotis, Prodromos Malakasiotis, Nikolaos Aletras, và Ion Androutsopoulos. Legal-bert: The muppets straight out of law school. In Findings of the Association for Computational Linguistics: EMNLP 2020, pages 2898–2904, Online, nov 2020. Association for Computational Linguistics.
+
+[34] Arman Cohan, Franck Dernoncourt, Doo Soon Kim, Trung Bui, Seokhwan Kim, Walter Chang, và Nazli Goharian. A discourse-aware attention model for abstractive summarization of long documents. Proceedings of the 2018 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies, Volume 2 (Short Papers), 2018.
+
+[35] Alexander R. Fabbri, Irene Li, Tianwei She, Suyi Li, và Dragomir R. Radev. Multi-news: a large-scale multi-document summarization dataset and abstractive hierarchical model, 2019.
+
+[36] Chenguang Zhu, Yang Liu, Jie Mei, và Michael Zeng. Mediasum: A large-scale media interview dataset for dialogue summarization. arXiv preprint arXiv:2103.06410, 2021.
+
+[37] Mike Lewis, Yinhan Liu, Naman Goyal, Marjan Ghazvininejad, Abdelrahman Mohamed, Omer Levy, Veselin Stoyanov, và Luke Zettlemoyer. Bart: Denoising sequence-to-sequence pre-training for natural language generation, translation, and comprehension. In Proceedings of the 58th Annual Meeting of the Association for Computational Linguistics, pages 7871–7880, Online, jul 2020. Association for Computational Linguistics.
+
+[38] Wen Xiao, Iz Beltagy, Giuseppe Carenini, và Arman Cohan. Primera: Pyramid-based masked sentence pre-training for multi-document summarization. In Proceedings of the 60th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), pages 5245–5263, Dublin, Ireland, may 2022. Association for Computational Linguistics.
+
+[39] Tobias Rohde, Xiaoxia Wu, và Yinhan Liu. Hierarchical learning for generation with long source sequences. CoRR, abs/2104.07545, 2021.
+
+[40] Jingqing Zhang, Yao Zhao, Mohammad Saleh, và Peter J. Liu. Pegasus: Pre-training with extracted gap-sentences for abstractive summarization, 2019.
+
+[41] Mandy Guo, Joshua Ainslie, David C. Uthus, Santiago Ontañón, Jianmo Ni, Yun-Hsuan Sung, và Yinfei Yang. Longt5: Efficient text-to-text transformer for long sequences. CoRR, abs/2112.07916, 2021.
+
+## A Tham số huấn luyện
+
+Chúng tôi sử dụng batch size 32, learning rate giảm tuyến tính, dropout rate 0.10 và optimizer Adam cho tất cả các tác vụ. Các tham số khác được báo cáo trong Bảng 9.
+
+Epochs LR Warmup
+Phân loại
+IMDb 3 2e-5 0%
+ArXiv 3 5e-5 0%
+Patent 3 2e-5 0%
+Scotus 7 1e-4 0%
+ECtHRa 5 1e-4 0%
+ECtHRb 5 1e-4 0%
+Tóm tắt
+ArXiv 6/1 8e-5 10%
+PubMed 8/1 8e-5 10%
+MultiNews 12/1 8e-5 10%
+MediaSum 6/1 8e-5 10%
+
+Bảng 9: Tham số huấn luyện cho tất cả các tác vụ.
+
+## B Kết quả phân loại bổ sung
+
+Kết quả phân loại bổ sung sử dụng kích thước khối nhỏ hơn được trình bày trong Bảng 10. Nó cho thấy rằng việc sử dụng kích thước khối nhỏ hơn vẫn cạnh tranh ngay cả khi một mất mát nhỏ trong hiệu suất được quan sát.
+
+## C Kết quả tóm tắt bổ sung
+
+Các mô hình được huấn luyện trên các tác vụ tóm tắt được đánh giá lại sau khi thay đổi loại sparse attention và kích thước khối. Kết quả trên ArXiv và PubMed được báo cáo trong Bảng 11 và 12. Cột context đề cập đến số lượng key mà mỗi query chú ý đến. Vì các mô hình tham chiếu được huấn luyện trên các khối local lớn (256), số lượng kết nối là 3×256. Bằng cách sử dụng ít hơn 20% key (644), kết quả suy luận vẫn cạnh tranh ngay cả khi mô hình chưa bao giờ thấy những mẫu sparse cụ thể này trước đây. Bằng cách hạn chế kết nối đến 20% của các key (160), một sự suy giảm hiệu suất được quan sát ngay cả khi các metric vẫn đáng kính. Trong những điều kiện này, các phương pháp stride và block-stride tạo ra dự đoán tốt hơn.
+
+## D Tập dữ liệu và Mô hình
+
+Tất cả các tập dữ liệu được đánh giá đều có sẵn trên HuggingFace hub, các liên kết được cung cấp trong Bảng 13.
+
+Các checkpoint tóm tắt có sẵn trên HuggingFace hub, các liên kết được cung cấp trong Bảng 14.
+
+Kích thước đầu vào trung bình được cung cấp trong Bảng 15. Lưu ý rằng số lượng token được lấy bằng việc chia tách khoảng trắng. Tokenization từ con tăng những con số này lên 30% đến 40% tùy thuộc vào tokenizer và kích thước từ vựng.
+
+## E Siêu tham số và độ phức tạp
+
+LSG attention nhạy cảm với một số siêu tham số và bản chất của mô hình được huấn luyện trước.
+
+**Kích thước khối** Nói chung, kích thước khối cải thiện hiệu suất đến một mức độ nhất định. Nếu mô hình được chuyển đổi được huấn luyện trên các chuỗi độ dài 512, kích thước khối vượt quá 256 có tác động tiêu cực và đòi hỏi một giai đoạn fine-tuning dài hơn. Một khối nhỏ hơn giảm chi phí huấn luyện và bộ nhớ.
+
+**Hệ số sparsity** Hệ số sparsity thường được chọn giữa 0 (không có sparse attention), 2, 4 và 8. Mặc dù việc lựa chọn vẫn phụ thuộc vào tác vụ, một hệ số trên 8 có xu hướng trung bình giảm mức hiệu suất, đặc biệt đối với các phương pháp dựa trên pooling. Siêu tham số này được chọn nhỏ khi tác vụ tập trung vào thông tin cục bộ (MLM, NER) và có thể lớn hơn cho các tác vụ đòi hỏi ngữ cảnh rộng hơn (tóm tắt, hỏi đáp).
+
+**Global token** Càng nhiều global token, mô hình càng mất nhiều thời gian để hội tụ và đạt được những cải thiện hiệu suất. Việc khởi tạo các token này quan trọng, đặc biệt đối với token đầu tiên được sử dụng làm token pooling cho các tác vụ phân loại ([CLS] hoặc <s> + vị trí 0).
+
+**Độ phức tạp tổng thể** LSG attention có một số điểm tương đồng với Big Bird attention và có cùng độ phức tạp O(n) đối với độ dài chuỗi. Hình 5 hiển thị tác động của việc tăng độ dài chuỗi đối với thời gian huấn luyện và tiêu thụ bộ nhớ (với optimizer Adam).
+
+[Các bảng và hình còn lại được duy trì như trong bản gốc với các số liệu và thống kê tương ứng]

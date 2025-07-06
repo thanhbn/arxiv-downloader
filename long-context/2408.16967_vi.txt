@@ -1,0 +1,160 @@
+# MemLong: Tăng cường Bộ nhớ cho Mô hình hóa Văn bản Dài
+
+Weijie Liu1*, Zecheng Tang1*, Juntao Li1†, Kehai Chen2, Min Zhang1
+1Trường Khoa học Máy tính và Công nghệ, Đại học Soochow
+2Viện Công nghệ Harbin, Thâm Quyến
+{wjliu,zctang}@stu.suda.edu.cn
+{ljt,minzhang}@suda.edu.cn ;chenkehai@hit.edu.cn
+
+## Tóm tắt
+
+Những tiến bộ gần đây trong các Mô hình Ngôn ngữ Lớn (LLM) đã mang lại thành công đáng kể trên nhiều lĩnh vực đa dạng. Tuy nhiên, xử lý các ngữ cảnh dài vẫn là một thách thức lớn đối với LLM do độ phức tạp thời gian và không gian bậc hai của cơ chế attention và việc tiêu thụ bộ nhớ ngày càng tăng của bộ đệm key-value trong quá trình sinh. Công trình này giới thiệu MemLong: Tăng cường Bộ nhớ để Truy xuất cho Sinh văn bản Dài (MemLong), một phương pháp được thiết kế để nâng cao khả năng mô hình hóa ngôn ngữ ngữ cảnh dài bằng cách sử dụng một bộ truy xuất bên ngoài để truy xuất thông tin lịch sử. MemLong kết hợp một mô-đun ret-mem không khả vi với một mô hình ngôn ngữ chỉ giải mã có thể huấn luyện một phần và giới thiệu một cơ chế attention truy xuất tinh tế, có thể kiểm soát tận dụng các chunk có liên quan ở mức ngữ nghĩa. Các đánh giá toàn diện trên nhiều điểm chuẩn mô hình hóa ngôn ngữ ngữ cảnh dài chứng minh rằng MemLong liên tục vượt trội so với các LLM tiên tiến khác. Quan trọng hơn, MemLong có thể mở rộng độ dài ngữ cảnh trên một GPU 3090 từ 4k lên 80k1.
+
+## 1 Giới thiệu
+
+Các Mô hình Ngôn ngữ Lớn (LLM) đã đạt được thành công đáng kể trong nhiều lĩnh vực khác nhau. Tuy nhiên, do độ phức tạp thời gian và không gian bậc hai của cơ chế attention vanilla (Vaswani et al., 2017), việc mở rộng độ dài ngữ cảnh một cách đáng kể là thách thức, điều này đặt ra những hạn chế lớn cho các ứng dụng liên quan đến các tác vụ chuỗi dài, chẳng hạn như tóm tắt tài liệu dài (Koh et al., 2022) và nhiều vòng đối thoại (Wang et al., 2024a).
+
+Kết quả là, LLM thường được kỳ vọng duy trì khả năng làm việc lâu dài (a.k.a. LLM ngữ cảnh dài) để xử lý hiệu quả những tình huống đòi hỏi này.
+
+*Đóng góp ngang nhau.
+†Tác giả liên hệ.
+1Mã nguồn của chúng tôi có sẵn tại https://github.com/Bui1dMySea/MemLong
+
+[THIS IS FIGURE: Hình minh họa về Sinh Tăng cường Truy xuất (RAG) và luồng Truy xuất-Bộ nhớ của MemLong, bao gồm (a) RAG có thể làm giảm hiệu suất sinh (màu vàng) khi độ dài thông tin được truy xuất vượt quá khả năng xử lý của mô hình, và (b) phương pháp của chúng tôi sử dụng bộ truy xuất bên ngoài để lấy thông tin lịch sử, sau đó được truyền vào mô hình dưới dạng cặp K-V thay vì dạng văn bản.]
+
+Để giải quyết nghẽn cổ chai tính toán, nhiều nỗ lực đã được thực hiện. Hướng công việc đầu tiên tập trung vào việc giảm tính toán của cơ chế attention vanilla (Vaswani et al., 2017) bằng cách sử dụng các phép toán attention thưa (Beltagy et al., 2020; Wang et al., 2020; Kitaev et al., 2020; Xiao et al., 2023a; Chen et al., 2023b; Lu et al., 2024). Mặc dù những loại công việc này có thể giảm độ phức tạp tính toán xuống khoảng O(n), nó thường đi kèm với sự đánh đổi về khả năng của mô hình. Do đó, một số công việc chuyển hướng tập trung vào việc lựa chọn bộ nhớ (Dai et al., 2019; Bertsch et al., 2024; Yu et al., 2023). Những phương pháp này, như lựa chọn bộ nhớ ở mức token, có thể dẫn đến việc cắt bớt thông tin ngữ nghĩa. Một hướng công việc gần đây khác là Mô hình hóa Ngôn ngữ Tăng cường Truy xuất (Wu et al., 2022; Wang et al., 2024b; Rubin and Berant, 2023). Những công việc này thường giới thiệu một cơ chế truy xuất để nâng cao khả năng xử lý văn bản dài của mô hình. Tuy nhiên, những phương pháp này có một số nhược điểm. Thứ nhất, thông tin được lưu trữ trong bộ nhớ có thể gặp phải sự thay đổi phân phối do những thay đổi trong tham số mô hình trong quá trình huấn luyện. Thứ hai, những phương pháp này thường yêu cầu huấn luyện lại, điều này không thực tế trong thời đại các mô hình lớn. Cuối cùng, những mô hình này thường dễ bị xử lý đầu vào văn bản dài với chi phí của các khả năng ban đầu của mô hình được tiền huấn luyện. Để giải quyết những hạn chế của nghiên cứu trước đây, chúng tôi đặt ra câu hỏi sau: Liệu chúng ta có thể sử dụng khả năng truy xuất rõ ràng của một bộ truy xuất để xấp xỉ các quá trình truy xuất ngầm trong mô hình không?
+
+Trong công việc này, chúng tôi đề xuất MemLong, một phương pháp hiệu quả và nhẹ để mở rộng cửa sổ ngữ cảnh của LLM. Ý tưởng chính là lưu trữ các ngữ cảnh và kiến thức trong quá khứ trong một ngân hàng bộ nhớ không thể huấn luyện và tiếp tục tận dụng những embeddings được lưu trữ này để truy xuất các cặp key-value (K-V) ở mức chunk để đưa vào mô hình. MemLong có thể áp dụng cho bất kỳ mô hình ngôn ngữ được tiền huấn luyện chỉ giải mã nào bằng cách kết hợp (1) một thành phần ret-mem bổ sung cho bộ nhớ và truy xuất, và (2) một mô-đun attention nhân quả truy xuất để tích hợp thông tin cục bộ và bộ nhớ. Quá trình bộ nhớ và truy xuất của MemLong được minh họa trong Hình 1(b). Trong quá trình sinh, một văn bản vượt quá độ dài xử lý tối đa của mô hình được lưu trữ như thông tin ngữ cảnh trong Ngân hàng Bộ nhớ. Tiếp theo, cho một chunk văn bản được sinh gần đây trong một tài liệu dài, chúng tôi sử dụng bộ truy xuất để truy xuất rõ ràng thông tin quá khứ, thu được thông tin ngữ cảnh bổ sung thông qua căn chỉnh chỉ mục.
+
+MemLong mang lại một số lợi ích: (1) Tính nhất quán Phân phối: Không giống như các mô hình trước đây gặp phải sự thay đổi phân phối khi thông tin được lưu trữ trong bộ nhớ, MemLong đảm bảo phân phối của thông tin được cache vẫn nhất quán. (2) Hiệu quả Huấn luyện: Chúng tôi đóng băng các lớp dưới của mô hình và chỉ cần tinh chỉnh các lớp trên, điều này giảm đáng kể chi phí tính toán. Trong các thí nghiệm của chúng tôi, việc tinh chỉnh phiên bản 3B tham số của MemLong trên 0.5B token chỉ yêu cầu tám GPU 3090 trong tám giờ. (3) Cửa sổ Ngữ cảnh Rộng: Vì chỉ cần ghi nhớ các cặp K-V của một lớp duy nhất, MemLong có khả năng mở rộng cửa sổ ngữ cảnh lên đến 80k token một cách dễ dàng trên một GPU 3090.
+
+Các thí nghiệm rộng rãi đã chứng minh rằng MemLong thể hiện hiệu suất vượt trội trong một số khía cạnh khi so sánh với các LLM hàng đầu khác. MemLong vượt trội so với OpenLLaMA (Touvron et al., 2023) và các mô hình dựa trên truy xuất khác trên một số bộ dữ liệu mô hình hóa ngôn ngữ ngữ cảnh dài. Trong các tác vụ học trong ngữ cảnh tăng cường truy xuất, MemLong đạt được cải thiện lên đến 10.2 điểm phần trăm so với OpenLLaMA.
+
+## 2 Sơ bộ
+
+### 2.1 Định nghĩa Tác vụ
+
+Các mô hình ngôn ngữ được thiết kế để định nghĩa phân phối xác suất trên các chuỗi token, dự đoán hiệu quả khả năng của một chuỗi trong một ngôn ngữ nhất định. Cho một chuỗi như vậy x1, . . . , xn, phương pháp chuẩn để mô hình hóa xác suất của nó là thông qua dự đoán token tiếp theo: p(x1, . . . , xn) = Σni=0pθ(xi|x<i), trong đó x<i := x1, . . . , xi−1 là chuỗi các token đứng trước xi. Khác với mục tiêu mô hình hóa ngôn ngữ chuẩn, chúng tôi không chỉ sử dụng ngữ cảnh hiện tại để đưa ra dự đoán token tiếp theo, mà còn sử dụng truy xuất bên ngoài để thu được thông tin có liên quan và thực hiện fusion kiến thức ở các lớp trên của mô hình. Cụ thể, cho một chuỗi gồm l token và kích thước của mỗi chunk τ, chúng tôi phân chia nó thành một chuỗi dài gồm ν = l/τ chunk không chồng lấp, được ký hiệu là C = (c1, . . . , cν). Tương ứng, dạng văn bản của nó được chia thành ν chunk văn bản, được ký hiệu là T = (t1, . . . , tν). Trong mỗi bước, chúng tôi thực hiện mô hình hóa ngôn ngữ nhân quả trên ci trong các lớp dưới, trong khi ở các lớp trên, chúng tôi tiến hành truy xuất có thể kiểm soát tinh tế trên ti để fusion thông tin bổ sung. Sau khi thực hiện điều này, mục tiêu mô hình hóa ngôn ngữ của chúng tôi trở thành
+
+p(x1, . . . , xn) = Σni=0pθ(xi|R(ti), x<i)     (1)
+
+trong đó R(ti) biểu thị việc truy xuất các chunk lân cận của ti nơi xi được đặt.
+
+### 2.2 Định nghĩa Mô-đun và Phép toán
+
+Như được hiển thị trong Hình 2, mô-đun Ret-Mem bao gồm một Retriever và một thành phần Memory để trao đổi thông tin. Ban đầu, chúng tôi định nghĩa thành phần Memory là M và Retriever là R, và các phép toán tương ứng của chúng M(·) và R(·). Hơn nữa, chúng tôi chỉ định chiều của mô hình là dmodel, chiều của retriever là dret. Mô-đun Memory bao gồm hai phân đoạn: cặp K-V và các Representation Embeddings tương ứng. Chiều cho cả keys và values được biểu diễn là Rdmodel và cho Embeddings là Rdret. Điều quan trọng cần nhấn mạnh là quá trình truy xuất thực tế liên quan đến các embeddings đại diện cho các chunk, không phải các cặp K-V. Retriever về cơ bản là một dense embedder được tiền huấn luyện với khả năng biểu diễn xuất sắc. MemLong sử dụng nó để mã hóa mỗi chunk thành Representation Embeddings. Vì nó tạo ra một vector biểu diễn một chiều cho một chunk, dấu chân bộ nhớ vẫn tối thiểu ngay cả khi kích thước bộ nhớ là đáng kể.
+
+## 3 MemLong
+
+### 3.1 Tổng quan
+
+Như được minh họa trong Hình 2, mỗi bước liên quan đến một đầu vào của một chunk ci, trong đó văn bản gốc cho chunk đó là ti. Trong các lớp dưới nơi mô hình bị đóng băng, attention nhân quả chuẩn được áp dụng cho toàn bộ ci. Đối với lớp cuối cùng của các lớp dưới, chúng tôi gọi nó là lớp bộ nhớ. Sau mỗi lần duyệt qua lớp bộ nhớ, hai phép toán chính được thực hiện. Phép toán đầu tiên là truy xuất, được mô tả bằng đường màu đỏ, trong đó ti được sử dụng để lấy các cặp K-V có liên quan nhất. Phép toán thứ hai, được chỉ ra bằng đường màu xanh, liên quan đến việc cache các cặp K-V thu được cùng với biểu diễn chunk liên quan của chúng. Trong các lớp trên của mô hình, các cặp K-V được truy xuất được tích hợp với ngữ cảnh đầu vào hiện tại, sau đó điều chỉnh các tham số mô hình để hiệu chuẩn tham chiếu truy xuất. Các phần tiếp theo sẽ khám phá các khía cạnh khác nhau của khung MemLong và sự phức tạp của chúng, bao gồm Retriever và Dynamic Memory Management (§ 3.2), Attention Reformulation (§ 3.3), và Inference với MemLong (§ 3.4).
+
+### 3.2 Retriever và Dynamic Memory Management
+
+Chúng tôi cung cấp một giải thích toàn diện về quá trình truy xuất và động lực của quản lý bộ nhớ.
+
+**Quá trình Truy xuất.** Cho mục tiêu của chúng tôi là thay thế truy xuất kNN truyền thống dựa trên cặp K-V bằng truy xuất rõ ràng, chúng tôi nhằm tiền-lấy thông tin mong muốn khi khả thi trước mỗi đầu vào mô hình. Cụ thể, đối với mỗi khối truy vấn tiềm năng cq = ci và khối văn bản tương ứng tq = ti, chúng tôi đầu tiên truyền nó qua Retriever và sau đó thu được một representation embedding rq = R(tq), trong đó rq ∈ Rdret. Tiếp theo, chúng tôi sử dụng representation embedding này để thực hiện truy xuất đối với các embeddings trong M để thu được k chỉ mục mức chunk cần thiết. Chúng tôi tính toán độ tương tự cosine giữa representation truy xuất rq và các embeddings được lưu trữ trong Memory M. Cuối cùng, chúng tôi lấy các chỉ mục top-k zq = TopK{Cos(rq)} cho cq, trong đó zq ∈ Rk. Do tính chất liền kề trong các khối, chúng tôi có thể dễ dàng mở rộng các chỉ mục thu được để bao phủ toàn bộ phạm vi liên quan cho truy xuất. Cuối cùng, chúng tôi truy xuất các cặp K-V tương ứng z̃q ∈ Rk×τ×dmodel từ Memory dựa trên những chỉ mục này và sử dụng cho lớp trên. Đáng chú ý là chúng tôi đã trang bị cho Memory một cơ chế đếm để ghi lại tần suất truy xuất cho mỗi chỉ mục có trong đó. Dữ liệu tần suất này sau đó sẽ phục vụ như một cơ sở cho cập nhật bộ nhớ động, cho phép ưu tiên thông tin được truy xuất thường xuyên hơn.
+
+**Quá trình Bộ nhớ.** Quá trình bộ nhớ đồng bộ lưu trữ các cặp K-V từ lớp bộ nhớ và representation embedding được tính toán trước đó để truy xuất, đảm bảo rằng các chỉ mục cho cặp K-V tương ứng chính xác với representation embeddings của chúng (xem Hình 2, bên phải, đường màu xanh). Đối với mỗi chunk bộ nhớ có thể cm = ci, và chunk văn bản tương ứng tm = ti, chúng tôi chia quá trình bộ nhớ thành hai phần: phần đầu tiên chi tiết cách cache các cặp K-V, và phần thứ hai giải thích cách lưu trữ các representations tương ứng. Thứ nhất, chúng tôi đưa cm vào MemLong và lấy đầu ra từ lớp bộ nhớ. Đáng chú ý là, vì các lớp dưới bị đóng băng trong quá trình huấn luyện, chúng tôi có thể đảm bảo rằng phân phối của các cặp K-V đầu ra là nhất quán. Tính nhất quán này rất quan trọng để tránh vấn đề thay đổi phân phối, điều này đã được quan sát trước đây trong các mô hình như MemTrm (Wu et al., 2022). Phép toán bộ nhớ của chúng tôi rất hiệu quả vì nó chỉ liên quan đến việc lưu trữ các representations cần thiết cho truy xuất, rm = rq, do đó tránh được sự dư thừa. Sau khi truy xuất cho tất cả các cặp chunk hoàn thành, phép toán bộ nhớ—được ký hiệu là M(k, v; rm)—đồng bộ cập nhật bộ nhớ với cả các cặp Key-Value và representations tương ứng của chúng.
+
+**Cập nhật Bộ nhớ Động.** Khi bộ nhớ tràn, chúng tôi sử dụng Counter để cập nhật bộ nhớ một cách thông minh. Trong các thí nghiệm của chúng tôi, chúng tôi giữ 10% nội dung bộ nhớ mới nhất do tiềm năng liên quan của nó, loại bỏ 10% cũ nhất vì có khả năng lỗi thời, và ưu tiên 80% giữa dựa trên tần suất truy xuất, xóa các mục được truy cập ít nhất cho đến khi việc sử dụng bộ nhớ giảm xuống 50%. Việc cắt tỉa có chọn lọc này cân bằng giữa tính gần đây và sự liên quan, giữ lại thông tin có giá trị và loại bỏ dữ liệu ít liên quan hơn. Không giống như các chiến lược FIFO truyền thống, phương pháp của chúng tôi tập trung vào tần suất truy xuất để cắt tỉa hiệu quả thông tin dư thừa, duy trì một bộ dữ liệu chất lượng cao. Quyết định cập nhật dynamic datastore là một sự đánh đổi giữa hiệu quả và efficiency. Đối với các tác vụ yêu cầu phụ thuộc dài hạn, việc lưu trữ tất cả thông tin có thể nâng cao xử lý toàn diện, nhưng đối với các tác vụ ngắn hạn hơn, cập nhật động phù hợp hơn. Cập nhật động kiểm soát kích thước bộ nhớ để ngăn chặn các vấn đề hết bộ nhớ, loại bỏ thông tin cũ, và giảm overhead truy xuất, đảm bảo hiệu quả mà không làm giảm đáng kể hiệu suất.
+
+### 3.3 Attention Reformulation
+
+Trong các lớp trên có thể huấn luyện của mô hình, chúng tôi đã sửa đổi các attention để fusion với bộ nhớ dài hạn. Như được minh họa trong Hình 3, không giống như các lớp decoder Transformer truyền thống sử dụng Multi-Head Attention (Vaswani et al., 2017), chúng tôi đề xuất một Retrieval Causal Attention để mở rộng nó thành một cơ chế joint-attention và đề xuất một quá trình fusion bộ nhớ dài hạn để cho phép mỗi token attend trên cả ngữ cảnh cục bộ và ngữ cảnh quá khứ mức chunk có ngữ nghĩa hoàn chỉnh và liên tục. Với đầu ra hidden state theo head từ lớp trước Hl−1 ∈ R|x|×dmodel và các cặp key-value được truy xuất tương ứng là z̃q = {K̃i, Ṽi}ωi=1 ∈ Rk×τ×dmodel, hidden state đầu ra cho lớp tiếp theo Hl được tính toán như:
+
+Sa = Softmax(QKT/√d)     (2)
+
+Sm = Concat[Softmax(z̃qi)]ωi=1     (3)
+
+Để tránh sự can thiệp gây ra bởi các điểm attention truy xuất Sm ở giai đoạn đầu của huấn luyện, chúng tôi áp dụng một cơ chế multi-head attention theo phương pháp của LLaMA-adapter (Zhang et al., 2023b):
+
+Sgl = [(Sm) · gl; (Sa)]T     (4)
+
+Cuối cứng, chúng tôi concatenate Ṽ và V để thu được Hl:
+
+Vl = [Ṽc; Vi], Hl = SglVl     (5)
+
+### 3.4 Inference với MemLong
+
+Khi MemLong nhận một đầu vào vượt quá độ dài, chúng tôi coi nó như hai phân đoạn: prefix và main. Chúng tôi sẽ mô tả riêng biệt việc mã hóa đầu vào dài và việc sinh đầu ra dài trong giai đoạn inference. Khi MemLong nhận đầu vào dài, nó đầu tiên chia prefix thành nhiều chunk không chồng lấp và tính toán từ lớp bộ nhớ của nó, điều này đảm bảo rằng số lượng token liên quan đến attention bằng kích thước chunk, nhỏ hơn nhiều so với độ dài của đầu vào. Điều quan trọng cần lưu ý là mỗi chunk có liên quan với nhau (ví dụ, chunk thứ t cần xử lý của t−1 chunk trước đó).
+
+Bước thứ hai là chọn k chunk có liên quan nhất cho main dựa trên representations truy xuất mức chunk và thu được representations key và value của chúng. Sau đó, đối với các lớp truy xuất trên, cửa sổ attention cho truy xuất tương đương với k∗τ, cũng nhỏ hơn độ dài đầu vào. Cuối cùng, cả attention nhân quả giới hạn độ dài và attention truy xuất đều được thực hiện hiệu quả.
+
+## 4 Thí nghiệm
+
+Chúng tôi đánh giá mô hình MemLong được đề xuất trên các tác vụ khác nhau yêu cầu xử lý ngữ cảnh dài trong bộ nhớ: (a) mô hình hóa ngôn ngữ ngữ cảnh dài và mô hình hóa ngôn ngữ tăng cường truy xuất; (b) học trong ngữ cảnh có thể mở rộng có khả năng xử lý một số lượng lớn ví dụ demonstration trong bộ nhớ.
+
+### 4.1 Chi tiết Triển khai
+
+**Chi tiết Huấn luyện.** Chúng tôi sử dụng OpenLLaMA-3B làm LLM backbone được tiền huấn luyện với rotation position coding (Su et al., 2024). Do hạn chế phần cứng, chúng tôi chọn huấn luyện các mô hình của mình bằng kỹ thuật LoRA (Hu et al., 2021). LLM backbone có kiến trúc L = 26, H = 32, d = 100. Trừ khi được chỉ định khác, chúng tôi sử dụng lớp thứ 13 làm lớp bộ nhớ và các lớp [14,18,22,26] làm các lớp tăng cường truy xuất. Việc huấn luyện cho adaptation tăng cường truy xuất chỉ lặp lại trên 0.5B token với độ dài chuỗi 1024. Các tham số có thể huấn luyện của MemLong là từ lớp 14 đến 26. Chúng tôi sử dụng bộ dữ liệu slimpajama được lấy mẫu bởi (Fu et al., 2024) làm corpus huấn luyện của chúng tôi.
+
+**Position Remapping.** Có một số K-V mức chunk trong M được truy xuất để sinh. Do sự không chắc chắn của truy xuất ở mỗi bước, chúng tôi cần remap position embeddings cho các chunk được truy xuất. Giống như công việc trước đây (Tworkowski et al., 2024), ngữ cảnh cục bộ (lên đến 2048 token) nhận rotary positional encoding chuẩn, trong khi memory keys được mã hóa như thể chúng có position 0 trong cửa sổ ngữ cảnh cục bộ.
+
+### 4.2 Mô hình hóa Ngôn ngữ Ngữ cảnh Dài
+
+Chúng tôi đầu tiên đánh giá MemLong trên các điểm chuẩn mô hình hóa ngôn ngữ ngữ cảnh dài để đánh giá khả năng mô hình hóa ngôn ngữ cơ bản. Do K-V cache cung cấp thông tin nền và ngữ cảnh đáng kể, MemLong có thể truy xuất K-V cache liên quan nhanh chóng và tận dụng đầy đủ nó, do đó nâng cao mô hình trong các tác vụ mô hình hóa ngữ cảnh dài.
+
+**Bộ dữ liệu.** Chúng tôi tiến hành đánh giá mô hình của chúng tôi trên bốn bộ dữ liệu điểm chuẩn văn bản rộng lớn: sách tiếng Anh PG-19 (Rae et al., 2019) và BookCorpus (Zhu et al., 2015), bài viết Wikipedia Wikitext-103 (Merity et al., 2016), và các bài báo toán học Proof-Pile (Azerbayev et al., 2023). Kết quả thí nghiệm cho thấy cải thiện perplexity đáng kể trên tất cả các bộ dữ liệu. Mô hình của chúng tôi được kiểm tra trên các độ dài khác nhau từ 1024 đến 32768 token. Trên tất cả các bộ dữ liệu, mô hình của chúng tôi đã chứng minh được những cải thiện hiệu suất đáng kể với overhead bộ nhớ tối thiểu bằng cách tận dụng một retriever và bộ nhớ bên ngoài.
+
+**Cài đặt.** Theo (Yen et al., 2024), chúng tôi tính toán perplexity trên 2048 token cuối cùng của mỗi chuỗi. Cài đặt thí nghiệm này được thiết kế để xác thực ảnh hưởng của các kích thước retriever khác nhau lên hiệu suất tổng thể của mô hình chúng tôi. Để triển khai truy xuất tinh tế hiệu quả, chúng tôi sử dụng toolkit faiss (Johnson et al., 2019) để xây dựng một chỉ mục exact-search trên GPU để lưu trữ Representation Embeddings của các chunk văn bản và thực hiện truy xuất hiệu quả. Đối với MemLong, chúng tôi chia và đưa các token trên finetune-length = 1024 vào M được sử dụng để truy xuất thêm.
+
+**Baselines.** Cho các thí nghiệm của chúng tôi, chúng tôi sử dụng mô hình OpenLLaMA-3B làm baseline. Để đảm bảo so sánh công bằng, chúng tôi sử dụng cấu hình LoRA tương tự và tinh chỉnh các mô hình trên cùng một lượng dữ liệu từ bộ dữ liệu slimpajama. Bổ sung, chúng tôi so sánh LongLLaMA-3B (Tworkowski et al., 2024), được tinh chỉnh với phương pháp Focused Transformer (FoT) và 5B token. Để thực hiện so sánh toàn diện hơn, chúng tôi bổ sung kiểm tra hai mô hình 7B: LLaMA-2-7B và LongLoRA-7B-32K (Chen et al., 2023b) và hai mô hình positional encoding: Yarn-7b-128k (Peng et al., 2023) và Phi3-128k (Abdin et al., 2024).
+
+**Kết quả.** Kết quả được hiển thị trong Bảng 1. Chúng tôi sử dụng Perplexity (PPL) làm metric đánh giá cho mô hình ngôn ngữ. PPL thấp hơn cho thấy khả năng mô hình hóa ngôn ngữ mạnh hơn. So với hai mô hình được tinh chỉnh đầy đủ, OpenLLaMA-3B và LLaMA-2-7B, mô hình của chúng tôi thể hiện hiệu suất tương đương trên nhiều bộ dữ liệu khi độ dài kiểm tra nằm trong giới hạn tiền huấn luyện của chúng (2048 cho OpenLLaMA-3B và 4096 cho LLaMA-2-7B). Tuy nhiên, một khi độ dài kiểm tra vượt quá những giới hạn tiền huấn luyện này, mô hình của chúng tôi tiếp tục giảm perplexity ngay cả vượt ra ngoài độ dài tinh chỉnh 1024 và độ dài tiền huấn luyện 2048, thể hiện khả năng khái quát hóa vượt trội. Ngược lại, các mô hình OpenLLaMA-3B và LLaMA-2-7B không thể khái quát hóa cho các đầu vào vượt ra ngoài độ dài tiền huấn luyện của chúng và thể hiện overhead bộ nhớ tăng đáng kể do độ phức tạp bậc hai của attention. Chúng tôi cũng so sánh mô hình của chúng tôi với LongLoRA. Mặc dù Shifted Sparse Attention được đề xuất trong LongLoRA giảm đáng kể việc sử dụng bộ nhớ, nó cũng làm giảm hiệu suất của mô hình trên văn bản ngắn. Ngược lại, LongLLaMA, mà các cặp K-V cũng có thể được lưu trữ, gặp phải các vấn đề OOM khi độ dài kiểm tra trở nên quá dài do việc sử dụng bộ nhớ tăng vô hạn. Các mô hình positional encoding có khả năng khái quát hóa mạnh. Tuy nhiên, hiệu suất của những phương pháp như vậy chỉ có thể đảm bảo rằng hiệu suất sinh trên khoảng cách dài không bị giảm. So với các phương pháp của chúng, MemLong tận dụng một retriever bên ngoài để xử lý token đầu vào dài hơn và đạt được cải thiện perplexity tốt hơn. Đồng thời, do hiệu quả lưu trữ cao, MemLong có thể kiểm soát hiệu quả việc sử dụng GPU để tránh các vấn đề OOM.
+
+### 4.3 In Context Learning
+
+In-context learning truyền thống (ICL; Brown et al., 2020) đưa vào ít ví dụ demonstration không tham số cùng với truy vấn vào mô hình. Tuy nhiên, những phương pháp này thường bị hạn chế bởi độ dài đầu vào của mô hình. Trong thí nghiệm này, vì MemLong có thể lưu trữ các ví dụ dưới dạng tham số trong bộ nhớ của nó, chúng tôi chủ yếu điều tra liệu MemLong có thể sử dụng hiệu quả kiến thức được lưu trữ trong bộ nhớ của nó để nâng cao khả năng nổi lên của nó hay không. Kết quả được hiển thị trong Bảng 2. So với OpenLLaMA, chỉ dựa vào kiến thức phi tham số, cho cùng số lượng demonstration trong ngữ cảnh, MemLong có thể sử dụng các demonstration bổ sung được lưu trữ trong bộ nhớ của nó. Hiệu suất tiếp tục tăng hoặc vẫn nhất quán với nhiều demonstration hơn trong bộ nhớ. Trong phân tích so sánh của chúng tôi với LongLLaMA, đã quan sát thấy rằng mô hình của chúng tôi vượt trội so với LongLLaMA trên phần lớn các bộ dữ liệu trong cùng điều kiện bảo tồn In-Memory Demonstrations. Điều quan trọng cần nhấn mạnh là mô hình của chúng tôi hoạt động với số lượng tham số huấn luyện thấp hơn đáng kể (200M so với 0.3B) và khối lượng dữ liệu tinh chỉnh (0.5B so với 5B) so với LongLLaMA. Điều này nhấn mạnh hiệu quả của mô hình chúng tôi trong việc tận dụng một retriever bên ngoài để thu thập thông tin, thể hiện khả năng vượt trội trong việc tổng hợp và sử dụng kiến thức hiệu quả với ít tài nguyên hơn đáng kể.
+
+## 5 Nghiên cứu Ablation
+
+### 5.1 Cài đặt Huấn luyện
+
+Trong giai đoạn huấn luyện, chúng tôi khám phá ảnh hưởng của việc thay đổi các lớp truy xuất lên mô hình và kiểm tra liệu vấn đề thay đổi phân phối, như đã thảo luận trong MemTrm (Wu et al., 2022), có thể được giải quyết đầy đủ bằng phương pháp của chúng tôi hay không. Như đã đề cập trước đây, phương pháp của chúng tôi đề xuất một giải pháp chi phí thấp cho sự thay đổi phân phối. Như được hiển thị trong Hình 4, đường màu nâu (đường ở trên cùng của hình; phương pháp huấn luyện tương tự như MemTrm tinh chỉnh tất cả tham số của mô hình và tất cả các lớp sau lớp bộ nhớ đều tham gia vào truy xuất) kém hơn đáng kể so với tất cả các phương pháp khác của chúng tôi (ngay cả những cài đặt không hợp lý nhất) về hiệu suất và tốc độ fitting. Chúng tôi sẽ phân tích hiệu suất của giai đoạn reasoning sau này.
+
+### 5.2 Hiệu suất Inference
+
+**Q1: Độ dài bộ nhớ có ảnh hưởng đến hiệu suất của mô hình không?** Như được mô tả trong Hình 5, việc kiểm tra hiệu suất của cùng một mô hình trên các kích thước bộ nhớ khác nhau của chúng tôi thể hiện một mối tương quan rõ ràng giữa dung lượng bộ nhớ và hiệu quả mô hình. Xu hướng cho thấy rằng việc tăng dần kích thước bộ nhớ mang lại những cải thiện dần dần về hiệu suất. Hơn nữa, một ngưỡng quan trọng được xác định ở kích thước bộ nhớ 65536, vượt ra ngoài đó khả năng của mô hình trải qua một bước nhảy đáng kể. Điều này gợi ý rằng trong khi việc mở rộng bộ nhớ mang lại lợi ích đáng kể, có một trần thực tế đối với hiệu quả của nó, có thể bị ảnh hưởng bởi những sắc thái của phân phối dữ liệu.
+
+**Q2: Chúng ta cần bao nhiêu lớp để giới thiệu thông tin bộ nhớ bổ sung?** Như được hiển thị trong Hình 4, (đường màu hồng) và Bảng 3 (RPL+TH), mô hình hoạt động tốt nhất khi số lượng lớp truy xuất được đặt thành [13,17,21,25]. Theo kinh nghiệm, người ta tin rằng nếu thông tin truy xuất được đưa vào tất cả các lớp trên của mô hình, nó dẫn đến giảm sự chú ý của mô hình đến ngữ cảnh cục bộ. Do đó, việc chọn các lớp truy xuất ở các khoảng thời gian thích hợp thực sự có thể nâng cao khả năng của mô hình.
+
+## 6 Công việc Liên quan
+
+### 6.1 Mô hình hóa Ngôn ngữ Ngữ cảnh Dài
+
+Mô hình hóa Ngôn ngữ Ngữ cảnh Dài chủ yếu tập trung vào mở rộng độ dài và mở rộng cửa sổ ngữ cảnh. Các nghiên cứu Mở rộng Độ dài thường nhắm mục tiêu vào mã hóa RoPE phổ biến, nhằm mở rộng PE chưa thấy vào không gian của các vị trí thấy trong quá trình tiền huấn luyện. Những công việc này (Su et al., 2024; Press et al., 2021; Chen et al., 2023a; Peng et al., 2023) cho phép mô hình khái quát hóa cho các positional encoding chưa thấy trong quá trình inference, do đó đạt được ngoại suy vượt ra ngoài độ dài gặp phải trong quá trình huấn luyện. Ngược lại, phương pháp của chúng tôi không yêu cầu sửa đổi PE, và chỉ sử dụng một mô-đun bổ sung để mở rộng ngữ cảnh. Mở rộng Cửa sổ Ngữ cảnh tập trung vào cách mở rộng cửa sổ ngữ cảnh mà LLM có thể xử lý đầu vào cùng một lúc. Do độ phức tạp thời gian và không gian bậc hai của việc tính toán attention, việc mở rộng độ dài đầu vào của các mô hình ngôn ngữ là khá thách thức. Các kỹ thuật sparse attention (Kitaev et al., 2020; Chen et al., 2023b; Tworkowski et al., 2024; Bertsch et al., 2024; Beltagy et al., 2020) đã có những bước tiến đáng kể, nhưng trọng tâm của chúng tôi là cải thiện mô hình hóa ngôn ngữ tầm xa bằng cách cho phép LLM truy cập thông tin liên quan ở độ dài đầu vào ngắn hơn thông qua một phương pháp tăng cường truy xuất.
+
+### 6.2 Mô hình hóa Ngôn ngữ Tăng cường Truy xuất
+
+Nhiều nỗ lực đã được thực hiện để nâng cao Mô hình hóa Ngôn ngữ Tăng cường Truy xuất (Lewis et al., 2020; Izacard and Grave, 2020; Ram et al., 2023; Yu et al., 2022; Asai et al., 2023). Trong khi một số phương pháp sử dụng các retriever bên ngoài, fusion thông tin phi tham số thường không đạt được so với các phương pháp tham số trong mô hình. Chúng tôi tập trung vào việc tích hợp các khái niệm truy xuất trực tiếp vào mô hình. REALM (Guu et al., 2020) gợi ý rằng việc chỉ dựa vào kiến thức mô hình nội bộ là không hiệu quả và ủng hộ việc mô hình học cách truy xuất và hiểu. kNN-LM (Khandelwal et al., 2019) nâng cao mô hình hóa ngôn ngữ bằng cách pha trộn dự đoán từ tiếp theo của LLM với những dự đoán từ một cơ chế dựa trên truy xuất. MemTrm (Wu et al., 2022) giới thiệu một ngân hàng bộ nhớ nhưng có nguy cơ thay đổi phân phối bộ nhớ do điều chỉnh tham số. LongMEM (Wang et al., 2024b) giảm thiểu điều này bằng cách huấn luyện một sub-network, mặc dù điều này thêm overhead đáng kể. Ngược lại, phương pháp của chúng tôi liên quan đến một mô hình được tiền huấn luyện cố định, nâng cao nó với một retriever đóng băng phù hợp với các quá trình truy xuất nội bộ của mô hình, do đó tránh sự thay đổi phân phối và thay đổi kiến trúc.
+
+## 7 Kết luận
+
+Chúng tôi giới thiệu MemLong, một phương pháp sáng tạo nâng cao đáng kể khả năng của các mô hình ngôn ngữ xử lý văn bản dài bằng cách tận dụng một retriever bên ngoài. MemLong sử dụng một retriever thành thạo để truy cập nhanh chóng và chính xác văn bản liên quan đến ngữ cảnh xa với overhead bộ nhớ tối thiểu. MemLong thành công mở rộng cửa sổ ngữ cảnh của mô hình từ 2k đến 80k token. Chúng tôi chứng minh rằng MemLong thể hiện những lợi thế cạnh tranh đáng kể trong các tác vụ mô hình hóa và hiểu văn bản khoảng cách xa. MemLong có thể đạt được cải thiện hiệu suất lên đến 10.4 điểm phần trăm so với mô hình ngữ cảnh đầy đủ.
+
+## Hạn chế
+
+Công việc của chúng tôi chủ yếu tập trung vào OpenLLaMA-3B. Chúng tôi hy vọng rằng nghiên cứu tương lai sẽ khám phá và điều tra việc áp dụng các phương pháp của chúng tôi cho các mô hình có kích thước khác nhau. Đồng thời, đã phát hiện ra rằng trong khi các K-V Pairs một lớp có thể cung cấp thông tin ngữ nghĩa bổ sung cho các lớp trên, thông tin này không ổn định. Chúng tôi hy vọng rằng công việc tương lai có thể cung cấp một khung hợp lý hơn để phù hợp với các phương pháp của chúng tôi. Đồng thời, chúng tôi sử dụng một retriever với FlagEmbeddings cố định (Xiao et al., 2023b; Zhang et al., 2023a), nhưng việc nghiên cứu một phạm vi rộng hơn các retriever sẽ hữu ích.
+
+## Tuyên bố Đạo đức
+
+Trong việc theo đuổi thúc đẩy kiến thức và phát triển các giải pháp sáng tạo, chúng tôi cam kết duy trì các tiêu chuẩn đạo đức cao nhất. Công việc của chúng tôi được hướng dẫn bởi sự cống hiến kiên định cho tính chính trực, minh bạch, và tôn trọng tất cả các cá nhân và cộng đồng liên quan. Vì các mô hình được tiền huấn luyện có thể có một số thiên vị do sự hiện diện không thể tránh khỏi của corpus có hại/xúc phạm trong quá trình huấn luyện, việc tinh chỉnh MemLong trên Slimpajama cũng sẽ đối mặt với vấn đề này. Mặc dù việc giải quyết vấn đề này nằm ngoài công việc hiện tại của chúng tôi, chúng tôi hy vọng rằng sẽ có công việc tương lai giải quyết tốt loại vấn đề này.
+
+## Tài liệu tham khảo
+
+[Danh sách tài liệu tham khảo được giữ nguyên như bản gốc]
+
+## A Các Cài đặt Huấn luyện Khác nhau
+
+Như được hiển thị trong 4, chúng tôi liệt kê các giá trị biến tương ứng với các tên cài đặt khác nhau trong thí nghiệm ablation.
+
+| Tên Cài đặt | Lớp Truy xuất | Lớp Bộ nhớ | Tham số Huấn luyện |
+|---|---|---|---|
+| Retreival_All_and_Training_All | [14,15, . . .,26] | 13 | Tất cả Tham số Có thể Huấn luyện của Mô hình |
+| Retreival_All_and_Training_Half | [14,15, . . .,26] | 13 | Một nửa Tham số Có thể Huấn luyện của Mô hình |
+| Retreival_Partial_and_Training_Half | [14,16,18, . . .,26] | 13 | Một nửa Tham số Có thể Huấn luyện của Mô hình |
+| Retreival_lower_Partial_and_Training_Half | [14,18,22,26] | 13 | Một nửa Tham số Có thể Huấn luyện của Mô hình |
+
+Bảng 4: Các tham số cụ thể của các tên cài đặt khác nhau.

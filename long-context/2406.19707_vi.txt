@@ -1,0 +1,407 @@
+# InfiniGen: Suy luận tạo sinh hiệu quả của các mô hình ngôn ngữ lớn với quản lý KV Cache động
+
+Wonbeom Lee†Jungi Lee†Junghwan Seo Jaewoong Sim
+Seoul National University
+
+## Tóm tắt
+
+Các mô hình ngôn ngữ lớn (LLM) dựa trên Transformer thể hiện hiệu suất ấn tượng trên nhiều nhiệm vụ xử lý ngôn ngữ tự nhiên khác nhau. Tuy nhiên, việc phục vụ suy luận LLM để tạo ra nội dung dài đặt ra thách thức do dung lượng bộ nhớ khổng lồ của trạng thái tạm thời, được gọi là bộ nhớ đệm key-value (KV), mà tỷ lệ với độ dài chuỗi và kích thước batch. Trong bài báo này, chúng tôi trình bày InfiniGen, một khung quản lý KV cache mới được thiết kế riêng cho việc tạo văn bản dài, hoạt động hiệp lực với các hệ thống suy luận dựa trên offloading hiện đại. InfiniGen tận dụng thông tin quan trọng rằng một số token quan trọng cần thiết để tính toán lớp attention tiếp theo trong Transformer có thể được suy đoán bằng cách thực hiện một cuộc diễn tập tối thiểu với các đầu vào của lớp hiện tại và một phần của trọng số query và key cache của lớp tiếp theo. Điều này cho phép chúng tôi chỉ prefetch các mục KV cache cần thiết (mà không cần lấy tất cả), từ đó giảm thiểu overhead fetch từ bộ nhớ host trong các hệ thống phục vụ LLM dựa trên offloading. Đánh giá của chúng tôi trên một số LLM đại diện cho thấy InfiniGen cải thiện hiệu suất tổng thể của hệ thống offloading hiện đại lên đến 3.00× so với các phương pháp quản lý KV cache trước đây trong khi cung cấp độ chính xác mô hình tốt hơn đáng kể.
+
+## 1 Giới thiệu
+
+Các mô hình ngôn ngữ lớn (LLM) đã mở ra một kỷ nguyên mới trên một loạt các ứng dụng thực tế như chatbot [40, 76], trợ lý coding [11, 43], dịch ngôn ngữ [1, 68], và tóm tắt tài liệu [64, 74]. Thành công đáng chú ý của LLM có thể được quy cho kích thước mô hình khổng lồ, cho phép xử lý và tạo ra nội dung dài một cách hiệu quả. Ví dụ, trong khi độ dài chuỗi tối đa của phiên bản đầu tiên của GPT bị hạn chế ở 512 token [51], phiên bản mới nhất, GPT-4, có thể xử lý lên đến 32K token, tương đương với khoảng 50 trang văn bản [3]. Một số mô hình được công bố gần đây như Claude 3 [6] và Gemini 1.5 [53] thậm chí có thể xử lý lên đến 1 triệu token, mở rộng đáng kể cửa sổ ngữ cảnh theo nhiều bậc độ lớn.
+
+Ngoài thách thức được nghiên cứu kỹ về kích thước mô hình, việc triển khai LLM hiện gặp phải thách thức mới do dung lượng đáng kể của trạng thái tạm thời, được gọi là bộ nhớ đệm key-value (KV cache), trong quá trình xử lý và tạo ngữ cảnh dài. Đối với suy luận LLM tạo sinh, các key và value của tất cả các token trước đó được lưu trữ trong bộ nhớ để tránh tính toán dư thừa và lặp lại. Tuy nhiên, không giống như trọng số mô hình, KV cache tỷ lệ với độ dài chuỗi đầu ra, thường tiêu thụ nhiều dung lượng bộ nhớ hơn cả trọng số mô hình. Khi nhu cầu về độ dài chuỗi dài hơn (cùng với kích thước batch lớn hơn) tiếp tục tăng, vấn đề về kích thước KV cache sẽ trở nên rõ rệt hơn trong tương lai.
+
+Trong khi đó, các hệ thống phục vụ LLM hiện đại hỗ trợ offloading dữ liệu vào bộ nhớ CPU để phục vụ LLM một cách hiệu quả trong ngân sách phần cứng [5,57]. Các hệ thống suy luận dựa trên offloading này bắt đầu hỗ trợ thậm chí offloading KV cache vào bộ nhớ CPU, từ đó cho phép người dùng tạo ra ngữ cảnh dài hơn nhiều vượt quá dung lượng bộ nhớ GPU. Tuy nhiên, việc chuyển kích thước khổng lồ của KV cache từ bộ nhớ CPU sang GPU trở thành một nút thắt hiệu suất mới trong suy luận LLM.
+
+Trong công trình này, chúng tôi đề xuất InfiniGen, một khung quản lý KV cache được thiết kế để hoạt động hiệp lực với các hệ thống suy luận dựa trên offloading hiện đại. InfiniGen được xây dựng trên hai nguyên tắc thiết kế chính. Đầu tiên, nó suy đoán và chọn các mục KV cache quan trọng để tạo ra token đầu ra tiếp theo, loại bỏ những mục không quan trọng, bằng cách thực hiện một cuộc diễn tập tối thiểu của tính toán attention cho Lớp i tại Lớp i−1. Thứ hai, nó tận dụng dung lượng bộ nhớ CPU và duy trì pool KV cache trên CPU, thay vì trên GPU, để đảm bảo rằng các giá trị KV cache quan trọng có thể được xác định cho tất cả các đầu ra và lớp với kích thước cửa sổ lớn trong khi giảm bớt mối lo ngại về dung lượng bộ nhớ GPU hạn chế cho việc tạo nội dung dài.
+
+Cụ thể, InfiniGen thao tác trọng số mô hình offline để làm cho việc suy đoán hiệu quả và chính xác hơn nhiều, bằng cách làm lệch kiến trúc Transformer query và key matrices để nhấn mạnh một số cột quan trọng nhất định. Trong giai đoạn prefill, trong khi prompt và đầu vào của một yêu cầu suy luận được xử lý ban đầu, InfiniGen tạo ra các trọng số từng phần để sử dụng trong giai đoạn decoding (tức là tạo đầu ra) tiếp theo. Tại Lớp i−1 của giai đoạn decoding, InfiniGen suy đoán mẫu attention của lớp tiếp theo (Lớp i) bằng cách sử dụng đầu vào attention của Lớp i−1, một trọng số query từng phần, và một key cache từng phần của Lớp i. Dựa trên mẫu attention được suy đoán, InfiniGen prefetch các mục KV cache cần thiết từ bộ nhớ CPU cho tính toán attention tại Lớp i. Bằng cách điều chỉnh động số lượng mục KV để prefetch, InfiniGen chỉ mang lượng KV cache cần thiết lên GPU, từ đó giảm đáng kể overhead chuyển KV cache. Ngoài ra, InfiniGen quản lý pool KV cache bằng cách loại bỏ động các mục KV cache của các token ít được sử dụng.
+
+Chúng tôi triển khai InfiniGen trên một hệ thống suy luận dựa trên offloading hiện đại [57] và đánh giá nó trên hai LLM đại diện với kích thước mô hình, kích thước batch và độ dài chuỗi khác nhau. Đánh giá của chúng tôi cho thấy InfiniGen đạt được tăng tốc lên đến 3.00× so với các phương pháp quản lý KV cache hiện có trong khi cung cấp tăng đến 32.6 điểm phần trăm về độ chính xác. Ngoài ra, InfiniGen liên tục cung cấp cải thiện hiệu suất với các mô hình lớn hơn, độ dài chuỗi dài hơn và kích thước batch lớn hơn, trong khi các phương pháp dựa trên nén trước đây dẫn đến tăng tốc bão hòa.
+
+Tóm lại, bài báo này đóng góp những điểm sau:
+
+• Chúng tôi trình bày InfiniGen, một khung quản lý KV cache động hoạt động hiệp lực với các hệ thống phục vụ LLM dựa trên offloading hiện đại bằng cách quản lý thông minh KV cache trong bộ nhớ CPU.
+
+• Chúng tôi đề xuất một kỹ thuật prefetching KV cache mới với tỉa tạm thời, suy đoán mẫu attention của lớp attention tiếp theo và chỉ mang phần thiết yếu của KV cache lên GPU trong khi giữ phần còn lại trong bộ nhớ CPU.
+
+• Chúng tôi triển khai InfiniGen trên một hệ thống suy luận dựa trên offloading hiện đại và chứng minh rằng nó vượt trội đáng kể so với các phương pháp quản lý KV cache hiện có, đạt được hiệu suất nhanh hơn lên đến 3.00× trong khi cũng cung cấp độ chính xác mô hình tốt hơn.
+
+## 2 Kiến thức nền
+
+Phần này giải thích ngắn gọn luồng hoạt động và kỹ thuật KV caching của các mô hình ngôn ngữ lớn và giới thiệu phân tích giá trị đơn (SVD) như một phương pháp làm lệch ma trận để hiểu rõ hơn về khung đề xuất của chúng tôi, mà chúng tôi thảo luận trong Phần 4.2.
+
+### 2.1 Các mô hình ngôn ngữ lớn
+
+Các mô hình ngôn ngữ lớn (LLM) được cấu thành từ một ngăn xếp các khối Transformer, mỗi khối chứa một lớp attention theo sau bởi một lớp feed-forward [61]. Tensor đầu vào (X) của khối Transformer có chiều N×D, trong đó N là số lượng query token, và D là chiều mô hình. Tensor đầu vào này (X) trước tiên được chuẩn hóa lớp (LayerNorm), và tensor được chuẩn hóa lớp (Xa) được đưa vào lớp attention như đầu vào. Đầu vào attention (Xa) được nhân với ba ma trận trọng số khác nhau (WQ, WK, WV) để tạo ra các ma trận Query (Q), Key (K), và Value (V). Mỗi ma trận trọng số có chiều D×D. Do đó, Query, Key, và Value có chiều N×D. Các ma trận này được định hình lại để có chiều H×N×d, trong đó H là số lượng attention head và d là chiều head; lưu ý rằng D=H×d.
+
+Mỗi head thực hiện tính toán attention độc lập, có thể được công thức hóa như sau: softmax(QKT)V.1 Đầu ra attention, sau một phép cộng dư (cộng vào tensor đầu vào X) và chuẩn hóa lớp, được đưa vào lớp feed-forward. Mạng feed-forward (FFN) bao gồm hai phép chiếu tuyến tính liên tiếp và một hoạt động kích hoạt phi tuyến giữa chúng. Đầu ra của FFN sau một phép cộng dư trở thành đầu ra của một khối Transformer, có cùng chiều với đầu vào của khối Transformer (tức là N×D). Điều này cho phép chúng ta dễ dàng mở rộng LLM bằng cách điều chỉnh số lượng khối Transformer.
+
+### 2.2 Suy luận tạo sinh và KV Caching
+
+Suy luận LLM tạo sinh thường bao gồm hai giai đoạn chính: giai đoạn prefill và giai đoạn decoding. Trong giai đoạn prefill, LLM tóm tắt ngữ cảnh của chuỗi đầu vào (tức là prompt đầu vào) và tạo ra một token mới làm đầu vào ban đầu cho giai đoạn decoding. Sau đó, sử dụng token mới này, LLM chạy giai đoạn decoding để tạo ra token tiếp theo. Token mới được tạo sau đó được đưa trở lại vào giai đoạn decoding như đầu vào, tạo ra một quá trình tự hồi quy để tạo token. Trong công trình này, chúng tôi gọi mỗi lần tạo token trong giai đoạn decoding là một iteration.
+
+Để tạo ra một token mới phù hợp với ngữ cảnh, LLM cần tính toán mối quan hệ giữa token cuối cùng và tất cả các token trước đó, bao gồm các token từ chuỗi đầu vào, trong lớp attention. Một cách tiếp cận ngây thơ cho điều này là tính toán lại các key và value của tất cả các token trước đó ở mỗi iteration. Tuy nhiên, điều này phát sinh một overhead đáng kể do tính toán dư thừa và lặp lại. Hơn nữa, overhead tính toán tăng tuyến tính với số lượng token trước đó; tức là overhead trở nên lớn hơn đối với các chuỗi dài hơn.
+
+Để tránh overhead như vậy, các key (K) và value (V) của tất cả các token trước đó thường được ghi nhớ trong bộ nhớ, được gọi là KV cache. KV cache sau đó tiếp tục được cập nhật với key và value của token được tạo ra ở mỗi iteration. Do đó, chiều của KV cache tại iteration thứ i có thể được biểu diễn là H×(N+i)×d. Nếu suy luận batch được sử dụng, kích thước của KV cache cũng tăng tuyến tính theo kích thước batch. Bằng cách sử dụng KV cache, chúng ta có thể tránh tính toán lặp lại và chỉ tạo ra key và value của một token ở mỗi iteration. Lưu ý rằng trong giai đoạn decoding, đầu vào cho khối Transformer (X) có chiều 1×D, và chiều của ma trận điểm attention trở thành H×1×(N+i) tại iteration thứ i.
+
+### 2.3 Outlier trong các mô hình ngôn ngữ lớn
+
+Các mô hình ngôn ngữ lớn có outlier trong các tensor đầu vào khối Transformer. Các outlier đề cập đến các phần tử có độ lớn lớn hơn đáng kể so với các phần tử khác. Các outlier trong LLM xuất hiện trong một số kênh cố định (tức là các cột trong ma trận 2D) qua các lớp. Công trình trước đây đã chỉ ra rằng outlier là do thuộc tính nội tại của mô hình (ví dụ: độ lớn lớn trong một số kênh cố định của trọng số chuẩn hóa lớp) [19, 65].
+
+### 2.4 Phân tích giá trị đơn
+
+Chúng tôi quan sát thấy rằng việc làm lệch các ma trận query và key để làm cho một số ít kênh lớn hơn nhiều so với những kênh khác và chỉ sử dụng những kênh đó để tính toán ma trận điểm attention có thể dự đoán hiệu quả token nào quan trọng. Về bản chất, chúng tôi nhân các ma trận Q và K với một ma trận trực giao A để làm cho nó căn chỉnh với hướng mà Q kéo giãn nhiều nhất, để tạo ra các ma trận lệch tương ứng Q̃ và K̃. Chúng tôi giải thích chi tiết tại sao chúng tôi sử dụng ma trận trực giao trong Phần 4.2.
+
+Để tìm ma trận trực giao A như vậy, chúng tôi sử dụng phân tích giá trị đơn (SVD), một kỹ thuật phân tích ma trận được sử dụng rộng rãi trong đại số tuyến tính. Đối với một ma trận thực Q có kích thước m×n, phân tích SVD của nó có thể được biểu diễn như sau:
+
+Q = UΣVT,
+
+trong đó U và V là các ma trận trực giao có kích thước m×m và n×n, tương ứng.2 Σ là ma trận đường chéo m×n, có các giá trị khác không (σ1, σ2, ..., σk) trên đường chéo, trong đó k=min(m,n). Về mặt biến đổi tuyến tính, được biết rõ rằng một biến đổi của một vector v∈Rn bởi một ma trận thực B (tức là tích của B và v) là một phép quay và/hoặc phản chiếu trong Rn nếu ma trận B là trực giao. Nếu B là ma trận đường chéo m×n, mỗi chiều của v được kéo giãn bởi mục đường chéo tương ứng của B và được chiếu vào Rm.
+
+Ví dụ, Hình 1 cho thấy cách các vector cột v1 và v2 của VT sẽ biến đổi thành các vector cột q1 và q2 của Q, khi m và n là 2. Trong Hình 1(a), các vector đơn vị trực giao v1 và v2 trước tiên được kéo giãn đến các điểm trên một elip có độ dài bán trục tương ứng với các mục đường chéo trong Σ. Các vector sau đó được quay và/hoặc phản chiếu thành q1 và q2 bởi ma trận U. Mặt khác, Hình 1(b) cho thấy cách ma trận trực giao A thực hiện phép quay để làm cho q̃1 kết quả lớn hơn nhiều so với q̃2. Cụ thể, A quay các vector v1 và v2 thành e1 và e2, được ánh xạ đến các bán trục của elip. Bằng cách này, các vector được kéo giãn đến tối đa và tối thiểu bởi ma trận Σ. Quá trình này nhấn mạnh độ lớn của q̃1 so với q̃2, cho phép chúng ta dự đoán hiệu quả điểm attention chỉ sử dụng q̃1 trong khi bỏ qua q̃2.
+
+## 3 Động lực
+
+Trong phần này, chúng tôi trước tiên giải thích rằng kích thước KV cache trở thành một vấn đề quan trọng đối với việc tạo văn bản dài trong suy luận LLM, và nó trở nên có vấn đề hơn khi triển khai các hệ thống suy luận dựa trên offloading hiện đại (Phần 3.1). Sau đó chúng tôi thảo luận tại sao các phương pháp quản lý KV cache hiện có không thể giải quyết căn bản vấn đề trong hệ thống suy luận dựa trên offloading (Phần 3.2).
+
+### 3.1 KV Cache trong các hệ thống suy luận LLM
+
+Như đã thảo luận trong Phần 2.2, các hệ thống phục vụ LLM ngày nay khai thác KV caching để tránh tính toán dư thừa của các phép chiếu key và value trong giai đoạn decoding. Mặc dù đây là một giải pháp hiệu quả cho việc tạo chuỗi ngắn với một yêu cầu client duy nhất, KV cache nhanh chóng trở thành một người tiêu thụ bộ nhớ chính khi chúng ta tạo ra các chuỗi dài hoặc sử dụng các kỹ thuật batching yêu cầu hiện đại [57, 71].
+
+Hình 2 cho thấy kích thước kết hợp của trọng số LLM và KV cache qua các độ dài chuỗi và kích thước batch khác nhau. Như được mô tả trong hình, kích thước mô hình vẫn không đổi bất kể độ dài chuỗi hoặc kích thước batch, trong khi kích thước KV cache tỷ lệ tuyến tính với chúng. Lưu ý rằng các hệ thống phục vụ LLM hiện đại, chẳng hạn như NVIDIA Triton Inference Server [45] và TensorFlow Serving [47], đã hỗ trợ suy luận batch để sử dụng tính toán tốt hơn và thông lượng cao hơn trong việc phục vụ các yêu cầu client. Khi các yêu cầu riêng lẻ được batch, mỗi yêu cầu giữ lại KV cache riêng của mình, từ đó tăng kích thước KV cache tổng thể cho việc suy luận. Ngay cả đối với một yêu cầu client duy nhất, beam search [59] và parallel sampling [20] được sử dụng rộng rãi để tạo ra đầu ra tốt hơn hoặc để cung cấp cho client một lựa chọn các ứng viên [11, 24]. Các kỹ thuật này cũng tăng kích thước của KV cache như suy luận batch vì nhiều chuỗi được xử lý cùng nhau. Do đó, kích thước KV cache có thể dễ dàng vượt quá kích thước mô hình cho nhiều trường hợp sử dụng thực tế, như cũng được quan sát trong công trình trước đây [37,49,57,78]. Điều này có thể gây áp lực đáng kể lên dung lượng bộ nhớ GPU, vốn tương đối khan hiếm và đắt đỏ.
+
+Các hệ thống suy luận LLM với Offloading. Các hệ thống phục vụ LLM hiện đại như DeepSpeed [5] và FlexGen [57] đã hỗ trợ offloading trọng số mô hình hoặc KV cache vào bộ nhớ CPU. Khi nói đến các hệ thống suy luận dựa trên offloading, kích thước KV cache trở nên có vấn đề hơn do băng thông PCIe thấp giữa CPU và GPU, trở thành một nút thắt mới và quan trọng.
+
+Hình 3 mô tả một sơ đồ thời gian cấp cao giữa các phong cách thực thi khác nhau của các khối Transformer. Hình 3(a) đại diện cho trường hợp khi KV cache hoàn toàn nằm trong bộ nhớ GPU (Full GPU). Trong trường hợp này, độ trễ tải của KV cache (Load Cache) bao gồm một hoạt động đọc đơn giản từ bộ nhớ GPU, có thể bỏ qua do băng thông cao của bộ nhớ GPU. Tuy nhiên, kích thước batch tối đa hoặc độ dài chuỗi bị giới hạn bởi dung lượng bộ nhớ GPU, tương đối nhỏ hơn bộ nhớ CPU.
+
+Để cho phép kích thước batch lớn hơn hoặc độ dài chuỗi dài hơn, chúng ta có thể offload KV cache vào bộ nhớ CPU (KV cache on CPU), như được hiển thị trong Hình 3(b). Trong khi các hệ thống suy luận dựa trên offloading giảm bớt giới hạn về kích thước batch và độ dài chuỗi, việc chuyển hàng trăm gigabyte của KV cache lên GPU cho tính toán attention làm tăng đáng kể thời gian thực thi tổng thể của các khối Transformer do băng thông PCIe hạn chế.
+
+Ngay cả khi chúng ta áp dụng kỹ thuật prefetching thông thường (Prefetch KV cache), như được hiển thị trong Hình 3(c), chỉ một phần của độ trễ tải có thể được ẩn bởi tính toán của khối Transformer trước đó. Lưu ý rằng mặc dù việc nén KV cache thông qua quantization có thể giảm overhead chuyển dữ liệu trong các hệ thống dựa trên offloading [57], nó không phục vụ như một giải pháp căn bản vì quantization không giải quyết nguyên nhân gốc rễ của vấn đề KV cache, đó là tỷ lệ tuyến tính của các mục KV với độ dài chuỗi. Điều này đòi hỏi quản lý KV cache thông minh để giảm thiểu overhead hiệu suất trong khi bảo tồn lợi ích của nó.
+
+### 3.2 Thách thức trong quản lý KV Cache
+
+Phương pháp căn bản để giảm thiểu overhead chuyển của KV cache từ CPU sang GPU là giảm khối lượng KV cache cần tải bằng cách xác định các key và value quan trọng để tính toán điểm attention, như được hiển thị trong Hình 3(d). Được công nhận rộng rãi rằng các key và value của một số token quan trọng hơn những token khác trong tính toán attention [9, 10, 14, 33, 63]. Như được giải thích trong Phần 2.1, sau khi tính toán điểm attention, hoạt động softmax được áp dụng, nhấn mạnh một số giá trị lớn của các token. Do đó, việc bỏ qua tính toán attention cho một số token ít quan trọng hơn không làm giảm đáng kể độ chính xác mô hình, miễn là việc lựa chọn token phù hợp.
+
+Trong bối cảnh này, một số công trình gần đây đề xuất giảm kích thước KV cache thông qua việc loại bỏ key/value tại runtime trong một ngân sách KV cache bị ràng buộc [37, 78]. Tuy nhiên, tất cả các công trình trước đây đều giả định sự bền vững của các mẫu attention qua các iteration; nghĩa là, nếu một token được coi là không quan trọng trong iteration hiện tại (tức là có trọng số attention thấp), nó có khả năng vẫn không quan trọng trong việc tạo ra các token tương lai. Dưới giả định này, họ loại bỏ các token có trọng số attention thấp khỏi KV cache tại mỗi iteration khi kích thước KV cache vượt quá ngân sách của nó. Các key và value của các token bị loại bỏ bị loại trừ vĩnh viễn khỏi các iteration tiếp theo trong khi bị xóa khỏi bộ nhớ. Mặc dù các công trình gần đây về quản lý KV cache có thể được áp dụng cho các hệ thống suy luận dựa trên offloading, chúng tôi quan sát thấy rằng chúng không giải quyết hiệu quả các thách thức trong quản lý KV cache dưới đây và do đó có hiệu suất kém với các hệ thống suy luận dựa trên offloading.
+
+C1: Bản chất động của các mẫu attention qua các iteration. Hình 4 cho thấy độ tương tự cosine giữa các trọng số attention của mô hình cơ sở, sử dụng KV cache của tất cả các token trước đó để tính toán trọng số attention (tức là tối đa 2000 token trong thí nghiệm), và hai phương pháp quản lý KV cache khác nhau (H2O và Optimal) với ngân sách KV cache là 200 token.3 H2O [78] là một kỹ thuật tiên tiến chỉ giữ lại một phần trăm nhỏ các token quan trọng trong KV cache để giảm kích thước của nó. Nó đánh giá tầm quan trọng của mỗi token trong mỗi iteration và loại bỏ những token không quan trọng trước iteration tiếp theo để giữ kích thước KV cache trong tầm kiểm soát (tức là sử dụng cửa sổ đánh giá hẹp). Ngược lại, Optimal đại diện cho kịch bản mà chúng ta chọn cùng số lượng token như H2O từ KV cache tại mỗi iteration nhưng giữ lại tất cả các key và value trước đó (tức là sử dụng cửa sổ đánh giá rộng hơn). Nói cách khác, Optimal chọn 200 token từ toàn bộ chuỗi các token trước đó tại mỗi iteration.
+
+Hình này chỉ ra rằng mặc dù các phương pháp giống H2O giả định rằng mẫu attention không thay đổi qua các iteration, điều này không đúng trong thực tế. Các token được coi là không quan trọng trong iteration hiện tại có thể trở nên quan trọng trong các iteration tiếp theo. Do đó, H2O thể hiện độ tương tự cao cho đến khoảng 200 iteration (tức là trong ngân sách KV cache), nhưng khi độ dài chuỗi mở rộng vượt quá ngân sách KV cache, nó bắt đầu gặp khó khăn với bản chất động của mẫu attention, dẫn đến độ tương tự cosine thấp hơn so với trường hợp Optimal. Lưu ý rằng mặc dù chúng tôi chỉ cho thấy kịch bản của ngân sách KV cache là 200 trong tổng số độ dài chuỗi 2000 token cho ngắn gọn, vấn đề này sẽ trở nên rõ rệt hơn khi độ dài chuỗi vượt quá nó.
+
+C2: Điều chỉnh số lượng mục KV qua các lớp. Hình 4 cũng minh họa rằng tác động của việc loại bỏ KV cache khác nhau qua các lớp trong LLM. Đối với Lớp 0, cả H2O và Optimal đều cho thấy sự giảm đáng kể về độ tương tự cosine khi token ID tăng. Điều này ngụ ý rằng Lớp 0 có mẫu attending rộng hơn các lớp khác; tức là các trọng số attention tương đối giống nhau giữa các key token. Do đó, 200 token được chọn với trọng số attention lớn không đại diện đầy đủ cho mẫu attention của mô hình cơ sở cho lớp này, vì chúng có khả năng chỉ lớn hơn một chút so với những token khác, không mạnh mẽ. Trong những trường hợp như vậy, cần thiết phải tính toán trọng số attention với số lượng token lớn hơn.
+
+Để ước tính có bao nhiêu key/value từ KV cache cần được giữ lại, chúng tôi sắp xếp trọng số attention cho mỗi query token theo thứ tự giảm dần và tổng các key token cho đến khi trọng số tích lũy đạt 0.9. Hình 5 trình bày một biểu đồ tần số của số lượng query token (trục y) yêu cầu số lượng key token (trục x) cần thiết để đạt trọng số 0.9 (trong tổng trọng số attention là 1.0) trong hai lớp khác nhau: Lớp 0 và Lớp 18. Lớp 0 cho thấy phân phối rộng, cho thấy sự biến đổi đáng kể trong số lượng key token cần thiết để đạt trọng số 0.9 cho mỗi query token. Ngược lại, Lớp 18 thể hiện phân phối rất lệch, gợi ý rằng phần lớn các query token trong lớp này chỉ yêu cầu một số ít key token để đạt trọng số 0.9. Điều này ngụ ý rằng chúng ta cần điều chỉnh động số lượng key token tham gia vào tính toán attention qua các lớp khác nhau để sử dụng hiệu quả ngân sách KV cache.
+
+C3: Điều chỉnh số lượng mục KV qua các query. H2O đặt số lượng key/value token để giữ lại như một phần trăm cố định của độ dài chuỗi đầu vào. Ngân sách KV cache vẫn không đổi bất kể có bao nhiêu token đã được tạo ra. Bằng cách phân tích dữ liệu từ Hình 5 trên Lớp 18, chúng tôi quan sát thấy rằng ngân sách KV cache cố định này có một số hạn chế. Ví dụ, với độ dài chuỗi đầu vào là 200 và ngân sách KV cache 20%, H2O duy trì 40 key/value token trong suốt quá trình tạo token. Tuy nhiên, hầu hết các query token tiếp theo yêu cầu nhiều hơn 40 token để đại diện hiệu quả cho trọng số attention của mô hình cơ sở; ví dụ, token thứ 500, 1000, 1500, và 2000 cần 80, 146, 160, và 164 key token, tương ứng, để đạt trọng số attention tích lũy 0.9. Điều này ngụ ý một lượng không đầy đủ của các key/value token để đại diện đúng cho trọng số attention của mô hình cơ sở. Hơn nữa, số lượng key token cần thiết để đạt 0.9 thay đổi ngay cả đối với các query token liền kề; ví dụ, token thứ 998, 999, 1000, 1001, và 1002 cần 172, 164, 146, 154, và 140 key token, tương ứng. Việc cố định ngân sách KV cache mà không tính đến sự biến đổi giữa các query token không thể tránh khỏi dẫn đến quản lý KV cache không hiệu quả. Do đó, chúng ta cần điều chỉnh động lượng key/value token được tải và tính toán cho mỗi query token để quản lý hiệu quả KV cache.
+
+Tóm tắt. Các công trình trước đây nhằm giảm kích thước KV cache thông qua việc loại bỏ token vốn có một số thách thức. Với bản chất động của mẫu attention qua các iteration, việc loại trừ vĩnh viễn các token bị loại bỏ khỏi việc tạo token tương lai có thể dẫn đến sự giảm độ chính xác không thể bỏ qua. Thay vào đó, chúng ta cần chọn động các token quan trọng từ KV cache trong khi tránh việc loại bỏ hoàn toàn những token ít quan trọng hơn. Hơn nữa, kích thước cố định của ngân sách KV cache trong các công trình trước đây dẫn đến quản lý KV cache không hiệu quả. Số lượng key/value token cần thiết cho mỗi lớp khác nhau, và mỗi query token yêu cầu một số lượng key/value token khác nhau để đại diện hiệu quả cho mẫu attention của mô hình cơ sở. Việc không tính đến những biến đổi này có thể dẫn đến quản lý KV cache không hiệu quả. Do đó, chúng ta cần điều chỉnh động số lượng key/value token để chọn từ KV cache trong khi xem xét các biến đổi giữa các lớp và query token.
+
+## 4 Thiết kế InfiniGen
+
+Trong phần này, chúng tôi trình bày InfiniGen, một khung quản lý KV cache cho các hệ thống suy luận dựa trên offloading. Chúng tôi trước tiên cho thấy cái nhìn tổng quan cấp cao về giải pháp quản lý KV cache đề xuất của chúng tôi (Phần 4.1) và thảo luận về các cơ hội prefetching KV cache mà chúng tôi quan sát thấy (Phần 4.2). Sau đó chúng tôi giải thích mô-đun prefetching của chúng tôi (Phần 4.3), được xây dựng trên các hệ thống suy luận dựa trên offloading, và thảo luận cách InfiniGen quản lý KV cache trên bộ nhớ CPU liên quan đến áp lực bộ nhớ (Phần 4.4).
+
+### 4.1 Tổng quan
+
+Hình 6 cho thấy tổng quan về khung quản lý KV cache của chúng tôi, InfiniGen, cho phép offloading KV cache với overhead chuyển dữ liệu thấp. Nguyên tắc thiết kế chính đằng sau InfiniGen là khai thác dung lượng bộ nhớ CPU dồi dào để tăng kích thước cửa sổ khi xác định các token quan trọng trong KV cache. Do đó, phần lớn các token cho KV cache được giữ trong bộ nhớ CPU khi chúng ta tạo ra các token mới, không loại bỏ hoàn toàn chúng không giống như các công trình trước đây [37, 78]. Tuy nhiên, chúng tôi không mang toàn bộ KV cache lên GPU cho tính toán attention, mà chỉ tải và tính toán với các key và value của một số ít token quan trọng, loại bỏ những token không quan trọng khác một cách động. Để làm như vậy, chúng tôi duy trì pool KV cache trong bộ nhớ CPU và chọn lọc và suy đoán tải một số ít token.
+
+Chi tiết, chúng tôi sử dụng đầu vào attention của lớp Transformer trước đó để suy đoán và prefetch các key và value của các token quan trọng cho lớp hiện tại. Việc suy đoán được thực hiện bằng cách thực hiện một cuộc diễn tập tối thiểu của tính toán attention của lớp hiện tại trong lớp trước đó. Điều này cho phép giảm lãng phí băng thông PCIe bằng cách chỉ chuyển các key và value quan trọng cho tính toán attention trong khi bảo tồn độ chính xác mô hình. Ngoài ra, mặc dù KV cache được offload vào bộ nhớ CPU, rẻ hơn và lớn hơn nhiều so với bộ nhớ GPU, chúng tôi quản lý kích thước pool KV cache để không gây áp lực quá nhiều lên bộ nhớ CPU.
+
+Như được hiển thị trong Hình 6, có hai thành phần chính trong runtime InfiniGen. Thành phần đầu tiên bao gồm Partial Weight Index Generation Controller, KV Selection Controller, và Inference Controller. Các bộ điều khiển này hợp tác để suy đoán và prefetch các mục KV cache quan trọng trong khi phục vụ suy luận LLM. Ngoài ra, để hỗ trợ trong prefetching, Skewing Controller thực hiện các sửa đổi offline trên trọng số mô hình. Chúng tôi giải thích mỗi hoạt động trong Phần 4.3. Thành phần thứ hai là Pool Manager. Nó quản lý pool KV cache trên bộ nhớ CPU dưới áp lực bộ nhớ CPU, mà chúng tôi thảo luận trong Phần 4.4.
+
+### 4.2 Cơ hội Prefetching
+
+Trong phần sau, chúng tôi trước tiên giải thích tại sao việc sử dụng đầu vào attention của lớp trước đó cho việc suy đoán có ý nghĩa. Sau đó chúng tôi cho thấy cách chúng tôi sửa đổi các ma trận trọng số query và key để làm cho việc suy đoán của chúng tôi hiệu quả hơn nhiều.
+
+Sự tương tự đầu vào Attention. Mô-đun prefetching của chúng tôi được xây dựng trên quan sát chính rằng các đầu vào attention của các lớp attention liên tiếp rất tương tự nhau trong LLM. Có hai lý do chính đằng sau điều này. Thứ nhất là sự tồn tại của outlier trong LLM, như đã thảo luận trong Phần 2.3, và thứ hai là do chuẩn hóa lớp (LayerNorm).
+
+Để bắt đầu, đầu vào cho khối Transformer i (Tblock_ini) có thể được công thức hóa như sau:
+
+Attn_outi−1 = Attn(LN(Tblock_ini−1))
+FFN_outi−1 = FFN(LN(Tblock_ini−1 + Attn_outi−1))
+Tblock_ini = Tblock_ini−1 + Attn_outi−1 + FFN_outi−1, (1)
+
+trong đó Tblock_ini−1 là đầu vào cho Lớp i−1, trước tiên được chuẩn hóa lớp (LN) và được đưa vào lớp attention trong khối Transformer. Sau khi thực hiện attention, chúng ta có được đầu ra (Attn_outi−1), được cộng vào Tblock_ini−1 do kết nối dư. Sau đó, tổng của Tblock_ini−1 và Attn_outi−1 lại được chuẩn hóa lớp và được đưa vào lớp FFN. Sau đó, chúng ta có được đầu ra FFN (FFN_outi−1), được cộng vào tổng của Tblock_ini−1 và Attn_outi−1 lại do kết nối dư. Cuối cùng, tổng của Tblock_ini−1, FFN_outi−1, và Attn_outi−1 được sử dụng làm đầu vào cho khối Transformer tiếp theo (Tblock_ini).
+
+Bây giờ, chúng tôi cho thấy tại sao đầu vào attention của Lớp i tương tự với đầu vào của Lớp i−1 với ví dụ trong Hình 7(a). Trong hình, có bốn vector, mỗi vector tương ứng với một thuật ngữ trong Phương trình 1. Trục x đại diện cho một kênh outlier trong chiều mô hình, trong khi trục y đại diện cho một kênh bình thường (tức là khác với kênh outlier). Trong thực tế, có nhiều kênh bình thường hơn và chỉ một số ít kênh outlier trong các tensor đầu vào, nhưng chúng tôi chỉ trình bày một kênh cho cả kênh outlier và kênh bình thường để rõ ràng.
+
+Tblock_ini−1 rất lệch theo kênh outlier (trục x) do một số ít kênh outlier chứa các giá trị lớn đáng kể so với những giá trị trong các kênh bình thường. Ngược lại, Attn_outi−1 và FFN_outi−1 có các giá trị tương đối nhỏ cho cả kênh outlier và kênh bình thường (tức là các vector ngắn). Điều này là do các đầu vào attention và FFN được chuẩn hóa lớp, giảm độ lớn của mỗi giá trị. Độ lớn nhỏ của các đầu vào attention và FFN tự nhiên dẫn đến các giá trị đầu ra của chúng tương đối nhỏ so với Tblock_ini−1. Do đó, Tblock_ini bị ảnh hưởng mạnh bởi Tblock_ini−1, thay vì Attn_outi−1 hoặc FFN_outi−1. Các đầu vào rất tương tự giữa các khối Transformer liên tiếp dẫn đến các đầu vào tương tự qua các lớp attention, vì đầu vào attention là một đầu vào được chuẩn hóa lớp của đầu vào khối Transformer.
+
+Bảng 1 cho thấy độ tương tự cosine giữa Tblock_ini và ba tensor khác (Tblock_ini−1, Attn_outi−1, FFN_outi−1). Như được hiển thị trong bảng, Tblock_ini phụ thuộc cao vào Tblock_ini−1 thay vì những cái khác. InfiniGen tận dụng quan sát chính này để suy đoán mẫu attention của Lớp i bằng cách sử dụng đầu vào attention của Lớp i−1. Lưu ý rằng Tblock_in dần dần thay đổi qua các lớp; các đầu vào cho các lớp xa nhau là khác biệt.
+
+Trọng số từng phần lệch. Chúng tôi quan sát thấy rằng điểm attention phụ thuộc rất nhiều vào một số ít cột trong các ma trận query và key. Hình 7(b) cho thấy các giá trị trong ma trận query của Lớp 18 của mô hình OPT-13B, trong đó các mẫu theo cột cho thấy rằng có một số cột nhất định với độ lớn lớn trong ma trận; chúng tôi quan sát cùng các mẫu trong các ma trận key và query qua các lớp và mô hình khác nhau. Các cột có độ lớn lớn có tác động lớn đến mẫu attention vì tích vô hướng giữa query và key bị ảnh hưởng mạnh bởi những cột ít này. Mẫu theo cột trong đầu vào attention cho thấy rằng có ít biến đổi giữa mỗi hàng trong các kênh outlier. Do đó, tích vô hướng giữa bất kỳ hàng nào của đầu vào attention và một cột của ma trận trọng số có thể có độ lớn tương tự lớn, gây ra các kênh outlier trong các ma trận query và key.
+
+Đi xa hơn một bước, nếu chúng ta làm cho một số ít cột trong các ma trận query và key có độ lớn lớn hơn nhiều so với những cột khác, một số lượng nhỏ hơn nhiều các cột ảnh hưởng đáng kể đến mẫu attention. Chúng ta có thể làm điều này bằng cách nhân các ma trận trọng số query và key với cùng ma trận trực giao A. Vì chuyển vị của ma trận trực giao là nghịch đảo của chính nó, hoạt động đề xuất không thay đổi kết quả cuối cùng, như được hiển thị trong Phương trình 2 (tức là, điều này tương đương về mặt toán học với QKT, không phải là một xấp xỉ):
+
+Q̃ = Xa × WQ × A, K̃ = Xa × WK × A
+Q̃ × K̃T = Xa × WQ × A × (Xa × WK × A)T
+= Xa × WQ × A × AT × WTK × XTa
+= Xa × WQ × WTK × XTa
+= Xa × WQ × (Xa × WK)T
+= Q × KT, (2)
+
+trong đó Q̃ và K̃ là các ma trận query và key lệch, trong khi WQ và WK là các ma trận trọng số query và key. Xa biểu thị đầu vào attention. Chúng tôi đặt ma trận trực giao A có hướng căn chỉnh với hướng mà ma trận query kéo giãn nhiều nhất. Cụ thể, chúng tôi trước tiên phân tích ma trận query bằng SVD và có được U, Σ, và V. Sau đó chúng tôi đặt A thành ma trận trực giao V để căn chỉnh các vector cột với các vector đơn vị chuẩn khi VTA = VTV = I, trong đó I là ma trận đơn vị. Chúng tôi công thức hóa ma trận query lệch như sau:
+
+Q̃ = Q × A = UΣVT × A = UΣVT × V (3)
+
+Bằng cách này, chúng ta có thể làm cho một số ít cột có độ lớn lớn trong Q̃ mà không thay đổi kết quả tính toán, như đã thảo luận trong Phần 2.4.
+
+### 4.3 Prefetching KV Cache hiệu quả
+
+Sơ đồ Prefetching. Hình 8 cho thấy luồng hoạt động của mô-đun prefetching trong InfiniGen. Trong giai đoạn offline, InfiniGen sửa đổi các ma trận trọng số để tạo ra các ma trận query và key lệch. Để đạt được điều này, InfiniGen trước tiên chạy forward pass của mô hình một lần với một đầu vào mẫu. Trong quá trình này, InfiniGen thu thập ma trận query từ mỗi lớp và thực hiện phân tích giá trị đơn (SVD) của mỗi ma trận query. Ma trận lệch (Ai) của mỗi lớp được thu được bằng cách sử dụng các ma trận đã phân tích của ma trận query, như được hiển thị trong Phương trình 3. Ma trận này sau đó được nhân với mỗi ma trận trọng số query và key trong lớp tương ứng. Quan trọng là, sau phép nhân, các chiều của ma trận trọng số vẫn không thay đổi. Lưu ý rằng việc lệch là một quá trình offline một lần và không phát sinh bất kỳ overhead runtime nào vì chúng tôi sửa đổi các ma trận trọng số bất biến tại runtime. Khi chúng tôi khai thác mẫu theo cột, xuất phát từ thuộc tính nội tại của mô hình thay vì đầu vào, bất cứ khi nào chúng tôi tính toán query và key cho các đầu vào khác nhau sau khi lệch, các giá trị thể hiện mức độ lệch cao, từ đó cải thiện hiệu quả của mô-đun prefetching của chúng tôi. Lưu ý rằng việc lệch không thay đổi chức năng ban đầu. Ngay cả với việc lệch, lớp attention tạo ra kết quả tính toán giống hệt nhau.
+
+Giai đoạn Prefill. Trong giai đoạn prefill, InfiniGen chọn một số cột quan trọng từ ma trận trọng số query và key cache để suy đoán mẫu attention, và tạo ra các ma trận trọng số query từng phần và key cache được sử dụng trong giai đoạn decoding. Hình 9 cho thấy cách InfiniGen tạo ra các ma trận từng phần này. Vì chúng tôi nhân mỗi cột trong ma trận query với hàng tương ứng trong ma trận key chuyển vị, cần thiết phải chọn cùng các chỉ số cột trong ma trận trọng số query và key cache để có được một xấp xỉ phù hợp của điểm attention. Tuy nhiên, các chỉ số của các cột outlier của các ma trận query (Q̃) và key (K̃) lệch có thể không căn chỉnh chính xác. Để có được các ma trận từng phần nắm bắt các outlier, chúng tôi trước tiên lấy các giá trị tuyệt đối theo phần tử của các ma trận query và key lệch, sau đó cộng hai ma trận này lại với nhau. Điều này giúp chúng tôi tính toán tổng của mỗi cột và thực hiện hoạt động top-k chỉ một lần trong khi phù hợp với các cột outlier của cả ma trận query và key. Sau đó chúng tôi tổng các phần tử trong mỗi cột và chọn các cột top-k trong ma trận; chúng tôi chọn 30% số cột trong công trình của chúng tôi. Việc sử dụng tổng các giá trị cột nắm bắt xu hướng toàn cầu của mỗi cột trong khi giảm thiểu tác động của biến đổi trong mỗi hàng. Các cột được chọn xấp xỉ tốt hơn mẫu attention vì việc sử dụng các ma trận query và key lệch.
+
+Giai đoạn Decoding. Trong giai đoạn decoding, InfiniGen suy đoán mẫu attention của lớp tiếp theo và xác định các key và value quan trọng để prefetch. Hình 10 cho thấy cách InfiniGen tính toán điểm attention được suy đoán. Tại Lớp i−1, chúng tôi sử dụng ma trận trọng số query từng phần và key cache của Lớp i, được xác định trong giai đoạn prefill, cùng với đầu vào attention của Lớp i−1. Sau khi nhân query từng phần và key cache từng phần, InfiniGen chọn các token có điểm attention cao.
+
+Chúng tôi đặt ngưỡng xem xét giá trị tối đa của điểm attention được suy đoán. Chúng tôi chỉ chọn các token có điểm attention lớn hơn điểm số tối đa trừ đi alpha. Lưu ý rằng phép trừ từ điểm attention dẫn đến phép chia sau softmax. Ví dụ, giả sử rằng điểm attention của token thứ 3 là điểm attention tối đa trừ 5. Khi chúng ta áp dụng softmax cho các điểm attention, trọng số attention của token thứ 3 là trọng số attention tối đa chia cho e5≈148.4. Mặc dù chúng ta không sử dụng token này, nó không làm tổn hại đáng chú ý đến độ chính xác của mô hình vì nó chiếm ít hơn 1% tầm quan trọng (≈1/148.4) sau softmax. Do đó, InfiniGen chỉ prefetch các key và value của các token có điểm attention lớn hơn điểm attention cao nhất trừ alpha. Khi nhiều attention head được tính toán song song, chúng tôi đảm bảo rằng mỗi head trong cùng một lớp lấy cùng số lượng token bằng cách tính trung bình số lượng token giữa điểm số tối đa và ngưỡng qua các head.
+
+Bằng cách giảm lượng KV cache cần tải và tính toán, InfiniGen hiệu quả giảm độ trễ tải (tức là chuyển dữ liệu từ CPU sang GPU) trong khi duy trì chất lượng đầu ra tương tự như mô hình ban đầu với KV cache đầy đủ. Hơn nữa, vì InfiniGen không yêu cầu số lượng token cố định để tải từ bộ nhớ CPU, nó chỉ sử dụng băng thông interconnect PCI cần thiết. InfiniGen bắt đầu suy đoán và prefetching từ Lớp 1 vì các outlier, cần thiết để khai thác sự tương tự đầu vào, xuất hiện trong quá trình tính toán ở Lớp 0.
+
+### 4.4 Quản lý Pool KV Cache
+
+Chúng tôi quản lý KV cache như một pool, offloading vào bộ nhớ CPU và prefetching chỉ lượng cần thiết lên GPU. Mặc dù bộ nhớ CPU rẻ hơn và lớn hơn bộ nhớ GPU, nó vẫn có dung lượng hạn chế. Do đó, đối với một số kịch bản triển khai nhất định, có thể quan trọng để hạn chế kích thước của pool KV cache và loại bỏ các mục KV ít quan trọng hơn mà ít được chọn bởi các query token. Chúng tôi mở rộng thiết kế để kết hợp giới hạn kích thước bộ nhớ do người dùng định nghĩa. Trong runtime, khi kích thước của bộ nhớ CPU đạt đến giới hạn do người dùng định nghĩa, trình quản lý pool KV cache chọn một mục KV nạn nhân để loại bỏ. Sau đó, trình quản lý ghi đè nạn nhân được chọn với key và value mới được tạo, cùng với việc cập nhật key cache từng phần tương ứng nằm trong GPU. Lưu ý rằng thứ tự của các mục KV có thể tùy ý, miễn là key và value của cùng một token duy trì cùng vị trí tương đối trong pool KV cache.
+
+Chính sách chọn nạn nhân là quan trọng vì nó trực tiếp tác động đến độ chính xác mô hình. Chúng tôi xem xét một chính sách dựa trên bộ đếm cùng với hai chính sách loại bỏ cache phần mềm được sử dụng rộng rãi: FIFO [7, 69, 70] và Least-Recently-Used (LRU) [2]. Chính sách dựa trên FIFO dễ triển khai với overhead thấp nhưng dẫn đến sự giảm độ chính xác tương đối lớn vì nó đơn giản loại bỏ token cũ nhất đang cư trú. Chính sách dựa trên LRU thường thể hiện sự giảm độ chính xác nhỏ hơn nhưng thường đòi hỏi overhead runtime cao hơn. Nói chung, chính sách dựa trên LRU sử dụng một danh sách liên kết đôi với khóa để thăng cấp các đối tượng được truy cập lên đầu, yêu cầu cập nhật bộ nhớ nguyên tử cho các mục KV được truy cập. Trong trường hợp chính sách dựa trên bộ đếm, trình quản lý pool tăng một bộ đếm cho mỗi mục KV được prefetch và chọn một nạn nhân với số đếm nhỏ nhất trong pool KV cache. Nếu bất kỳ bộ đếm nào trở nên bão hòa, tất cả các giá trị bộ đếm được giảm một nửa. Chúng tôi quan sát thấy rằng chính sách dựa trên bộ đếm và chính sách dựa trên LRU cho thấy độ chính xác mô hình có thể so sánh được, mà chúng tôi thảo luận trong Phần 5.2. Chúng tôi chọn phương pháp dựa trên bộ đếm do thiết kế đơn giản hơn và để tránh cập nhật bộ nhớ nguyên tử cho song song tốt hơn.
+
+## 5 Đánh giá
+
+### 5.1 Thiết lập thí nghiệm
+
+Cấu hình Mô hình và Hệ thống. Chúng tôi sử dụng các mô hình Open Pre-trained Transformer (OPT) [77] với 6.7B, 13B, và 30B tham số để đánh giá. Các mô hình 7B và 13B của Llama-2 [60] cũng được sử dụng để chứng minh rằng InfiniGen hoạt động hiệu quả trên các kiến trúc mô hình khác nhau. Chúng tôi chạy thí nghiệm trên một hệ thống được trang bị GPU NVIDIA RTX A6000 [44] với 48GB bộ nhớ và bộ xử lý Intel Xeon Gold 6136 với 96GB bộ nhớ DDR4-2666. PCIe 3.0 ×16 kết nối CPU và GPU.
+
+Workload. Chúng tôi đánh giá bằng cách sử dụng các nhiệm vụ downstream few-shot và các bộ dữ liệu mô hình hóa ngôn ngữ. Chúng tôi sử dụng năm nhiệm vụ few-shot từ benchmark lm-evaluation-harness [23]: COPA [54], OpenBookQA [42], WinoGrande [55], PIQA [8], và RTE [62]. Các bộ dữ liệu mô hình hóa ngôn ngữ được sử dụng là WikiText-2 [41] và Penn Treebank (PTB) [38]. Ngoài ra, các câu được lấy mẫu ngẫu nhiên từ bộ dữ liệu PG-19 [52] được sử dụng để đo tăng tốc với độ dài chuỗi dài.
+
+Baseline. Chúng tôi sử dụng hai môi trường suy luận hỗ trợ offloading KV cache: CUDA Unified Virtual Memory (UVM) [4] và FlexGen [57]. Trên UVM, tất cả các chuyển động dữ liệu giữa CPU và GPU được quản lý ngầm định bởi driver thiết bị UVM, từ đó cho phép offloading mà không yêu cầu can thiệp từ lập trình viên. Ngược lại, FlexGen sử dụng chuyển dữ liệu rõ ràng giữa CPU và GPU. Đối với baseline FlexGen, trừ khi được chỉ định khác, chúng tôi rõ ràng đặt tất cả KV cache trong bộ nhớ CPU. Các tham số mô hình được lưu trữ trong bộ nhớ GPU càng nhiều càng tốt, với phần còn lại trong bộ nhớ CPU. Chúng tôi so sánh InfiniGen với hai phương pháp quản lý KV cache khác nhau: H2O [78] và Quantization [57]. H2O, một phương pháp gần đây trong quản lý KV cache, duy trì KV cache của các token quan trọng hoặc gần đây bằng cách đánh giá tầm quan trọng của mỗi token và loại bỏ những token khác. Nén dựa trên Quantization áp dụng quantization bất đối xứng theo nhóm cho KV cache.
+
+Metric chính. Chúng tôi đánh giá độ chính xác (%) để đánh giá tác động của xấp xỉ khi InfiniGen, H2O, và Quantization được sử dụng. Đối với các nhiệm vụ mô hình hóa ngôn ngữ với WikiText-2 và PTB, chúng tôi sử dụng perplexity như một metric; perplexity thấp hơn có nghĩa là độ chính xác tốt hơn. Để trình bày cải thiện hiệu suất, chúng tôi đo thời gian wall clock trong quá trình suy luận với các kích thước batch và độ dài chuỗi khác nhau. Tỷ lệ trọng số từng phần được đặt thành 0.3. Chúng tôi đặt alpha thành 4 cho OPT và 5 cho Llama-2, dẫn đến việc sử dụng ít hơn 10% KV cache trung bình qua các lớp. Đối với mỗi lớp, chúng tôi cho phép gửi lên đến 20% tổng KV cache lên GPU nếu nó chứa nhiều ứng viên hơn.
+
+### 5.2 Mô hình hóa Ngôn ngữ
+
+Độ chính xác trên lm-evaluation-harness. Hình 11 cho thấy độ chính xác của các baseline và InfiniGen trên các mô hình khác nhau với các nhiệm vụ 5-shot. Kích thước KV cache tương đối cho biết kích thước của KV cache tham gia vào tính toán attention so với baseline full-cache (ví dụ: kích thước KV cache tương đối 10% có nghĩa là 10% kích thước KV cache đầy đủ được sử dụng). InfiniGen liên tục cho thấy độ chính xác tốt hơn trên các mô hình và nhiệm vụ khi kích thước KV cache tương đối nhỏ hơn 10%, trong khi những phương pháp khác thể hiện sự giảm độ chính xác đáng chú ý do độ rộng bit không đủ (Quantization) hoặc loại bỏ KV cache vĩnh viễn (H2O). Điều này ngụ ý rằng giải pháp đề xuất của chúng tôi có thể hiệu quả giảm overhead chuyển KV cache trong khi bảo tồn độ chính xác mô hình. Đối với kích thước KV cache tương đối lớn hơn 10%, độ chính xác với InfiniGen khớp gần với baseline full-cache. Trong một số trường hợp, InfiniGen thậm chí cho thấy độ chính xác tốt hơn một chút so với baseline full-cache. Điều này có thể là do việc giảm lượng KV cache tham gia vào tính toán attention có thể giúp mô hình tập trung hơn vào các token quan trọng.
+
+Độ dài Chuỗi. Hình 12 cho thấy perplexity của hai mô hình khác nhau với InfiniGen và các baseline, khi độ dài chuỗi tăng. Trong thí nghiệm này, H2O được cấu hình để sử dụng cùng lượng KV cache như InfiniGen. Độ dài chuỗi là 2048 và 4096 cho OPT-13B và Llama-2-13B, tương ứng. Để có cái nhìn rõ ràng hơn, chúng tôi đánh giá perplexity với 256 token liên tiếp như một nhóm, được gọi là một decoding chunk trong hình. Kết quả cho thấy rằng mặc dù độ dài chuỗi trở nên dài hơn (tức là ID decoding chunk tăng), perplexity của InfiniGen vẫn liên tục có thể so sánh với baseline full-cache, trong khi H2O cho thấy sự phân kỳ tăng dần từ baseline. H2O gặp khó khăn do loại bỏ KV cache vĩnh viễn và có thể không giữ lại đủ lượng KV cache trong một số lớp nhất định do ngân sách cố định của nó. Ngược lại, InfiniGen tính toán attention động chỉ sử dụng lượng KV cache cần thiết cho mỗi lớp. Sự khác biệt có khả năng sẽ rộng hơn khi các mô hình trở nên có khả năng xử lý các chuỗi dài hơn nhiều.
+
+Hiệu quả của Skewing. Hình 13 cho thấy độ chính xác có hoặc không có key/query skewing trên mô hình OPT-6.7B. Đối với thí nghiệm, chúng tôi sử dụng ngân sách KV cache cố định là 20%, thay vì sử dụng phương pháp động, để rõ ràng cho thấy hiệu quả của skewing. Chúng tôi quan sát thấy rằng một số mô hình ngôn ngữ (ví dụ: Llama-2) cho thấy sự giảm nhỏ về độ chính xác mà không có skewing. Đối với một số mô hình như OPT-6.7B, tuy nhiên, chúng ta thấy sự giảm độ chính xác lớn nếu chúng ta không áp dụng phương pháp skewing như được hiển thị trong Hình 13. Điều này cho thấy rằng trong trường hợp OPT-6.7B, trọng số từng phần không đại diện đầy đủ cho ma trận ban đầu mà không có skewing. Sau khi áp dụng phương pháp skewing của chúng tôi, chúng tôi đạt được độ chính xác tương tự như baseline full-cache. Phương pháp skewing của chúng tôi hiệu quả làm lệch các ma trận key và query sao cho một số ít cột có thể đại diện tốt hơn cho các ma trận ban đầu.
+
+Quản lý Pool KV Cache. Bảng 2 cho thấy perplexity của năm mô hình khác nhau có hoặc không có giới hạn dung lượng bộ nhớ cho WikiText-2 và PTB. Chúng tôi so sánh các chính sách chọn nạn nhân dựa trên FIFO, LRU, và Counter trong Phần 4.4 dưới giới hạn bộ nhớ 80% của KV cache đầy đủ. Chúng tôi cũng trình bày kết quả perplexity không có giới hạn bộ nhớ (100%). Phương pháp dựa trên FIFO cho thấy hiệu suất mô hình tệ nhất vì nó đơn giản xóa mục KV cũ nhất bất kể tầm quan trọng của nó. Các phương pháp LRU và dựa trên Counter cho thấy perplexity gần như tương tự với không có giới hạn bộ nhớ. Chúng tôi chọn chính sách chọn nạn nhân dựa trên Counter thay vì phương pháp dựa trên LRU vì phương pháp dựa trên LRU thường cần duy trì hàng đợi danh sách liên kết đôi với khóa cho cập nhật bộ nhớ nguyên tử.
+
+### 5.3 Hiệu suất
+
+Trong phần này, chúng tôi đề cập đến H2O (với ngân sách KV cache là 20%) và quantization 4-bit được triển khai trên FlexGen như H2O và INT4.
+
+Độ trễ Suy luận. Hình 14 cho thấy độ trễ suy luận bao gồm các giai đoạn prefill và decoding. Chúng tôi sử dụng mô hình OPT-13B với 1920 token đầu vào, 128 token đầu ra, và kích thước batch là 20. InfiniGen đạt được tăng tốc 1.63×-32.93× so với các baseline. Lợi ích hiệu suất chủ yếu đến từ lượng KV cache giảm đáng kể cần tải từ bộ nhớ CPU do phương pháp động của chúng tôi.
+
+UVM cho thấy độ trễ cực kỳ dài vì kích thước working set (tức là kích thước của các tham số mô hình và KV cache) lớn hơn dung lượng bộ nhớ GPU, từ đó dẫn đến lỗi trang thường xuyên và chuyển dữ liệu giữa CPU và GPU. Giai đoạn prefill của UVM + H2O cũng cho thấy độ trễ dài do lỗi trang và chuyển dữ liệu. Tuy nhiên, vì tất cả dữ liệu cần thiết được di chuyển vào bộ nhớ GPU sau giai đoạn prefill, UVM + H2O cho thấy độ trễ decoding ngắn hơn đáng kể. FlexGen tải KV cache đầy đủ với độ chính xác cao (tức là FP16) từ bộ nhớ CPU cho mỗi tính toán attention. Mặt khác, INT4 và H2O tải lượng dữ liệu tương đối nhỏ từ CPU vì định dạng dữ liệu bit thấp (INT4) hoặc kích thước nhỏ hơn của KV cache (H2O). Tuy nhiên, chúng vẫn tải lượng dữ liệu lớn hơn InfiniGen; ngay cả với độ chính xác thấp, INT4 tải KV cache của tất cả các token trước đó; H2O luôn tải cùng lượng dữ liệu bất kể có bao nhiêu token thực sự quan trọng trong mỗi lớp. Kết quả là, InfiniGen đạt được hiệu suất tốt hơn cả hai.
+
+Kích thước Batch. Hình 15 cho thấy độ trễ suy luận qua các kích thước batch khác nhau. Kết quả cho thấy InfiniGen đạt được độ trễ thấp hơn so với những phương pháp khác qua các kích thước batch (1.28×-34.64×). Khi kích thước batch tăng, khoảng cách hiệu suất giữa InfiniGen và những phương pháp khác trở nên lớn hơn. UVM và UVM + H2O cho thấy độ trễ tăng chủ yếu do lỗi trang thường xuyên trong giai đoạn prefill. Đối với UVM, độ trễ cũng tăng nhanh ở kích thước batch 16 vì kích thước working set vượt quá dung lượng bộ nhớ GPU cho cả giai đoạn prefill và decoding. Khi kích thước batch tiếp tục tăng, UVM + H2O sẽ đối mặt với cùng vấn đề.
+
+Độ trễ của FlexGen gần như tăng tuyến tính với kích thước batch vì chuyển KV cache chiếm phần lớn độ trễ suy luận. Khi chúng tôi tăng kích thước batch từ 4 lên 20, thông lượng (token mỗi giây) của InfiniGen tăng từ 27.36 lên 41.99, trong khi INT4 và H2O cung cấp sự tăng nhỏ về thông lượng (từ 12.22 lên 14.02 và từ 21.31 lên 25.70, tương ứng). Bằng cách điều chỉnh động lượng KV cache cần tải, InfiniGen đạt được hiệu suất có thể mở rộng qua các kích thước batch.
+
+Độ dài Chuỗi. Hình 16(a) cho thấy tăng tốc của INT4, H2O, và InfiniGen so với FlexGen trên OPT-13B qua các độ dài chuỗi khác nhau. Với kích thước batch là 8, chúng tôi sử dụng bốn cấu hình đầu vào/đầu ra khác nhau. Mỗi cấu hình bao gồm 128 token đầu ra và 384, 896, 1408, 1920 token đầu vào (tức là tổng số token từ 512 đến 2048). Tăng tốc của InfiniGen tiếp tục tăng qua các độ dài chuỗi (lên đến 5.28×), trong khi INT4 và H2O cho thấy tăng tốc bão hòa (lên đến 1.92× và 3.40×). Điều này gợi ý rằng cả INT4 và H2O đều không cung cấp giải pháp có thể mở rộng cho quản lý KV cache. INT4 cho thấy sự tăng không đáng kể về tăng tốc do sự tăng trưởng vốn có trong kích thước của KV cache. Tương tự, H2O thiếu khả năng mở rộng do tỷ lệ cố định của ngân sách KV cache; khi độ dài chuỗi tăng, H2O lưu trữ và tải nhiều KV cache hơn.
+
+Mặc dù độ dài chuỗi tăng, số lượng token mà mỗi token chú ý đến không tăng tuyến tính. Ví dụ, trong mô hình OPT-13B, chúng tôi đếm số lượng token quan trọng với điểm attention lớn hơn (max−4) và xác định rằng, trung bình, 37, 60, 66, và 73 token được đánh giá là quan trọng cho độ dài chuỗi 512, 1024, 1536, và 2048, tương ứng. H2O, sử dụng 20% ngân sách KV cache cố định, tải 409 token cho độ dài chuỗi 2048, trong khi chỉ 73 token tương đối quan trọng. Ngược lại, InfiniGen tự nhiên nắm bắt xu hướng này (tức là sự tăng phi tuyến trong số lượng token quan trọng) bằng cách quan sát động điểm attention được suy đoán.
+
+Kích thước Mô hình. Hình 16(b) cho thấy tăng tốc của INT4, H2O, và InfiniGen so với FlexGen trên ba kích thước mô hình khác nhau. Chúng tôi sử dụng 1920 token đầu vào và 128 token đầu ra với kích thước batch là 4 cho thí nghiệm. Kết quả cho thấy InfiniGen vượt trội so với những phương pháp khác qua các kích thước mô hình. Khi kích thước mô hình tăng từ 6.7B lên 13B, tăng tốc của InfiniGen cũng tăng 1.17×, trong khi những phương pháp khác không dẫn đến sự tăng đáng chú ý về tăng tốc. Đối với hầu hết các lớp, InfiniGen tải lượng KV cache nhỏ hơn H2O vì số lượng token tương đối nhỏ được cần. Do đó, InfiniGen hoạt động tốt hơn H2O khi kích thước mô hình trở nên lớn hơn do số lượng khối Transformer tăng. Đối với mô hình 30B, các tham số mô hình không vừa trong bộ nhớ GPU. Do đó, chúng tôi offload 30% tham số mô hình vào CPU. Trong trường hợp này, kích thước của các tham số được offload lớn hơn 1.7× so với kích thước KV cache. Mặc dù vậy, InfiniGen cho thấy tăng tốc 1.34× so với FlexGen, trong khi những phương pháp khác đạt được 1.18× và 1.28×, tương ứng.
+
+## 6 Phân tích và Thảo luận
+
+### 6.1 Nghiên cứu Độ nhạy
+
+Chúng tôi sử dụng mô hình OPT-6.7B với 1920 token đầu vào, 128 token đầu ra, và kích thước batch là 8. Độ chính xác được đánh giá với nhiệm vụ WinoGrande trong lm-evaluation-harness.
+
+Ngưỡng và Alpha. Như đã thảo luận trong Phần 4.3, chúng tôi tải KV cache của các token có điểm attention được suy đoán lớn hơn ngưỡng (tức là điểm attention tối đa trừ alpha). Tăng alpha dẫn đến việc lấy nhiều mục KV hơn lên GPU, do đó tăng độ trễ suy luận nhưng cũng cải thiện độ chính xác. Hình 17(a) cho thấy những đánh đổi như vậy giữa độ chính xác và độ trễ suy luận cho chín giá trị alpha khác nhau với tỷ lệ trọng số từng phần là 0.3. Kết quả cho thấy nhiều mục KV hơn được lấy và tham gia vào tính toán attention khi alpha tăng, từ đó dẫn đến độ chính xác tốt hơn. Tuy nhiên, đối với các giá trị alpha vượt quá 4, vì hầu hết các token quan trọng đã được bao gồm, độ chính xác không tăng thêm, trong khi chi phí cho chuyển KV và tính toán attention tiếp tục tăng. Xu hướng này được quan sát tương tự trong các mô hình khác, và do đó chúng tôi chọn giá trị alpha là 4 hoặc 5 để đạt được sự cân bằng giữa độ trễ suy luận và độ chính xác.
+
+Tỷ lệ Trọng số Từng phần. Hình 17(b) cho thấy độ chính xác và độ trễ suy luận qua các tỷ lệ trọng số từng phần khác nhau với giá trị alpha là 4. Như được hiển thị trong hình, lượng trọng số từng phần có tác động không đáng kể đến độ trễ suy luận vì chi phí cho việc tính toán điểm attention được suy đoán tương đối nhỏ. Lưu ý rằng lượng KV cache cần chuyển không liên quan đến tỷ lệ trọng số từng phần. Tuy nhiên, việc tăng tỷ lệ trọng số từng phần dẫn đến tiêu thụ bộ nhớ cao hơn cho các trọng số từng phần và key cache (ví dụ: nhân đôi tỷ lệ sẽ nhân đôi overhead tiêu thụ bộ nhớ). Độ chính xác cũng không khác biệt đáng chú ý vượt quá tỷ lệ 0.3. Trong công trình của chúng tôi, chúng tôi chọn tỷ lệ trọng số từng phần là 0.3 để đạt được độ chính xác tốt hơn trong khi xem xét overhead tiêu thụ bộ nhớ.
+
+### 6.2 Overhead
+
+Overhead Prefetching. Hình 18 cho thấy phân tích độ trễ của việc thực thi một khối Transformer duy nhất cho mô hình OPT-13B; FFN không được hiển thị trong hình cho các sơ đồ khác ngoài Ideal vì nó được chồng lấp hoàn toàn với thời gian chuyển dữ liệu. Ideal là kịch bản mà tất cả các tính toán (tức là attention và FFN) được thực hiện trên GPU mà không có bất kỳ chuyển dữ liệu nào giữa CPU và GPU. Như được hiển thị trong kết quả, nút thắt hiệu suất chính của FlexGen và H2O là overhead chuyển dữ liệu, chiếm 96.9% và 91.8% thời gian thực thi, tương ứng. Đối với INT4, do overhead quantization và dequantization, tính toán attention cũng chiếm một phần lớn thời gian thực thi ngoài chuyển dữ liệu. Mặt khác, InfiniGen cải thiện đáng kể tốc độ suy luận so với FlexGen bằng cách giảm lượng chuyển dữ liệu với prefetching KV cache động của chúng tôi. Hơn nữa, InfiniGen chỉ chậm hơn 1.52× so với Ideal, trong khi những phương pháp khác cho thấy độ chậm 3.90×-18.55×.
+
+Tiêu thụ Bộ nhớ. InfiniGen sử dụng trọng số query từng phần và key cache để suy đoán. Đối với tỷ lệ 0.3, kích thước của trọng số query từng phần và key cache chỉ là 2.5% và 15% của tổng tham số mô hình và tổng KV cache, tương ứng. Mặc dù chúng tôi đơn giản lưu trữ chúng trong GPU trong các thí nghiệm của chúng tôi, chúng tôi có thể quản lý overhead lưu trữ theo nhiều cách tối ưu hóa khác nhau nếu cần. Ví dụ, chúng tôi có thể chỉ lưu trữ các chỉ số cột của trọng số query từng phần và lấy các vector cột từ ma trận trọng số query đầy đủ (đã nằm trong GPU) khi cần cho phép chiếu query từng phần. Ngoài ra, chúng tôi có thể đặt key cache từng phần trong CPU và thực hiện suy đoán trên CPU sau khi lấy query từng phần từ GPU. Ngay cả một phương pháp ngây thơ về việc giảm tỷ lệ từng phần có thể vẫn cung cấp độ chính xác tốt hơn so với các phương pháp khác trong khi giảm overhead lưu trữ. Tóm lại, bằng cách hy sinh tối thiểu hiệu suất suy luận, chúng tôi có thể giảm đáng kể overhead lưu trữ trên GPU nếu cần thiết.
+
+### 6.3 Cửa sổ Ngữ cảnh Dài
+
+Hình 19 cho thấy perplexity của mô hình Llama-2-7B-32K, có thể xử lý lên đến 32K token, qua các kích thước cache tương đối và độ dài chuỗi. Chúng tôi sử dụng bộ dữ liệu WikiText-2 cho thí nghiệm. Khi kích thước cửa sổ ngữ cảnh tăng cho các LLM tương lai, phần tương đối của KV cache mà GPU có thể giữ lại sẽ giảm do dung lượng hạn chế của bộ nhớ GPU.
+
+Hình 19(a) cho thấy InfiniGen duy trì mức perplexity gần với baseline full-cache ngay cả khi kích thước KV cache tương đối giảm, mà không dẫn đến sự tăng đáng chú ý về perplexity ngay cả với kích thước cache nhỏ hơn nhiều. Ngược lại, các phương pháp khác tăng perplexity so với baseline full-cache và phân kỳ đáng kể ở một số kích thước nhất định do độ rộng bit không đủ để bảo tồn thông tin đầy đủ trên tất cả các key và value (Quantization) hoặc việc loại bỏ vĩnh viễn các mục KV cache (H2O). Như được hiển thị trong Hình 19(b), khoảng cách perplexity giữa InfiniGen và H2O rộng hơn đối với độ dài chuỗi dài hơn, có khả năng sẽ tăng thêm đối với độ dài chuỗi vượt quá 32K. Điều này ngụ ý rằng InfiniGen có thể mở rộng đến các chuỗi dài hơn và bảo tồn độ chính xác mô hình tốt hơn so với những phương pháp khác.
+
+Chúng tôi tiếp tục suy đoán về cách InfiniGen sẽ có lợi trong kỷ nguyên của cửa sổ ngữ cảnh hàng triệu token bằng cách phân tích một mô hình có khả năng xử lý 1 triệu token. Hình 20(a) cho thấy rằng tỷ lệ phần trăm của các query token chú ý đến ít hơn 1% key token tăng khi độ dài chuỗi trở nên dài hơn. InfiniGen có thể thích ứng với xu hướng thay đổi này bằng cách điều chỉnh động lượng KV cache cần tải, trong khi các phương pháp ngân sách cố định/tỉa trước đây sẽ không dễ dàng điều chỉnh kích thước KV cache hiệu quả. Hình 20(b) tiếp tục cho thấy rằng các trọng số attention của key token có thể thay đổi qua các iteration; các key token được lấy mẫu cho thấy những đột biến đột ngột sau hàng nghìn iteration với trọng số attention thấp đáng kể (ví dụ: iteration thứ 7425 trong số 16K iteration cuối cùng trong Lớp 18, Head 30). Chúng tôi quan sát thấy rằng các phương pháp trước đây loại bỏ vĩnh viễn các token trong khi chúng không quan trọng có thể mất các ngữ cảnh quan trọng nếu chúng trở nên quan trọng trở lại trong các iteration sau. Ngược lại, InfiniGen có thể bảo tồn hiệu suất mô hình bằng cách giữ các mục KV tạm thời không quan trọng để sử dụng tiềm năng trong tương lai.
+
+## 7 Công trình Liên quan
+
+Hệ thống Phục vụ DNN. Một phương pháp hệ thống để cho phép hệ thống phục vụ mô hình hiệu quả và nhanh chóng là một chủ đề quan trọng đã được nghiên cứu rộng rãi bởi cả học thuật và công nghiệp. Một số công trình trước đây tập trung vào các hệ thống phân tán với độ trễ có thể dự đoán cho các mục tiêu cấp độ dịch vụ (SLO) [15, 16, 25, 56]. Các công trình khác cải thiện song song và thông lượng của hệ thống thông qua preemption [28, 75], batching tinh tế [17, 21, 71], hoặc tối ưu hóa bộ nhớ [18, 35, 58]. Một số công trình khác nhằm đạt được thực thi thông lượng cao với bộ nhớ GPU hạn chế bằng cách offloading các tham số vào bộ lưu trữ thứ cấp (ví dụ: bộ nhớ CPU và đĩa). Một số trong số chúng được xây dựng trên CUDA Unified Memory [46] với prefetching [31, 39], trong khi những cái khác rõ ràng di chuyển tensor vào và ra khi cần cho tính toán [29, 30, 48, 72, 73]. FlexGen [57] là một hệ thống phục vụ LLM gần đây cho phép suy luận thông lượng cao trên một GPU duy nhất bằng cách offloading trọng số và KV cache vào bộ nhớ CPU và đĩa. InfiniGen trực giao với FlexGen và có thể hoạt động cùng với nó để hiệu quả offload và prefetch KV cache.
+
+Quản lý KV Cache. vLLM [35] giảm thiểu lãng phí bộ nhớ KV cache từ phân mảnh và nhân bản. StreamingLLM [67] cho phép LLM tạo ra độ dài chuỗi dài hơn so với những cái được huấn luyện. Tuy nhiên, vì cả vLLM và StreamingLLM đều không giảm kích thước của KV cache, chuyển dữ liệu vẫn phát sinh overhead đáng kể trong các hệ thống suy luận dựa trên offloading. InfiniGen bổ sung cho quản lý KV cache để giảm overhead chuyển dữ liệu, là một nút thắt chính trong các hệ thống dựa trên offloading.
+
+Suy luận LLM Hiệu quả. Có các hướng nghiên cứu khai thác quantization hoặc sparsity để làm cho LLM hiệu quả thông qua các phương pháp thuật toán [13, 19, 22, 34, 66] hoặc thiết kế đồng phần cứng-phần mềm [26,27,36,50]. Về sparsity, hầu hết các công trình dựa trên thuật toán tập trung vào việc giảm kích thước mô hình bằng cách khai thác sparsity của trọng số. Ngoài ra, H2O và Sparse Transformer [13] tận dụng sparsity theo hàng (tức là cấp độ token) trong KV cache bằng cách loại bỏ vĩnh viễn một số mục KV nhất định. Mặt khác, hầu hết các nghiên cứu thiết kế đồng phần cứng-phần mềm tập trung vào việc giảm bớt độ phức tạp tính toán bậc hai trong giai đoạn prefill bằng cách bỏ qua các key token không cần thiết với sự hỗ trợ của phần cứng chuyên dụng. Tuy nhiên, chúng thường không giảm truy cập bộ nhớ vì chúng xác định các key token quan trọng chỉ sau khi quét tất cả các phần tử của các tensor key.
+
+Kernel fusion [18,32] là một phương pháp khác để giảm thiểu overhead bộ nhớ bậc hai của attention trong giai đoạn prefill. InfiniGen có thể được triển khai với các kỹ thuật kernel fusion để giảm bớt overhead truy cập KV cache trong giai đoạn decoding. Theo hiểu biết của chúng tôi, đây là công trình đầu tiên cho phép suy luận LLM hiệu quả bằng cách prefetching chỉ các mục KV cần thiết trong các hệ thống suy luận dựa trên offloading.
+
+## 8 Kết luận
+
+Kích thước của KV cache đặt ra vấn đề về khả năng mở rộng trong các hệ thống suy luận dựa trên offloading thông lượng cao, thậm chí vượt quá kích thước tham số mô hình. Các chính sách loại bỏ KV cache hiện có cho thấy sự giảm độ chính xác lớn và không sử dụng hiệu quả băng thông interconnect khi chúng được sử dụng trong các hệ thống LLM dựa trên offloading. Chúng tôi đề xuất InfiniGen, một khung quản lý KV cache động dựa trên offloading thực thi hiệu quả suy luận của các mô hình ngôn ngữ lớn. InfiniGen khai thác đầu vào attention của lớp trước đó để suy đoán prefetch KV cache của các token quan trọng. Chúng tôi thao tác các trọng số query và key để làm cho việc suy đoán hiệu quả hơn. InfiniGen cho thấy độ trễ suy luận giảm đáng kể trong khi bảo tồn hiệu suất mô hình ngôn ngữ. Nó cũng cho thấy khả năng mở rộng tốt hơn nhiều về kích thước batch, độ dài chuỗi, và kích thước mô hình so với các giải pháp trước đây.
+
+## Lời cảm ơn
+
+Chúng tôi muốn cảm ơn các nhà đánh giá ẩn danh và người hướng dẫn Petros Maniatis của chúng tôi vì phản hồi có giá trị của họ. Công trình này được hỗ trợ một phần bởi tài trợ nghiên cứu từ Samsung Advanced Institute of Technology (SAIT) và bởi chương trình hỗ trợ bán dẫn trí tuệ nhân tạo để nuôi dưỡng những tài năng tốt nhất (Số RS-2023-00256081) được giám sát bởi Institute for Information & Communications Technology Planning & Evaluation (IITP). Viện Nghiên cứu Kỹ thuật tại Seoul National University đã cung cấp cơ sở nghiên cứu cho công trình này. Jaewoong Sim là tác giả liên lạc.
+
+## Tài liệu tham khảo
+
+[1] DeepL. https://www.deepl.com/translator.
+
+[2] Memcached. https://memcached.org.
+
+[3] Josh Achiam, Steven Adler, Sandhini Agarwal, Lama Ahmad, Ilge Akkaya, Florencia Leoni Aleman, Diogo Almeida, Janko Altenschmidt, Sam Altman, Shyamal Anadkat, et al. Gpt-4 technical report. arXiv preprint arXiv:2303.08774, 2023.
+
+[4] Tyler Allen and Rong Ge. In-depth analyses of unified virtual memory system for gpu accelerated computing. In International Conference for High Performance Computing, Networking, Storage and Analysis (SC), 2021.
+
+[5] Reza Yazdani Aminabadi, Samyam Rajbhandari, Ammar Ahmad Awan, Cheng Li, Du Li, Elton Zheng, Olatunji Ruwase, Shaden Smith, Minjia Zhang, Jeff Rasley, et al. Deepspeed-inference: enabling efficient inference of transformer models at unprecedented scale. In International Conference for High Performance Computing, Networking, Storage and Analysis (SC), 2022.
+
+[6] Anthropic. The claude 3 model family: Opus, sonnet, haiku. 2024. https://www.anthropic.com/claude.
+
+[7] Benjamin Berg, Daniel S. Berger, Sara McAllister, Isaac Grosof, Sathya Gunasekar, Jimmy Lu, Michael Uhlar, Jim Carrig, Nathan Beckmann, Mor Harchol-Balter, and Gregory R. Ganger. The CacheLib caching engine: Design and experiences at scale. In Proceedings of the USENIX Symposium on Operating Systems Design and Implementation (OSDI), 2020.
+
+[8] Yonatan Bisk, Rowan Zellers, Ronan bras, Jianfeng Gao, and Choi Yejin. Piqa: Reasoning about physical commonsense in natural language. In Proceedings of the AAAI Conference on Artificial Intelligence (AAAI), 2020.
+
+[9] Beidi Chen, Tri Dao, Eric Winsor, Zhao Song, Atri Rudra, and Christopher Ré. Scatterbrain: Unifying sparse and low-rank attention. In Advances in Neural Information Processing Systems (NeurIPS), 2021.
+
+[10] Beidi Chen, Zichang Liu, Binghui Peng, Zhaozhuo Xu, Jonathan Lingjie Li, Tri Dao, Zhao Song, Anshumali Shrivastava, and Christopher Re. Mongoose: A learnable lsh framework for efficient neural network training. In Proceedings of the International Conference on Learning Representations (ICLR), 2021.
+
+[11] Mark Chen, Jerry Tworek, Heewoo Jun, Qiming Yuan, Henrique Ponde de Oliveira Pinto, Jared Kaplan, Harri Edwards, Yuri Burda, Nicholas Joseph, Greg Brockman, et al. Evaluating large language models trained on code. arXiv preprint arXiv:2107.03374, 2021.
+
+[12] Shouyuan Chen, Sherman Wong, Liangjian Chen, and Yuandong Tian. Extending context window of large language models via positional interpolation. arXiv preprint arXiv:2306.15595, 2023.
+
+[13] Rewon Child, Scott Gray, Alec Radford, and Ilya Sutskever. Generating long sequences with sparse transformers. arXiv preprint arXiv:1904.10509, 2019.
+
+[14] Krzysztof Marcin Choromanski, Valerii Likhosherstov, David Dohan, Xingyou Song, Andreea Gane, Tamas Sarlos, Peter Hawkins, Jared Quincy Davis, Afroz Mohiuddin, Lukasz Kaiser, David Benjamin Belanger, Lucy J Colwell, and Adrian Weller. Rethinking attention with performers. In Proceedings of the International Conference on Learning Representations (ICLR), 2021.
+
+[15] Daniel Crankshaw, Gur-Eyal Sela, Xiangxi Mo, Corey Zumar, Ion Stoica, Joseph Gonzalez, and Alexey Tumanov. Inferline: latency-aware provisioning and scaling for prediction serving pipelines. In Proceedings of the ACM Symposium on Cloud Computing (SoCC), 2020.
+
+[16] Daniel Crankshaw, Xin Wang, Guilio Zhou, Michael J Franklin, Joseph E Gonzalez, and Ion Stoica. Clipper: A low-latency online prediction serving system. In Proceedings of the USENIX Symposium on Networked Systems Design and Implementation (NSDI), 2017.
+
+[17] Weihao Cui, Han Zhao, Quan Chen, Hao Wei, Zirui Li, Deze Zeng, Chao Li, and Minyi Guo. Dvabatch: Diversity-aware multi-entry multi-exit batching for efficient processing of dnn services on gpus. In Proceedings of the USENIX Annual Technical Conference (USENIX ATC), 2022.
+
+[18] Tri Dao, Dan Fu, Stefano Ermon, Atri Rudra, and Christopher Ré. Flashattention: Fast and memory-efficient exact attention with io-awareness. In Advances in Neural Information Processing Systems (NeurIPS), 2022.
+
+[19] Tim Dettmers, Mike Lewis, Younes Belkada, and Luke Zettlemoyer. Gpt3.int8(): 8-bit matrix multiplication for transformers at scale. In Advances in Neural Information Processing Systems (NeurIPS), 2022.
+
+[20] Angela Fan, Mike Lewis, and Yann Dauphin. Hierarchical neural story generation. In Annual Meeting of the Association for Computational Linguistics (ACL), 2018.
+
+[21] Jiarui Fang, Yang Yu, Chengduo Zhao, and Jie Zhou. Turbotransformers: an efficient gpu serving system for transformer models. In Proceedings of the Symposium on Principles and Practice of Parallel Programming (PPoPP), 2021.
+
+[22] Elias Frantar and Dan Alistarh. Sparsegpt: Massive language models can be accurately pruned in one-shot. In Proceedings of the International Conference on Machine Learning (ICML), 2023.
+
+[23] Leo Gao, Jonathan Tow, Stella Biderman, Sid Black, Anthony DiPofi, Charles Foster, Laurence Golding, Jeffrey Hsu, Kyle McDonell, Niklas Muennighoff, et al. A framework for few-shot language model evaluation, 2021.
+
+[24] GitHub. Copilot. https://github.com/features/copilot.
+
+[25] Arpan Gujarati, Reza Karimi, Safya Alzayat, Wei Hao, Antoine Kaufmann, Ymir Vigfusson, and Jonathan Mace. Serving dnns like clockwork: Performance predictability from the bottom up. In Proceedings of the USENIX Symposium on Operating Systems Design and Implementation (OSDI), 2020.
+
+[26] Cong Guo, Jiaming Tang, Weiming Hu, Jingwen Leng, Chen Zhang, Fan Yang, Yunxin Liu, Minyi Guo, and Yuhao Zhu. Olive: Accelerating large language models via hardware-friendly outlier-victim pair quantization. In Proceedings of the International Symposium on Computer Architecture (ISCA), 2023.
+
+[27] Tae Jun Ham, Yejin Lee, Seong Hoon Seo, Soosung Kim, Hyunji Choi, Sung Jun Jung, and Jae W Lee. Elsa: Hardware-software co-design for efficient, lightweight self-attention mechanism in neural networks. In Proceedings of the International Symposium on Computer Architecture (ISCA), 2021.
+
+[28] Mingcong Han, Hanze Zhang, Rong Chen, and Haibo Chen. Microsecond-scale preemption for concurrent gpu-accelerated dnn inferences. In Proceedings of the USENIX Symposium on Operating Systems Design and Implementation (OSDI), 2022.
+
+[29] Mark Hildebrand, Jawad Khan, Sanjeev Trika, Jason Lowe-Power, and Venkatesh Akella. Autotm: Automatic tensor movement in heterogeneous memory systems using integer linear programming. In Proceedings of the International Conference on Architectural Support for Programming Languages and Operating Systems (ASPLOS), 2020.
+
+[30] Chien-Chin Huang, Gu Jin, and Jinyang Li. Swapadvisor: Pushing deep learning beyond the gpu memory limit via smart swapping. In Proceedings of the International Conference on Architectural Support for Programming Languages and Operating Systems (ASPLOS), 2020.
+
+[31] Jaehoon Jung, Jinpyo Kim, and Jaejin Lee. Deepum: Tensor migration and prefetching in unified memory. In Proceedings of the International Conference on Architectural Support for Programming Languages and Operating Systems (ASPLOS), 2023.
+
+[32] Sheng-Chun Kao, Suvinay Subramanian, Gaurav Agrawal, Amir Yazdanbakhsh, and Tushar Krishna. Flat: An optimized dataflow for mitigating attention bottlenecks. In Proceedings of the International Conference on Architectural Support for Programming Languages and Operating Systems (ASPLOS), 2023.
+
+[33] Nikita Kitaev, Lukasz Kaiser, and Anselm Levskaya. Reformer: The efficient transformer. In Proceedings of the International Conference on Learning Representations (ICLR), 2020.
+
+[34] Woosuk Kwon, Sehoon Kim, Michael W Mahoney, Joseph Hassoun, Kurt Keutzer, and Amir Gholami. A fast post-training pruning framework for transformers. In Advances in Neural Information Processing Systems (NeurIPS), 2022.
+
+[35] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph Gonzalez, Hao Zhang, and Ion Stoica. Efficient memory management for large language model serving with pagedattention. In Proceedings of the Symposium on Operating Systems Principles (SOSP), 2023.
+
+[36] Jungi Lee, Wonbeom Lee, and Jaewoong Sim. Tender: Accelerating large language models via tensor decomposition and runtime requantization. In Proceedings of the International Symposium on Computer Architecture (ISCA), 2024.
+
+[37] Zichang Liu, Aditya Desai, Fangshuo Liao, Weitao Wang, Victor Xie, Zhaozhuo Xu, Anastasios Kyrillidis, and Anshumali Shrivastava. Scissorhands: Exploiting the persistence of importance hypothesis for llm kv cache compression at test time. In Advances in Neural Information Processing Systems (NeurIPS), 2023.
+
+[38] Mitch Marcus, Grace Kim, Mary Ann Marcinkiewicz, Robert MacIntyre, Ann Bies, Mark Ferguson, Karen Katz, and Britta Schasberger. The penn treebank: Annotating predicate argument structure. In Proceedings of the Workshop on Human Language Technology, 1994.
+
+[39] Pak Markthub, Mehmet E. Belviranli, Seyong Lee, Jeffrey S. Vetter, and Satoshi Matsuoka. Dragon: Breaking gpu memory capacity limits with direct nvm access. In International Conference for High Performance Computing, Networking, Storage and Analysis (SC), 2018.
+
+[40] Pierre-Emmanuel Mazare, Samuel Humeau, Martin Raison, and Antoine Bordes. Training millions of personalized dialogue agents. In Conference on Empirical Methods in Natural Language Processing (EMNLP), 2018.
+
+[41] Stephen Merity, Caiming Xiong, James Bradbury, and Richard Socher. Pointer sentinel mixture models. In Proceedings of the International Conference on Learning Representations (ICLR), 2017.
+
+[42] Todor Mihaylov, Peter Clark, Tushar Khot, and Ashish Sabharwal. Can a suit of armor conduct electricity? a new dataset for open book question answering. In Conference on Empirical Methods in Natural Language Processing (EMNLP), 2018.
+
+[43] Erik Nijkamp, Bo Pang, Hiroaki Hayashi, Lifu Tu, Huan Wang, Yingbo Zhou, Silvio Savarese, and Caiming Xiong. Codegen: An open large language model for code with multi-turn program synthesis. In Proceedings of the International Conference on Learning Representations (ICLR), 2023.
+
+[44] NVIDIA. NVIDIA RTX A6000 Graphics Card. https://www.nvidia.com/en-us/design-visualization/rtx-a6000/.
+
+[45] NVIDIA. Triton inference server. https://developer.nvidia.com/triton-inference-server.
+
+[46] Nvidia. Unified memory programming. https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#um-unified-memory-programming-hd.
+
+[47] Christopher Olston, Noah Fiedel, Kiril Gorovoy, Jeremiah Harmsen, Li Lao, Fangwei Li, Vinu Rajashekhar, Sukriti Ramesh, and Jordan Soyke. Tensorflow-serving: Flexible, high-performance ml serving. In Advances in Neural Information Processing Systems (NeurIPS), 2017.
+
+[48] Xuan Peng, Xuanhua Shi, Hulin Dai, Hai Jin, Weiliang Ma, Qian Xiong, Fan Yang, and Xuehai Qian. Capuchin: Tensor-based gpu memory management for deep learning. In Proceedings of the International Conference on Architectural Support for Programming Languages and Operating Systems (ASPLOS), 2020.
+
+[49] Reiner Pope, Sholto Douglas, Aakanksha Chowdhery, Jacob Devlin, James Bradbury, Jonathan Heek, Kefan Xiao, Shivani Agrawal, and Jeff Dean. Efficiently scaling transformer inference. In Proceedings of the Machine Learning and Systems (MLSys), 2023.
+
+[50] Zheng Qu, Liu Liu, Fengbin Tu, Zhaodong Chen, Yufei Ding, and Yuan Xie. Dota: detect and omit weak attentions for scalable transformer acceleration. In Proceedings of the International Conference on Architectural Support for Programming Languages and Operating Systems (ASPLOS), 2022.
+
+[51] Alec Radford, Karthik Narasimhan, Tim Salimans, Ilya Sutskever, et al. Improving language understanding by generative pre-training. 2018.
+
+[52] Jack W Rae, Anna Potapenko, Siddhant M Jayakumar, Chloe Hillier, and Timothy P Lillicrap. Compressive transformers for long-range sequence modelling. In Proceedings of the International Conference on Learning Representations (ICLR), 2020.
+
+[53] Machel Reid, Nikolay Savinov, Denis Teplyashin, Dmitry Lepikhin, Timothy Lillicrap, Jean-baptiste Alayrac, Radu Soricut, Angeliki Lazaridou, Orhan Firat, Julian Schrittwieser, et al. Gemini 1.5: Unlocking multimodal understanding across millions of tokens of context. arXiv preprint arXiv:2403.05530, 2024.
+
+[54] Melissa Roemmele, Cosmin Bejan, and Andrew Gordon. Choice of plausible alternatives: An evaluation of commonsense causal reasoning. In AAAI Spring Symposium Series, 2011.
+
+[55] Keisuke Sakaguchi, Ronan Le Bras, Chandra Bhagavatula, and Yejin Choi. Winogrande: An adversarial winograd schema challenge at scale. Communications of the ACM, 2021.
+
+[56] Haichen Shen, Lequn Chen, Yuchen Jin, Liangyu Zhao, Bingyu Kong, Matthai Philipose, Arvind Krishnamurthy, and Ravi Sundaram. Nexus: A gpu cluster engine for accelerating dnn-based video analysis. In Proceedings of the Symposium on Operating Systems Principles (SOSP), 2019.
+
+[57] Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan Li, Max Ryabinin, Beidi Chen, Percy Liang, Christopher Re, Ion Stoica, and Ce Zhang. FlexGen: High-throughput generative inference of large language models with a single gpu. In Proceedings of International Conference on Machine Learning (ICML), 2023.
+
+[58] Yining Shi, Zhi Yang, Jilong Xue, Lingxiao Ma, Yuqing Xia, Ziming Miao, Yuxiao Guo, Fan Yang, and Lidong Zhou. Welder: Scheduling deep learning memory access via tile-graph. In Proceedings of the USENIX Symposium on Operating Systems Design and Implementation (OSDI), 2023.
+
+[59] Ilya Sutskever, Oriol Vinyals, and Quoc V Le. Sequence to sequence learning with neural networks. In Advances in Neural Information Processing Systems (NeurIPS), 2014.
+
+[60] Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei, Nikolay Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, et al. Llama 2: Open foundation and fine-tuned chat models. arXiv preprint arXiv:2307.09288, 2023.
+
+[61] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Ł ukasz Kaiser, and Illia Polosukhin. Attention is all you need. In Advances in Neural Information Processing Systems (NeurIPS), 2017.
+
+[62] Alex Wang, Amanpreet Singh, Julian Michael, Felix Hill, Omer Levy, and Samuel Bowman. Glue: A multi-task benchmark and analysis platform for natural language understanding. In EMNLP Workshop BlackboxNLP, 2018.
+
+[63] Sinong Wang, Belinda Z. Li, Madian Khabsa, Han Fang, and Hao Ma. Linformer: Self-attention with linear complexity. arXiv preprint arXiv:2006.04768, 2020.
+
+[64] Yiming Wang, Zhuosheng Zhang, and Rui Wang. Element-aware summarization with large language models: Expert-aligned evaluation and chain-of-thought method. In Annual Meeting of the Association for Computational Linguistics (ACL), 2023.
+
+[65] Xiuying Wei, Yunchen Zhang, Xiangguo Zhang, Ruihao Gong, Shanghang Zhang, Qi Zhang, Fengwei Yu, and Xianglong Liu. Outlier suppression: Pushing the limit of low-bit transformer language models. In Advances in Neural Information Processing Systems (NeurIPS), 2022.
+
+[66] Guangxuan Xiao, Ji Lin, Mickael Seznec, Hao Wu, Julien Demouth, and Song Han. Smoothquant: Accurate and efficient post-training quantization for large language models. In International Conference on Machine Learning (ICML), 2023.
+
+[67] Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song Han, and Mike Lewis. Efficient streaming language models with attention sinks. In Proceedings of the International Conference on Learning Representations (ICLR), 2024.
+
+[68] Haoran Xu, Young Jin Kim, Amr Sharaf, and Hany Hassan Awadalla. A paradigm shift in machine translation: Boosting translation performance of large language models. In Proceedings of the International Conference on Learning Representations (ICLR), 2024.
+
+[69] Juncheng Yang, Yazhuo Zhang, Ziyue Qiu, Yao Yue, and Rashmi Vinayak. Fifo queues are all you need for cache eviction. In Proceedings of the Symposium on Operating Systems Principles (SOSP), 2023.
+
+[70] Tzu-Wei Yang, Seth Pollen, Mustafa Uysal, Arif Merchant, and Homer Wolfmeister. CacheSack: Admission optimization for google datacenter flash caches. In Proceedings of the USENIX Annual Technical Conference (USENIX ATC), 2022.
+
+[71] Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soojeong Kim, and Byung-Gon Chun. Orca: A distributed serving system for Transformer-Based generative models. In Proceedings of the USENIX Symposium on Operating Systems Design and Implementation (OSDI), 2022.
+
+[72] Yuan Yu, Martín Abadi, Paul Barham, Eugene Brevdo, Mike Burrows, Andy Davis, Jeff Dean, Sanjay Ghemawat, Tim Harley, Peter Hawkins, et al. Dynamic control flow in large-scale machine learning. In Proceedings of the Thirteenth EuroSys Conference (EuroSys), 2018.
+
+[73] Haoyang Zhang, Yirui Eric Zhou, Yu Xue, Yiqi Liu, and Jian Huang. G10: Enabling an efficient unified gpu memory and storage architecture with smart tensor migrations. In Proceedings of the International Symposium on Microarchitecture (MICRO), 2023.
+
+[74] Haoyu Zhang, Jingjing Cai, Jianjun Xu, and Ji Wang. Pretraining-based natural language generation for text summarization. In Conference on Computational Natural Language Learning (CoNLL), 2019.
+
+[75] Hong Zhang, Yupeng Tang, Anurag Khandelwal, and Ion Stoica. Shepherd: Serving dnns in the wild. In Proceedings of the Symposium on Networked Systems Design and Implementation (NSDI), 2023.
+
+[76] Saizheng Zhang, Emily Dinan, Jack Urbanek, Arthur Szlam, Douwe Kiela, and Jason Weston. Personalizing dialogue agents: I have a dog, do you have pets too? In Annual Meeting of the Association for Computational Linguistics (ACL), 2018.
+
+[77] Susan Zhang, Stephen Roller, Naman Goyal, Mikel Artetxe, Moya Chen, Shuohui Chen, Christopher Dewan, Mona Diab, Xian Li, Xi Victoria Lin, et al. Opt: Open pre-trained transformer language models. arXiv preprint arXiv:2205.01068, 2022.
+
+[78] Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong Chen, Lianmin Zheng, Ruisi Cai, Zhao Song, Yuandong Tian, Christopher Ré, Clark Barrett, et al. H2O: Heavy-hitter oracle for efficient generative inference of large language models. In Advances in Neural Information Processing Systems (NeurIPS), 2023.

@@ -1,0 +1,336 @@
+# Retentive Network: Một Kế Thừa của Transformer cho Mô Hình Ngôn Ngữ Lớn
+
+Yutao Sun∗†‡Li Dong∗†Shaohan Huang†Shuming Ma†
+Yuqing Xia†Jilong Xue†Jianyong Wang‡Furu Wei†⋄
+†Microsoft Research‡Tsinghua University
+https://aka.ms/GeneralAI
+
+## Tóm tắt
+
+Trong nghiên cứu này, chúng tôi đề xuất Retentive Network (RETNET) như một kiến trúc nền tảng cho các mô hình ngôn ngữ lớn, đồng thời đạt được tính song song trong huấn luyện, chi phí suy luận thấp và hiệu suất tốt. Chúng tôi suy dẫn lý thuyết mối liên hệ giữa phép lặp và attention. Sau đó chúng tôi đề xuất cơ chế retention cho mô hình hóa chuỗi, hỗ trợ ba mô hình tính toán, tức là song song, lặp lại và lặp lại theo khối. Cụ thể, biểu diễn song song cho phép tính song song trong huấn luyện. Biểu diễn lặp lại cho phép suy luận O(1) chi phí thấp, điều này cải thiện thông lượng giải mã, độ trễ và bộ nhớ GPU mà không hy sinh hiệu suất. Biểu diễn lặp lại theo khối tạo điều kiện cho mô hình hóa chuỗi dài hiệu quả với độ phức tạp tuyến tính, trong đó mỗi khối được mã hóa song song trong khi tóm tắt các khối một cách lặp lại. Kết quả thực nghiệm về mô hình hóa ngôn ngữ cho thấy RETNET đạt được kết quả mở rộng thuận lợi, huấn luyện song song, triển khai chi phí thấp và suy luận hiệu quả. Những tính chất hấp dẫn làm cho RETNET trở thành một kế thừa mạnh mẽ của Transformer cho các mô hình ngôn ngữ lớn. Mã nguồn sẽ có sẵn tại https://aka.ms/retnet.
+
+[Hình 1: Retentive network (RetNet) đạt được suy luận chi phí thấp (tức là bộ nhớ GPU, thông lượng và độ trễ), tính song song trong huấn luyện và đường cong mở rộng thuận lợi so với Transformer. Kết quả chi phí suy luận được báo cáo với độ dài đầu vào 8k. Hình 6 hiển thị thêm kết quả về các độ dài chuỗi khác nhau.]
+
+∗Đóng góp ngang nhau. ⋄Tác giả liên hệ.
+
+"Cách duy nhất để khám phá giới hạn của những gì có thể là vượt qua chúng vào những điều không thể.
+Arthur C. Clarke"
+
+## 1 Giới thiệu
+
+[Hình 2: RetNet làm cho "tam giác bất khả thi" trở thành khả thi, đạt được tính song song trong huấn luyện, hiệu suất tốt và chi phí suy luận thấp đồng thời.]
+
+Transformer [VSP+17] đã trở thành kiến trúc de facto cho các mô hình ngôn ngữ lớn [BMR+20], ban đầu được đề xuất để khắc phục vấn đề huấn luyện tuần tự của các mô hình lặp lại [HS97]. Tuy nhiên, tính song song trong huấn luyện của Transformers đạt được với chi phí suy luận không hiệu quả, do độ phức tạp O(N) mỗi bước và bộ nhớ đệm key-value bị ràng buộc bộ nhớ [Sha19], điều này làm cho Transformers không thân thiện với triển khai. Độ dài chuỗi ngày càng tăng làm tăng tiêu thụ bộ nhớ GPU cũng như độ trễ và giảm tốc độ suy luận.
+
+Nhiều nỗ lực đã tiếp tục phát triển kiến trúc thế hệ tiếp theo, nhằm duy trì tính song song trong huấn luyện và hiệu suất cạnh tranh như Transformers trong khi có suy luận O(1) hiệu quả. Thật khó khăn để đạt được đồng thời các mục tiêu trên, tức là cái gọi là "tam giác bất khả thi" như được hiển thị trong Hình 2.
+
+Đã có ba hướng nghiên cứu chính. Thứ nhất, attention tuyến tính hóa [KVPF20] xấp xỉ điểm attention tiêu chuẩn exp(q·k) với các kernel ϕ(q)·ϕ(k), để suy luận tự hồi quy có thể được viết lại dưới dạng lặp lại. Tuy nhiên, khả năng mô hình hóa và hiệu suất kém hơn Transformers, điều này cản trở sự phổ biến của phương pháp. Hướng thứ hai quay trở lại các mô hình lặp lại để suy luận hiệu quả trong khi hy sinh tính song song trong huấn luyện. Như một biện pháp khắc phục, các toán tử theo phần tử [PAA+23] được sử dụng để tăng tốc, tuy nhiên, khả năng biểu diễn và hiệu suất bị tổn hại. Hướng nghiên cứu thứ ba khám phá việc thay thế attention bằng các cơ chế khác, chẳng hạn như S4 [GGR21], và các biến thể của nó [DFS+22,PMN+23]. Không có nghiên cứu trước đây nào có thể phá vỡ tam giác bất khả thi, dẫn đến không có người chiến thắng rõ ràng so với Transformers.
+
+Trong nghiên cứu này, chúng tôi đề xuất retentive networks (RetNet), đạt được suy luận chi phí thấp, mô hình hóa chuỗi dài hiệu quả, hiệu suất có thể so sánh với Transformer và huấn luyện mô hình song song đồng thời. Cụ thể, chúng tôi giới thiệu một cơ chế retention đa tỷ lệ để thay thế multi-head attention, có ba mô hình tính toán, tức là biểu diễn song song, lặp lại và lặp lại theo khối. Thứ nhất, biểu diễn song song trao quyền cho tính song song trong huấn luyện để sử dụng đầy đủ các thiết bị GPU. Thứ hai, biểu diễn lặp lại cho phép suy luận O(1) hiệu quả về mặt bộ nhớ và tính toán. Chi phí triển khai và độ trễ có thể được giảm đáng kể. Hơn nữa, việc triển khai được đơn giản hóa rất nhiều mà không cần các thủ thuật bộ nhớ đệm key-value. Thứ ba, biểu diễn lặp lại theo khối có thể thực hiện mô hình hóa chuỗi dài hiệu quả. Chúng tôi mã hóa song song mỗi khối cục bộ để tăng tốc độ tính toán trong khi mã hóa lặp lại các khối toàn cục để tiết kiệm bộ nhớ GPU.
+
+Chúng tôi tiến hành các thí nghiệm mở rộng để so sánh RetNet với Transformer và các biến thể của nó. Kết quả thực nghiệm về mô hình hóa ngôn ngữ cho thấy RetNet luôn cạnh tranh về cả đường cong mở rộng và học tập trong ngữ cảnh. Hơn nữa, chi phí suy luận của RetNet không phụ thuộc vào độ dài. Đối với mô hình 7B và độ dài chuỗi 8k, RetNet giải mã nhanh hơn 8.4× và tiết kiệm 70% bộ nhớ so với Transformers với bộ nhớ đệm key-value. Trong quá trình huấn luyện, RetNet cũng đạt được tiết kiệm bộ nhớ 25-50% và tăng tốc 7× so với Transformer tiêu chuẩn và có lợi thế so với FlashAttention được tối ưu hóa cao [DFE+22]. Bên cạnh đó, độ trễ suy luận của RetNet không nhạy cảm với kích thước batch, cho phép thông lượng khổng lồ. Những tính chất hấp dẫn làm cho RetNet trở thành một kế thừa mạnh mẽ của Transformer cho các mô hình ngôn ngữ lớn.
+
+## 2 Retentive Networks
+
+Retentive network (RetNet) được xếp chồng với L khối giống hệt nhau, tuân theo bố cục tương tự (tức là kết nối dư, và pre-LayerNorm) như trong Transformer [VSP+17]. Mỗi khối RetNet chứa hai module: một module multi-scale retention (MSR), và một module feed-forward network (FFN). Chúng tôi giới thiệu module MSR trong các phần sau. Cho một chuỗi đầu vào x=x1···x|x|, RetNet mã hóa chuỗi theo cách tự hồi quy. Các vector đầu vào {xi}|x|i=1 đầu tiên được đóng gói vào X0= [x1,···,x|x|]∈R|x|×dmodel, trong đó dmodel là chiều ẩn. Sau đó chúng tôi tính toán các biểu diễn vector ngữ cảnh hóa Xl= RetNetl(Xl−1), l∈[1, L].
+
+### 2.1 Retention
+
+Trong phần này, chúng tôi giới thiệu cơ chế retention có dạng kép của lặp lại và song song. Vì vậy chúng tôi có thể huấn luyện các mô hình theo cách song song trong khi tiến hành suy luận lặp lại. Cho đầu vào X∈R|x|×dmodel, chúng tôi chiếu nó thành hàm một chiều v(n) =Xn·wV. Xem xét một bài toán mô hình hóa chuỗi ánh xạ v(n)7→o(n) thông qua các trạng thái sn. Gọi vn, on biểu thị v(n), o(n) cho đơn giản. Chúng tôi hình thức hóa ánh xạ theo cách lặp lại:
+
+sn=Asn−1+K⊺nvn, A ∈Rd×d, Kn∈R1×d
+on=Qnsn=∑m=1nQnAn−mK⊺mvm, Qn∈R1×d (1)
+
+trong đó chúng tôi ánh xạ vn thành vector trạng thái sn, và sau đó thực hiện một biến đổi tuyến tính để mã hóa thông tin chuỗi một cách lặp lại.
+
+Tiếp theo, chúng tôi làm cho chiếu Qn, Kn nhận biết nội dung:
+Q=XWQ, K=XWK (2)
+
+trong đó WQ, WK∈Rd×d là các ma trận có thể học được.
+
+Chúng tôi chéo hóa ma trận A= Λ(γeiθ)Λ−1, trong đó γ, θ∈Rd. Sau đó chúng tôi thu được An−m= Λ(γeiθ)n−mΛ−1. Bằng cách hấp thụ Λ vào WQ và WK, chúng tôi có thể viết lại Phương trình (1) như:
+
+on=∑m=1nQn(γeiθ)n−mK⊺mvm
+=∑m=1n(Qn(γeiθ)n)(Km(γeiθ)−m)⊺vm (3)
+
+trong đó Qn(γeiθ)n, Km(γeiθ)−m được biết đến như xPos [SDP+22], tức là một embedding vị trí tương đối được đề xuất cho Transformer. Chúng tôi đơn giản hóa thêm γ như một vô hướng, Phương trình (3) trở thành:
+
+on=∑m=1nγn−m(Qneinθ)(Kmeimθ)†vm (4)
+
+trong đó † là chuyển vị liên hợp. Công thức có thể dễ dàng song song hóa trong các thể hiện huấn luyện. Tóm lại, chúng tôi bắt đầu với mô hình hóa lặp lại như được hiển thị trong Phương trình (1), và sau đó suy dẫn công thức song song của nó trong Phương trình (4). Chúng tôi xem xét ánh xạ ban đầu v(n)7→o(n) như các vector và thu được cơ chế retention như sau.
+
+**Biểu diễn Song song của Retention** Như được hiển thị trong Hình 3a, lớp retention được định nghĩa là:
+
+Q= (XWQ)⊙Θ, K = (XWK)⊙Θ, V =XWV
+Θn=einθ, Dnm=γn−m, n≥m
+0, n < m
+Retention(X) = (QK⊺⊙D)V (5)
+
+trong đó Θ là liên hợp phức của Θ, và D∈R|x|×|x| kết hợp che dấu nguyên nhân và phân rã hàm mũ dọc theo khoảng cách tương đối thành một ma trận. Tương tự như self-attention, biểu diễn song song cho phép chúng tôi huấn luyện các mô hình với GPU một cách hiệu quả.
+
+**Biểu diễn Lặp lại của Retention** Như được hiển thị trong Hình 3b, cơ chế được đề xuất cũng có thể được viết như các mạng neural lặp lại (RNN), điều này thuận lợi cho suy luận. Đối với bước thời gian thứ n, chúng tôi thu được đầu ra một cách lặp lại như:
+
+Sn=γSn−1+K⊺nVn
+Retention(Xn) =QnSn, n = 1,···,|x| (6)
+
+trong đó Q, K, V, γ giống như trong Phương trình (5).
+
+**Biểu diễn Lặp lại theo Khối của Retention** Một dạng lai của biểu diễn song song và biểu diễn lặp lại có sẵn để tăng tốc huấn luyện, đặc biệt cho các chuỗi dài. Chúng tôi chia các chuỗi đầu vào thành các khối. Trong mỗi khối, chúng tôi tuân theo biểu diễn song song (Phương trình (5)) để tiến hành tính toán. Ngược lại, thông tin xuyên khối được truyền theo biểu diễn lặp lại (Phương trình (6)). Cụ thể, để B biểu thị độ dài khối. Chúng tôi tính toán đầu ra retention của khối thứ i thông qua:
+
+Q[i]=QBi:B(i+1), K[i]=KBi:B(i+1), V[i]=VBi:B(i+1)
+Ri=K⊺[i](V[i]⊙ζ) +γBRi−1, ζij=γB−i−1
+Retention(X[i]) = (Q[i]K⊺[i]⊙D)V[i]|{z}Inner-Chunk + (Q[i]Ri−1)⊙ξ|{z}Cross-Chunk, ξij=γi+1 (7)
+
+trong đó [i] chỉ ra khối thứ i, tức là x[i]= [x(i−1)B+1,···, xiB].
+
+### 2.2 Gated Multi-Scale Retention
+
+Chúng tôi sử dụng h=dmodel/d đầu retention trong mỗi lớp, trong đó d là chiều đầu. Các đầu sử dụng các ma trận tham số khác nhau WQ, WK, WV∈Rd×d. Hơn nữa, multi-scale retention (MSR) gán γ khác nhau cho mỗi đầu. Để đơn giản, chúng tôi đặt γ giống hệt nhau giữa các lớp khác nhau và giữ chúng cố định. Ngoài ra, chúng tôi thêm một cổng swish [HG16,RZL17] để tăng tính phi tuyến của các lớp retention. Chính thức, cho đầu vào X, chúng tôi định nghĩa lớp như:
+
+γ= 1−2−5−arange(0,h)∈Rh
+headi= Retention(X, γi)
+Y= GroupNormh(Concat(head1,···,headh))
+MSR(X) = (swish(XWG)⊙Y)WO (8)
+
+trong đó WG, WO∈Rdmodel×dmodel là các tham số có thể học được, và GroupNorm [WH18] chuẩn hóa đầu ra của mỗi đầu, tuân theo SubLN được đề xuất trong [SPP+19]. Lưu ý rằng các đầu sử dụng nhiều tỷ lệ γ, dẫn đến các thống kê phương sai khác nhau. Vì vậy chúng tôi chuẩn hóa các đầu ra đầu riêng biệt. Mã giả của retention được tóm tắt trong Hình 4.
+
+[Hình 3: Dạng kép của RetNet. "GN" là viết tắt của GroupNorm.]
+
+[Hình 4: Mã giả cho ba mô hình tính toán của retention.]
+
+```python
+def ParallelRetention(
+q, # bsz * num_head * len * qk_dim
+k, # bsz * num_head * len * qk_dim
+v, # bsz * num_head * len * v_dim
+decay_mask # num_head * len * len
+):
+retention = q @ k.transpose(-1,-2)
+retention = retention * decay_mask
+output = retention @ v
+output = group_norm(output)
+return output
+
+def RecurrentRetention(
+q, k, v, # bsz * num_head * len * qkv_dim
+past_kv, # bsz * num_head * qk_dim * v_dim
+decay # num_head * 1 * 1
+):
+current_kv = decay * past_kv + k.unsqueeze(-1) * v.unsqueeze(-2)
+output = torch.sum(q.unsqueeze(-1) * current_kv, dim=-2)
+output = group_norm(output)
+return output, current_kv
+
+def ChunkwiseRetention(
+q, k, v, # bsz * num_head * chunk_size * qkv_dim
+past_kv, # bsz * num_head * qk_dim * v_dim
+decay_mask, # num_head * chunk_size * chunk_size
+chunk_decay, # num_head * 1 * 1
+inner_decay, # num_head * chunk_size
+):
+retention = q @ k.transpose(-1,-2)
+retention = retention * decay_mask
+inner_retention = retention @ v
+cross_retention = (q @ past_kv) * inner_decay
+retention = inner_retention + cross_retention
+output = group_norm(retention)
+current_kv = chunk_decay * past_kv + k.transpose(-1,-2) @ v
+return output, current_kv
+```
+
+**Chuẩn hóa Điểm Retention** Chúng tôi sử dụng tính chất bất biến tỷ lệ của GroupNorm để cải thiện độ chính xác số của các lớp retention. Cụ thể, nhân một giá trị vô hướng trong GroupNorm không ảnh hưởng đến đầu ra và gradient ngược, tức là GroupNorm(α∗headi) = GroupNorm(headi). Chúng tôi thực hiện ba yếu tố chuẩn hóa trong Phương trình (5). Thứ nhất, chúng tôi chuẩn hóa QK⊺ thành QK⊺/√d. Thứ hai, chúng tôi thay thế D bằng D̃nm=Dnm/√∑i=1nDni. Thứ ba, để R biểu thị điểm retention R=QK⊺⊙D, chúng tôi chuẩn hóa nó thành R̃nm=Rnm/max(|∑i=1nRni|,1). Sau đó đầu ra retention trở thành Retention(X) =R̃V. Các thủ thuật trên không ảnh hưởng đến kết quả cuối cùng trong khi ổn định luồng số của cả lượt thuận và ngược, do tính chất bất biến tỷ lệ.
+
+### 2.3 Kiến trúc Tổng thể của Retention Networks
+
+Đối với một retention network L lớp, chúng tôi xếp chồng multi-scale retention (MSR) và feed-forward network (FFN) để xây dựng mô hình. Chính thức, chuỗi đầu vào {xi}|x|i=1 được biến đổi thành các vector bởi một lớp embedding từ. Chúng tôi sử dụng các embedding được đóng gói X0= [x1,···,x|x|]∈R|x|×dmodel làm đầu vào và tính toán đầu ra mô hình XL:
+
+Yl= MSR(LN(Xl)) +Xl
+Xl+1= FFN(LN(Yl)) +Yl (9)
+
+trong đó LN(·) là LayerNorm [BKH16]. Phần FFN được tính toán như FFN(X) = gelu(XW1)W2, trong đó W1, W2 là các ma trận tham số.
+
+**Huấn luyện** Chúng tôi sử dụng các biểu diễn song song (Phương trình (5)) và lặp lại theo khối (Phương trình (7)) trong quá trình huấn luyện. Việc song song hóa trong các chuỗi hoặc khối sử dụng GPU một cách hiệu quả để tăng tốc tính toán. Thuận lợi hơn, lặp lại theo khối đặc biệt hữu ích cho huấn luyện chuỗi dài, hiệu quả về cả FLOP và tiêu thụ bộ nhớ.
+
+**Suy luận** Biểu diễn lặp lại (Phương trình (6)) được sử dụng trong quá trình suy luận, phù hợp tốt với giải mã tự hồi quy. Độ phức tạp O(1) giảm bộ nhớ và độ trễ suy luận trong khi đạt được kết quả tương đương.
+
+### 2.4 Mối quan hệ và Khác biệt với Các Phương pháp Trước đây
+
+Bảng 1 so sánh RetNet với các phương pháp trước đây từ nhiều góc độ khác nhau. Kết quả so sánh phản ánh "tam giác bất khả thi" được trình bày trong Hình 2. Hơn nữa, RetNet có độ phức tạp bộ nhớ tuyến tính cho các chuỗi dài do biểu diễn lặp lại theo khối. Chúng tôi cũng tóm tắt các so sánh với các phương pháp cụ thể như sau.
+
+[Bảng 1: So sánh mô hình từ nhiều góc độ khác nhau. RetNet đạt được song song hóa huấn luyện, chi phí suy luận không đổi, độ phức tạp bộ nhớ tuyến tính cho chuỗi dài và hiệu suất tốt.]
+
+**Transformer** Biểu diễn song song của retention có tinh thần tương tự như Transformers [VSP+17]. Biến thể Transformer liên quan nhất là Lex Transformer [SDP+22] thực hiện xPos như embedding vị trí. Như được mô tả trong Phương trình (3), việc suy dẫn retention phù hợp với xPos. So với attention, retention loại bỏ softmax và cho phép công thức lặp lại, điều này mang lại lợi ích đáng kể cho suy luận.
+
+**S4** Không giống như Phương trình (2), nếu Qn và Kn không nhận biết nội dung, công thức có thể thoái hóa thành S4 [GGR21], trong đó O= (QK⊺, QAK⊺, .., QA|x|−1K⊺)*V.
+
+**Linear Attention** Các biến thể thường sử dụng các kernel khác nhau ϕ(qi)ϕ(kj)/∑n=1|x|ϕ(qi)ϕ(kn) để thay thế hàm softmax. Tuy nhiên, linear attention gặp khó khăn trong việc mã hóa hiệu quả thông tin vị trí, làm cho các mô hình kém hiệu suất hơn. Bên cạnh đó, chúng tôi kiểm tra lại mô hình hóa chuỗi từ đầu, thay vì nhằm mục đích xấp xỉ softmax.
+
+**AFT/RWKV** Attention Free Transformer (AFT) đơn giản hóa dot-product attention thành các phép toán theo phần tử và di chuyển softmax sang các vector key. RWKV thay thế embedding vị trí của AFT bằng phân rã hàm mũ và chạy các mô hình lặp lại để huấn luyện và suy luận. So sánh, retention bảo tồn các trạng thái chiều cao để mã hóa thông tin chuỗi, điều này góp phần vào khả năng biểu đạt và hiệu suất tốt hơn.
+
+**xPos/RoPE** So với các phương pháp embedding vị trí tương đối được đề xuất cho Transformers, Phương trình (3) trình bày một công thức tương tự như xPos [SDP+22] và RoPE [SLP+21].
+
+**Sub-LayerNorm** Như được hiển thị trong Phương trình (8), lớp retention sử dụng Sub-LayerNorm [WMH+22] để chuẩn hóa đầu ra. Bởi vì mô hình hóa đa tỷ lệ dẫn đến các phương sai khác nhau cho các đầu, chúng tôi thay thế LayerNorm ban đầu bằng GroupNorm.
+
+## 3 Thí nghiệm
+
+Chúng tôi tiến hành thí nghiệm về mô hình hóa ngôn ngữ để đánh giá RetNet. Chúng tôi đánh giá kiến trúc được đề xuất với các benchmark khác nhau, tức là hiệu suất mô hình hóa ngôn ngữ, và học tập zero-/few-shot trên các tác vụ downstream. Hơn nữa, đối với huấn luyện và suy luận, chúng tôi so sánh tốc độ, tiêu thụ bộ nhớ và độ trễ.
+
+[Bảng 2: Kích thước và siêu tham số học tập của các mô hình trong thí nghiệm mô hình hóa ngôn ngữ.]
+
+### 3.1 Thiết lập
+
+**Phân bổ Tham số** Chúng tôi phân bổ lại các tham số trong MSR và FFN để so sánh công bằng. Để d biểu thị dmodel để đơn giản ở đây. Trong Transformers, có khoảng 4d² tham số trong self-attention trong đó WQ, WK, WV, WO∈Rd×d, và 8d² tham số trong FFN trong đó chiều trung gian là 4d. So sánh, RetNet có 8d² tham số trong retention, trong đó WQ, WK∈Rd×d, WG, WV∈Rd×2d, WO∈R2d×d. Lưu ý rằng chiều đầu của V gấp đôi Q, K. Chiều mở rộng được chiếu ngược về d bởi WO. Để giữ số lượng tham số giống với Transformer, chiều trung gian FFN trong RetNet là 2d. Trong khi đó, chúng tôi đặt chiều đầu là 256 trong các thí nghiệm của chúng tôi, tức là 256 cho queries và keys, và 512 cho values. Để so sánh công bằng, chúng tôi giữ γ giống hệt nhau giữa các kích thước mô hình khác nhau, trong đó γ= 1−elinspace(log 1/32,log1/512,h)∈Rh thay vì giá trị mặc định trong Phương trình (8).
+
+**Huấn luyện Mô hình Ngôn ngữ** Như được hiển thị trong Bảng 2, chúng tôi huấn luyện các mô hình ngôn ngữ với nhiều kích thước khác nhau (tức là 1.3B, 2.7B và 6.7B) từ đầu. Corpus huấn luyện là một tập hợp được tuyển chọn của The Pile [GBB+20], C4 [DMI+21], và The Stack [KLBA+22]. Chúng tôi thêm token <bos> để chỉ ra sự bắt đầu của một chuỗi². Kích thước batch huấn luyện là 4M token với độ dài tối đa 2048. Chúng tôi huấn luyện các mô hình với 100B token, tức là 25k bước. Chúng tôi sử dụng optimizer AdamW [LH19] với β1= 0.9, β2= 0.98, và weight decay được đặt thành 0.05. Số bước làm ấm là 375 với suy giảm tốc độ học tập tuyến tính. Các tham số được khởi tạo theo DeepNet [WMD+22] để đảm bảo tính ổn định huấn luyện. Việc triển khai dựa trên TorchScale [MWH+22]. Chúng tôi huấn luyện các mô hình với 512 GPU AMD MI200.
+
+### 3.2 So sánh với Transformer
+
+**Mô hình hóa Ngôn ngữ** Như được hiển thị trong Hình 5, chúng tôi báo cáo perplexity trên tập validation cho các mô hình ngôn ngữ dựa trên Transformer và RetNet. Chúng tôi trình bày các đường cong mở rộng với ba kích thước mô hình, tức là 1.3B, 2.7B và 6.7B. RetNet đạt được kết quả có thể so sánh với Transformers. Quan trọng hơn, kết quả chỉ ra rằng RetNet có lợi thế về mở rộng kích thước. Bên cạnh hiệu suất, việc huấn luyện RetNet khá ổn định trong các thí nghiệm của chúng tôi. Kết quả thực nghiệm cho thấy RetNet là một đối thủ mạnh của Transformer cho các mô hình ngôn ngữ lớn. Theo kinh nghiệm, chúng tôi thấy rằng RetNet bắt đầu vượt trội hơn Transformer khi kích thước mô hình lớn hơn 2B. Chúng tôi cũng tóm tắt kết quả mô hình hóa ngôn ngữ với các độ dài ngữ cảnh khác nhau trong Phụ lục B.
+
+[Hình 5: Perplexity giảm cùng với việc mở rộng kích thước mô hình. Chúng tôi quan sát thực nghiệm rằng RetNet có xu hướng vượt trội hơn Transformer khi kích thước mô hình lớn hơn 2B.]
+
+**Đánh giá Zero-Shot và Few-Shot trên Các Tác vụ Downstream** Chúng tôi cũng so sánh các mô hình ngôn ngữ trên một loạt rộng các tác vụ downstream. Chúng tôi đánh giá học tập zero-shot và 4-shot với các mô hình 6.7B. Như được hiển thị trong Bảng 3, các tập dữ liệu bao gồm HellaSwag (HS) [ZHB+19], BoolQ [CLC+19], COPA [WPN+19], PIQA [BZB+20], Winograd, Winogrande [LDM12], và StoryCloze (SC) [MRL+17]. Các số độ chính xác phù hợp với perplexity mô hình hóa ngôn ngữ được trình bày trong Hình 5. RetNet đạt được hiệu suất có thể so sánh với Transformer trong các thiết lập học tập zero-shot và trong ngữ cảnh.
+
+[Bảng 3: Học tập Zero-shot và few-shot với Transformer và RetNet. Kích thước mô hình là 6.7B.]
+
+### 3.3 Chi phí Huấn luyện
+
+Như được hiển thị trong Bảng 4, chúng tôi so sánh tốc độ huấn luyện và tiêu thụ bộ nhớ của Transformer và RetNet, trong đó độ dài chuỗi huấn luyện là 8192. Chúng tôi cũng so sánh với FlashAttention [DFE+22], cải thiện tốc độ và giảm IO bộ nhớ GPU bằng tính toán lại và fusion kernel. So sánh, chúng tôi triển khai RetNet sử dụng mã PyTorch vanilla, và để lại fusion kernel hoặc tăng tốc giống FlashAttention cho công việc tương lai. Chúng tôi sử dụng biểu diễn lặp lại theo khối của retention như được mô tả trong Phương trình (7). Kích thước khối được đặt thành 512. Chúng tôi đánh giá kết quả với tám GPU Nvidia A100-80GB, bởi vì FlashAttention được tối ưu hóa cao cho A100. Tensor parallelism được kích hoạt cho các mô hình 6.7B và 13B.
+
+Kết quả thực nghiệm cho thấy RetNet hiệu quả hơn về bộ nhớ và có thông lượng cao hơn Transformers trong quá trình huấn luyện. Ngay cả so với FlashAttention, RetNet vẫn cạnh tranh về tốc độ và chi phí bộ nhớ. Hơn nữa, không dựa vào các kernel cụ thể, dễ dàng huấn luyện RetNet trên các nền tảng khác một cách hiệu quả. Ví dụ, chúng tôi huấn luyện các mô hình RetNet trên cụm AMD MI200 với thông lượng khá tốt. Đáng chú ý là RetNet có tiềm năng giảm thêm chi phí thông qua triển khai tiên tiến, chẳng hạn như fusion kernel.
+
+[Bảng 4: Chi phí huấn luyện của Transformer (Trm), Transformer với FlashAttention (Trm+FlashAttn), và RetNet. Chúng tôi báo cáo tiêu thụ bộ nhớ và thông lượng huấn luyện (từ mỗi giây; wps).]
+
+### 3.4 Chi phí Suy luận
+
+Như được hiển thị trong Hình 6, chúng tôi so sánh chi phí bộ nhớ, thông lượng và độ trễ của Transformer và RetNet trong quá trình suy luận. Transformers tái sử dụng bộ nhớ đệm KV của các token đã giải mã trước đó. RetNet sử dụng biểu diễn lặp lại như được mô tả trong Phương trình (6). Chúng tôi đánh giá mô hình 6.7B trên GPU A100-80GB trong các thí nghiệm của chúng tôi. Hình 6 cho thấy RetNet vượt trội hơn Transformer về chi phí suy luận.
+
+**Bộ nhớ** Như được hiển thị trong Hình 6a, chi phí bộ nhớ của Transformer tăng tuyến tính do bộ nhớ đệm KV. Ngược lại, tiêu thụ bộ nhớ của RetNet duy trì nhất quán ngay cả đối với các chuỗi dài, yêu cầu ít bộ nhớ GPU hơn nhiều để host RetNet. Tiêu thụ bộ nhớ bổ sung của RetNet gần như không đáng kể (tức là khoảng 3%) trong khi trọng lượng mô hình chiếm 97%.
+
+**Thông lượng** Như được trình bày trong Hình 6b, thông lượng của Transformer giảm cùng với độ dài giải mã tăng. So sánh, RetNet có thông lượng cao hơn và không phụ thuộc vào độ dài trong quá trình giải mã, bằng cách sử dụng biểu diễn lặp lại của retention.
+
+**Độ trễ** Độ trễ là một metric quan trọng trong triển khai, ảnh hưởng rất nhiều đến trải nghiệm người dùng. Chúng tôi báo cáo độ trễ giải mã trong Hình 6c. Kết quả thực nghiệm cho thấy việc tăng kích thước batch làm cho độ trễ của Transformer lớn hơn. Hơn nữa, độ trễ của Transformers tăng nhanh hơn với đầu vào dài hơn. Để làm cho độ trễ có thể chấp nhận được, chúng tôi phải hạn chế kích thước batch, điều này ảnh hưởng đến thông lượng suy luận tổng thể của Transformers. Ngược lại, độ trễ giải mã của RetNet vượt trội hơn Transformers và giữ gần như nhau trên các kích thước batch và độ dài đầu vào khác nhau.
+
+[Hình 6: Chi phí suy luận của Transformer và RetNet với kích thước mô hình 6.7B. RetNet vượt trội hơn Transformers về tiêu thụ bộ nhớ, thông lượng và độ trễ.]
+
+### 3.5 So sánh với Các Biến thể Transformer
+
+Ngoài Transformer, chúng tôi so sánh RetNet với nhiều biến thể Transformer hiệu quả khác nhau, bao gồm Linear Transformer [KVPF20], RWKV [PAA+23], H3 [DFS+22], và Hyena [PMN+23]. Tất cả các mô hình có 200M tham số với 16 lớp và chiều ẩn 1024. Đối với H3, chúng tôi đặt chiều đầu là 8. Đối với RWKV, chúng tôi sử dụng module TimeMix để thay thế các lớp self-attention trong khi giữ các lớp FFN nhất quán với các mô hình khác để so sánh công bằng. Chúng tôi huấn luyện các mô hình với 10k bước với kích thước batch 0.5M token. Hầu hết các siêu tham số và corpus huấn luyện được giữ giống như trong Phần 3.1.
+
+Bảng 5 báo cáo các số perplexity trên tập validation trong domain và các corpus ngoài domain khác, ví dụ Project Gutenberg 2019-2022 (PG22) [SDP+22], QMSum [ZYY+21], GovReport [HCP+21], SummScreen [CCWG21,SSI+22]. Tổng thể, RetNet vượt trội hơn các phương pháp trước đây trên các tập dữ liệu khác nhau. RetNet không chỉ đạt được kết quả đánh giá tốt hơn trên corpus trong domain mà còn thu được perplexity thấp hơn trên một số tập dữ liệu ngoài domain. Hiệu suất thuận lợi làm cho RetNet trở thành một kế thừa mạnh mẽ của Transformer, bên cạnh lợi ích giảm chi phí đáng kể (Phần 3.3 và 3.4).
+
+[Bảng 5: Kết quả perplexity về mô hình hóa ngôn ngữ. RetNet vượt trội hơn các kiến trúc khác trên cả tập đánh giá trong domain và các corpus ngoài domain khác nhau.]
+
+Ngoài ra, chúng tôi thảo luận về hiệu quả huấn luyện và suy luận của các phương pháp được so sánh. Để d biểu thị chiều ẩn, và n độ dài chuỗi. Đối với huấn luyện, độ phức tạp token-mixing của RWKV là O(dn) trong khi của Hyena là O(dn log n) với tăng tốc Fast Fourier Transform. Hai phương pháp trên giảm FLOP huấn luyện thông qua việc sử dụng các toán tử theo phần tử để đánh đổi khả năng mô hình hóa. So với retention, biểu diễn lặp lại theo khối là O(dn(b+h)), trong đó b là kích thước khối, h là chiều đầu, và chúng tôi thường đặt b= 512, h= 256. Đối với kích thước mô hình lớn (tức là d lớn hơn) hoặc độ dài chuỗi, b+h bổ sung có tác động không đáng kể. Vì vậy việc huấn luyện RetNet khá hiệu quả mà không hy sinh hiệu suất mô hình hóa. Đối với suy luận, trong số các kiến trúc hiệu quả được so sánh, Hyena có cùng độ phức tạp (tức là O(n) mỗi bước) như Transformer trong khi các kiến trúc khác có thể thực hiện giải mã O(1).
+
+### 3.6 Nghiên cứu Ablation
+
+Chúng tôi ablate các lựa chọn thiết kế khác nhau của RetNet và báo cáo kết quả mô hình hóa ngôn ngữ trong Bảng 6. Các thiết lập đánh giá và metric giống như trong Phần 3.5.
+
+**Kiến trúc** Chúng tôi ablate cổng swish và GroupNorm như được mô tả trong Phương trình (8). Bảng 6 cho thấy hai thành phần trên cải thiện hiệu suất cuối cùng. Thứ nhất, module gating là cần thiết để tăng cường tính phi tuyến và cải thiện khả năng mô hình. Lưu ý rằng chúng tôi sử dụng cùng phân bổ tham số như Transformers sau khi loại bỏ cổng. Thứ hai, chuẩn hóa nhóm trong retention cân bằng các phương sai của đầu ra multi-head, cải thiện tính ổn định huấn luyện và kết quả mô hình hóa ngôn ngữ.
+
+**Multi-Scale Decay** Phương trình (8) cho thấy chúng tôi sử dụng γ khác nhau như tỷ lệ phân rã cho các đầu retention. Trong các nghiên cứu ablation, chúng tôi kiểm tra việc loại bỏ γ decay (tức là "−γ decay") và áp dụng cùng tỷ lệ phân rã trên các đầu (tức là "−multi-scale decay"). Cụ thể, ablating γ decay tương đương với γ= 1. Trong thiết lập thứ hai, chúng tôi đặt γ= 127/128 cho tất cả các đầu. Bảng 6 chỉ ra rằng cả cơ chế phân rã và sử dụng nhiều tỷ lệ phân rã đều có thể cải thiện hiệu suất mô hình hóa ngôn ngữ.
+
+**Chiều Đầu** Từ góc độ lặp lại của Phương trình (1), chiều đầu hàm ý khả năng bộ nhớ của các trạng thái ẩn. Trong nghiên cứu ablation, chúng tôi giảm chiều đầu mặc định từ 256 xuống 64, tức là 64 cho queries và keys, và 128 cho values. Chúng tôi giữ chiều ẩn dmodel giống nhau nên số lượng đầu tăng. Kết quả thực nghiệm trong Bảng 6 cho thấy chiều đầu lớn hơn đạt được hiệu suất tốt hơn.
+
+[Bảng 6: Kết quả ablation trên các corpus trong domain và ngoài domain.]
+
+## 4 Kết luận
+
+Trong nghiên cứu này, chúng tôi đề xuất retentive networks (RetNet) cho mô hình hóa chuỗi, cho phép nhiều biểu diễn khác nhau, tức là song song, lặp lại và lặp lại theo khối. RetNet đạt được hiệu quả suy luận tốt hơn đáng kể (về bộ nhớ, tốc độ và độ trễ), song song hóa huấn luyện thuận lợi và hiệu suất cạnh tranh so với Transformers. Những lợi thế trên làm cho RetNet trở thành một kế thừa lý tưởng của Transformers cho các mô hình ngôn ngữ lớn, đặc biệt xem xét lợi ích triển khai mang lại bởi độ phức tạp suy luận O(1). Trong tương lai, chúng tôi muốn mở rộng RetNet về kích thước mô hình [CDH+22] và các bước huấn luyện. Hơn nữa, retention có thể làm việc hiệu quả với structured prompting [HSD+22b] bằng cách nén bộ nhớ dài hạn. Chúng tôi cũng sẽ sử dụng RetNet như kiến trúc xương sống để huấn luyện các mô hình ngôn ngữ lớn đa phương thức [HSD+22a,HDW+23,PWD+23]. Ngoài ra, chúng tôi quan tâm đến việc triển khai các mô hình RetNet trên nhiều thiết bị edge khác nhau, chẳng hạn như điện thoại di động.
+
+## Lời cảm ơn
+
+Chúng tôi muốn cảm ơn Jiayu Ding, Songlin Yang và các đồng nghiệp từ MSRA System Group cho những thảo luận hữu ích.
+
+## Tài liệu tham khảo
+
+[BKH16] Jimmy Lei Ba, Jamie Ryan Kiros, và Geoffrey E Hinton. Layer normalization. arXiv preprint arXiv:1607.06450, 2016.
+
+[BMR+20] Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, Sandhini Agarwal, Ariel Herbert-Voss, Gretchen Krueger, Tom Henighan, Rewon Child, Aditya Ramesh, Daniel Ziegler, Jeffrey Wu, Clemens Winter, Chris Hesse, Mark Chen, Eric Sigler, Mateusz Litwin, Scott Gray, Benjamin Chess, Jack Clark, Christopher Berner, Sam McCandlish, Alec Radford, Ilya Sutskever, và Dario Amodei. Language models are few-shot learners. In Advances in Neural Information Processing Systems, volume 33, pages 1877–1901. Curran Associates, Inc., 2020.
+
+[BZB+20] Yonatan Bisk, Rowan Zellers, Ronan Le Bras, Jianfeng Gao, và Yejin Choi. Piqa: Reasoning about physical commonsense in natural language. In Thirty-Fourth AAAI Conference on Artificial Intelligence, 2020.
+
+[CCWG21] Mingda Chen, Zewei Chu, Sam Wiseman, và Kevin Gimpel. Summscreen: A dataset for abstractive screenplay summarization. arXiv preprint arXiv:2104.07091, 2021.
+
+[CDH+22] Zewen Chi, Li Dong, Shaohan Huang, Damai Dai, Shuming Ma, Barun Patra, Saksham Singhal, Payal Bajaj, Xia Song, Xian-Ling Mao, Heyan Huang, và Furu Wei. On the representation collapse of sparse mixture of experts. In Advances in Neural Information Processing Systems, 2022.
+
+[CLC+19] Christopher Clark, Kenton Lee, Ming-Wei Chang, Tom Kwiatkowski, Michael Collins, và Kristina Toutanova. BoolQ: Exploring the surprising difficulty of natural yes/no questions. In Proceedings of the 2019 Conference of the North American Chapter of the Association for Computational Linguistics, pages 2924–2936, 2019.
+
+[DFE+22] Tri Dao, Dan Fu, Stefano Ermon, Atri Rudra, và Christopher Ré. Flashattention: Fast and memory-efficient exact attention with io-awareness. Advances in Neural Information Processing Systems, 35:16344–16359, 2022.
+
+[DFS+22] Tri Dao, Daniel Y Fu, Khaled K Saab, Armin W Thomas, Atri Rudra, và Christopher Ré. Hungry hungry hippos: Towards language modeling with state space models. arXiv preprint arXiv:2212.14052, 2022.
+
+[DMI+21] Jesse Dodge, Ana Marasović, Gabriel Ilharco, Dirk Groeneveld, Margaret Mitchell, và Matt Gardner. Documenting large webtext corpora: A case study on the colossal clean crawled corpus. In Conference on Empirical Methods in Natural Language Processing, 2021.
+
+[GBB+20] Leo Gao, Stella Biderman, Sid Black, Laurence Golding, Travis Hoppe, Charles Foster, Jason Phang, Horace He, Anish Thite, Noa Nabeshima, et al. The Pile: An 800GB dataset of diverse text for language modeling. arXiv preprint arXiv:2101.00027, 2020.
+
+[GGR21] Albert Gu, Karan Goel, và Christopher Ré. Efficiently modeling long sequences with structured state spaces. arXiv preprint arXiv:2111.00396, 2021.
+
+[HCP+21] Luyang Huang, Shuyang Cao, Nikolaus Parulian, Heng Ji, và Lu Wang. Efficient attentions for long document summarization. arXiv preprint arXiv:2104.02112, 2021.
+
+[HDW+23] Shaohan Huang, Li Dong, Wenhui Wang, Yaru Hao, Saksham Singhal, Shuming Ma, Tengchao Lv, Lei Cui, Owais Khan Mohammed, Qiang Liu, Kriti Aggarwal, Zewen Chi, Johan Bjorck, Vishrav Chaudhary, Subhojit Som, Xia Song, và Furu Wei. Language is not all you need: Aligning perception with language models. ArXiv, abs/2302.14045, 2023.
+
+[HG16] Dan Hendrycks và Kevin Gimpel. Gaussian error linear units (GELUs). arXiv: Learning, 2016.
+
+[HS97] Sepp Hochreiter và Jürgen Schmidhuber. Long short-term memory. Neural Computation, 9:1735–1780, November 1997.
+
+[HSD+22a] Yaru Hao, Haoyu Song, Li Dong, Shaohan Huang, Zewen Chi, Wenhui Wang, Shuming Ma, và Furu Wei. Language models are general-purpose interfaces. ArXiv, abs/2206.06336, 2022.
+
+[HSD+22b] Yaru Hao, Yutao Sun, Li Dong, Zhixiong Han, Yuxian Gu, và Furu Wei. Structured prompting: Scaling in-context learning to 1,000 examples. ArXiv, abs/2212.06713, 2022.
+
+[KLBA+22] Denis Kocetkov, Raymond Li, Loubna Ben Allal, Jia Li, Chenghao Mou, Carlos Muñoz Ferrandis, Yacine Jernite, Margaret Mitchell, Sean Hughes, Thomas Wolf, Dzmitry Bahdanau, Leandro von Werra, và Harm de Vries. The Stack: 3TB of permissively licensed source code. Preprint, 2022.
+
+[KVPF20] Angelos Katharopoulos, Apoorv Vyas, Nikolaos Pappas, và François Fleuret. Transformers are rnns: Fast autoregressive transformers with linear attention. In International Conference on Machine Learning, pages 5156–5165. PMLR, 2020.
+
+[LDM12] Hector Levesque, Ernest Davis, và Leora Morgenstern. The winograd schema challenge. In Thirteenth International Conference on the Principles of Knowledge Representation and Reasoning, 2012.
+
+[LH19] Ilya Loshchilov và Frank Hutter. Decoupled weight decay regularization. In International Conference on Learning Representations, 2019.
+
+[MRL+17] Nasrin Mostafazadeh, Michael Roth, Annie Louis, Nathanael Chambers, và James Allen. Lsdsem 2017 shared task: The story cloze test. In Proceedings of the 2nd Workshop on Linking Models of Lexical, Sentential and Discourse-level Semantics, pages 46–51, 2017.
+
+[MWH+22] Shuming Ma, Hongyu Wang, Shaohan Huang, Wenhui Wang, Zewen Chi, Li Dong, Alon Benhaim, Barun Patra, Vishrav Chaudhary, Xia Song, và Furu Wei. TorchScale: Transformers at scale. CoRR, abs/2211.13184, 2022.
+
+[OSG+23] Antonio Orvieto, Samuel L. Smith, Albert Gu, Anushan Fernando, Caglar Gulcehre, Razvan Pascanu, và Soham De. Resurrecting recurrent neural networks for long sequences. ArXiv, abs/2303.06349, 2023.
+
+[PAA+23] Bo Peng, Eric Alcaide, Quentin Anthony, Alon Albalak, Samuel Arcadinho, Huanqi Cao, Xin Cheng, Michael Chung, Matteo Grella, Kranthi Kiran GV, Xuzheng He, Haowen Hou, Przemyslaw Kazienko, Jan Kocon, Jiaming Kong, Bartlomiej Koptyra, Hayden Lau, Krishna Sri Ipsit Mantri, Ferdinand Mom, Atsushi Saito, Xiangru Tang, Bolun Wang, Johan S. Wind, Stansilaw Wozniak, Ruichong Zhang, Zhenyuan Zhang, Qihang Zhao, Peng Zhou, Jian Zhu, và Rui-Jie Zhu. Rwkv: Reinventing rnns for the transformer era, 2023.
+
+[PMN+23] Michael Poli, Stefano Massaroli, Eric Nguyen, Daniel Y Fu, Tri Dao, Stephen Baccus, Yoshua Bengio, Stefano Ermon, và Christopher Ré. Hyena hierarchy: Towards larger convolutional language models. arXiv preprint arXiv:2302.10866, 2023.
+
+[PWD+23] Zhiliang Peng, Wenhui Wang, Li Dong, Yaru Hao, Shaohan Huang, Shuming Ma, và Furu Wei. Kosmos-2: Grounding multimodal large language models to the world. ArXiv, abs/2306.14824, 2023.
+
+[RZL17] Prajit Ramachandran, Barret Zoph, và Quoc V. Le. Swish: a self-gated activation function. arXiv: Neural and Evolutionary Computing, 2017.
+
+[SDP+22] Yutao Sun, Li Dong, Barun Patra, Shuming Ma, Shaohan Huang, Alon Benhaim, Vishrav Chaudhary, Xia Song, và Furu Wei. A length-extrapolatable transformer. arXiv preprint arXiv:2212.10554, 2022.
+
+[Sha19] Noam M. Shazeer. Fast transformer decoding: One write-head is all you need. ArXiv, abs/1911.02150, 2019.
+
+[SLP+21] Jianlin Su, Yu Lu, Shengfeng Pan, Bo Wen, và Yunfeng Liu. Roformer: Enhanced transformer with rotary position embedding. arXiv preprint arXiv:2104.09864, 2021.
+
+[SPP+19] Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper, và Bryan Catanzaro. Megatron-LM: Training multi-billion parameter language models using model parallelism. arXiv preprint arXiv:1909.08053, 2019.
+
+[SSI+22] Uri Shaham, Elad Segal, Maor Ivgi, Avia Efrat, Ori Yoran, Adi Haviv, Ankit Gupta, Wenhan Xiong, Mor Geva, Jonathan Berant, et al. Scrolls: Standardized comparison over long language sequences. arXiv preprint arXiv:2201.03533, 2022.
+
+[VSP+17] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez, Lukasz Kaiser, và Illia Polosukhin. Attention is all you need. In Advances in Neural Information Processing Systems 30: Annual Conference on Neural Information Processing Systems 2017, 4-9 December 2017, Long Beach, CA, USA, pages 6000–6010, 2017.
+
+[WH18] Yuxin Wu và Kaiming He. Group normalization. In Proceedings of the European conference on computer vision (ECCV), pages 3–19, 2018.
+
+[WMD+22] Hongyu Wang, Shuming Ma, Li Dong, Shaohan Huang, Dongdong Zhang, và Furu Wei. DeepNet: Scaling Transformers to 1,000 layers. ArXiv, abs/2203.00555, 2022.
+
+[WMH+22] Hongyu Wang, Shuming Ma, Shaohan Huang, Li Dong, Wenhui Wang, Zhiliang Peng, Yu Wu, Payal Bajaj, Saksham Singhal, Alon Benhaim, et al. Foundation transformers. arXiv preprint arXiv:2210.06423, 2022.
+
+[WPN+19] Alex Wang, Yada Pruksachatkun, Nikita Nangia, Amanpreet Singh, Julian Michael, Felix Hill, Omer Levy, và Samuel R Bowman. SuperGLUE: A stickier benchmark for general-purpose language understanding systems. arXiv preprint arXiv:1905.00537, 2019.
+
+[ZHB+19] Rowan Zellers, Ari Holtzman, Yonatan Bisk, Ali Farhadi, và Yejin Choi. Hellaswag: Can a machine really finish your sentence? In Proceedings of the 57th Annual Meeting of the Association for Computational Linguistics, 2019.
+
+[ZYY+21] Ming Zhong, Da Yin, Tao Yu, Ahmad Zaidi, Mutethia Mutuma, Rahul Jha, Ahmed Hassan Awadallah, Asli Celikyilmaz, Yang Liu, Xipeng Qiu, et al. Qmsum: A new benchmark for query-based multi-domain meeting summarization. arXiv preprint arXiv:2104.05938, 2021.
+
+## A Siêu tham số
+
+[Bảng 7: Siêu tham số được sử dụng cho các mô hình trong Phần 3.]
+
+## B Kết quả Nhóm của Các Độ dài Ngữ cảnh Khác nhau
+
+Như được hiển thị trong Bảng 8, chúng tôi báo cáo kết quả mô hình hóa ngôn ngữ với các độ dài ngữ cảnh khác nhau. Để làm cho các số có thể so sánh được, chúng tôi sử dụng 2048 khối văn bản như dữ liệu đánh giá và chỉ tính toán perplexity cho 128 token cuối cùng. Kết quả thực nghiệm cho thấy RetNet vượt trội hơn Transformer trên các độ dài ngữ cảnh khác nhau. Bên cạnh đó, RetNet có thể sử dụng ngữ cảnh dài hơn để có kết quả tốt hơn.
+
+[Bảng 8: Perplexity mô hình hóa ngôn ngữ của RetNet và Transformer với độ dài ngữ cảnh khác nhau. Kết quả cho thấy RetNet có lợi thế nhất quán trên độ dài chuỗi.]

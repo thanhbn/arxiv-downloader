@@ -1,0 +1,340 @@
+# RWKV: Tái phát minh RNN cho Kỷ nguyên Transformer
+
+Bo Peng1,2∗Eric Alcaide2,3,4∗Quentin Anthony2,5∗
+Alon Albalak2,6Samuel Arcadinho2,7Stella Biderman2,8Huanqi Cao9Xin Cheng10
+Michael Chung11Xingjian Du1Matteo Grella12Kranthi Kiran GV2,13Xuzheng He2
+Haowen Hou14Jiaju Lin1Przemysław Kazienko15Jan Koco ´n15Jiaming Kong16
+Bartłomiej Koptyra15Hayden Lau2Krishna Sri Ipsit Mantri17Ferdinand Mom18,19
+Atsushi Saito2,20Guangyu Song21Xiangru Tang22Bolun Wang23Johan S. Wind24
+Stanisław Wo´ zniak15Ruichong Zhang9Zhenyuan Zhang2Qihang Zhao25,26
+Peng Zhou23Qinghua Zhou5Jian Zhu27Rui-Jie Zhu28,29
+
+1Generative AI Commons2EleutherAI3U. of Barcelona4Charm Therapeutics5Ohio State U.6U. of C., Santa Barbara
+7Zendesk8Booz Allen Hamilton9Tsinghua University10Peking University11Storyteller.io12Crisis2413New York U.
+14National U. of Singapore15Wroclaw U. of Science and Technology16Databaker Technology17Purdue U.18Criteo AI Lab
+19Epita20Nextremer21Moves22Yale U.23RuoxinTech24U. of Oslo25U. of Science and Technology of China
+26Kuaishou Technology27U. of British Columbia28U. of C., Santa Cruz29U. of Electronic Science and Technology of China
+
+## Tóm tắt
+
+Transformers đã cách mạng hóa hầu như tất cả các nhiệm vụ xử lý ngôn ngữ tự nhiên (NLP) nhưng gặp phải vấn đề về độ phức tạp bộ nhớ và tính toán tăng theo cấp số hai với độ dài chuỗi. Ngược lại, các mạng nơ-ron hồi quy (RNNs) thể hiện việc mở rộng tuyến tính về bộ nhớ và yêu cầu tính toán nhưng gặp khó khăn để đạt được hiệu suất tương tự như Transformers do những hạn chế trong song song hóa và khả năng mở rộng. Chúng tôi đề xuất một kiến trúc mô hình mới, Receptance Weighted Key Value (RWKV), kết hợp việc huấn luyện song song hiệu quả của transformers với suy luận hiệu quả của RNNs.
+
+Phương pháp của chúng tôi tận dụng cơ chế chú ý tuyến tính và cho phép chúng tôi công thức hóa mô hình như một Transformer hoặc một RNN, do đó song song hóa các tính toán trong quá trình huấn luyện và duy trì độ phức tạp tính toán và bộ nhớ không đổi trong quá trình suy luận. Chúng tôi mở rộng các mô hình của mình lên đến 14 tỷ tham số, cho đến nay là RNN dày đặc lớn nhất từng được huấn luyện, và thấy rằng RWKV hoạt động ngang bằng với các Transformers có kích thước tương tự, gợi ý rằng công việc tương lai có thể tận dụng kiến trúc này để tạo ra các mô hình hiệu quả hơn. Công trình này trình bày một bước tiến đáng kể hướng tới việc hòa giải sự đánh đổi giữa hiệu quả tính toán và hiệu suất mô hình trong các nhiệm vụ xử lý chuỗi.1
+
+## 1 Giới thiệu
+
+Học sâu đã thúc đẩy mạnh mẽ trí tuệ nhân tạo, tác động đến một loạt các ứng dụng khoa học và công nghiệp. Những ứng dụng này thường liên quan đến các nhiệm vụ xử lý dữ liệu tuần tự phức tạp như hiểu ngôn ngữ tự nhiên, AI đối thoại, phân tích chuỗi thời gian, và các định dạng tuần tự gián tiếp như hình ảnh và đồ thị (Brown et al., 2020; Ismail Fawaz et al., 2019; Wu et al., 2020; Albalak et al., 2022). Những kỹ thuật chủ đạo trong số này bao gồm RNNs và Transformers (Vaswani et al., 2017), mỗi loại có những lợi ích và hạn chế cụ thể. RNNs yêu cầu ít bộ nhớ hơn, đặc biệt là để xử lý các chuỗi dài. Tuy nhiên, chúng gặp phải vấn đề gradient biến mất và không thể song song hóa trong chiều thời gian trong quá trình huấn luyện, hạn chế khả năng mở rộng của chúng (Hochreiter, 1998; Le and Zuidema, 2016).
+
+[Hình 1: Hiệu suất trung bình của các mô hình RWKV so với transformers trên mười hai nhiệm vụ NLP. Để biết thêm chi tiết, xem phần 5.]
+
+Transformers xuất hiện như một giải pháp thay thế mạnh mẽ, thành thạo trong việc quản lý các phụ thuộc cục bộ và tầm xa và hỗ trợ huấn luyện song song (Tay et al., 2022). Các mô hình như GPT-3 (Brown et al., 2020), ChatGPT (OpenAI, 2022; Koco ´n et al., 2023), LLaMA (Touvron et al., 2023), và Chinchilla (Hoffmann et al., 2022) thể hiện tiềm năng của Transformers trong NLP. Tuy nhiên, độ phức tạp bậc hai của cơ chế tự chú ý làm cho nó tốn nhiều tính toán và bộ nhớ cho các nhiệm vụ liên quan đến chuỗi dài và tài nguyên hạn chế. Điều này đã kích thích nghiên cứu để tăng cường khả năng mở rộng của Transformers, đôi khi hy sinh một phần hiệu quả của chúng (Wang et al., 2020; Zaheer et al., 2020; Dao et al., 2022a).
+
+[Bảng 1: So sánh độ phức tạp suy luận với các Transformers khác nhau. Ở đây T biểu thị độ dài chuỗi, d là chiều đặc trưng, c là kích thước chunk của chú ý bậc hai của MEGA, và s là kích thước của cửa sổ cục bộ cho AFT.]
+
+Để giải quyết những thách thức này, chúng tôi giới thiệu mô hình Receptance Weighted Key Value (RWKV), kết hợp điểm mạnh của RNNs và Transformers trong khi tránh được những hạn chế chính. RWKV giảm thiểu nút thắt cổ chai bộ nhớ và việc mở rộng bậc hai liên quan đến Transformers (Katharopoulos et al., 2020) với việc mở rộng tuyến tính hiệu quả, đồng thời duy trì các tính chất biểu đạt của Transformer, như huấn luyện song song và khả năng mở rộng mạnh mẽ. RWKV tái công thức hóa cơ chế chú ý với một biến thể của chú ý tuyến tính, thay thế tương tác token tích vô hướng truyền thống bằng chú ý hướng kênh hiệu quả hơn. Việc triển khai này, không có xấp xỉ, cung cấp độ phức tạp tính toán và bộ nhớ thấp nhất; xem Bảng 1.
+
+Động lực đằng sau RWKV là cân bằng hiệu quả tính toán với khả năng biểu đạt trong các mạng nơ-ron. Nó cung cấp một giải pháp để xử lý các mô hình quy mô lớn với hàng tỷ tham số, thể hiện hiệu suất cạnh tranh với chi phí tính toán giảm. Các thí nghiệm gợi ý RWKV giải quyết các thách thức mở rộng và triển khai trong AI, đặc biệt là cho xử lý dữ liệu tuần tự, hướng tới các mô hình AI bền vững và hiệu quả hơn.
+
+Những đóng góp của chúng tôi trong bài báo này như sau:
+
+• Giới thiệu RWKV, một kiến trúc mới kết hợp các ưu điểm của RNNs và Transformer đồng thời giảm thiểu các hạn chế của chúng.
+
+• Các thí nghiệm chi tiết chứng minh hiệu suất và hiệu quả của RWKV trên các bộ dữ liệu benchmark cho các mô hình quy mô lớn.
+
+• Việc phát hành các mô hình đã được huấn luyện trước, từ 169 triệu đến 14 tỷ tham số, được huấn luyện trên the Pile (Gao et al., 2020; Biderman et al., 2022).2
+
+## 2 Nền tảng
+
+Ở đây chúng tôi xem xét ngắn gọn các nguyên tắc cơ bản của RNNs và Transformers.
+
+### 2.1 Mạng Nơ-ron Hồi quy (RNNs)
+
+Các kiến trúc RNN phổ biến như LSTM (Hochreiter và Schmidhuber, 1997) và GRU (Chung et al., 2014) được đặc trưng bởi công thức sau (được hiển thị cho LSTM, các mô hình khác có thể được suy luận tương tự):
+
+ft=σg(Wfxt+Ufht−1+bf), (1)
+it=σg(Wixt+Uiht−1+bi), (2)
+ot=σg(Woxt+Uoht−1+bo), (3)
+˜ct=σc(Wcxt+Ucht−1+bc), (4)
+ct=ft⊙ct−1+it⊙˜ct, (5)
+ht=ot⊙σh(ct). (6)
+
+Mặc dù RNNs có thể được phân tích thành hai khối tuyến tính (W và U) và một khối đặc trưng RNN (1)–(6), như được chỉ ra bởi Bradbury et al. (2017), sự phụ thuộc dữ liệu dựa vào các bước thời gian trước đó cấm song song hóa những RNNs điển hình này.
+
+### 2.2 Transformers và AFT
+
+Được giới thiệu bởi Vaswani et al. (2017), Transformers là một lớp mạng nơ-ron đã trở thành kiến trúc chủ đạo cho một số nhiệm vụ NLP. Thay vì hoạt động trên các chuỗi từng bước như RNNs, Transformers dựa vào các cơ chế chú ý để nắm bắt mối quan hệ giữa tất cả các token đầu vào và tất cả các token đầu ra:
+
+Attn(Q, K, V) = softmax(QK⊤)V, (7)
+
+trong đó tính đa đầu và hệ số tỷ lệ 1/√dk bị bỏ qua để thuận tiện. Phép nhân QK⊤ cốt lõi là một tổ hợp các điểm chú ý theo cặp giữa mỗi token trong một chuỗi, có thể được phân tách thành các phép toán vector:
+
+Attn(Q, K, V)t = ∑(i=1 to T) e^(q_t^⊤k_i) ⊙ v_i / ∑(i=1 to T) e^(q_t^⊤k_i). (8)
+
+AFT (Zhai et al., 2021), công thức hóa thay thế
+
+Attn+(W, K, V)t = ∑(i=1 to t) e^(w_{t,i}+k_i) ⊙ v_i / ∑(i=1 to t) e^(w_{t,i}+k_i), (9)
+
+trong đó {w_{t,i}} ∈ R^{T×T} là các bias vị trí theo cặp đã học, và mỗi w_{t,i} là một số vô hướng.
+
+Lấy cảm hứng từ AFT, RWKV áp dụng một phương pháp tương tự. Tuy nhiên, để đơn giản, nó sửa đổi các trọng số tương tác để có thể được chuyển đổi thành một RNN. Mỗi w_{t,i} trong RWKV là một vector phân rã thời gian theo kênh nhân với vị trí tương đối và được truy vết ngược từ thời gian hiện tại khi nó phân rã:
+
+w_{t,i} = -(t-i)w, (10)
+
+trong đó w ∈ (R≥0)^d, với d là số kênh. Chúng tôi yêu cầu w không âm để đảm bảo rằng e^{w_{t,i}} ≤ 1 và các trọng số theo kênh phân rã ngược theo thời gian.
+
+## 3 RWKV
+
+Kiến trúc mô hình RWKV được định nghĩa bởi bốn yếu tố cơ bản vốn có trong các khối time-mixing và channel-mixing:
+
+• R: Vector Receptance hoạt động như người nhận thông tin quá khứ.
+
+• W: Weight biểu thị vector phân rã trọng số vị trí, một tham số có thể huấn luyện trong mô hình.
+
+• K: Vector Key thực hiện vai trò tương tự như K trong các cơ chế chú ý truyền thống.
+
+• V: Vector Value hoạt động tương tự như V trong các quá trình chú ý thông thường.
+
+Những yếu tố cốt lõi này tương tác nhân tính tại mỗi timestep, như được mô tả trong Hình 2.
+
+### 3.1 Kiến trúc
+
+Mô hình RWKV được cấu tạo từ các khối residual xếp chồng. Mỗi khối bao gồm một khối con time-mixing và channel-mixing, thể hiện các cấu trúc hồi quy để tận dụng thông tin quá khứ.
+
+Mô hình này sử dụng một quá trình cập nhật điểm giống chú ý độc đáo, bao gồm một hoạt động softmax phụ thuộc thời gian cải thiện tính ổn định số và giảm thiểu gradient biến mất (để chứng minh nghiêm ngặt, xem Phụ lục H). Nó đảm bảo rằng gradient được truyền dọc theo con đường liên quan nhất. Ngoài ra, layer normalization (Ba et al., 2016) được tích hợp trong kiến trúc giúp ổn định các gradient, giải quyết hiệu quả cả vấn đề gradient biến mất và bùng nổ. Những yếu tố thiết kế này không chỉ tăng cường động lực huấn luyện của các mạng nơ-ron sâu mà còn tạo điều kiện cho việc xếp chồng nhiều lớp, dẫn đến hiệu suất vượt trội so với các mô hình RNN thông thường bằng cách nắm bắt các mẫu phức tạp qua các mức độ trừu tượng khác nhau (xem thêm Phụ lục I).
+
+[Hình 2: Các yếu tố trong một khối RWKV (trái) và khối residual RWKV hoàn chỉnh, được trang bị một head cuối cùng cho mô hình hóa ngôn ngữ (phải).]
+
+#### 3.1.1 Token Shift
+
+Trong kiến trúc này, tất cả các vector chiếu tuyến tính (R, K, V trong time-mixing, và R′, K′ trong channel-mixing) tham gia vào các tính toán được tạo ra bởi phép nội suy tuyến tính giữa đầu vào timestep hiện tại và trước đó, tạo điều kiện cho một token shift.
+
+Các vector cho tính toán time-mixing là các chiếu tuyến tính của các tổ hợp tuyến tính của đầu vào hiện tại và trước đó của khối:
+
+rt = Wr·(μr⊙xt + (1−μr)⊙xt−1), (11)
+kt = Wk·(μk⊙xt + (1−μk)⊙xt−1), (12)
+vt = Wv·(μv⊙xt + (1−μv)⊙xt−1), (13)
+
+cũng như các đầu vào channel-mixing:
+
+r′t = W′r·(μ′r⊙xt + (1−μ′r)⊙xt−1), (14)
+k′t = W′k·(μ′k⊙xt + (1−μ′k)⊙xt−1). (15)
+
+Token shift được triển khai như một offset đơn giản trong chiều thời gian tại mỗi khối sử dụng thư viện PyTorch (Paszke et al., 2019) như nn.ZeroPad2d((0,0,1,-1)).
+
+#### 3.1.2 Toán tử WKV
+
+Việc tính toán toán tử WKV trong mô hình của chúng tôi song song với phương pháp được sử dụng trong Attention Free Transformer (AFT) (Zhai et al., 2021). Tuy nhiên, không giống như AFT nơi W là một ma trận theo cặp, mô hình của chúng tôi coi W như một vector theo kênh được sửa đổi bởi vị trí tương đối. Trong mô hình của chúng tôi, hành vi hồi quy này được định nghĩa bởi việc cập nhật phụ thuộc thời gian của các vector WKV, được chính thức hóa trong phương trình sau:
+
+wkvt = (∑(i=1 to t-1) e^{-(t-1-i)w+ki}⊙vi + e^{u+kt}⊙vt) / (∑(i=1 to t-1) e^{-(t-1-i)w+ki} + e^{u+kt}). (16)
+
+Để tránh bất kỳ sự suy giảm tiềm năng nào của W, chúng tôi giới thiệu một vector U chú ý riêng biệt đến token hiện tại. Thông tin thêm về điều này có thể được tìm thấy trong Phụ lục I.
+
+#### 3.1.3 Output Gating
+
+Output gating được triển khai trong cả khối time-mixing và channel-mixing sử dụng sigmoid của receptance, σ(r). Vector đầu ra ot sau toán tử WKV được cho bởi:
+
+ot = Wo·(σ(rt)⊙wkvt). (17)
+
+Trong khối channel-mixing, một hoạt động tương tự được thực hiện:
+
+o′t = σ(r′t)⊙(W′v·max(k′t,0)2), (18)
+
+trong đó chúng tôi áp dụng hàm kích hoạt ReLU bình phương (So et al., 2021).
+
+### 3.2 Huấn luyện giống Transformer
+
+RWKV có thể được song song hóa hiệu quả bằng một kỹ thuật gọi là chế độ time-parallel, gợi nhớ đến Transformers. Độ phức tạp thời gian của việc xử lý một batch chuỗi trong một lớp đơn là O(BTd2), chủ yếu bao gồm các phép nhân ma trận Wλ, trong đó λ ∈ {r, k, v, o} (giả sử B chuỗi, T token tối đa, và d kênh). Ngược lại, việc cập nhật điểm chú ý wkvt liên quan đến một phép quét nối tiếp (xem Phụ lục D để biết thêm chi tiết) và có độ phức tạp O(BTd).
+
+Các phép nhân ma trận có thể được song song hóa tương tự như Wλ, trong đó λ ∈ {Q, K, V, O} trong Transformers thông thường. Việc tính toán WKV theo từng phần tử phụ thuộc vào thời gian nhưng có thể được song song hóa dễ dàng dọc theo hai chiều còn lại (Lei et al., 2018)3.
+
+### 3.3 Suy luận giống RNN
+
+Các mạng hồi quy thường sử dụng đầu ra tại trạng thái t làm đầu vào tại trạng thái t+1. Việc sử dụng này cũng được quan sát trong suy luận giải mã tự hồi quy của các mô hình ngôn ngữ, nơi mỗi token phải được tính toán trước khi được truyền đến bước tiếp theo. RWKV tận dụng cấu trúc giống RNN này, được gọi là chế độ time-sequential. Trong bối cảnh này, RWKV có thể được công thức hóa một cách thuận tiện đệ quy cho việc giải mã trong quá trình suy luận, như được trình bày trong Phụ lục D.
+
+### 3.4 Các Tối ưu hóa Bổ sung
+
+**Custom Kernels** Để giải quyết sự không hiệu quả trong tính toán WKV phát sinh từ bản chất tuần tự của nhiệm vụ khi sử dụng các framework học sâu tiêu chuẩn, chúng tôi đã phát triển một kernel CUDA tùy chỉnh. Kernel này cho phép thực thi một kernel tính toán đơn trên các bộ tăng tốc huấn luyện, trong khi tất cả các phần khác của mô hình, như phép nhân ma trận và các hoạt động theo điểm, đã vốn có thể song song hóa và hiệu quả.
+
+**Small Init Embedding** Trong giai đoạn đầu của việc huấn luyện một mô hình transformer (Vaswani et al., 2017), chúng tôi quan sát thấy rằng ma trận embedding trải qua những thay đổi chậm, tạo ra thách thức cho mô hình để thoát khỏi trạng thái embedding nhiễu ban đầu. Để giải quyết vấn đề này, chúng tôi đề xuất một phương pháp liên quan đến việc khởi tạo ma trận embedding với các giá trị nhỏ và sau đó áp dụng một hoạt động LayerNorm bổ sung. Điều này tăng tốc và ổn định quá trình huấn luyện, cho phép huấn luyện các kiến trúc sâu với các thành phần post-LN. Hiệu quả của phương pháp này được chứng minh trong Hình 9, minh họa sự hội tụ được cải thiện bằng cách cho phép mô hình nhanh chóng chuyển đổi khỏi embedding ban đầu nhỏ. Điều này đạt được thông qua những thay đổi nhỏ xảy ra trong một bước đơn, sau đó dẫn đến những thay đổi đáng kể về hướng và những thay đổi đáng chú ý thêm sau hoạt động LayerNorm.
+
+**Custom Initialization** Dựa trên các nguyên tắc từ các công trình trước đây (He et al., 2016; Jumper et al., 2021), chúng tôi áp dụng một chiến lược khởi tạo trong đó các tham số được đặt thành các giá trị giống như một ánh xạ đồng nhất trong khi phá vỡ tính đối xứng để thiết lập một luồng thông tin rõ ràng. Phần lớn các trọng số được khởi tạo về không, và các lớp tuyến tính không sử dụng bias. Các công thức chi tiết được đưa ra trong Phụ lục E. Chúng tôi quan sát thấy rằng việc lựa chọn khởi tạo đóng một vai trò quan trọng trong cả tốc độ và chất lượng hội tụ (tham khảo Phụ lục F để biết thêm chi tiết).
+
+### 3.5 Triển khai
+
+RWKV được triển khai bằng Thư viện Học sâu PyTorch (Paszke et al., 2019). Chúng tôi tích hợp các chiến lược tối ưu hóa bổ sung lấy cảm hứng từ DeepSpeed (Rasley et al., 2020) vào hệ thống, cải thiện hiệu quả và khả năng mở rộng của nó.
+
+Mô hình bắt đầu với một lớp embedding, như được chi tiết trong Phần 3.4. Theo sau đó là một số khối residual giống hệt nhau được sắp xếp tuần tự. Những khối này được mô tả trong Hình 2 và 3 và tuân thủ các nguyên tắc được nêu trong Phần 3.1.1. Sau khối cuối cùng, một head chiếu đầu ra đơn giản, bao gồm một LayerNorm (Ba et al., 2016) và một chiếu tuyến tính, được sử dụng để tạo logits cho dự đoán token tiếp theo và tính toán cross-entropy loss trong quá trình huấn luyện.
+
+[Hình 3: Kiến trúc RWKV cho mô hình hóa ngôn ngữ.]
+
+## 4 Các Mô hình Đã Huấn luyện và Chi phí Tính toán
+
+Để chứng minh khả năng mở rộng của RWKV, chúng tôi huấn luyện sáu mô hình từ 169 triệu đến 14 tỷ tham số như được thể hiện trong Bảng 2. Tất cả các mô hình được huấn luyện cho một epoch (330 tỷ token) trên the Pile (Gao et al., 2020; Biderman et al., 2022).
+
+[Bảng 2: Kiến trúc mô hình RWKV và số lượng FLOP. Chi tiết thêm về những siêu tham số này được trình bày trong Phụ lục G.]
+
+Số lượng tham số cho mỗi mô hình được tính bằng công thức: # parameters = 2VD + 13D²L + D(11L + 4) trong đó V = 50277 là kích thước từ vựng, D đại diện cho Chiều Mô hình và L tương ứng với số lượng lớp. FLOPs dành cho một lượt chuyển tiến cho một token. Nó được tính như 2(2VD + 13D²L), đó là gấp đôi (cộng và nhân) số lượng tham số trong các lớp tuyến tính. FLOPs lượt chuyển ngược có thể được ước tính là gấp đôi so với lượt chuyển tiến, cho tổng số 6(2VD + 13D²L) FLOP mỗi token. Đáng chú ý, điều này khớp với công thức tiêu chuẩn cho tính toán FLOP trong transformers Kaplan et al. (2020): FLOP = 6·[# tokens]·[# parameters].
+
+### 4.1 Chi tiết Huấn luyện Bổ sung
+
+Để huấn luyện, chúng tôi sử dụng bộ tối ưu Adam tiêu chuẩn không có weight decay, sử dụng độ chính xác bfloat16, và huấn luyện với độ dài ngữ cảnh 1024 token. Chi tiết thêm về các siêu tham số có trong Phụ lục G. Khác với thực hành tiêu chuẩn cho transformers, chúng tôi áp dụng phân rã mũ cho tốc độ học của chúng tôi. Chúng tôi cũng tích hợp auxiliary loss được giới thiệu bởi PaLM (Chowdhery et al., 2022), bổ sung cho hàm cross-entropy loss tiêu chuẩn. Auxiliary loss này khuyến khích bộ chuẩn hóa softmax xấp xỉ gần với số không. Đối với lịch trình tốc độ học, nó duy trì không đổi cho các lần lặp đầu, và sau đó giảm theo cấp số mũ.
+
+### 4.2 Scaling Laws
+
+Scaling laws (Kaplan et al., 2020; Henighan et al., 2020; Hoffmann et al., 2022; Muennighoff et al., 2023) trong các mô hình ngôn ngữ đề cập đến các mối quan hệ toán học mô tả cách hiệu suất của một mô hình ngôn ngữ thay đổi đối với các yếu tố khác nhau. Những yếu tố này có thể bao gồm kích thước mô hình (N), kích thước tập dữ liệu (D), hoặc ngân sách tính toán được phân bổ tối ưu (Cmin). Scaling laws quan trọng vì hai lý do chính: chúng cho phép chúng ta đưa ra dự đoán và kế hoạch về chi phí và hiệu suất của các mô hình lớn trước khi chúng được huấn luyện thông qua nội suy và ngoại suy (Black et al., 2022; Le Scao et al., 2022) và các bối cảnh mà chúng thất bại cung cấp phản hồi phong phú về các lĩnh vực quan trọng cho nghiên cứu tương lai (Wei et al., 2022a; Biderman et al., 2023a).
+
+Công việc trước đây về scaling laws cho RNNs đã tuyên bố rằng LSTMs không tuân theo cùng một việc mở rộng tuyến tính log-log mà transformers làm (Kaplan et al., 2020). Chúng tôi huấn luyện 45 mô hình RWKV cho nhiều cặp (dataset, parameters) khác nhau và thấy rằng RWKV thực sự tuân theo cùng dạng tổng quát của scaling law được thiết lập tốt cho transformers. Hình 4 cho thấy kết quả của chúng tôi cho loss như một hàm của compute, với việc khớp tuyến tính với các điểm Pareto tối ưu giữ giá trị r² là 0.994. Ngay cả khi chúng tôi ngoại suy đường cong của mình thêm một bậc độ lớn (màu xanh), chúng tôi tìm thấy một khớp cực kỳ tốt với r² là 0.875.
+
+[Hình 4: Đường cong scaling laws cho các mô hình RWKV]
+
+## 5 Đánh giá
+
+Sau khi chứng minh khả năng mở rộng của các mô hình RWKV trong phần trước, giờ đây chúng tôi chuyển sự chú ý đến tính cạnh tranh của chúng với các transformers truyền thống. Chúng tôi tập trung vào hai câu hỏi:
+
+**Tính cạnh tranh** RWKV có cạnh tranh chống lại các kiến trúc transformer bậc hai với cùng lượng compute không?
+
+**Ngữ cảnh dài** Việc tăng độ dài ngữ cảnh của RWKV có mang lại loss mô hình hóa ngôn ngữ tốt hơn khi các mô hình RWKV được huấn luyện cho độ dài ngữ cảnh mà hầu hết các transformers bậc hai mã nguồn mở không thể xử lý hiệu quả không?
+
+### 5.1 Đánh giá NLP
+
+Để chứng minh rằng RWKV cạnh tranh với các transformers truyền thống trong các nhiệm vụ NLP, chúng tôi so sánh với các mô hình có kích thước tương tự được huấn luyện cho số lượng token tương tự (Pythia (Biderman et al., 2023b), OPT (Zhang et al., 2022) và BLOOM (Scao et al., 2022)). Tất cả các mô hình RWKV được huấn luyện cho một epoch trên the Pile (330B token), gần nhưng không giống hệt với lượng token mà các mô hình Pythia, OPT, và BLOOM được huấn luyện. Do đó, chúng tôi so sánh các mô hình của chúng tôi trên cơ sở FLOP-matched. Chúng tôi tránh so sánh với mô hình được huấn luyện trong chế độ Chinchilla-optimal (Hoffmann et al., 2022) hoặc chế độ overtrained (Touvron et al., 2023) để đảm bảo so sánh công bằng nhất.
+
+Chúng tôi báo cáo kết quả trên ARC (cả Easy và Challenge) (Clark et al., 2018), BoolQ (Clark et al., 2019), COPA (Roemmele et al., 2018), HeadQA (Vilares và Gómez-Rodríguez, 2019), HellaSwag (Zellers et al., 2019), LAMBADA (Paperno et al., 2016), OpenBookQA (Mihaylov et al., 2018), PIQA (Bisk et al., 2020), ReCoRD (Zhang et al., 2018), SciQ (Johannes Welbl Nelson F. Liu, 2017), và Winogrande (Zellers et al., 2020). Hình 1 cho thấy kết quả trung bình trên tất cả các benchmark. Một số benchmark riêng lẻ được hiển thị trong Hình 5, phần còn lại trong Phụ lục J.
+
+Ngoài ra, chúng tôi đã thực hiện các nghiên cứu so sánh về RWKV và ChatGPT / GPT-4, xem Phụ lục L. Chúng tiết lộ rằng RWKV rất nhạy cảm với prompt engineering. Khi các prompts được điều chỉnh (sắp xếp lại) từ những cái được sử dụng cho GPT thành phù hợp hơn cho RWKV, hiệu suất (F1) tăng thậm chí từ 44.2% lên 74.8%. Đối với phát hiện châm biếm, RWKV vượt trội hơn ChatGPT, nhưng vẫn hơi tệ hơn so với giải pháp SOTA.
+
+[Hình 5: Hiệu suất Zero-Shot của RWKV trên các benchmark đánh giá mô hình hóa ngôn ngữ phổ biến. Các biểu đồ bổ sung có thể được tìm thấy trong Phụ lục J.]
+
+### 5.2 Fine-tuning Ngữ cảnh Mở rộng
+
+Không giống như transformers, RNNs không có độ dài chuỗi được xác định trước khi chúng được tạo ra. Tuy nhiên để sử dụng hiệu quả compute, chúng ta vẫn cần tiền xử lý dữ liệu huấn luyện thành các ngữ cảnh có cùng độ dài. Chúng tôi thấy rằng chúng ta có thể dạy mô hình cách xử lý hiệu quả các kích thước batch lớn hơn đáng kể bằng cách fine-tuning với độ dài chuỗi tăng dần. Cụ thể, đầu tiên chúng tôi tăng gấp đôi độ dài chuỗi từ 1024 lên 2048 và fine-tune cho 10B token từ corpus huấn luyện trước ban đầu, sau đó chúng tôi tăng gấp đôi lần nữa lên 4096 cho 100B token từ cùng corpus, và cuối cùng tăng gấp đôi lên 8192 token cho thêm 100B token từ cùng corpus. Trong Hình 6 chúng tôi cho thấy rằng việc tăng độ dài ngữ cảnh dẫn đến loss kiểm tra thấp hơn trên the Pile, một dấu hiệu cho thấy RWKV có thể sử dụng hiệu quả thông tin ngữ cảnh dài.
+
+[Hình 6: RWKV cho thấy mean test loss giảm như một hàm của độ dài ngữ cảnh trên the Pile (Gao et al., 2020)]
+
+### 5.3 Benchmark Ngữ cảnh Dài
+
+Ngoài ra, chúng tôi đánh giá khả năng của mô hình trong việc xử lý các chuỗi rất dài bằng cách so sánh với các mô hình chuỗi dài tiên tiến trên benchmark Long-Range Arena (LRA) (Tay et al., 2021). LRA được thiết kế để đánh giá hiệu suất của các mô hình trong việc xử lý các tình huống ngữ cảnh dài. Nó bao gồm một tập hợp các nhiệm vụ với các chuỗi từ 1,000 đến 16,000 token, bao phủ nhiều loại dữ liệu khác nhau như văn bản, ngôn ngữ tự nhiên, hình ảnh tổng hợp, và biểu thức toán học. Chúng tôi áp dụng RWKV trên benchmark LRA và kết quả có trong Phụ lục J.2. Kết quả cho thấy RWKV hoạt động đứng thứ hai chỉ sau mô hình S4 trong năm tập dữ liệu.
+
+## 6 Thí nghiệm Suy luận
+
+Chúng tôi đánh giá yêu cầu suy luận theo kích thước và họ mô hình. Cụ thể, chúng tôi đánh giá tốc độ tạo văn bản và yêu cầu bộ nhớ trên các nền tảng tính toán điển hình bao gồm CPU (x86) và GPU (NVIDIA A100 80 GB). Đối với tất cả các thí nghiệm suy luận của chúng tôi, chúng tôi sử dụng độ chính xác float32 và HuggingFace Transformers (Wolf et al., 2020). Chúng tôi bao gồm tất cả các tham số mô hình trong số lượng tham số, bao gồm cả các lớp embedding và non-embedding. Hiệu suất dưới các thiết lập lượng tử hóa khác nhau được để dành cho công việc tiếp theo. Xem Phụ lục K để biết thêm kết quả.
+
+[Hình 7: Thời gian tích lũy trong tạo văn bản cho LLMs. Không giống như transformers, RWKV thể hiện việc mở rộng tuyến tính.]
+
+## 7 Công việc Tương lai
+
+Có một số hướng nghiên cứu đầy hứa hẹn cho công việc tương lai về kiến trúc RWKV. Công việc có thể được thực hiện để tăng khả năng biểu đạt của mô hình bằng cách tăng cường các công thức time-decay và khám phá các trạng thái mô hình ban đầu trong khi duy trì hiệu quả.
+
+Hiệu quả tính toán RWKV có thể được cải thiện thêm bằng cách áp dụng parallel scan trong bước wkvt để giảm chi phí tính toán xuống O(Blog(T)d).
+
+Các cơ chế được sử dụng trong RWKV có thể được áp dụng cho các kiến trúc encoder-decoder, có khả năng thay thế cơ chế cross-attention. Điều này có thể áp dụng trong các thiết lập seq2seq hoặc multimodal, do đó tăng cường hiệu quả trong cả huấn luyện và suy luận.
+
+Trạng thái (hoặc ngữ cảnh) của RWKV có thể được tận dụng cho khả năng diễn giải, dự đoán trong dữ liệu chuỗi, và an toàn. Thao tác trạng thái ẩn cũng có thể hướng dẫn hành vi và cho phép khả năng tùy chỉnh lớn hơn thông qua prompt tuning.
+
+Kiến trúc RWKV không hoàn hảo, và có thể được cải thiện qua nhiều khía cạnh, như sửa đổi các công thức hoặc triển khai các trạng thái nội bộ lớn hơn. Các trạng thái lớn hơn có thể tăng cường bộ nhớ của mô hình về ngữ cảnh trước đó và cải thiện hiệu suất trên các nhiệm vụ khác nhau.
+
+## 8 Kết luận
+
+Chúng tôi đã giới thiệu RWKV, một phương pháp mới cho các mô hình RNN khai thác tiềm năng của các thành phần mixing dựa trên thời gian. RWKV giới thiệu một số chiến lược chính cho phép nó nắm bắt tính địa phương và các phụ thuộc tầm xa trong khi giải quyết các hạn chế của các kiến trúc hiện tại bằng cách: (1) thay thế chú ý QK bậc hai bằng một công thức scalar với chi phí tuyến tính, (2) tái công thức hóa tính hồi quy và bias quy nạp tuần tự để cho phép song song hóa huấn luyện hiệu quả và suy luận hiệu quả, và (3) tăng cường động lực huấn luyện bằng các khởi tạo tùy chỉnh.
+
+Chúng tôi đánh giá kiến trúc được đề xuất trong nhiều nhiệm vụ NLP đa dạng và cho thấy hiệu suất tương đương với SoTA với chi phí giảm. Các thí nghiệm thêm về khả năng biểu đạt, khả năng diễn giải, và mở rộng thể hiện khả năng của mô hình và vẽ ra những tương đồng trong hành vi giữa RWKV và các LLMs khác.
+
+RWKV mở ra một con đường mới cho các kiến trúc có thể mở rộng và hiệu quả để mô hình hóa các mối quan hệ phức tạp trong dữ liệu tuần tự. Mặc dù nhiều giải pháp thay thế cho Transformers đã được đề xuất với những tuyên bố tương tự, của chúng tôi là cái đầu tiên hỗ trợ những tuyên bố đó bằng các mô hình đã được huấn luyện trước với hàng chục tỷ tham số.
+
+## 9 Hạn chế
+
+Mặc dù mô hình RWKV được đề xuất của chúng tôi đã chứng minh kết quả đầy hứa hẹn về hiệu quả huấn luyện và bộ nhớ trong quá trình suy luận, một số hạn chế nên được thừa nhận và giải quyết trong công việc tương lai.
+
+Đầu tiên, chú ý tuyến tính của RWKV dẫn đến lợi ích hiệu quả đáng kể nhưng vẫn có thể hạn chế hiệu suất của mô hình trong các nhiệm vụ yêu cầu nhớ lại thông tin chi tiết trên các ngữ cảnh rất dài. Điều này là do việc kênh hóa thông tin thông qua một biểu diễn vector đơn qua nhiều bước thời gian, so với thông tin đầy đủ được duy trì bởi chú ý bậc hai của Transformers tiêu chuẩn. Nói cách khác, kiến trúc hồi quy của mô hình vốn dĩ hạn chế khả năng "nhìn lại" các token trước đó, trái ngược với các cơ chế tự chú ý truyền thống. Mặc dù time decay đã học giúp ngăn chặn mất thông tin, về mặt cơ chế nó bị hạn chế so với tự chú ý đầy đủ.
+
+Một hạn chế khác của công việc này là tầm quan trọng gia tăng của prompt engineering so với các mô hình Transformer tiêu chuẩn. Cơ chế chú ý tuyến tính được sử dụng trong RWKV hạn chế thông tin từ prompt sẽ được chuyển tiếp đến phần tiếp theo của mô hình. Do đó, các prompts được thiết kế cẩn thận có thể thậm chí quan trọng hơn đối với mô hình để hoạt động tốt trong các nhiệm vụ.
+
+Thuộc tính RWKV ở trên đã được xác nhận bởi các nghiên cứu về prompt engineering được trình bày trong Phụ lục L. Bằng cách thay đổi thứ tự của các phần thông tin, chúng tôi thậm chí có thể gần như tăng gấp đôi hiệu suất RWKV cho một số nhiệm vụ.
+
+## 10 Tuyên bố Đạo đức
+
+Trong bài báo này, chúng tôi trình bày một kiến trúc mới cho xử lý dữ liệu tuần tự và chứng minh hiệu quả của nó bằng cách xây dựng một loạt LLMs được huấn luyện trên dữ liệu huấn luyện trước được phát hành công khai (Gao et al., 2020; Biderman et al., 2022) và sau đó được fine-tuned trên các hướng dẫn có sẵn công khai (Taori et al., 2023; Chaudhary, 2023; Cheung, 2023; Anand et al., 2023; Anonymous, 2023; Yang, 2023; Ji et al., 2023a,b).
+
+Là một kiến trúc mới cho dữ liệu tuần tự, RWKV có tiềm năng cải thiện các mô hình dựa trên chuỗi qua các ứng dụng khác nhau từ xử lý ngôn ngữ tự nhiên đến xử lý dữ liệu y sinh học hoặc mô hình hóa khí hậu. Vì mã huấn luyện được phát hành mã nguồn mở, RWKV đóng góp vào việc dân chủ hóa AI, cân bằng sân chơi, và trao quyền cho các thành viên của cộng đồng Mã nguồn Mở để kiểm tra, nghiên cứu, và fine-tune RWKV trong các nhiệm vụ cụ thể. Hơn nữa, nó đóng góp vào việc thúc đẩy hiểu biết về khả năng và hạn chế của LLMs. Một lượng công việc đáng kể đã được dành để tăng hiệu quả huấn luyện RWKV nhằm giảm thiểu chi phí và thúc đẩy khả năng tiếp cận.
+
+Là các LLMs được huấn luyện trên dữ liệu công cộng, chi phí suy luận thấp hơn của RWKV so với các giải pháp thay thế Transformer làm cho nó phù hợp hơn để triển khai trong phần cứng consumer và edge, đó là một bước hướng tới việc dân chủ hóa và phân phối LLMs cho công chúng, tạo ra các động lực quyền riêng tư và quyền sở hữu tốt hơn. Nó cũng hạ thấp rào cản tài nguyên cho các trợ lý Chat và tạo văn bản cho các cộng đồng nhỏ và/hoặc thiểu số. Các trọng số mô hình Đã Huấn luyện Trước cho các kích thước khác nhau từ 0.1B đến 14B tham số được huấn luyện trên nhiều ngôn ngữ được phát hành để tăng dễ dàng áp dụng và cho phép nghiên cứu các hiện tượng nổi lên.
+
+Mặt khác, với rào cản tài nguyên thấp hơn, việc lan truyền văn bản được tạo bởi AI có thể trở nên phổ biến hơn. Các LLMs RWKV hiện tại có thể thể hiện và/hoặc tái tạo các bias và nội dung có thể gây hại có mặt trong dữ liệu được sử dụng để huấn luyện. Tuy nhiên, các chiến lược giảm thiểu và fine-tuning được thảo luận cho các mô hình Transformer lớn khác cũng nên áp dụng được cho RWKV.
+
+## Lời cảm ơn
+
+Chúng tôi cảm ơn StabilityAI vì compute được sử dụng để huấn luyện các mô hình của chúng tôi và hỗ trợ kỹ thuật trong việc phát triển RWKV. Chúng tôi cũng cảm ơn các thành viên của các máy chủ Discord RWKV và EleutherAI vì sự giúp đỡ và công việc của họ trong việc mở rộng thêm khả năng áp dụng của RWKV cho các lĩnh vực khác nhau.
+
+## Tài liệu tham khảo
+
+[Phần này chứa tất cả các tài liệu tham khảo được liệt kê trong văn bản gốc]
+
+## A Đóng góp của Tác giả
+
+Tất cả các tác giả đã đóng góp vào việc soạn thảo bài báo này. Eric Alcaide và Quentin Anthony đã tổ chức bài báo và các thí nghiệm của nó và tham gia vào tất cả các giai đoạn của quá trình phát triển.
+
+**Thiết kế và Phát triển Mô hình** Bo Peng (dẫn đầu), Matteo Grella, Xuzheng He, Haowen Hou, Jiaming Kong, Johan S. Wind
+
+**Huấn luyện Mô hình** Bo Peng
+
+**Phân tích Scaling Laws** Stella Biderman, Bo Peng
+
+**Đánh giá Benchmark** Stella Biderman (dẫn đầu), Kranthi Kiran GV, Krishna Sri Ipsit Mantri, Atsushi Saito, Qihang Zhao, Peng Zhou, Rui-Jie Zhu
+
+**Thí nghiệm Ngữ cảnh Dài** Xingjian Du, Rui-Jie Zhu, Bolun Wang, Ruichong Zhang, Jian Zhu, Rui-Jie Zhu
+
+**Thí nghiệm Tốc độ Suy luận** Samuel Arcadinho, Przemysław Kazienko, Qinghua Zhou
+
+**Thí nghiệm Luồng Thông tin** Huanqi Cao, Michael Chung, Matteo Grella, Ferdinand Mom, Zhenyuan Zhang
+
+**Thí nghiệm Chat** Jan Koco ´n (dẫn đầu), Przemysław Kazienko, Bartłomiej Koptyra, Hayden Lau, Xiangru Tang, Stanisław Wo´ zniak, Zhenyuan Zhang
+
+**Đạo đức và Tác động Rộng hơn** Stella Biderman, Guangyu Song
+
+## B Đóng góp của Tác giả
+
+[Chi tiết đóng góp cụ thể của từng tác giả được liệt kê như trong bản gốc]
+
+## C Công việc Liên quan Bổ sung
+
+[Phần này chứa thông tin về các công việc liên quan đến tối ưu hóa cơ chế chú ý, mô hình không có chú ý, và tiến bộ trong RNNs]
+
+## D Khối Time-Mixing như một RNN Cell
+
+[Phần này chứa các công thức toán học và sơ đồ về cách RWKV có thể được công thức hóa như một RNN]
+
+## E Khởi tạo Tham số
+
+[Phần này chứa các công thức khởi tạo cụ thể cho các tham số khác nhau]
+
+## F Small Init Embedding
+
+[Phần này chứa thí nghiệm xác nhận về khởi tạo embedding nhỏ]
+
+## G Siêu tham số
+
+[Phần này chứa bảng các siêu tham số được sử dụng để huấn luyện các mô hình]
+
+## H Tính ổn định Gradient trong RWKV
+
+[Phần này chứa mô tả toán học về tính chất ổn định gradient trong RWKV]
+
+## I Trực quan hóa Hành vi Mô hình
+
+[Phần này chứa các hình ảnh và phân tích về cách RWKV hoạt động và truyền thông tin]
+
+## J Đánh giá Bổ sung
+
+[Phần này chứa chi tiết thêm về các nhiệm vụ NLP, đánh giá trên Long Range Arena, và kết quả Enwik8]
+
+## K Kết quả Suy luận
+
+[Phần này chứa các hình ảnh về yêu cầu thời gian và bộ nhớ cho suy luận LLM]
+
+## L Tầm quan trọng của việc xây dựng prompt và so sánh với các mô hình GPT
+
+[Phần này chứa so sánh chi tiết với ChatGPT và GPT-4, và tầm quan trọng của prompt engineering]
+
+## M Các trường hợp
+
+[Phần này chứa các ví dụ về đầu ra được tạo bởi mô hình RWKV trong giao diện Chat]

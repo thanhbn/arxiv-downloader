@@ -1,0 +1,964 @@
+# MINI-SEQUENCE TRANSFORMER : Tối ưu hóa
+Bộ nhớ trung gian cho việc huấn luyện chuỗi dài
+Cheng Luo
+California Institute of Technology
+chengluo@caltech.eduJiawei Zhao
+Meta FAIR
+jwzhao@meta.comZhuoming Chen
+Carnegie Mellon University
+zhuominc@andrew.cmu.edu
+Beidi Chen
+Carnegie Mellon University
+beidic@andrew.cmuAnima Anandkumar
+California Institute of Technology
+anima@caltech.edu
+
+Tóm tắt
+Chúng tôi giới thiệu MINI-SEQUENCE TRANSFORMER (MST), một phương pháp đơn giản và hiệu quả để huấn luyện LLM cực kỳ hiệu quả và chính xác với các chuỗi cực dài. MST phân chia các chuỗi đầu vào và xử lý lặp đi lặp lại các mini-chuỗi để giảm việc sử dụng bộ nhớ trung gian. Tích hợp với việc tính toán lại kích hoạt, nó cho phép tiết kiệm bộ nhớ đáng kể trong cả hai lượt truyền thuận và ngược. Trong các thí nghiệm với mô hình Llama3-8B, với MST, chúng tôi đo được không có suy giảm về thông lượng hoặc hội tụ ngay cả với chuỗi dài gấp 12 lần so với các triển khai tiêu chuẩn. MST hoàn toàn tổng quát, không phụ thuộc vào triển khai và yêu cầu thay đổi mã tối thiểu để tích hợp với các khung huấn luyện LLM hiện có. Được tích hợp với thư viện huggingface, MST thành công mở rộng độ dài ngữ cảnh tối đa của Qwen, Mistral và Gemma-2 tăng 12-24 lần.
+
+1 Giới thiệu
+Sự phát triển của Transformer [56] đã là một hành trình đáng chú ý, với mỗi lần lặp đều đẩy giới hạn của những gì có thể về kích thước mô hình, hiệu suất và hiệu quả. Một trong những thách thức quan trọng trong hành trình này là quản lý các yêu cầu bộ nhớ của những mô hình này, đặc biệt là trong quá trình huấn luyện. Khi Transformers đã tăng trưởng đáng kể về kích thước [10] và độ phức tạp [44], nhu cầu bộ nhớ đã tăng theo cấp số nhân, cần thiết các giải pháp sáng tạo để tối ưu hóa việc sử dụng bộ nhớ trong khi duy trì hiệu suất.
+
+Một cột mốc quan trọng trong hành trình này là việc giới thiệu attention đa truy vấn [50]. Kỹ thuật này đã giảm đáng kể kích thước của KV-cache trong quá trình suy luận, sử dụng nhiều đầu truy vấn nhưng đầu khóa và giá trị đơn. Ý tưởng này lần đầu được áp dụng trong việc huấn luyện quy mô lớn của PaLM [12], sau đó được áp dụng và kiểm tra thực nghiệm trong LLaMA [55]. Khi lĩnh vực tiến triển, attention đa truy vấn phát triển thành attention truy vấn nhóm (GQA) [2], nó nới lỏng hạn chế đầu khóa và giá trị đơn thành nhiều đầu, và mỗi đầu được ghép nối với một nhóm truy vấn. Nó cải thiện đáng kể chất lượng và được áp dụng bởi Llama2-70B [55] và Mistral-7B [24].
+
+Để cải thiện hơn nữa chất lượng mô hình, Llama3 [36] đã giới thiệu một tokenizer với từ vựng 128K token, cho phép mã hóa ngôn ngữ hiệu quả hơn so với từ vựng 32K của Llama2. Ngoài ra, Llama3 tăng kích thước trung gian MLP từ 11k lên 14k. Những thay đổi này phản ánh xu hướng hướng tới từ vựng và kích thước trung gian rộng lớn hơn để có chất lượng tốt hơn. Trong khi đó, Llama3 duy trì kích thước ẩn 4k để hiệu quả suy luận. Xu hướng này cũng được phản ánh trong việc phát triển Phi-3 [1] của Microsoft so với Phi-2 [23].
+
+38th Conference on Neural Information Processing Systems (NeurIPS 2024).arXiv:2407.15892v4 [cs.LG] 9 Nov 2024
+
+--- TRANG 2 ---
+
+NormAttentionNormNormLoss Loss 
+(a) Kiến trúc Transformer 
+Thông thường(b) Chi tiết Mini-Sequence 
+Transformer được đề xuất LM head:
+Intermediate (S)LM head:
+Intermediate (S)
+
+MLP:
+Intermediate (S)MLP:
+Intermediate (S)
+
+Tensor (S)Tensor (S)L x
+MLP/LM_head inputs (S)MLP/LM_head inputs (S)Mini -Seq. 1 
+(S/M )Mini -Seq. 1 
+(S/M )MLP/LM head
+(S/M )MLP/LM head
+(S/M )Mini -Out. 1 Mini -Out. 1 OutputOutput
+...Mini -Seq.  
+Mini -Seq.M 
+(S/M )Mini -Seq.M 
+(S/M )MLP/LM head
+(S/M )MLP/LM head
+(S/M )Mini -Out.M Mini -Out.M 
+(C) Kích thước chuỗi tối đa của các mô hình khác nhau, với 
+không có suy giảm thông lượng và hội tụ1020304050607080
+Llama3 Llama2Kích thước chuỗi tối đa(K)60k(12x)
+14k(3x)
+5k(1x)7k(1x)45k(7x)84k(12x)MsT(công trình của chúng tôi)
+Activation Recompute
+PyTorch
+0
+
+Hình 1: (a) Kiến trúc Transformer tiêu chuẩn. Độ dài chuỗi kích hoạt của MLP và LM-Head được chú thích với S. (b) MINI-SEQUENCE TRANSFORMER được sử dụng để thay thế các khối MLP và khối LM-Head, phân chia chuỗi đầu vào S thành M mini-chuỗi với độ dài chuỗi S/M, trong đó M= 2 trong hình này. (c) Kích thước chuỗi tối đa để huấn luyện Llama2/Llama3 trên GPU A100-80GB, không có suy giảm thông lượng hoặc hội tụ khi sử dụng phương pháp của chúng tôi.
+
+Những tiến bộ này cũng mang lại những thách thức bộ nhớ mới, đặc biệt là trong giá trị trung gian của các lớp tuyến tính của nhận thức đa lớp (MLP) và đầu mô hình ngôn ngữ (LM-Head). Sự gia tăng đáng kể trong các biến trung gian, có thể lớn gấp gần mười lần so với các biến đầu vào, đã hạn chế nghiêm trọng khả năng mở rộng độ dài chuỗi và kích thước batch của mạng. Hạn chế này đã làm cho việc huấn luyện các mô hình lớn trở nên khó khăn mà không hạn chế độ dài chuỗi xuống 8K hoặc dựa vào tích lũy gradient hoặc hệ thống phân tán để mở rộng kích thước batch.
+
+Phương pháp của chúng tôi: Nhận ra những thách thức này, chúng tôi giới thiệu MINI-SEQUENCE TRANSFORMER (MST), một phương pháp đơn giản và hiệu quả để cho phép huấn luyện LLM cực kỳ hiệu quả và chính xác với độ dài chuỗi cực dài bằng cách giảm chi phí bộ nhớ trung gian. MST giới thiệu một mini-chuỗi theo lớp trong đó các phân vùng đầu vào hoạt động cho mỗi khối MLP và LM-Head. MST phân vùng các mẫu riêng lẻ theo chiều chuỗi và xử lý lặp lại từng mini-chuỗi, kết hợp tất cả kết quả mini-chuỗi để khôi phục đầu ra chuỗi đầy đủ cho những khối này. Công trình của chúng tôi cũng áp dụng tính toán lại kích hoạt [8]. Chúng tôi không thấy suy giảm về thông lượng hoặc hội tụ ngay cả với chuỗi lên đến 12× so với triển khai tiêu chuẩn của Llama3-8B, như được hiển thị trong Hình 1(c).
+
+Để tóm tắt, chúng tôi đóng góp những điều sau để thúc đẩy huấn luyện chuỗi dài:
+• MST huấn luyện độ dài chuỗi dài 12−24× so với các hệ thống hiện có trên một GPU A100 đơn không có suy giảm về thông lượng và hội tụ huấn luyện.
+• Hoàn toàn tổng quát và không phụ thuộc triển khai: MST hỗ trợ hầu hết huấn luyện hiệu quả tham số vì nó hoạt động độc lập với các lớp attention.
+• Hỗ trợ huấn luyện phân tán quy mô lớn: MST hoạt động cùng với DeepSpeed-Ulysses [21] để hỗ trợ mở rộng tuyến tính độ dài chuỗi theo số lượng GPU.
+• Dễ sử dụng và di động, yêu cầu thay đổi mã tối thiểu cho các khung huấn luyện hiện có như Huggingface [22]. Chi tiết có thể tham khảo Phụ lục G.
+
+Trong các phần tiếp theo, chúng tôi cung cấp lý lịch và công trình liên quan, thảo luận chi tiết về thiết kế MINI-SEQUENCE TRANSFORMER (MST), phân tích hiệu quả phần cứng, đánh giá thực nghiệm và so sánh với các công trình hiện có. Công trình này là mã nguồn mở dưới giấy phép MIT tại https://github.com/wdlctc/mini-s.
+
+2 Lý lịch và Công trình liên quan
+
+Phần này tóm tắt ngắn gọn các đặc điểm hiệu suất của transformers chuỗi dài trên phần cứng hiện đại (ví dụ: GPU). Chúng tôi cũng mô tả một số lý lịch về huấn luyện mini-batch và tính toán lại kích hoạt, những điều truyền cảm hứng cho công trình của chúng tôi.
+
+2.1 Kiến trúc Transformer
+
+Hình 1(a) là bản phác thảo các khối xây dựng của kiến trúc Transformer điển hình [56]. Nó bao gồm các chuỗi đầu vào S được gửi vào L khối lặp lại với attention và MLP, sau đó tính toán loss đầu ra với khối LM-Head. Đầu vào và đầu ra của mỗi khối thường là tensor 3D có kích thước (B, S, d) trong đó B là kích thước micro batch, S là độ dài chuỗi và d là chiều ẩn. Giá trị trung gian bao gồm các tensor Q, K, V có kích thước (B, S, d) trong khối attention, tensor I có kích thước (B, S, I) trong khối MLP, và tensor logits có kích thước (B, S, V) trong khối LM-Head. Ở đây, I đại diện cho kích thước trung gian của MLP, và V đại diện cho kích thước từ vựng.
+
+2.2 Hiệu suất phần cứng của huấn luyện chuỗi dài
+
+Hệ thống phân cấp bộ nhớ. GPU có hệ thống phân cấp bộ nhớ với bộ nhớ GPU toàn cục lớn hơn nhưng chậm hơn (bộ nhớ băng thông cao; HBM) và bộ nhớ chia sẻ nhỏ hơn nhưng nhanh hơn (SRAM). Nhu cầu bộ nhớ cao của Transformers bắt nguồn từ độ phức tạp bậc hai của các phép toán self-attention, trong đó bộ nhớ cần thiết để lưu trữ điểm attention cho mỗi token tăng theo bậc hai khi độ dài chuỗi tăng. Sự gia tăng đáng kể này trong nhu cầu bộ nhớ có thể nhanh chóng vượt quá dung lượng của HBM, dẫn đến các vấn đề OOM. Flashattention [15] sử dụng kernel fusion để giảm thiểu hiệu quả chi phí bộ nhớ liên quan đến tăng trưởng bậc hai trong độ dài chuỗi, và Xformer [41] triển khai các mẫu truy cập bộ nhớ được tối ưu hóa đạt được mở rộng bộ nhớ tuyến tính. Công trình của chúng tôi được truyền cảm hứng một phần bởi các công nghệ tối ưu hóa bộ nhớ, trong đó các mục tiêu tối ưu hóa của chúng tôi là MLP và LM-Head.
+
+Độ chiếm dụng. GPU có nhiều thread được thực thi song song; các thread được nhóm thành các khối thread, thực thi trên các bộ xử lý đa luồng (SM). Phần cứng hiện đại có các đơn vị chuyên biệt như tensor cores trên NVIDIA GPU để tăng tốc mammals. Trong các tình huống huấn luyện chuỗi dài nơi kích thước chuỗi có xu hướng dài (>10k), song song hóa trên chiều chuỗi thường cho phép độ chiếm dụng GPU cao.
+
+Đặc điểm hiệu suất. Các toán tử GPU có thể được phân loại là bị ràng buộc tính toán hoặc bị ràng buộc bộ nhớ, được xác định bởi thời gian dành cho các phép toán số học và thời gian dành cho việc truy cập HBM. Self-attention điển hình với chuỗi dài, MLP với kích thước trung gian dài là toán tử bị ràng buộc tính toán vì các toán tử cốt lõi của chúng là nhân ma trận với chiều trong lớn của độ dài chuỗi. Sau đó, cross-entropy với reduction bị ràng buộc bộ nhớ.
+
+2.3 Huấn luyện Mini-Batch
+
+Công trình của chúng tôi được truyền cảm hứng bởi các thuật toán Huấn luyện Mini-Batch, còn được gọi là tích lũy gradient. Các thuật toán huấn luyện mini-batch [17,40] có thể hỗ trợ kích thước batch lớn bằng cách xử lý batch huấn luyện trong các mini-batch nhỏ hơn, cho phép mô hình được huấn luyện trên một tập con dữ liệu tại một thời điểm, tích lũy gradient qua nhiều mini-batch và chỉ cập nhật tham số với gradient tích lũy. Điều này giảm yêu cầu bộ nhớ so với descent gradient batch [25], cho phép huấn luyện kích thước batch lớn hơn so với ràng buộc bộ nhớ GPU. Chúng tôi được truyền cảm hứng bởi ý tưởng và thích ứng nó để huấn luyện chuỗi dài thay vì kích thước batch lớn.
+
+2.4 Tính toán lại kích hoạt
+
+Tính toán lại kích hoạt [8], còn được gọi là gradient checkpointing, là một kỹ thuật tiết kiệm bộ nhớ để huấn luyện các mạng neural lớn. Phương pháp này đánh đổi tính toán cho bộ nhớ bằng cách loại bỏ các kích hoạt trung gian trong lượt truyền thuận và tính toán lại chúng khi cần thiết trong lượt truyền ngược. Trong huấn luyện tiêu chuẩn, tất cả kích hoạt phải được lưu trữ để tính toán gradient, có thể dẫn đến việc sử dụng bộ nhớ đáng kể cho các mô hình lớn hoặc chuỗi dài. Tính toán lại kích hoạt trực giao với MST của chúng tôi, và chúng tôi tích hợp phương pháp này để tối ưu hóa tốt hơn giá trị trung gian. Chúng tôi phân tích hiệu quả bộ nhớ của tính toán lại kích hoạt và tích hợp của nó với MST trong Phần 3.2.
+
+3 MINI-SEQUENCE TRANSFORMER (MST): Thuật toán, Phân tích và Mở rộng phân tán
+
+Chúng tôi trình bày cơ chế MINI-SEQUENCE TRANSFORMER (MST) để phân vùng chuỗi đầu vào thành M mini-chuỗi. Chúng tôi cho thấy cách tính toán khối transformer chính xác bằng tích lũy gradient trong lượt truyền ngược. Sau đó, chúng tôi phân tích hiệu quả bộ nhớ và độ phức tạp IO của nó, cho thấy rằng phương pháp của chúng tôi hiệu quả về bộ nhớ và cân bằng thông lượng so với transformer tiêu chuẩn. Dựa trên phân tích, chúng tôi tìm thấy triển khai tối ưu của MST bằng cách chọn các siêu tham số tốt nhất. Chúng tôi tiếp tục cho thấy cách MST có thể hoạt động trong cài đặt phân tán bằng cách tích hợp với DeepSpeed [21].
+
+Chúng tôi tập trung vào lượt truyền thuận ở đây để dễ trình bày; Phụ lục B chứa chi tiết cho lượt truyền ngược.
+
+3.1 Thuật toán: Tối ưu hóa bộ nhớ trung gian với xử lý Mini-Sequence
+
+Ý tưởng của chúng tôi phát sinh từ việc quan sát các giá trị trung gian lớn từ các khối transformer. Cho các đầu vào X∈RN×d trong HBM, các khối attention và khối MLP tính toán đầu ra O∈RN×d và khối LM-head tính toán loss đầu ra∈R1, N bằng với kích thước chuỗi S ở đây. Chúng tôi quan sát rằng các giá trị trung gian luôn lớn hơn đầu vào X và đầu ra O, loss, được minh họa trong Bảng 1. Attention có các giá trị trung gian Q,K,V∈RN×d, lớn hơn kích thước đầu vào (1 + 2 ×d)/G, trong đó (1 + 2 ×d/G= 1.5) trong cài đặt Llama3. G đề cập đến số lượng attention truy vấn nhóm (GQA). MLP có giá trị trung gian Iup, Igate∈RN×I, trong đó 2×I/d= 7 trong cài đặt Llama3. LM-Head có logits ∈RV×d, trong đó V/d= 32 trong cài đặt Llama3. Cài đặt chi tiết của Llama3-8B được liệt kê trong Phụ lục C.
+
+Bảng 1: Phân tích kích thước giá trị trung gian cho các khối transformer
+
+Khối Transformer | Kích thước đầu vào/đầu ra | Kích thước giá trị trung gian đỉnh | Tỷ lệ trung gian/đầu vào¹
+Attention | (B, S, d)/(B, S, d) | (B, S, d) + 2×(B, S, d/G) | (1 + 2 ×d/G)≈1.5
+MLP | (B, S, d)/(B, S, d) | 2 ×(B, S, I) | (2 ×I)/d≈7
+LM-Head | (B, S, d)/1 | (B, S, V) | V/d≈32
+
+¹Tỷ lệ trong cài đặt Llama3.
+
+Khi flash attention và group query attention đã giảm thiểu giá trị trung gian của attention, chúng tôi tập trung vào khối MLP và khối LM-Head. Do đó, triển khai MST của chúng tôi đủ tổng quát để hoạt động với bất kỳ attention nào: self-attention [56], cross-attention [5], causal attention [42], các đối tác thưa thớt của chúng [11,59,48], và các kernel được tối ưu hóa khác nhau như các phiên bản khác nhau của FlashAttention [15, 14]. Triển khai của chúng tôi áp dụng FlashAttention2 [14] cho các thí nghiệm.
+
+Phân vùng đầu vào. Chúng tôi áp dụng kỹ thuật mini-chuỗi để vượt qua thách thức kỹ thuật của các giá trị trung gian lớn chiếm dụng bộ nhớ HBM. Chúng tôi mô tả điều này trong Thuật toán 1 và 2, đại diện cho các khối MLP và LM-Head từ dòng Llama. Khối MLP của chúng bao gồm ba lớp tuyến tính và hàm SiLU [46], và khối LM-Head của chúng bao gồm một lớp tuyến tính và hàm CrossEntropyLoss [49]. Các triển khai ngược tương ứng có thể được tham khảo trong Phụ lục B để biết thêm chi tiết. Ý tưởng chính là phân vùng đầu vào X thành mini-chuỗi Xi như Thuật toán 1 dòng 1 và Thuật toán 2 dòng 1, sau đó tính toán đầu ra liên quan đến những mini-chuỗi đó. Chúng tôi nhận được kết quả chính xác giống như triển khai tiêu chuẩn bằng cách liên kết tất cả đầu ra mini-chuỗi.
+
+Tích lũy gradient. Một trong những mục tiêu của chúng tôi là giảm các giá trị trung gian cho lượt truyền ngược. Lượt truyền ngược thường yêu cầu các ma trận X∈RN×d,I∈RN×I,logits ∈RN×V để tính toán gradient liên quan đến trọng số. Tuy nhiên, bằng phân vùng đầu vào X∈RNm×d, chúng tôi có thể giảm giá trị trung gian là I∈RNm×I,logits ∈RNm×V bằng M× trong lượt truyền ngược trong HBM. Với tích lũy gradient cho tất cả mini-chuỗi, tất cả gradient được tạo ra theo cách tương tự như triển khai tiêu chuẩn bằng cách giới thiệu thêm thời gian tải bộ nhớ. Tuy nhiên, vì MLP là toán tử bị ràng buộc tính toán tiêu chuẩn và LM-Head chỉ chiếm một lượng nhỏ tổng thời gian huấn luyện, MST sẽ không ảnh hưởng đến tốc độ huấn luyện toàn bộ với việc giảm đáng kể chi phí bộ nhớ.
+
+Thuật toán 1 Mini-Sequence MLP
+Yêu cầu: Ma trận X∈RN×d, khối MLP, Wdown,∈RI×d, Trọng số của ba lớp tuyến tính
+Wgate, Wup∈Rd×I,Wdown∈RI×d
+1: Phân vùng ma trận X thành M khối X1, . . . , Xm có kích thước Nm×d, trong đó Nm=N/M
+2: for 1≤i≤M do
+3: Tính toán O′i=MLP(Xi, Wgate, Wup, Wdown),Oi∈RNm×d
+4: end for
+5: Liên kết O={O′i, . . . ,O′m} ∈RN×d
+6: Return O.
+
+Thuật toán 2 Mini-Sequence LM-Head
+Yêu cầu: Ma trận X∈RN×d, Nhãn L∈RN, Trọng số Wout∈Rd×V
+1: Phân vùng ma trận X thành M khối X1, . . . , Xm có kích thước Nm×d, trong đó Nm=N/M
+2: Phân vùng nhãn L thành M nhãn con, L1, . . . , Lm có kích thước Nm, trong đó Nm=N/M
+3: for 1≤i≤M do
+4: Tính toán logitsi=XiWout,logitsi∈RNm×V
+5: Tính toán if (i−1)∗Nm≤Li≤(i−1)∗Nm,Li=Li else Li=−100
+6: Tính toán lossi=crossentropyloss(logitsi, L_)
+7: end for
+8: Tính toán loss=∑M1lossi/M
+9: Return loss.
+
+3.2 Phân tích: Hiệu quả bộ nhớ của MINI-SEQUENCE TRANSFORMER (MST)
+
+Chúng tôi phân tích hiệu quả bộ nhớ của MST. MST có thể giảm giá trị trung gian bằng M× trong khi duy trì cùng hiệu suất thông lượng.
+
+Định lý 1. Gọi S là độ dài chuỗi, Wmem là chiếm dụng bộ nhớ trọng số, bao gồm trọng số, gradient và optimizer. Amem là chiếm dụng bộ nhớ kích hoạt trên mỗi chuỗi, Imem là chiếm dụng bộ nhớ trung gian trên mỗi chuỗi. Bộ nhớ đỉnh của transformer tiêu chuẩn đạt được bởi M=Wmem+S×(Imem+L×Amem). Lưu ý rằng L×Amem>> Imem cho transformer tiêu chuẩn, vì Amem kéo dài cho tất cả L lớp, nhưng Imem chỉ kéo dài cho một lớp.
+
+Định lý 2. Với tính toán lại kích hoạt của OpenAI [39], L×Amem có thể được giảm xuống sqrt(L)×Amem. Do đó bộ nhớ đỉnh được giảm xuống M=Wmem+S×(Imem+sqrt(L)×Amem). Đối với các mô hình có từ vựng lớn và trung gian MLP, sqrt(L)×Amem< Imem.
+
+Định lý 3. MST có thể giảm giá trị trung gian bằng M×, vì vậy chiếm dụng bộ nhớ trở thành M=Wmem+S×(Imem/M+sqrt(L)×Amem). Đối với GPU có bộ nhớ tối đa Mmax, độ dài chuỗi tối đa được chứa bởi Smax=(Mmax−Wmem)/(Imem/M+sqrt(L)×Amem). Độ dài chuỗi này sẽ dài hơn nhiều so với triển khai tiêu chuẩn với Smax=(Mmax−Wmem)/(Imem+L×Amem).
+
+3.3 Phân tích: Độ phức tạp IO và bộ nhớ của MINI-SEQUENCE TRANSFORMER (MST)
+
+Chúng tôi phân tích độ phức tạp IO của MST, so với độ phức tạp tính toán nhất quán, có thể ảnh hưởng đến đặc điểm hiệu suất bị ràng buộc tính toán hoặc bị ràng buộc bộ nhớ của nó.
+
+Định lý 4. Gọi S là độ dài chuỗi, d là chiều ẩn, I là kích thước trung gian, và V là kích thước giọng nói. MLP tiêu chuẩn trả về O=act((XWgate)∗(XiWup))∗Wdown với O(SdI) FLOPS và MST MLP trả về O(SdI/M∗M) =O(SdI) FLOPS. LM-Loss tiêu chuẩn trả về loss=crossentropyloss(XW, L) với O(SdV+SV) FLOPS, và MST LM-Loss trả về O((SdV+SV)/M∗M) =O(SdV+SV) FLOPS.
+
+Định lý 5. MLP tiêu chuẩn yêu cầu Θ(Sd+SI+dI) lần truy cập HBM, trong khi MST(1) yêu cầu Θ(Sd+SI+dIM) lần truy cập HBM. LM-Head tiêu chuẩn yêu cầu Θ(Sd+SV+dV) lần truy cập HBM, trong khi MST(2) yêu cầu Θ(Sd+SV+dVM) lần truy cập HBM.
+
+Đối với các giá trị Llama3 của d(4096), I(14336) và V(128256), SI, SV lớn hơn nhiều lần so với Sd. Đối với các trường hợp chuỗi dài, độ phức tạp tính toán và độ phức tạp IO được chi phối bởi SI và SV, trong đó MST gần với triển khai tiêu chuẩn. Tuy nhiên, đối với các trường hợp chuỗi nhỏ trong đó S << d, độ phức tạp tính toán và độ phức tạp IO được chi phối bởi dI và dV trong khi MST cần dIM và dVM. Do đó, MST sẽ gây ra suy giảm thông lượng cho độ dài chuỗi nhỏ.
+
+3.4 MINI-SEQUENCE TRANSFORMER (MST) dựa trên chunk
+
+Chúng tôi trình bày một triển khai tối ưu hóa của MST dựa trên chunk được thiết kế để giảm thiểu giảm thông lượng khi huấn luyện với dữ liệu chuỗi nhỏ. Phương pháp cơ bản bao gồm việc phân vùng chuỗi S thành các chunk có kích thước bằng nhau là C (khi có thể), dẫn đến M=S/C mini-chuỗi.
+
+Phân tích độ phức tạp IO của chúng tôi chỉ ra rằng số lượng mini-chuỗi M ảnh hưởng đến các lần truy cập HBM là Θ(Sd+SI+dIM) và Θ(Sd+SV+dVM). Tuy nhiên, các lần truy cập HBM vẫn ổn định ở Θ(SI) và Θ(SV) miễn là dIM≤SI và dVM≤SV. Nó có nghĩa là d≤S/M.
+
+Do đó, bằng cách đặt kích thước chunk thành C=S/M≥d, MST tránh suy giảm thông lượng cho chuỗi nhỏ. Trực quan, khi kích thước chuỗi nhỏ hơn kích thước chunk, MST không tách đầu vào, từ đó ngăn chặn mọi mất mát hiệu suất.
+
+Chúng tôi áp dụng MST dựa trên chunk độc quyền cho các khối MLP bằng cách đặt kích thước chunk không đổi C bằng chiều ẩn, C=d. Đối với các khối LM-head, chúng tôi duy trì kích thước mini-chuỗi không đổi là M=V/d, vì những khối này đóng góp tối thiểu vào tổng thời gian huấn luyện của transformers.
+
+3.5 Mở rộng: MINI-SEQUENCE TRANSFORMER (MST) phân tán
+
+NormAttention
+Deepspeed
+UlyssesNormNormLoss Loss 
+LM head:
+Mini -SeqLM head:
+Mini -Seq
+
+MLP:
+Mini -SeqMLP:
+Mini -Seq
+
+Tensor (S)Tensor (S)L x
+
+Hình 2: MINI-SEQUENCE TRANSFORMER phân tán
+
+Chúng tôi mở rộng MINI-SEQUENCE TRANSFORMER (MST) sang cài đặt phân tán: chúng tôi đề xuất MST+ SP, có thể mở rộng hiệu quả transformer bằng song song chuỗi (SP). Trong SP, tensor đầu vào của mỗi lớp Transformer được chia theo chiều chuỗi, cho phép tính toán song song trên nhiều GPU. Việc phân đoạn này, kết hợp với tính toán lại kích hoạt, dẫn đến việc giảm đáng kể yêu cầu bộ nhớ kích hoạt. Đáng chú ý rằng phương pháp được đề xuất của chúng tôi trực giao với hầu hết song song chuỗi, như Megatron-LM [26], Deepspeed-Ulysses [21], Song song chuỗi [29], và Ring Attention [30]. Ở đây, chúng tôi lấy Deepspeed-Ulysses làm ví dụ về cách chúng hoạt động cùng nhau.
+
+Hình 2 cho thấy thiết kế mở rộng MST với DeepSpeed-Ulysses. Như với kiến trúc transformers, thiết kế bao gồm một khối attention với DeepSpeed-Ulysses, MLP, và LM-Head với công nghệ mini-chuỗi của MST. Thiết kế bao gồm các chuỗi đầu vào S được phân vùng trên các thiết bị có sẵn và mini-chuỗi. Mỗi khối attention Ma trận Q,K,V được truyền thông qua tất cả collective trước và sau tính toán attention. Các mô-đun còn lại của MLP và LM-Head sử dụng song song chuỗi và mini-chuỗi cùng nhau. Vì thay đổi chính của DeepSpeed-Ulysses đang hoạt động trên khối attention và MST đang hoạt động trên MLP và LM-Head, nó đơn giản để làm cho chúng hoạt động cùng nhau để mở rộng độ dài chuỗi.
+
+4 Thí nghiệm
+
+Chúng tôi đánh giá tác động của việc sử dụng MINI-SEQUENCE TRANSFORMER (MST) dựa trên chunk trên Llama3 [36], một mô hình tiên tiến cho nhiều nhiệm vụ NLP. Chúng tôi cũng đánh giá Qwen [6], Mistral [24], và Gemma-2 [54] cho cải thiện độ dài ngữ cảnh. Chúng tôi xác thực các tuyên bố của mình về mở rộng độ dài chuỗi, báo cáo thời gian huấn luyện và chi phí bộ nhớ. Kết quả Mở rộng phân tán có thể được tìm thấy trong phụ lục E, xác nhận rằng độ dài chuỗi của MST có thể mở rộng tuyến tính với số lượng GPU.
+
+• Độ dài chuỗi tối đa. MST có thể huấn luyện Llama3-8B với độ dài ngữ cảnh 60k và Llama3-7B với độ dài ngữ cảnh 84k trên một GPU A100 đơn, vượt trội hơn triển khai tiêu chuẩn 12×. Ngoài ra, nó đạt được 12−24× so với triển khai tiêu chuẩn của Qwen, Mistral, và Gemma-2.
+
+• Thông lượng huấn luyện. MST duy trì cùng thông lượng huấn luyện so với huấn luyện chuỗi dài tiêu chuẩn. Hơn nữa, thông lượng có thể được cải thiện một chút với kích thước batch lớn được hỗ trợ bởi MST.
+
+4.1 Độ dài chuỗi dài hơn với MINI-SEQUENCE TRANSFORMER (MST)
+
+Llama3 và Llama2. Chúng tôi huấn luyện Llama3-8B [36] MST và các mô hình Llama2 [43] MST bằng cách khám phá độ dài chuỗi trên một GPU A100 đơn với các chiến lược huấn luyện không mất mát, như tính toán lại kích hoạt, fusion phép toán ngược với cập nhật optimizer [34] và MST. Bảng 2 so sánh chuỗi tối đa và thời gian huấn luyện của chúng tôi với triển khai tiêu chuẩn PyTorch và Huggingface PEFT với tính toán lại kích hoạt. Triển khai của chúng tôi huấn luyện chuỗi dài 4× so với LLAMA-3 so với tính toán lại kích hoạt và chuỗi dài 12× so với triển khai tiêu chuẩn. Ngoài ra, triển khai của chúng tôi huấn luyện chuỗi dài 1.8× so với tính toán lại kích hoạt và chuỗi dài 12× so với triển khai tiêu chuẩn.
+
+Bảng 2: Độ dài chuỗi tối đa của Llama3-8B và Llama2-7B.
+
+Triển khai Llama3-8B-hf | Độ dài chuỗi tối đa (K)
+Llama3-8B-hf vanilla | 5
+Llama3-8B-hf tính toán lại kích hoạt | 14
+Llama3-8B-hf MST | 60
+Llama2-7B-hf vanilla | 7
+Llama2-7B-hf tính toán lại kích hoạt | 45
+Llama2-7B-hf MST | 84
+
+Qwen, Mistral, và Gemma-2. Chúng tôi đã mở rộng đánh giá của mình để bao gồm Mistral-7B, Qwen2-7B, và Gemma-2-9B, thể hiện sự gia tăng đáng kể trong độ dài chuỗi tối đa (12× cho Mistral-7B, 18× cho Qwen2-7B, 24× cho Gemma-2-9B) trên những kiến trúc này. Trong số những mô hình này, MST cung cấp mở rộng chuỗi tốt nhất cho Gemma-2 là 24×. Quan sát quan trọng ở đây là gemma-2 sử dụng kích thước giọng nói lớn nhất (256k) so với Mistral-7B (32k) và Qwen2(152k).
+
+Bảng 3: Độ dài chuỗi tối đa của các mô hình khác nhau.
+
+Triển khai mô hình | Độ dài chuỗi tối đa (K)
+Mistral-7B vanilla | 5
+Mistral-7B tính toán lại kích hoạt | 42
+Mistral-7B MST | 70
+Qwen2-7B vanilla | 4
+Qwen2-7B tính toán lại kích hoạt | 13
+Qwen2-7B MST | 74
+gemma-2-9b vanilla | 1.5
+gemma-2-9b tính toán lại kích hoạt | 5
+gemma-2-9b MST | 36
+
+Kết hợp với tích lũy gradient. Tích lũy Gradient đã được sử dụng trong việc huấn luyện Llama2 và Llama3, giúp chúng huấn luyện kích thước batch lớn hơn với bộ nhớ GPU có sẵn hạn chế. Tuy nhiên, trong Tích lũy Gradient, thay vì cập nhật các tham số mô hình sau khi xử lý mỗi batch dữ liệu huấn luyện, các gradient được tích lũy qua nhiều batch trước khi cập nhật. Điều này có nghĩa là việc sử dụng bộ nhớ cho gradient sẽ chiếm dụng bộ nhớ được sử dụng cho kích hoạt. Do đó, việc sử dụng tích lũy gradient trong huấn luyện sẽ hạn chế kích thước chuỗi tối đa.
+
+Bảng 4 tóm tắt độ dài chuỗi tối đa với tích lũy gradient. Công nghệ tính toán lại kích hoạt có thể huấn luyện lên đến chuỗi 8K. Sau đó MST có thể huấn luyện lên đến độ dài chuỗi 30k, dài 4× so với tính toán lại kích hoạt, và dài 21× so với vanilla. Đối với Llama2-7B, MST cũng có thể huấn luyện lên đến độ dài chuỗi 55k.
+
+Bảng 4: Độ dài chuỗi tối đa huấn luyện với tích lũy gradient.
+
+Triển khai mô hình với tích lũy gradient | Độ dài chuỗi tối đa (K)
+Llama3-8B-hf vanilla | 1.5
+Llama3-8B-hf Tính toán lại kích hoạt | 8
+Llama3-8B-hf MST | 32
+Llama2-7B-hf vanilla | 4
+Llama2-7B-hf tính toán lại kích hoạt | 38
+Llama2-7B-hf MST | 55
+
+So sánh và kết hợp với phương pháp có mất mát. Chúng tôi đã so sánh toàn diện MST với các phương pháp lượng tử hóa và các kết hợp giữa MST và lượng tử hóa trên Bảng 5. Tất cả phương pháp có mất mát là các triển khai chính thức của HuggingFace. So sánh này thể hiện sự vượt trội của MST trong việc cho phép chuỗi dài hơn cho huấn luyện Llama3 trên một GPU A100 đơn. MST một mình (60K token) vượt trội hơn những phương pháp có mất mát này (4bit 28k). Khi kết hợp với các kỹ thuật lượng tử hóa, MST đạt được kết quả ấn tượng hơn nữa: MST+ 8-bit đạt 110K token (cải thiện 22× so với 8-bit tiêu chuẩn), trong khi MST+ 4-bit đẩy ranh giới lên 140K token. Chúng tôi không đánh giá tác động của lượng tử hóa đến loss huấn luyện.
+
+Bảng 5: Độ dài chuỗi tối đa huấn luyện với phương pháp có mất mát
+
+Triển khai Llama3 | Độ dài chuỗi tối đa (K)
+8-bit | 5
+4-bit | 10
+MST | 60
+MST + 8-bit | 110
+MST + 4-bit | 140
+
+4.2 Huấn luyện chuỗi dài nhanh hơn với MINI-SEQUENCE TRANSFORMER (MST)
+
+Chúng tôi đánh giá hiệu suất huấn luyện của MST trên Llama3-8B với chuỗi 8k và Llama2-7B với chuỗi 4k sử dụng một GPU A100 80G đơn. Bảng 6 so sánh thời gian huấn luyện trên mỗi bước và TFLOPS đạt được bởi MST với triển khai PyTorch vanilla và kỹ thuật tính toán lại kích hoạt.
+
+Bảng 6: Hiệu suất huấn luyện sử dụng MST trên GPU A100 80G đơn.
+
+Triển khai mô hình | Kích thước batch | Thời gian huấn luyện trên mỗi bước (s) | TFLOPS
+Llama3-8B-hf vanilla | 1 | OOM | OOM
+Llama3-8B-hf tính toán lại kích hoạt | 2 | 5.01 | 3271.42
+Llama3-8B-hf MST | 2 | 5.13 | 3194.90
+Llama3-8B-hf MST | 8 | 19.35 | 3386.13
+Llama2-7B-hf vanilla | 1 | 1.24 | 3290.88
+Llama2-7B-hf tính toán lại kích hoạt | 1 | 1.52 | 2684.67
+Llama2-7B-hf MST không có tính toán lại kích hoạt | 1 | 1.31 | 3115.03
+Llama2-7B-hf tính toán lại kích hoạt | 8 | 8.85 | 3703.48
+Llama2-7B-hf MST | 8 | 9.33 | 3511.39
+Llama2-7B-hf MST | 16 | 17.92 | 3656.17
+
+Đối với Llama3-8B, triển khai vanilla hết bộ nhớ (OOM) với kích thước batch là 1. Tính toán lại kích hoạt cho phép huấn luyện với kích thước batch là 2, đạt 3271.42 TFLOPS và thời gian huấn luyện 5.01 giây mỗi bước. MST, với cùng kích thước batch là 2, đạt 3194.90 TFLOPS tương đương với thời gian huấn luyện dài hơn một chút là 5.13 giây mỗi bước. Tuy nhiên, hiệu quả bộ nhớ của MST cho phép mở rộng kích thước batch lên 8, dẫn đến cải thiện 3386.13 TFLOPS và thời gian huấn luyện 19.35 giây mỗi bước.
+
+Trong trường hợp Llama2-7B, triển khai vanilla có thể huấn luyện với kích thước batch là 1, đạt 3290.88 TFLOPS và thời gian huấn luyện 1.24 giây mỗi bước. Đối với cùng kích thước batch, MST không có tính toán lại kích hoạt đạt 3115.03 TFLOPS với thời gian huấn luyện 1.31 giây mỗi bước, thể hiện tăng tốc 16% so với tính toán lại kích hoạt (2684.67 TFLOPS) và chỉ chậm 5% so với PyTorch vanilla. MST tiếp tục tăng kích thước batch lên 16, duy trì 3656.17 TFLOPS tương tự với thời gian huấn luyện 17.92 giây mỗi bước.
+
+4.3 Mô hình tốt hơn với chuỗi dài hơn
+
+Mô hình ngôn ngữ với ngữ cảnh dài. Hiệu quả bộ nhớ của MST cho phép chúng tôi tăng độ dài ngữ cảnh của llama 4× so với tính toán lại kích hoạt. Bảng 7 cho thấy rằng huấn luyện Llama3-8B với độ dài ngữ cảnh 30K đạt được cải thiện perplexity 2.7× so với baseline 8K.
+
+Chúng tôi huấn luyện Llama3-8B [36] MST trên bộ dữ liệu LongAlpaca [9]. Việc huấn luyện kéo dài hai epoch và 10k bước để minh họa. Đối với tất cả triển khai, chúng tôi sử dụng optimizer AdamW [32]. Chúng tôi sử dụng weight decay 0.001, gradient clipping 1.0, và learning rate không đổi 1e-4. Tất cả kích thước batch bằng 16, với bước tích lũy gradient là 16. Độ chính xác bf16 cũng được triển khai.
+
+Bảng 7: LLAMA3-8b với MST, với độ dài ngữ cảnh lớn gấp 4 lần so với tính toán lại kích hoạt.
+
+Triển khai Llama3-8B-hf | Độ dài ngữ cảnh | LongAlpaca-12k (ppl) | loss | Thời gian huấn luyện
+Tính toán lại kích hoạt | 8k | 9.34 | 2.23 | 25.6 giờ
+MST | 8k | 7.41 | 2.00 | 26.5 giờ
+MST | 16k | 3.53 | 1.26 | 62.5 giờ
+MST | 30k | 3.45 | 1.23 | 233 giờ
+
+(a) Llama3-8B với ngữ cảnh 20k.
+(b) Gemma2-9B với ngữ cảnh 20k.
+
+Hình 3: Tiêu thụ bộ nhớ của việc tiền huấn luyện các mô hình Llama3-8B và Gemma2-9B với kích thước batch là 1 trên một thiết bị A100 đơn, với tính toán lại kích hoạt và MST. Lưu ý rằng gradient huấn luyện chuỗi dài chồng chéo với kích hoạt, vì vậy gradient không được hiển thị trong thanh.
+
+5 Nghiên cứu loại bỏ:
+
+5.1 Tối ưu hóa bộ nhớ của MINI-SEQUENCE TRANSFORMER (MST)
+
+MST giới thiệu một loạt tối ưu hóa bộ nhớ để giảm chi phí bộ nhớ của huấn luyện chuỗi dài. Để hiểu hiệu quả của các tối ưu hóa bộ nhớ MST, chúng tôi thực hiện một nghiên cứu loại bỏ từ từ tắt những tối ưu hóa này (mini-chuỗi, tính toán lại kích hoạt) và đo yêu cầu bộ nhớ. Chúng tôi xem xét ba tùy chọn: vanilla (Pytorch tiêu chuẩn với BF16), chỉ tính toán lại kích hoạt, và MST với tính toán lại kích hoạt.
+
+Hình 3 cho thấy kết quả. Chúng tôi phân tích việc sử dụng bộ nhớ đỉnh của Llama3-8B và Gemma2-9B, với độ dài chuỗi 20k. Đối với độ dài chuỗi 20k của Llama3-8B và Gemma2-9B, chỉ MST có thể làm cho mô hình vừa với GPU A100. Phần còn lại của việc tiêu thụ bộ nhớ được ước tính dựa trên kiến trúc mô hình và lượng kích hoạt lý thuyết của nó. Đối với Llama3, tính toán lại kích hoạt có thể giảm chi phí bộ nhớ của kích hoạt 3×, và MST có thể giảm thêm 4× chi phí bộ nhớ dựa trên tính toán lại kích hoạt. Đối với Gemma2-9B, MST đạt được chuỗi dài 24× so với vanilla và chuỗi dài 8× so với tính toán lại kích hoạt. Cải thiện này từ 12× lên 24× là do tỷ lệ trung gian/đầu vào cao hơn của Gemma2-9B (8 cho MLP và 72 cho LM head) so với Llama3 (7 cho MLP và 32 cho LM head, như được hiển thị trong Bảng 1). Chi tiết thêm về nghiên cứu loại bỏ bộ nhớ có thể được tìm thấy trong Phụ lục D.
+
+5.2 Cần bao nhiêu mini-chuỗi trong quá trình huấn luyện
+
+Chúng tôi quan sát rằng việc tăng M, số lượng mini-chuỗi, có thể nâng cao hiệu quả bộ nhớ; tuy nhiên, sự nâng cao này có một giới hạn nhất định. Cụ thể, việc tăng M cũng có thể ảnh hưởng đến hiệu suất thông lượng. Phụ lục F cung cấp chi tiết về những hạn chế này và tác động của chúng.
+
+Quan sát này cho phép chúng tôi xác định cấu hình tối ưu cho tối ưu hóa bộ nhớ và đạt được sự cân bằng tốt nhất giữa hiệu suất bộ nhớ, nhất quán với phân tích của chúng tôi trong Phần 3.2 và 3.3.
+
+Chúng tôi thấy rằng sự cân bằng tốt nhất cho bộ nhớ và thông lượng đạt được bởi các giá trị tối ưu của C cho MLP dựa trên chunk C=d, M=S/d, trong đó d là kích thước ẩn. Đối với LM-Head, MST gốc được sử dụng để tiết kiệm bộ nhớ, và cài đặt tối ưu cho M được xác định bởi M=V/d, cụ thể là 32 cho Llama3 và 64 cho Gemma-2. Giá trị này cung cấp hiệu quả bộ nhớ tốt nhất.
+
+6 Hạn chế và hướng tương lai
+
+Chúng tôi thảo luận về các hạn chế và hướng tương lai. Công trình liên quan cũng được đưa ra trong Phụ lục A.
+
+Biên dịch sang CUDA. Các phương pháp hiện tại của chúng tôi được xây dựng trên triển khai Pytorch. Điều này có thể hạn chế hiệu suất và tiết kiệm bộ nhớ cấp thấp. Nó có thể được cải thiện bằng fused kernel và tối ưu hóa cuda, có thể là bước tiếp theo của chúng tôi.
+
+Kết hợp với tối ưu hóa bộ nhớ. Mục tiêu của chúng tôi là tăng độ dài chuỗi trong khi duy trì hiệu suất và độ chính xác. Nới lỏng những yêu cầu này, MST có thể được kết hợp với activation offload để mở rộng độ dài chuỗi là Smax=(Mmax−Wmem)/(Imem/M+Amem), hoặc với lượng tử hóa để mở rộng độ dài chuỗi là Smax=bf16/(4bit/8bit)(Mmax−Wmem)/(Imem/M+L×Amem). Sự kết hợp này có thể được khám phá trong nghiên cứu tương lai.
+
+Lời cảm ơn
+Chúng tôi cảm ơn Vast AI vì tài nguyên tính toán cho thuê.
+
+A. Anandkumar được hỗ trợ bởi tấm giáo sư được đặt tên Bren, Schmidt AI 2050 senior fellowship, ONR (MURI grant N00014-18-12624).
+
+Tài liệu tham khảo
+[1] Marah Abdin, Sam Ade Jacobs, Ammar Ahmad Awan, Jyoti Aneja, Ahmed Awadallah, Hany Awadalla, Nguyen Bach, Amit Bahree, Arash Bakhtiari, Harkirat Behl, et al. Phi-3 technical report: A highly capable language model locally on your phone. arXiv preprint arXiv:2404.14219, 2024.
+
+[2] Joshua Ainslie, James Lee-Thorp, Michiel de Jong, Yury Zemlyanskiy, Federico Lebrón, and Sumit Sanghai. Gqa: Training generalized multi-query transformer models from multi-head checkpoints. arXiv preprint arXiv:2305.13245, 2023.
+
+[3] Apsod et al. Flashce. https://github.com/Apsod/FlashCE, 2023.
+
+[4] Apsod et al. optimizer step in backward tutorial. https://pytorch.org/tutorials/intermediate/optimizer_step_in_backward_tutorial.html, 2024.
+
+[5] Dzmitry Bahdanau, Kyunghyun Cho, and Yoshua Bengio. Neural machine translation by jointly learning to align and translate. arXiv preprint arXiv:1409.0473, 2014.
+
+[6] Jinze Bai, Shuai Bai, Yunfei Chu, Zeyu Cui, Kai Dang, Xiaodong Deng, Yang Fan, Wenbin Ge, Yu Han, Fei Huang, et al. Qwen technical report. arXiv preprint arXiv:2309.16609, 2023.
+
+[7] Iz Beltagy, Matthew E Peters, and Arman Cohan. Longformer: The long-document transformer. arXiv preprint arXiv:2004.05150, 2020.
+
+[8] Tianqi Chen, Bing Xu, Chiyuan Zhang, and Carlos Guestrin. Training deep nets with sublinear memory cost. arXiv preprint arXiv:1604.06174, 2016.
+
+[9] Yukang Chen, Shengju Qian, Haotian Tang, Xin Lai, Zhijian Liu, Song Han, and Jiaya Jia. Longlora: Efficient fine-tuning of long-context large language models. arXiv preprint arXiv:2309.12307, 2023.
+
+[10] Zonglei Chen, Minbo Ma, Tianrui Li, Hongjun Wang, and Chongshou Li. Long sequence time-series forecasting with deep learning: A survey. Information Fusion, 97:101819, 2023.
+
+[11] Rewon Child, Scott Gray, Alec Radford, and Ilya Sutskever. Generating long sequences with sparse transformers. arXiv preprint arXiv:1904.10509, 2019.
+
+[12] Aakanksha Chowdhery, Sharan Narang, Jacob Devlin, Maarten Bosma, Gaurav Mishra, Adam Roberts, Paul Barham, Hyung Won Chung, Charles Sutton, Sebastian Gehrmann, et al. Palm: Scaling language modeling with pathways. Journal of Machine Learning Research, 24(240):1–113, 2023.
+
+[13] Zihang Dai, Zhilin Yang, Yiming Yang, Jaime Carbonell, Quoc V Le, and Ruslan Salakhutdinov. Transformer-xl: Attentive language models beyond a fixed-length context. arXiv preprint arXiv:1901.02860, 2019.
+
+[14] Tri Dao. Flashattention-2: Faster attention with better parallelism and work partitioning. arXiv preprint arXiv:2307.08691, 2023.
+
+[15] Tri Dao, Dan Fu, Stefano Ermon, Atri Rudra, and Christopher Ré. Flashattention: Fast and memory-efficient exact attention with io-awareness. Advances in Neural Information Processing Systems, 35:16344–16359, 2022.
+
+[16] Tim Dettmers, Artidoro Pagnoni, Ari Holtzman, and Luke Zettlemoyer. Qlora: Efficient finetuning of quantized llms. Advances in Neural Information Processing Systems, 36, 2024.
+
+[17] Joeri R Hermans, Gerasimos Spanakis, and Rico Möckel. Accumulated gradient normalization. In Asian Conference on Machine Learning, pages 439–454. PMLR, 2017.
+
+[18] Edward J Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang, and Weizhu Chen. Lora: Low-rank adaptation of large language models. arXiv preprint arXiv:2106.09685, 2021.
+
+[19] Yanping Huang, Youlong Cheng, Ankur Bapna, Orhan Firat, Dehao Chen, Mia Chen, HyoukJoong Lee, Jiquan Ngiam, Quoc V Le, Yonghui Wu, et al. Gpipe: Efficient training of giant neural networks using pipeline parallelism. Advances in neural information processing systems, 32, 2019.
+
+[20] Dongseong Hwang, Weiran Wang, Zhuoyuan Huo, Khe Chai Sim, and Pedro Moreno Mengibar. Transformerfam: Feedback attention is working memory. arXiv preprint arXiv:2404.09173, 2024.
+
+[21] Sam Ade Jacobs, Masahiro Tanaka, Chengming Zhang, Minjia Zhang, Leon Song, Samyam Rajbhandari, and Yuxiong He. Deepspeed ulysses: System optimizations for enabling training of extreme long sequence transformer models. arXiv preprint arXiv:2309.14509, 2023.
+
+[22] Shashank Mohan Jain. Hugging face. In Introduction to transformers for NLP: With the hugging face library and models to solve problems, pages 51–67. Springer, 2022.
+
+[23] Mojan Javaheripi, Sébastien Bubeck, Marah Abdin, Jyoti Aneja, Sebastien Bubeck, Caio César Teodoro Mendes, Weizhu Chen, Allie Del Giorno, Ronen Eldan, Sivakanth Gopi, et al. Phi-2: The surprising power of small language models. Microsoft Research Blog, 2023.
+
+[24] Albert Q Jiang, Alexandre Sablayrolles, Arthur Mensch, Chris Bamford, Devendra Singh Chaplot, Diego de las Casas, Florian Bressand, Gianna Lengyel, Guillaume Lample, Lucile Saulnier, et al. Mistral 7b. arXiv preprint arXiv:2310.06825, 2023.
+
+[25] Sarit Khirirat, Hamid Reza Feyzmahdavian, and Mikael Johansson. Mini-batch gradient descent: Faster convergence under data sparsity. In 2017 IEEE 56th Annual Conference on Decision and Control (CDC), pages 2880–2887. IEEE, 2017.
+
+[26] Vijay Anand Korthikanti, Jared Casper, Sangkug Lym, Lawrence McAfee, Michael Andersch, Mohammad Shoeybi, and Bryan Catanzaro. Reducing activation recomputation in large transformer models. Proceedings of Machine Learning and Systems, 5, 2023.
+
+[27] Alex Krizhevsky, Ilya Sutskever, and Geoffrey E Hinton. Imagenet classification with deep convolutional neural networks. Communications of the ACM, 60(6):84–90, 2017.
+
+[28] Wojciech Kryściński, Nazneen Rajani, Divyansh Agarwal, Caiming Xiong, and Dragomir Radev. Booksum: A collection of datasets for long-form narrative summarization. arXiv preprint arXiv:2105.08209, 2021.
+
+[29] Shenggui Li, Fuzhao Xue, Chaitanya Baranwal, Yongbin Li, and Yang You. Sequence parallelism: Long sequence training from system perspective. arXiv preprint arXiv:2105.13120, 2021.
+
+[30] Hao Liu, Matei Zaharia, and Pieter Abbeel. Ring attention with blockwise transformers for near-infinite context. arXiv preprint arXiv:2310.01889, 2023.
+
+[31] Xin Liu, Daniel McDuff, Geza Kovacs, Isaac Galatzer-Levy, Jacob Sunshine, Jiening Zhan, Ming-Zher Poh, Shun Liao, Paolo Di Achille, and Shwetak Patel. Large language models are few-shot health learners. arXiv preprint arXiv:2305.15525, 2023.
+
+[32] Ilya Loshchilov and Frank Hutter. Decoupled weight decay regularization. arXiv preprint arXiv:1711.05101, 2017.
+
+[33] Lefteris Loukas, Manos Fergadiotis, Ion Androutsopoulos, and Prodromos Malakasiotis. Edgar-corpus: Billions of tokens make the world go round. arXiv preprint arXiv:2109.14394, 2021.
+
+[34] Kai Lv, Hang Yan, Qipeng Guo, Haijun Lv, and Xipeng Qiu. Adalomo: Low-memory optimization with adaptive learning rate. arXiv preprint arXiv:2310.10195, 2023.
+
+[35] Mohammad Malek et al. Efficient cross entropy. https://github.com/mgmalek/efficient_cross_entropy, 2023.
+
+[36] Meta. Introducing meta llama 3: The most capable openly available llm to date. https://ai.meta.com/blog/meta-llama-3/.
+
+[37] Deepak Narayanan, Mohammad Shoeybi, Jared Casper, Patrick LeGresley, Mostofa Patwary, Vijay Korthikanti, Dmitri Vainbrand, Prethvi Kashinkunti, Julie Bernauer, Bryan Catanzaro, et al. Efficient large-scale language model training on gpu clusters using megatron-lm. In Proceedings of the International Conference for High Performance Computing, Networking, Storage and Analysis, pages 1–15, 2021.
+
+[38] Tung Nguyen, Johannes Brandstetter, Ashish Kapoor, Jayesh K Gupta, and Aditya Grover. Climax: A foundation model for weather and climate. arXiv preprint arXiv:2301.10343, 2023.
+
+[39] OpenAI. gradient-checkpointing. https://github.com/cybertronai/gradient-checkpointing, 2018.
+
+[40] Myle Ott, Sergey Edunov, David Grangier, and Michael Auli. Scaling neural machine translation. arXiv preprint arXiv:1806.00187, 2018.
+
+[41] Markus N Rabe and Charles Staats. Self-attention does not need o(n^2) memory. arXiv preprint arXiv:2112.05682, 2021.
+
+[42] Alec Radford, Karthik Narasimhan, Tim Salimans, Ilya Sutskever, et al. Improving language understanding by generative pre-training. preprint, 2018.
+
+[43] Alec Radford, Jeffrey Wu, Rewon Child, David Luan, Dario Amodei, Ilya Sutskever, et al. Language models are unsupervised multitask learners. OpenAI blog, 1(8):9, 2019.
+
+[44] Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan Narang, Michael Matena, Yanqi Zhou, Wei Li, and Peter J Liu. Exploring the limits of transfer learning with a unified text-to-text transformer. Journal of machine learning research, 21(140):1–67, 2020.
+
+[45] Samyam Rajbhandari, Olatunji Ruwase, Jeff Rasley, Shaden Smith, and Yuxiong He. Zero-infinity: Breaking the gpu memory wall for extreme scale deep learning. In Proceedings of the international conference for high performance computing, networking, storage and analysis, pages 1–14, 2021.
+
+[46] Prajit Ramachandran, Barret Zoph, and Quoc V Le. Searching for activation functions. arXiv preprint arXiv:1710.05941, 2017.
+
+[47] Machel Reid, Nikolay Savinov, Denis Teplyashin, Dmitry Lepikhin, Timothy Lillicrap, Jean-baptiste Alayrac, Radu Soricut, Angeliki Lazaridou, Orhan Firat, Julian Schrittwieser, et al. Gemini 1.5: Unlocking multimodal understanding across millions of tokens of context. arXiv preprint arXiv:2403.05530, 2024.
+
+[48] Aurko Roy, Mohammad Saffar, Ashish Vaswani, and David Grangier. Efficient content-based sparse attention with routing transformers. Transactions of the Association for Computational Linguistics, 9:53–68, 2021.
+
+[49] Reuven Rubinstein. The cross-entropy method for combinatorial and continuous optimization. Methodology and computing in applied probability, 1:127–190, 1999.
+
+[50] Noam Shazeer. Fast transformer decoding: One write-head is all you need. arXiv preprint arXiv:1911.02150, 2019.
+
+[51] Noam Shazeer and Mitchell Stern. Adafactor: Adaptive learning rates with sublinear memory cost. In International Conference on Machine Learning, pages 4596–4604. PMLR, 2018.
+
+[52] Ying Sheng, Shiyi Cao, Dacheng Li, Coleman Hooper, Nicholas Lee, Shuo Yang, Christopher Chou, Banghua Zhu, Lianmin Zheng, Kurt Keutzer, et al. S-lora: Serving thousands of concurrent lora adapters. arXiv preprint arXiv:2311.03285, 2023.
+
+[53] Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper, and Bryan Catanzaro. Megatron-lm: Training multi-billion parameter language models using model parallelism. arXiv preprint arXiv:1909.08053, 2019.
+
+[54] Gemma Team, Thomas Mesnard, Cassidy Hardin, Robert Dadashi, Surya Bhupatiraju, Shreya Pathak, Laurent Sifre, Morgane Rivière, Mihir Sanjay Kale, Juliette Love, et al. Gemma: Open models based on gemini research and technology. arXiv preprint arXiv:2403.08295, 2024.
+
+[55] Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei, Nikolay Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, et al. Llama 2: Open foundation and fine-tuned chat models. arXiv preprint arXiv:2307.09288, 2023.
+
+[56] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Łukasz Kaiser, and Illia Polosukhin. Attention is all you need. Advances in neural information processing systems, 30, 2017.
+
+[57] Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song Han, and Mike Lewis. Efficient streaming language models with attention sinks. arXiv preprint arXiv:2309.17453, 2023.
+
+[58] Wenhan Xiong, Jingyu Liu, Igor Molybog, Hejia Zhang, Prajjwal Bhargava, Rui Hou, Louis Martin, Rashi Rungta, Karthik Abinav Sankararaman, Barlas Oguz, et al. Effective long-context scaling of foundation models. arXiv preprint arXiv:2309.16039, 2023.
+
+[59] Manzil Zaheer, Guru Guruganesh, Kumar Avinava Dubey, Joshua Ainslie, Chris Alberti, Santiago Ontanon, Philip Pham, Anirudh Ravula, Qifan Wang, Li Yang, et al. Big bird: Transformers for longer sequences. Advances in neural information processing systems, 33:17283–17297, 2020.
+
+[60] Jiawei Zhao, Zhenyu Zhang, Beidi Chen, Zhangyang Wang, Anima Anandkumar, and Yuandong Tian. Galore: Memory-efficient llm training by gradient low-rank projection. arXiv preprint arXiv:2403.03507, 2024.
+
+[61] Yanli Zhao, Andrew Gu, Rohan Varma, Liang Luo, Chien-Chin Huang, Min Xu, Less Wright, Hamid Shojanazeri, Myle Ott, Sam Shleifer, et al. Pytorch fsdp: experiences on scaling fully sharded data parallel. arXiv preprint arXiv:2304.11277, 2023.
+
+[62] Maxim Zvyagin, Alexander Brace, Kyle Hippe, Yuntian Deng, Bin Zhang, Cindy Orozco Bohorquez, Austin Clyde, Bharat Kale, Danilo Perez-Rivera, Heng Ma, et al. Genslms: Genome-scale language models reveal sars-cov-2 evolutionary dynamics. The International Journal of High Performance Computing Applications, 37(6):683–705, 2023.
+
+A Công trình liên quan
+
+Mô hình chuỗi dài. Khả năng huấn luyện các mô hình lớn với chuỗi dài đang trở nên ngày càng quan trọng trên các lĩnh vực khác nhau, từ AI tạo sinh đến khám phá khoa học. Trong AI tạo sinh, các nhiệm vụ như AI đối thoại, tóm tắt tài liệu dài giàu kiến thức, và tạo video đòi hỏi suy luận trên các ngữ cảnh mở rộng trong cả chiều không gian và thời gian. Các mô hình nền tảng đa phương thức xử lý âm thanh, hình ảnh và dạng sóng đồng thời, yêu cầu suy luận ngữ cảnh dài trên các đầu vào có chiều cao với chuỗi dài. Tương tự, tóm tắt cấp chương và sách, ước tính liên quan đến hàng chục đến hàng trăm nghìn từ, có tầm quan trọng lớn trong AI đối thoại và các nhiệm vụ tóm tắt trừu tượng [7,28,33] và đã thể hiện lợi ích từ huấn luyện chuỗi dài [58, 47, 36].
+
+Sự xuất hiện của ChatGPT và các mô hình ngôn ngữ lớn mã nguồn mở và thương mại tiếp theo đã đẩy các ứng dụng chat lên hàng đầu của AI hiện đại, làm cho chúng trở nên phù hợp hơn bao giờ hết. Xử lý hiệu quả chuỗi dài là quan trọng để hỗ trợ lịch sử đối thoại rộng lớn hơn trong những ứng dụng này [55]. Khả năng chuỗi dài cũng quan trọng như nhau đối với AI trong các lĩnh vực khoa học, cho phép hiểu biết và tiến bộ tốt hơn trong chăm sóc sức khỏe [31], dự báo khí hậu và thời tiết [38], và mô phỏng phân tử quy mô lớn [62].
+
+Huấn luyện chuỗi dài có mất mát. Một hướng là làm cho LLM có thể xử lý chuỗi dài tùy ý một cách hiệu quả bằng cách hy sinh cửa sổ nhận thức của mạng. Sliding window attention được giới thiệu [13] để xử lý chuỗi dài vô hạn làm đầu vào. Tuy nhiên, nó bỏ qua thông tin ngoài trường tiếp nhận hiệu quả. Longformer [7] mở rộng ý tưởng này, cache theo từng khối, tăng kích thước cửa sổ nhận thức, cũng như TransformerFAM [20]. StreamLLM [57] không bị hạn chế bởi một cửa sổ cho trước nhưng loại bỏ có chọn lọc thông tin giữa token đầu tiên và cửa sổ cho trước. Chúng gặp khó khăn trong việc nắm bắt các phụ thuộc tầm xa ngoài phạm vi cố định này, nhưng chất lượng xấp xỉ cũng có vẻ suy giảm ở độ dài chuỗi dài. MST có thể hoạt động trực tiếp với chúng để tăng kích thước cửa sổ cho chất lượng tốt hơn.
+
+Huấn luyện hiệu quả bộ nhớ. Khi nhu cầu xử lý chuỗi dài tiếp tục tăng trưởng trên các lĩnh vực khác nhau, phát triển các phương pháp hiệu quả để huấn luyện các mô hình lớn với ngữ cảnh mở rộng trở nên ngày càng thiết yếu để thúc đẩy trạng thái nghệ thuật trong AI. Các phương pháp điều chỉnh tinh hiệu quả tham số (PEFT) nhằm giảm dấu chân bộ nhớ và tính toán liên quan đến tham số và gradient. Adafactor [51] đạt được chi phí bộ nhớ dưới tuyến tính bằng cách phân tích thống kê bậc hai sử dụng tích ngoài hàng-cột. Thích ứng thứ hạng thấp (LoRA) [18] giảm dấu chân bộ nhớ của các mô hình được tiền huấn luyện sử dụng bộ chuyển đổi thứ hạng thấp với bộ chuyển đổi trọng số thứ hạng thấp cho mỗi lớp. Một số biến thể của LoRA đã được đề xuất để nâng cao hiệu suất của nó. [52, 60]. Lượng tử hóa là một kỹ thuật khác được sử dụng rộng rãi trong PEFT để giảm chi phí bộ nhớ của các trạng thái optimizer [16].
+
+Các kỹ thuật khác tập trung vào việc giảm dấu chân bộ nhớ và tính toán liên quan đến kích hoạt. Tích lũy gradient là một phương pháp cho phép huấn luyện kích thước batch lớn hơn bằng cách tích lũy gradient qua nhiều mini-batch trước khi thực hiện một bước tối ưu hóa [40]. Phương pháp này cho phép huấn luyện với kích thước batch hiệu quả lớn hơn trong khi duy trì kích thước batch vật lý nhỏ hơn, giảm yêu cầu bộ nhớ kích hoạt. Một công trình tương tự của activation offloading [45] di chuyển các kích hoạt được checkpoint sang CPU không đồng bộ và prefetch các kích hoạt đã offload trở lại từ CPU trong backward. Có các công trình liên quan trong Transformers thưa thớt, chủ yếu tập trung vào xấp xỉ full-attention, như sparse attention [11,59]. Các công trình gần đây cũng tập trung vào bộ nhớ GPU đơn và attention hiệu quả tính toán. Một ví dụ phổ biến trong danh mục này là Flash attention [15], tận dụng các kỹ thuật đã biết như tiling và recomputation cho hiệu quả tính toán và bộ nhớ. Ngoài ra, một số công trình quan tâm đến cross-entropy. FlashCE [3] tối ưu hóa cross-entropy bằng cách tận dụng cấu trúc dữ liệu thưa thớt và tối ưu hóa CUDA để nâng cao tốc độ và hiệu quả bộ nhớ. Efficient cross-entropy [35] giới thiệu một biến thể hiệu quả bộ nhớ của cross-entropy loss để giảm bộ nhớ kích hoạt bằng cách chỉ lưu trữ các tính toán thiết yếu. Những công trình này trực giao với công trình của chúng tôi và có thể được tận dụng tương ứng để cải thiện hơn nữa hiệu quả của các mô hình dựa trên Transformer.
+
+Huấn luyện phân tán. Các kỹ thuật huấn luyện phân tán đã trở nên thiết yếu để huấn luyện các mô hình ngôn ngữ lớn (LLM) do yêu cầu tính toán và bộ nhớ khổng lồ của chúng. Bằng cách phân chia khối lượng công việc trên nhiều GPU, những phương pháp này giúp giảm bớt các nút thắt cổ chai bộ nhớ và cho phép huấn luyện các mô hình mà nếu không sẽ không khả thi trên một thiết bị đơn. Song song dữ liệu [27] sao chép mô hình trên nhiều thiết bị, xử lý các batch dữ liệu khác nhau song song và đồng bộ hóa gradient trên các GPU. Song song tensor [53] chia các lớp riêng lẻ của mô hình trên các GPU, cho phép sử dụng bộ nhớ hiệu quả hơn cho các mô hình cực lớn. Một phương pháp nổi bật khác là song song dữ liệu phân mảnh đầy đủ (FSDP) [61], mở rộng phương pháp song song dữ liệu bằng cách phân mảnh cả tham số mô hình và trạng thái optimizer trên các thiết bị, từ đó giảm thêm chi phí bộ nhớ. Song song chuỗi [26,21,29,30] chuyên về tối ưu hóa việc sử dụng bộ nhớ cho các mô hình dựa trên transformer bằng cách phân vùng chuỗi trên các GPU và giảm bộ nhớ kích hoạt. Ngoài những điều này, song song pipeline [19] chia mô hình thành các phân đoạn, với mỗi phân đoạn được gán cho một GPU khác nhau, và xử lý dữ liệu theo cách pipeline, cải thiện hiệu quả bằng cách chồng chéo tính toán và truyền thông. Song song lai [37] kết hợp song song dữ liệu, tensor và pipeline để tối đa hóa việc sử dụng tài nguyên tùy thuộc vào kiến trúc của mô hình và phần cứng có sẵn.
+
+B Chi tiết thuật toán
+
+Chúng tôi mô tả chi tiết đầy đủ của lượt truyền ngược MINI-SEQUENCE TRANSFORMER (MST). Thuật toán 3 cho thấy MLP backward, và Thuật toán 4 cho thấy LM-Head backward.
+
+Thuật toán 3 Mini-Sequence MLP Backward
+Yêu cầu: Gradient của đầu ra ∇O∈RN×d, Ma trận X∈RN×d, Trọng số của ba lớp tuyến tính
+Wgate, Wup∈Rd×I,Wdown∈RI×d
+1: Phân vùng ma trận X thành M khối X1, . . . , Xm có kích thước Nm×d, trong đó Nm=N/M
+2: Phân vùng ma trận ∇O thành M khối ∇O1, . . . ,∇Om có kích thước Nm×d, trong đó Nm=N/M
+3: for 1≤i≤M do
+4: Tính toán ∇Xi=∇MLP(∇Oi)
+5: Tính toán ∇Wdown,∇Wup,∇Wgate+ =∇MLP gradient(∇Oi, Xi)
+6: end for
+7: Concatenate ∇X=∇X1, . . . ,∇Xm∈RN×d
+8: Return ∇X,∇Wgate,∇Wup,∇Wdown.
+
+Bây giờ chúng tôi quan sát về lượt truyền ngược MST rằng khi tính toán gradient của MLP và LM-Head, chúng tôi không cần sử dụng dữ liệu đầu vào và trung gian đầy đủ. Thay vào đó, chúng tôi có thể sử dụng dữ liệu giảm 1/M với mini-chuỗi, giảm đáng kể chi phí bộ nhớ giá trị trung gian.
+
+Ý tưởng chính của backward là tích lũy gradient ∇W được tạo ra từ mỗi mini-chuỗi Xi như Thuật toán 3 dòng 5 và Thuật toán 4 dòng 8. Chúng tôi nhận được kết quả chính xác giống như triển khai tiêu chuẩn bằng cách tích lũy tất cả gradient mini-chuỗi.
+
+Thuật toán 4 Mini-Sequence LM-Head Backward
+Yêu cầu: Gradient loss ∇loss∈R1, Logits ∈RN×V, Nhãn L∈RN, Trọng số Wout∈Rd×V
+1: Phân vùng ma trận X thành M khối X1, . . . , Xm có kích thước Nm×d, trong đó Nm=N/M
+2: Phân vùng nhãn L thành M nhãn con L1, . . . , Lm có kích thước Nm, trong đó Nm=N/M
+3: Tính toán lại kích hoạt với backward
+4: for 1≤i≤M do
+5: Tính toán logitsi=XiWout,logitsi∈RNm×V
+6: Tính toán ∇logitsi=CrossEntropyLossBackward(Logitsi, Li)
+7: Tính toán ∇Xi=∇logitsiWTout,∇Xi∈RNm×d
+8: Tính toán ∇Wout+ =XTi∇logitsi
+9: Tính toán ∇Xi=∇Xi⊙∇loss
+10: Tính toán ∇Wout=∇Wout⊙∇loss
+11: end for
+12: Concatenate ∇X=∇X1, . . . ,∇Xm∈RN×d
+13: Return ∇X,∇Wout.
+
+C So sánh kiến trúc mô hình Llama2 và Llama3
+
+Phụ lục này làm nổi bật những khác biệt kiến trúc chính giữa các mô hình Llama2-7B và Llama3-8B được triển khai bởi Hugging Face. Sự khác biệt chính nằm ở cấu hình của các khối MLP và LM-Head (tuyến tính với cross-entropy loss) trong kiến trúc mô hình.
+
+NormAttentionNormNormLoss Loss 
+LM headLM head
+
+MLPMLP
+
+Tensor (S)Tensor (S)L x
+X:N×d I1=XWgate:N×I I2=XWup:N×I O:N×dX:N×d Logit=XWlmhead:N×V Loss: N×1 LM head 
+ MLP 
+IntermediateIntermediate
+
+Hình 4: Kiến trúc Transformer tiêu chuẩn với việc làm nổi bật LM-head và MLP.
+
+Hình 4 minh họa kiến trúc của mô hình Transformer tiêu chuẩn, tập trung vào các thành phần MLP và LM-head. Các tensor trung gian (I1, I2) có kích thước lớn hơn đầu vào và đầu ra. Ngoài ra, tensor logit có kích thước từ vựng (V) lớn hơn nhiều so với kích thước ẩn (d).
+
+Hình 5: Kiến trúc mô hình của triển khai HuggingFace của Llama2-7B
+
+LlamaForCausalLM(
+(model): LlamaModel(
+(embed_tokens): Embedding(32000, 4096)
+(layers): ModuleList(
+(0-31): 32 x LlamaDecoderLayer(
+(self_attn): LlamaFlashAttention2(
+(q_proj): Linear(in_features=4096, out_features=4096, bias=False)
+(k_proj): Linear(in_features=4096, out_features=4096, bias=False)
+(v_proj): Linear(in_features=4096, out_features=4096, bias=False)
+(o_proj): Linear(in_features=4096, out_features=4096, bias=False)
+(rotary_emb): LlamaRotaryEmbedding()
+)
+(mlp): LlamaMLP(
+(gate_proj): Linear(in_features=4096, out_features=11008, bias=False)
+(up_proj): Linear(in_features=4096, out_features=11008, bias=False)
+(down_proj): Linear(in_features=11008, out_features=4096, bias=False)
+(act_fn): SiLU()
+)
+(input_layernorm): LlamaRMSNorm((4096,), eps=1e-05)
+(post_attention_layernorm): LlamaRMSNorm((4096,), eps=1e-05)
+)
+)
+(norm): LlamaRMSNorm((4096,), eps=1e-05)
+(rotary_emb): LlamaRotaryEmbedding()
+)
+(lm_head): Linear(in_features=4096, out_features=32000, bias=False)
+)
+
+Kiến trúc mô hình Llama2-7B: Như được hiển thị trong Hình 5, mô hình Llama2-7B sử dụng cấu hình khối MLP với các đặc điểm sau:
+• Khối MLP: Lớp tuyến tính đầu tiên chiếu đầu vào từ kích thước ẩn 4096 lên kích thước trung gian 11008. Lớp tuyến tính thứ hai chiếu biểu diễn trung gian từ 11008 về 4096, kích thước ẩn.
+• LM-Head (Chiếu đầu ra với Loss tuyến tính): LM-Head trong Llama2-7B bao gồm một lớp tuyến tính chiếu biểu diễn ẩn từ kích thước 4096 lên kích thước từ vựng 32000. Đầu ra của lớp tuyến tính sau đó được truyền qua hàm cross-entropy loss để tính toán loss huấn luyện.
+
+Hình 6: Kiến trúc mô hình của triển khai HuggingFace của Llama3-8B.
+
+LlamaForCausalLM(
+(model): LlamaModel(
+(embed_tokens): Embedding(128256, 4096)
+(layers): ModuleList(
+(0-31): 32 x LlamaDecoderLayer(
+(self_attn): LlamaFlashAttention2(
+(q_proj): Linear(in_features=4096, out_features=4096, bias=False)
+(k_proj): Linear(in_features=4096, out_features=1024, bias=False)
+(v_proj): Linear(in_features=4096, out_features=1024, bias=False)
+(o_proj): Linear(in_features=4096, out_features=4096, bias=False)
+(rotary_emb): LlamaRotaryEmbedding()
+)
+(mlp): LlamaMLP(
+(gate_proj): Linear(in_features=4096, out_features=14336, bias=False)
+(up_proj): Linear(in_features=4096, out_features=14336, bias=False)
+(down_proj): Linear(in_features=14336, out_features=4096, bias=False)
+(act_fn): SiLU()
+)
+(input_layernorm): LlamaRMSNorm((4096,), eps=1e-05)
+(post_attention_layernorm): LlamaRMSNorm((4096,), eps=1e-05)
+)
+)
+(norm): LlamaRMSNorm((4096,), eps=1e-05)
+(rotary_emb): LlamaRotaryEmbedding()
+)
+(lm_head): Linear(in_features=4096, out_features=128256, bias=False)
+)
+
+Kiến trúc mô hình Llama3-8B: Như được hiển thị trong Hình 6, mô hình Llama3-8B sử dụng cấu hình khối MLP với các đặc điểm sau:
+• Khối MLP: Lớp tuyến tính đầu tiên chiếu đầu vào từ kích thước ẩn 4096 lên kích thước trung gian lớn hơn là 13824. Lớp tuyến tính thứ hai sau đó chiếu biểu diễn trung gian từ kích thước 13824 trở lại kích thước ẩn 4096.
+• LM-Head (Tuyến tính với Cross-Entropy Loss): Trong Llama3-8B, LM-Head cũng bao gồm một lớp tuyến tính, nhưng nó chiếu biểu diễn ẩn từ kích thước 4096 lên kích thước từ vựng lớn hơn là 32000. Giống như Llama2-7B, đầu ra của lớp tuyến tính được truyền qua hàm cross-entropy loss để tính toán loss huấn luyện.
+
+Kích thước trung gian tăng trong khối MLP của Llama3-8B cho phép mô hình nắm bắt các mẫu và biến đổi phức tạp hiệu quả hơn. Ngoài ra, kích thước từ vựng lớn hơn trong LM-HEAD của Llama3-8B cho phép mô hình tạo ra đầu ra đa dạng và tinh tế hơn.
+
+Đáng chú ý rằng trong khi kích thước của khối MLP và LM-Head khác nhau giữa Llama2-7B và Llama3-8B, cấu trúc và chức năng tổng thể của những thành phần này vẫn giống nhau. Hàm cross-entropy loss trong LM-Head đo lường sự khác biệt giữa xác suất từ được dự đoán và từ mục tiêu trong quá trình huấn luyện, hướng dẫn mô hình tạo ra đầu ra chính xác và phù hợp ngữ cảnh hơn. Những khác biệt kiến trúc này đóng góp vào hiệu suất và khả năng nâng cao của Llama3-8B so với người tiền nhiệm Llama2-7B, trong khi duy trì cấu trúc tổng thể nhất quán. Tuy nhiên, giá trị trung gian lớn bất ngờ cũng đến từ sự thay đổi của các khối MLP và LM-HEAD (tuyến tính với cross-entropy loss), mà chúng tôi sẽ thảo luận trong phần tiếp theo.
+
+Hơn nữa, xu hướng này cũng được phản ánh trong việc phát triển Phi-3 [1] của Microsoft so với Phi-2 [23]. Kích thước từ vựng tăng từ 50k lên 100K (2×), kích thước trung gian tăng từ 10k lên 16k (1.6×), và kích thước ẩn tăng nhẹ từ 2560 lên 3072 (1.2×).
+
+Kết luận, những mô hình này chia sẻ một xu hướng rõ ràng: tỷ lệ giữa kích thước trung gian và ẩn (cũng như từ vựng và ẩn) đang trở nên lớn hơn.
+
+ParametersActivations GradsOptimizers
+StateOptimizers
+IntermediatesForward Backward optimizer Forwardoptimizer Backward
+
+Hình 7: Trực quan hóa bộ nhớ của việc huấn luyện Llama3 8B với độ dài chuỗi 4k trên A100-80G.
+
+D Chi tiết tối ưu hóa bộ nhớ của MINI-SEQUENCE TRANSFORMER
+
+Chúng tôi so sánh MINI-SEQUENCE TRANSFORMER (MST) với việc chụp và trực quan hóa ảnh chụp bộ nhớ. Chúng tôi lấy huấn luyện Pytorch vanilla cho Llama3-8B với độ dài chuỗi 4k làm ví dụ để cho thấy cách bộ nhớ thay đổi theo thời gian.
+
+vanilla. Hình 7 cho thấy ví dụ vanilla. Các tham số mô hình đã được tải vào bộ nhớ trước bước huấn luyện, vì vậy chúng tôi ngay lập tức thấy một phần bộ nhớ dành cho trọng số. Đối với Llama3-8B, trọng số của nó sẽ là 15GB. Khi chúng tôi bắt đầu lượt truyền thuận, bộ nhớ được phân bổ dần dần cho các kích hoạt hoặc các tensor chúng tôi đang lưu để có thể tính toán gradient trong lượt truyền ngược. Ở đây, bộ nhớ được phân bổ cho kích hoạt lớn hơn trọng số, với khoảng 29GB. Khi chúng tôi bắt đầu lượt truyền ngược, các kích hoạt dần dần được giải phóng trong khi bộ nhớ của gradient bắt đầu tích tụ. Vì gradient bằng kích thước của trọng số, nhỏ hơn kích hoạt, chúng tôi có thể quan sát việc sử dụng bộ nhớ giảm xuống khoảng 30 GB. Cuối cùng, khi optimizer khởi động, trạng thái của nó sẽ được khởi tạo lười biếng, vì vậy chúng tôi nên thấy bộ nhớ trạng thái optimizer tăng dần trong bước optimizer của vòng lặp huấn luyện đầu tiên. Trong các vòng lặp tương lai, bộ nhớ optimizer sẽ được duy trì và cập nhật. Bộ nhớ cho gradient sau đó được giải phóng tương ứng ở cuối mỗi vòng lặp huấn luyện khi nó được gọi zero grade. Ở đây, optimizer sẽ lấy 2× của trọng số khi sử dụng Adam với 30GB, và intermediate optimizer bằng kích thước của trọng số với 15. Do đó, việc sử dụng bộ nhớ đỉnh là trong bước optimizer, bằng tổng kích thước của trọng số, gradient, trạng thái optimizer, và intermediate optimizer, khoảng bằng 5× của kích thước trọng số với 75GB như được hiển thị trong Bảng 8.
+
+Bảng 8: Chi phí bộ nhớ của việc huấn luyện Llama3-8B trên GPU A100 80G đơn.
+
+Chi phí bộ nhớ Llama3-8B-hf | Trong bộ nhớ đỉnh
+Kích hoạt | 29 | 0
+Trọng số | 15 | 15
+Gradient | 15 | 15
+Optimizer | 45 | 45
+Tổng | - | 75
+
+optimizer-in-backward. Tối ưu hóa bộ nhớ đầu tiên được thảo luận ở đây là optimizer-in-backward [4]. Nó fusion trạng thái optimizer với lượt truyền ngược để tiết kiệm bộ nhớ của gradient và intermediate optimizer. Trực quan hóa bộ nhớ của optimizer-in-backward được hiển thị trong Hình 8, trong đó không có giai đoạn optimizer mà chỉ có trạng thái forward và backward. Thời gian backward sẽ trở nên lớn hơn do fusion. Sử dụng công nghệ này, bộ nhớ đỉnh sẽ thay đổi thành tổng của trọng số, trạng thái optimizer, và kích hoạt. Mặc dù chúng tôi đã thành công tiết kiệm 30GB chi phí bộ nhớ của gradient và intermediate optimizer, nó cộng thêm 29GB chi phí bộ nhớ của kích hoạt, chỉ tiết kiệm 1GB bộ nhớ. Tổng cộng nó tiêu thụ 74GB bộ nhớ, như được hiển thị trong Bảng 9. Nó sẽ tệ hơn nếu độ dài chuỗi tăng, đưa thêm kích hoạt vào huấn luyện LLM. Do đó, optimizer-in-backward khó có thể có lợi cho huấn luyện chuỗi dài, nhưng nó đơn giản hóa quá trình huấn luyện, vì vậy chúng tôi sẽ bao gồm kỹ thuật này trong thảo luận sau.
+
+Bảng 9: Chi phí bộ nhớ của việc huấn luyện Llama3-8B trên GPU A100 80G đơn. Kỹ thuật optimizer in Backward được triển khai.
+
+Chi phí bộ nhớ Llama3-8B-hf | Trong bộ nhớ đỉnh
+Kích hoạt | 29 | 29
+Trọng số | 15 | 15
+Gradient | 15 | 0
+Optimizer | 30 | 30
+Tổng | - | 74
+
+ParametersActivationsOptimizer stateForward Backward Forward Backward
+Intermediate Value
+
+Hình 9: Trực quan hóa bộ nhớ của việc huấn luyện Llama3 8B với độ dài chuỗi 4k trên A100-80G. Kỹ thuật tính toán lại kích hoạt được triển khai ở đây
+
+Tính toán lại kích hoạt. Tính toán lại kích hoạt là một kỹ thuật mạnh mẽ được sử dụng trong phân tích của chúng tôi. Nó có thể giảm đáng kể kích hoạt với chi phí giảm nhỏ tốc độ huấn luyện do tính toán lại các phần của đồ thị trong quá trình lan truyền ngược. Như được hiển thị trong hình 9, nó thành công giảm tổng chi phí bộ nhớ từ 74GB xuống 52GB và giảm chi phí bộ nhớ kích hoạt từ 29GB xuống 7GB với tiết kiệm bộ nhớ 4×. Tuy nhiên, chúng tôi có thể dễ dàng tìm thấy nhiều điểm đơn lẻ trong đồ thị, xuất hiện như tín hiệu xung. Thời gian của tín hiệu xung này rất ngắn gọn, có nghĩa là đó là dữ liệu trung gian được tạo ra ngắn gọn trong lượt truyền thuận/ngược và ngay lập tức được loại bỏ khỏi bộ nhớ GPU HBM. Dữ liệu trung gian nổi bật nhất là vài lần tổng kích hoạt (4-5 lần trong phân tích dữ liệu của chúng tôi). Những dữ liệu trung gian này ảnh hưởng nghiêm trọng đến hiệu suất huấn luyện của chuỗi dài và trở thành nút thắt cổ chai kích hoạt của hàng.
+
+Bảng 10: Chi phí bộ nhớ của việc huấn luyện Llama3-8B trên GPU A100 80G đơn. Kỹ thuật tính toán lại kích hoạt được triển khai.
+
+Chi phí bộ nhớ Llama3-8B-hf | Trong bộ nhớ đỉnh
+Kích hoạt | 7 | 7
+Trọng số | 15 | 15
+Gradient | 15 | 0
+Optimizer | 30 | 30
+Tổng | - | 52
+
+ParametersActivationsOptimizer stateForward Backward Forward Backward
+Intermediate Value
+
+Hình 10: Trực quan hóa bộ nhớ của việc huấn luyện Llama3 8B với độ dài chuỗi 4k trên A100-80G. Kỹ thuật MINI-SEQUENCE TRANSFORMER được triển khai ở đây
+
+MINI-SEQUENCE TRANSFORMER (MST) Được truyền cảm hứng bởi quan sát từ kỹ thuật tính toán lại kích hoạt, chúng tôi đề xuất MST để giảm giá trị trung gian trong quá trình huấn luyện. Chúng tôi thành công giảm chi phí bộ nhớ của kích hoạt từ 7GB xuống 4GB, trong khi giá trị trung gian được giảm đáng kể. Điều này là do chỉ 1/M giá trị trung gian được sử dụng để tính toán đầu ra truyền thuận, lỗi truyền ngược, và gradient trong cả truyền thuận và ngược.
+
+Bảng 11: Chi phí bộ nhớ của việc huấn luyện Llama3-8B trên GPU A100 80G đơn. Kỹ thuật MINI-SEQUENCE TRANSFORMER được triển khai.
+
+Chi phí bộ nhớ Llama3-8B-hf | Trong bộ nhớ đỉnh
+Kích hoạt | 2 | 2
+Trọng số | 15 | 15
+Gradient | 15 | 0
+Optimizer | 30 | 30
+Tổng | - | 48
+
+Kết luận. chúng tôi so sánh việc sử dụng bộ nhớ theo thời gian khi huấn luyện mô hình Llama3-8B sử dụng kiến trúc transformer tiêu chuẩn so với sử dụng MST, được hiển thị trên 11.
+
+Trong Hình 11(a), cho thấy dòng thời gian bộ nhớ cho huấn luyện Llama3-8B tiêu chuẩn, chúng tôi có thể thấy rằng việc sử dụng bộ nhớ bị chi phối bởi ba thành phần chính: trọng số mô hình (màu xanh), trạng thái optimizer (màu xanh lá), và bộ nhớ trung gian (được làm nổi bật bởi vòng tròn đỏ). Việc sử dụng bộ nhớ đỉnh đạt khoảng 67GB.
+
+(a) Dòng thời gian bộ nhớ Transformer thông thường
+60
+50
+40
+30
+20
+10
+0
+ThờiganChi phí bộ nhớ(GB)
+60
+50
+40
+30
+10
+0
+ThờiganChi phí bộ nhớ(GB)
+Trọng số Trọng sốOptimizer OptimizerTrung gian Trung gianBộ nhớ đỉnh: 67GB Bộ nhớ đỉnh: 48GB(-30%)LLAMA 3 Được đề xuất LLAMA 3 Tiêu chuẩn
+(b) Dòng thời gian bộ nhớ Mini-Sequence Transformer
+20
+
+Hình 11: Trực quan hóa bộ nhớ. (a) Dòng thời gian bộ nhớ của việc huấn luyện Llama3-8B sử dụng kiến trúc transformer tiêu chuẩn, Vòng tròn đỏ làm nổi bật bộ nhớ trung gian (b) Dòng thời gian bộ nhớ của việc huấn luyện Llama3-8B sử dụng MST, Vòng tròn đỏ làm nổi bật bộ nhớ trung gian đã được thu hẹp.
+
+Ngược lại, Hình 11(b) thể hiện dòng thời gian bộ nhớ khi huấn luyện Llama3-8B với MST. Sự khác biệt quan trọng là bộ nhớ trung gian, một lần nữa được làm nổi bật bởi vòng tròn đỏ, đã được giảm đáng kể hoặc "thu hẹp" so với trường hợp transformer tiêu chuẩn. Kết quả là, việc sử dụng bộ nhớ đỉnh với MST là khoảng 47GB, đạt được giảm 30% so với transformer tiêu chuẩn.
+
+Các dòng thời gian bộ nhớ minh họa rằng MST hiệu quả giảm dấu chân bộ nhớ trung gian trong quá trình huấn luyện, đóng góp đáng kể vào tổng tiêu thụ bộ nhớ. Bằng cách giảm thiểu bộ nhớ trung gian, MST cho phép sử dụng bộ nhớ hiệu quả hơn và cho phép huấn luyện với độ dài chuỗi dài hơn hoặc kích thước batch lớn hơn trong khi vẫn nằm trong giới hạn bộ nhớ có sẵn của phần cứng.
+
+E Mở rộng đến chuỗi cực dài trong cài đặt phân tán
+
+Chúng tôi đánh giá mở rộng phân tán của MST trên các mô hình Llama3-8B Llama2-7B và so sánh với song song chuỗi DeepSpeed-Ulysses vanilla trên 2,4,8 GPU, tương ứng, cho độ dài chuỗi tối đa và thời gian huấn luyện tương ứng. Kết quả của đánh giá này được hiển thị trong Bảng 12.
+
+Bảng 12: Độ dài chuỗi tối đa của Llama3-8B, chạy trên cài đặt phân tán.
+
+Triển khai mô hình | Số lượng GPU
+2 | 4 | 8
+Llama3-8b-hf MST | 120 | 240 | 480
+Llama2-7B-hf MST | 160 | 320 | 640
+
+F Cần bao nhiêu mini-chuỗi trong quá trình tiền huấn luyện
+
+Chúng tôi cũng cung cấp hiểu biết về các đặc điểm hiệu suất và việc sử dụng bộ nhớ của mô hình Llama3-8B khi sử dụng phương pháp MINI-SEQUENCE TRANSFORMER (MST) với số lượng mini-chuỗi (M) và độ dài chuỗi khác nhau.
+
+Bảng 13 cho thấy thời gian thực thi cho các độ dài chuỗi và cài đặt mini-chuỗi khác nhau. Khi số lượng mini-chuỗi (M) tăng, thời gian thực thi tăng nhẹ, đặc biệt đối với chuỗi ngắn hơn. Tuy nhiên, đối với chuỗi dài hơn (ví dụ: 80000), thời gian thực thi vẫn tương đối ổn định trên các mini-chuỗi (M) khác nhau.
+
+Bảng 13: Thời gian LM-head cho các độ dài chuỗi và cài đặt mini-chuỗi khác nhau
+
+Thời gian LM-head | 1024 | 2048 | 4096 | 8192 | 20000 | 40000 | 80000
+tiêu chuẩn | 0.01 | 0.02 | 0.04 | 0.09 | 0.2 | 0.4 | 0.85
+M=2 | 0.02 | 0.04 | 0.07 | 0.14 | 0.31 | 0.67 | 1.36
+M=4 | 0.03 | 0.04 | 0.07 | 0.14 | 0.33 | 0.67 | 1.33
+M=8 | 0.04 | 0.05 | 0.08 | 0.14 | 0.34 | 0.67 | 1.34
+M=16 | 0.06 | 0.07 | 0.09 | 0.16 | 0.34 | 0.68 | 1.35
+M=32 | 0.11 | 0.11 | 0.14 | 0.19 | 0.37 | 0.69 | 1.36
+
+Bảng 14 cho thấy việc sử dụng bộ nhớ tính bằng gigabyte (GB) cho các độ dài chuỗi và cài đặt mini-chuỗi khác nhau cho thành phần LM-Head. Cài đặt tiêu chuẩn không có mini-chuỗi tiêu thụ 59.92 GB cho độ dài chuỗi 80000. Bằng cách tăng số lượng mini-chuỗi, việc sử dụng bộ nhớ giảm đáng kể. Với M=16, việc sử dụng bộ nhớ giảm xuống 9.12 GB cho cùng độ dài chuỗi, đạt được giảm 84.8% trong tiêu thụ bộ nhớ. Điều này được cải thiện thêm với M=32 lên 89.8%.
+
+Bảng 14: Việc sử dụng bộ nhớ LM-head (tính bằng GB) cho các độ dài chuỗi và cài đặt mini-chuỗi khác nhau
+
+Bộ nhớ LM-head | 1024 | 2048 | 4096 | 8192 | 20000 | 40000 | 80000
+tiêu chuẩn | 3.20 | 3.46 | 4.94 | 7.91 | 16.46 | 30.95 | 59.92
+mini-seq=2 | 2.59 | 3.21 | 4.46 | 6.95 | 14.14 | 26.31 | 50.66
+mini-seq=4 | 2.28 | 2.60 | 3.24 | 4.52 | 8.20 | 14.44 | 26.92
+mini-seq=8 | 2.13 | 2.30 | 2.63 | 3.30 | 5.24 | 8.51 | 15.05
+mini-seq=16 | 2.06 | 2.15 | 2.33 | 2.70 | 4.14 | 5.54 | 9.12
+mini-seq=32 | 2.02 | 2.07 | 2.18 | 2.39 | 3.01 | 4.06 | 6.15
+
+Bảng 15 cho thấy thời gian thực thi cho các độ dài chuỗi và cài đặt mini-chuỗi khác nhau. Giống như LM-Head, việc tăng M dẫn đến thời gian thực thi dài hơn một chút, đặc biệt đối với chuỗi ngắn hơn. Tuy nhiên, tác động đến thời gian thực thi là tối thiểu đối với chuỗi dài hơn (ví dụ: 80000).
+
+Bảng 15: Thời gian MLP (tính bằng giây) cho các độ dài chuỗi và cài đặt mini-chuỗi khác nhau
+
+Thời gian MLP | 1024 | 2048 | 4096 | 8192 | 20000 | 40000 | 80000
+tiêu chuẩn | 0.05 | 0.08 | 0.16 | 0.31 | 0.74 | 1.52 | 2.96
+M=2 | 0.05 | 0.10 | 0.17 | 0.32 | 0.76 | 1.49 | 3.05
+M=4 | 0.07 | 0.11 | 0.19 | 0.33 | 0.79 | 1.52 | 2.99
+M=8 | 0.12 | 0.15 | 0.22 | 0.38 | 0.81 | 1.58 | 3.05
+
+Đối với thành phần MLP, Bảng 16 thể hiện việc sử dụng bộ nhớ cho các độ dài chuỗi và cài đặt mini-chuỗi khác nhau. Cài đặt tiêu chuẩn tiêu thụ 14.72 GB cho độ dài chuỗi 80000, trong khi sử dụng M=8 mini-chuỗi giảm việc sử dụng bộ nhớ xuống 11.66 GB, dẫn đến giảm 20.8%. Ở đây, chúng tôi có thể quan sát.
+
+Phân tích cho thấy rằng việc tăng số lượng mini-chuỗi (M) có thể giảm đáng kể việc sử dụng bộ nhớ, đặc biệt đối với thành phần LM-Head, trong khi có tác động tối thiểu đến thời gian thực thi cho chuỗi dài hơn. Tiết kiệm bộ nhớ rõ ràng hơn đối với LM-Head so với MLP.
+
+Quan trọng cần lưu ý rằng trong khi MST rất có lợi cho huấn luyện với chuỗi cực dài, nó có thể dẫn đến suy giảm hiệu suất khi áp dụng cho các mô hình với chuỗi ngắn hơn do chi phí được đưa ra bởi việc phân vùng đầu vào và chuyển động bộ nhớ bổ sung cần thiết cho tích lũy gradient. Có thể dễ dàng quan sát từ Bảng 13 rằng việc sử dụng M=32 mini-chuỗi tăng thời gian thực thi từ 0.01s (cài đặt tiêu chuẩn) lên 0.11s cho độ dài chuỗi 1024, gây ra suy giảm hiệu suất 11x. Ngoài ra, từ Bảng 15, việc sử dụng M=8 mini-chuỗi tăng thời gian thực thi từ 0.05s (cài đặt tiêu chuẩn) lên 0.12s cho độ dài chuỗi 1024, gây ra suy giảm hiệu suất 2x. Giảm hiệu suất rõ ràng hơn đối với LM-Head so với MLP. May mắn thay, LM-head chiếm rất ít thời gian chạy của transformer, nhỏ hơn MLP và nhỏ hơn nhiều so với attention, vì vậy công nghệ của chúng tôi sẽ không ảnh hưởng đến hiệu suất tổng thể, ngay cả khi nó ảnh hưởng đến hiệu suất mô-đun của nó.
+
+Bảng 16: Việc sử dụng bộ nhớ MLP (tính bằng GB) cho các độ dài chuỗi và cài đặt mini-chuỗi khác nhau
+
+Bộ nhớ MLP | 1024 | 2048 | 4096 | 8192 | 20000 | 40000 | 80000
+tiêu chuẩn | 0.93 | 1.09 | 1.39 | 2.11 | 4.18 | 7.69 | 14.72
+M=2 | 1.29 | 1.36 | 1.50 | 2.00 | 3.76 | 6.73 | 12.69
+M=4 | 1.32 | 1.41 | 1.61 | 2.00 | 3.49 | 6.21 | 11.66
+M=8 | 1.33 | 1.44 | 1.66 | 2.11 | 3.42 | 6.17 | 11.66
+
+G Tích hợp với các khung hiện có
+
+Ý tưởng cốt lõi của MST về mặt khái niệm đơn giản, chủ yếu nhắm mục tiêu các khối MLP và LM-Head. Chúng tôi cung cấp hai phương pháp tích hợp:
+
+Hugging Face Transformer tùy chỉnh. Phương pháp này bao gồm việc sửa đổi trực tiếp thư viện Hugging Face Transformer để kết hợp chức năng MST. Bằng cách tùy chỉnh thư viện, người dùng có thể tích hợp liền mạch MST vào quy trình làm việc hiện có của họ sử dụng Hugging Face Transformers. Chúng tôi đã làm cho phương pháp này mã nguồn mở tại https://github.com/wdlctc/transformers.
+
+Để sử dụng Hugging Face Transformer tùy chỉnh với MST, nhà phát triển ML không thay đổi dòng nào mà cài đặt thư viện transformers tùy chỉnh của chúng tôi với MST:
+import transformers
+
+Chế độ Wrapper. Chế độ Wrapper cung cấp phương pháp ít xâm lấn hơn để tích hợp MST. Phương pháp này bao gồm việc tạo wrapper xung quanh các triển khai mô hình hiện có, chặn và sửa đổi các lượt truyền thuận và ngược của các khối MLP và LM-Head. Chúng tôi đã làm cho phương pháp này mã nguồn mở tại https://github.com/wdlctc/mini-s.
+
+Để sử dụng Chế độ Wrapper:
+from mini-s import mst
+model = mst(model)
+
+Kết luận. Cả hai phương pháp tích hợp đều cung cấp tính linh hoạt trong việc áp dụng MST cho huấn luyện chuỗi dài. Sự lựa chọn giữa Hugging Face Transformer tùy chỉnh và Chế độ Wrapper phụ thuộc vào yêu cầu cụ thể của dự án, mức độ tích hợp mong muốn, và sự sẵn lòng duy trì thư viện tùy chỉnh.
+
+Đối với người dùng đầu tư sâu vào hệ sinh thái Hugging Face, phương pháp Hugging Face Transformer tùy chỉnh có thể được ưa thích. Phương pháp này yêu cầu thay đổi tối thiểu cho codebase hiện có đã được tích hợp với hệ sinh thái Hugging Face, và cho phép truy cập tất cả tính năng và tối ưu hóa của Hugging Face. Đối với những người tìm kiếm giải pháp linh hoạt hơn hoặc làm việc với nhiều triển khai mô hình, Chế độ Wrapper có thể là lựa chọn tốt hơn để sử dụng với thách thức codebase tùy chỉnh.
+
+NeurIPS Paper Checklist
+
+Checklist được thiết kế để khuyến khích các thực hành tốt nhất cho nghiên cứu máy học có trách nhiệm, giải quyết các vấn đề về khả năng tái tạo, minh bạch, đạo đức nghiên cứu và tác động xã hội. Đừng loại bỏ checklist: Các bài báo không bao gồm checklist sẽ bị từ chối. Checklist nên theo sau tài liệu tham khảo và theo sau tài liệu bổ sung (tùy chọn). Checklist KHÔNG tính vào giới hạn trang.
+
+Vui lòng đọc hướng dẫn checklist cẩn thận để biết thông tin về cách trả lời những câu hỏi này. Đối với mỗi câu hỏi trong checklist:
+• Bạn nên trả lời [Có], [Không], hoặc [Không áp dụng].
+• [Không áp dụng] có nghĩa là câu hỏi không áp dụng cho bài báo cụ thể đó hoặc thông tin liên quan không có sẵn.
+• Vui lòng cung cấp một lời giải thích ngắn (1–2 câu) ngay sau câu trả lời của bạn (ngay cả cho Không áp dụng).
+
+Các câu trả lời checklist là một phần không thể thiếu của việc nộp bài báo của bạn. Chúng có thể nhìn thấy đối với các reviewers, area chairs, senior area chairs, và ethics reviewers. Bạn sẽ được yêu cầu cũng bao gồm nó (sau những sửa đổi cuối cùng) với phiên bản cuối cùng của bài báo của bạn, và phiên bản cuối cùng của nó sẽ được xuất bản cùng với bài báo.
+
+Các reviewers của bài báo của bạn sẽ được yêu cầu sử dụng checklist như một trong những yếu tố trong đánh giá của họ. Trong khi "[Có]" thường được ưa thích hơn "[Không]", hoàn toàn có thể chấp nhận trả lời "[Không]" miễn là có lời giải thích thích hợp (ví dụ: "thanh lỗi không được báo cáo vì nó sẽ quá tốn kém về mặt tính toán" hoặc "chúng tôi không thể tìm thấy giấy phép cho bộ dữ liệu chúng tôi đã sử dụng"). Nói chung, trả lời "[Không]" hoặc "[Không áp dụng]" không phải là lý do để từ chối. Trong khi các câu hỏi được phát biểu theo cách nhị phân, chúng tôi thừa nhận rằng câu trả lời thực sự thường tinh tế hơn, vì vậy vui lòng chỉ cần sử dụng phán đoán tốt nhất của bạn và viết lời giải thích để làm rõ. Tất cả bằng chứng hỗ trợ có thể xuất hiện trong bài báo chính hoặc tài liệu bổ sung, được cung cấp trong phụ lục. Nếu bạn trả lời [Có] cho một câu hỏi, trong lời giải thích vui lòng chỉ ra phần nơi tài liệu liên quan cho câu hỏi có thể được tìm thấy.
+
+QUAN TRỌNG, vui lòng:
+• Xóa khối hướng dẫn này, nhưng giữ tiêu đề phần "NeurIPS paper checklist",
+• Giữ tiêu đề phần con checklist, câu hỏi/câu trả lời và hướng dẫn bên dưới.
+• Không sửa đổi câu hỏi và chỉ sử dụng các macro được cung cấp cho câu trả lời của bạn.
+
+1. Tuyên bố
+Câu hỏi: Các tuyên bố chính được đưa ra trong tóm tắt và giới thiệu có phản ánh chính xác đóng góp và phạm vi của bài báo không?
+Câu trả lời: [Có]
+Lời giải thích: Phần 1
+Hướng dẫn:
+• Câu trả lời Không áp dụng có nghĩa là tóm tắt và giới thiệu không bao gồm các tuyên bố được đưa ra trong bài báo.
+• Tóm tắt và/hoặc giới thiệu nên nêu rõ các tuyên bố được đưa ra, bao gồm các đóng góp được thực hiện trong bài báo và những giả định và hạn chế quan trọng. Câu trả lời Không hoặc Không áp dụng cho câu hỏi này sẽ không được các reviewers đánh giá tốt.
+• Các tuyên bố được đưa ra nên phù hợp với kết quả lý thuyết và thực nghiệm, và phản ánh mức độ kết quả có thể được mong đợi khái quát hóa sang các cài đặt khác.
+• Có thể bao gồm các mục tiêu khát vọng làm động lực miễn là rõ ràng rằng những mục tiêu này không được đạt được bởi bài báo.
+
+2. Hạn chế
+Câu hỏi: Bài báo có thảo luận về các hạn chế của công việc được thực hiện bởi các tác giả không?
+Câu trả lời: [Có]
+Lời giải thích: Phần 6
+Hướng dẫn:
+• Câu trả lời Không áp dụng có nghĩa là bài báo không có hạn chế trong khi câu trả lời Không có nghĩa là bài báo có hạn chế, nhưng những hạn chế đó không được thảo luận trong bài báo.
+• Các tác giả được khuyến khích tạo một phần "Hạn chế" riêng biệt trong bài báo của họ.
+• Bài báo nên chỉ ra bất kỳ giả định mạnh nào và mức độ mạnh mẽ của kết quả đối với việc vi phạm những giả định này (ví dụ: giả định độc lập, cài đặt không nhiễu, đặc tả mô hình tốt, xấp xỉ tiệm cận chỉ giữ cục bộ). Các tác giả nên suy ngẫm về cách những giả định này có thể bị vi phạm trong thực tế và hệ quả sẽ là gì.
+• Các tác giả nên suy ngẫm về phạm vi của các tuyên bố được đưa ra, ví dụ: nếu phương pháp chỉ được kiểm tra trên một vài bộ dữ liệu hoặc với một vài lần chạy. Nói chung, kết quả thực nghiệm thường phụ thuộc vào các giả định ngầm, cần được diễn đạt.
+• Các tác giả nên suy ngẫm về các yếu tố ảnh hưởng đến hiệu suất của phương pháp. Ví dụ: một thuật toán nhận dạng khuôn mặt có thể hoạt động kém khi độ phân giải hình ảnh thấp hoặc hình ảnh được chụp trong ánh sáng yếu. Hoặc một hệ thống chuyển giọng nói thành văn bản có thể không được sử dụng đáng tin cậy để cung cấp phụ đề đóng cho các bài giảng trực tuyến vì nó không xử lý được thuật ngữ kỹ thuật.
+• Các tác giả nên thảo luận về hiệu quả tính toán của các thuật toán được đề xuất và cách chúng mở rộng theo kích thước bộ dữ liệu.
+• Nếu áp dụng, các tác giả nên thảo luận về các hạn chế có thể có của phương pháp của họ để giải quyết các vấn đề về quyền riêng tư và công bằng.
+• Trong khi các tác giả có thể sợ rằng sự trung thực hoàn toàn về hạn chế có thể được các reviewers sử dụng làm lý do để từ chối, một kết quả tệ hơn có thể là các reviewers phát hiện ra những hạn chế không được thừa nhận trong bài báo. Các tác giả nên sử dụng phán đoán tốt nhất của họ và nhận ra rằng các hành động cá nhân ủng hộ minh bạch đóng vai trò quan trọng trong việc phát triển các chuẩn mực bảo tồn tính toàn vẹn của cộng đồng. Các reviewers sẽ được hướng dẫn cụ thể không phạt tính trung thực về hạn chế.
+
+3. Giả định và chứng minh lý thuyết
+Câu hỏi: Đối với mỗi kết quả lý thuyết, bài báo có cung cấp tập hợp đầy đủ các giả định và một chứng minh hoàn chỉnh (và chính xác) không?
+Câu trả lời: [Có]
+Lời giải thích: Phần 3.3
+Hướng dẫn:
+• Câu trả lời Không áp dụng có nghĩa là bài báo không bao gồm kết quả lý thuyết.
+• Tất cả các định lý, công thức và chứng minh trong bài báo nên được đánh số và tham chiếu chéo.
+• Tất cả giả định nên được nêu rõ hoặc tham chiếu trong tuyên bố của bất kỳ định lý nào.
+• Các chứng minh có thể xuất hiện trong bài báo chính hoặc tài liệu bổ sung, nhưng nếu chúng xuất hiện trong tài liệu bổ sung, các tác giả được khuyến khích cung cấp một phác thảo chứng minh ngắn để cung cấp trực giác.
+• Ngược lại, bất kỳ chứng minh không chính thức nào được cung cấp trong phần cốt lõi của bài báo nên được bổ sung bằng chứng minh chính thức được cung cấp trong phụ lục hoặc tài liệu bổ sung.
+• Các định lý và bổ đề mà chứng minh dựa vào nên được tham chiếu thích hợp.
+
+4. Khả năng tái tạo kết quả thực nghiệm
+Câu hỏi: Bài báo có tiết lộ đầy đủ tất cả thông tin cần thiết để tái tạo các kết quả thực nghiệm chính của bài báo đến mức ảnh hưởng đến các tuyên bố và/hoặc kết luận chính của bài báo (bất kể mã và dữ liệu có được cung cấp hay không)?
+Câu trả lời: [Có]
+Lời giải thích: Phụ lục D
+Hướng dẫn:
+• Câu trả lời Không áp dụng có nghĩa là bài báo không bao gồm thí nghiệm.
+• Nếu bài báo bao gồm thí nghiệm, câu trả lời Không cho câu hỏi này sẽ không được các reviewers đánh giá tốt: Làm cho bài báo có thể tái tạo là quan trọng, bất kể mã và dữ liệu có được cung cấp hay không.
+• Nếu đóng góp là một bộ dữ liệu và/hoặc mô hình, các tác giả nên mô tả các bước được thực hiện để làm cho kết quả của họ có thể tái tạo hoặc có thể xác minh.
+• Tùy thuộc vào đóng góp, khả năng tái tạo có thể được thực hiện theo nhiều cách khác nhau. Ví dụ: nếu đóng góp là một kiến trúc mới, việc mô tả kiến trúc đầy đủ có thể đủ, hoặc nếu đóng góp là một mô hình cụ thể và đánh giá thực nghiệm, có thể cần thiết để hoặc làm cho người khác có thể sao chép mô hình với cùng bộ dữ liệu, hoặc cung cấp quyền truy cập vào mô hình. Nói chung. việc phát hành mã và dữ liệu thường là một cách tốt để thực hiện điều này, nhưng khả năng tái tạo cũng có thể được cung cấp thông qua hướng dẫn chi tiết về cách sao chép kết quả, truy cập vào mô hình được lưu trữ (ví dụ: trong trường hợp mô hình ngôn ngữ lớn), phát hành checkpoint mô hình, hoặc các phương tiện khác phù hợp với nghiên cứu được thực hiện.
+• Trong khi NeurIPS không yêu cầu phát hành mã, hội nghị yêu cầu tất cả việc nộp cung cấp một số con đường hợp lý cho khả năng tái tạo, có thể phụ thuộc vào bản chất của đóng góp. Ví dụ:
+(a) Nếu đóng góp chủ yếu là một thuật toán mới, bài báo nên làm rõ cách tái tạo thuật toán đó.
+(b) Nếu đóng góp chủ yếu là một kiến trúc mô hình mới, bài báo nên mô tả kiến trúc một cách rõ ràng và đầy đủ.
+(c) Nếu đóng góp là một mô hình mới (ví dụ: một mô hình ngôn ngữ lớn), thì nên có cách để truy cập mô hình này để tái tạo kết quả hoặc cách để tái tạo mô hình (ví dụ: với bộ dữ liệu mã nguồn mở hoặc hướng dẫn về cách xây dựng bộ dữ liệu).
+(d) Chúng tôi nhận ra rằng khả năng tái tạo có thể khó khăn trong một số trường hợp, trong trường hợp đó các tác giả được hoan nghênh mô tả cách cụ thể họ cung cấp cho khả năng tái tạo. Trong trường hợp các mô hình nguồn đóng, có thể là quyền truy cập vào mô hình bị hạn chế theo một cách nào đó (ví dụ: cho người dùng đã đăng ký), nhưng nó nên có thể cho các nhà nghiên cứu khác có một số con đường để tái tạo hoặc xác minh kết quả.
+
+5. Quyền truy cập mở vào dữ liệu và mã
+Câu hỏi: Bài báo có cung cấp quyền truy cập mở vào dữ liệu và mã, với hướng dẫn đủ để tái tạo trung thực các kết quả thực nghiệm chính, như được mô tả trong tài liệu bổ sung không?
+Câu trả lời: [Có]
+Lời giải thích: tài liệu cung cấp
+Hướng dẫn:
+• Câu trả lời Không áp dụng có nghĩa là bài báo không bao gồm thí nghiệm yêu cầu mã.
+• Vui lòng xem hướng dẫn nộp mã và dữ liệu NeurIPS (https://nips.cc/public/guides/CodeSubmissionPolicy) để biết thêm chi tiết.
+• Trong khi chúng tôi khuyến khích việc phát hành mã và dữ liệu, chúng tôi hiểu rằng điều này có thể không khả thi, vì vậy "Không" là câu trả lời có thể chấp nhận. Các bài báo không thể bị từ chối đơn giản vì không bao gồm mã, trừ khi điều này là trung tâm của đóng góp (ví dụ: cho một benchmark mã nguồn mở mới).
+• Hướng dẫn nên chứa lệnh chính xác và môi trường cần thiết để chạy để tái tạo kết quả. Xem hướng dẫn nộp mã và dữ liệu NeurIPS (https://nips.cc/public/guides/CodeSubmissionPolicy) để biết thêm chi tiết.
+• Các tác giả nên cung cấp hướng dẫn về truy cập và chuẩn bị dữ liệu, bao gồm cách truy cập dữ liệu thô, dữ liệu được xử lý trước, dữ liệu trung gian và dữ liệu được tạo, v.v.
+• Các tác giả nên cung cấp scripts để tái tạo tất cả kết quả thực nghiệm cho phương pháp mới được đề xuất và baseline. Nếu chỉ một tập con của thí nghiệm có thể tái tạo, họ nên nêu rõ những cái nào được bỏ qua khỏi script và tại sao.
+• Tại thời điểm nộp, để bảo tồn tính ẩn danh, các tác giả nên phát hành các phiên bản ẩn danh (nếu áp dụng).
+• Cung cấp càng nhiều thông tin càng tốt trong tài liệu bổ sung (được đính kèm với bài báo) được khuyến nghị, nhưng bao gồm URL đến dữ liệu và mã được cho phép.
+
+6. Cài đặt/Chi tiết thực nghiệm
+Câu hỏi: Bài báo có chỉ định tất cả chi tiết huấn luyện và kiểm tra (ví dụ: phân chia dữ liệu, siêu tham số, cách chúng được chọn, loại optimizer, v.v.) cần thiết để hiểu kết quả không?
+Câu trả lời: [Có]
+Lời giải thích: Phần 4
+Hướng dẫn:
+• Câu trả lời Không áp dụng có nghĩa là bài báo không bao gồm thí nghiệm.
+• Cài đặt thực nghiệm nên được trình bày trong phần cốt lõi của bài báo ở mức chi tiết cần thiết để đánh giá kết quả và hiểu chúng.
+• Chi tiết đầy đủ có thể được cung cấp hoặc với mã, trong phụ lục, hoặc như tài liệu bổ sung.
+
+7. Ý nghĩa thống kê thực nghiệm
+Câu hỏi: Bài báo có báo cáo thanh lỗi được định nghĩa phù hợp và chính xác hoặc thông tin thích hợp khác về ý nghĩa thống kê của thí nghiệm không?
+Câu trả lời: [Không]
+Lời giải thích: Thanh lỗi không được báo cáo vì nó sẽ quá tốn kém về mặt tính toán.
+Hướng dẫn:
+• Câu trả lời Không áp dụng có nghĩa là bài báo không bao gồm thí nghiệm.
+• Các tác giả nên trả lời "Có" nếu kết quả được đi kèm với thanh lỗi, khoảng tin cậy, hoặc kiểm tra ý nghĩa thống kê, ít nhất cho các thí nghiệm hỗ trợ các tuyên bố chính của bài báo.
+• Các yếu tố biến động mà thanh lỗi đang nắm bắt nên được nêu rõ (ví dụ: phân chia train/test, khởi tạo, vẽ ngẫu nhiên của một số tham số, hoặc chạy tổng thể với các điều kiện thực nghiệm cho trước).
+• Phương pháp tính toán thanh lỗi nên được giải thích (công thức dạng đóng, gọi hàm thư viện, bootstrap, v.v.)
+• Các giả định được đưa ra nên được cho (ví dụ: lỗi phân phối Bình thường).
+• Nên rõ ràng liệu thanh lỗi là độ lệch chuẩn hay sai số chuẩn của trung bình.
+• Có thể báo cáo thanh lỗi 1-sigma, nhưng người ta nên nêu rõ nó. Các tác giả nên ưu tiên báo cáo thanh lỗi 2-sigma hơn là nêu rằng họ có 96% CI, nếu giả thuyết Bình thường của lỗi không được xác minh.
+• Đối với phân phối bất đối xứng, các tác giả nên cẩn thận không hiển thị trong bảng hoặc hình thanh lỗi đối xứng sẽ mang lại kết quả ngoài phạm vi (ví dụ: tỷ lệ lỗi âm).
+• Nếu thanh lỗi được báo cáo trong bảng hoặc biểu đồ, Các tác giả nên giải thích trong văn bản cách chúng được tính toán và tham chiếu các hình hoặc bảng tương ứng trong văn bản.
+
+8. Tài nguyên tính toán thực nghiệm
+Câu hỏi: Đối với mỗi thí nghiệm, bài báo có cung cấp thông tin đầy đủ về tài nguyên máy tính (loại workers tính toán, bộ nhớ, thời gian thực thi) cần thiết để tái tạo thí nghiệm không?
+Câu trả lời: [Có]
+Lời giải thích: GPU A100
+Hướng dẫn:
+• Câu trả lời Không áp dụng có nghĩa là bài báo không bao gồm thí nghiệm.
+• Bài báo nên chỉ ra loại workers tính toán CPU hoặc GPU, cluster nội bộ, hoặc nhà cung cấp đám mây, bao gồm bộ nhớ và lưu trữ liên quan.
+• Bài báo nên cung cấp lượng tính toán cần thiết cho mỗi lần chạy thực nghiệm riêng lẻ cũng như ước tính tổng tính toán.
+• Bài báo nên tiết lộ liệu dự án nghiên cứu đầy đủ có yêu cầu nhiều tính toán hơn các thí nghiệm được báo cáo trong bài báo hay không (ví dụ: thí nghiệm sơ bộ hoặc thất bại không đưa vào bài báo).
+
+9. Quy tắc đạo đức
+Câu hỏi: Nghiên cứu được tiến hành trong bài báo có tuân thủ, về mọi mặt, với Quy tắc đạo đức NeurIPS https://neurips.cc/public/EthicsGuidelines không?
+Câu trả lời: [Có]
+Lời giải thích:
+Hướng dẫn:
+• Câu trả lời Không áp dụng có nghĩa là các tác giả chưa xem xét Quy tắc đạo đức NeurIPS.
+• Nếu các tác giả trả lời Không, họ nên giải thích những tình huống đặc biệt yêu cầu sự lệch khỏi Quy tắc đạo đức.
+• Các tác giả nên đảm bảo bảo tồn tính ẩn danh (ví dụ: nếu có xem xét đặc biệt do luật pháp hoặc quy định trong khu vực pháp lý của họ).
+
+10. Tác động rộng hơn
+Câu hỏi: Bài báo có thảo luận về cả tác động xã hội tích cực tiềm năng và tác động xã hội tiêu cực của công việc được thực hiện không?
+Câu trả lời: [Không áp dụng]
+Lời giải thích:
+Hướng dẫn:
+• Câu trả lời Không áp dụng có nghĩa là không có tác động xã hội của công việc được thực hiện.
+• Nếu các tác giả trả lời Không áp dụng hoặc Không, họ nên giải thích tại sao công việc của họ không có tác động xã hội hoặc tại sao bài báo không giải quyết tác động xã hội.
+• Ví dụ về tác động xã hội tiêu cực bao gồm các sử dụng độc hại hoặc không mong muốn tiềm năng (ví dụ: thông tin sai lệch, tạo hồ sơ giả, giám sát), cân nhắc về công bằng (ví dụ: triển khai các công nghệ có thể đưa ra quyết định ảnh hưởng không công bằng đến các nhóm cụ thể), cân nhắc về quyền riêng tư và cân nhắc về bảo mật.
+• Hội nghị mong đợi rằng nhiều bài báo sẽ là nghiên cứu nền tảng và không gắn với các ứng dụng cụ thể, chứ đừng nói đến việc triển khai. Tuy nhiên, nếu có con đường trực tiếp đến bất kỳ ứng dụng tiêu cực nào, các tác giả nên chỉ ra. Ví dụ: hợp lệ khi chỉ ra rằng một cải thiện trong chất lượng của các mô hình tạo sinh có thể được sử dụng để tạo deepfakes cho thông tin sai lệch. Mặt khác, không cần chỉ ra rằng một thuật toán chung để tối ưu hóa mạng neural có thể cho phép mọi người huấn luyện mô hình tạo Deepfakes nhanh hơn.
+• Các tác giả nên xem xét những tổn hại có thể có thể phát sinh khi công nghệ được sử dụng như dự định và hoạt động chính xác, những tổn hại có thể phát sinh khi công nghệ được sử dụng như dự định nhưng cho kết quả không chính xác, và những tổn hại theo sau từ việc sử dụng sai (có chủ ý hoặc vô ý) công nghệ.
+• Nếu có tác động xã hội tiêu cực, các tác giả cũng có thể thảo luận về các chiến lược giảm thiểu có thể (ví dụ: phát hành có cổng của mô hình, cung cấp phòng thủ ngoài tấn công, cơ chế để giám sát sử dụng sai, cơ chế để giám sát cách hệ thống học từ phản hồi theo thời gian, cải thiện hiệu quả và khả năng tiếp cận của ML).
+
+11. Biện pháp bảo vệ
+Câu hỏi: Bài báo có mô tả các biện pháp bảo vệ đã được đặt ra cho việc phát hành có trách nhiệm dữ liệu hoặc mô hình có nguy cơ cao bị lạm dụng (ví dụ: mô hình ngôn ngữ được tiền huấn luyện, trình tạo hình ảnh, hoặc bộ dữ liệu được cạo) không?
+Câu trả lời: [Không áp dụng]
+Lời giải thích:
+Hướng dẫn:
+• Câu trả lời Không áp dụng có nghĩa là bài báo không đặt ra những rủi ro như vậy.
+• Các mô hình được phát hành có nguy cơ cao bị lạm dụng hoặc sử dụng kép nên được phát hành với các biện pháp bảo vệ cần thiết để cho phép sử dụng có kiểm soát mô hình, ví dụ bằng cách yêu cầu người dùng tuân thủ hướng dẫn sử dụng hoặc hạn chế để truy cập mô hình hoặc triển khai bộ lọc an toàn.
+• Các bộ dữ liệu đã được cạo từ Internet có thể đặt ra rủi ro an toàn. Các tác giả nên mô tả cách họ tránh phát hành hình ảnh không an toàn.
+• Chúng tôi nhận ra rằng việc cung cấp các biện pháp bảo vệ hiệu quả là thách thức, và nhiều bài báo không yêu cầu điều này, nhưng chúng tôi khuyến khích các tác giả tính đến điều này và thực hiện nỗ lực thiện chí tốt nhất.
+
+12. Giấy phép cho tài sản hiện có
+Câu hỏi: Những người tạo ra hoặc chủ sở hữu ban đầu của tài sản (ví dụ: mã, dữ liệu, mô hình), được sử dụng trong bài báo, có được ghi nhận đúng cách và giấy phép và điều khoản sử dụng có được đề cập rõ ràng và được tôn trọng đúng cách không?
+Câu trả lời: [Có]
+Lời giải thích: Tài liệu tham khảo
+Hướng dẫn:
+• Câu trả lời Không áp dụng có nghĩa là bài báo không sử dụng tài sản hiện có.
+• Các tác giả nên trích dẫn bài báo gốc đã tạo ra gói mã hoặc bộ dữ liệu.
+• Các tác giả nên nêu rõ phiên bản nào của tài sản được sử dụng và, nếu có thể, bao gồm một URL.
+• Tên của giấy phép (ví dụ: CC-BY 4.0) nên được bao gồm cho mỗi tài sản.
+• Đối với dữ liệu được cạo từ một nguồn cụ thể (ví dụ: trang web), bản quyền và điều khoản dịch vụ của nguồn đó nên được cung cấp.
+• Nếu tài sản được phát hành, giấy phép, thông tin bản quyền và điều khoản sử dụng trong gói nên được cung cấp. Đối với các bộ dữ liệu phổ biến, paperswithcode.com/datasets đã tuyển chọn giấy phép cho một số bộ dữ liệu. Hướng dẫn cấp phép của họ có thể giúp xác định giấy phép của một bộ dữ liệu.
+• Đối với các bộ dữ liệu hiện có được đóng gói lại, cả giấy phép gốc và giấy phép của tài sản phái sinh (nếu nó đã thay đổi) nên được cung cấp.
+• Nếu thông tin này không có sẵn trực tuyến, các tác giả được khuyến khích liên hệ với những người tạo ra tài sản.
+
+13. Tài sản mới
+Câu hỏi: Các tài sản mới được giới thiệu trong bài báo có được ghi chép tốt và tài liệu có được cung cấp cùng với tài sản không?
+Câu trả lời: [Có]
+Lời giải thích: [Không áp dụng].
+Hướng dẫn:
+• Câu trả lời Không áp dụng có nghĩa là bài báo không phát hành tài sản mới.
+• Các nhà nghiên cứu nên truyền đạt chi tiết của bộ dữ liệu/mã/mô hình như một phần của việc nộp của họ thông qua các mẫu có cấu trúc. Điều này bao gồm chi tiết về huấn luyện, giấy phép, hạn chế, v.v.
+• Bài báo nên thảo luận về việc liệu và cách sự đồng ý đã được thu được từ những người có tài sản được sử dụng.
+• Tại thời điểm nộp, hãy nhớ ẩn danh tài sản của bạn (nếu áp dụng). Bạn có thể tạo URL ẩn danh hoặc bao gồm tệp zip ẩn danh.
+
+14. Crowdsourcing và nghiên cứu với đối tượng con người
+Câu hỏi: Đối với các thí nghiệm crowdsourcing và nghiên cứu với đối tượng con người, bài báo có bao gồm toàn bộ văn bản hướng dẫn được đưa cho người tham gia và ảnh chụp màn hình, nếu áp dụng, cũng như chi tiết về bồi thường (nếu có) không?
+Câu trả lời: [Không áp dụng]
+Lời giải thích:
+Hướng dẫn:
+• Câu trả lời Không áp dụng có nghĩa là bài báo không liên quan đến crowdsourcing cũng như nghiên cứu với đối tượng con người.
+• Bao gồm thông tin này trong tài liệu bổ sung là tốt, nhưng nếu đóng góp chính của bài báo liên quan đến đối tượng con người, thì càng nhiều chi tiết càng tốt nên được bao gồm trong bài báo chính.
+• Theo Quy tắc đạo đức NeurIPS, các workers tham gia vào thu thập dữ liệu, tuyển chọn, hoặc lao động khác nên được trả ít nhất mức lương tối thiểu ở quốc gia của người thu thập dữ liệu.
+
+15. Phê duyệt Hội đồng đánh giá thể chế (IRB) hoặc tương đương cho nghiên cứu với đối tượng con người
+Câu hỏi: Bài báo có mô tả các rủi ro tiềm năng gặp phải bởi người tham gia nghiên cứu, liệu những rủi ro như vậy đã được tiết lộ cho đối tượng hay không, và liệu phê duyệt Hội đồng đánh giá thể chế (IRB) (hoặc phê duyệt/đánh giá tương đương dựa trên yêu cầu của quốc gia hoặc thể chế của bạn) đã được thu được hay không?
+Câu trả lời: [Không áp dụng]
+Lời giải thích:
+Hướng dẫn:
+• Câu trả lời Không áp dụng có nghĩa là bài báo không liên quan đến crowdsourcing cũng như nghiên cứu với đối tượng con người.
+• Tùy thuộc vào quốc gia nơi nghiên cứu được tiến hành, phê duyệt IRB (hoặc tương đương) có thể được yêu cầu cho bất kỳ nghiên cứu đối tượng con người nào. Nếu bạn đã nhận được phê duyệt IRB, bạn nên nêu rõ điều này trong bài báo.
+• Chúng tôi nhận ra rằng các thủ tục cho điều này có thể khác nhau đáng kể giữa các thể chế và địa điểm, và chúng tôi mong đợi các tác giả tuân thủ Quy tắc đạo đức NeurIPS và hướng dẫn cho thể chế của họ.
+• Đối với việc nộp ban đầu, đừng bao gồm bất kỳ thông tin nào sẽ phá vỡ tính ẩn danh (nếu áp dụng), chẳng hạn như thể chế tiến hành đánh giá.

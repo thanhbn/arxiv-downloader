@@ -1,0 +1,255 @@
+# Giraffe: Cuộc phiêu lưu mở rộng độ dài ngữ cảnh trong LLM
+Arka Pal∗, Deep Karkhanis, Manley Roberts,
+Samuel Dooley, Arvind Sundararajan, Siddartha Naidu
+Abacus.AI
+
+## Tóm tắt
+Các mô hình ngôn ngữ lớn hiện đại (LLM) dựa trên cơ chế attention thường được huấn luyện với độ dài ngữ cảnh cố định, điều này tạo ra giới hạn trên cho độ dài của các chuỗi đầu vào mà chúng có thể xử lý tại thời điểm đánh giá. Để sử dụng các mô hình này trên các chuỗi dài hơn độ dài ngữ cảnh tại thời điểm huấn luyện, người ta có thể sử dụng các kỹ thuật từ họ phương pháp ngoại suy độ dài ngữ cảnh đang phát triển — hầu hết trong số này tập trung vào việc sửa đổi hệ thống mã hóa vị trí được sử dụng trong cơ chế attention để chỉ ra vị trí của các token hoặc activation trong chuỗi đầu vào. Chúng tôi tiến hành một khảo sát rộng rãi về các phương pháp ngoại suy độ dài ngữ cảnh hiện có trên mô hình LLaMA hoặc LLaMA 2 cơ sở, và giới thiệu một số thiết kế của riêng chúng tôi — đặc biệt là một chiến lược cắt bớt mới để sửa đổi cơ sở cho việc mã hóa vị trí.
+
+Chúng tôi kiểm tra các phương pháp này bằng cách sử dụng ba nhiệm vụ đánh giá mới (FreeFormQA, AlteredNumericQA và LongChat-Lines) cũng như perplexity, mà chúng tôi thấy là ít chi tiết hơn như một thước đo hiệu suất ngữ cảnh dài của LLM. Chúng tôi phát hành ba nhiệm vụ này công khai như các tập dữ liệu trên HuggingFace. Chúng tôi khám phá ra rằng tỷ lệ tuyến tính là phương pháp tốt nhất để mở rộng độ dài ngữ cảnh, và chỉ ra rằng có thể đạt được lợi ích thêm bằng cách sử dụng tỷ lệ dài hơn tại thời điểm đánh giá. Chúng tôi cũng khám pha ra khả năng ngoại suy hứa hẹn trong cơ sở bị cắt bớt. Để hỗ trợ nghiên cứu thêm trong lĩnh vực này, chúng tôi phát hành ba mô hình ngữ cảnh dài 13B tham số mới mà chúng tôi gọi là Giraffe: các mô hình ngữ cảnh 4k và 16k được huấn luyện từ LLaMA-13B cơ sở, và một mô hình ngữ cảnh 32k được huấn luyện từ LLaMA2-13B cơ sở. Chúng tôi cũng phát hành mã để tái tạo kết quả của chúng tôi.¹
+
+## 1 Giới thiệu
+Trong những năm gần đây, transformer [1] đã trở thành kiến trúc mạng nơ-ron thống trị trong nhiều nhiệm vụ mô hình hóa ngôn ngữ tự nhiên [2, 3], nhờ vào tính linh hoạt và khả năng thích ứng để được huấn luyện trên các tập dữ liệu cực lớn [4, 5]. Sau đó, một thuật ngữ phổ biến đã được áp dụng cho các mạng nơ-ron này là 'Mô hình Ngôn ngữ Lớn' (LLM) — với 'Lớn' đề cập đến cả kích thước tập dữ liệu huấn luyện cũng như số lượng tham số của chúng (và thực sự, chi phí huấn luyện và môi trường liên quan).
+
+Một yếu tố chính của kiến trúc transformer tiêu chuẩn là tính không nhạy cảm vốn có của nó đối với thứ tự của các phần tử đầu vào. Attention về bản chất là một phép toán giống như tập hợp trong đó vị trí của các phần tử không quan trọng [1]. Tuy nhiên, thứ tự của các phần tử rất quan trọng đối với nhiều nhiệm vụ quan trọng như phân tích ngôn ngữ tự nhiên, lập trình, dự báo, v.v. Do đó, cần thiết phải tiêm thông tin vị trí vào các đầu vào của LLM, thường ở dạng mã hóa vị trí.
+
+Một desideratum có thể có của một sơ đồ mã hóa vị trí là ngoại suy độ dài ngữ cảnh: khả năng sử dụng LLM để suy luận trên độ dài đầu vào dài hơn những gì nó được huấn luyện. Do sự phức tạp tăng bậc hai của cơ chế attention trong transformer, thường không khả thi để huấn luyện trên độ dài ngữ cảnh lớn. Lợi ích của việc tăng độ dài ngữ cảnh rất đa dạng - cho phép đọc các tài liệu và bài báo dài hơn, tính nhất quán nội bộ hơn trong các cuộc trò chuyện dài với người dùng trong chatbot được hỗ trợ bởi LLM, làm việc trên các codebase lớn hơn, và vân vân. Chúng ta có thể chia ngoại suy độ dài ngữ cảnh thành hai mô hình chính. Đầu tiên, có ngoại suy tinh chỉnh nơi một mô hình trước đó được tiền huấn luyện trên các ngữ cảnh ngắn hơn được phép tinh chỉnh, hoặc cập nhật trọng số mô hình dựa trên độ dài ngữ cảnh dài hơn. Ngoài ra, có ngoại suy zero-shot nơi một mô hình trước đó được tiền huấn luyện trên các ngữ cảnh ngắn được đánh giá ngay lập tức trên độ dài ngữ cảnh dài hơn với cùng trọng số như mô hình ngữ cảnh ngắn.
+
+Trong bài báo này, chúng tôi tập trung chủ yếu vào ngoại suy zero-shot và đưa ra các đóng góp chính sau:
+
+**Đánh giá các sơ đồ ngoại suy ngữ cảnh khác nhau** Chúng tôi tiến hành khảo sát các phương pháp ngoại suy độ dài ngữ cảnh với mô hình cơ sở được tiền huấn luyện, và thử một số phát minh của riêng chúng tôi. Đặc biệt, chúng tôi trình bày một cơ sở bị cắt bớt mới cho mã hóa vị trí. Trọng tâm trong bài báo này về các mô hình được tiền huấn luyện cũng khác với các công trình khác trong tài liệu [6, 7], có xu hướng thay vào đó huấn luyện từ đầu với một sơ đồ mã hóa vị trí được chọn. Như đã đề cập ở trên, mặc dù LLM đã thành công, việc huấn luyện chúng là một doanh nghiệp tốn kém. Các mô hình nguồn đóng nổi tiếng bao gồm GPT-4 [8] và Claude [9]. Gần đây LLaMA nguồn mở [10] đã được phát hành bởi một nhóm tại Meta AI, và điều này được theo sau bởi LLaMA2 được cải thiện [11]. Theo quan điểm của chúng tôi, tài nguyên cần thiết để huấn luyện các mô hình cơ sở cạnh tranh thuộc bản chất này sẽ vẫn bị ràng buộc với một số ít người chơi lớn. Do đó, điều quan trọng là có thể sửa đổi các mô hình theo mong muốn cho người dùng cuối—lý tưởng nhất là với một phần nhỏ sức mạnh tính toán được áp dụng.
+
+Những phát hiện chính của chúng tôi là:
+• Nội suy tuyến tính là tốt nhất như một phương pháp ngoại suy độ dài ngữ cảnh.
+• Tất cả các phương pháp ngoại suy độ dài ngữ cảnh đều cho thấy sự suy giảm về độ chính xác nhiệm vụ, ngay cả đối với các độ dài mà chúng cung cấp đầu ra mạch lạc khác (và điểm perplexity vẫn hợp lý).
+• Có thể đạt được sự gia tăng độ dài ngữ cảnh thêm bằng cách sử dụng hệ số tỷ lệ cao hơn tại thời điểm đánh giá so với thời điểm tinh chỉnh, nhưng dường như chỉ lên đến hệ số 2x.
+
+**Phát hành công khai trọng số LLM và tập dữ liệu đánh giá** Chúng tôi phát hành trọng số của hai mô hình 13B mới được huấn luyện từ LLaMA cơ sở với độ dài ngữ cảnh mở rộng 16k² và độ dài ngữ cảnh 4k³ trên HuggingFace. Chúng tôi cũng phát hành một mô hình 13B được huấn luyện đến độ dài 32k từ LLaMA 2 cơ sở⁴. Chúng tôi gọi họ mô hình này là Giraffe. Ngoài ra, chúng tôi phát hành ba tập dữ liệu (LongChat-Lines⁵, FreeFormQA⁶ và AlteredNumericQA⁷) để đánh giá hiệu suất ngữ cảnh dài của những mô hình này và các mô hình khác. LongChat-Lines là một nhiệm vụ truy xuất chi tiết key-value. FreeFormQA và AlteredQA là các tập dữ liệu hỏi-đáp dựa trên Tập dữ liệu Câu hỏi Tự nhiên [12]. Một số công trình hiện có [6, 7] chỉ tập trung vào perplexity trên một tập đánh giá corpus tài liệu như thước đo hiệu suất ngoại suy của chúng. Chúng tôi thấy rằng điểm perplexity không phải là thước đo nhạy cảm của hiệu suất ngữ cảnh dài như các nhiệm vụ chúng tôi giới thiệu.
+
+## 2 Công trình liên quan
+
+**RoPE** Trong công trình này, chúng tôi kiểm tra hiệu quả của lựa chọn mã hóa vị trí của LLaMA [10] đối với độ dài ngữ cảnh dài hơn so với mô hình cơ sở được huấn luyện. Mã hóa vị trí được sử dụng bởi LLaMA là RoPE (Rotary Position Embedding) [13]. RoPE hoạt động bằng cách xoay các lát cắt của ma trận chiếu query và key ở các tốc độ khác nhau. Vì vậy, ví dụ, ngay cả khi query và key được chiếu đến cùng một mã hóa, chúng sẽ được xoay với các lượng khác nhau tùy thuộc vào vị trí của chúng trong chuỗi. Nếu chúng sau đó không được căn chỉnh, tích vô hướng của chúng sẽ nhỏ hơn so với nếu chúng không được xoay chút nào. Ngược lại, chúng có thể trở nên căn chỉnh hơn, dẫn đến tích vô hướng và điểm attention lớn hơn. Trong RoPE, việc xoay này đang xảy ra ở các tốc độ khác nhau trên tất cả các lát cắt 2 của query và key trong chiều embedding, cho phép mô hình xây dựng một hàm phức tạp của điểm attention qua các khoảng cách. Một trong những điểm hấp dẫn chính của việc sử dụng phương pháp RoPE là nó đảm bảo về mặt toán học rằng hàm điểm attention chỉ phụ thuộc vào khoảng cách tương đối giữa query và key, thay vì vị trí tuyệt đối của chúng. Điều này được coi là một tính chất mong muốn của LLM [13, 14].
+
+**ALiBi** Mặc dù RoPE đã thành công trong mục tiêu này, công trình về ALiBi [6] đã chứng minh rằng RoPE không thể thực hiện ngoại suy độ dài ngữ cảnh zero-shot. Bài báo ALiBi cho thấy RoPE nhanh chóng suy giảm khi nó được kiểm tra trên độ dài ngữ cảnh dài hơn mô hình đã thấy trong quá trình huấn luyện; nó cũng giới thiệu phương án thay thế được đề xuất của riêng nó cho thấy khả năng ngoại suy vượt trội trên các benchmark của họ. Tuy nhiên, ALiBi có những thiếu sót riêng của nó; việc sử dụng các hàm tuyến tính đơn giản để điều chế điểm attention qua khoảng cách có nghĩa là nó không thể biểu diễn các hàm khoảng cách-attention phức tạp như cơ sở Fourier của RoPE. Ngoài ra, ALiBi sử dụng một hàm như vậy cho mỗi head, làm giảm thêm sức mạnh biểu đạt. Điều này có thể giải thích tại sao, mặc dù ALiBi có ngoại suy, các mô hình sử dụng nó có hiệu suất tệ hơn so với các mô hình dựa trên RoPE trên các benchmark như MMLU [2] và arena LMSys đo lường sở thích của con người [15].
+
+**xPos** Sun et al. [7] kiểm tra tại sao RoPE thất bại trong việc ngoại suy thành công và xác định rằng điều này là do ảnh hưởng của các thành phần tần số cao gây ra nhiễu dư trong điểm attention ngay cả khi các token cách xa nhau. Họ cố gắng giải quyết điều này bằng cách thêm một số hạng biên độ suy giảm theo cấp số nhân vào RoPE. Phương pháp mới này, được gọi là xPos, làm suy giảm các thành phần tần số cao nhiễu này nhanh hơn so với các thành phần tần số thấp. Phương pháp này cho thấy kết quả tốt trong việc huấn luyện LLM từ đầu [7], và trực giác thúc đẩy nó phù hợp với các giả thuyết của chúng tôi về sự thiếu hụt của RoPE. Tuy nhiên, Sun et al. không thử nghiệm trong môi trường quan tâm của chúng tôi: lấy một mô hình được tiền huấn luyện với RoPE và xem liệu nó có thể được thuyết phục (qua tinh chỉnh hạn chế) để học mã hóa xPos thay thế. Hơn nữa, các thí nghiệm của họ chứng minh rằng Blockwise Causal Attention là cần thiết để họ đạt được ngoại suy.
+
+**Tỷ lệ Tuyến tính/Nội suy Vị trí** Kỹ thuật ngoại suy độ dài ngữ cảnh đơn giản nhưng hiệu quả này được báo cáo đồng thời bởi kaiokendev [16] và bởi một nhóm tại Meta [17]. Phương pháp được sử dụng ở đây là đơn giản chia vector vị trí cho một hệ số tỷ lệ phù hợp với đầu vào trong độ dài ngữ cảnh của mô hình gốc. Trực giác của kỹ thuật này là sử dụng khả năng nội suy của LLM, thay vì dựa vào ngoại suy. Đây là một hiện tượng nổi tiếng rằng các mạng nơ-ron có xu hướng nội suy trong một phạm vi các giá trị đã thấy trước đó tốt hơn so với chúng ngoại suy bên ngoài phạm vi đó (ví dụ [18]). Trong trường hợp cụ thể của mã hóa vị trí, [17] tuyên bố rằng nội suy vị trí tránh được rủi ro bùng nổ số lượng lớn trong các giá trị attention liên quan đến ngoại suy. Chúng tôi thực hiện nhiều thí nghiệm về sơ đồ này và các biến thể của nó và báo cáo kết quả trong bài báo này.
+
+**Mã hóa Vị trí Ngẫu nhiên** Ruoss et al trình bày phương pháp này trong [19]. Trong quá trình huấn luyện, họ tạo ngẫu nhiên vector vị trí của mình bằng cách rút N mẫu một cách đồng nhất không thay thế từ phạm vi [1, L], trong đó N là độ dài ngữ cảnh huấn luyện và L là một giá trị lớn lớn hơn (được giả định là biết trước) độ dài ngữ cảnh đánh giá tối đa. Các vị trí được lấy mẫu này sau đó được sắp xếp theo thứ tự tăng dần và hoạt động như các đầu vào vị trí mà mô hình thấy tại thời điểm đánh giá. Trong quá trình đánh giá, các đầu vào vị trí [1, ..., M] được đưa cho mô hình. Các tác giả tuyên bố cải thiện hiệu suất trong ngoại suy độ dài ngữ cảnh. Chúng tôi độc lập đến được ý tưởng tương tự với bài báo này nhưng thay vào đó ngẫu nhiên hóa bằng cách rút từ các vị trí dưới số nguyên xấp xỉ trong phạm vi [1, N]; xem Phần 4 để biết thêm chi tiết. Chúng tôi cũng lưu ý rằng Ruoss et al điều tra việc sử dụng sơ đồ như vậy để huấn luyện LLM từ đầu, trong khi chúng tôi chủ yếu quan tâm đến việc tinh chỉnh hậu hoc một LLM được tiền huấn luyện với ngẫu nhiên hóa để cho phép ngoại suy độ dài ngữ cảnh.
+
+## 3 Đánh giá Ngoại suy Ngữ cảnh Dài
+
+Câu hỏi chính được đặt ra trong bài báo này xoay quanh việc mở rộng khả năng độ dài ngữ cảnh của LLM. Để đánh giá điều này, một số liệu thường được sử dụng trong tài liệu là perplexity [6, 7, 13]. Tuy nhiên, như chúng tôi cho thấy trong Phần 5.3, perplexity hơi thô ráp để đánh giá mức độ tốt của mô hình có thể sử dụng cửa sổ ngữ cảnh dài hơn. Trực giác của chúng tôi là — trong nhiều tập dữ liệu ngôn ngữ tự nhiên — một điểm perplexity hợp lý có thể đạt được ngay cả khi mô hình chỉ chú ý đến thông tin trong một phạm vi hạn chế (512 token cuối cùng, chẳng hạn) của cửa sổ ngữ cảnh. Ví dụ, một sơ đồ mã hóa vị trí chỉ đơn giản che đi bất kỳ phần tử nào của ngữ cảnh (và activation key và query bên trong trong các head attention) lớn hơn về độ dài so với những gì mô hình được huấn luyện sẽ thành công trong việc đạt được một điểm perplexity hợp lý, nhưng sẽ hoạt động kém trong các nhiệm vụ chúng tôi mô tả dưới đây.
+
+Chúng tôi mở rộng công trình hiện có để xem xét độ chính xác của một mô hình khi được trình bày các vấn đề có câu trả lời có thể xác minh. Trong việc sử dụng số liệu này, chúng tôi có thể đánh giá cách mô hình sử dụng thông tin ngữ cảnh bổ sung để phản hồi các prompt. Chúng tôi dựa vào hai loại nhiệm vụ đánh giá để đánh giá khả năng của các mô hình trong việc trích xuất và sử dụng thông tin từ các ngữ cảnh đầu vào dài: loại đầu tiên là các nhiệm vụ truy xuất key-value và loại khác là các nhiệm vụ hỏi đáp. Bằng cách sử dụng hai loại nhiệm vụ này, chúng tôi thực thi yêu cầu của mô hình phải chú ý đến toàn bộ ngữ cảnh để đạt được độ chính xác cao. Chúng tôi coi nhiệm vụ truy xuất là một bài kiểm tra thuần túy hơn về truy xuất thông tin không có nhiều thiên kiến ngôn ngữ tự nhiên. Tuy nhiên, nhiệm vụ truy xuất là một cấu trúc hơi nhân tạo mà LLM có thể sẽ không thấy trong quá trình huấn luyện, vì vậy chúng tôi cũng bao gồm hỏi đáp để tái tạo các nhiệm vụ thế giới thực hơn.
+
+**LongChat-Lines** Chúng tôi bắt đầu với một nhiệm vụ truy xuất key-value chi tiết tổng hợp được đề xuất lần đầu trong [20] và cũng được sử dụng bởi [21]. Mặc dù những công trình này xuất sắc với các ngữ cảnh tiêu chuẩn của LLM, chúng thiếu độ dài ngữ cảnh dài hơn cần thiết để đánh giá các thí nghiệm của chúng tôi. Vì vậy, chúng tôi sử dụng cùng một nhiệm vụ như [20, 21], nhưng tạo ra các mẫu bổ sung với độ dài ngữ cảnh dài hơn. Nhiệm vụ này đưa cho mô hình một prompt với các dòng có dạng:
+
+• line grotesque-classmate: REGISTER CONTENT is <42527>
+• line imperfect-bull: REGISTER CONTENT is <3119>
+• line supreme-inversion: REGISTER CONTENT is <13960>
+• ...
+
+Mô hình được yêu cầu ghi nhớ giá trị tương ứng với REGISTER CONTENT cho mỗi dòng và được yêu cầu ở cuối để truy xuất giá trị cho một dòng cụ thể. Bằng cách thay đổi số dòng trong prompt, chúng tôi có thể kiểm soát độ dài ngữ cảnh. Chúng tôi phát hành các phiên bản độ dài dài hơn của nhiệm vụ này so với trong [20], và chúng tôi cũng phát hành script tạo cho nhiệm vụ này.
+
+**WikiQA** Chúng tôi cũng tạo hai tập dữ liệu mới từ tập dữ liệu Natural Questions [12] với đánh giá ngữ cảnh dài hơn cụ thể trong tâm trí mà chúng tôi gọi chung là WikiQA. Trong đánh giá này, prompt được đưa cho LLM có định dạng của một tài liệu Wikipedia theo sau bởi một câu hỏi liên quan đến tài liệu đó; mô hình được yêu cầu trả lời câu hỏi. Chúng tôi đảm bảo câu trả lời cho câu hỏi là một câu trả lời ngắn là một từ duy nhất hoặc một câu nhỏ có khớp chuỗi chính xác trong tài liệu được đưa cho LLM như đầu vào. Chúng tôi gọi nhiệm vụ này là Free Form QA (FFQA).
+
+Tuy nhiên, một vấn đề tiềm ẩn trong tập dữ liệu dựa trên Wikipedia là mô hình có thể trả lời chính xác từ corpus được tiền huấn luyện của nó và không cụ thể sử dụng thông tin trong ngữ cảnh. Để giải quyết điều này, chúng tôi đã tạo một tập dữ liệu "thay đổi" khác, mà chúng tôi gọi là Altered Numeric QA (AltQA). Tập dữ liệu này chỉ bao gồm các câu hỏi có câu trả lời số. Ở đây, chúng tôi thay đổi câu trả lời và mọi lần xuất hiện của câu trả lời trong tài liệu thành một số khác, do đó đảm bảo rằng LLM phải chú ý đến ngữ cảnh, và chỉ ngữ cảnh, để đưa ra câu trả lời chính xác. Việc sửa đổi được thực hiện như sau:
+
+... là phần thứ ba và cuối cùng của Divine Comedy của Dante, theo sau Inferno và Purgatorio. Đó là một câu chuyện ngụ ngôn kể về cuộc hành trình của Dante qua Thiên đàng, được dẫn dắt bởi Beatrice, người tượng trưng cho thần học. Trong bài thơ, Paradise được mô tả như một loạt các hình cầu đồng tâm bao quanh Trái đất, bao gồm Mặt trăng, Sao Thủy, Sao Kim, Mặt trời, Sao Hỏa, Sao Mộc, Sao Thổ, Fixed Stars, Primum Mobile và cuối cùng, Empyrean. Nó được viết vào đầu thế kỷ 14...
+
+Câu hỏi:
+Ai phục vụ như hướng dẫn viên của dante qua paradise
+Câu trả lời tham khảo:
+Beatrice
+
+Tài liệu: FreeForm WikiQA
+
+... Hy Lạp đã tổ chức Olympic Games Mùa hè trong hai dịp, Olympic hiện đại khai mạc năm 1896 và lần nữa năm 2004 2009. Cả hai đều được tổ chức tại Athens, cùng với Paris và Los Angeles là những thành phố đã tổ chức Olympic Games hai lần, với London là thành phố duy nhất tổ chức ba lần. Thủ đô Hy Lạp cũng tổ chức 1906 Intercalated Games, tại thời điểm đó được coi là Olympic Games bởi Ủy ban Olympic Quốc tế...
+
+Câu hỏi:
+Lần cuối cùng olympic ở Hy Lạp là khi nào?
+Câu trả lời tham khảo:
+2009*
+*và không phải 2004
+
+Tài liệu: AlteredNumeric WikiQA
+
+Hình 1: Ví dụ đoạn QA từ tập dữ liệu WikiQA của chúng tôi.
+
+• Nếu câu trả lời là một năm, điều này khá thường xuyên, (tức là nó nằm trong khoảng 1000-2100), chúng tôi thay đổi nó thành một giá trị ngẫu nhiên khác trong phạm vi +/- 10 của giá trị gốc. Chúng tôi xem các năm như một trường hợp đặc biệt để không làm gián đoạn tính mạch lạc tổng thể của tài liệu bằng cách có các giá trị ngày tháng rất cổ xưa.
+
+• Nếu câu trả lời là bất kỳ số nào khác, chúng tôi thay đổi nó thành một số ngẫu nhiên khác có cùng số chữ số.
+
+Hình 1 nêu bật các ví dụ từ tập dữ liệu WikiQA của chúng tôi. Vì các ngữ cảnh trong ứng dụng của chúng tôi dài, vị trí của câu trả lời trong ngữ cảnh có thể đóng vai trò quan trọng trong khả năng trả lời câu hỏi của mô hình. Do đó, chúng tôi sử dụng cả hai nhiệm vụ WikiQA để tiến hành phân tích về hiệu suất của LLM khi cả vị trí câu trả lời di chuyển trong tài liệu (trong 10% đầu, 10% cuối, hoặc ngẫu nhiên ở bất kỳ đâu khác), cũng như với câu hỏi được đưa ra ở đầu hoặc cuối prompt — trong nỗ lực tái tạo các phân tích của [22].
+
+## 4 Kỹ thuật Ngoại suy Độ dài Ngữ cảnh
+
+Chúng tôi kiểm tra một số kỹ thuật ngoại suy độ dài ngữ cảnh, bao gồm các phương pháp hiện có (hoặc các biến thể nhỏ của chúng) cũng như các phương pháp mới được đề xuất của chúng tôi.
+
+### 4.1 Kỹ thuật Ngoại suy Độ dài Ngữ cảnh Hiện có
+
+Một số phương pháp tồn tại để thích ứng mã hóa vị trí RoPE với độ dài ngữ cảnh dài hơn. Chúng tôi đã đánh giá các kỹ thuật sau.
+
+**Tỷ lệ Tuyến tính/Nội suy Vị trí** Ở đây, vector vị trí được chia cho một hệ số tỷ lệ. Do đó, nếu mô hình gốc được huấn luyện trên một phạm vi vị trí [0, 1, ..., 2048], chẳng hạn, thì mô hình mới sẽ thấy thay vào đó [0/x, 1/x, ..., 2048/x] trong đó x là hệ số tỷ lệ.
+
+**xPos** Chúng tôi muốn kiểm tra liệu một checkpoint được huấn luyện với sơ đồ mã hóa RoPE của mô hình cơ sở có thể được tinh chỉnh thành sơ đồ xPos [7]. Ngoài rào cản lập trình của việc vá toàn bộ module attention để xử lý biến đổi độc đáo của xPos về key và query, vấn đề chính được trình bày bởi loại thích ứng này là độ nhạy cảm của xPos đối với độ chính xác dấu phẩy động. Phương pháp dựa vào việc tỷ lệ key bằng các giá trị số với số mũ tuyệt đối lớn; những giá trị này sau đó hủy bỏ trong tích vô hướng với query. Tuy nhiên, đối với các ngữ cảnh dài, các giá trị lớn thực sự có thể vượt quá độ lớn được hỗ trợ bởi float16. Chúng tôi chọn làm việc xung quanh điều này bằng cách thực hiện phép toán attention cốt lõi trong float32 với chi phí là làm chậm đào tạo 2X.
+
+**Mã hóa Vị trí Ngẫu nhiên** Ở đây chúng tôi ngẫu nhiên hóa khoảng cách giữa các giá trị vị trí một cách đồng nhất trong phạm vi [ε, 2] với 0 < ε≪1, thay vì sử dụng [0, 1, ..., n] điển hình có khoảng cách cố định kích thước 1. Trực giác đằng sau phương pháp này là bằng cách cho mô hình thấy nhiều khoảng cách intra-position khác nhau tại thời điểm tinh chỉnh, mô hình sẽ có thể tổng quát hóa cho bất kỳ lựa chọn vị trí chi tiết nào tại thời điểm đánh giá, do đó cho phép tăng hiệu quả độ dài ngữ cảnh bằng cách chọn các chia nhỏ hơn. Điều này có một số tương đồng với quy trình được mô tả trong Ruoss et al. [19]. Chúng tôi đặt giới hạn trên là 2 để mô hình trong kỳ vọng sẽ thấy vị trí cuối cùng là n (như E[X] ≈ 1 với X ∼ U(ε, 2)). Chúng tôi cũng đặt giới hạn dưới dương, khác không là ε để tránh các vấn đề với aliasing vị trí do độ chính xác số hạn chế.
+
+### 4.2 Kỹ thuật Ngoại suy Độ dài Ngữ cảnh Mới được Đề xuất
+
+**Tỷ lệ Luỹ thừa** Trong RoPE gốc, cơ sở được sử dụng được đưa ra bởi:
+Θ = {θᵢ = 10000^(-2(i-1)/d) | i ∈ {1, 2, ..., d/2}} (1)
+
+trong đó d là chiều embedding. Chúng tôi sử dụng thay vào đó cơ sở được đưa ra bởi:
+Θ* = {θᵢ* = θᵢ^(1-2i/(d·k)) | i ∈ {1, 2, ..., d/2}} (2)
+
+trong đó k là một tham số cần được đặt. Bằng cách áp dụng biến đổi này, các phần tử tần số cao (khoảng cách ngắn) của cơ sở ít bị ảnh hưởng hơn so với các phần tử tần số thấp (khoảng cách dài), được làm cho thậm chí còn thấp hơn về tần số — xem Hình 2. Bằng cách làm như vậy, hy vọng của chúng tôi là mô hình sẽ phải thực hiện ngoại suy ít phức tạp hơn cho các tần số thấp nơi nó chưa thấy phạm vi đầy đủ của hàm tuần hoàn trong thời gian huấn luyện, và do đó ngoại suy tốt hơn. Tuy nhiên, một vấn đề tiềm ẩn là mô hình dựa vào các mối quan hệ cụ thể qua các tần số mà một biến đổi tuyến tính bảo tồn nhưng một biến đổi phi tuyến phá hủy.
+
+**Cơ sở Bị cắt bớt** Bắt đầu từ Phương trình 1, chúng tôi thay vào đó sử dụng cơ sở được đưa ra bằng cách áp dụng:
+
+θᵢ* = {
+  θᵢ nếu θᵢ ≥ b,
+  ρ nếu a < θᵢ < b,
+  0 nếu θᵢ* ≤ a.
+} (3)
+
+Trong đó ρ là một giá trị cố định tương đối nhỏ, và a và b là các giá trị cutoff được chọn. Ý tưởng ở đây là chúng tôi muốn bảo tồn các thành phần tần số cao của cơ sở nhưng đặt các phần tử tần số thấp thành một giá trị không đổi — trong trường hợp này là 0. Bằng cách làm như vậy với một lựa chọn cutoff a thận trọng, mô hình sẽ đã trải nghiệm tất cả các giá trị của cơ sở trong độ dài ngữ cảnh được sử dụng trong tinh chỉnh (do bản chất tuần hoàn của các hàm sin và cosine) và do đó nên ngoại suy tốt hơn đến độ dài ngữ cảnh lớn hơn để đánh giá. Tuy nhiên, mô hình vẫn cần có thể phân biệt giữa các khoảng cách trải dài toàn bộ ngữ cảnh mà nó được huấn luyện, vì vậy chúng tôi cũng bao gồm tần số cố định ρ. Tóm lại, chúng tôi hy vọng rằng với cơ sở này, mô hình có thể tránh vấn đề phải học các hệ số phức tạp trong toàn bộ cơ sở RoPE bằng cách thay vào đó học các hàm mượt mà ở khoảng cách dài hơn (như được chứng minh trong bài báo [17]).
+
+Trong Hình 2, chúng tôi so sánh trực quan các tần số được tạo ra bởi cơ sở RoPE tiêu chuẩn, tỷ lệ luỹ thừa và cắt bớt.
+
+Hình 2: So sánh cơ sở RoPE tiêu chuẩn với cơ sở luỹ thừa và cơ sở bị cắt bớt. Trục x trải dài qua chiều embedding, và trục y là giá trị tần số của cơ sở sin-cosine.
+
+## 5 Kết quả & Thảo luận
+
+Trong các thí nghiệm sau, chúng tôi đã tinh chỉnh mô hình LLaMA-13B cơ sở trên một phần của tập dữ liệu RedPajama [5] đã được sửa đổi để mỗi mẫu dữ liệu có kích thước chính xác 4096 token. Chúng tôi huấn luyện với mỗi phương pháp mã hóa vị trí cho đến khi loss đánh giá gần như ổn định. Các đường cong loss có thể được tìm thấy trong Phụ lục B.
+
+Sau đó chúng tôi tiếp tục áp dụng tinh chỉnh hướng dẫn (IFT) với tập dữ liệu Vicuna [23] và sử dụng LoRA [24] trên mô hình cơ sở. Tuy nhiên, chúng tôi phát hiện ra rằng mặc dù IFT đã tăng độ chính xác trên LongChat-Lines, nó không thay đổi đáng kể phạm vi ngữ cảnh mà mô hình cơ sở có thể xử lý (xem Hình 5 trong Phụ lục C). Điều này chúng tôi thấy là một sự tương phản rõ rệt với các biến thể WikiQA; ở đó, IFT là cần thiết để mô hình tạo ra bất kỳ kết quả có ý nghĩa nào. Do đó, đối với LongChat-Lines, chúng tôi sử dụng các mô hình không IFT; đối với WikiQA, chúng tôi thực hiện đánh giá trên một tập con của các mô hình hứa hẹn hơn với IFT bổ sung.
+
+### 5.1 Ngoại suy Độ dài Ngữ cảnh Được tinh chỉnh
+
+**LongChat-Lines** Chúng tôi tiến hành đánh giá trên LongChat-Lines với các kỹ thuật được mô tả trong Phần 4 và báo cáo kết quả trong Bảng 1. Chúng tôi mong đợi tất cả các mô hình có thể thực hiện với độ chính xác khác không cho đến ít nhất 4200 cho rằng mô hình được tinh chỉnh trên độ dài ngữ cảnh 4096 và hội tụ đạt được trong tất cả các trường hợp. Tuy nhiên, điều này hóa ra không phải là trường hợp đối với xPos, không thể thực hiện nhiệm vụ chút nào. Chúng tôi nghi ngờ điều này có thể là do xPos quá khác biệt so với cơ sở RoPE để mô hình có thể thích ứng trong tinh chỉnh; như chúng tôi thấy trong Phụ lục B, loss huấn luyện và đánh giá cho xPos không thể đạt cùng giá trị như các phương pháp khác. Điều này cũng có thể là sản phẩm của các vấn đề độ chính xác số gặp phải trong việc triển khai xPos.
+
+Tỷ lệ tuyến tính có thể đạt được ngoại suy độ dài ngữ cảnh thành công. Đáng đề cập ở đây là chúng tôi sẽ mong đợi tỷ lệ với hệ số x đạt được độ chính xác khác không lên đến 2048 · x, do mô hình cơ sở được huấn luyện trên độ dài ngữ cảnh 2048. Mặc dù điều này được quan sát với tỷ lệ tuyến tính với hệ số 4, chúng tôi thấy trong Bảng 1 sự suy giảm nhanh hơn nhiều khi độ dài ngữ cảnh tăng với hệ số tỷ lệ 16. Đến độ dài ngữ cảnh 17500, nó đã ghi nhận 0% độ chính xác mặc dù chúng tôi ngây thơ sẽ mong đợi hiệu suất hợp lý lên đến khoảng 32000 độ dài ngữ cảnh. Chúng tôi tin rằng điều này chỉ ra rằng có những giới hạn đối với phương pháp nội suy và quan tâm đến việc kiểm tra điều này thêm trong công việc tương lai.
+
+Bảng 1: Sau khi tinh chỉnh LLaMA-13B với độ dài ngữ cảnh cơ sở 4096, bảng này thể hiện các đánh giá với các phương pháp ngoại suy ngữ cảnh khác nhau trên LongChat-Lines. Độ chính xác 1.0 sẽ chỉ ra hiệu suất hoàn hảo và 0.0 chỉ ra việc làm sai mọi đánh giá. Cơ sở luỹ thừa sử dụng tham số k = 0.5. Cơ sở bị cắt bớt sử dụng các tham số sau: a = 1/(82π/2048), b = 2π/2048, ρ = 1/(162π/2048). Ngẫu nhiên hóa sử dụng tham số giới hạn dưới ε = 1/16. Tất cả các đánh giá được thực hiện mà không có tinh chỉnh hướng dẫn bổ sung.
+
+Cơ sở luỹ thừa, mặc dù hoạt động tốt nhất ở ngữ cảnh ngắn nhất, cũng suy giảm nhanh nhất và không thể hiển thị bất kỳ hiệu suất ngoại suy nào vượt quá 4200 ngữ cảnh chút nào.
+
+Phương pháp vị trí ngẫu nhiên có thể xuất hiện đang ngoại suy dựa trên kết quả trong bảng. Tuy nhiên, điều này có thể là do cách chúng tôi đánh giá mô hình. Tại thời điểm huấn luyện, mô hình lấy mẫu khoảng cách một cách đồng nhất trong [ε, 2] như được mô tả trong Phần 4. Tại thời điểm đánh giá, không rõ ràng trước lựa chọn tốt nhất của các vị trí là gì. Chúng tôi đã thử một loạt các phương pháp khác nhau: khoảng cách cố định kích thước 1, ngẫu nhiên đồng nhất trong [ε, 2] và ngẫu nhiên đồng nhất trong [ε, 1]. Chúng tôi tìm thấy kết quả tốt nhất cho ngoại suy với phương pháp cuối cùng, vì vậy chúng tôi báo cáo điều này. Chúng tôi hy vọng rằng bằng cách giảm giới hạn trên thêm, chúng tôi có thể thuyết phục mô hình về ngoại suy độ dài ngữ cảnh mong muốn. Tuy nhiên, đi đến [ε, 0.5] và dưới đó làm suy giảm đáng kể hiệu suất của mô hình. Kết luận của chúng tôi từ điều này là mô hình không thể tự học để biểu diễn mỗi vị trí mà không biết các vị trí khác. Một con đường thú vị cho công việc tương lai sẽ là điều kiện hóa các ma trận Q-proj và K-proj trên các vị trí được lấy mẫu trong quá trình huấn luyện (và đánh giá).
+
+Cơ sở bị cắt bớt dường như cung cấp ngoại suy độ dài ngữ cảnh thực sự, vì nó có thể đạt được độ chính xác khác không trên độ dài ngữ cảnh bên ngoài bất kỳ giá trị nào nó đã thấy trước đó. Mặc dù hiệu suất có suy giảm khi độ dài tăng và biểu hiện hiện tại của điều này kém hơn về hiệu suất so với tỷ lệ tuyến tính, chúng tôi tin rằng đây có thể là một hướng điều tra có thể dẫn đến hiệu suất ngoại suy tốt hơn. Cắt bớt cũng có thể được kết hợp với tỷ lệ tuyến tính, như chúng tôi thảo luận trong Phần 5.2.
+
+**Biến thể WikiQA** Chúng tôi tiếp tục tiến hành đánh giá các phương pháp tỷ lệ tuyến tính và cơ sở bị cắt bớt trên các biến thể WikiQA được mô tả trong Phần 4. Không giống như nhiệm vụ truy xuất, chúng tôi thấy rằng các mô hình không thể thực hiện nhiệm vụ này thành công mà không có bất kỳ tinh chỉnh hướng dẫn nào, vì vậy chúng tôi thực hiện phân tích này chỉ trên một số phương pháp quan tâm. Kết quả được hiển thị trong Bảng 2 và 3. Chúng phần lớn khớp với mô hình được thấy trong LongChat-Lines — tỷ lệ tuyến tính với hệ số tỷ lệ 4 có thể thực hiện nhiệm vụ lên đến 7500 ngữ cảnh nhưng không vượt quá, trong khi hệ số tỷ lệ 16 có thể vượt qua cutoff này nhưng với độ dốc giảm độ chính xác. Như với LongChat-Lines, chúng tôi thấy rằng các mô hình dường như cho thấy một số suy giảm độ chính xác khi độ dài ngữ cảnh tăng. Chúng tôi thấy một lần nữa rằng cơ sở bị cắt bớt có thể ngoại suy thành công đến khoảng cùng độ dài ngữ cảnh như trong LongChat-Lines với độ chính xác có thể so sánh với tỷ lệ tuyến tính với tỷ lệ 4, nhưng một lần nữa dường như không thể đi xa hơn độ dài ngữ cảnh khoảng 8k.
+
+Bảng 2: Độ chính xác trên biến thể AlteredNumeric WikiQA của các mô hình được tinh chỉnh với các phương pháp ngoại suy ngữ cảnh khác nhau. Tất cả các đánh giá được thực hiện với tinh chỉnh hướng dẫn.
+
+Bảng 3: Độ chính xác trên biến thể FreeForm WikiQA của các mô hình được tinh chỉnh với các phương pháp ngoại suy ngữ cảnh khác nhau. Tất cả các đánh giá được thực hiện với tinh chỉnh hướng dẫn.
+
+### 5.2 Tỷ lệ Tuyến tính Zero-Shot
+
+Trong phần trước, chúng tôi đã kiểm tra hiệu suất của tỷ lệ tuyến tính sử dụng cùng giá trị tại thời điểm tinh chỉnh như tại thời điểm đánh giá. Trong phần này, chúng tôi thay vào đó điều tra ảnh hưởng của việc sử dụng hệ số tỷ lệ khác tại thời điểm đánh giá so với những gì mô hình được huấn luyện. Trong Bảng 4, chúng tôi hiển thị kết quả cho chiến lược này như được đánh giá trên LongChat-Lines. Chúng tôi thấy nói chung rằng nếu mô hình được huấn luyện với hệ số tỷ lệ x, thì mô hình có thể đánh giá thành công zero-shot với hệ số tỷ lệ 2x (với một số giảm độ chính xác trong phạm vi độ dài ngữ cảnh mà mô hình có thể xử lý trước đó). Nó cũng xuất hiện rằng ở hệ số tỷ lệ 16, mô hình không còn có thể tăng độ dài ngữ cảnh hiệu quả của nó bằng cách sử dụng phương pháp này. Chúng tôi cũng thấy rằng đánh giá với >2x dẫn đến mô hình bị hỏng và không thể thực hiện nhiệm vụ.
+
+Chúng tôi cho thấy rằng tỷ lệ tuyến tính zero-shot có thể được áp dụng thành công sau khi tinh chỉnh với cơ sở bị cắt bớt. Thú vị, trong khi đối với tỷ lệ tuyến tính sử dụng hệ số tỷ lệ dài hơn tại thời điểm đánh giá dẫn đến suy giảm độ chính xác trên độ dài ngữ cảnh mà mô hình có thể xử lý trước đó, điều này dường như không phải là trường hợp đối với cơ sở bị cắt bớt — thay vào đó, phạm vi độ dài ngữ cảnh mà mô hình đạt được độ chính xác khác không tăng lên, và độ chính xác cải thiện trong số các độ dài ngữ cảnh mà mô hình được tinh chỉnh.
+
+Bảng 4: Độ chính xác trên LongChat-Lines của các mô hình được tinh chỉnh với các phương pháp ngoại suy ngữ cảnh khác nhau và sau đó được đánh giá với tỷ lệ tuyến tính bổ sung. Bất cứ khi nào tỷ lệ tuyến tính đánh giá lớn hơn tỷ lệ tuyến tính huấn luyện, điều này tạo ra ngoại suy độ dài ngữ cảnh zero-shot. Nói chung, tăng độ dài ngữ cảnh đánh giá 2x so với huấn luyện thực sự tăng gấp đôi độ dài ngữ cảnh có thể sử dụng, với chi phí độ chính xác, cho độ dài huấn luyện 1 và 4 (cho độ dài huấn luyện 16, nó không). Độ chính xác cơ sở bị cắt bớt cải thiện với tỷ lệ 2x. Một tỷ lệ tích cực hơn 4x lần độ dài huấn luyện dẫn đến sự thất bại mô hình rõ ràng.
+
+### 5.3 So sánh Perplexity với Nhiệm vụ
+
+Trong Phần 3, chúng tôi giới thiệu hai nhiệm vụ đặc biệt yêu cầu LLM ngữ cảnh dài trích xuất câu trả lời từ khắp toàn bộ văn bản, lập luận rằng các nhiệm vụ này có thể đánh giá hiệu suất ngữ cảnh dài tốt hơn so với perplexity thô. Để phân tích cách perplexity hoạt động so với các nhiệm vụ này, chúng tôi báo cáo perplexity trên một tập giữ lại của tập dữ liệu RedPajama cho một tập con các mô hình được huấn luyện của chúng tôi (xem Bảng 5). Điểm perplexity có cho thấy sự gia tăng lớn khi đạt được độ dài ngữ cảnh mà mô hình hoàn toàn không thể xử lý (ví dụ, vượt quá 2k trên mô hình LLaMA cơ sở, hoặc vượt quá 8k trên mô hình tỷ lệ tuyến tính 4). Tuy nhiên, chúng dường như ít hiệu quả hơn để hiển thị sự giảm khả năng ngữ cảnh dài trong phạm vi hiệu quả đó. Đặc biệt, trong khi chúng tôi quan sát một độ dốc giảm mạnh trong hiệu suất trên LongChat-Lines và các biến thể WikiQA khi độ dài ngữ cảnh tăng cho các cột tỷ lệ tuyến tính 4 và cơ sở bị cắt bớt của Bảng 1), sự suy giảm này không được phản ánh mạnh mẽ trong điểm perplexity tại những ngữ cảnh đó. Tuy nhiên, mô hình tỷ lệ tuyến tính 16 dường như có perplexity và độ chính xác tương quan tốt trên các nhiệm vụ của chúng tôi. Có lẽ đáng nói nhất, chúng tôi thấy thiếu sót của perplexity cho so sánh giữa các mô hình. Theo Bảng 5, cơ sở bị cắt bớt hoạt động tốt nhất ở 8k trở xuống; tuy nhiên, trong Bảng 1, 2 và 3, cơ sở bị cắt bớt thấp hơn đáng kể về hiệu suất so với các mô hình được tỷ lệ tuyến tính ở 8k ngữ cảnh.
+
+Perplexity thường được sử dụng trong tài liệu để đo lường hiệu suất ngữ cảnh dài [13, 7], nhưng chúng tôi tin rằng các kết quả này cho thấy nó không phải là một thước đo đủ của hiệu suất ngữ cảnh dài trong chính nó, nhưng được sử dụng tốt nhất với các nhiệm vụ khác mà bổ sung thăm dò khả năng của LLM.
+
+Bảng 5: Điểm perplexity trên một tập đánh giá giữ lại của tập dữ liệu RedPajama ở các độ dài ngữ cảnh khác nhau trên các mô hình khác nhau. Độ dài đánh giá là 256 token, và prompt được đưa cho các mô hình là N - 256 token trước đó của tài liệu, trong đó N là độ dài ngữ cảnh chúng tôi đánh giá. Khi độ dài ngữ cảnh quá dài để mô hình xử lý hiệu quả, perplexity có bùng nổ; tuy nhiên, trong các phạm vi mô hình có thể xử lý, perplexity dường như ít nhạy cảm hơn với suy giảm sử dụng ngữ cảnh so với nhiệm vụ LongChat-Lines, và không tuân theo cùng xếp hạng giữa các mô hình như của LongChat-Lines hoặc WikiQA.
+
+### 5.4 Phân tích vị trí câu hỏi và câu trả lời
+
+Đối với các biến thể WikiQA, chúng tôi thực hiện phân tích phân tầng về ảnh hưởng của vị trí câu trả lời và câu hỏi. Như được mô tả trong Phần 4, chúng tôi xem xét tác động của việc đặt câu trả lời trong 10% đầu tiên của tài liệu, 10% cuối cùng, hoặc ở chỗ khác ngẫu nhiên. Chúng tôi cũng kiểm tra ảnh hưởng của việc đặt câu hỏi ở đầu hoặc cuối prompt. Kết quả được hiển thị trong Bảng 6 và 7, được thực hiện trên mô hình với tỷ lệ tuyến tính với hệ số 16, với tinh chỉnh hướng dẫn bổ sung.
+
+Bảng 6: Phân tích độ chính xác phân tầng trên nhiệm vụ AlteredNumericQA. Đối với câu trả lời, "Start" đề cập đến 10% đầu tiên của tài liệu, "End" đến 10% cuối cùng, và "Middle" đến bất kỳ vị trí nào khác. Đối với câu hỏi, "Start" đề cập đến việc đặt câu hỏi trước phần còn lại của prompt ngôn ngữ, và "End" đề cập đến việc đặt câu hỏi ở cuối. Kết quả được báo cáo trên LLaMA-13B được tinh chỉnh với tỷ lệ tuyến tính 16, với IFT được áp dụng.
+
+Bảng 7: Phân tích độ chính xác phân tầng trên nhiệm vụ FreeFormQA. Đối với câu trả lời, "Start" đề cập đến 10% đầu tiên của tài liệu, "End" đến 10% cuối cùng, và "Middle" đến bất kỳ vị trí nào khác. Đối với câu hỏi, "Start" đề cập đến việc đặt câu hỏi trước phần còn lại của prompt ngôn ngữ, và "End" đề cập đến việc đặt câu hỏi ở cuối. Kết quả được báo cáo trên LLaMA-13B được tinh chỉnh với tỷ lệ tuyến tính 16, với IFT được áp dụng.
+
+Chúng tôi nhằm xây dựng trên một phân tích tương tự từ [22]. Tuy nhiên, chúng tôi không thể tái tạo kết quả được hiển thị trong bài báo đó trên mô hình LongChat-13B (16K) (mà phương pháp mô hình hóa của chúng tôi có thể so sánh nhất). Trên cả FreeFormQA và AlteredNumericQA, chúng tôi quan sát không có xu hướng rõ ràng liên quan đến vị trí của câu trả lời trong prompt và độ chính xác của mô hình lên đến 15k độ dài ngữ cảnh. Cũng không có vẻ như có tác động đáng kể về vị trí của câu hỏi đối với AlteredNumericQA, nhưng có tác động đáng chú ý quan sát được đối với FreeFormQA nơi có câu hỏi ở cuối dường như có cải thiện đáng kể về độ chính xác. Tuy nhiên, ở độ dài ngữ cảnh 24k và 32k, chúng tôi thấy một dấu hiệu rõ ràng trong cả hai tập dữ liệu cho cả câu trả lời ở cuối và câu hỏi ở cuối trả về độ chính xác vượt trội so với vị trí của chúng ở chỗ khác. Những kết quả này là một sự tương phản rõ rệt với những kết quả trong [22]. Cách hiểu của chúng tôi từ điều này là có khả năng có một lượng lớn biến thiên có điều kiện nhiệm vụ trong hiệu suất của LLM liên quan đến mức độ tốt chúng có thể sử dụng tất cả các phần của ngữ cảnh; ngay cả những khác biệt nhỏ trong việc xây dựng nhiệm vụ có thể dẫn đến những khác biệt lớn trong các xu hướng quan sát được.
+
+## 6 Kết luận và Hạn chế
+
+Trong bài báo này, chúng tôi đã kiểm tra nhiều phương pháp tinh chỉnh một LLM cơ sở LLaMA và LLaMA2 được tiền huấn luyện có độ dài ngữ cảnh hạn chế sao cho nó có khả năng ngoại suy zero-shot đến độ dài ngữ cảnh mới, dài hơn. Chúng tôi so sánh các phương pháp sử dụng perplexity, cũng như hai nhiệm vụ tùy chỉnh thăm dò hiệu suất ngữ cảnh dài; chúng tôi thấy rằng các nhiệm vụ tùy chỉnh cung cấp sự hiểu biết chi tiết hơn về hiệu suất ngữ cảnh dài so với perplexity. Chúng tôi cho thấy rằng phương pháp nội suy tuyến tính hoạt động tốt nhất trong ngoại suy độ dài ngữ cảnh, và tìm thấy một số hứa hẹn trong tiềm năng của việc sử dụng một cơ sở mới mà chúng tôi gọi là cơ sở bị cắt bớt. Chúng tôi phát hành ba mô hình mà chúng tôi gọi là Giraffe mở rộng độ dài ngữ cảnh của các mô hình LLaMA và LLaMA 2 cơ sở bằng phương pháp nội suy tuyến tính.
+
+Có chỗ đáng kể để xây dựng trên công việc được trình bày trong bài báo này. Chúng tôi lưu ý rằng tất cả các phương pháp đều cho thấy sự suy giảm độ chính xác trên các nhiệm vụ đánh giá của chúng tôi khi độ dài ngữ cảnh tăng, mặc dù perplexity thường vẫn hợp lý và mô hình vẫn có thể tạo ra đầu ra mạch lạc. Đây là một thiếu sót sẽ quan tâm để giải quyết, và theo quan điểm của chúng tôi là cần thiết để tuyên bố khả năng ngoại suy ngữ cảnh dài 'thực sự' của một mô hình.
+
+Các hạn chế của công việc này là chúng tôi chỉ tiến hành phân tích perplexity của chúng tôi trên một tập dữ liệu tài liệu duy nhất. Công việc tương lai có thể nhìn vào việc tái tạo phân tích này trên các tập dữ liệu khác. Ngoài ra, chúng tôi tập trung cụ thể vào ngoại suy độ dài ngữ cảnh từ một mô hình cơ sở được tiền huấn luyện, và đặc biệt là các mô hình LLaMA và LLaMA 2 được huấn luyện với mã hóa vị trí RoPE. Công việc tương lai có thể điều tra liệu phân tích ở đây có mở rộng đến các loại mã hóa vị trí và mô hình khác. Công việc tương lai cũng có thể giải quyết các hạn chế của phương pháp nội suy tuyến tính. Chúng tôi thấy một số bằng chứng trên nhiệm vụ LongChat-Lines đặc biệt về suy giảm độ chính xác khi hệ số tỷ lệ được tăng lên. Giới hạn của kích thước hệ số tỷ lệ của phương pháp này là gì? Có điểm nào mà nó đơn giản không cải thiện phạm vi ngữ cảnh mà nó có thể xử lý? Hơn nữa, phương pháp cơ sở bị cắt bớt dường như cho thấy dấu hiệu của khả năng ngoại suy thực sự có thể được sửa đổi theo cách để đạt được sự ngang bằng với hoặc vượt qua phương pháp nội suy tuyến tính? Chúng tôi tin rằng đây là một số hướng tương lai tiềm năng quan tâm.
+
+## Tài liệu tham khảo
+
+[1] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez, Lukasz Kaiser, và Illia Polosukhin. Attention is all you need, 2023.
+
+[2] Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou, Mantas Mazeika, Dawn Song, và Jacob Steinhardt. Measuring massive multitask language understanding, 2021.
+
+[3] Mark Chen, Jerry Tworek, Heewoo Jun, Qiming Yuan, Henrique Ponde de Oliveira Pinto, Jared Kaplan, Harri Edwards, Yuri Burda, Nicholas Joseph, Greg Brockman, Alex Ray, Raul Puri, Gretchen Krueger, Michael Petrov, Heidy Khlaaf, Girish Sastry, Pamela Mishkin, Brooke Chan, Scott Gray, Nick Ryder, Mikhail Pavlov, Alethea Power, Lukasz Kaiser, Mohammad Bavarian, Clemens Winter, Philippe Tillet, Felipe Petroski Such, Dave Cummings, Matthias Plappert, Fotios Chantzis, Elizabeth Barnes, Ariel Herbert-Voss, William Hebgen Guss, Alex Nichol, Alex Paino, Nikolas Tezak, Jie Tang, Igor Babuschkin, Suchir Balaji, Shantanu Jain, William Saunders, Christopher Hesse, Andrew N. Carr, Jan Leike, Josh Achiam, Vedant Misra, Evan Morikawa, Alec Radford, Matthew Knight, Miles Brundage, Mira Murati, Katie Mayer, Peter Welinder, Bob McGrew, Dario Amodei, Sam McCandlish, Ilya Sutskever, và Wojciech Zaremba. Evaluating large language models trained on code, 2021.
+
+[4] Leo Gao, Stella Biderman, Sid Black, Laurence Golding, Travis Hoppe, Charles Foster, Jason Phang, Horace He, Anish Thite, Noa Nabeshima, Shawn Presser, và Connor Leahy. The pile: An 800gb dataset of diverse text for language modeling, 2020.
+
+[5] Together Computer. Redpajama: An open source recipe to reproduce llama training dataset, April 2023.
+
+[6] Ofir Press, Noah A. Smith, và Mike Lewis. Train short, test long: Attention with linear biases enables input length extrapolation, 2022.
+
+[7] Yutao Sun, Li Dong, Barun Patra, Shuming Ma, Shaohan Huang, Alon Benhaim, Vishrav Chaudhary, Xia Song, và Furu Wei. A length-extrapolatable transformer, 2022.
+
+[8] OpenAI. Gpt-4 technical report, 2023.
+
+[9] Anthropic. Introducing claude, 2023.
+
+[10] Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne Lachaux, Timothée Lacroix, Baptiste Rozière, Naman Goyal, Eric Hambro, Faisal Azhar, Aurelien Rodriguez, Armand Joulin, Edouard Grave, và Guillaume Lample. Llama: Open and efficient foundation language models, 2023.
+
+[11] Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei, Nikolay Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, Dan Bikel, Lukas Blecher, Cristian Canton Ferrer, Moya Chen, Guillem Cucurull, David Esiobu, Jude Fernandes, Jeremy Fu, Wenyin Fu, Brian Fuller, Cynthia Gao, Vedanuj Goswami, Naman Goyal, Anthony Hartshorn, Saghar Hosseini, Rui Hou, Hakan Inan, Marcin Kardas, Viktor Kerkez, Madian Khabsa, Isabel Kloumann, Artem Korenev, Punit Singh Koura, Marie-Anne Lachaux, Thibaut Lavril, Jenya Lee, Diana Liskovich, Yinghai Lu, Yuning Mao, Xavier Martinet, Todor Mihaylov, Pushkar Mishra, Igor Molybog, Yixin Nie, Andrew Poulton, Jeremy Reizenstein, Rashi Rungta, Kalyan Saladi, Alan Schelten, Ruan Silva, Eric Michael Smith, Ranjan Subramanian, Xiaoqing Ellen Tan, Binh Tang, Ross Taylor, Adina Williams, Jian Xiang Kuan, Puxin Xu, Zheng Yan, Iliyan Zarov, Yuchen Zhang, Angela Fan, Melanie Kambadur, Sharan Narang, Aurelien Rodriguez, Robert Stojnic, Sergey Edunov, và Thomas Scialom. Llama 2: Open foundation and fine-tuned chat models, 2023.
+
+[12] Tom Kwiatkowski, Jennimaria Palomaki, Olivia Redfield, Michael Collins, Ankur Parikh, Chris Alberti, Danielle Epstein, Illia Polosukhin, Matthew Kelcey, Jacob Devlin, Kenton Lee, Kristina N. Toutanova, Llion Jones, Ming-Wei Chang, Andrew Dai, Jakob Uszkoreit, Quoc Le, và Slav Petrov. Natural questions: a benchmark for question answering research. Transactions of the Association of Computational Linguistics, 2019.
+
+[13] Jianlin Su, Yu Lu, Shengfeng Pan, Ahmed Murtadha, Bo Wen, và Yunfeng Liu. Roformer: Enhanced transformer with rotary position embedding, 2022.
+
+[14] Peter Shaw, Jakob Uszkoreit, và Ashish Vaswani. Self-attention with relative position representations, 2018.
+
+[15] Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Siyuan Zhuang, Zhanghao Wu, Yonghao Zhuang, Zi Lin, Zhuohan Li, Dacheng Li, Eric. P Xing, Hao Zhang, Joseph E. Gonzalez, và Ion Stoica. Judging llm-as-a-judge with mt-bench and chatbot arena, 2023.
+
+[16] Things i'm learning while training superhot, 2023.
+
+[17] Shouyuan Chen, Sherman Wong, Liangjian Chen, và Yuandong Tian. Extending context window of large language models via positional interpolation, 2023.
+
+[18] Keyulu Xu, Mozhi Zhang, Jingling Li, Simon S. Du, Ken ichi Kawarabayashi, và Stefanie Jegelka. How neural networks extrapolate: From feedforward to graph neural networks, 2021.
+
+[19] Anian Ruoss, Grégoire Delétang, Tim Genewein, Jordi Grau-Moya, Róbert Csordás, Mehdi Bennani, Shane Legg, và Joel Veness. Randomized positional encodings boost length generalization of transformers, 2023.
+
+[20] anadim. A little retrieval test for large language models, May 2023.
+
+[21] Dacheng Li*, Rulin Shao*, Anze Xie, Ying Sheng, Lianmin Zheng, Joseph E. Gonzalez, Ion Stoica, Xuezhe Ma, và Hao Zhang. How long can open-source llms truly promise on context length?, June 2023.
+
+[22] Nelson F. Liu, Kevin Lin, John Hewitt, Ashwin Paranjape, Michele Bevilacqua, Fabio Petroni, và Percy Liang. Lost in the middle: How language models use long contexts, 2023.
+
+[23] Lianmin Zheng, Wei-Lin Chiang, Ying Sheng, Siyuan Zhuang, Zhanghao Wu, Yonghao Zhuang, Zi Lin, Zhuohan Li, Dacheng Li, Eric. P Xing, Hao Zhang, Joseph E. Gonzalez, và Ion Stoica. Judging llm-as-a-judge with mt-bench and chatbot arena, 2023.
+
+[24] Edward J. Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang, và Weizhu Chen. Lora: Low-rank adaptation of large language models, 2021.
+
+## Phụ lục A: LLaMA 2
+
+Khi chúng tôi đang hoàn thiện bài báo này, Meta đã phát hành LLaMA 2 [11]. Chúng tôi xác minh rằng kết quả tương tự của ngoại suy độ dài ngữ cảnh có thể đạt được với LLaMA 2 bằng phương pháp nội suy tuyến tính. Chúng tôi áp dụng cùng phương pháp như được mô tả trong Phần 4, huấn luyện LLaMA 2-13B trên một phần của tập dữ liệu RedPajama được sửa đổi sao cho mỗi mẫu dữ liệu có kích thước chính xác 4096 token. Sau đó chúng tôi cũng áp dụng tinh chỉnh hướng dẫn với tập dữ liệu Vicuna. Chúng tôi sử dụng tỷ lệ 8. Hiệu suất được hiển thị trong bảng 8 và 9.
+
+Chúng tôi thấy rằng mô hình có thể đạt được độ chính xác khác không trên LongChat-Lines lên đến độ dài ngữ cảnh 22000, xa hơn bất kỳ mô hình nào chúng tôi đã kiểm tra trong bài báo chính. Mô hình cũng có thể đạt được hiệu suất khác không trên các biến thể WikiQA lên đến 32k ngữ cảnh. Tuy nhiên, chúng tôi có thấy độ chính xác giảm dần trong cả hai nhiệm vụ khi độ dài ngữ cảnh tăng. Cũng đáng chú ý rằng độ chính xác trên cả hai nhiệm vụ thấp hơn một chút so với LLaMA 1 với tỷ lệ 16 trên độ dài ngữ cảnh mà cả hai mô hình đều có khả năng tạo ra kết quả khác không.
+
+Bảng 8: Hiệu suất LLaMA 2 trên LongChat-Lines với hệ số tỷ lệ 8.
+
+Bảng 9: Hiệu suất LLaMA 2 trên các biến thể WikiQA với hệ số tỷ lệ 8.
+
+## Phụ lục B: Đường cong Loss
+
+Hình 3: Đường cong loss huấn luyện của các mô hình trong các lần chạy fitting ban đầu trên các mẫu 4096 token được trích xuất từ tập dữ liệu RedPajama.
+
+Hình 4: Đường cong loss đánh giá của các mô hình trong các lần chạy fitting ban đầu trên các mẫu 4096 token được trích xuất từ tập dữ liệu RedPajama.
+
+## Phụ lục C: Tác động của IFT
+
+Như đã đề cập trong Phần 5 của văn bản chính, chúng tôi thấy rằng tinh chỉnh hướng dẫn với tập dữ liệu Vicuna có cải thiện độ chính xác trên LongChat-Lines, nhưng không thay đổi khoảng ngữ cảnh khác không cho một mô hình đã cho. Hình 5 cho thấy điều này trên mô hình với nội suy tuyến tính với tỷ lệ 4.
+
+Hình 5: So sánh giữa IFT và không IFT trên LongChat-Lines với tỷ lệ tuyến tính 4 được áp dụng. Mặc dù IFT cải thiện độ chính xác, nó không mở rộng phạm vi ngữ cảnh mà mô hình đạt được độ chính xác khác không.

@@ -1,0 +1,559 @@
+# CoCA: Fusing Position Embedding with Collinear Constrained Attention in Transformers for Long Context Window Extending
+# CoCA: Kết hợp Position Embedding với Collinear Constrained Attention trong Transformers để Mở rộng Cửa sổ Ngữ cảnh Dài
+
+Shiyi Zhu, Jing Ye, Wei Jiang, Siqiao Xue, Qi Zhang, Yifan Wu, Jianguo Li  
+Ant Group  
+{zhushiyi.zsy, qianye.yj, shouzhi.jw, lijg.zero}@antgroup.com
+
+## Tóm tắt
+Self-attention và position embedding là hai module quan trọng trong các Mô hình Ngôn ngữ Lớn (LLMs) dựa trên transformer. Tuy nhiên, mối quan hệ tiềm ẩn giữa chúng vẫn chưa được nghiên cứu kỹ lưỡng, đặc biệt là để mở rộng cửa sổ ngữ cảnh dài. Thực tế, các hành vi bất thường gây hại cho việc ngoại suy ngữ cảnh dài tồn tại giữa Rotary Position Embedding (RoPE) và self-attention thông thường được công trình của chúng tôi tiết lộ. Để giải quyết vấn đề này, chúng tôi đề xuất một cơ chế attention mới, CoCA (Collinear Constrained Attention). Cụ thể, chúng tôi áp dụng một ràng buộc collinear giữa Q và K để tích hợp liền mạch RoPE và self-attention. Mặc dù chỉ thêm độ phức tạp tính toán và không gian tối thiểu, việc tích hợp này đáng kể tăng cường khả năng ngoại suy cửa sổ ngữ cảnh dài. Chúng tôi cung cấp một triển khai tối ưu, làm cho nó trở thành một sự thay thế drop-in cho bất kỳ mô hình dựa trên transformer hiện có nào. Các thí nghiệm rộng rãi cho thấy CoCA hoạt động xuất sắc trong việc mở rộng cửa sổ ngữ cảnh. Một mô hình GPT dựa trên CoCA, được huấn luyện với độ dài ngữ cảnh 512, có thể mở rộng liền mạch cửa sổ ngữ cảnh lên đến 32K (60×), mà không cần fine-tuning. Ngoài ra, bằng cách áp dụng CoCA vào LLaMA-7B, chúng tôi đạt được ngoại suy lên đến 32K chỉ với độ dài huấn luyện 2K. Mã nguồn của chúng tôi được công khai tại: https://github.com/codefuse-ai/Collinear-Constrained-Attention
+
+## 1 Giới thiệu
+Trong công trình tiên phong của Transformer (Vaswani et al., 2017), nó tuyên bố khả năng "ngoại suy đến độ dài chuỗi dài hơn những gì gặp phải trong quá trình huấn luyện". Đây là một giả thuyết lý tưởng, nhưng thực tế không hoạt động trong thực tế đối với Transformer thông thường. Một số công trình tiếp theo, được gọi chung là ngoại suy ngữ cảnh dài, đã nghiên cứu sâu vào việc khám phá khả năng của các mô hình ngôn ngữ lớn (LLMs) được huấn luyện trong phạm vi [1, N−1] để mở rộng hiệu quả chuỗi kiểm tra ≥N.
+
+![Hình 1: Đánh giá perplexity trên 100 tài liệu PG-19 với chiến lược sliding window (Stride = 512). Perplexity của RoFormer (Su et al., 2024) tăng vọt vượt quá 1000 ngoài độ dài huấn luyện của nó, trong khi CoCA duy trì một cao nguyên thấp ngay cả ở 60× độ dài huấn luyện của nó. ALibi (Press et al., 2022) gặp vấn đề Out of Memory (OOM) với đầu vào Nmax>8000 do không tương thích với flash-attention (Dao et al., 2022), chúng tôi giả định nó duy trì perplexity cho Nmax>8000.]
+
+Các nghiên cứu hiện tại chủ yếu tập trung vào attention kernel (Beltagy et al., 2020; Ding et al., 2023; Han et al., 2023) hoặc position embedding (Huang et al., 2023), thường bỏ qua mối quan hệ nội tại giữa hai module quan trọng này. Attention bias là một phương án thay thế cho việc mã hóa rõ ràng thông tin vị trí. ALibi (Press et al., 2022) và KERPLE (Chi et al., 2022), kết hợp negative causal attention bias dựa trên heuristic và compositional triangle kernel, tương ứng. Mặc dù các phương pháp này hiệu quả trong việc duy trì perplexity thấp, chúng không đạt được việc nắm bắt các phụ thuộc tầm xa do giới thiệu các giả thuyết cục bộ cho các token ngữ cảnh.
+
+Một nhánh khác của các phương pháp liên quan đến việc đơn giản mở rộng Rotary Position Embedding (RoPE) (Su et al., 2024) để ngoại suy độ dài ngữ cảnh suy luận với fine-tuning tối thiểu hoặc không có. Ví dụ, Position Interpolation (PI) (Chen et al., 2023) sử dụng linear scaling trên mỗi số vị trí từ n đến n/k, trong đó k là tỷ lệ ngoại suy. NTK-aware Scaled RoPE (bloc97, 2023) và Dynamic-NTK (Emozilla, 2023) kết hợp ngoại suy tần số cao và nội suy tần số thấp. Chúng mở rộng cơ sở trong RoPE dựa trên độ dài chuỗi để thích ứng với các chỉ số vị trí chưa thấy. Tuy nhiên, các phương pháp này chủ yếu giảm nhẹ vấn đề mô hình hóa các góc xoay trong các vị trí ngoài phân phối, mà không nhận ra mối tương quan nội tại giữa ma trận attention và góc xoay. Do đó, các phương pháp này vẫn gặp phải tỷ lệ mở rộng cửa sổ ngữ cảnh hạn chế.
+
+Ở đây, chúng tôi trình bày một góc nhìn mới về mối quan hệ giữa position embedding (tập trung vào RoPE) và cơ chế self-attention. Tóm lại, RoPE sử dụng một ma trận xoay để mã hóa vị trí tuyệt đối đồng thời kết hợp các phụ thuộc vị trí tương đối rõ ràng trong công thức self-attention (Su et al., 2024). Nó được thiết kế dựa trên sự khác biệt góc tương đối giữa các queries (Q) và keys (K). Tuy nhiên, mối quan hệ tiềm ẩn tồn tại giữa Q và K, vì hai ma trận này được nhân trực tiếp với nhau. Chúng tôi chứng minh rằng việc khởi tạo không chính xác góc giữa Q và K trong RoPE dẫn đến hành vi không mong muốn xung quanh ranh giới cửa sổ ngữ cảnh, gây hại hiệu suất cho việc ngoại suy ngữ cảnh.
+
+Để giải quyết hành vi không mong muốn này, chúng tôi đề xuất một kiến trúc sáng tạo gọi là Collinear Constrained Attention (CoCA). Cụ thể, chúng tôi áp dụng một ràng buộc collinear giữa Q và K bằng cách khởi tạo góc giữa mỗi hai chiều ẩn trong các vector Q và K bằng 0. Điều này cho phép tích hợp liền mạch RoPE và self-attention. Kiến trúc mô hình và so sánh với RoFomer (Su et al., 2024) được minh họa trong Hình 2.
+
+Các thí nghiệm rộng rãi cho thấy một mô hình GPT dựa trên CoCA, được huấn luyện trong độ dài ngữ cảnh 512, mở rộng liền mạch cửa sổ ngữ cảnh lên đến 32K (60x) mà không có sự phân kỳ perplexity. Một so sánh toàn diện giữa phương pháp của chúng tôi và các phương pháp hiện có được trình bày trong Hình 1. Hơn nữa, nó tăng cường khả năng truy xuất ngữ cảnh dài, đạt được độ chính xác truy xuất passkey 50%+ ngay cả khi ngoại suy đến 16x dài hơn độ dài ngữ cảnh huấn luyện của nó bằng cách áp dụng Dynamic-NTK (Emozilla, 2023). Ngoài ra, bằng cách áp dụng CoCA vào LLaMA-7B, chúng tôi đạt được ngoại suy lên đến 32K chỉ với độ dài huấn luyện 2K.
+
+Các đóng góp chính của chúng tôi có thể được tóm tắt như sau:
+
+• Chúng tôi tiết lộ hành vi ranh giới ngữ cảnh không mong muốn do thiếu mô hình hóa mối quan hệ giữa position embeddings và self-attention.
+
+• Để giải quyết hành vi ranh giới ngữ cảnh không mong muốn, chúng tôi đề xuất Collinear Constrained Attention (CoCA) để tích hợp liền mạch position embeddings và self-attention, đạt được hiệu suất ngoại suy cửa sổ ngữ cảnh dài xuất sắc.
+
+• CoCA mở rộng cửa sổ ngữ cảnh từ 512 đến 32K mà không cần fine-tuning, đạt được hơn 50% độ chính xác ngay cả khi 16× dài hơn độ dài huấn luyện của nó. Sử dụng CoCA trong LLaMA-7B, chúng tôi đạt được ngoại suy lên đến 32K chỉ trong độ dài huấn luyện 2K.
+
+• CoCA giới thiệu độ phức tạp tính toán và không gian tối thiểu so với self-attention thông thường. Chúng tôi cung cấp một triển khai tối ưu của CoCA, làm cho nó có thể trở thành một sự thay thế drop-in liền mạch cho các mô hình dựa trên transformer hiện có.
+
+## 2 Phương pháp
+
+Trong phần này, chúng tôi mô tả Collinear Constrained Attention (CoCA) được đề xuất. Chúng tôi bắt đầu với việc giới thiệu lý thuyết nền tảng của RoPE (Su et al., 2024) trong Phần 2.1, sau đó phân tích các hành vi bất thường giữa ma trận attention và RoPE trong Phần 2.2. Cuối cùng, chúng tôi giới thiệu phương pháp đề xuất CoCA trong phần 2.3 và suy ra một phiên bản ràng buộc slack của CoCA trong Phần 2.4, tương ứng.
+
+### 2.1 Rotary Position Embedding
+
+Position embedding là một thành phần quan trọng trong các mô hình dựa trên transformer. Ở đây chúng tôi tập trung vào Rotary Position Embedding (RoPE) (Su et al., 2024), được sử dụng rộng rãi bởi các LLMs bao gồm LLaMA (Touvron et al., 2023a), LLaMA-2 (Touvron et al., 2023b), GPT-NeoX (Black et al., 2022) và Qwen (Bai et al., 2023). Giả sử chỉ số vị trí là một số nguyên n ∈ [1, N], và vector đầu vào tương ứng x = [x₀, x₁, ..., xₑ₋₁]ᵀ, trong đó N là độ dài chuỗi, d là chiều của attention head. RoPE định nghĩa một hàm phức có giá trị vector f(x, n):
+
+f(x, n) = [(x₀ + ix₁)e^(inθ₀), (x₂ + ix₃)e^(inθ₁), ..., (xₑ₋₁ + ixₑ)e^(inθₑ/₂₋₁)]ᵀ,
+
+trong đó θⱼ = B^(-2j/d), (1)
+
+trong bài báo này, base B = 10,000.
+
+Sau khi áp dụng RoPE, các vector đã chuyển đổi cho query (q) và key (k) trở thành f(q, m) và f(k, n), tương ứng. Ở đây, m, n ∈ [0, N] đại diện cho các chỉ số vị trí của q và k. Phép toán attention được tính như tích vô hướng giữa f(q, m) và f(k, n), được định nghĩa như sau:
+
+a(m, n) = Re(⟨f(q, m), f(k, n)⟩)
+= Re[∑ⱼ₌₀^(d/2-1) (q₂ⱼ + iq₂ⱼ₊₁)(k₂ⱼ - ik₂ⱼ₊₁)e^(i(m-n)θⱼ)]
+= ∑ⱼ₌₀^(d/2-1) [(q₂ⱼk₂ⱼ + q₂ⱼ₊₁k₂ⱼ₊₁) cos((m-n)θⱼ) + (q₂ⱼk₂ⱼ₊₁ - q₂ⱼ₊₁k₂ⱼ) sin((m-n)θⱼ)] (2)
+
+Điểm attention a(m-n) phụ thuộc vào vị trí tương đối (m-n).
+
+### 2.2 Hành vi Bất thường giữa RoPE và Ma trận Attention
+
+Sau khi áp dụng RoPE, điểm attention a(m-n) có thể được hiểu như tổng của d/2 tích vô hướng của các số phức, như được minh họa trong Phương trình (2). Đối với bất kỳ cặp qⱼ = (q₂ⱼ, q₂ⱼ₊₁) và kⱼ = (k₂ⱼ, k₂ⱼ₊₁) nào, là phép cắt 2 chiều của q (hoặc qₘ) và k (hoặc kₙ), chúng tôi giới thiệu góc ban đầu Θⱼ giữa chúng, được đo ngược chiều kim đồng hồ từ kⱼ đến qⱼ trong mặt phẳng phức. Trong suốt quá trình phân tích, chúng tôi giữ vị trí của kⱼ cố định, xoay qⱼ một cách có hệ thống để kiểm tra toàn diện vị trí tương đối của chúng. Góc cuối cùng giữa qⱼ và kⱼ được biểu diễn như θ(qⱼ, kⱼ) = Θⱼ + (m-n)θⱼ, trong đó m và n là các chỉ số vị trí của qⱼ và kⱼ.
+
+Trong khái niệm này, điểm attention có thể được công thức hóa như:
+
+a(m, n) = ∑ⱼ₌₀^(d/2-1) |qⱼ||kⱼ|cos(θ(qⱼ, kⱼ)) (3)
+
+Tham khảo Hình 3 để có biểu diễn trực quan của khái niệm này cho bất kỳ j ∈ [0, d/2] cá nhân nào trong không gian con 2-D. Có bốn kịch bản khác biệt giữa qⱼ và kⱼ sau khi xoay.
+
+(1) Kịch bản (b) và (c): Khi m > n và Θⱼ ≤ π, hoặc m < n và Θⱼ > π, giá trị của cos(θ(qⱼ, kⱼ)) giữa qⱼ và kⱼ giảm với khoảng cách mở rộng giữa m và n. Trong 2 kịch bản này, không có hành vi bất thường nào được quan sát, vì điểm attention tự nhiên giảm với khoảng cách vị trí. Xu hướng này tiếp tục cho đến khi góc tương đối θ(qⱼ, kⱼ) xoay vượt quá ranh giới của π.
+
+![Hình 3: Hành vi bất thường của RoPE trong mặt phẳng 2-D. Tích vô hướng của các vector qⱼ và kⱼ phụ thuộc vào góc tương đối θ(qⱼ, kⱼ), được định nghĩa là Θⱼ + (m-n)θⱼ. Ở đây, Θⱼ đại diện cho góc ban đầu, và (m-n)θⱼ biểu thị góc xoay phụ thuộc vị trí.]
+
+(2) Kịch bản (a) và (d): Khi m < n và Θⱼ ≤ π, hoặc m > n và Θⱼ > π, các hiện tượng thú vị xuất hiện. Khi khoảng cách giữa m và n tăng, giá trị của cos(θ(qⱼ, kⱼ)) giữa qⱼ và kⱼ nghịch lý tăng lên. Sự bất thường này có tác động đáng chú ý đến điểm attention, đặc biệt ảnh hưởng đến τ token gần nhất. Trong ngữ cảnh này, τ được định nghĩa là Θⱼ/θⱼ cho kịch bản (a) và (2π-Θⱼ)/θⱼ cho kịch bản (d). Do đó, điểm attention cho các token này bị giảm một cách bất thường.
+
+Đối với các mô hình ngôn ngữ hai chiều, cả bốn trường hợp đều có thể xảy ra. Đối với các mô hình causal, chỉ kịch bản (b) và (d) biểu hiện, vì m luôn vượt quá n.
+
+Điểm attention a(m-n) là tổng của d/2 tích vô hướng, một trong số chúng trở nên bất thường có thể không đáng kể, tuy nhiên, các thí nghiệm đã xác nhận tầm quan trọng này. Phân tích thêm về hành vi bất thường ranh giới xoay này được thảo luận trong Phụ lục D.2.
+
+### 2.3 Collinear Constrained Attention
+
+Để giải quyết hành vi bất thường giữa RoPE và ma trận attention, chúng tôi đề xuất một phương pháp mới gọi là Collinear Constrained Attention (CoCA). Cụ thể, bằng cách áp dụng ràng buộc collinear cho bất kỳ cặp qⱼ = (q₂ⱼ, q₂ⱼ₊₁) và kⱼ = (k₂ⱼ, k₂ⱼ₊₁) nào, chúng tôi tích hợp liền mạch RoPE vào cơ chế self-attention, đạt được ngoại suy ngữ cảnh dài.
+
+Để chính thức hóa điều này, xem xét một chuỗi N token đầu vào Sₙ = {wₙ}ₙₙ₌₁, với word embeddings tương ứng Eₙ = {xₙ}ₙₙ₌₁, trong đó xₙ ∈ ℝᵈ là vector word embedding d-chiều của token wₙ không có thông tin vị trí. Đầu tiên, các queries qₘ được thu được:
+
+qₘ = WQxₘ, ∀m ∈ [1, N] (4)
+
+Tiếp theo, chúng tôi suy ra các keys kₙ với ràng buộc collinear. Điều này bắt đầu với việc giới thiệu hệ số ràng buộc tₙ cho mỗi vị trí token n, như được mô tả trong Phương trình (5).
+
+tₙ = WTxₙ, ∀n ∈ [1, N] (5)
+
+Tiếp theo, Phương trình (6) áp dụng điều kiện collinearity trên các hệ số t₂ⱼ và t₂ⱼ₊₁, trong đó tₙ = [t₀, t₁, ..., tₑ₋₁]ᵀ, đảm bảo rằng mỗi cặp là giống hệt nhau. Bước này hiệu quả nhân đôi mỗi đoạn 2 chiều của tensor.
+
+t₂ⱼ = t₂ⱼ₊₁, ∀j ∈ [0, d/2-1]
+tₙ = Relu(tₙ) (6)
+
+Sau đó, các keys được tính như trong Phương trình (7), trong đó kₙ được biểu diễn bởi phép nhân element-wise của Q = (q₁, ..., qₙ) và tₙ. Điều này dẫn đến mở rộng chiều, vì kₙ ∈ ℝᴺˣᵈ bây giờ bao gồm một chiều độ dài chuỗi bổ sung. Chúng tôi giải quyết áp lực bộ nhớ tiềm ẩn bằng cách tối ưu hóa tensor contractions, đảm bảo không có tăng ròng trong tiêu thụ bộ nhớ. Để phân tích sâu, vui lòng tham khảo Phụ lục C.
+
+kₙ = Q ⊙ tₙ = (q₁ ○ tₙ, ..., qₙ ○ tₙ) (7)
+
+Sau đó, chúng tôi áp dụng RoPE trên Q và K, với hàm f được chi tiết trong Phương trình (1).
+
+f(qₘ) = f(qₘ, m)
+f(kₙ) = f(Q ⊙ tₙ, n) = f(Q, n) ⊙ tₙ (8)
+
+Cuối cùng, điểm attention của CoCA sẽ là:
+
+a(m, n) = Re(⟨f(qₘ, m), f(qₘ, n) ○ tₙ⟩) (9)
+
+Phương trình (9) minh họa chiều bổ sung của các keys trong cơ chế CoCA của chúng tôi. Cụ thể, nó ánh xạ chỉ số của mỗi query đến chiều bổ sung, thiết lập mối quan hệ collinear giữa key thứ n và query thứ m. Đây là một khía cạnh quan trọng của phương pháp chúng tôi.
+
+### 2.4 Nới lỏng Ràng buộc trên Query
+
+Trong Phần 2.3, chúng tôi trình bày một giải pháp chính xác về mặt lý thuyết cho CoCA. Tuy nhiên, triển khai thực tế gặp phải thách thức do độ phức tạp O(N²d) khi lưu trữ f(Q, n). Để giải quyết vấn đề này, chúng tôi cung cấp một triển khai kép với độ phức tạp O(Nd) trong phần này và chứng minh sự tương đương của chúng.
+
+**Định lý 1.** (Triển khai kép của CoCA) Đối với bất kỳ điểm attention nào được định nghĩa trong Phương trình (9), tồn tại một dạng tương đương như sau:
+
+a(m, n) = Re(⟨f(qₘ, m), qₘ ○ f(tₙ, n)⟩) (10)
+
+với ràng buộc:
+
+q₂ⱼ = q₂ⱼ₊₁, ∀j ∈ [0, d/2-1] (11)
+
+**Chứng minh:** Chứng minh bao gồm hai bước.
+
+**Bước 1.** Chúng tôi chứng minh rằng, bằng cách áp dụng ràng buộc q₂ⱼ = q₂ⱼ₊₁, ∀j ∈ [0, d/2-1], Re(⟨f(qₘ, m), qₘ ○ f(tₙ, n)⟩) tương đương với Re(⟨f(qₘ, m), f(qₘ, n) ○ tₙ⟩).
+
+Để thấy điều này, chúng tôi tính toán sự khác biệt giữa f(qₘ, n) ○ tₙ và qₘ ○ f(tₙ, n):
+
+f(qₘ, n) ○ tₙ - qₘ ○ f(tₙ, n) = 
+[t₀(q₀cosnθ₀ - q₁sinnθ₀)
+t₁(q₀sinnθ₀ + q₁cosnθ₀)
+...
+tₑ₋₂(qₑ₋₂cosnθₑ/₂₋₁ - qₑ₋₁sinnθₑ/₂₋₁)
+tₑ₋₁(qₑ₋₂sinnθₑ/₂₋₁ + qₑ₋₁cosnθₑ/₂₋₁)]
+
+- [q₀(t₀cosnθ₀ - t₁sinnθ₀)
+q₁(t₀sinnθ₀ + t₁cosnθ₀)
+...
+qₑ₋₂(tₑ₋₂cosnθₑ/₂₋₁ - tₑ₋₁sinnθₑ/₂₋₁)
+qₑ₋₁(tₑ₋₂sinnθₑ/₂₋₁ + tₑ₋₁cosnθₑ/₂₋₁)] (12)
+
+Nhớ rằng t₂ⱼ = t₂ⱼ₊₁, ∀j ∈ [0, d/2-1] (xem Phương trình (6)), Phương trình (12) tương đương với:
+
+f(qₘ, n) ○ tₙ - qₘ ○ f(tₙ, n) = 
+[t₀(q₀ - q₁) sinnθ₀
+t₁(q₀ - q₁) sinnθ₀
+...
+tₑ₋₂(qₑ₋₂ - qₑ₋₁) sinnθₑ/₂₋₁
+tₑ₋₁(qₑ₋₂ - qₑ₋₁) sinnθₑ/₂₋₁] (13)
+
+Rõ ràng, nếu chúng ta áp dụng ràng buộc q₂ⱼ = q₂ⱼ₊₁, ∀j ∈ [0, d/2-1], vector trong Phương trình (13) trở thành null và chúng ta suy ra rằng:
+
+f(qₘ, n) ○ tₙ - qₘ ○ f(tₙ, n) = 0 (14)
+
+Do đó, với ràng buộc q₂ⱼ = q₂ⱼ₊₁, ∀j ∈ [0, d/2-1], chúng ta có:
+
+Re(⟨f(qₘ, m), qₘ ○ f(tₙ, n)⟩) = Re(⟨f(qₘ, m), f(qₘ, n) ○ tₙ⟩) (15)
+
+**Bước 2.** Chúng tôi tiếp tục chứng minh rằng, q₂ⱼ = q₂ⱼ₊₁, ∀j ∈ [0, d/2-1] thực tế là một ràng buộc dư thừa khi tính toán Re(⟨f(qₘ, m), f(qₘ, n) ○ tₙ⟩). Để xác minh điều này, chúng tôi mở rộng tích vô hướng:
+
+Re(⟨f(qₘ, m), f(qₘ, n) ○ tₙ⟩) = 
+∑ⱼ₌₀^(d/2-1) [(q²₂ⱼt₂ⱼ + q²₂ⱼ₊₁t₂ⱼ₊₁) cos((m-n)θⱼ) + (q₂ⱼq₂ⱼ₊₁t₂ⱼ - q₂ⱼ₊₁q₂ⱼt₂ⱼ₊₁) sin((m-n)θⱼ)] (16)
+
+Nhớ lại t₂ⱼ = t₂ⱼ₊₁, ∀j ∈ [0, d/2-1], chúng ta có
+
+Re(⟨f(qₘ, m), f(qₘ, n) ○ tₙ⟩) = 
+∑ⱼ₌₀^(d/2-1) t₂ⱼ[(q²₂ⱼ + q²₂ⱼ₊₁) cos((m-n)θⱼ)] = 
+∑ⱼ₌₀^(d/2-1) t₂ⱼ|qⱼ|² cos((m-n)θⱼ) (17)
+
+Điều này ngụ ý rằng Re(⟨f(qₘ, m), f(qₘ, n) ○ tₙ⟩) chỉ phụ thuộc vào độ lớn của qⱼ = (q₂ⱼ, q₂ⱼ₊₁) trong không gian con 2-D, chứng minh sự độc lập của mối quan hệ giữa q₂ⱼ và q₂ⱼ₊₁. Tham khảo Phụ lục D.3 để có chứng minh nghiêm ngặt.
+
+Bây giờ chúng tôi kết luận rằng, với ràng buộc q₂ⱼ = q₂ⱼ₊₁, ∀j ∈ [0, d/2-1], Re(⟨f(qₘ, m), qₘ ○ f(tₙ, n)⟩) tương đương với Re(⟨f(qₘ, m), f(qₘ, n) ○ tₙ⟩) không có ràng buộc trên query.
+
+Bằng cách loại bỏ ràng buộc q₂ⱼ = q₂ⱼ₊₁, chúng tôi gọi phiên bản sửa đổi này là CoCA-Slack. Định nghĩa toán học được cung cấp trong Phụ lục D.4.
+
+## 3 Cài đặt Thí nghiệm
+
+Phần này cung cấp tổng quan về cài đặt thí nghiệm, bao gồm chi tiết về dữ liệu huấn luyện được sử dụng và các mô hình baseline được sử dụng để đánh giá hiệu quả của phương pháp đề xuất.
+
+### 3.1 Dữ liệu Huấn luyện
+
+Mô hình của chúng tôi trải qua huấn luyện trên kết hợp các tập dữ liệu, bao gồm tập dữ liệu huấn luyện Pile (Gao et al., 2020), BookCorpus (Zhu et al., 2015), và Wikipedia Corpus (Foundation, 2021). Ngoài ra, chúng tôi tích hợp mã nguồn mở được thu thập thủ công từ các repository GitHub với ít nhất 1 sao. Từ các tập dữ liệu này, chúng tôi lấy một mẫu khoảng 50B token, duy trì thành phần 75% văn bản và 25% mã.
+
+### 3.2 Biến thể Mô hình
+
+Để đánh giá hiệu quả của phương pháp đề xuất, chúng tôi huấn luyện 3 mô hình từ đầu dưới cài đặt thí nghiệm giống hệt nhau, bao gồm ALibi (Press et al., 2022), RoFomer (Su et al., 2024), và RoFormer+CoCA. Tất cả các mô hình chia sẻ thông số kỹ thuật chung, có kích thước 350M, 24 lớp, chiều ẩn 1024, 16 attention heads, và độ dài chuỗi tối đa 512. Sự khác biệt chính giữa chúng nằm ở các biến thể trong cơ chế self-attention và position embeddings. Triển khai được tối ưu dựa trên EleutherAI GPT-NeoX¹. Huấn luyện một mô hình từ đầu đòi hỏi tài nguyên tính toán đáng kể. Do đó, chúng tôi cũng tiến hành các thí nghiệm liên quan đến fine-tuning các LLMs hiện có với module CoCA drop-in. Để mục đích này, chúng tôi sử dụng mô hình LLaMA-7B (Touvron et al., 2023a), được huấn luyện với độ dài ngữ cảnh 2,048. Ngoài ra, chúng tôi sử dụng dynamic-NTK cho tất cả các mô hình trên.
+
+Tóm lại, các mô hình so sánh của chúng tôi được phân loại như sau: ALibi, RoFormer, RoFormer+CoCA, RoFormer+dynamic NTK, và RoFormer+dynamic NTK & CoCA, tất cả thuộc danh mục huấn luyện từ đầu. Trong khi đó, LLaMA-7B, LLaMA-7B+CoCA, LLaMA-7B+dynamic NTK, và LLaMA-7B+dynamic NTK & CoCA thuộc danh mục fine-tuning LLM với CoCA drop-in.
+
+### 3.3 Chi tiết Triển khai
+
+**Quy trình Pre-training** Chúng tôi huấn luyện tất cả các mô hình sử dụng objective dự đoán token tiếp theo. Chúng tôi sử dụng AdamW (Loshchilov và Hutter, 2017) với β₁ = 0.9 và β₂ = 0.95. Learning rate theo một linear warm-up của 1% tổng số bước, bắt đầu từ 1e-7. Sau đó, learning rate được điều chỉnh thành 1e-4 với linear decay, cuối cùng đạt 1e-5. Việc huấn luyện sử dụng 8 GPU A100, với global batch size 256 và 2 gradient steps accumulation, mất khoảng 96 giờ cho 2 epochs.
+
+**Quy trình Fine-tuning** Để tích hợp CoCA vào LLaMA, chúng tôi sử dụng một chiến lược fine-tuning ba giai đoạn: (1) chỉ cập nhật projection K (7% tham số). Giai đoạn này nhằm tái tạo projection K trong CoCA. Bằng cách đóng băng các tham số khác, chúng tôi duy trì điểm attention gần nhất có thể với self-attention thông thường. (2) cập nhật projection QKV (21% tham số). Giai đoạn này nhằm giải quyết over-fitting nội tại trong self-attention thông thường gây ra bởi các hành vi không mong muốn giữa RoPE và ma trận attention. (3) fine-tuning tất cả tham số. Mỗi giai đoạn bao gồm 15K bước, tổng cộng 7.5B token (22B token tổng thể), sử dụng objective dự đoán token tiếp theo. Độ dài huấn luyện của LLaMA-7B + CoCA vẫn ở 2,048 như trong mô hình gốc. Tất cả thí nghiệm được tiến hành với 32 GPU A100, đặt per-device batch size thành 8 mà không gradient accumulation.
+
+## 4 Kết quả Thí nghiệm
+
+Chúng tôi đã tiến hành các thí nghiệm để làm sáng tỏ những nghi ngờ hợp lý sau:
+
+• Liệu cơ chế attention mới CoCA của chúng tôi có thể cải thiện hiệu suất ngoại suy ngữ cảnh dài của các mô hình hiện có không?
+
+• Liệu việc kết hợp CoCA với các phương pháp mở rộng khác cho RoPE có thể hiệu quả giải quyết ba loại vấn đề ranh giới xoay được thảo luận trong Phụ lục D.2 không?
+
+### 4.1 Mô hình Ngôn ngữ Chuỗi Dài
+
+Chúng tôi đánh giá hiệu suất mô hình ngôn ngữ chuỗi dài của cả mô hình của chúng tôi và các mô hình baseline trên các phần test của tập dữ liệu PG-19 (Rae et al., 2020). Để đánh giá này, chúng tôi ngẫu nhiên chọn một subsample bao gồm 100 tài liệu, mỗi tài liệu chứa ít nhất 32,768 token SentencePiece (Kudo và Richardson, 2018). Sau đó chúng tôi cắt ngắn mỗi tài liệu test thành 32,768 token đầu tiên. Việc đánh giá bao gồm tính toán perplexity qua các kích thước cửa sổ ngữ cảnh khác nhau sử dụng phương pháp sliding window, như được mô tả bởi (Press et al., 2022), với stride 512. Kết quả perplexity cho cả mô hình của chúng tôi và baselines được trình bày trong Bảng 1 và Hình 1.
+
+Dựa trên các thí nghiệm của chúng tôi, kết quả đánh giá cho thấy các mô hình kết hợp với CoCA thể hiện perplexity được cải thiện đáng kể với độ dài chuỗi suy luận dài hơn. Đối với các mô hình pre-trained, bằng cách tăng kích thước cửa sổ ngữ cảnh từ 512 (kích thước cửa sổ ngữ cảnh huấn luyện) đến 32k, perplexity của CoCA chỉ tăng từ 20.11 đến 171.63, trong khi perplexity của RoFormer trở thành inf. Ngoài ra, bằng cách tăng kích thước cửa sổ ngữ cảnh từ 2K đến 32K, perplexity của LLaMA-7B+CoCA đã fine-tuned chỉ tăng 21.68, trong khi LLaMA-7B với các phương pháp mở rộng khác tăng hơn 100. Nhìn chung, chúng tôi quan sát một xu hướng nhất quán của CoCA đạt được perplexity tốt hơn với cửa sổ ngữ cảnh dài hơn. Điều này cho thấy CoCA có position embedding mạnh mẽ hơn, cho phép nó xử lý ngữ cảnh dài hiệu quả hơn.
+
+Ngược lại, chúng tôi quan sát rằng các mô hình được mở rộng thông qua áp dụng trực tiếp dynamic NTK-aware Scaled RoPE thể hiện sự gia tăng perplexity lớn hơn ở các chuỗi dài hơn. Perplexity của cả RoFormer+dynamic NTK và LLaMA-7B+dynamic NTK vẫn cao hơn đáng kể so với việc kết hợp CoCA. Sự khác biệt này trở nên rõ rệt hơn khi độ dài chuỗi tăng. Khi độ dài chuỗi suy luận đạt 32k, perplexity của RoFormer+dynamic NTK tăng đến 380.75, trong khi kết quả cho RoFormer+CoCA chỉ là 171.63. Tương tự, perplexity của LLaMA-7B+dynamic NTK đạt 133.87, trong khi LLaMA-7B+CoCA chỉ là 29.95.
+
+Đáng chú ý là mô hình đạt được hiệu suất tốt nhất khi cả dynamic NTK và CoCA được kết hợp. Đặc biệt, LLaMA-7B+dynamic NTK & CoCA liên tục duy trì perplexity rất thấp. Ngay cả khi độ dài chuỗi suy luận đã đạt 32k (16× dài hơn độ dài huấn luyện), perplexity chỉ là 13.89. Điều này cho thấy việc kết hợp CoCA với các phương pháp mở rộng khác cho RoPE có thể hiệu quả giải quyết ba loại vấn đề ranh giới xoay, đạt được khả năng mô hình hóa ngoại suy văn bản dài mạnh mẽ.
+
+| Phương pháp | Kích thước Cửa sổ Ngữ cảnh Đánh giá (Perplexity ↓) |
+|-------------|---------------------------------------------------|
+|             | 512 | 1024 | 2048 | 4096 | 8192 | 16k | 32k |
+| **Huấn luyện mô hình từ đầu** |
+| ALibi | 18.69 | 21.27 | 28.20 | 35.66 | 37.03 | OOM | OOM |
+| RoFomer | 19.66 | 411.50 | 3276.00 | 3026.00 | 3028.00 | inf | inf |
+| + dynamic NTK | 19.66 | 22.30 | 38.00 | 75.75 | 138.13 | 370.75 | 380.75 |
+| + CoCA | 20.11 | 33.47 | 69.06 | 113.19 | 157.38 | 141.00 | 171.63 |
+| + dynamic NTK & CoCA | **20.11** | **20.81** | **25.88** | **34.16** | **55.75** | **89.31** | **101.13** |
+| **Fine-tuning LLM với CoCA drop-in** |
+| LLaMA-7B | 9.25 | 7.56 | 7.30 | 9673.14 | inf | inf | inf |
+| + dynamic NTK | 9.25 | 7.56 | 7.30 | 9.40 | 14.40 | 63.62 | 133.87 |
+| + CoCA | 9.91 | 8.49 | 8.27 | 24.23 | 42.00 | 23.83 | 29.95 |
+| + dynamic NTK & CoCA | **9.91** | **8.49** | **8.27** | **8.61** | **9.56** | **11.10** | **13.98** |
+
+Bảng 1: Đánh giá perplexity trên 100 tài liệu PG-19 sử dụng chiến lược sliding window (S = 512). Dynamic-NTK được sử dụng mà không fine-tuning. Kết quả tốt nhất được làm nổi bật bằng chữ đậm.
+
+### 4.2 Truy xuất Ngữ cảnh Dài
+
+Perplexity đánh giá hiệu suất của mô hình ngôn ngữ trong việc dự đoán token tiếp theo. Tuy nhiên, nó không đủ để đánh giá toàn diện kích thước cửa sổ ngữ cảnh hiệu quả. Để giải quyết điều này, chúng tôi đã tiến hành các thí nghiệm sử dụng nhiệm vụ truy xuất passkey (Mohtashami và Jaggi, 2023) để đánh giá phương pháp và baselines của chúng tôi. Nhiệm vụ bao gồm việc xác định và truy xuất một passkey được ẩn ngẫu nhiên trong một tài liệu dài. Chi tiết hơn về định nghĩa nhiệm vụ và cài đặt tạo mẫu test có thể được tìm thấy trong Phụ lục B.1. Bảng 2 minh họa độ chính xác của tất cả các mô hình được test và các biến thể của chúng.
+
+Rõ ràng là ALibi thể hiện thất bại khi được test trên các chuỗi dài 1× so với độ dài huấn luyện của nó, do giả thuyết cục bộ của nó. Ngược lại, mô hình của chúng tôi liên tục chứng minh độ chính xác vượt trội. RoFormer+dynamic NTK & CoCA duy trì độ chính xác 50%, ngay cả với độ dài chuỗi test mở rộng đến 16× độ dài huấn luyện của nó. Tương tự, LLaMA-7B+dynamic NTK & CoCA vẫn duy trì độ chính xác 30% khi độ dài test lên đến 32K.
+
+| Phương pháp | Kích thước Cửa sổ Ngữ cảnh Đánh giá (Độ chính xác ↑) |
+|-------------|---------------------------------------------------|
+|             | 512 | 1024 | 2048 | 4096 | 8192 | 16k | 32k |
+| **Huấn luyện mô hình từ đầu** |
+| ALibi | 0.82 | 0.65 | 0.28 | 0.18 | 0.12 | OOM | OOM |
+| RoFomer | 0.99 | 0.53 | 0.30 | 0.18 | 0.04 | 0.02 | 0.04 |
+| + dynamic NTK | 0.99 | 1.00 | 0.95 | 0.70 | 0.41 | 0.16 | 0.06 |
+| + CoCA | 1.00 | 0.64 | 0.33 | 0.19 | 0.06 | 0.02 | 0.04 |
+| + dynamic NTK & CoCA | **1.00** | **1.00** | **0.96** | **0.89** | **0.50** | **0.23** | **0.08** |
+| **Fine-tuning LLM với CoCA drop-in** |
+| LLaMA-7B | 1.00 | 1.00 | 1.00 | 0.61 | 0.21 | 0.07 | 0.09 |
+| + dynamic NTK | 1.00 | 1.00 | 1.00 | 0.81 | 0.26 | 0.06 | 0.03 |
+| + CoCA | 1.00 | 1.00 | 1.00 | 0.71 | 0.28 | 0.11 | 0.10 |
+| + dynamic NTK & CoCA | **1.00** | **1.00** | **1.00** | **1.00** | **0.85** | **0.51** | **0.30** |
+
+Bảng 2: Hiệu suất truy xuất ngữ cảnh dài trên nhiệm vụ truy xuất passkey. Kết quả tốt nhất được làm nổi bật bằng chữ đậm.
+
+### 4.3 Tác động của Ràng buộc Strict và Slack trên Q
+
+Như đã đề cập trong Phần 2.4, chúng tôi triển khai một phiên bản slack của CoCA, được gọi là CoCA-Slack. Trong phần này, dưới cùng cài đặt thí nghiệm, chúng tôi triển khai hai phiên bản của CoCA dựa trên RoFormer-350M, được gắn nhãn là CoCA-Slack và CoCA-Strict. Kết quả so sánh giữa chúng được hiển thị trong Bảng 3.
+
+Chúng tôi quan sát rằng các mô hình CoCA-Strict và CoCA-Slack thể hiện hiệu suất tương tự trong mô hình ngôn ngữ chuỗi dài, được chứng minh bởi kết quả perplexity tương đương. Tuy nhiên, trong nhiệm vụ truy xuất passkey, trái với kỳ vọng ban đầu của chúng tôi, mô hình CoCA-Strict tạo ra kết quả thấp hơn đáng kể. Kết quả bất ngờ này cho thấy các mô hình với ràng buộc slack có thể cung cấp lợi thế hiệu suất bổ sung, chẳng hạn như kích thước cửa sổ ngữ cảnh hiệu quả lớn hơn.
+
+| Phương pháp | 512 | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 |
+|-------------|-----|------|------|------|------|-------|-------|
+| **Hiệu suất Mô hình Chuỗi Dài (Perplexity)** |
+| CoCA-Slack ntk-2 | 20.11 | 19.02 | 24.92 | 40.53 | 68.38 | 92.75 | 103.44 |
+| CoCA-Strict | +0.07 | +0.61 | -1.58 | -4.03 | +15.37 | +12.38 | +1.94 |
+| CoCA-Slack ntk-4 | 20.11 | 20.81 | 25.88 | 34.16 | 55.75 | 89.31 | 101.13 |
+| CoCA-Strict | +0.07 | -0.49 | -0.66 | -0.88 | +3.16 | -18.25 | -2.57 |
+| CoCA-Slack ntk-8 | 20.11 | 23.66 | 29.05 | 37.47 | 55.5 | 88.88 | 111.38 |
+| CoCA-Strict | +0.07 | -1.74 | -0.64 | +1.16 | +0.03 | +0.5 | +0.31 |
+| **Hiệu suất Truy xuất Ngữ cảnh Dài (Độ chính xác Passkey)** |
+| CoCA-Slack ntk-2 | 1.0 | 0.99 | 0.94 | 0.77 | 0.47 | 0.27 | 0.15 |
+| CoCA-Strict | +0.0 | -0.12 | -0.3 | -0.42 | -0.34 | -0.22 | -0.07 |
+| CoCA-Slack ntk-4 | 1.0 | 1.0 | 0.96 | 0.89 | 0.5 | 0.23 | 0.08 |
+| CoCA-Strict | +0.0 | -0.11 | -0.38 | -0.46 | -0.38 | -0.19 | -0.02 |
+| CoCA-Slack ntk-8 | 1.0 | 0.98 | 0.99 | 0.85 | 0.5 | 0.11 | 0.02 |
+| CoCA-Strict | +0.0 | -0.05 | -0.34 | -0.51 | -0.4 | -0.07 | -0.01 |
+
+Bảng 3: Kết quả so sánh cho Ràng buộc Strict và Slack của Q trong module CoCA đề xuất của chúng tôi. Hiệu suất vượt trội so với CoCA-Slack được chỉ bằng màu xanh, trong khi hiệu suất kém hơn được biểu thị bằng màu đỏ. Perplexity của các mô hình strict và slack tương đương, trong khi mô hình strict đạt được độ chính xác thấp hơn trong nhiệm vụ truy xuất passkey.
+
+Hiểu các lý do đằng sau sự vượt trội của ràng buộc slack sẽ là trọng tâm chính của công việc tương lai của chúng tôi. Trong vấn đề này, chúng tôi cung cấp một số hiểu biết lý thuyết trong Phụ lục D.3 và D.4. Những hiểu biết này nhằm làm sáng tỏ các cơ chế cơ bản góp phần vào những khác biệt được quan sát và đặt nền tảng cho phân tích toàn diện hơn trong nghiên cứu tiếp theo.
+
+## 5 Kết luận
+
+Trong bài báo này, chúng tôi giới thiệu Collinear Constrained Attention (CoCA), một phương pháp mới tích hợp position embedding với cơ chế self-attention. Sự đổi mới này giải quyết các hành vi không mong muốn xảy ra xung quanh ranh giới cửa sổ ngữ cảnh, xuất phát từ sự khác biệt giữa RoPE và ma trận attention. Theo hiểu biết tốt nhất của chúng tôi, chúng tôi là những người đầu tiên phân tích các góc ban đầu giữa queries và keys trong cơ chế self-attention, điều này làm phát sinh hiện tượng bất thường trong RoPE. Hơn nữa, chúng tôi suy ra một ràng buộc slack cho việc triển khai CoCA của chúng tôi. Các thí nghiệm rộng rãi chứng minh rằng việc kết hợp CoCA vào các mô hình hiện có đáng kể tăng cường hiệu suất trong cả nhiệm vụ mô hình ngôn ngữ chuỗi dài và truy xuất ngữ cảnh dài. Ngoài ra, việc tích hợp đồng thời CoCA với các phương pháp RoPE mở rộng khác (ví dụ: dynamic-NTK) hiệu quả giảm thiểu ba loại vấn đề ranh giới xoay, dẫn đến khả năng ngoại suy ngữ cảnh dài được cải thiện đáng kể.
+
+## Hạn chế
+
+Phương pháp hiện tại của chúng tôi, CoCA, cho đến nay đã trải qua xác thực độc quyền trên RoPE. Kết quả thí nghiệm chứng minh rằng CoCA tăng cường hiệu suất ngoại suy ngữ cảnh dài của LLMs và tiếp tục tăng cường các phương pháp mở rộng khác bằng cách giải quyết các vấn đề ranh giới xoay. Tuy nhiên, các câu hỏi phát sinh về khả năng áp dụng của nó cho các phương pháp tổng quát hơn. Mặc dù hiệu quả của slack position embedding (SPE) là rõ ràng, việc hiểu sâu hơn các lý do cơ bản cho hiệu suất vượt trội của nó đòi hỏi điều tra thêm.
+
+## Tài liệu tham khảo
+
+[Danh sách tài liệu tham khảo được giữ nguyên như bản gốc]
+
+## A Công trình Liên quan
+
+Các nghiên cứu hiện tại chủ yếu tập trung vào sub-module của attention kernel hoặc position embedding (Huang et al., 2023). Trong các phần sau, chúng tôi sẽ giới thiệu riêng biệt các công trình về hai khía cạnh này: Phần A.1 chủ yếu giải quyết cái trước, trong khi Phần A.2 đi sâu vào cái sau.
+
+### A.1 Cơ chế Attention Hiệu quả
+
+Một số công trình nhằm triển khai các cơ chế attention hiệu quả với yêu cầu tính toán giảm, thậm chí đạt được độ phức tạp tuyến tính. Điều này cho phép mở rộng ranh giới độ dài ngữ cảnh hiệu quả của LLMs trong quá trình suy luận bằng cách trực tiếp tăng Lmax trong giai đoạn pre-training (Ding et al., 2023; Mohtashami và Jaggi, 2023). Các phương pháp đáng chú ý bao gồm Longformer (Beltagy et al., 2020), sử dụng slide window attention, và các mô hình như StreamingLLM (Xiao et al., 2023) và LM-Infinite (Han et al., 2023), tận dụng cơ chế global-local attention. Các biến thể này đã đạt được thành công ở một mức độ nhất định, nhưng vẫn gặp phải các vấn đề chúng tôi tiết lộ trong công trình này khi sử dụng RoPE như phương pháp mã hóa vị trí của chúng.
+
+### A.2 Phương pháp Position Embedding Ngoại suy
+
+Các phương pháp position embedding ngoại suy nhằm tăng cường khả năng tổng quát hóa độ dài của LLMs.
+
+#### A.2.1 Attention Bias
+
+Trong việc tìm kiếm các phương án thay thế cho việc mã hóa rõ ràng thông tin vị trí, các nhà nghiên cứu đã khám phá việc tích hợp attention bias để nắm bắt các sắc thái tuần tự và tạm thời vốn có trong ngôn ngữ tự nhiên. Các phương pháp đầu tiên, như T5 (Ruder et al., 2019), kết hợp attention bias có thể học được. Tuy nhiên, các phương pháp này không giải quyết rõ ràng thách thức ngoại suy độ dài. ALibi (Press et al., 2022) giới thiệu negative causal attention bias theo cách heuristic. Mở rộng attention bias kiểu ALiBi, KERPLE (Chi et al., 2022) coi nó như một composition triangle kernel cho self-attention và sửa đổi kiểu Xpos (Sun et al., 2023) bằng cách tích hợp nó với RoPE. Mặc dù các phương pháp này hiệu quả trong việc duy trì mức perplexity thấp, chúng không đạt được việc nắm bắt các phụ thuộc tầm xa do giới thiệu các giả thuyết cục bộ cho các token ngữ cảnh.
+
+#### A.2.2 Mở rộng RoPE
+
+Bên cạnh đó, các chiến lược khác nhau đã được khám phá để mở rộng RoPE (Su et al., 2024), một phương pháp mã hóa vị trí được sử dụng phổ biến trong các LLMs nổi tiếng. Các phương pháp gần đây bao gồm việc đơn giản mở rộng nó để ngoại suy độ dài ngữ cảnh suy luận với fine-tuning tối thiểu hoặc không có. Ví dụ, Position Interpolation (PI) (Chen et al., 2023) áp dụng linear scaling trên mỗi số vị trí từ n thành n/k, làm dày đặc không gian biểu diễn để mở rộng ranh giới độ dài xa nhất k lần. Các phương pháp khác, như NTK-aware Scaled RoPE (bloc97, 2023) và Dynamic-NTK (Emozilla, 2023), kết hợp ngoại suy tần số cao và nội suy tần số thấp. Các phương pháp training-free này yêu cầu thay đổi mã hạn chế trong quá trình suy luận (Peng et al., 2023). Tuy nhiên, các phương pháp này chỉ nhằm giảm nhẹ vấn đề mô hình hóa các góc xoay trong các vị trí out-of-distribution (OOD) mà không nhận ra mối tương quan nội tại giữa ma trận attention và góc xoay. Do đó, các phương pháp này vẫn gặp phải tỷ lệ mở rộng cửa sổ ngữ cảnh hạn chế.
+
+Các phương pháp trước đây độc lập điều tra self-attention và position embedding mà không xem xét mối quan hệ nội tại của chúng, đặc biệt đối với phương pháp RoPE được sử dụng rộng rãi.
+
+## B Thí nghiệm Bổ sung
+
+### B.1 Định nghĩa Nhiệm vụ Truy xuất Passkey
+
+```
+Có một thông tin quan trọng được ẩn bên trong
+rất nhiều văn bản không liên quan. Tìm nó và
+ghi nhớ chúng. Tôi sẽ hỏi bạn về
+thông tin quan trọng đó.
+
+Cỏ màu xanh. Bầu trời màu xanh. Mặt
+trời màu vàng. Chúng ta bắt đầu. Đi và về
+lại.
+... // Lặp lại x lần.
+// Passkey là 5 số được tạo ngẫu nhiên.
+Passkey là 12345. Hãy nhớ nó. 12345 là
+passkey.
+
+Cỏ màu xanh. Bầu trời màu xanh. Mặt
+trời màu vàng. Chúng ta bắt đầu. Đi và về
+lại.
+... // Lặp lại y lần.
+
+Passkey là gì?
+```
+
+Listing 1: Định dạng prompt cho truy xuất passkey (Mohtashami và Jaggi, 2023). Passkey được tạo ngẫu nhiên từ 10,000 đến 99,999.
+
+Nhiệm vụ truy xuất passkey, như được đề xuất bởi Mohtashami và Jaggi (2023), bao gồm việc mô hình khôi phục một passkey được tạo ngẫu nhiên ẩn trong một tài liệu dài (xem Listing 1 cho định dạng prompt nhiệm vụ). Cho một mô hình ngôn ngữ, chúng ta có thể xác định cửa sổ ngữ cảnh hiệu quả bằng cách đánh giá ranh giới trên và dưới. Chúng ta giả định một passkey ngẫu nhiên cách k token từ cuối đầu vào. Nếu một mô hình liên tục thất bại trong việc khôi phục passkey trong nhiều lần thử, điều đó cho thấy kích thước cửa sổ ngữ cảnh nhỏ hơn k. Ngược lại, việc truy xuất thành công cho thấy kích thước cửa sổ ngữ cảnh hiệu quả ít nhất k token (Chen et al., 2023).
+
+Trong các thí nghiệm của chúng tôi, chúng tôi tạo các mẫu test dựa trên template prompt trong Listing 1, với độ dài từ 512 đến 32k. Có 100 trường hợp test cho mỗi độ dài. Cho một mô hình ngôn ngữ, chúng tôi nhập prompt nhiệm vụ passkey, kiểm tra đầu ra của mô hình cho 64 token mới, và tính toán độ chính xác.
+
+### B.2 Phân tích I: Tính nhất quán của Tối ưu hóa trong Position Embedding
+
+Kết quả truy xuất passkey được trình bày trong Phần 4.2. Mô hình của chúng tôi chứng minh độ chính xác truy xuất passkey vượt trội so với các mô hình baseline dưới các điều kiện khác nhau. Tuy nhiên, chúng tôi vẫn tò mò về việc tối ưu hóa của nó, cụ thể là liệu nó xảy ra trong hay ngoài phạm vi cửa sổ ngữ cảnh huấn luyện. Để khám phá điều này sâu hơn, chúng tôi phân loại dữ liệu thí nghiệm thành hai đoạn: khoảng cách passkey ngắn hơn và xa hơn độ dài cửa sổ ngữ cảnh huấn luyện.
+
+Hình 4 (a) minh họa kết quả so sánh khi passkey được chèn ít hơn 512 token từ token cuối, trong khi Hình 4 (b) minh họa kết quả ngoài phạm vi này. Khi passkey được chèn bên ngoài cửa sổ 512, RoFormer+NTK & CoCA liên tục vượt trội RoFormer+NTK qua các độ dài khác nhau của chuỗi suy luận. Sự vượt trội này tiếp tục khi passkey được chèn bên trong cửa sổ 512. Đáng chú ý, với sự gia tăng độ dài của chuỗi suy luận, RoFormer + NTK & CoCA chứng minh hiệu suất ngày càng vượt trội so với RoFormer + NTK. Các thí nghiệm này cho thấy mô hình của chúng tôi có thể liên tục tối ưu hóa position embedding và mở rộng cửa sổ ngữ cảnh hiệu quả.
+
+![Hình 4: So sánh cửa sổ ngữ cảnh hiệu quả giữa RoFormer + NTK và RoFormer + NTK & CoCA.]
+
+### B.3 Phân tích II: Tác động của Dynamic-NTK trong CoCA
+
+Chúng tôi sử dụng phương pháp dynamic NTK (Emozilla, 2023) trong quá trình suy luận, áp dụng nó riêng biệt cho cả mô hình của chúng tôi và mô hình baseline. Để đánh giá toàn diện tính mạnh mẽ của các mô hình này, chúng tôi tiến hành xác thực kỹ lưỡng bằng cách thay đổi các hệ số tỷ lệ (2, 4, và 8).
+
+Kết quả trong Hình 1 và 5 chứng minh rằng, với việc tích hợp phương pháp dynamic NTK, mô hình của chúng tôi đạt được độ chính xác passkey cao hơn và perplexity thấp hơn. Ngoài ra, khi hệ số tỷ lệ thay đổi giữa 2, 4, và 8, mô hình RoFormer vanilla không duy trì được hiệu suất ổn định. Ngược lại, CoCA liên tục vượt trội RoFormer ở các tỷ lệ tỷ lệ khác nhau. Xu hướng nhất quán này cho thấy mô hình của chúng tôi mạnh mẽ hơn, thể hiện biến động hiệu suất tối thiểu với các thay đổi trong hệ số tỷ lệ.
+
+![Hình 5: Phân phối độ chính xác passkey trên 4 phạm vi khoảng cách. CoCA vượt trội RoFormer cho tất cả khoảng cách và hệ số tỷ lệ của NTK.]
+
+Hơn nữa, nó cho thấy rằng bằng cách triển khai ràng buộc collinear, chúng ta có thể khéo léo giải quyết hành vi bất thường trong RoPE, cho phép RoPE tận dụng tốt hơn các kỹ thuật ngoại suy khác.
+
+### B.4 Phân tích III: Tính tương thích của CoCA với PI
+
+#### B.4.1 Cài đặt Thí nghiệm
+
+Chúng tôi tiến hành các thí nghiệm sử dụng mô hình LLaMA-7B pre-trained (Touvron et al., 2023a) và LLaMA-7B + CoCA từ Phần 3.2. Để áp dụng PI, chúng tôi theo cài đặt của Chen et al. (2023): Chúng tôi đặt độ dài chuỗi fine-tuning thành 32,768. Learning rate được điều chỉnh thành 2e−5 mà không decay để phù hợp. Tất cả các cài đặt khác được duy trì như cấu hình LLaMA-7B. Tất cả thí nghiệm được tiến hành với 32 GPU A100, đặt per-device batch size thành 1 mà không gradient accumulation. Các thí nghiệm mất 6,000 bước để hoàn thành.
+
+#### B.4.2 Xác thực Ngữ cảnh Dài
+
+Kết quả fine-tuning với PI được trình bày trong Bảng 4. Về mô hình chuỗi dài, cả LLaMA-7B+PI và LLaMA-7B+CoCA & PI đều chứng minh hiệu suất cạnh tranh qua độ dài chuỗi từ 512 đến 8192. Tuy nhiên, ở độ dài chuỗi dài hơn (16384 và 32768), LLaMA-7B+CoCA & PI thể hiện lợi thế hiệu suất nhẹ so với LLaMA-7B+PI. Đối với truy xuất ngữ cảnh dài, cả hai phương pháp đều đạt được độ chính xác cực cao, với điểm số tiếp cận giá trị lý tưởng 1.0 qua tất cả độ dài chuỗi.
+
+Nhìn chung, những phát hiện này cho thấy việc tích hợp PI và module CoCA với mô hình LLaMA-7B mang lại hiệu suất mạnh mẽ trong cả nhiệm vụ mô hình chuỗi dài và truy xuất ngữ cảnh dài. Ngoài ra, module CoCA chứng minh khả năng duy trì mức hiệu suất tương đương với PI, đặc biệt rõ ràng ở độ dài chuỗi dài hơn.
+
+| Phương pháp | 512 | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 |
+|-------------|-----|------|------|------|------|-------|-------|
+| **Hiệu suất Mô hình Chuỗi Dài (Perplexity)** |
+| LLaMA-7B+PI | 9.06 | 7.55 | 7.74 | 7.16 | 7.04 | 6.93 | 7.11 |
+| + CoCA & PI | 9.65 | 8.19 | 8.37 | 7.87 | 7.84 | 7.83 | 7.96 |
+| **Hiệu suất Truy xuất Ngữ cảnh Dài (Độ chính xác Passkey)** |
+| LLaMA-7B+PI | 1.0 | 1.0 | 1.0 | 1.0 | 1.0 | 1.0 | 0.99 |
+| + CoCA & PI | 1.0 | 1.0 | 1.0 | 1.0 | 1.0 | 0.99 | 0.99 |
+
+Bảng 4: Kết quả so sánh cho LLaMA-7B+PI và LLaMA-7B+CoCA & PI sau fine-tuning với độ dài chuỗi 32,768. CoCA thành công trong việc duy trì hiệu suất của PI trong kích thước cửa sổ fine-tuning.
+
+#### B.4.3 Xác thực Ngữ cảnh Ngắn
+
+Ngoài việc tăng cường ngoại suy ngữ cảnh dài, việc xem xét tính thực tế và khả năng mở rộng của CoCA trong ngữ cảnh ngắn là bắt buộc. Do đó, chúng tôi đánh giá mô hình của chúng tôi trên OpenCompass (Contributors, 2023), bao gồm các chiều khác nhau, bao gồm lý luận, hiểu biết, ngôn ngữ, và kiểm tra. Kết quả được trình bày trong Bảng 5.
+
+Bảng cho thấy các mô hình LLaMA-7B được tích hợp với CoCA đạt được hiệu suất tương đương với LLaMA-7B baseline qua tất cả các chiều được đánh giá. Cụ thể, việc tích hợp CoCA không mang lại sự suy giảm đáng kể trong khả năng biểu đạt của mô hình. Điều này cho thấy CoCA hiệu quả không chỉ trong các kịch bản ngữ cảnh dài mà còn trong các nhiệm vụ ngữ cảnh ngắn, chứng minh tính linh hoạt và sự phù hợp cho các ứng dụng thực tế.
+
+| Phương pháp | Lý luận | Hiểu biết | Ngôn ngữ | Kiểm tra | Trung bình |
+|-------------|---------|-----------|----------|----------|-----------|
+| LLaMA-7B | 48.25 | 47.57 | 46.41 | 29.63 | 42.97 |
+| + CoCA | 45.55 | 51.14 | 55.27 | 25.14 | 44.28 |
+| + PI | 44.98 | 51.54 | 54.79 | 27.03 | 44.59 |
+| + CoCA & PI | 46.88 | 51.82 | 55.56 | 25.31 | 44.89 |
+
+Bảng 5: Kết quả OpenCompass của LLaMA-7B và các biến thể của nó. Các mô hình được tích hợp với CoCA đạt được hiệu suất tương đương với LLaMA-7B, không gây hại đến khả năng biểu đạt của mô hình.
+
+## C Phân tích Độ phức tạp Tính toán và Không gian
+
+| Module | vanilla self-attention | CoCA |
+|--------|------------------------|------|
+|        | Tính toán | Không gian | Tính toán | Không gian |
+| WQK(T)V | 3Nd²h | Nd | 3Nd²h | Nd |
+| T half | — | — | Ndh | Nd |
+| T Relu | — | — | Ndh | Nd |
+| QK(T) rotation | 2Ndh | Nd | 2Ndh | Nd |
+| Krot=Q⊙Trot | — | — | N²dh | N²d |
+| QrotKᵀrot | N²dh | N² | N²dh | N² |
+| Mask | N² | N² | N² | N² |
+| Softmax | N² | N² | N² | N² |
+
+Bảng 6: So sánh độ phức tạp tính toán và không gian giữa vanilla self-attention block và CoCA. Ở đây, N đại diện cho độ dài chuỗi, h biểu thị số heads, và d biểu thị chiều của mỗi head.
+
+Trong phần này, chúng tôi phân tích độ phức tạp tính toán và không gian của CoCA. Bảng 6 cung cấp so sánh chi tiết giữa cơ chế vanilla self-attention và CoCA.
+
+Khi sử dụng phép toán Krot = Q ⊙ Trot, độ phức tạp tính toán của CoCA không vượt quá gấp đôi so với vanilla self-attention. Trong thực tế, tốc độ huấn luyện và suy luận của CoCA tương đương với cơ chế vanilla self-attention, chỉ tăng nhẹ khoảng 5% đến 10%, như được mô tả trong Hình 6. Tuy nhiên, có sự gia tăng đáng kể trong độ phức tạp không gian khi mở rộng Krot = Q ⊙ Trot, trở thành d lần so với vanilla self-attention. Mức độ phức tạp không gian này không thực tế cho các ứng dụng.
+
+![Hình 6: So sánh tốc độ suy luận giữa CoCA và vanilla self-attention.]
+
+Để giải quyết vấn đề này, chúng ta có thể lấy cảm hứng từ việc tính toán QrotKᵀrot, bao gồm hai bước: phép nhân element-wise giữa Qrot và Krot tiếp theo là tổng theo chiều ẩn. Tối ưu hóa có thể đạt được bằng cách nén chiều ẩn trước khi mở rộng hoàn toàn chiều độ dài chuỗi. Do đó, độ phức tạp không gian được giảm hiệu quả từ N²d thành N². Chiến lược tối ưu hóa này cũng áp dụng được cho Krot = Q ⊙ Trot. Hai thành phần này có thể được thống nhất như được phát biểu trong Phương trình (18):
+
+QrotKᵀrot = Qrot(Q ⊙ Trot)ᵀ (18)
+
+Công việc đáng khen ngợi được thực hiện bởi opt_einsum (a. Smith và Gray, 2018) tạo thuận lợi cho việc tối ưu hóa Phương trình (18). Kết quả thí nghiệm cho thấy RoFormer+CoCA chỉ yêu cầu khoảng 60GB bộ nhớ GPU trong quá trình suy luận với độ dài chuỗi 32k, phù hợp chặt chẽ với tiêu thụ bộ nhớ của cơ chế vanilla self-attention.
+
+## D Chứng minh Lý thuyết
+
+### D.1 Dạng Mạnh của Long-term Decay với CoCA
+
+Chúng tôi đã giới thiệu lý thuyết cơ bản của Rotary Position Embedding trong Phần 2.1. Thực tế, (Su et al., 2024) cho thấy RoPE có đặc tính long-term decay:
+
+|a(s)| = Re[∑ⱼ₌₀^(d/2-1) hⱼe^(isθⱼ)] ≤ (max_i|hᵢ₊₁ - hᵢ|)∑ⱼ₌₀^(d/2-1) |Sⱼ₊₁| (19)
+
+trong đó hⱼ := (q₂ⱼ + iq₂ⱼ₊₁)(k₂ⱼ - ik₂ⱼ₊₁) và Sⱼ := ∑ₖ₌₀^(j-1) e^(isθₖ), s = (m-n), m cho chỉ số của query, n cho chỉ số của key. Vì giá trị của ∑ⱼ₌₀^(d/2-1) |Sⱼ₊₁| giảm với khoảng cách tương đối s, điểm attention cũng giảm.
+
+Đặc tính này đảm bảo tính ổn định của RoPE trong quá trình ngoại suy ở một mức độ nhất định bằng cách ngăn chặn các outliers. Đối với CoCA, một suy luận mạnh hơn có thể được công thức như sau:
+
+|a(s)| ≤ (max_i|lᵢ₊₁ - lᵢ|)∑ⱼ₌₀^(d/2-1) |Cⱼ₊₁| (20)
+
+trong đó lⱼ := |q₂ⱼ + iq₂ⱼ₊₁||k₂ⱼ + ik₂ⱼ₊₁|, và Cⱼ := ∑ₖ₌₀^(j-1) cos(sθₖ). Hơn nữa, nó đúng rằng:
+
+|lᵢ₊₁ - lᵢ| ≤ |hᵢ₊₁ - hᵢ| (21)
+
+**Chứng minh:** Chú ý rằng khi góc ban đầu Θⱼ giữa qⱼ và kⱼ là 0, từ Phương trình (17), điểm attention có thể được đơn giản hóa như:
+
+a(s) = Re[∑ⱼ₌₀^(d/2-1) hⱼe^(isθⱼ)] = ∑ⱼ₌₀^(d/2-1) lⱼcos(sθⱼ) (22)
+
+Bằng cách theo nghiên cứu của (Su et al., 2024), chúng ta có thể dễ dàng suy ra ước lượng trong Phương trình (20).
+
+Đối với Phương trình (21), áp dụng bất đẳng thức tam giác, chúng ta có:
+
+|hᵢ₊₁ - hᵢ| ≥ ||hᵢ₊₁| - |hᵢ|| (23)
+
+Xem xét định nghĩa của hᵢ = (q₂ⱼ + iq₂ⱼ₊₁)(k₂ⱼ - ik₂ⱼ₊₁), chúng ta sẽ thấy:
+
+|hᵢ₊₁ - hᵢ| ≥ ||hᵢ₊₁| - |hᵢ|| = ||qᵢ₊₁k*ᵢ₊₁| - |qᵢk*ᵢ|| = ||qᵢ₊₁kᵢ₊₁| - |qᵢkᵢ|| = |lᵢ₊₁ - lᵢ| (24)
+
+![Hình 7: Phân tích Ranh giới Xoay. Lấy qⱼ làm trục x, 3 ranh giới khác biệt tương ứng với kⱼ, -qⱼ, và qⱼ]
+
+### D.2 Phân tích Ranh giới Xoay
+
+Trong Phần 2.2, chúng tôi phân tích hiện tượng bất thường của RoPE. Để minh họa các bất thường xoay, hãy tập trung vào một trường hợp cụ thể (trường hợp (d) của Phần 2.2). Như được hiển thị trong Hình 7, ba ranh giới khác biệt xuất hiện trong quá trình xoay. Bằng cách áp dụng hệ tọa độ tương đối với qⱼ phục vụ như trục x, các ranh giới này tương ứng với kⱼ, -qⱼ, và qⱼ.
+
+Mỗi khi góc tương đối của qⱼ và kⱼ vượt qua các ranh giới này, tính đơn điệu của tích vô hướng ⟨qⱼ, kⱼ⟩ của chúng trải qua sự đảo ngược. Do đó, đối với vanilla self-attention, nó học một hàm đơn điệu từng phần của ⟨qⱼ, kⱼ⟩:
+
+⟨qⱼ, kⱼ⟩ = {
+↑(m-n), ∀ -(2π-Θⱼ) ≤ θ(qⱼ, kⱼ) < 0
+↓(m-n), ∀ 0 ≤ θ(qⱼ, kⱼ) < π
+↑(m-n), ∀ π ≤ θ(qⱼ, kⱼ) < 2π
+...
+↑(m-n), ∀ (2k-1)π ≤ θ(qⱼ, kⱼ) < (2k)π
+↓(m-n), ∀ (2k)π ≤ θ(qⱼ, kⱼ) < (2k+1)π
+} (25)
+
+trong đó θ(qⱼ, kⱼ) = Θⱼ + (m-n)θⱼ được định nghĩa trong Phần 2.2.
+
+Điều này đưa sự nhầm lẫn vào mô hình trong quá trình ngoại suy ngữ cảnh trực tiếp. Do đó, các phương pháp như PI và NTK đã cố gắng giới thiệu các kỹ thuật nội suy hoặc ngoại suy để loại bỏ các vị trí out-of-distribution (OOD).
+
+Ngoại trừ phương trình đầu tiên trong Phương trình (25), hai ranh giới gây ra bởi -qⱼ, và qⱼ đều đều đặn với chu kỳ 2π, nó dễ xử lý khi áp dụng các phương pháp như PI hoặc NTK. Tuy nhiên, các ranh giới gây ra bởi kⱼ khó xử lý. Có d/2*h*L (d cho chiều head, h cho số heads, L cho số lớp) ranh giới khác nhau trong quá trình ngoại suy ngữ cảnh, phá vỡ chu kỳ 2π.
+
+Hơn nữa, sau khi áp dụng các kỹ thuật nội suy hoặc ngoại suy, nhiều vị trí hơn sẽ rơi vào khu vực bất thường này. Nó tăng k lần (k cho hệ số nội suy) cho PI và λ^(2j/d) lần (λ cho hệ số tỷ lệ) cho NTK.
+
+Từ góc nhìn này, việc tập trung vị trí của PI dẫn đến nhiều rắc rối hơn NTK, tức là bổ sung nhiều vị trí hơn trong khu vực bất thường trong quá trình ngoại suy ngữ cảnh. Điều này có thể giải thích ở một mức độ nào đó tại sao NTK có thể được sử dụng mà không fine-tuning cho vanilla self-attention, nhưng PI yêu cầu fine-tuning.
+
+Bằng cách áp dụng Θⱼ thành 0, CoCA đề xuất của chúng tôi, ràng buộc kⱼ collinear với qⱼ, hiệu quả giải quyết thách thức liên quan đến ranh giới với kⱼ.
+
+Từ các thí nghiệm trong Phần 4, với việc tích hợp CoCA, bây giờ NTK có thể được tận dụng tốt thông qua sử dụng trực tiếp, trong khi PI đạt được cải thiện cho sử dụng trực tiếp nhưng vẫn hạn chế, cần nghiên cứu thêm.
+
+### D.3 Homeomorphism của Không gian Biểu diễn
+
+**Định lý 2.** (Homeomorphism của không gian biểu diễn) Đối với bất kỳ điểm attention nào được định nghĩa như sau:
+
+a(m, n) = Re(⟨f(qₘ, m), f(qₘ, n) ○ tₙ⟩) (26)
+
+trong đó qₘ là query, m là số chỉ số của query, tₙ là hệ số collinear của CoCA, n là số chỉ số của key, f là toán tử xoay.
+
+Ký hiệu không gian biểu diễn của nó đối với qₘ như:
+
+F(Q) = {a(m, n)|∀qₘ ∈ Q ⊂ ℝᵈ} (27)
+
+trong đó qₘ = WQxₘ, xₘ ∈ Eₙ, m ∈ [1, N] và Eₙ là không gian word embedding, WQ là ma trận projection.
+
+Khi đó chúng ta có homeomorphism sau:
+
+F(Q) ≅ F(Qhalf) (28)
+
+trong đó Qhalf = Q|q₂ⱼ = q₂ⱼ₊₁, ∀j ∈ [0, d/2-1].
+
+**Chứng minh:** Chúng tôi chứng minh nó bằng cách chứng minh ánh xạ homeomorphism G:
+
+G: F(Q) → F(Qhalf)
+F((q₀, ..., qₑ₋₁) ↦ F((√((q₀² + q₁²)/2), ..., √((qₑ₋₂² + qₑ₋₁²)/2)) (29)
+
+Nó bao gồm ba phần:
+
+**Phần I (G là một song ánh):** nhớ lại Phương trình (17), chúng ta có:
+
+G(X) = X, ∀X ∈ F(Q) (30)
+
+điều này ngụ ý rằng G là một ánh xạ đồng nhất, tự nhiên đơn ánh.
+
+Tiếp theo, chúng tôi chứng minh rằng G cũng toàn ánh: đối với bất kỳ Y = F((q₀, ..., qₑ₋₁)|q₂ⱼ = q₂ⱼ₊₁) ∈ F(Qhalf) nào, tồn tại Ỹ ∈ F(Q) sao cho G(Ỹ) = Y. Đặt
+
+Ỹ = F((q₀, ..., qₑ₋₁)|q₂ⱼ = q₂ⱼ₊₁) ∈ F(Q) (31)
+
+rõ ràng chúng ta có G(Ỹ) = Y.
+
+**Phần II (G liên tục):** Đối với bất kỳ X₀ ∈ F(Q), ε > 0 nào, tồn tại δ, sao cho nếu |X - X₀| < δ, thì |G(X) - G(X₀)| < ε.
+
+Từ Phần I, G là một ánh xạ đồng nhất, đặt δ = ε, khi đó tính liên tục của G đúng.
+
+**Phần III (G⁻¹ liên tục):** G là một ánh xạ đồng nhất, G⁻¹ cũng vậy. Theo Phần II, chúng ta ngay lập tức suy ra rằng G⁻¹ liên tục.
+
+### D.4 Slack Position Embedding
+
+Đặt H là một không gian Hilbert, và {T(n)|n ≥ 0} ⊂ L(H) là một họ toán tử tuyến tính bị chặn trên H. A là tích vô hướng được định nghĩa trên H.
+
+Nếu nó thỏa mãn tính chất sau, thì chúng ta gọi {T(n)|n ≥ 0} là một toán tử tương đối (tuyến tính bị chặn) trên H:
+
+∃ {S(m)|m ∈ ℤ}: H × H → ℂ
+(X, Y) ↦ S(m)(X, Y)
+là một họ toán tử semi-bilinear trên H
+sao cho S(p-q)(X, Y) = A(T(p)(X), T(q)(Y))
+∀p, q ∈ [0, N], X, Y ∈ H, (32)
+
+Ngoài ra, nếu nó thỏa mãn tính chất sau, thì chúng ta gọi {T(n)|n ≥ 0} là một toán tử tương đối slack (tuyến tính bị chặn) trên H:
+
+∃ {S(m)|m ∈ ℤ}: H × H → ℂ
+(X, Y) ↦ S(m)(X, Y)
+là một họ toán tử semi-bilinear trên H
+và H' ⊂ H, H' ≠ ∅
+sao cho S(p-q)(X, Y) = A(T(p)(X), T(q)(Y))
+∀p, q ∈ [0, N], X, Y ∈ H', (33)
+
+Cụ thể, khi H đại diện cho không gian projection của chúng ta trong self-attention, và {T(n)|n ≥ 0} là một position embedding trên đó, chẳng hạn như Rotary Position Embedding (RoPE), chúng ta gọi nó là Slack Position Embedding (SPE) nếu nó thỏa mãn tính chất được mô tả trong Phương trình (33).
