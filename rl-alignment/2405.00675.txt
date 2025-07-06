@@ -1,0 +1,1484 @@
+# 2405.00675.pdf
+# Converted from PDF to TXT
+# Source path: /home/admin88/arxiv-downloader/rl-alignment/2405.00675.pdf
+# File size: 788493 bytes
+
+===============================================
+PDF FILE CONTENT
+===============================================
+
+
+--- PAGE 1 ---
+Self-Play Preference Optimization for Language Model
+Alignment
+Yue Wu∗†Zhiqing Sun∗‡Huizhuo Yuan∗§Kaixuan Ji¶Yiming Yang‖Quanquan Gu∗∗
+Abstract
+Standard reinforcement learning from human feedback (RLHF) approaches relying on paramet-
+ric models like the Bradley-Terry model fall short in capturing the intransitivity and irrationality in
+human preferences. Recent advancements suggest that directly working with preference probabili-
+ties can yield a more accurate reflection of human preferences, enabling more flexible and accurate
+language model alignment. In this paper, we propose a self-play-based method for language model
+alignment, which treats the problem as a constant-sum two-player game aimed at identifying
+the Nash equilibrium policy. Our approach, dubbed Self-Play Preference Optimization (SPPO),
+utilizes iterative policy updates to provably approximate the Nash equilibrium. Additionally,
+we propose a new SPPO objective which is both strongly motivated by theory and is simple
+and effective in practice. In our experiments, using only 60k prompts (without responses) from
+the UltraFeedback dataset and without any prompt augmentation, by leveraging a pre-trained
+preference model PairRM with only 0.4B parameters, SPPO can obtain a model from fine-tuning
+Mistral-7B-Instruct-v0.2 that achieves the state-of-the-art length-controlled win-rate of 28.53%
+against GPT-4-Turbo on AlpacaEval 2.0. It also outperforms the (iterative) DPO and IPO on
+MT-Bench, Arena-Hard, and the Open LLM Leaderboard. Starting from a stronger base model
+Llama-3-8B-Instruct, we are able to achieve a length-controlled win rate of 38.77%. Notably, the
+strong performance of SPPO is achieved without additional external supervision (e.g., responses,
+preferences, etc.) from GPT-4 or other stronger language models. Codes are available at
+https://github.com/uclaml/SPPO .
+1 Introduction
+Large Language Models (LLMs) (e.g., Ouyang et al., 2022; OpenAI et al., 2023), have shown
+remarkable capabilities in producing human-like text, fielding questions, and coding. Despite
+∗Equal contribution
+†Department of Computer Science, University of California, Los Angeles, Los Angeles, CA 90095; e-mail:
+ywu@cs.ucla.edu
+‡Language Technologies Institute, Carnegie Mellon University, Pittsburgh, PA 15213; e-mail: zhiqings@cs.cmu.edu
+§Department of Computer Science, University of California, Los Angeles, Los Angeles, CA 90095; e-mail:
+hzyuan@cs.ucla.edu
+¶Department of Computer Science, University of California, Los Angeles, Los Angeles, CA 90095; e-mail:
+kauxuanji@cs.ucla.edu
+‖Language Technologies Institute & Machine Learning Department, Carnegie Mellon University, Pittsburgh, PA
+15213; e-mail: yiming@cs.cmu.edu
+∗∗Department of Computer Science, University of California, Los Angeles, Los Angeles, CA 90095; e-mail:
+qgu@cs.ucla.edu
+1arXiv:2405.00675v5  [cs.LG]  4 Oct 2024
+
+--- PAGE 2 ---
+their advancements, these models encounter challenges in tasks requiring high levels of reliability,
+safety, and ethical alignment. To address these challenges, Reinforcement Learning from Human
+Feedback (RLHF), also known as Preference-based Reinforcement Learning (PbRL), presents a
+promising solution. This framework for policy optimization, highlighted in works by Christiano et al.
+(2017) and recently in Ouyang et al. (2022), has led to significant empirical success in fine-tuning
+instruction-following LLMs, making them more aligned with human preferences and thus more
+helpful.
+Most existing approaches to RLHF rely on either explicit or implicit reward models. Taking
+InstructGPT (Ouyang et al., 2022) as an example, a reference policy πrefis first established,
+typically from supervised pre-training or instruction-based (supervised) fine-tuning. An explicit
+reward function is obtained by training a reward model based on human preference feedback data,
+employing the Bradley-Terry (BT) model (Bradley and Terry, 1952). Subsequently, reinforcement
+learning algorithms such as Proximal Policy Optimization (Schulman et al., 2017, PPO) are used to
+fine-tune the reference LLM πrefby maximizing the expected reward function. The reward model
+provides a “reward score” r(y;x) for the given response yand prompt x, approximately reflecting how
+humans value these responses. More recently, methods like Direct Preference Optimization (Rafailov
+et al., 2024b, DPO) have been introduced. These methods forgo the training of a separate reward
+model but still fundamentally adhere to the reward maximization objective and are determined by
+parametric models such as the BT model.
+These models presuppose a monotonous and transitive relationship among preferences for
+different choices. However, empirical evidence suggests otherwise. For instance, Tversky (1969)
+observed human decisions can be influenced by different factors and exhibit inconsistency. Such
+observations indicate that human preferences do not always adhere to a single, value-based hierarchy
+and can even appear irrational, such as exhibiting loops in preference relations. For LLMs, another
+motivating evidence is that Munos et al. (2023) has empirically shown that directly predicting the
+pairwise preference can achieve higher accuracy than predicting the preference via a BT-based
+reward model.
+To address the inconsistency in human preference, researchers have proposed to work directly
+with the preference probability and design algorithms that can more flexibly represent human
+preferences (Lou et al., 2022; Wu et al., 2023) in the ranking or bandit setting. Recently, an
+emerging line of work (Wang et al., 2024; Munos et al., 2023; Swamy et al., 2024) also proposed to
+study RLHF for LLMs under such general preference P(y≻y′|x), where yandy′are two different
+responses and xis prompt. The goal is to identify the Nash equilibrium or von Neumann winner of
+the two-player constant-sum game
+(π∗, π∗) = arg max
+πmin
+π′Ex∼Xh
+Ey∼π(·|x),y′∼π′(·|x)
+P(y≻y′|x)i
+,
+where each player is an LLM that outputs responses and aims to maximize its probability of being
+preferred over its opponent.
+Independent from our work, Swamy et al. (2024) proposed Self-play Preference Optimization
+(SPO)1for the same (unregularized) two-player constant-sum game. They provide a general reduction
+of preference optimization to no-regret online learning for the multi-step Markov Decision Process.
+When constrained to the bandit setting for LLMs, their proposed algorithmic framework reduces to
+1The SPO framework does not pertain to the efficient fine-tuning of LLMs. Our Self-Play Preference Optimization
+(SPPO) focuses on LLM alignment and was developed independently. To distinguish it from the SPO framework, we
+use the abbreviation SPPO.
+2
+
+--- PAGE 3 ---
+the famous Hedge algorithm (Freund and Schapire, 1997), which admits the exponential update
+rule as described in (4.1). To approximately solve the exponential update, Swamy et al. (2024) then
+proposed to employ typical policy optimization algorithms such as Proximal Policy Optimization
+(PPO) (Schulman et al., 2017) or Soft Actor-Critic (SAC) (Haarnoja et al., 2018) to maximize the
+win rate against the reference policy and evaluated the performance of their self-play algorithms
+in robotic and game tasks. However, it typically requires more effort to apply PPO or SAC to
+large-scale fine-tuning of LLM and make them work stably. Therefore, it remains unclear how their
+self-play framework can be applied to large-scale language model alignment efficiently.
+In this paper, motivated by these developments mentioned above, we propose a new self-play
+algorithm that (1) enjoys provable guarantees to solve the two-player constant-sum game; and (2)
+can scale up to large-scale efficient fine-tuning of large language models. In detail, we formulate
+the RLHF problem as a constant-sum two-player game. Our objective is to identify the Nash
+equilibrium policy, which consistently provides preferred responses over any other policy on average.
+To identify the Nash equilibrium policy approximately, we adopt the classic online adaptive algorithm
+with multiplicative weights (Freund and Schapire, 1999) as a high-level framework that solves the
+two-player game. Further, each step of the high-level framework can be approximated by a self-play
+mechanism, where in each round the policy is playing against itself in the previous round by
+fine-tuning it on synthetic data that are generated by the policy and annotated by the preference
+model.
+Our contributions are highlighted as follows:
+•Starting from the exponential weight update algorithm which provably converges to the Nash equi-
+librium of the two-player constant-sum game, we propose the Self-Play Preference Optimization
+(SPPO) algorithm for large language model alignment. The algorithm converges to an approximate
+Nash equilibrium provably and admits a simple form of loss function for easy optimization.
+•Unlike the symmetric pairwise loss such as DPO and Identity Preference Optimization (IPO) (Azar
+et al., 2023), we propose a new optimization objective that does not rely on pairwise comparisons.
+The new loss objective (4.4), initially driven by game-theoretical concepts, turns out strongly
+motivated by the policy gradient theory and implicitly encourages the LLM to learn a token-level
+optimal value function.
+•Empirically, SPPO significantly enhances the well-aligned Mistral-7B-Instruct-v0.2 and Llama-3-
+8B-Instruct model, achieving an increase of over 11% on the length-controlled win rate against
+GPT-4-Turbo on the AlpacaEval 2.0 (Dubois et al., 2024a) test set. Additionally, SPPO exhibits
+strong generalist abilities across different tasks, including MT-Bench, the Open LLM Leaderboard,
+and the more recent, more challenging benchmark, Arena-Hard. Unlike iterative DPO/IPO, which
+tends to show performance decay on other benchmarks when optimized towards the PairRM
+score, SPPO’s performance gain is consistent. Notably, all the strong performances are achieved
+without external supervision (e.g., responses, preferences, etc.) from GPT-4 or other stronger
+language models.
+Concurrent to our work, several studies, including Direct Nash Optimization (Rosset et al.,
+2024) and REBEL (Gao et al., 2024) have also explored using either cross-entropy loss or square
+loss minimization to approximate the exponential update. Specifically, they used the same trick
+proposed in DPO (Rafailov et al., 2024b) to cancel out the log-partition factor and directly regress
+on the win-rate difference. However, it is shown theoretically and empirically by Pal et al. (2024)
+3
+
+--- PAGE 4 ---
+that the pairwise loss may only drive the relative likelihood gap to be large, but may not necessarily
+drive up the likelihood of the preferred responses. Our method instead has a deeper connection to
+the policy gradient theory and can effectively match the likelihood of the response to its win rate.
+2 Related Work
+RLHF with Explicit/Implicit Reward Model Originally, reinforcement learning from human
+feedback (RLHF) was proposed by Christiano et al. (2017) as a methodology that first learns a reward
+model reflecting human preferences and then uses reinforcement learning algorithms to maximize
+the reward. This methodology is applied by Ouyang et al. (2022) to fine-tune instruction-following
+large language models and leads to the popular ChatGPT.
+The reward model in the works mentioned above assumes a parametric model such as the
+Bradley-Terry model (Bradley and Terry, 1952), which assigns a “score” representing how preferred
+a given response is. More recently, Rafailov et al. (2024b) proposed to instead directly solve
+the closed-form solution of such a score implied by the Bradley-Terry model. The Direct Policy
+Optimization (DPO) method is claimed to be more efficient and stable, yet, still implicitly assumes
+such a reward model that specifies the “score”. In a similar spirit, Zhao et al. (2023) proposed to
+calibrate the score so that the score of the winner in comparison has a margin over the score of
+the loser, and induces a different SLic loss. Similarly, Ethayarajh et al. (2024) derived a different
+loss function (called KTO) from the Kahneman-Tversky human utility function, which implicitly
+denotes a score of the given response. Liu et al. (2023) proposed Rejection Sampling Optimization
+(RSO) which utilizes a preference model to generate preference pairs with candidates sampled from
+the optimal policy; then preference optimization is applied on the sampled preference pairs. Hong
+et al. (2024) proposed Odds Ratio Preference Optimization (ORPO) algorithm that can perform
+supervised fine-tuning and preference alignment in one training session without maintaining an
+intermediate reference policy.
+RLHF with General Preference Model Often, the human preference is not strictly transitive,
+and cannot be sufficiently represented by a single numerical score. Azar et al. (2023) proposed a
+general preference optimization objective based on the preference probability between a pair of
+responses instead of a score of a single response. They further propose a learning objective based on
+identity mapping of the preference probability called IPO (Preference Optimization with Identity
+mapping), which aims to maximize the current policy’s expected winning probability over a given
+reference policy. Munos et al. (2023) formulated the RLHF problem with general preference as a
+two-player, constant-sum game, where each player is one policy that aims to maximize the probability
+of its response being preferred against its opponent. They aim to identify the Nash equilibrium policy
+of this game and propose a mirror-descent algorithm that guarantees the last-iterate convergence of
+a policy with tabular representations2. Wang et al. (2024) proposed to identify the Nash equilibrium
+policy for multi-step MDPs when a general preference model is present and shows that the problem
+can be reduced to a two-player zero-sum Markov game.
+Theory of RLHF There is also a line of research to analyze RLHF and provide its theoretical
+guarantees. Zhu et al. (2023) studied the standard RLHF with separate reward-learning and
+2Due to the tabular representation, computing the normalizing factor is prohibitive and the algorithm is approxi-
+mately executed by sampling one token instead of a full response.
+4
+
+--- PAGE 5 ---
+model-tuning and proposed a pessimistic reward-learning process that provably learns a linear
+reward model. Wang et al. (2024) proposed a framework to reduce any RLHF problem with a
+reward model to a reward-based standard RL problem. Additionally, they proposed to identify the
+Nash equilibrium policy when a general preference model is present and show that the problem
+can be reduced to a two-player zero-sum Markov game. Xiong et al. (2023) studied the reverse-KL
+regularized contextual bandit for RLHF in different settings and proposed efficient algorithms with
+finite-sample theoretical guarantees. Ye et al. (2024) studied the theoretical learnability of the
+KL-regularized Nash-Learning from Human Feedback (NLHF) by considering both offline and online
+settings and proposed provably efficient algorithms. Ji et al. (2024) proposed an active-query-based
+proximal policy optimization algorithm with regret bounds and query complexity based on the
+problem dimension and the sub-optimality gap.
+Self-Play Fine-Tuning Most works mentioned above (Rafailov et al., 2024b; Zhao et al., 2023;
+Azar et al., 2023; Ethayarajh et al., 2024) consider one single optimization procedure starting from
+some reference policy. The same procedure may be applied repeatedly for multiple rounds in a
+self-play manner. In each round, new data are generated by the policy obtained in the last round;
+these new data are then used for training a new policy that can outperform the old policy.
+The self-play fine-tuning can be applied to both scenarios with or without human preference
+data. For example, Singh et al. (2023) proposed an Expectation-Maximization (EM) framework
+where in each round, new data are generated and annotated with a reward score; the new policy is
+obtained by fine-tuning the policy on the data with a high reward. Chen et al. (2024) proposed
+a self-play framework to fine-tune the model in a supervised way. In each round, new preference
+pairs are synthesized by labeling the policy-generated responses as losers and the human-generated
+responses as winners. Then DPO is applied in each round to fine-tune another policy based on
+these synthesized preference data. Yuan et al. (2024) proposed Self-Rewarding Language Models,
+where the language model itself is used to annotate preference on its own responses. Iterative
+DPO is applied to fine-tune language models on these annotated data. These works show iterative
+fine-tuning can significantly improve the performance.
+Swamy et al. (2024) considered a more general multi-step Markov Decision Process (MDP)
+setting and proposed Self-play Preference Optimization (SPO), an RLHF framework that can
+utilize any no-regret online learning algorithm for preference-based policy optimization. They then
+instantiated their framework with Soft Policy Iteration as an idealized variant of their algorithm,
+which reduces to the exponential weight update rule (4.1) when constrained to the bandit setting.
+The main difference is that they focus on the multi-round Markov decision process (MDP) in robotic
+and game tasks rather than on fine-tuning large language models and approximating the update
+using policy optimization methods such as PPO.
+Concurrent to our work, Rosset et al. (2024) proposed the Direct Nash Optimization (DNO)
+algorithm based on the cross-entropy between the true and predicted win rate gaps, and provided
+theoretical guarantees on the error of finite-sample approximation. However, their practical version
+still utilizes the iterative-DPO framework as in Xu et al. (2023) with the DPO loss instead of their
+derived DNO loss. Notably, in their experiments, they added the GPT-4 generated responses as
+their “gold sample” into their fine-tuning data, and used GPT-4 as a judge to assign a numerical
+score to each response for preference pair construction. In sharp contrast, our work does not require
+the use of any strong external supervision besides a small-sized reward model. Another concurrent
+work (Gao et al., 2024) proposed REBEL , an iterative fine-tuning framework via regressing the
+5
+
+--- PAGE 6 ---
+relative reward. When applied to the preference setting, it results in a similar algorithm to our
+algorithm SPPO, except that SPPO approximates the log-partition factor logZπt(x) with a constant
+η/2 while REBEL regresses on the win rate difference (so that logZπt(x) is canceled). Additionally,
+Calandriello et al. (2024) pointed out that optimizing the IPO loss (Azar et al., 2023) iteratively
+with self-play generated data is equivalent to finding the Nash equilibrium of the two-player game,
+and they proposed the IPO-MD algorithm based on this observation, which generates data with a
+mixture policy similar to the Nash-MD algorithm.
+3 Preliminaries
+We consider the preference learning scenario as follows. Given a text sequence (commonly referred
+to as prompt) x= [x1, x2, . . .], two text sequences y= [y1, y2, . . .] and y′are generated as responses
+to the prompt x. An autoregressive language model πgiven the prompt xcan generate responses y
+following the probability decomposition
+π(y|x) =NY
+i=1π(yi|x,y<i).
+Given the prompt xand two responses yandy′, a preference oracle (either a human annotator or
+a language model) will provide preference feedback o(y≻y′|x)∈ {0,1}indicating whether yis
+preferred over y′. We denote P(y≻y′|x) =E[o(y≻y′|x)] as the probability of y“winning the
+duel” over y′. The KL divergence of two probability distributions of density pandqis defined as
+KL(p∥q) =Ey∼p(y)h
+logp(y)
+q(y)i
+.
+3.1 RLHF with Reward Models
+Christiano et al. (2017) first learn a reward function r(y;x) following the Bradley-Terry model (Bradley
+and Terry, 1952). For a prompt-response-response triplet ( x,y,y′), the Bradley-Terry model specifies
+the probability of ybeing chosen over yas
+P(y≻y′|x) =exp(r(y;x))
+exp(r(y;x)) + exp( r(y′;x))=σ 
+r(y;x)−r(y′;x)
+, (3.1)
+where σ(x) =ex/(ex+ 1) is the logistic function. The reward function associated with the Bradley-
+Terry model can be estimated by maximizing the log-likelihood logP(y≻y′|x). Suppose the
+true reward function r(y;x)) is available, Christiano et al. (2017) proposed to solve the following
+optimization problem with policy optimization algorithms in RL such as PPO (Schulman et al.,
+2017):
+max
+θEx∼X,y∼πθ(·|x)[r(y;x)]−η−1Ex∼X[KL(πθ(·|x)∥πref(·|x))], (3.2)
+where Xis the prompt distribution.
+Rafailov et al. (2024b) identified that the optimization problem above has a closed-form solution
+such that for any y,
+π∗(y|x)∝πref(y|x) exp( ηr(y;x)),
+6
+
+--- PAGE 7 ---
+which can be further converted to the DPO loss for any triplet ( x,yw,yl) where the winner ywis
+chosen over the loser yl:
+ℓDPO(x,yw,yl;θ;πref) :=−logσ 
+η−1
+logπθ(yw|x)
+πref(yw|x)
+−logπθ(yl|x)
+πref(yl|x)!
+.
+3.2 RLHF with General Preference
+Following Wang et al. (2024); Munos et al. (2023), we aim to establish RLHF methods without a
+reward model, as the human preference can be non-transitive (Tversky, 1969). Under a general
+preference oracle P(y≻y′|x), we follow Dud´ ık et al. (2015) and aim to identify the von Neumann
+winner . More specifically, the von Neumann winner π∗is the (symmetric) Nash equilibrium of the
+following two-player constant-sum game:
+(π∗, π∗) = arg max
+πmin
+π′Ex∼Xh
+Ey∼π(·|x),y′∼π′(·|x)
+P(y≻y′|x)i
+. (3.3)
+In addition, we define the winning probability of one response yagainst a distribution of
+responses πas
+P(y≻π|x) =Ey′∼π(·|x)[P(y≻y′|x)],
+and the winning probability of one policy πagainst another policy π′as
+P(π≻π′|x) =Ey∼π(·|x)Ey′∼π′(·|x)[P(y≻y′|x)].
+Furthermore, we define P(π≻π′) =Ex∼X[P(π≻π′|x)], where xis a prompt drawn from the
+prompt distribution X. The two-player constant-sum game (3.3) can be simplified as
+(π∗, π∗) = arg max
+πmin
+π′P(π≻π′).
+4 Self-Play Preference Optimization(SPPO)
+In this section, we introduce the Self-Play Preference Optimization (SPPO) algorithm, derived from
+the following theoretical framework.
+4.1 Theoretical Framework
+There are well-known algorithms to approximately solve the Nash equilibrium in a constant-sum
+two-player game. In this work, we follow Freund and Schapire (1999) to establish an iterative
+framework that can asymptotically converge to the optimal policy on average. We start with a
+theoretical framework that conceptually solves the two-player game as follows:
+πt+1(y|x)∝πt(y|x) exp( ηP(y≻πt|x)),fort= 1,2, . . . . (4.1)
+(4.1) is an iterative framework that relies on the multiplicative weight update in each round tand
+enjoys a clear structure. Initially, we have a base policy π1usually from some supervised fine-tuned
+model. In each round, the updated policy πt+1is obtained from the reference policy πtfollowing
+7
+
+--- PAGE 8 ---
+the multiplicative weight update. More specifically, a response yshould have a higher probability
+weight if it has a higher average advantage over the current policy πt.
+Equivalently, (4.1) can be written as
+πt+1(y|x) =πt(y|x) exp 
+ηP(y≻πt|x)
+Zπt(x), (4.2)
+where Zπt(x) =P
+yπt(y|x)exp 
+ηP(y≻πt|x)
+is the normalizing factor (a.k.a., the partition
+function). For any fixed xandy, the ideal update policy πt+1should satisfy the following equation:
+logπt+1(y|x)
+πt(y|x)
+=η·P(y≻πt|x)−logZπt(x). (4.3)
+Unlike the pair-wise design in DPO or IPO that cancels the log normalizing factor logZπt(x) by
+differentiating (4.3) between yandy′, we choose to approximate (4.3) directly in terms of L2
+distance:
+πt+1= argmin
+πEx∼X,y∼πt(·|x)
+logπ(y|x)
+πt(y|x)
+−
+ηP(y≻πt|x)−logZπt(x)2
+. (4.4)
+Estimation of the Probability The optimization objective (4.4) can be approximated with finite
+samples. We choose to sample Kresponses y1,y2, . . . ,yK∼πt(·|x) for each prompt x, and denote
+the empirical distribution by bπK
+t. The finite-sample optimization problem can be approximated as
+πt+1= argmin
+πEx∼X,y∼πt(·|x)
+logπ(y|x)
+πt(y|x)
+−
+ηP(y≻bπK
+t|x)−logZbπK
+t(x)2
+. (4.5)
+Specifically, P(y≻bπK
+t|x) =PK
+k=1P(y≻yk|x)/KandZbπK
+t(x) =Ey∼πt(·|x)[exp(ηP(y≻bπK
+t|x))].
+ZbπK
+t(x), treated as an expectation, can be further estimated by Bnew samples with in total O(KB)
+queries of the preference oracle P.(4.5) is an efficiently tractable optimization problem. Informally
+speaking, when K→ ∞ ,(4.5) will recover (4.4). We have the following guarantee on the convergence
+of (4.4):
+Theorem 4.1. Assume the optimization problem (4.4) is realizable. Denote πtas the policy
+obtained via (4.4) and the mixture policy ¯πT=1
+TPT
+t=1πt. By setting η= Θ(1 /√
+T), we have that
+max
+π
+P(π≻¯πT)
+−min
+π
+P(π≺¯πT)
+=O(1/√
+T).
+Theorem 4.1 characterizes the convergence rate of the average policy across the time horizon T
+towards the Nash equilibrium, in terms of the duality gap. The proof is based on Theorem 1 in
+Freund and Schapire (1999) with slight modification. For completeness, we include the proof in
+Appendix B.
+Alternatively, we can avoid estimating logZbπK
+t(x) by replacing it with a constant based on the
+human preference model. The choice of the constant is discussed in detail in Appendix A. Here, we
+replace log ZbπK
+t(x) with η/23in (4.5) to obtain a more clear objective:
+πt+1= argmin
+πEx∼X,y∼πt(·|x)
+logπ(y|x)
+πt(y|x)
+−η
+P(y≻bπK
+t|x)−1
+22
+. (4.6)
+3Assuming the winning probability between any given pair is either 1 or 0 with equal chance, when K→ ∞ , we
+can show that indeed ZbπK
+t(x)→eη/2. Also see Appendix A for a complete derivation.
+8
+
+--- PAGE 9 ---
+Algorithm 1 Self-Play Preference Optimization(SPPO)
+1:input : base policy πθ1, preference oracle P, learning rate η, number of generated samples K.
+2:fort= 1,2, . . .do
+3: Generate synthetic responses by sampling x∼ X andy1:K∼πt(·|x).
+4: Annotate the win-rate P(yk≻yk′|x),∀k, k′∈[K].
+5: Select responses from y1:Kto form dataset Dt={(xi,yi,bP(yi≻πt|xi))}i∈[N].
+6: Optimize πθt+1according to (4.6):
+θt+1←argmin
+θE(x,y,bP(y≻πt|x))∼Dt
+logπθ(y|x)
+πt(y|x)
+−η
+bP(y≻πt|x)−1
+22
+. (4.7)
+7:end for
+Intuitively, if a tie occurs (i.e., P(y≻bπK
+t|x) = 1 /2), we prefer the model does not update weight
+aty. Ifywins over bπK
+ton average (i.e., P(y≻bπK
+t|x)>1/2), then we increase the probability
+density at yto employ the advantage of yoverbπK
+t. In our experiments, we choose to minimize the
+objective (4.6).
+4.2 The SPPO Algorithm
+Based on the aformentioned theoretical framework, we propose the Self-Play Preference Optimization
+algorithm in Algorithm 1. In each round t, Algorithm 1 will first generate Kresponses y1,y2, . . . ,yK
+according to πt(·|x) for each prompt x(Line 3). Then, the preference oracle Pwill be queried
+to calculate the win rate among the Kresponses (Line 4). At Line 5, certain criteria can be
+applied to determine which response should be kept in the constructed dataset Dtand construct
+the prompt-response-probability triplet ( x,y,bP(y≻πt|x)). We will discuss the design choices later
+in Section 5. One straightforward design choice is to include all Kresponses into Dtand each
+bP(yi≻πt|x) is estimated by comparing yito all Kresponses. In total, O(K2) queries will be made.
+Then the algorithm will optimize (4.6) on the dataset Dt(Line 6).
+4.3 Connection to Policy Gradient
+While SPPO is derived from the iterative framework (Freund and Schapire, 1999) for two-player
+games, the square loss in the SPPO objective (4.4) provides an alternative interpretation for SPPO
+as a semi-online variant of policy gradient method due to its special loss form. The difference from
+standard policy gradient is that it collects samples from πθtat the start of iteration t, rather than
+perform on-policy sampling at each gradient step.
+Consider a general reward function r(y;x), the RLHF problem (3.2) can be written as:
+max
+θJ(θ) :=Ex∼X,y∼πθ(·|x)
+r(y;x)−η−1logπθ(y|x)
+πref(y|x)
+. (4.8)
+The policy gradient of the objective J(θ) is:
+∇J(θ) =Ex∼X,y∼πθ(·|x)
+r(y;x)−η−1logπθ(y|x)
+πref(y|x)−b(x)
+∇logπθ(y|x)
+(4.9)
+9
+
+--- PAGE 10 ---
+=ηEx∼X,y∼πθ(·|x)
+− ∇
+r(y;x)−η−1logπθ(y|x)
+πref(y|x)−b(x)2
+, (4.10)
+where the first line follows the policy gradient theorem (Sutton et al., 1999) and the baseline b(x)
+is an arbitrary constant relying only on xused for variance reduction. Comparing the square loss
+(4.10) with the SPPO objective (4.4) (rewritten below):
+θt+1= argmin
+θEx∼X,y∼πθt(·|x)
+P(y≻πθt|x)−η−1logπθ(y|x)
+πθt(y|x)
+−η−1logZπθt(x)2
+,
+one can see that the win rate P(y≻πθt|x) is exactly the reward SPPO aims to maximize, and
+η−1logZπθt(x) is in fact the best possible baseline–the (soft) value function. When the value
+function is not available in practice, it can be replaced by any constant baseline to reduce the
+variance of the policy gradient. We choose 1 /2 as a good approximation to η−1logZπθt(x) but the
+constant can vary depending on the human preference model (see Appendix A). Equation (4.9) is
+also discussed in Munos et al. (2023).
+Comparing with the general framework proposed by Swamy et al. (2024), SPPO can be seen as a
+new, straightforward variant of policy gradient method without the need of extra modifications such
+as gradient clipping in PPO, Hessian calculation in TRPO, or maintaining multiple components
+(Q-critic, V-critic, actor, etc.) in many policy optimization algorithms.
+4.4 Token-Level Q∗Learning
+Rafailov et al. (2024a) showed that under the Max-Entropy RL formulation, the token-level log-ratio
+logπθ(y|x)
+πref(y|x)can be seen as an implicit token-level reward or advantage function (invariant under
+reward shaping). Below we show the square loss in SPPO can also lead to the optimal Max-Entropy
+policy π∗, with token-level optimal value/advantage function.
+We first briefly restate the setting and results in Rafailov et al. (2024b). The token-level MDP
+defines the state sh= (x, y1, y2, . . . , y h−1) as the prefix tokens, and the action ah=yhas the next
+token. An auto-regressive language model π(y|x) can be viewed as a token-level policy π(ah|sh)
+and the transition kernel is known and deterministic because it only concatenates the next token to
+the prefix to form a new token sequence sh+1= (x, y1, y2, . . . , y h).
+The Max-Entropy RL setting again considers the reverse-KL regularized reward maximization
+problem (3.2):
+max
+θEx∼X,y∼πθ(·|x)[r(y;x)]−η−1Ex∼X[KL(πθ(·|x)∥πref(·|x))]
+=Ex∼X,y∼πθ(·|x)[r(y;x) +η−1logπref(y|x)] +η−1Ex∼X[H(πθ(·|x))].
+We denote the optimal solution for the problem above as π∗. Rafailov et al. (2024a) showed that
+the Bradley-Terry preference model (4.13) can be rewritten as:
+P(yw≻yl|x) =σ
+η−1|yw|X
+h=1logπ∗(aw
+h|sw
+h)
+πref(aw
+h|sw
+h)−η−1|yl|X
+h=1logπ∗(al
+h|sl
+h)
+πref(al
+h|sl
+h)
+,
+where the state and action is defined as in the token-level MDP introduced above, with superscription
+(·)wand (·)ldenoting if it is for the winner ywor the loser yl. And maximizing the log likelihood
+with π∗replaced by πθgives the DPO loss.
+10
+
+--- PAGE 11 ---
+From now on we assume the horizon is fixed at Hfor simplicity. The derivation of the Max-
+Entropy RL formulation relies on the (soft) optimal value function Q∗andV∗as4:
+V∗(sH+1) =r(sH+1) :=r(y;x),(reward at EOS)
+Q∗(sh,ah) =η−1logπref(ah|sh) +V∗(sh+1),
+V∗(sh) =η−1logX
+aexp 
+ηQ∗(sh,a)
+,when h≤H.
+Rafailov et al. (2024a) showed that the optimal policy π∗satisfies:
+η−1logπ∗(ah|sh) =Q∗(sh,ah)−V∗(sh)
+=η−1logπref(ah|sh) +V∗(sh+1)−V∗(sh).
+It can be verified that for s1= (x), we have ηV∗(s1) = logP
+yπref(y|x) exp 
+ηr(y;x)
+:
+exp 
+ηV∗(s1)
+=X
+a1exp 
+ηQ∗(s1,a1)
+=X
+a1πref(a1|s1) exp 
+ηV∗(s2)
+=X
+a1,a2πref(a1|s1)πref(a2|s2) exp 
+ηV∗(s3)
+···
+=X
+(a1,a2,...,aH)HY
+h=1πref(ah|sh) exp 
+ηr(sH+1)
+=X
+yπref(y|x) exp 
+ηr(y;x)
+.
+Going back to the SPPO objective (4.4) att-th iteration, if we set πref=πtandr(y;x) =P(y≻
+πt|x), we have V∗(s1) =η−1logZπt(x), and the learning objective at t-th iteration becomes:
+πt+1= argmin
+πEx∼X,y∼πt(·|x)
+logπ(y|x)
+πt(y|x)
+−
+ηP(y≻πt|x)−logZπt(x)2
+= argmin
+πEs1∼X,ah∼πt(·|sh)HX
+h=1logπ(ah|sh)
+π∗(ah|sh)2
+. (4.11)
+Similar to DPO, SPPO “secretly” encourages the policy πθto converge to the optimal policy π∗
+at token level via the square loss form (4.11) . Additionally, one may realize that minimizing the
+square-loss form is related to minimizing the KL divergence KL( πθ∥π∗) via policy gradient:
+∇θKL(πθ∥π∗) =Es1∼X,ah∼πθ(·|sh) HX
+h=1logπθ(ah|sh)
+π∗(ah|sh)HX
+h=1∇θlogπθ(ah|sh)
+4Here we restated with the sequence-level reward r(y;x). Rafailov et al. (2024a) started their derivation from
+a ground-truth token-level reward r(sh,ah), which is under-specified due to the reward reshaping issue (Ng et al.,
+1999): reshaping the reward will not affect the Bradley-Terry preference probability so it is impossible to recover the
+ground-truth reward from the preference signal (Rafailov et al., 2024a, Section 4.2).
+11
+
+--- PAGE 12 ---
+=Es1∼X,ah∼πθ(·|sh)
+∇θHX
+h=1logπθ(ah|sh)
+π∗(ah|sh)2
+.
+4.5 Comparison with DPO, IPO, and KTO
+In practice, we utilize mini-batches of more than 2 responses to estimate the win rate of a given
+response, while the DPO and IPO loss focus on a single pair of responses. When only a pair of
+responses ywandylis available, we have the pair-wise symmetric loss based on the preference
+triplet ( x,yw,yl) defined as:
+ℓSPPO (x,yw,yl;θ;πref) :=
+logπθ(yw|x)
+πref(yw|x)
+−η
+P(yw≻yl|x)−1
+22
++
+logπθ(yl|x)
+πref(yl|x)
+−η
+P(yw≺yl|x)−1
+22
+, (4.12)
+where P(yw≻yl|x) can be either a soft probability within [0 ,1] or a hard label 1 indicating yw≻yl.
+We now compare the SPPO loss to other baselines assuming a hard label yw≻ylis given. For
+the ease of comparison, let ( β=η−1):
+a=βlogπθ(yw|x)
+πref(yw|x)
+, b=βlogπθ(yl|x)
+πref(yl|x)
+, c=βKL(πθ∥πref),
+then we have
+ℓDPO(yw,yl,x) =−logσ(a−b), (4.13)
+ℓIPO(yw,yl,x) = [( a−b)−1]2, (4.14)
+ℓKTO(yw,yl,x) =σ(−a+c) +σ(b−c) (simplified) , (4.15)
+where σ(x) =ex/(ex+ 1) and the SPPO loss can be written as
+ℓSPPO(yw,yl,x) = (a−1/2)2+ (b+ 1/2)2.
+It can be seen that SPPO not only pushes the gap between aandbto be 1, but also attempts
+to push the value of ato be close to 1 /2 and the value of bto be close to −1/2 so that πθ(yw|x)>
+πref(yw|x) and πθ(yl|x)< π ref(yl|x). We believe this to be particularly important: when the
+preference pairs are scarce (e.g., one pair for each prompt), there is no guarantee that the winner
+log-ratio awill increase and the loser log-ratio bwill decrease. Instead, only the gap between the
+winner and the loser (i.e., a−b) will increase. This phenomenon is observed by Pal et al. (2024)
+that DPO only lowers the loser’s likelihood, but barely change the winner’s likelihood.
+As discussed above, fitting βlog
+πt+1(y|x)
+πt(y|x)
+directly to P(y≻πt|x)−1/2 under a square loss is
+closely related to the policy gradient. This explains why SPPO is more effective than IPO which
+attempts to fit βlog
+πt+1(yw|x)
+πt(yw|x)
+−βlog
+πt+1(yl|x)
+πt(yl|x)
+toP(yw≻πt|x)−P(yl≻πt|x). In addition,
+SPPO shares a similar spirit as KTO. The KTO loss pushes ato be large by minimizing σ(−a+c)
+and pushes bto be small by minimizing σ(b−c). In contrast, SPPO pushes ato be as large as 1 /2
+andbto be as small as −1/2.
+On the other hand, we would like to comment that although DPO and KTO can be extended
+to their iterative variants, they are not by nature iterative algorithms and do not have provable
+12
+
+--- PAGE 13 ---
+guarantees that they can reach the Nash equilibrium. In contrast, SPPO and IPO are by design
+capable to solve the Nash equilibrium iteratively. SPPO is superior to IPO because its design
+explicitly alleviates the data sparsity issue, as discussed above and detailed in Pal et al. (2024).
+5 Experiments
+5.1 Experiment Setup
+Base Model and Datasets We follow the experimental setup of Snorkel5, a model that utilizes
+iterative DPO to achieve state-of-the-art performance on AlpacaEval benchmarks. Specifically,
+we use Mistral-7B-Instruct-v0.2 as our base model6. Mistral-7B-Instruct-v0.2 is an instruction
+fine-tuned version of Mistral-7B-v0.2 model (Jiang et al., 2023a). We also adopt Ultrafeedback (Cui
+et al., 2023) as our source of prompts which includes around 60k prompts from diverse resources.
+During generation, we follow the standard chat template of Mistral-7B. To avoid overfitting during
+the fine-tuning, we split the dataset into three portions and use only one portion per iteration.
+These settings were also adopted by training the model Snorkel-Mistral-PairRM-DPO7(Snorkel).
+We follow the splitting in Snorkel for a fair comparison. Additionally, we use Llama-3-8B-Instruct8
+as a stronger base model along with the same preference dataset and data splitting.
+Preference Model We employ PairRM (Jiang et al., 2023b), an efficient pair-wise preference
+model of size 0.4B. PairRM is based on DeBERTA-V3 (He et al., 2021) and trained on high-quality
+human-preference datasets. Results on benchmarks like Auto-J Pairwise dataset (Li et al., 2023a)
+show that it outperforms most of the language-model-based reward models and performs comparably
+with larger reward models like UltraRM-13B (Cui et al., 2023). We refer the readers to the homepage
+on Huggingface9for detailed benchmark results. We therefore keep PairRM as our ranking model
+following Snorkel for a balance between accuracy and efficiency.
+Specifically, PairRM will output a “relative reward” s(y,y′;x) that reflects the strength difference
+between yandy′, i.e.,
+P(y≻y′|x) =exp(s(y,y′;x))
+1 + exp( s(y,y′;x)).
+Unlike the Bradley-Terry-based reward model, PairRM only assigns the relative reward which is not
+guaranteed to be transitive (i.e., s(y1,y2;x) +s(y2,y3;x)̸=s(y1,y3;x)). So it indeed models the
+general preference.
+Response Generation and Selection During the generation phase in each iteration, we use top
+p= 1.0 and temperature 1 .0 to sample from the current policy. We sample with different random
+seeds to get K= 5 different responses for each prompt. Previous works utilizing Iterative DPO
+choose 2 responses to form a pair for each prompt. For a fair comparison, we do not include all
+K= 5 responses in the preference data but choose two responses among them. Following Snorkel,
+5https://huggingface.co/snorkelai/Snorkel-Mistral-PairRM-DPO
+6https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.2
+7https://huggingface.co/snorkelai/Snorkel-Mistral-PairRM-DPO
+8https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct
+9https://huggingface.co/llm-blender/PairRM
+13
+
+--- PAGE 14 ---
+we choose the winner ywand loser ylto be the response with the highest andlowest PairRM score,
+which is defined for each response yias:
+sPairRM (yi;x) :=1
+KKX
+k=1s(yi,yk;x).
+Probability Estimation We then estimate the win rate over the distribution by the average win
+rate over all the sampled responses as explained in (4.5):
+bP(yi≻πt|x) =1
+KKX
+k=1P(yi≻yk|x),∀i∈[K].
+Hyperparameter Tuning The experiments are conducted on 8 ×Nvidia A100 GPUs. For
+SPPO, we trained three iterations in total. In each iteration, we selected the model trained on
+the first epoch of the 20k prompts from UltraFeedback to proceed to the next iteration. For both
+Mistral-7B-Instruct-v0.2 and Llama-3-8B-Instruct, the global training batch size is set to 64, and η
+is set to 1 e3. The learning rate schedule is determined by the following hyperparameters: learning
+rate=5.0e-7, number of total training epochs=18, warmup ratio=0.1, linear schedule. The best
+hyper-parameters for each model are selected by the average win rate (judged by PairRM-0.4B)
+on a hold-out subset of Ultrafeedback as the metric. For more details on the win-rate comparison
+using PairRM as a judge, please refer to Section 5.2 and Figure 3.
+Baselines We evaluate the following base models as well as baseline methods for fine-tuning
+LLMs:
+•Mistral-7B-Instruct-v0.2: Mistral-7B-Instruct-v0.2 is an instruction fine-tuned version of Mistral-
+7B-v0.2 model (Jiang et al., 2023a). It is the starting point of our algorithm.
+•Snorkel (Mistral-PairRM-DPO): We directly evaluate the uploaded checkpoint on HuggingFace10.
+This model is obtained by three rounds of iterative DPO from Mistral-7B-Instruct-v0.2.
+•(Iterative) DPO: We also implement the iterative DPO algorithm by ourselves. The experimental
+settings and model selection schemes align with those used for SPPO, except for the adoption
+of the DPO loss function as defined in (4.13) . Hyperparameters are optimized to maximize the
+average win-rate assessed by PairRM at each iteration. Note that the practical algorithm in
+Rosset et al. (2024) is essentially the same as iterative DPO.
+•(Iterative) IPO: We implement the iterative IPO algorithm by ourselves. The experimental setting
+and the model selection scheme is the same as iterative DPO, except that the loss function is
+the IPO loss (4.14) . For fair comparison, hyperparameters for IPO is also selected by evaluation
+using the average PairRM win-rate on the hold-out subset of Ultrafeedback.
+•Self-rewarding LM: Yuan et al. (2024) proposed to prompt the LLM itself as a preference judge
+to construct new preference pairs and iteratively fine-tune the LLM with the DPO algorithm.
+We use the AlpacaEval 2.0 win rate reported by Yuan et al. (2024) for comparison. Note that
+Self-rewarding LM is a trained from Llama 2 70B.
+10https://huggingface.co/snorkelai/Snorkel-Mistral-PairRM-DPO
+14
+
+--- PAGE 15 ---
+•Llama-3-8B-Instruct: Llama-3-8B-Instruct is an instruction-tuned model optimized for dialogue
+use cases and outperforms many of the available open-source chat models on common industry
+benchmarks.
+Benchmarks Following previous works, we use AlpacaEval 2.0 (Dubois et al., 2024a), Arena-
+Hard(Li et al., 2024), MT-Bench (Zheng et al., 2024), and Open LLM Leaderboard (Beeching et al.,
+2023a) as our evaluation benchmarks.
+•AlpacaEval 2.0 is an LLM-based automatic evaluation benchmark. It employs AlpacaFarm
+(Dubois et al., 2024b) as its prompts set composed of general human instructions. The model
+responses and the reference response generated by GPT-4-Turbo are fed into a GPT-4-Turbo-based
+annotator to be judged. We follow the standard approach and report the win rate over the
+reference responses.
+•Arena-Hard (Li et al., 2024) is a high-quality benchmark that claims to be harder and has
+the highest correlation and separability to Chatbot Arena among popular open-ended LLM
+benchmarks including AlpacaEval 2.0. We evaluate our models Mistral-PairRM-SPPO and the
+baseline models.
+•MT-Bench (Zheng et al., 2024) is a collection of 80 high-quality multi-turn open-ended questions.
+The questions cover topics like writing, role-playing, math, coding, etc.. The generated answer is
+judged by GPT-4 and given a score directly without pairwise comparison.
+•Open LLM Leaderboard (Beeching et al., 2023a) consists of six datasets, each of which
+focuses on a facet of language model evaluation. In detail, the evaluation rubric includes math
+problem-solving, language understanding, human falsehood mimicking, and reasoning. We follow
+the standard evaluation process and use in-context learning to prompt the language model and
+compute the average score over six datasets to measure the performance.
+5.2 Experimental Results
+Evaluation using GPT-4 as a judge Human evaluation remains the benchmark for quality
+and accuracy (Askell et al., 2021; Ouyang et al., 2022). However, due to its limitations in scalability
+and reproducibility, we explore the alternative approach of using the advanced capabilities of
+GPT-4 (OpenAI et al., 2023) as an automatic evaluation tool. We conduct GPT-4-based automatic
+evaluation on AlpacaEval 2.0 (Li et al., 2023b), MT-Bench (Zheng et al., 2023), and Arena-Hard (Li
+et al., 2024) to measure the chatbot capability of our model. The results can be found in Table 1
+for AlpacaEval 2.0, Figure 2 (left) for MT-Bench, and Figure 2 (right) for Arena-Hard. We found
+that the performance of SPPO models consistently improves throughout all iterations.
+Table 1 (AlpacaEval 2.0) shows the win rate over the GPT-4-Turbo baseline of different models
+on 805 prompts. We also include one column indicating the length-controlled win rate, and one
+column on the average length of each model, to account for the tendency of the LLM-based judge
+to favor longer sequence outputs — an issue colloquially termed the ”reward hacking” phenomenon.
+15
+
+--- PAGE 16 ---
+Table 1: AlpacaEval 2.0 evaluation of various models (detailed in Baselines) in terms of both normal
+and length-controlled (LC) win rates in percentage (%). Mistral-7B-SPPO Iter3 model achieves
+the highest LC win rate of 28.53% and a normal win rate of 31.02%. SPPO demonstrates steady
+performance gains across iterations and outperforms other baselines which show a tendency to
+produce longer responses. Additionally, re-ranking with the PairRM reward model (best-of-16) at
+test time consistently enhances the performance across all models and SPPO (best-of-16) achieves
+high win rate without strong external supervision like GPT-4 . We additionally include the results
+obtained from fine-tuning Llama-3-8B-Instruct, which also show steady performance improvement.
+ModelAlpacaEval 2.0
+LC Win Rate Win Rate Avg. Len
+Mistral-7B-Instruct-v0.2 17.11 14.72 1676
+Mistral-7B-Instruct-v0.2 (best-of-16) 22.45 17.94 1529
+Snorkel (Mistral-PairRM-DPO) 26.39 30.22 2736
+Snorkel (Mistral-PairRM-DPO best-of-16) 29.97 34.86 2616
+Self-Rewarding 70B Iter1 - 9.94 1092
+Self-Rewarding 70B Iter2 - 15.38 1552
+Self-Rewarding 70B Iter3 - 20.44 2552
+Mistral-7B-DPO Iter1 23.81 20.44 1723
+Mistral-7B-DPO Iter2 24.23 24.46 2028
+Mistral-7B-DPO Iter3 22.30 23.39 2189
+Mistral-7B-IPO Iter1 23.78 20.77 1693
+Mistral-7B-IPO Iter2 21.08 23.38 2660
+Mistral-7B-IPO Iter3 20.06 22.47 2760
+Mistral-7B-SPPO Iter1 24.79(+7.69) 23.51(+8.79) 1855
+Mistral-7B-SPPO Iter2 26.89(+2.10) 27.62(+4.11) 2019
+Mistral-7B-SPPO Iter3 28.53 (+1.64) 31.02 (+3.40) 2163
+Mistral-7B-SPPO Iter1 (best-of-16) 28.71(+6.26) 27.77(+9.83) 1901
+Mistral-7B-SPPO Iter2 (best-of-16) 31.23(+2.52) 32.12(+4.35) 2035
+Mistral-7B-SPPO Iter3 (best-of-16) 32.13 (+0.9) 34.94 (+2.82) 2174
+Llama-3-8B-Instruct 22.92 22.57 1899
+Llama-3-8B-SPPO Iter1 31.73(+8.81) 31.74(+9.17) 1962
+Llama-3-8B-SPPO Iter2 35.15(+3.42) 35.98(+4.24) 2021
+Llama-3-8B-SPPO Iter3 38.77 (+3.62) 39.85 (+3.87) 2066
+According to the table, Mistral-7B-SPPO Iter3 has the highest win rate, 28.52% for the length-
+controlled version, and 31.02% for the overall win rate.
+The performance gains over previous iterations are 7.69% (Mistral-7B-Instruct →Iter1), 2.10%
+(Iter1 →Iter2), and 1.64% (Iter2 →Iter3), respectively, indicating steady improvements across
+iterations, as illustrated in Figure 1. We also apply SPPO to a stronger baseline model, i.e.,
+Llama-3-8B-Instruct, and the fine-tuned model Llama-3-8B-SPPO has a higher length-controlled
+16
+
+--- PAGE 17 ---
+Table 2: AlpacaEval 2.0 leaderboard results of both normal and length-controlled (LC) win rates in
+percentage (%). Mistral-7B-SPPO can outperform larger models and Mistral-7B-SPPO (best-of-16)
+can outperform proprietary models such as GPT-4(6/13). Llama-3-8B-SPPO exhibits even better
+performance.
+ModelAlpacaEval 2.0
+LC. Win Rate Win Rate
+GPT-4 Turbo 50.0 50.0
+Claude 3 Opus 40.5 29.1
+Llama-3-8B-SPPO Iter3 38.8 39.9
+GPT-4 0314 35.3 22.1
+Llama 3 70B Instruct 34.4 33.2
+Mistral-7B-SPPO Iter3 (best-of-16) 32.1 34.9
+GPT-4 0613 30.2 15.8
+Snorkel (Mistral-PairRM-DPO best-of-16) 30.0 34.9
+Mistral Medium 28.6 21.9
+Mistral-7B-SPPO Iter3 28.5 31.0
+Claude 2 28.2 17.2
+Snorkel (Mistral-PairRM-DPO) 26.4 30.2
+Gemini Pro 24.4 18.2
+Mistral 8 ×7B v0.1 23.7 18.1
+Llama 3 8B Instruct 22.9 22.6
+Iter1 Iter2 Iter320253035LC. Win Rate (%)
+GPT-4 0314
+Snorkel (Mistral-PairRM-DPO)
+Mistral-7B-Instruct-v0.2
+Mistral-7B-DPO
+Mistral-7B-IPO
+Mistral-7B-SPPO
+(a)
+Iter1 Iter2 Iter31015202530Win Rate (%)
+GPT-4 0314
+Snorkel (Mistral-PairRM-DPO)
+Mistral-7B-Instruct-v0.2
+Self-Rewarding 70B
+Mistral-7B-DPO
+Mistral-7B-IPO
+mistral-7B-SPPO (b)
+Figure 1: Win Rate against GPT-4-Turbo with (a) and without (b) Length Controlling (LC) on
+AlpacaEval 2.0. SPPO demonstrates steady improvements on both LC and raw win rates.
+win rate 38.77% and overall win rate 39.85%. The performance gains are more significant: 8.81%
+(Llama-3-8B-Instruct →Iter1), 3.42% (Iter1 →Iter2), and 3.62% (Iter2 →Iter3), summing up to a
+total gain of 15.85%.
+Additionally, the result indicates that SPPO achieves superior performance compared to the
+iterative variants of DPO and IPO. The length-controlled win rate for SPPO reaches 28.53%,
+17
+
+--- PAGE 18 ---
+ModelMT-Bench
+1st Turn 2nd Turn Average
+Mistral-7B-Instruct-v0.2 7.78 7.25 7.51
+Snorkel (Mistral-PairRM-DPO) 7.83 7.33 7.58
+Mistral-7B-DPO Iter1 7.45 6.58 7.02
+Mistral-7B-DPO Iter2 7.57 6.56 7.06
+Mistral-7B-DPO Iter3 7.49 6.69 7.09
+Mistral-7B-SPPO Iter1 7.63 6.79 7.21
+Mistral-7B-SPPO Iter2 7.90 7.08 7.49
+Mistral-7B-SPPO Iter3 7.84 7.34 7.59Model Arena-Hard-Auto-v0.1
+Mistral-7B-Instruct 12.6
+Snorkel (Mistral-PairRM-DPO) 20.7
+Mistral-7B-SPPO Iter1 18.7
+Mistral-7B-SPPO Iter2 20.4
+Mistral-7B-SPPO Iter3 23.3
+Figure 2: MT-Bench & Arena-Hard Evaluation. Left: Mistral-7B-SPPO Iter3 outperforms
+all baseline models by achieving an average score of 7.59 in MT-Bench. Despite initial drops in
+performance in the first two iterations, SPPO Iter3 improves upon the base model by the final
+iteration. Right: Mistral-7B-SPPO Iter3 outperforms the baseline model Snorkel(Mistral-PairRM-
+DPO) in Arena-Hard. The improvement across different iterations is consistent.
+outperforming the DPO’s best rate of 26.39% (by Snorkel) and IPO’s rate of 25.45%. Notably, while
+DPO and IPO training tend to significantly increase the average output length—2736 and 2654,
+respectively—SPPO shows a more moderate length increase, moving from 1676 in the base model
+to 2163 at the third iteration. Finally, we present the best-of-16 results for each model, selected
+using the PairRM reward model. We find that re-ranking with the preference model at test time
+can consistently improve the performance of base model (Mistral-7B-Instruct-v0.2), DPO (Snorkel),
+and SPPO (Iter3) by 5.34%, 3.57%, and 3.6%, respectively. Notably, this shows that while SPPO
+significantly enhances model alignment using PairRM-0.4B as the sole external supervision, it has
+not resulted in over-optimization against the preference model (Gao et al., 2023).
+In Table 2, we compare SPPO on the AlpacaEval 2.0 leaderboard with other state-of-the-art AI
+chatbots. We found our SPPO model outperforms many competing models trained on proprietary
+alignment data (e.g., Claude 2, Gemini Pro, & Llama 3 8B Instruct). When applied to Llama 3
+8B Instruct, our Llama-3-8B-SPPO exhibits an even higher win rate. With test-time reranking,
+Mistral-7B-SPPO Iter3 (best-of-16) is even competitive to GPT-4 0613 and Llama 3 70B Instruct.
+In Figure 2 (left), we evaluate the performance of SPPO on MT-Bench. We can see that
+Mistral-7B-SPPO Iter3 outperforms all baseline models, achieving an average score of 7.59. While
+we are not certain why the MT-Bench performance drops at the first two iterations, the performance
+of SPPO at the final iteration still improves over the base model.
+Arena-Hard (Li et al., 2024) contains 500 challenging user queries and follow the same evaluation
+method as AlpacaEval 2.0. In Figure 2 (right), we evaluate the performance of SPPO on Arena-Hard.
+We can see that Mistral-7B-SPPO exhibits a steady performance gain across iterations.Mistral-7B-
+SPPO Iter 3 outperforms the baseline models, achieving an average score of 23.3.
+Open LLM Leaderboard We further evaluate the capabilities of SPPO models using Huggingface
+Open LLM Leaderboard (Beeching et al., 2023b). This leaderboard encompasses 6 different datasets,
+each focusing on a specific capability of LLMs: Arc (Clark et al., 2018), HellaSwag (Zellers et al.,
+2019), Winogrande (Sakaguchi et al., 2021), MMLU (Hendrycks et al., 2020), TruthfulQA (Lin et al.,
+2021), and GSM8k (Cobbe et al., 2021). The models are prompted with zero or few-shot exemplars.
+18
+
+--- PAGE 19 ---
+Table 3: Open LLM Leaderboard Evaluation . SPPO fine-tuning improves the base model’s
+performance on different tasks, reaching a state-of-the-art average score of 66.75 for Mistral-7B
+and 70.29 for Llama-3-8B. For Mistral-7B, subsequent iterations of DPO, IPO, and SPPO see
+a decline in performance. It is possible that aligning with human preferences (simulated by the
+PairRM preference model in our study) may not always enhance, and can even detract from, overall
+performance.
+Models Arc TruthfulQA WinoGrande GSM8k HellaSwag MMLU Average
+Mistral-7B-Instruct-v0.2 63.65 66.85 77.98 41.93 84.89 59.15 65.74
+Snorkel 66.04 70.86 77.74 36.77 85.64 60.83 66.31
+Mistral-7B-DPO Iter1 63.14 68.39 77.19 40.33 85.25 59.41 65.62
+Mistral-7B-DPO Iter2 64.16 67.84 76.09 39.95 85.23 59.03 65.38
+Mistral-7B-DPO Iter3 65.19 67.89 77.27 32.30 85.49 59.00 64.52
+Mistral-7B-IPO Iter1 64.68 68.60 77.98 43.75 85.08 59.04 66.52
+Mistral-7B-IPO Iter2 62.12 66.30 77.51 39.20 83.15 59.70 64.66
+Mistral-7B-IPO Iter3 62.97 67.12 77.51 37.45 83.69 59.57 64.72
+Mistral-7B-SPPO Iter1 65.02 69.40 77.82 43.82 85.11 58.84 66.67
+Mistral-7B-SPPO Iter2 65.53 69.55 77.03 44.35 85.29 58.72 66.75
+Mistral-7B-SPPO Iter3 65.36 69.97 76.80 42.68 85.16 58.45 66.40
+Llama-3-8B-Instruct 62.29 51.65 76.09 75.89 78.73 65.59 68.37
+Llama-3-8B-SPPO Iter1 63.82 54.96 76.40 75.44 79.80 65.65 69.35
+Llama-3-8B-SPPO Iter2 64.93 56.48 76.87 75.13 80.39 65.67 69.91
+Llama-3-8B-SPPO Iter3 65.19 58.04 77.11 74.91 80.86 65.60 70.29
+The results, presented in Table 3, demonstrate that SPPO can enhance the performance of the
+base model on Arc, TruthfulQA, and GSM8k, and achieve the state-of-the-art performance with an
+averagte score of 66.75. However, these improvements do not hold in subsequent alignment iterations:
+DPO, IPO, and SPPO’s performance declines after the first or second iterations. This limitation
+may be attributed to the “alignment tax” phenomenon (Askell et al., 2021), which suggests that
+aligning with human preferences (simulated by PairRM preference in our study) might not improve
+or even hurt the general performance. Improving language model capabilities through alignment
+iterations remains a topic for future research, and we posit that incorporating high-quality SFT
+annotations (Chen et al., 2024) could play a significant role in this endeavor.
+Evaluation using PairRM as a judge As SPPO identifies the von Neumann winner (see (3.3))
+in a two-player constant-sum game, we examine the pairwise preferences among SPPO models and
+other baselines. The pairwise win rates, measured by PairRM, are depicted in Figure 3. We observe
+that in all algorithms—namely DPO, IPO, and SPPO—the newer model iterations surpass the
+previous ones. For example, SPPO Iteration 3 outperforms SPPO Iteration 2. Both SPPO and IPO
+consistently outperform DPO across all iterations. While SPPO is superior to IPO in the first two
+iterations, IPO exceeds SPPO in performance during the final iteration. Considering the superior
+performance of SPPO in standard benchmarks evaluated by GPT-4 or against ground-truth answers
+(e.g., AlpacaEval 2.0, MT-Bench, and Open LLM Leaderboard), along with IPO’s tendency to
+19
+
+--- PAGE 20 ---
+0.500 0.552 0.572 0.577 0.631 0.656 0.664 0.719 0.713 0.741 0.809
+0.448 0.500 0.520 0.523 0.577 0.601 0.627 0.676 0.682 0.706 0.781
+0.428 0.480 0.500 0.496 0.568 0.580 0.609 0.659 0.652 0.673 0.758
+0.423 0.477 0.504 0.500 0.552 0.577 0.608 0.636 0.631 0.667 0.750
+0.369 0.423 0.432 0.448 0.500 0.517 0.551 0.595 0.598 0.631 0.722
+0.344 0.399 0.420 0.423 0.483 0.500 0.530 0.574 0.577 0.613 0.707
+0.336 0.373 0.391 0.392 0.449 0.470 0.500 0.550 0.562 0.587 0.670
+0.281 0.324 0.341 0.364 0.405 0.426 0.450 0.500 0.514 0.540 0.651
+0.287 0.318 0.348 0.369 0.402 0.423 0.438 0.486 0.500 0.526 0.633
+0.259 0.294 0.327 0.333 0.369 0.387 0.413 0.460 0.474 0.500 0.613
+0.191 0.219 0.242 0.250 0.278 0.293 0.330 0.349 0.367 0.387 0.500
+IPO Iter3 SPPO Iter3 Snork
+el (Mistral-P
+airRM-DPO)DPO Iter3 SPPO Iter2 IPO Iter2 DPO Iter2 SPPO Iter1 DPO Iter1 IPO Iter1 Mistral-7B-Instruct-
+v0.2IPO Iter3
+SPPO Iter3
+Snork el (Mistral-P airRM-DPO)
+DPO Iter3
+SPPO Iter2
+IPO Iter2
+DPO Iter2
+SPPO Iter1
+DPO Iter1
+IPO Iter1
+Mistral-7B-Instruct- v0.2
+0.20.30.40.50.60.70.8Figure 3: Pairwise win rates among base model (Mistral-7B-Instruct-v0.2), DPO models, IPO
+models, and SPPO models using PairRM-0.4B as a judge, which may favor models with longer
+outputs. On benchmarks with more powerful judge models (e.g., GPT-4), such as AlpacaEval 2.0
+and MT-Bench, SPPO outperforms other baseline algorithms by a large margin.
+produce longer sequence outputs (see Avg. Len in Table 1), we believe this is due to IPO exploiting
+the length bias in PairRM that favors longer sequences. Conversely, SPPO models benefit from a
+more robust regularization within a multiplicative weight update framework.
+5.3 Ablation Study
+We study the effect of mini-batch size when estimating the win rate P(y≻πt|x). Specifically, for
+each prompt, we still generate 5 responses and choose the winner ywand loser ylaccording to the
+PairRM score. When estimating the probability, we varies the batch size to be K= 2,3,5. For
+K= 2, we estimate P(y≻πt|x) with only 2 samples ywandyl:
+bP(yw≻πt|x) =P(yw≻yw|x) +P(yw≻yl|x)
+2=1/2 +P(yw≻yl|x)
+2,
+andbP(yl≻πt|x) similarly. K= 5 indicates the original setting we use.
+We compare the results on AlpacaEval 2.0, as shown in Figure 4. We find that the performance
+of SPPO is robust to the noise in estimating P(y≻πt|x). While K= 5 initially outperforms
+20
+
+--- PAGE 21 ---
+Mini-Batch
+SizeIterationAlpacaEval 2.0
+Win Rate Avg. Len
+(chars) LC. Raw
+K= 2Iter1 23.85 23.53 1948
+Iter2 26.91 27.24 1999
+Iter3 28.26 28.22 1961
+Iter1 24.79 23.51 1855
+Iter2 26.89 27.62 2019 K= 5
+Iter3 28.53 31.02 2163
+Iter1 Iter2 Iter3182022242628LC. Win Rate (%)
+Snorkel (Mistral-PairRM-DPO)
+Mistral-7B-Instruct-v0.2
+SPPO (K=2)
+SPPO (K=5)
+Figure 4: AlpacaEval 2.0 evaluation on SPPO of different mini-batch size in terms of both normal
+and length-controlled (LC) win rates in percentage (%). K= 2,5 denote different mini-batch sizes
+when estimating the win rate P(y≻πt|x).
+K= 2 in the first iteration, the difference in their performance diminishes in subsequent iterations.
+Additionally, we observe that K= 2 exhibits a reduced tendency to increase output length.
+6 Conclusions
+This paper introduced Self-Play Preference Optimization (SPPO), an approach to fine-tuning Large
+Language Models (LLMs) from Human/AI Feedback. SPPO has demonstrated significant im-
+provements over existing methods such as DPO and IPO across multiple benchmarks, including
+AlpacaEval 2.0, MT-Bench, Arena-Hard, and the Open LLM Leaderboard. By integrating a prefer-
+ence model and employing a new optimization objective, SPPO can align LLMs more closely with
+human preferences.
+Limitations Theoretically, approximating the optimal policy update via regression relies on the
+assumption that the model class is expressive enough and the generated data well cover the input
+space. Approximating the log-partition factor with a constant can help reduce variance only when it
+is close to the soft value function. The experiments are run on one dataset UltraFeedback and the
+models are tested on a few benchmarks due to limited computational resources, but the proposed
+methods can be further validated on more models, datasets, and benchmarks to have a holistic
+evaluation given more resources.
+Acknowledgement
+We would like to thank Alekh Agarwal for his insightful comments that helped clarify the technical
+contributions of our work and its connection and distinction from SPO (Swamy et al., 2024). We
+would also like to thank Wen Sun for pointing out the concurrent work (Gao et al., 2024) and for
+the valuable discussion on the design choice of objective functions.
+21
+
+--- PAGE 22 ---
+A Approximating the Normalizing Factor
+As discussed before, we replace the log-partition factor with a constant to avoid either estimating
+or predicting the log-partition factor. In hindsight, the approximation of the normalizing factor
+serves as a baseline for variance reduction, and does not need to be exact. Here we discuss the
+implicit assumptions and how we obtained an approximation based on different assumptions on
+human preference behaviour.
+We first consider the case where we have Kresponses and then calculate the limit of ZbπK
+t(x)
+when K→ ∞ . We have two extreme cases:
+1. The most “disordered” case: any preference is a fair coin flip
+2. The most “ordered” case: there is a strict ordering among all responses.
+The most “disordered” case Specifically, we have Kdifferent responses y1,y2, . . . ,yKfor the
+given prompt x. Since we consider the general preference setting, we assume that the preference
+probability between yiandyj(i < j) we observe is a fair coin toss:
+P(yi≻yj|x) =(
+1,w.p. 1 /2,
+0,w.p. 1 /2.
+Note that for simplicity, we assumed that the preference probability follows the Bernoulli distribution,
+not the preference feedback . The preference feedback is deterministic since the preference probability
+is either 0 or 1. Assuming P(yi≻yj|x) follows any other 1 /2-mean distribution will yield the same
+constant.
+We define the random variable pi,j:= 2P(yi≻yj|x)−1 for convenience. In total, we have
+K(K−1)/2 independent Rademacher random variables for all i < j , and then we have pj,i=−pi,j
+for all i > j. For i=j,pi,j= 0. We also define Xi=PK
+j=1pi,j/K.
+Given the setting and notations above, we have
+P(yi≻bπK
+t|x) =KX
+j=1P(yi≻yj|x)/K= 1/2 +Xi.
+Furthermore,
+ZbπK
+t(x) =KX
+i=1exp(ηP(yi≻bπK
+t|x))/K=eη/2·KX
+i=1eηXi/K.
+For any fixed i, we have the expectation as follows:
+E[eηXi] =E"KY
+j=1eηpi,j/K#
+=KY
+j=1Eh
+eηpi,j/Ki
+=eη/K+e−η/K
+2K−1
+,
+where the last equation comes from the definition of pi,j(note that pi,i= 0). The variance is:
+Var[eηXi] =E[e2ηXi]−E[eηXi]2=e2η/K+e−2η/K
+2K−1
+−eη/K+e−η/K
+22K−2
+.
+22
+
+--- PAGE 23 ---
+Additionally, the covariance between eηXiandeηXj(i̸=j) is:
+Cov(eηXi, eηXj) =E[eηXi+ηXj]−E[eηXi]E[eηXj]
+=E"
+exp 
+ηKX
+k=1pi,k/K+ηKX
+l=1pj,l/K!#
+−E[eηXi]E[eηXj]
+=eη/K+e−η/K
+22K−4
+−E[eηXi]E[eηXj]
+=eη/K+e−η/K
+22K−4
+−eη/K+e−η/K
+22K−2
+,
+where the third line holds because pi,i=pj,j= 0,pi,j+pj,i= 0, and the rest terms are i.i.d..
+One can check that when K→ ∞ , we have E[eηXi]→1,Var[eηXi]→0, and Cov(eηXi, eηXj)→0.
+By Chebyshev’s inequality,PK
+i=1eηXi/Kwill converge to 1 in probability. So we have
+ZbπK
+t(x) =eη/2·KX
+i=1eηXi/K→eη/2,
+and we can approximate log ZbπK
+t(x) with η/2.
+The most “ordered” case We assume there is an ordering σ(·) among the Kdifferent responses
+y1,y2, . . . ,yKfor the given prompt x. The preference probability between yiandyj(i < j) is:
+P(yi≻yj|x) =(
+1,ifσ(i)< σ(j),
+0,ifσ(i)> σ(j).
+Again, the preference feedback is deterministic: as long as yiis ranked higher than yj,yiwill always
+be preferred over yj. The same responses still tie: P(yi≻yi|x) = 1 /2.
+Without loss of generality, we can assume y1≺y2≺y3≺ ··· ≺ yK. Given the setting and
+notations above, we have
+P(yi≻bπK
+t|x) =KX
+j=1P(yi≻yj|x)/K=i−1 + 1 /2
+K=i−1/2
+K,
+because for yi, there are i−1 responses that are strictly worse, and yities with itself.
+For the normalizing factor, we have
+logZbπK
+t(x) = logKX
+i=1exp(ηP(y≻bπK
+t|x))/K
+= logKX
+i=1exp
+ηi−1/2
+K
+/K
+→logZ1
+0exp(ηx)dx
+= logeη−1
+η.
+23
+
+--- PAGE 24 ---
+where the third line (limiting) can be obtained by the squeeze theorem.
+Forη= 1, logeη−1
+η≈0.54η. For large η≈1e3 as we used in the experiments, we have
+logeη−1
+η≈η.
+Choice of ηDepending on how “disordered” the preference is, ηcan vary between η/2 and η. As
+this paper is partially motivated by human intransitive and irrational preference behavior ,
+we chose to use η/2 to approximate logZbπK
+t(x). Fine-tuning the coefficient of this constant as a
+hyperparameter is also an option and can help improve performance on given dataset.
+B Proof of Theorem 4.1
+Proof of Theorem 4.1. Suppose the optimization problem is realizable, we have exactly that
+πt+1(y|x)∝πt(y|x) exp( ηP(y≻πt|x)),fort= 1,2, . . . . (B.1)
+To prove that the exponential weight update can induce the optimal policy, we directly invoke a
+restated version of Theorem 1 in Freund and Schapire (1999):
+Lemma B.1 (Theorem 1 in Freund and Schapire (1999), restated) .For any oracle Pand for any
+sequence of mixed policies µ1, µ2, . . . , µ T, the sequence of policies π1, π2, . . . , π Tproduced by (B.1)
+satisfies:
+TX
+t=1P(πt≺µt)≤min
+πη
+1−e−ηTX
+t=1P(π≺µt) +KL(π∥π0)
+1−e−η
+.
+By setting µt=πt, we have that
+T
+2≤min
+πηT
+1−e−ηP(π≺¯πT) +KL(π∥π0)
+1−e−η
+,
+where the LHS comes from that P(πt≺πt) = 1 /2 and the RHS comes from that1
+TPT
+t=1P(π≺
+πt) =P(π≺¯πt). Now rearranging terms gives
+1−e−η
+2η≤min
+π
+P(π≺¯πT) +KL(π∥π0)
+ηT
+.
+Note that π0is an autoregressive model that is fully supported on a finite vocabulary ( π0(yk+1|x,y1:k)
+has non-zero probability for every token). Because its support is a large but finite set, |logπ0(·)|is
+bounded from above. So we can naively bound the KL-divergence KL(π∥π0)≤ ∥logπ0(·)∥∞, which
+can be seen as a (large) constant.
+By choosing η=∥logπ0(·)∥∞√
+T, we have
+1
+2−∥logπ0(·)∥∞
+4√
+T+O(T−1)≤min
+π
+P(π≺¯πT)
++r
+∥logπ0(·)∥∞
+T,
+where the LHS comes from Taylor’s expansion1−e−η
+2η=1
+2−η
+4+O(η2). Notice that 1 /2 at the
+LHS is already the value of the symmetric two-player constant-sum game. This shows that for
+24
+
+--- PAGE 25 ---
+appropriately chosen ηandT, the mixture policy ¯πTis close to the minimax optimal policy (Nash
+equilibrium).
+The optimality gap is thus bounded by
+max
+π
+P(π≻¯πT)
+−min
+π
+P(π≺¯πT)
+= max
+π
+1−P(π≺¯πT)
+−min
+π
+P(π≺¯πT)
+= 21
+2−min
+π
+P(π≺¯πT)
+=O1√
+T
+.
+C Response Examples in Different Iterations
+25
+
+--- PAGE 26 ---
+Table 4: Generation example of our fine-tuned model by SPPO at different iterations.
+Prompt You will be given a definition of a task first, then some input of the task. You are
+given a dialog between 2 or more individuals. The dialog will include information
+as to the relationship between 2 of the participants. At the end, you will be asked
+to provide an answer as to the relationship of those 2 participants. In this scenario,
+’0’ will represent a spousal relationship, ’1’ will represent siblings, and ’2’ will
+represent a child/parent relationship. Speaker 1: I’ll be right with you. Okay?
+Thanks, Wendy. Speaker 2: Oh my God! How cute is the on-call doctor? Speaker
+3: Ooh, so cute, that I’m thinking about jamming this pen in my eye. Speaker 4:
+Dr. Burke will see you know. Speaker 2: Oh no-no-no, not Dr. Burke. Dr. Burke
+is out of town. The-the on-call doctor will see me now. Speaker 4: Dr. Richard
+Burke is out of town. Dr. Timothy Burke, his son, will see you now. Speaker 5:
+Ready? What is the relationship between Speaker 5 and Richard Burke? Output:
+Mistral-7B The relationship between Speaker 5 and Richard Burke is that of a parent and
+child, as Richard Burke is identified as the son of another character in the dialog.
+Iteration 1 The relationship between Speaker 5 and Richard Burke is that of a father and
+child. Based on the dialogue, it was revealed that Dr. Timothy Burke is the on-call
+doctor and the son of Dr. Richard Burke.
+Iteration 2 The relationship between Speaker 5 and Richard Burke is that of a father and
+child. The conversation reveals that Dr. Timothy Burke is the on-call doctor and
+he is identified as the son of Dr. Richard Burke.
+Iteration 3 Speaker 5 is the individual asking about the relationship, so they are not directly
+related to Dr. Richard Burke. The information provided in the dialog reveals
+that Dr. Timothy Burke is the on-call doctor and the son of Dr. Richard Burke.
+Therefore, the answer is: The relationship between Speaker 5 and Dr. Richard
+Burke is that of a child (Dr. Timothy Burke) and parent. Speaker 5 is inquiring
+about the relationship, but they are not themselves a part of it. The specified
+relationship codes (0 for spousal, 1 for sibling, 2 for child/parent) align with
+this description: Speaker 5 (0, 1, or 2) and Dr. Richard Burke (2) connect as a
+parent-child duo. Output: 2 (child/parent relationship) In this scenario, Speaker
+5’s role is to determine the relationship between herself and Dr. Richard Burke,
+but since they are not related (she is an outside inquirer), the correct answer
+pertains only to the relationship identified within the dialog: Dr. Richard Burke
+(father) and Dr. Timothy Burke (son).
+26
+
+--- PAGE 27 ---
+Table 5: Another generation example of our fine-tuned model by SPPO at different iterations.
+Prompt Q: Context: Roman Brady is a fictional character from the long running NBC soap
+opera, Days of Our Lives. The role was originated in 1981 by Wayne Northrop
+who played the role until 1984, was filled by Drake Hogestyn from 1986 – 1991,
+again by Northrop from 1991 – 1994, and is currently being portrayed by series
+veteran Josh Taylor, who stepped into the role in 1997. Question: who is roman
+brady on days of our lives? Let’s give stream of consciousness below
+Mistral-7B Roman Brady is a fictional character on the NBC soap opera ”Days of Our Lives.”
+He was first portrayed by Wayne Northrop from 1981 to 1984. Later, Drake
+Hogestyn took over the role from 1986 to 1991. Northrop returned to the role from
+1991 to 1994. Since 1997, the character is being portrayed by Josh Taylor. Roman
+Brady is a significant character in the show’s long-running storylines.
+Iteration 1 Roman Brady is a fictional character on the NBC soap opera ”Days of Our Lives.”
+He was first portrayed by Wayne Northrop from 1981 to 1984. Drake Hogestyn
+took over the role from 1986 to 1991. Northrop returned to play Roman again
+from 1991 to 1994. Since 1997, the character has been portrayed by Josh Taylor.
+So, in summary, Roman Brady is a long-standing character on ”Days of Our Lives”
+who has been played by three different actors over the years: Wayne Northrop
+(1981-1984, 1991-1994), Drake Hogestyn (1986-1991), and currently by Josh Taylor
+(1997-present).
+Iteration 2 Roman Brady is a fictional character on the NBC soap opera ”Days of Our Lives.”
+He was first portrayed by Wayne Northrop from 1981 to 1984. Drake Hogestyn
+took over the role from 1986 to 1991. Northrop returned to play Roman again
+from 1991 to 1994. Since 1997, the character has been portrayed by Josh Taylor.
+Overall, Roman Brady is a long-standing and complex figure in the show’s history,
+with multiple actors bringing their unique interpretations to the role.
+Iteration 3 Roman Brady is a fictional character on the NBC soap opera ”Days of Our Lives.”
+He was originally played by Wayne Northrop from 1981 to 1984. Drake Hogestyn
+took over the role from 1986 to 1991. Northrop returned to portray Roman
+once more from 1991 to 1994. Since 1997, the character has been portrayed by
+Josh Taylor.Roman Brady is a complex and prominent figure in the long-running
+daytime drama. Initially played by Northrop in the early 1980s, his tenure included
+involvement in various storylines, such as romantic relationships and business
+dealings. Hogestyn’s portrayal during the late 1980s and early 1990s introduced
+new dimensions to the character. Northrop’s second stint, from 1991 to 1994,
+further developed Roman’s narrative. Since 1997, Josh Taylor has assumed the
+role, continuing to contribute to the evolving story of Roman Brady on ”Days of
+Our Lives.” Throughout these different portrayals, Roman has remained a central
+character, known for his intricate relationships, business ventures, and personal
+struggles.
+27
+
+--- PAGE 28 ---
+References
+Askell, A. ,Bai, Y. ,Chen, A. ,Drain, D. ,Ganguli, D. ,Henighan, T. ,Jones, A. ,Joseph,
+N.,Mann, B. ,DasSarma, N. et al. (2021). A general language assistant as a laboratory for
+alignment. arXiv preprint arXiv:2112.00861 .
+Azar, M. G. ,Rowland, M. ,Piot, B. ,Guo, D. ,Calandriello, D. ,Valko, M. andMunos,
+R.(2023). A general theoretical paradigm to understand learning from human preferences. arXiv
+preprint arXiv:2310.12036 .
+Beeching, E. ,Fourrier, C. ,Habib, N. ,Han, S. ,Lambert, N. ,Rajani, N. ,Sanseviero,
+O.,Tunstall, L. andWolf, T. (2023a). Open llm leaderboard. https://huggingface.co/
+spaces/HuggingFaceH4/open_llm_leaderboard .
+Beeching, E. ,Fourrier, C. ,Habib, N. ,Han, S. ,Lambert, N. ,Rajani, N. ,Sanseviero, O. ,
+Tunstall, L. andWolf, T. (2023b). Open llm leaderboard. Hugging Face .
+Bradley, R. A. andTerry, M. E. (1952). Rank Analysis of Incomplete Block Designs: I. The
+Method of Paired Comparisons. Biometrika 39324–345.
+Calandriello, D. ,Guo, D. ,Munos, R. ,Rowland, M. ,Tang, Y. ,Pires, B. A. ,Richemond,
+P. H. ,Lan, C. L. ,Valko, M. ,Liu, T. et al. (2024). Human alignment of large language
+models through online preference optimisation. arXiv preprint arXiv:2403.08635 .
+Chen, Z. ,Deng, Y. ,Yuan, H. ,Ji, K. andGu, Q. (2024). Self-play fine-tuning converts weak
+language models to strong language models. arXiv preprint arXiv:2401.01335 .
+Christiano, P. F. ,Leike, J. ,Brown, T. ,Martic, M. ,Legg, S. andAmodei, D. (2017).
+Deep reinforcement learning from human preferences. Advances in neural information processing
+systems 30.
+Clark, P. ,Cowhey, I. ,Etzioni, O. ,Khot, T. ,Sabharwal, A. ,Schoenick, C. andTafjord,
+O.(2018). Think you have solved question answering? try arc, the ai2 reasoning challenge. arXiv
+preprint arXiv:1803.05457 .
+Cobbe, K. ,Kosaraju, V. ,Bavarian, M. ,Chen, M. ,Jun, H. ,Kaiser, L. ,Plappert, M. ,
+Tworek, J. ,Hilton, J. ,Nakano, R. et al. (2021). Training verifiers to solve math word
+problems. arXiv preprint arXiv:2110.14168 .
+Cui, G. ,Yuan, L. ,Ding, N. ,Yao, G. ,Zhu, W. ,Ni, Y. ,Xie, G. ,Liu, Z. andSun, M.
+(2023). Ultrafeedback: Boosting language models with high-quality feedback. arXiv preprint
+arXiv:2310.01377 .
+Dubois, Y. ,Galambosi, B. ,Liang, P. andHashimoto, T. B. (2024a). Length-controlled
+alpacaeval: A simple way to debias automatic evaluators. arXiv preprint arXiv:2404.04475 .
+Dubois, Y. ,Li, C. X. ,Taori, R. ,Zhang, T. ,Gulrajani, I. ,Ba, J. ,Guestrin, C. ,Liang,
+P. S. andHashimoto, T. B. (2024b). Alpacafarm: A simulation framework for methods that
+learn from human feedback. Advances in Neural Information Processing Systems 36.
+28
+
+--- PAGE 29 ---
+Dud´ık, M. ,Hofmann, K. ,Schapire, R. E. ,Slivkins, A. andZoghi, M. (2015). Contextual
+dueling bandits. In Conference on Learning Theory . PMLR.
+Ethayarajh, K. ,Xu, W. ,Muennighoff, N. ,Jurafsky, D. andKiela, D. (2024). Kto: Model
+alignment as prospect theoretic optimization. arXiv preprint arXiv:2402.01306 .
+Freund, Y. andSchapire, R. E. (1997). A decision-theoretic generalization of on-line learning
+and an application to boosting. Journal of computer and system sciences 55119–139.
+Freund, Y. andSchapire, R. E. (1999). Adaptive game playing using multiplicative weights.
+Games and Economic Behavior 2979–103.
+Gao, L. ,Schulman, J. andHilton, J. (2023). Scaling laws for reward model overoptimization.
+InInternational Conference on Machine Learning . PMLR.
+Gao, Z. ,Chang, J. D. ,Zhan, W. ,Oertell, O. ,Swamy, G. ,Brantley, K. ,Joachims, T. ,
+Bagnell, J. A. ,Lee, J. D. andSun, W. (2024). Rebel: Reinforcement learning via regressing
+relative rewards. arXiv preprint arXiv:2404.16767 .
+Haarnoja, T. ,Zhou, A. ,Abbeel, P. andLevine, S. (2018). Soft actor-critic: Off-policy
+maximum entropy deep reinforcement learning with a stochastic actor. In International conference
+on machine learning . PMLR.
+He, P. ,Gao, J. andChen, W. (2021). Debertav3: Improving deberta using electra-style
+pre-training with gradient-disentangled embedding sharing.
+Hendrycks, D. ,Burns, C. ,Basart, S. ,Zou, A. ,Mazeika, M. ,Song, D. andSteinhardt, J.
+(2020). Measuring massive multitask language understanding. arXiv preprint arXiv:2009.03300 .
+Hong, J. ,Lee, N. andThorne, J. (2024). Reference-free monolithic preference optimization with
+odds ratio. arXiv preprint arXiv:2403.07691 .
+Ji, K. ,He, J. andGu, Q. (2024). Reinforcement learning from human feedback with active queries.
+arXiv preprint arXiv:2402.09401 .
+Jiang, A. Q. ,Sablayrolles, A. ,Mensch, A. ,Bamford, C. ,Chaplot, D. S. ,Casas, D.
+d. l. ,Bressand, F. ,Lengyel, G. ,Lample, G. ,Saulnier, L. et al. (2023a). Mistral 7b.
+arXiv preprint arXiv:2310.06825 .
+Jiang, D. ,Ren, X. andLin, B. Y. (2023b). Llm-blender: Ensembling large language models with
+pairwise ranking and generative fusion. arXiv preprint arXiv:2306.02561 .
+Li, J. ,Sun, S. ,Yuan, W. ,Fan, R.-Z. ,Zhao, H. andLiu, P. (2023a). Generative judge for
+evaluating alignment. arXiv preprint arXiv:2310.05470 .
+Li, T. ,Chiang, W.-L. ,Frick, E. ,Dunlap, L. ,Wu, T. ,Zhu, B. ,Gonzalez, J. E. andStoica,
+I.(2024). From crowdsourced data to high-quality benchmarks: Arena-hard and benchbuilder
+pipeline. arXiv preprint arXiv:2406.11939 .
+Li, X. ,Zhang, T. ,Dubois, Y. ,Taori, R. ,Gulrajani, I. ,Guestrin, C. ,Liang, P. and
+Hashimoto, T. B. (2023b). Alpacaeval: An automatic evaluator of instruction-following models.
+https://github.com/tatsu-lab/alpaca_eval .
+29
+
+--- PAGE 30 ---
+Lin, S. ,Hilton, J. andEvans, O. (2021). Truthfulqa: Measuring how models mimic human
+falsehoods. arXiv preprint arXiv:2109.07958 .
+Liu, T. ,Zhao, Y. ,Joshi, R. ,Khalman, M. ,Saleh, M. ,Liu, P. J. andLiu, J. (2023).
+Statistical rejection sampling improves preference optimization. arXiv preprint arXiv:2309.06657
+.
+Lou, H. ,Jin, T. ,Wu, Y. ,Xu, P. ,Gu, Q. andFarnoud, F. (2022). Active ranking without
+strong stochastic transitivity. Advances in neural information processing systems .
+Munos, R. ,Valko, M. ,Calandriello, D. ,Azar, M. G. ,Rowland, M. ,Guo, Z. D. ,Tang,
+Y.,Geist, M. ,Mesnard, T. ,Michi, A. et al. (2023). Nash learning from human feedback.
+arXiv preprint arXiv:2312.00886 .
+Ng, A. Y. ,Harada, D. andRussell, S. (1999). Policy invariance under reward transformations:
+Theory and application to reward shaping. In Icml, vol. 99.
+OpenAI, J., Achiam ,Adler, S. ,Agarwal, S. ,Ahmad, L. ,Akkaya, I. ,Aleman, F. L. ,
+Almeida, D. ,Altenschmidt, J. ,Altman, S. ,Anadkat, S. et al. (2023). Gpt-4 technical
+report. arXiv preprint arXiv:2303.08774 .
+Ouyang, L. ,Wu, J. ,Jiang, X. ,Almeida, D. ,Wainwright, C. ,Mishkin, P. ,Zhang, C. ,
+Agarwal, S. ,Slama, K. ,Ray, A. et al. (2022). Training language models to follow instructions
+with human feedback. Advances in Neural Information Processing Systems 3527730–27744.
+Pal, A. ,Karkhanis, D. ,Dooley, S. ,Roberts, M. ,Naidu, S. andWhite, C. (2024). Smaug:
+Fixing failure modes of preference optimisation with dpo-positive. arXiv preprint arXiv:2402.13228
+.
+Rafailov, R. ,Hejna, J. ,Park, R. andFinn, C. (2024a). From r to q*: Your language model is
+secretly a q-function. arXiv preprint arXiv:2404.12358 .
+Rafailov, R. ,Sharma, A. ,Mitchell, E. ,Manning, C. D. ,Ermon, S. andFinn, C. (2024b).
+Direct preference optimization: Your language model is secretly a reward model. Advances in
+Neural Information Processing Systems 36.
+Rosset, C. ,Cheng, C.-A. ,Mitra, A. ,Santacroce, M. ,Awadallah, A. andXie, T. (2024).
+Direct nash optimization: Teaching language models to self-improve with general preferences.
+arXiv preprint arXiv:2404.03715 .
+Sakaguchi, K. ,Bras, R. L. ,Bhagavatula, C. andChoi, Y. (2021). Winogrande: An
+adversarial winograd schema challenge at scale. Communications of the ACM 6499–106.
+Schulman, J. ,Wolski, F. ,Dhariwal, P. ,Radford, A. andKlimov, O. (2017). Proximal
+policy optimization algorithms. arXiv preprint arXiv:1707.06347 .
+Singh, A. ,Co-Reyes, J. D. ,Agarwal, R. ,Anand, A. ,Patil, P. ,Liu, P. J. ,Harrison,
+J.,Lee, J. ,Xu, K. ,Parisi, A. et al. (2023). Beyond human data: Scaling self-training for
+problem-solving with language models. arXiv preprint arXiv:2312.06585 .
+30
+
+--- PAGE 31 ---
+Sutton, R. S. ,McAllester, D. ,Singh, S. andMansour, Y. (1999). Policy gradient methods
+for reinforcement learning with function approximation. Advances in neural information processing
+systems 12.
+Swamy, G. ,Dann, C. ,Kidambi, R. ,Wu, Z. S. andAgarwal, A. (2024). A minimaximalist
+approach to reinforcement learning from human feedback. arXiv preprint arXiv:2401.04056 .
+Tversky, A. (1969). Intransitivity of preferences. Psychological review 7631.
+Wang, Y. ,Liu, Q. andJin, C. (2024). Is rlhf more difficult than standard rl? a theoretical
+perspective. Advances in Neural Information Processing Systems 36.
+Wu, Y. ,Jin, T. ,Di, Q. ,Lou, H. ,Farnoud, F. andGu, Q. (2023). Borda regret minimization for
+generalized linear dueling bandits. In ICML 2023 Workshop The Many Facets of Preference-Based
+Learning .
+Xiong, W. ,Dong, H. ,Ye, C. ,Zhong, H. ,Jiang, N. andZhang, T. (2023). Gibbs sampling from
+human feedback: A provable kl-constrained framework for rlhf. arXiv preprint arXiv:2312.11456 .
+Xu, J. ,Lee, A. ,Sukhbaatar, S. andWeston, J. (2023). Some things are more cringe than
+others: Preference optimization with the pairwise cringe loss. arXiv preprint arXiv:2312.16682 .
+Ye, C. ,Xiong, W. ,Zhang, Y. ,Jiang, N. andZhang, T. (2024). A theoretical analysis
+of nash learning from human feedback under general kl-regularized preference. arXiv preprint
+arXiv:2402.07314 .
+Yuan, W. ,Pang, R. Y. ,Cho, K. ,Sukhbaatar, S. ,Xu, J. andWeston, J. (2024). Self-
+rewarding language models. arXiv preprint arXiv:2401.10020 .
+Zellers, R. ,Holtzman, A. ,Bisk, Y. ,Farhadi, A. andChoi, Y. (2019). Hellaswag: Can a
+machine really finish your sentence? arXiv preprint arXiv:1905.07830 .
+Zhao, Y. ,Joshi, R. ,Liu, T. ,Khalman, M. ,Saleh, M. andLiu, P. J. (2023). Slic-hf: Sequence
+likelihood calibration with human feedback. arXiv preprint arXiv:2305.10425 .
+Zheng, L. ,Chiang, W.-L. ,Sheng, Y. ,Zhuang, S. ,Wu, Z. ,Zhuang, Y. ,Lin, Z. ,Li, Z. ,Li,
+D.,Xing, E. et al. (2023). Judging llm-as-a-judge with mt-bench and chatbot arena. Advances
+in Neural Information Processing Systems 36.
+Zheng, L. ,Chiang, W.-L. ,Sheng, Y. ,Zhuang, S. ,Wu, Z. ,Zhuang, Y. ,Lin, Z. ,Li, Z. ,Li,
+D.,Xing, E. et al. (2024). Judging llm-as-a-judge with mt-bench and chatbot arena. Advances
+in Neural Information Processing Systems 36.
+Zhu, B. ,Jiao, J. andJordan, M. I. (2023). Principled reinforcement learning with human
+feedback from pairwise or k-wise comparisons. arXiv preprint arXiv:2301.11270 .
+31
