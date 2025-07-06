@@ -1,0 +1,2862 @@
+# 2310.17157.pdf
+# Converted from PDF to TXT
+# Source path: /home/admin88/arxiv-downloader/context-compression/2310.17157.pdf
+# File size: 1516997 bytes
+
+===============================================
+PDF FILE CONTENT
+===============================================
+
+
+--- PAGE 1 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+Zichang Liu1Jue Wang2Tri Dao3Tianyi Zhou4Binhang Yuan5Zhao Song6Anshumali Shrivastava1
+Ce Zhang5Yuandong Tian7Christopher Ré3Beidi Chen8 7
+Abstract
+Large language models (LLMs) with hundreds of
+billions of parameters have sparked a new wave
+of exciting AI applications. However, they are
+computationally expensive at inference time. Spar-
+sity is a natural approach to reduce this cost, but
+existing methods either require costly retraining,
+have to forgo LLM’s in-context learning ability, or
+do not yield wall-clock time speedup on modern
+hardware. We hypothesize that contextual sparsity ,
+which are small, input-dependent sets of attention
+heads and MLP parameters that yield approxi-
+mately the same output as the dense model for a
+given input, can address these issues. We show that
+contextual sparsity exists, that it can be accurately
+predicted, and that we can exploit it to speed up
+LLM inference in wall-clock time without compro-
+mising LLM’s quality or in-context learning ability.
+Based on these insights, we propose DEJAVU , a
+system that uses a low-cost algorithm to predict
+contextual sparsity on the fly given inputs to each
+layer, along with an asynchronous and hardware-
+aware implementation that speeds up LLM
+inference. We validate that DEJAVU can reduce the
+inference latency of OPT-175B by over 2 ×com-
+pared to the state-of-the-art FasterTransformer,
+and over 6 ×compared to the widely used Hugging
+Face implementation, without compromising
+model quality. The code is available at https:
+//github.com/FMInference/DejaVu .
+1 Introduction
+Large language models (LLMs), such as GPT-3, PaLM,
+and OPT have demonstrated that an immense number of
+1Rice University2Zhe Jiang University3Stanford Uni-
+versity4University of California, San Diego5ETH Zurich
+6Adobe Research7Meta AI (FAIR)8Carnegie Mellon Univer-
+sity. Correspondence to: Zichang Liu <zl71@rice.edu>, Tri Dao
+<trid@stanford.edu>, Tianyi Zhou <t8zhou@ucsd.edu>, Zhao Song
+<zsong@adobe.com>, Beidi Chen <beidic@andrew.cmu.edu>.
+Proceedings of the 40thInternational Conference on Machine
+Learning , Honolulu, Hawaii, USA. PMLR 202, 2023. Copyright
+2023 by the author(s).parameters unleashes impressive performance and emergent
+in-context-learning abilities—they can perform a task by
+conditioning on input-output examples, without updating
+their parameters (Bommasani et al., 2021; Liang et al.,
+2022; Brown et al., 2020; Min et al., 2022; Chan et al.,
+2022). However, they are very expensive at inference time,
+especially for latency-sensitive applications (Pope et al.,
+2022). An ideal inference-time model should use less com-
+putation and memory while maintaining the performance
+and special abilities of pre-trained LLMs. The simplest and
+most natural approach is sparsification or pruning, which
+has a long history before the LLM era (LeCun et al., 1989).
+Unfortunately, speeding up inference-time sparse LLMs in
+wall-clock time while maintaining quality and in-context
+learning abilities remains a challenging problem.
+While sparsity and pruning have been well-studied, they
+have not seen wide adoption on LLMs due to the poor
+quality and efficiency trade-offs on modern hardware such
+as GPUs. First, it is infeasible to retrain or iteratively prune
+models at the scale of hundreds of billions of parameters.
+Thus, methods in iterative pruning and lottery ticket
+hypothesis (Lee et al., 2018; Frankle & Carbin, 2018) can
+only be applied to smaller-scale models. Second, it is
+challenging to find sparsity that preserves the in-context
+learning ability of LLMs. Many works have shown the
+effectiveness of task-dependent pruning (Michel et al., 2019;
+Bansal et al., 2022), but maintaining different models for
+each task conflicts with the task independence goal of LLMs.
+Lastly, it is hard to achieve wall-clock time speed-up with
+unstructured sparsity due to its well-known difficulty with
+modern hardware (Hooker, 2021). For example, recent
+development in zero-shot pruning like SparseGPT (Frantar
+& Alistarh, 2023) finds 60% unstructured sparsity but does
+not yet lead to any wall-clock time speedup.
+An ideal sparsity for LLMs should (i) not require model
+retraining, (ii) preserve quality and in-context learning
+ability, and (iii) lead to speed-up in wall-clock time on
+modern hardware. To achieve such demanding requirements,
+we go beyond static sparsity in previous works (e.g., struc-
+tured/unstructured weight pruning). We instead envision
+contextual sparsity , which are small, input-dependent
+sets of attention heads and MLP parameters that lead to
+(approximately) the same output as the full model for an
+input. Inspired by the connections between LLMs, Hidden
+1arXiv:2310.17157v1  [cs.LG]  26 Oct 2023
+
+--- PAGE 2 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+0 20 40 60 80
+Transformer Layer 0.00 0.20 0.40 0.60 0.80 1.00Contextual SparsityOPT-175B
+(a) Contextual Sparsity
+1 2 3 4 5 6 7 8
+Theoretical Reduction0.7940.7960.7980.8000.8020.8040.8060.8080.810Accuracy
+Static Sparsity
+Non-Contextual Sparsity
+Contextual Sparsity
+(b) Accuracy-Efficiency Trade-offs
+Figure 1. (1) LLMs have up to 85% contextual sparsity for a given
+input. (2) Contextual sparsity has much better efficiency-accuracy
+trade-offs (up to 7 ×) than non-contextual sparsity or static sparsity.
+Markov Models (Xie et al., 2022; Baum & Petrie, 1966), and
+the classic Viterbi algorithm (Viterbi, 1967), we hypothesize
+that for pre-trained LLMs,
+contextual sparsity exists given any input.
+The hypothesis, if true, would enable us to cut off specific
+attention heads and MLP parameters (structured sparsity)
+on the fly for inference-time, without modifying pre-trained
+models. However, there are three challenges.
+Existence : It is nontrivial to verify if such contextual sparsity
+exists, and naive verification can be prohibitively expensive.
+Prediction : Even if contextual sparsity exists, it is challeng-
+ing to predict the sparsity for a given input in advance.
+Efficiency : Even if the sparsity can be predicted, it might
+be difficult to achieve end-to-end wall-clock time speedup.
+Taking OPT-175B as an example, the latency of one MLP
+block is only 0.2 ms on an 8 ×A100 80GB machine. Without
+a fast prediction and optimized implementation, the overhead
+can easily increase the LLM latency rather than reduce it.
+In this work, we address these challenges as follows:
+Existence : Fortunately, we verify the existence of contextual
+sparsity with a surprisingly simple approach. To achieve
+essentially the same output, contextual sparsity is on average
+85% structured sparse and thereby potentially leads to a 7×
+parameter reduction for each specific input while maintain-
+ing accuracy (Figure 1(a)). During explorations of contextual
+sparsity, we make important empirical observations and build
+a theoretical understanding of major components in LLMs
+that help address the prediction and efficiency challenge.
+Deja Vu
+AttentionkMLPkPredictorPredictorPredictorAttentionk+1……Figure 2. DEJAVU uses lookahead predictors to side-step prediction
+costs: given the input to the attention layer at block k, they (asyn-
+chronously) predict the contextual sparsity for the MLP at block k,
+and given the input to the MLP at block k, they predict the sparsity
+for the attention head at the next layer.
+Prediction : We discover that contextual sparsity depends
+not only on individual input tokens (i.e., non-contextual
+dynamic sparsity) but also on their interactions ( contextual
+dynamic sparsity). Figure 1(b) shows that with pure dynamic
+information, sparsity prediction is inaccurate. Only with
+token embeddings with sufficient contextual information
+can we predict sparsity accurately. Another finding is that
+contextual dynamic sparsity for every layer can be predicted
+based on the “similarity” between layer parameters (head-
+s/MLP) and the output from the previous layer, which carries
+the immediate contextual mixture of token embeddings.
+Efficiency : Because at inference time, model parameters are
+static, inspired by the classical nearest neighbor search (NNS)
+literature and its applications in efficient deep learning, it is
+possible to formulate the above similarity-based prediction
+as an NNS problem (Indyk & Motwani, 1998b; Zhang et al.,
+2018; Chen et al., 2020a). However, as mentioned, the over-
+head might be difficult to overcome as we would need to
+perform on-the-fly predictions before every layer. Luckily,
+we exploit a phenomenon of LLM where token embeddings
+change slowly across layers due to residual connections (well-
+known in computer vision (He et al., 2016)). Since the inputs
+to a few consecutive layers are very similar, we can design
+an asynchronous lookahead predictor (Figure 2).
+Based on our findings, we present a system, DEJAVU , that
+exploits contextual sparsity and realizes efficient LLMs for
+latency-sensitive applications.
+•In Section 4.1 and Section 4.2, we present a low-cost
+learning-based algorithm to predict sparsity on the fly.
+Given the input to a specific layer, it predicts a relevant
+subset of attention (heads) or MLP parameters in the next
+layer and only loads them for the computation.
+•In Section 4.3, we propose an asynchronous predictor (simi-
+lar to classic branch predictor (Smith, 1998)) to avoid the se-
+quential overhead. A theoretical guarantee justifies that the
+2
+
+--- PAGE 3 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+cross-layer design suffices for accurate sparsity prediction.
+After integrating hardware-aware implementation of sparse
+matrix multiply (Section 4.4), DEJAVU (written mostly in
+Python) can reduce latency of open-source LLMs such
+as OPT-175B by over 2 ×end-to-end without quality
+degradation compared to the state-of-the-art library Faster-
+Transformer from Nvidia (written entirely in C++/CUDA),
+and over 2 ×compared to the widely used Hugging Face
+implementation at small batch sizes. Furthermore, we show
+several ablations on different components of DEJAVU and
+its compatibility with quantization techniques.
+2 Related Work and Problem Formulation
+We first briefly discuss the rich literature on efficient
+inference. Then, we introduce the latency breakdown in our
+setting. Last, we provide a formal problem formulation.
+2.1 Quantization, Pruning, Distillation for Inference
+Various relaxations have been studied for decades for
+model inference in machine learning. There are three main
+techniques: quantization (Han et al., 2015; Jacob et al.,
+2018; Nagel et al., 2019; Zhao et al., 2019), pruning or
+sparsity (Molchanov et al., 2016; Liu et al., 2018; Hoefler
+et al., 2021), and distillation (Hinton et al., 2015; Tang et al.,
+2019; Touvron et al., 2021). They are orthogonal areas and
+usually excel in different settings. Recently, there is active
+research attempting to apply one or a combination of such
+techniques in LLM inference (Yao et al., 2022; Park et al.,
+2022; Dettmers et al., 2022; Frantar et al., 2022; Frantar &
+Alistarh, 2023; Bansal et al., 2022; Xiao et al., 2022). More
+discussion is presented in Appendix A.
+2.2 LLM Inference Latency Breakdown
+The generative procedure of LLMs consists of two phases: (i)
+theprompt phase takes an input sequence to generate the keys
+and values (KV cache) for each transformer block of LLMs,
+which is similar to the forwarding pass of LLMs training;
+and (ii) the token generation phase utilizes and updates the
+KV cache to generate tokens step by step, where the current
+token generation depends on previously generated tokens.
+This paper studies the setting where the token generation
+phase easily dominates the end-to-end inference time. As
+shown in Table 1, generating a sequence of length 128 takes
+much longer time than processing a sequence of length 128
+as prompt due to I/O latency of loading model parameters.
+In addition, Table 2 shows that attention and MLP are both
+bottlenecks in LLMs, e.g., in 175B models, loading MLP
+parameters takes around2
+3of the total I/O and attention
+heads take the other1
+3. Further, in the tensor-parallel regime,
+there are two communications between GPUs, one after
+the attention block, and the other one after the MLP block.
+As shown in Table 3, communication between GPUs takes
+around 15 % token generation latency. This paper focuses on
+making attention and MLP more efficient. Communicationcost implies that the upper bound of such speed-up is around
+6×when skipping all transformer blocks.
+Table 1. Theoretical breakdown for prompting versus token genera-
+tion (tensor model parallelism on 8 A100-80G GPUs).
+TFLOPs I/O Compute Latency (ms) I/O Latency (ms)
+Prompting 128 44.6 330 GB 17.87 20.6
+Token Generation 128 44.6 41 TB 17.87 2600
+Table 2. Theoretical breakdown for Attention block versus MLP
+block in one transformer layer when generating one token (tensor
+model parallelism on 8 A100-80G GPUs).
+GFLOPs I/O (GB) Compute Latency (ms) I/O Latency (ms)
+Attention Block 1.21 1.12 0.00048 0.07
+MLP Block 2.41 2.25 0.00096 0.14
+Table 3. Latency breakdown of generating 1 token under the setting
+of batch size 1 and prompt length 128 on 8 A100-80GB.
+All Reduce MLP Block Attention Block (ms) Others
+6 ms 19ms 13ms 2ms
+2.3 Problem Formulation
+The goal is to reduce the generation latency of LLMs by
+exploiting contextual sparsity. In the following, we formally
+define the sparsified attention and MLP blocks.
+Sparsified MLP: There are two linear layers in one MLP
+block, W1,W2∈Rd×4d. Denote y∈R1×das the input to the
+MLP block in the current generation step. Let each column
+(the weight of i-th neuron) of linear layers be W1
+i,W2
+i∈
+Rd×1. With contextual sparsity, only a small set of them are
+required for computation. Let SM⊆[4d]denote such set of
+neurons for input y. The sparsified MLP computation is
+MLP SM(y)=σ(yW1
+SM)(W2
+SM)⊤, (1)
+where σis the activation function, e.g., ReLU, GeLU. Note
+that since the computation in the first linear results in sparse
+activations, the second linear layer is also sparsified.
+Sparsified Attention: LetX∈Rn×ddenote the embeddings
+of all tokens (e.g., prompts and previously generated tokens).
+Lety∈R1×dbe the input to the Multi-Head-Attention
+(MHA) in the current generation step. Suppose there are h
+heads. For each i∈[h], we use WK
+i,WQ
+i,WV
+i∈Rd×dhto
+denote key, query, value projections for the i-th head, and
+WO
+i∈Rdh×dfor output projections. With contextual spar-
+sity, we denote SAas a small set of attention heads leading to
+approximately the same output as the full attention for input
+y. Following the notation system in (Alman & Song, 2023),
+sparsified MHA computation can be formally written as
+MHA SA(y)=X
+i∈SAHi(y)|{z}
+1×dhWO
+i|{z}
+dh×d,
+where Hi(y):Rd→RdhandDi(y)∈Rcan be written as
+Hi(y):=Di(y)−1exp(yWQ
+i(WK
+i)⊤X⊤)XWV
+i,(2)
+Di(y):=exp( yWQ
+i(WK
+i)⊤X⊤)1n.
+For both MLP and Attention, given a compute budget, the
+goal is to find SMandSAthat minimize the error between
+the sparse approximation and full computation.
+3
+
+--- PAGE 4 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+0 20 40 60 80
+Transformer Layer20%40%60%80%100%% Not Activated HeadOPT-30B
+OPT-66B
+OPT-175B
+(a) Contextual sparsity in Attention Head
+0 20 40 60 80
+Transformer Layer90%92%94%96%98%100%% Not Activated NeuronsOPT-30B
+OPT-66B
+OPT-175B
+(b) Contextual sparsity in MLP Block
+Figure 3. In Figure (a), we plot the percentage of not-activated
+attention heads. By only keeping heads that yield large output
+norms, we can silence over 80% attention heads for a given token.
+In Figure (b), we plot the average sparsity we impose on MLP layers.
+We can zero out over 95% of MLP parameters for a given token.
+3Pre-trained LLMs are Contextually Sparse
+In this section, we present several key observations and the-
+oretical understandings of sparsity in LLMs, upon which the
+DEJAVU design is based. We first test the contextual sparsity
+hypothesis and verify that contextual sparsity exists in pre-
+trained LLMs in Section 3.1. Then, we build an understand-
+ing of why contextual sparsity happens naturally even when
+LLMs are densely trained in Section 3.2. Finally, we present
+an observation on residual connections and explain their
+relationship to contextual sparsity analytically in Section 3.3.
+3.1 Contextual Sparsity Hypothesis
+Inspired by prior pruning literature (Molchanov et al., 2016),
+we find a surprisingly simple method is sufficient to study and
+verify our hypothesis. In this section, we describe the testing
+procedure, observation details, and insights of this study.
+Verification: Our test is performed on OPT-175B, 66B, and
+30B models and various downstream datasets such as Open-
+BookQA (Mihaylov et al., 2018) and Wiki-Text (Merity et al.,
+2016). We find the contextual sparsity for every input exam-
+ple with two forward passes of the model. In the first pass, we
+record a subset of parameters, specifically which attention
+heads and MLP neurons yield large output norms for the input.
+In the second pass, each input example only uses the recorded
+subset of parameters for the computation. Surprisingly, these
+two forward passes lead to similar prediction or performance
+on all in-context learning and language modeling tasks.Observation: Figure 3 shows that on average, we can impose
+up to 80% sparsity on attention heads and 95% sparsity on
+MLP neurons. As mentioned in Section 2, OPT-175B model
+has2×MLP parameters than those of attention blocks.
+Therefore total sparsity here is around 85%. Since these are
+all structured sparsity (heads and neurons), predicting them
+accurately could potentially lead to 7×speedup.
+Insight: It is intuitive that we can find contextual sparsity in
+MLP blocks at inference time because of their activation func-
+tions, e.g., ReLU or GeLU (Kurtz et al., 2020). Similar obser-
+vations were made by (Li et al., 2022). However, it is surpris-
+ing that we can find contextual sparsity in attention layers.
+Note that, finding contextual sparsity in attention is not the
+same as head pruning. We cross-check that different exam-
+ples have different contextual sparsity. Although 80% of the
+parameters are not included in the paths for a given example,
+they might be used by other examples. Next, we will try to
+understand why contextual sparsity exists in attention blocks.
+3.2 Token Clustering in Attention Layers
+In the previous section, we have verified that there exists
+contextual sparsity for a given input in LLMs. In this
+section, we try to understand the reason for such phenomena,
+especially in attention layers. We first show an in-depth
+observation of attention. Then we present a hypothesis that
+self-attentions are conceptually clustering algorithms. Last
+we show analytical evidence to support this hypothesis.
+Observation: Figure 4 shows the attention map of three
+different heads from the same layer for an example input.
+The next token it should predict is “Truck”. Darker color
+represents higher attention scores. We observe that the
+middle head is a relatively uniform token-mixing head
+while the top and bottom ones are “heavy hitter” attention
+heads (with high attention to “like” and “shipping”).
+Unsurprisingly, only selecting heavy hitter heads but not
+uniform heads does not affect the prediction, since uniform
+heads do not model or encode important token interactions.
+In the next section, we will also explain in detail how the
+criteria for selecting uniform attention heads and heads with
+small output norms are highly correlated.
+Hypothesis: We hypothesize that the attention head is
+performing mean-shift clustering (Derpanis, 2005).
+Recall the notation defined in Section 2.3. For i-th head
+at current layer, X= [x1,...,x n]⊤∈Rn×dare the token
+embeddings in the previous time steps. XWK
+iandXWV
+i
+are the projection of embedding. For an input embedding
+y, the output ˜yi=Hi(y), where Hi(y)is defined in Eq. 2.
+For each i∈[h], if we let Ki(xj,y):=exp( yWQ
+i(WK
+i)⊤xj)
+measure the similarity between xjandy, and define
+mi(y):=P
+jKi(xj,y)xjP
+jKi(xj,y), then we have ˜yi=mi(y)WV
+i. Fur-
+ther, if we set WV
+i=Iand consider the residue connection
+followed by layer norm, then in the next layer, the embedding
+4
+
+--- PAGE 5 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+Layer LThis fruit shipping company provide different vehicle options like car and [MASK]Truck
+Figure 4. We visualize the attention scores of three different heads
+for an exemplary sentence. Head 42 and Head 44 give heavy atten-
+tion scores on particular tokens while Head 43 is more uniform.
+ˆyiof the current token becomes ˆyi= Normalize( y+ ˜yi) =
+Normalize( y+mi(y)), which has a fixed point y=γmi(y)
+for any scalar γ. This iteration bears a resemblance to mean-
+shift clustering, which simply performs iteration y←mi(y)
+until convergence. This has an obvious fixed point y=mi(y).
+Therefore, the self-attention head can be regarded as one
+mean-shift step to push input embeddings of different tokens
+together, if they are already neighbors in a projection space
+specified by WQ
+i(WK
+i)⊤. Different heads learn different
+projection spaces to perform clustering. These dynamics
+explain the precise reason why token embeddings tend to
+cluster after going through more layers, resulting in high
+attention scores among cluster members, and low scores for
+non-members. Furthermore, the cluster patterns are different
+at different heads (More details in Appendix K).
+The above analysis not only provides an understanding of
+why contextual sparsity exists naturally in pre-trained LLMs,
+but also inspires our design of “similarity”-based sparsity
+prediction for DEJAVU in Section 4.
+3.3 Slowly Changing Embeddings across Layers
+We first present our observation that embeddings change
+slowly across consecutive layers. Then we provide a detailed
+analysis on the phenomenon. Finally, we show its close
+connection with contextual sparsity. Details are in Section B.
+High similar embeddings in consecutive layers: In
+Figure 5(a), we show that for the same given input, the cosine
+similarity between embeddings or activations in two consec-
+utive layers is exceptionally high on 7 different sizes of OPT
+models. Specifically, we collect activations from each layer
+while performing OPT model inference on C4 validation
+set (Raffel et al., 2019). Taking OPT-175B as an example,
+starting from the second layer, the similarity between any
+two consecutive layers is around 0.99, which indicates that
+when an input is passed through the model, the direction of
+its embedding changes slowly. Interestingly, the most drastic
+change happens in the first layer. Furthermore, we increase
+the gap and investigate the similarity between the embedding
+at layer land at layer l+nshown in Figure 5(b). As we
+increase the gap, the similarity decreases as expected while
+the differences in cosine similarity between various choices
+125m1.3b 6.7b 13b 30b 66b175b0.950.960.970.980.991.00Cosine Similarity
+(a) Model Comparison
+0 20 40 60 80
+Transformer Layer0.00.20.40.60.81.0Cosine Similarityn = 1
+n = 2
+n = 4
+n = 8 (b) Across Layer
+0 20 40 60 80
+Transformer Layer0500100015002000Norm||X||
+||F(X)||
+(c) Residual Around Attention
+0 20 40 60 80
+Transformer Layer05001000150020002500Norm||X||
+||F(X)|| (d) Residual Around MLP
+Figure 5. Slowly Changing Embedding. Figure (a) shows the
+median cosine similarity between representations at two consecutive
+layers across all layers for different OPT models. All models show
+a similarity greater than 95%. Figure (b) shows cosine similarity
+stays high even a few layers apart. For the residual connection
+X′=X+F(X)inside each block, we plot the ℓ2norm of Xand
+F(X)in Figure (c) and Figure (d). ∥X∥is significantly higher than
+∥F(X)∥, which explains the slowly changing embedding.
+ofnare smaller at the shallower layer. We plot the mean sim-
+ilarity, and the standard deviation is indicated by the shading.
+Similar plots on more models are presented in Appendix B.
+Connection to residuals: We verify that the high similarity
+in embeddings in LLM inference is due to the residual
+connection. We first dissect the computation graph inside
+each transformer layer to understand the cause behind
+this phenomenon. There are two residual connections
+inside a transformer layer, one around the attention block,
+and the other one around the MLP block. The residual
+connection can be written as X+F(X), where Fis either
+the Multi-Head Attention or two MLP Layers. In Figure 5(c)
+and Figure 5(d), indeed we can see that ∥X∥is significantly
+greater than ∥F(X)∥, confirming that embeddings are
+changing slowly because the residual norm is large.
+Connection to Contextual Sparsity: We take a step deeper
+trying to understand the reason behind the large residual
+norm with mathematical modeling. We discover that one pos-
+sible reason for small ∥F(X)∥is due to high sparsity. For the
+MLP Block, high sparsity may contribute to the small norm
+ofF(X)because a large portion of outputs have small norms.
+Similar reasoning applies to the Attention Block, and thus
+a large number of attention heads yield small norm outputs.
+Residual Two Sides Bound: Besides empirical reasoning,
+5
+
+--- PAGE 6 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+we formally define the computation of LLMs mathematically.
+Under our computation model, we can show that a shrinking
+property which is observed by our practical experiments.
+Proofs are in Appendix G, H, I.
+Lemma 3.1 (Informal) .Let0<ϵ1<ϵ2<1be the lower and
+upper bound of the shrinking factor. Let xbe the ybe the
+output. We have the residual connection y=x+F(x). For
+the MLP block F(x), we have ϵ1≤ ∥y−x∥2≤ϵ2. For the
+attention block F(x), we have ϵ1≤∥y−x∥2≤ϵ2.
+4 DEJAVU
+In this section, we present our framework for inference-time
+contextual sparsity search for LLMs. We introduce the
+sparsity predictor for MLPs in Section 4.1 and for attention
+heads in Section 4.2. DEJAVU ’s workflow is shown in
+Figure 2. Section 4.3 discusses exploiting our observation
+on LLMs to avoid the sparse prediction overhead with
+theoretical guarantees. In Section 4.4, we present our
+optimized implementation that enables end-to-end latency
+reduction. More details are presented in Section D.
+4.1 Contextual Sparsity Prediction in MLP Blocks
+As explained in Section 2, MLP blocks are one of the major
+bottlenecks for the LLM generation (2
+3of the FLOPs and
+IOs). In this section, we discuss how we achieve wall-clock
+time speed-up with contextual sparsity in the MLP blocks.
+Challenge Figure 3(b) shows that for a given token, the
+contextual sparsity of 95% is possible. The contextual
+sparsity in the MLP block can be identified after computing
+the activation. However, this only demonstrates the existence
+of contextual sparsity but brings no benefits in terms of
+efficiency. A fast and precise prediction is needed to exploit
+contextual sparsity for end-to-end efficiency. The naive way
+is to select a subset of neurons randomly. Unsurprisingly,
+random selection fails to identify the accurate contextual
+sparsity, resulting in drastic model degradation.
+A Near-Neighbor Search Problem: Recall that we verify
+the existence of contextual sparsity by recording which
+neurons yield significant norms. Essentially, given the input,
+the goal is to search for the neurons that have high inner prod-
+ucts with the input, because the activation function “filters"
+low activation. Thus, we formulate the contextual sparsity
+prediction of an MLP layer as the classical near-neighbor
+search problem under the inner product metric.
+Definition 4.1 (Approximate MaxIP in MLP) .Letc∈(0,1)
+andτ∈(0,1)denote two parameters. Given an n-vector
+dataset W1⊂Sd−1on a unit sphere, the objective of the
+(c,τ)-MaxIP is to construct a data structure that, given a
+query y∈Sd−1such that max w∈W1⟨y,w⟩≥τ, it retrieves a
+vector zfromW1that satisfies ⟨y,z⟩≥c·max w∈W1⟨y,w⟩.
+Remark 4.2.OurW1(first linear layer) and y(input
+embedding) in MLP blocks can be viewed as the dataset and
+query in Definition 4.1 respectively.Design The standard state-of-the-art near-neighbor search
+methods and implementations slow down the computa-
+tion. Take OPT-175B where dis 12288 as an example.
+HNSW (Malkov & Yashunin, 2018) requires more than 10ms,
+and FAISS (Johnson et al., 2019) requires more than 4ms,
+while the MLP computation is only 0.2ms. The high dimen-
+sionality and complications of data structure implementation
+on GPU make the search time longer than the MLP computa-
+tion. Therefore, we choose a neural network classifier as our
+near-neighbor search method to exploit the fast matrix multi-
+plication on GPU. For each MLP block, we train a small two-
+layer fully connected network to predict contextual sparsity.
+Collecting training data is straightforward because we know
+the contextual sparsity using dense computation. The training
+algorithm is summarized in Algorithm 1. The sparsified com-
+putation in W1has two steps: (1) Given y, the sparsity predic-
+torSPMpredicts a set SMof important neurons in weights
+W1. (2) Compute the sparsified MLP defined in Eq. equa-
+tion 1. Note here the sparsity in MLP is highly structured.
+Algorithm 1 Sparse Predictor Training
+Input : A pre-trained LLM block with parameter set M,
+token embedding set at block M={xi}i∈[N], threshold t
+Sparse Predictor SP
+P+←∅,P−←∅
+fori=1→Ndo
+P+←P +∪{(xi,mr)|mr∈M,m r(xi)≥t}
+P−←P−∪{(xi,mr)|mr∈M,m r(xi)<t}
+end for
+SP ← TRAIN(P+,P−,L) ▷Lis a loss function
+4.2 Contextual Sparsity Prediction in Attention Blocks
+Attention blocks take around 30% I/Os in the generation. In
+this section, we describe how DEJAVU exploits contextual
+sparsity to speed up the Attention blocks.
+Challenge: As discussed in Section 3.1, only a few heads per-
+form important computations for a given input token. Similar
+to the MLP blocks, a fast selection of attention heads without
+full computation is required to reduce end-to-end latency.
+Furthermore, one particular challenge of sparse prediction in
+attention blocks is attention’s dependence on previous tokens.
+On the one hand, it is unclear whether the past token’s key and
+value caches are needed for sparse prediction. On the other
+hand, it is unclear how to handle the missing KV cache of past
+tokens for the current token computation at the selected head.
+A Near-Neighbor Search Problem: Head prediction
+can also be formulated as a near-neighbor search problem
+based on our understanding in Section 3.2. Since each
+head is performing mean-shift clustering, after the first
+few layers, the current token embedding alone is sufficient
+for the prediction thanks to the token-mixing nature of the
+transformer. Therefore, the prediction can be based on the
+similarity between yand head parameters.
+6
+
+--- PAGE 7 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+Approach: We design our attention sparse predictor to be
+the same architecture as the MLP sparse predictor. Each head
+is regarded as one class and a similar training process is used
+(Algorithm 1). Then, similar to how MLP prediction is per-
+formed, the attention sparsity predictor SPAselects a set SA
+of heads Hi(see Eq. equation 2). To address the problem of
+missing KV cache for a past token, we exploit the fact that the
+generation latency is I/O bounded while computation is essen-
+tially “free". Specifically, for the predicted attention head of
+input y, we compute the corresponding keys, and values and
+store them in the KV cache. But we also save a copy of yfor
+all the other non-selected heads. Then during the future token
+generation, if there is missing KV cache in the selected heads,
+we could load stored token embeddings and compute the
+keys and values together. This requires almost minimal extra
+memory access (the main cost is loading the weight matrices).
+4.3 Reducing Overhead with Asynchronous Execution
+Sparse prediction overhead may easily increase the end-to-
+end latency rather than reduce it despite the reduction in
+FLOPs. Therefore, we introduce a look-ahead sparse pre-
+diction method, inspired by our observations in Section 3.3.
+Challenge: Denote yl∈Rdas the input to transformer
+layer l. We can write the computation at layer laseyl←
+MHAl(yl),byl←MLPl(eyl). With predictors SPl
+AandSPl
+M,
+the computation at the transformer layer lcan be re-written as
+Sl
+A←SPl
+A(yl),eyl←MHAl
+Sl
+A(yl),
+Sl
+M←SPl
+M(eyl),byl←MLPl
+Sl
+M(eyl)
+where set Sl
+Ais the contextual sparsity for the Attention
+block, and set Sl
+Mis the contextual sparsity for the MLP
+block at l-th layer. Note that the computation at Attention
+and MLP blocks have to wait for the sparse predictor
+decision. This overhead potentially outweighs the saving
+from Attention and MLP blocks in terms of latency.
+Approach: In Section 3.3, we present the slowly evolving
+embedding phenomenon, which provides opportunities to
+relax the sequential computation to parallel computation.
+Along with the observation of low computation intensity
+during generation, we parallel the sparse prediction with the
+computation of each block ( See Figure 2). The computation
+can be written as follows:
+eyl←MHAl
+Sl
+A(yl),byl←MLPl
+Sl
+M(eyl),
+Sl+1
+A←SPl
+A(yl), Sl+1
+M←SPl
+M(yl),
+We remark Sl+1
+AandSl+1
+Mcan be computed in parallel with
+eylorbyl, while the previous 4 steps are sequential.
+Theoretical guarantee: The sparse predictor can make fur-
+ther cross-layer decisions because of the residual connection.
+We present an informal lemma statement regarding cross-
+layer prediction. It is well-known that MaxIP is equivalent to
+ℓ2nearest neighbor search. For convenience, we use MaxIP
+here. We include more discussions and proofs in Section J.
+Lemma 4.3 (Informal) .Letϵ∈(0,1). Let ylbe input atl-th layer. Let yl−1be the input at (l−1)-th layer. Suppose
+that∥yl−yl−1∥2≤ϵ. For any parameters c,τsuch that
+ϵ < O (cτ). Then we can show that, solving MaxIP (c,τ)is
+sufficient to solve MaxIP (0.99c,τ).
+4.4 Hardware-efficient Implementation
+We describe how DEJAVU is implemented in a hardware-
+efficient manner to realize the theoretical speedup of contex-
+tual sparsity. Taking into account hardware characteristics
+leads to over 2 ×speedup compared to an optimized dense
+model, and 4 ×faster than a standard sparse implementation.
+We highlight some hardware characteristics of GPUs:
+•Small-batch generation is bottlenecked by GPU memory
+I/Os (NVIDIA, 2022; Ivanov et al., 2021; Dao et al., 2022).
+This is because of low arithmetic intensity. For each
+element loaded from GPU memory, only a small number
+of floating point operations are performed.
+•GPUs are block-oriented devices: loading a single byte of
+memory takes the same time as loading a block of memory
+around that same address (Harris, 2013). The block size
+is usually 128 bytes for NVIDIA GPUs (Cook, 2012).
+These characteristics present some challenges in implement-
+ing contextual sparsity. However, they can be addressed with
+classical techniques in GPU programming.
+Kernel fusion: A standard implementation of sparse
+matrix-vector multiply (e.g., in PyTorch) that separately
+indexes a subset of the matrix W1
+SMbefore multiplying
+with input ywould incur 3 ×the amount of memory I/Os.
+Therefore, to avoid such overhead, we fuse the indexing
+and the multiplication step. Specifically, we load a subset
+ofW1
+SMto memory, along with y, perform the multiply,
+then write down the result. This fused implementation (in
+Triton (Tillet et al., 2019)) yields up to 4 ×speedup compared
+to a standard PyTorch implementation (Appendix E).
+Memory coalescing: In the dense implementation, the
+weight matrices of two linear layers in MLP are stored
+as(W1)⊤andW2so that no extra transpose operation is
+needed. They are conventionally stored in row-major format.
+In the sparse implementation, it allows us to load (W1
+SM)⊤
+optimally (the second dimension is contiguous in memory).
+However, for cases where we need to load (W2
+SM), this
+format significantly slows down memory loading, as indices
+inSMpoint to non-contiguous memory. We simply store
+these matrices in column-major format (i.e., store (W2)⊤
+in row-major format), then use the same fused kernel above.
+Similarly, in attention blocks, we store attention output
+projection WOcolumn-major format.
+These two techniques (kernel fusion and memory-
+coalescing) make DEJAVU hardware-efficient, yielding up
+to 2×speedup end-to-end compared to the state-of-the-art
+FasterTransformer (Section 5.1).
+7
+
+--- PAGE 8 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+0 20 40 60 80 100
+Sparsity percentage (%)891011 PerplexityWikiText
+c4
+(a) Language Modeling
+020 40 60 80100
+Sparsity percentage (%)0.40.50.60.70.80.9Accuracy
+020 40 60 80100
+Sparsity percentage (%)0.40.50.60.70.80.9
+CB
+COPA
+Lambada
+OpenbookQA
+PIQA
+RTE
+Winogrande (b) Zero-Shot(Left). Five-Shot(Right)
+Figure 6. Accuracy Trend for DEJAVU -OPT-175B . This figure shows the accuracy of DEJAVU -OPT-175B on language modeling datasets
+and downstream tasks when we set different sparsity at test time. In general, DEJAVU -OPT-175B incurs no accuracy drop until 75% sparsity.
+128 256 512 1024
+Sequence Length020406080100Latency(ms)HuggingFace
+FasterTransformer
+DejaVu
+Figure 7. Average per-token latency (ms) with batch size 1 on 8
+A100-80GB with NVLink when generating sequences with prompt
+lengths 128, 256, 512, and 1024, using FP16. DEJAVU speeds up
+generation by 1.8-2 ×compared to the state-of-the-art FT and by
+4.8-6×compared to the widely used HF implementation.
+5 Empirical Evaluation
+In Section 5.1, we present the end-to-end results that show
+DEJAVU achieves over 2 ×reduction in token generation
+latency compared to the state-of-the-art FasterTransformer
+and over 6 ×compared to Hugging Face with no accuracy
+loss. In Section 5.2, we perform a list of ablation studies such
+as independent evaluation on the inference-time contextual
+sparsity of the MLP block and the Attention block (Details
+are presented in Section C). At last, we present the additional
+results to demonstrate the future possibility of sparsifying
+the entire LLMs via layer skipping in Section C.3.
+5.1 End-to-End Result
+Experiment Setting: We compare the accuracy of DE-
+JAVU -OPT against the original OPT model on two lan-
+guage modeling datasets Wiki-Text (Merity et al., 2016)
+and C4 (Raffel et al., 2019) and seven few-shot downstream
+tasks: CB (de Marneffe et al., 2019), COPA (Gordon et al.,
+2012), Lambada (Radford et al., 2019), OpenBookQA (Mi-
+haylov et al., 2018), PIQA (Bisk et al., 2020), RTE (Giampic-
+colo et al., 2007), Winogrande (ai2, 2019). We use lm-eval-
+harness (Gao et al., 2021) for zero-shot and five-shot tasks.
+We collect training data for the sparsity predictor using 500
+random data points from the C4 training dataset. Our exper-
+iments are conducted on NVIDIA A100 80GB GPU servers.
+No accuracy drop until 75% sparsity: In Figure 6, we
+present DEJAVU -OPT-175B’s accuracy trend. In a zero-shotsetting, the average accuracy across tasks does not drop
+until 75% sparsity. A similar trend can be observed for
+the five-shot setting, which verifies the model’s ability for
+in-context learning. This result is exceptionally encouraging
+given our observation in Figure 1(a), where we could impose
+85% sparsity when allowed full computation.
+Over 2 ×latency reduction: Figure 7 presents the latency
+speed-up for the token generation with OPT-175B at batch
+size 1, where DEJAVU achieves the best performance. At
+around 75% sparsity, DEJAVU speeds up generation by
+1.8-2×compared to the state-of-the-art FasterTransformers
+(FT)1and by 4.8-6 ×to Hugging Face (HF) implementation2.
+5.2 Ablation Results
+Contextual Sparsity for Larger Batches: Although this
+paper focuses on latency-sensitive settings, we demonstrate
+that DEJAVU generalizes to larger batches. we present the
+Union contextual sparsity (fraction of neurons/heads that are
+not used by any of the inputs in the batch) of different batches
+sizes for MLP and Attention blocks, respectively, in Fig-
+ure 8 and 11. The union operation is essential to realize a fast
+sparse GEMM. Surprisingly the number of MLP neurons and
+Attention heads that DEJAVU activated does not grow linearly
+with the batch size. This suggests a power law distribution
+rather than a uniform distribution of parameter access from
+all input examples. This provides an opportunity for poten-
+tially extending Dejavu to the high-throughout setting. For
+example, we can first pre-process the inputs and batch similar
+inputs to enjoy a higher level of union contextual sparsity.
+Contextual sparsity on MLP blocks: We study the contex-
+tual sparsification of the MLP block in OPT-175B. We leave
+the Attention block as dense computation. Table 4 shows
+the model performance at 85% sparsity. The MLP sparse
+predictor introduces no accuracy loss on both zero-shot tasks
+and language modeling. In the training of the MLP sparse
+predictor, we observe that the sparse predictor achieves high
+validation accuracy. The shallow layer seems easier to model
+1http://github.com/NVIDIA/FasterTransformer
+2http://github.com/huggingface/transformers
+8
+
+--- PAGE 9 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+Table 4. Accuracy of zero-shot tasks and language modeling when sparsifying the MLP block and the Attention block separately. The
+sparsity is set at 85% for MLP-block and 50% for Attention-block. DEJAVU incurs no accuracy drop across the boards.
+Model CB COPA Lambada OpenBookQA PIQA RTE Winogrande Wikitext C4
+OPT-175B 0.3523 0.86 0.7584 0.446 0.8096 0.6029 0.7261 10.8221 7.7224
+DEJAVU -MLP-OPT-175B 0.3544 0.85 0.7619 0.446 0.8096 0.6065 0.7206 10.7988 7.7393
+DEJAVU -Attention-OPT-175B 0.3544 0.86 0.7586 0.4460 0.8063 0.5921 0.7245 10.8696 7.7393
+Table 5. DEJAVU -OPT66B on zero-shot downstream task.
+Model CB COPA Lambada OpenBookQA PIQA RTE Winogrande
+OPT-66B 0.3928 0.87 0.7508 0.426 0.7921 0.6028 0.6890
+DEJAVU -OPT-66B 0.4285 0.87 0.7458 0.434 0.7933 0.5884 0.6898
+Table 6. DEJAVU -BLOOM on zero-shot downstream task.
+CB COPA OpenBookQA PIQA RTE Winogrande Lambada
+BLOOM 0.455 0.8 0448 0.79 0.617 0.704 0.677
+Dejavu-BLOOM 0.448 0.8 0.44 0.787 0.606 0.710 0.675
+0 20 40 60 80 96
+Transformer Layer0.50.60.70.80.91.0Union Contextual Sparsity
+Batch size
+2
+4
+8
+16
+32
+Figure 8. Union contextual sparsity with larger batch size.
+because the predictor has validation accuracy over 99% in the
+shallow layers and drops to around 93% in the ending layers.
+Contextual sparsity on attention blocks: In this section,
+we study the sparse predictor for the Attention block on OPT-
+175B and leave the MLP block as dense computation. Table 4
+displays the test accuracy on zero-shot tasks and perplexity on
+the language modeling datasets. In summary, the Attention
+sparse predictor introduces no accuracy loss at around 50%
+sparsity. During the training of the Attention sparse predictor,
+we observe different trends compared to the MLP sparse
+predictor. The validation accuracy is around 93% in the
+middle layers and near 99% in the shallow and deep layers.
+Contextual Sparsity on Smaller Models: Our main exper-
+iments focus on OPT-175B. Here, we verify DEJAVU ’s effec-
+tiveness on a smaller model, specifically OPT-66B. In Table 5,
+we summarize the accuracy on zero-shot task at 50% sparsity.
+Similar to DEJAVU -OPT-175B, we notice no accuracy loss.
+Contextual Sparsity on Other Models: We expand
+the evaluation to another model family. In Table 6, we
+summarize the accuracy at attention sparsity 50% and MLP
+sparsity 30%. Similar to OPT family, we notice no accuracy
+loss. The lower sparsity level in MLP is due to the difference
+in activation function.
+Non-Contextual Sparsity: As we mentioned in Section 1,
+one could predict sparsity without contextual information.
+For non-contextual sparsity, we rely on the originalTable 7. DEJAVU -OPT-175B with 4-bit quantization.
+CB COPA OpenBookQA PIQA RTE Winogrande Lambada
+OPT-175B 0.352 0.86 0.446 0.809 0.602 0.726 0.758
+Dejavu-OPT-175B 0.402 0.85 0.450 0.802 0.592 0.726 0.753
+OPT-175B + W4A16 0.356 0.85 0.44 0.806 0.574 0.714 0.757
+Dejavu-OPT-175B + W4A16 0.365 0.86 0.452 0.805 0.592 0.726 0.754
+embedding at the input layer. At every block, we first pass
+the original embedding to record a subset of parameters
+yielding a large norm. In the second pass, the embedding
+at every layer only uses the recorded subset. As shown in
+Figure 1, non-contextual prediction is not sufficient and
+leads to accuracy losses even at 50% sparsity. This result
+verifies our design choices of relying on the activation at
+every layer as input to make contextual sparsity predictions.
+Compatibility with Quantization: Quantization is another
+promising direction for efficient language models. We inves-
+tigate the possibility of combining contextual sparsity with
+quantization techniques. For DEJAVU -OPT-175B, we set
+the entire model sparsity at 75%. For quantization, we apply
+4-bit quantization on model weights (W4A16). As shown
+in Table 7, the combination of quantization and DEJAVU
+almost always achieves better accuracy than DEJAVU or
+quantization alone. This suggests that the approximation
+errors from these two directions do not get compounded.
+6 Conclusion
+Our main goal is to make LLM inference efficient so that
+their powerful in-context learning abilities can be used
+in more application domains. We observe that contextual
+sparsity can be accurately predicted with lightweight
+learning-based algorithms. This motivated us to design
+DEJAVU that uses asynchronous lookahead predictors and
+hardware-efficient sparsity to speed up LLM inference in
+wall-clock time. Our encouraging empirical results validate
+that contextual sparsity can reduce inference latency by
+over 2×compared to the state-of-the-art FasterTransformer
+without model quality drops. Our method is a step towards
+making LLMs more accessible to the general community,
+which could unlock exciting new AI applications.
+Acknowledgements
+We would like to thank Ryan Spring, Laurel Orr, Guangxuan
+Xiao, Eric Han, Xun Huang, Daniel Y . Fu, Benjamin Spector,
+Ruan Silva, Diana Liskovich, and the anonymous reviewers
+for helpful discussions and feedback. We acknowledge the
+generous support by Together Computer, which enabled the
+necessary partial computations in this work.
+9
+
+--- PAGE 10 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+References
+Winogrande: An adversarial winograd schema challenge
+at scale. 2019.
+Allen-Zhu, Z. and Li, Y . What can resnet learn efficiently,
+going beyond kernels? Advances in Neural Information
+Processing Systems , 32, 2019.
+Alman, J. and Song, Z. Fast attention requires bounded
+entries. arXiv preprint arXiv:2302.13214 , 2023.
+Alman, J., Liang, J., Song, Z., Zhang, R., and Zhuo, D. By-
+pass exponential time preprocessing: Fast neural network
+training via weight-data correlation preprocessing. arXiv
+preprint arXiv:2211.14227 , 2022.
+Alon, N., Matias, Y ., and Szegedy, M. The space complexity
+of approximating the frequency moments. In Proceedings
+of the twenty-eighth annual ACM symposium on Theory
+of computing , pp. 20–29, 1996.
+Aminabadi, R. Y ., Rajbhandari, S., Awan, A. A., Li, C.,
+Li, D., Zheng, E., Ruwase, O., Smith, S., Zhang, M.,
+Rasley, J., et al. Deepspeed-inference: Enabling efficient
+inference of transformer models at unprecedented scale.
+In2022 SC22: International Conference for High Per-
+formance Computing, Networking, Storage and Analysis
+(SC), pp. 646–660. IEEE Computer Society, 2022.
+Andoni, A. and Razenshteyn, I. Optimal data-dependent
+hashing for approximate near neighbors. In Proceedings
+of the forty-seventh annual ACM symposium on Theory
+of computing (STOC) , pp. 793–801, 2015.
+Andoni, A., Indyk, P., Nguyen, H. L., and Razenshteyn, I.
+Beyond locality-sensitive hashing. In Proceedings of the
+twenty-fifth annual ACM-SIAM symposium on Discrete
+algorithms , pp. 1018–1028. SIAM, 2014.
+Andoni, A., Indyk, P., Laarhoven, T., Razenshteyn, I., and
+Schmidt, L. Practical and optimal lsh for angular distance.
+InAdvances in Neural Information Processing Systems
+(NIPS) , pp. 1225–1233. Curran Associates, 2015.
+Andoni, A., Laarhoven, T., Razenshteyn, I., and Waingarten,
+E. Optimal hashing-based time-space trade-offs for
+approximate near neighbors. In Proceedings of the
+Twenty-Eighth Annual ACM-SIAM Symposium on
+Discrete Algorithms (SODA) , pp. 47–66. SIAM, 2017.
+Andoni, A., Indyk, P., and Razenshteyn, I. Approximate
+nearest neighbor search in high dimensions. arXiv
+preprint arXiv:1806.09823 , 7, 2018.
+Arya, S. and Mount, D. M. Approximate nearest neighbor
+queries in fixed dimensions. In SODA , volume 93, pp.
+271–280. Citeseer, 1993.Balduzzi, D., Frean, M., Leary, L., Lewis, J., Ma, K. W.-D.,
+and McWilliams, B. The shattered gradients problem:
+If resnets are the answer, then what is the question? In
+International Conference on Machine Learning , pp.
+342–350. PMLR, 2017.
+Bansal, H., Gopalakrishnan, K., Dingliwal, S., Bodapati, S.,
+Kirchhoff, K., and Roth, D. Rethinking the role of scale for
+in-context learning: An interpretability-based case study
+at 66 billion scale. arXiv preprint arXiv:2212.09095 , 2022.
+Baum, L. E. and Petrie, T. Statistical inference for proba-
+bilistic functions of finite state markov chains. The annals
+of mathematical statistics , 37(6):1554–1563, 1966.
+Bello, I., Fedus, W., Du, X., Cubuk, E. D., Srinivas, A., Lin,
+T.-Y ., Shlens, J., and Zoph, B. Revisiting resnets: Im-
+proved training and scaling strategies. Advances in Neural
+Information Processing Systems , 34:22614–22627, 2021.
+Bengio, Y ., Ducharme, R., Vincent, P., and Jauvin, C. A
+neural probabilistic language model. Journal of machine
+learning research (JMLR) , 3(Feb):1137–1155, 2003.
+Bisk, Y ., Zellers, R., Bras, R. L., Gao, J., and Choi, Y .
+Piqa: Reasoning about physical commonsense in natural
+language. In Thirty-Fourth AAAI Conference on Artificial
+Intelligence , 2020.
+Black, S., Biderman, S., Hallahan, E., Anthony, Q., Gao,
+L., Golding, L., He, H., Leahy, C., McDonell, K., Phang,
+J., Pieler, M., Prashanth, U. S., Purohit, S., Reynolds, L.,
+Tow, J., Wang, B., and Weinbach, S. GPT-NeoX-20B:
+An open-source autoregressive language model. In
+Proceedings of the ACL Workshop on Challenges &
+Perspectives in Creating Large Language Models , 2022.
+URLhttps://arxiv.org/abs/2204.06745 .
+Bommasani, R., Hudson, D. A., Adeli, E., Altman, R., Arora,
+S., von Arx, S., Bernstein, M. S., Bohg, J., Bosselut, A.,
+Brunskill, E., et al. On the opportunities and risks of foun-
+dation models. arXiv preprint arXiv:2108.07258 , 2021.
+Boutsidis, C., Woodruff, D. P., and Zhong, P. Optimal
+principal component analysis in distributed and streaming
+models. In STOC’16—Proceedings of the 48th Annual
+ACM SIGACT Symposium on Theory of Computing , 2016.
+Boytsov, L., Novak, D., Malkov, Y ., and Nyberg, E. Off the
+beaten path: Let’s replace term-based retrieval with k-nn
+search. In Proceedings of the 25th ACM international on
+conference on information and knowledge management
+(CIKM) , pp. 1099–1108, 2016.
+Brand, J. v. d., Peng, B., Song, Z., and Weinstein, O. Training
+(overparametrized) neural networks in near-linear time.
+InITCS , 2021.
+10
+
+--- PAGE 11 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+Brand, J. v. d., Song, Z., and Zhou, T. Algorithm and
+hardness for dynamic attention maintenance in large
+language models. arXiv preprint arXiv:2304.02207 , 2023.
+Brown, T., Mann, B., Ryder, N., Subbiah, M., Kaplan, J. D.,
+Dhariwal, P., Neelakantan, A., Shyam, P., Sastry, G.,
+Askell, A., et al. Language models are few-shot learners.
+Advances in neural information processing systems , 33:
+1877–1901, 2020.
+Chan, S. C., Santoro, A., Lampinen, A. K., Wang, J. X.,
+Singh, A. K., Richemond, P. H., McClelland, J., and
+Hill, F. Data distributional properties drive emergent
+in-context learning in transformers. In Advances in Neural
+Information Processing Systems , 2022.
+Chang, W.-C., Yu, F. X., Chang, Y .-W., Yang, Y ., and Kumar,
+S. Pre-training tasks for embedding-based large-scale
+retrieval. arXiv preprint arXiv:2002.03932 , 2020.
+Charikar, M., Chen, K., and Farach-Colton, M. Finding
+frequent items in data streams. In International Collo-
+quium on Automata, Languages, and Programming , pp.
+693–703. Springer, 2002.
+Chen, B., Xu, Y ., and Shrivastava, A. Fast and accurate
+stochastic gradient estimation. Advances in Neural
+Information Processing Systems , 32, 2019.
+Chen, B., Medini, T., Farwell, J., Tai, C., Shrivastava, A., et al.
+Slide: In defense of smart algorithms over hardware accel-
+eration for large-scale deep learning systems. Proceedings
+of Machine Learning and Systems , 2:291–306, 2020a.
+Chen, B., Dao, T., Winsor, E., Song, Z., Rudra, A., and Ré,
+C. Scatterbrain: Unifying sparse and low-rank attention.
+Advances in Neural Information Processing Systems , 34:
+17413–17426, 2021a.
+Chen, B., Liu, Z., Peng, B., Xu, Z., Li, J. L., Dao, T., Song,
+Z., Shrivastava, A., and Re, C. Mongoose: A learnable lsh
+framework for efficient neural network training. In Inter-
+national Conference on Learning Representations , 2021b.
+Chen, H., Chillotti, I., Dong, Y ., Poburinnaya, O., Razen-
+shteyn, I., and Riazi, M. S. {SANNS }: Scaling up
+secure approximate k-nearest neighbors search. In 29th
+{USENIX }Security Symposium ( {USENIX }Security 20) ,
+pp. 2111–2128, 2020b.
+Chen, L. On the hardness of approximate and exact (bichro-
+matic) maximum inner product. In 33rd Computational
+Complexity Conference (CCC) , 2018.
+Cho, J. H. and Hariharan, B. On the efficacy of knowledge
+distillation. In Proceedings of the IEEE/CVF international
+conference on computer vision , pp. 4794–4802, 2019.Chowdhery, A., Narang, S., Devlin, J., Bosma, M., Mishra,
+G., Roberts, A., Barham, P., Chung, H. W., Sutton, C.,
+Gehrmann, S., et al. PaLM: Scaling language modeling
+with pathways. arXiv preprint arXiv:2204.02311 , 2022.
+Clarkson, K. L. and Woodruff, D. P. Low-rank approximation
+and regression in input sparsity time. In STOC , 2013.
+Cohen, M. B. Nearly tight oblivious subspace embeddings
+by trace inequalities. In Proceedings of the twenty-seventh
+annual ACM-SIAM symposium on Discrete algorithms ,
+pp. 278–287. SIAM, 2016.
+Cook, S. CUDA Programming: A Developer’s Guide to
+Parallel Computing with GPUs . Morgan Kaufmann
+Publishers Inc., San Francisco, CA, USA, 1st edition,
+2012. ISBN 9780124159334.
+Cox, M. and Cox, T. Multidimensional scaling, 315–347.
+Handbook of data visualization. Springer, Berlin,
+Germany , 2008.
+Dao, T., Fu, D. Y ., Ermon, S., Rudra, A., and Ré, C.
+Flashattention: Fast and memory-efficient exact attention
+with io-awareness. In Advances in Neural Information
+Processing Systems , 2022.
+Datar, M., Immorlica, N., Indyk, P., and Mirrokni, V . S.
+Locality-sensitive hashing scheme based on p-stable distri-
+butions. In Proceedings of the twentieth annual symposium
+on Computational geometry (SoCG) , pp. 253–262, 2004.
+de Marneffe, M.-C., Simons, M., and Tonhauser, J. The
+commitmentbank: Investigating projection in naturally
+occurring discourse. 2019.
+Deng, Y ., Li, Z., and Song, Z. Attention scheme inspired soft-
+max regression. arXiv preprint arXiv:2304.10411 , 2023a.
+Deng, Y ., Mahadevan, S., and Song, Z. Randomized and
+deterministic attention sparsification algorithms for
+over-parameterized feature dimension. arxiv preprint:
+arxiv 2304.03426 , 2023b.
+Derpanis, K. G. Mean shift clustering. Lecture Notes , 32:
+1–4, 2005.
+Dettmers, T., Lewis, M., Belkada, Y ., and Zettlemoyer, L.
+Llm. int8 (): 8-bit matrix multiplication for transformers
+at scale. arXiv preprint arXiv:2208.07339 , 2022.
+Dong, S., Lee, Y . T., and Ye, G. A nearly-linear time
+algorithm for linear programs with small treewidth: A
+multiscale representation of robust central path. In
+Proceedings of the 53rd Annual ACM SIGACT Symposium
+on Theory of Computing , pp. 1784–1797, 2021.
+Dong, Y ., Indyk, P., Razenshteyn, I., and Wagner, T. Learning
+space partitions for nearest neighbor search. In Interna-
+tional Conference on Learning Representations , 2019.
+11
+
+--- PAGE 12 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+Fang, J., Yu, Y ., Zhao, C., and Zhou, J. Turbotransformers:
+an efficient gpu serving system for transformer models.
+InProceedings of the 26th ACM SIGPLAN Symposium
+on Principles and Practice of Parallel Programming , pp.
+389–402, 2021.
+Frankle, J. and Carbin, M. The lottery ticket hypothesis:
+Finding sparse, trainable neural networks. arXiv preprint
+arXiv:1803.03635 , 2018.
+Frantar, E. and Alistarh, D. Massive language models
+can be accurately pruned in one-shot. arXiv preprint
+arXiv:2301.00774 , 2023.
+Frantar, E., Ashkboos, S., Hoefler, T., and Alistarh, D. Gptq:
+Accurate post-training quantization for generative pre-
+trained transformers. arXiv preprint arXiv:2210.17323 ,
+2022.
+Frei, S., Cao, Y ., and Gu, Q. Algorithm-dependent gen-
+eralization bounds for overparameterized deep residual
+networks. Advances in neural information processing
+systems , 32, 2019.
+Gao, L., Tow, J., Biderman, S., Black, S., DiPofi, A., Foster,
+C., Golding, L., Hsu, J., McDonell, K., Muennighoff, N.,
+Phang, J., Reynolds, L., Tang, E., Thite, A., Wang, B.,
+Wang, K., and Zou, A. A framework for few-shot lan-
+guage model evaluation, September 2021. URL https:
+//doi.org/10.5281/zenodo.5371628 .
+Gao, Y ., Mahadevan, S., and Song, Z. An over-parameterized
+exponential regression. arXiv preprint arXiv:2303.16504 ,
+2023a.
+Gao, Y ., Song, Z., and Yang, X. Differentially private
+attention computation. arXiv preprint arXiv:2305.04701 ,
+2023b.
+Giampiccolo, D., Magnini, B., Dagan, I., and Dolan, B. The
+third PASCAL recognizing textual entailment challenge.
+InProceedings of the ACL-PASCAL Workshop on Textual
+Entailment and Paraphrasing , pp. 1–9, Prague, June
+2007. Association for Computational Linguistics. URL
+https://aclanthology.org/W07-1401 .
+Gionis, A., Indyk, P., Motwani, R., et al. Similarity search
+in high dimensions via hashing. In Vldb , volume 99, pp.
+518–529, 1999.
+Gordon, A., Kozareva, Z., and Roemmele, M. SemEval-2012
+task 7: Choice of plausible alternatives: An evaluation
+of commonsense causal reasoning. In *SEM 2012: The
+First Joint Conference on Lexical and Computational Se-
+mantics – Volume 1: Proceedings of the main conference
+and the shared task, and Volume 2: Proceedings of the
+Sixth International Workshop on Semantic Evaluation
+(SemEval 2012) , pp. 394–398, Montréal, Canada, 7-8June 2012. Association for Computational Linguistics.
+URLhttps://aclanthology.org/S12-1052 .
+Gu, Y . and Song, Z. A faster small treewidth sdp solver.
+arXiv preprint arXiv:2211.06033 , 2022.
+Gu, Y ., Song, Z., Yin, J., and Zhang, L. Low rank matrix
+completion via robust alternating minimization in nearly
+linear time. arXiv preprint arXiv:2302.11068 , 2023.
+Hall, R. and Attenberg, J. Fast and accurate maximum inner
+product recommendations on map-reduce. In Proceedings
+of the 24th International Conference on World Wide Web
+(WWW) , pp. 1263–1268, 2015.
+Han, S., Mao, H., and Dally, W. J. Deep compression:
+Compressing deep neural networks with pruning, trained
+quantization and huffman coding. arXiv preprint
+arXiv:1510.00149 , 2015.
+Harris, M. How to access global memory efficiently in
+CUDA C/C++ kernels. NVIDIA, Jan , 2013.
+He, K., Zhang, X., Ren, S., and Sun, J. Deep residual
+learning for image recognition. In Proceedings of
+the IEEE conference on computer vision and pattern
+recognition , pp. 770–778, 2016.
+He, Y ., Liu, P., Wang, Z., Hu, Z., and Yang, Y . Filter pruning
+via geometric median for deep convolutional neural
+networks acceleration. In Proceedings of the IEEE/CVF
+conference on computer vision and pattern recognition ,
+pp. 4340–4349, 2019.
+Hinton, G., Vinyals, O., Dean, J., et al. Distilling
+the knowledge in a neural network. arXiv preprint
+arXiv:1503.02531 , 2(7), 2015.
+Hoefler, T., Alistarh, D., Ben-Nun, T., Dryden, N., and Peste,
+A. Sparsity in deep learning: Pruning and growth for
+efficient inference and training in neural networks. J.
+Mach. Learn. Res. , 22(241):1–124, 2021.
+Hooker, S. The hardware lottery. Communications of the
+ACM , 64(12):58–65, 2021.
+Hu, H., Song, Z., Weinstein, O., and Zhuo, D. Training
+overparametrized neural networks in sublinear time.
+arXiv preprint arXiv:2208.04508 , 2022.
+Indyk, P. and Motwani, R. Approximate nearest neighbors:
+towards removing the curse of dimensionality. In
+Proceedings of the thirtieth annual ACM symposium on
+Theory of computing (STOC) , pp. 604–613, 1998a.
+Indyk, P. and Motwani, R. Approximate nearest neighbors:
+towards removing the curse of dimensionality. In
+Proceedings of the thirtieth annual ACM symposium on
+Theory of computing , pp. 604–613, 1998b.
+12
+
+--- PAGE 13 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+Indyk, P. and Wagner, T. Approximate nearest neighbors
+in limited space. In Conference On Learning Theory , pp.
+2012–2036. PMLR, 2018.
+Ivanov, A., Dryden, N., Ben-Nun, T., Li, S., and Hoefler,
+T. Data movement is all you need: A case study on
+optimizing transformers. Proceedings of Machine
+Learning and Systems , 3:711–732, 2021.
+Jacob, B., Kligys, S., Chen, B., Zhu, M., Tang, M., Howard,
+A., Adam, H., and Kalenichenko, D. Quantization and
+training of neural networks for efficient integer-arithmetic-
+only inference. In Proceedings of the IEEE conference on
+computer vision and pattern recognition , pp. 2704–2713,
+2018.
+Jiang, S., Song, Z., Weinstein, O., and Zhang, H. A faster
+algorithm for solving general lps. In Proceedings of the
+53rd Annual ACM SIGACT Symposium on Theory of
+Computing , pp. 823–832, 2021.
+Johnson, J., Douze, M., and Jégou, H. Billion-scale
+similarity search with GPUs. IEEE Transactions on Big
+Data , 7(3):535–547, 2019.
+Johnson, W. B. and Lindenstrauss, J. Extensions of
+lipschitz mappings into a hilbert space. Contemporary
+mathematics , 26(189-206):1, 1984.
+Kitaev, N., Kaiser, Ł., and Levskaya, A. Reformer: The
+efficient transformer. In ICLR , 2020.
+Kurtz, M., Kopinsky, J., Gelashvili, R., Matveev, A., Carr, J.,
+Goin, M., Leiserson, W., Moore, S., Shavit, N., and Alis-
+tarh, D. Inducing and exploiting activation sparsity for fast
+inference on deep neural networks. In III, H. D. and Singh,
+A. (eds.), Proceedings of the 37th International Confer-
+ence on Machine Learning , volume 119 of Proceedings
+of Machine Learning Research , pp. 5533–5543. PMLR,
+13–18 Jul 2020. URL https://proceedings.mlr.
+press/v119/kurtz20a.html .
+Laurent, B. and Massart, P. Adaptive estimation of a
+quadratic functional by model selection. Annals of
+Statistics , pp. 1302–1338, 2000.
+LeCun, Y ., Denker, J., and Solla, S. Optimal brain damage.
+Advances in neural information processing systems , 2,
+1989.
+Lee, M., He, X., Yih, W.-t., Gao, J., Deng, L., and Smolensky,
+P. Reasoning in vector space: An exploratory study of
+question answering. In ICLR , 2016.
+Lee, N., Ajanthan, T., and Torr, P. H. Snip: Single-shot
+network pruning based on connection sensitivity. arXiv
+preprint arXiv:1810.02340 , 2018.Lee, Y . T., Song, Z., and Zhang, Q. Solving empirical risk
+minimization in the current matrix multiplication time. In
+Conference on Learning Theory , pp. 2140–2157. PMLR,
+2019.
+Li, P., Li, X., and Zhang, C.-H. Re-randomized densification
+for one permutation hashing and bin-wise consistent
+weighted sampling. Advances in Neural Information
+Processing Systems , 32, 2019.
+Li, S., Song, Z., Xia, Y ., Yu, T., and Zhou, T. The closeness
+of in-context learning and weight shifting for softmax
+regression. arXiv preprint , 2023a.
+Li, X. and Li, P. C-MinHash: Improving minwise hashing
+with circulant permutation. In Chaudhuri, K., Jegelka,
+S., Song, L., Szepesvari, C., Niu, G., and Sabato, S.
+(eds.), Proceedings of the 39th International Conference
+on Machine Learning , volume 162 of Proceedings of
+Machine Learning Research , pp. 12857–12887. PMLR,
+17–23 Jul 2022. URL https://proceedings.mlr.
+press/v162/li22m.html .
+Li, Z., You, C., Bhojanapalli, S., Li, D., Rawat, A. S.,
+Reddi, S. J., Ye, K., Chern, F., Yu, F., Guo, R., and
+Kumar, S. Large models are parsimonious learners:
+Activation sparsity in trained transformers, 2022. URL
+https://arxiv.org/abs/2210.06313 .
+Li, Z., Song, Z., and Zhou, T. Solving regularized exp, cosh
+and sinh regression problems. arXiv preprint, 2303.15725 ,
+2023b.
+Liang, P., Bommasani, R., Lee, T., Tsipras, D., Soylu, D.,
+Yasunaga, M., Zhang, Y ., Narayanan, D., Wu, Y ., Kumar,
+A., et al. Holistic evaluation of language models. arXiv
+preprint arXiv:2211.09110 , 2022.
+Liu, Z., Sun, M., Zhou, T., Huang, G., and Darrell, T.
+Rethinking the value of network pruning. arXiv preprint
+arXiv:1810.05270 , 2018.
+Liu, Z., Xu, Z., Ji, A., Zhang, J., Li, J., Chen, B., and
+Shrivastava, A. Halos: Hashing large output space for
+cheap inference. Proceedings of Machine Learning and
+Systems , 4:110–125, 2022.
+Lu, Y ., Dhillon, P., Foster, D. P., and Ungar, L. Faster ridge
+regression via the subsampled randomized hadamard
+transform. In Advances in neural information processing
+systems (NIPS) , pp. 369–377, 2013.
+Malkov, Y ., Ponomarenko, A., Logvinov, A., and Krylov,
+V . Approximate nearest neighbor algorithm based on
+navigable small world graphs. Information Systems , 45:
+61–68, 2014.
+13
+
+--- PAGE 14 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+Malkov, Y . A. and Yashunin, D. A. Efficient and robust ap-
+proximate nearest neighbor search using hierarchical nav-
+igable small world graphs. IEEE transactions on pattern
+analysis and machine intelligence , 42(4):824–836, 2018.
+Meng, X. and Mahoney, M. W. Low-distortion subspace
+embeddings in input-sparsity time and applications to
+robust linear regression. In Proceedings of the forty-fifth
+annual ACM symposium on Theory of computing , pp.
+91–100, 2013.
+Merity, S., Xiong, C., Bradbury, J., and Socher, R. Pointer
+sentinel mixture models, 2016.
+Michel, P., Levy, O., and Neubig, G. Are sixteen heads
+really better than one? Advances in neural information
+processing systems , 32, 2019.
+Mihaylov, T., Clark, P., Khot, T., and Sabharwal, A. Can a
+suit of armor conduct electricity? a new dataset for open
+book question answering. In EMNLP , 2018.
+Min, S., Lyu, X., Holtzman, A., Artetxe, M., Lewis, M.,
+Hajishirzi, H., and Zettlemoyer, L. Rethinking the role
+of demonstrations: What makes in-context learning work?
+arXiv preprint arXiv:2202.12837 , 2022.
+Molchanov, P., Tyree, S., Karras, T., Aila, T., and Kautz, J.
+Pruning convolutional neural networks for resource ef-
+ficient inference. arXiv preprint arXiv:1611.06440 , 2016.
+Nagel, M., Baalen, M. v., Blankevoort, T., and Welling,
+M. Data-free quantization through weight equalization
+and bias correction. In Proceedings of the IEEE/CVF
+International Conference on Computer Vision , pp.
+1325–1334, 2019.
+Nelson, J. and Nguyên, H. L. Osnap: Faster numerical linear
+algebra algorithms via sparser subspace embeddings.
+In2013 ieee 54th annual symposium on foundations of
+computer science , pp. 117–126. IEEE, 2013.
+Neyshabur, B. and Srebro, N. On symmetric and asymmetric
+lshs for inner product search. In International Conference
+on Machine Learning (ICML) , pp. 1926–1934. PMLR,
+2015.
+NVIDIA. Fastertransformer. https://github.com/
+NVIDIA/FasterTransformer .
+NVIDIA. Gpu performance background user’s
+guide, 2022. URL https://docs.nvidia.
+com/deeplearning/performance/
+dl-performance-gpu-background/index.
+html .
+Park, G., Park, B., Kwon, S. J., Kim, B., Lee, Y ., and Lee,
+D. nuqmm: Quantized matmul for efficient inference of
+large-scale generative language models. arXiv preprint
+arXiv:2206.09557 , 2022.Pope, R., Douglas, S., Chowdhery, A., Devlin, J., Bradbury,
+J., Levskaya, A., Heek, J., Xiao, K., Agrawal, S., and
+Dean, J. Efficiently scaling transformer inference. arXiv
+preprint arXiv:2211.05102 , 2022.
+Qin, L., Song, Z., and Wang, Y . Fast submodular function
+maximization. CoRR , abs/2305.08367, 2023a.
+Qin, L., Song, Z., Zhang, L., and Zhuo, D. An online and
+unified algorithm for projection matrix vector multipli-
+cation with application to empirical risk minimization. In
+AISTATS , 2023b.
+Radford, A., Wu, J., Child, R., Luan, D., Amodei, D., and
+Sutskever, I. Language models are unsupervised multitask
+learners. 2019.
+Raffel, C., Shazeer, N., Roberts, A., Lee, K., Narang, S.,
+Matena, M., Zhou, Y ., Li, W., and Liu, P. J. Exploring
+the limits of transfer learning with a unified text-to-text
+transformer. arXiv e-prints , 2019.
+Razenshteyn, I., Song, Z., and Woodruff, D. P. Weighted
+low rank approximations with provable guarantees. In
+Proceedings of the forty-eighth annual ACM symposium
+on Theory of Computing , pp. 250–263, 2016.
+Sarlos, T. Improved approximation algorithms for large
+matrices via random projections. In 2006 47th annual
+IEEE symposium on foundations of computer science
+(FOCS) , pp. 143–152. IEEE, 2006.
+Seo, M., Lee, J., Kwiatkowski, T., Parikh, A. P., Farhadi,
+A., and Hajishirzi, H. Real-time open-domain question
+answering with dense-sparse phrase index. In ACL, pp.
+4430–4441, 2019.
+Shrivastava, A., Song, Z., and Xu, Z. Sublinear least-squares
+value iteration via locality sensitive hashing. arXiv
+preprint arXiv:2105.08285 , 2021.
+Smith, J. E. A study of branch prediction strategies. In
+25 years of the international symposia on Computer
+architecture (selected papers) , pp. 202–215, 1998.
+Sohler, C. and Woodruff, D. P. Subspace embeddings
+for the l1-norm with applications. In Proceedings of
+the forty-third annual ACM symposium on Theory of
+computing , pp. 755–764, 2011.
+Song, Z. and Ye, M. Efficient asynchronize stochas-
+tic gradient algorithm with structured data. CoRR ,
+abs/2305.08001, 2023.
+Song, Z. and Yu, Z. Oblivious sketching-based central path
+method for linear programming. In International Confer-
+ence on Machine Learning , pp. 9835–9847. PMLR, 2021.
+14
+
+--- PAGE 15 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+Song, Z., Woodruff, D. P., and Zhong, P. Low rank approx-
+imation with entrywise l1-norm error. In Proceedings of
+the 49th Annual ACM SIGACT Symposium on Theory of
+Computing , pp. 688–701, 2017.
+Song, Z., Woodruff, D. P., and Zhong, P. Relative error
+tensor low rank approximation. In Proceedings of the
+Thirtieth Annual ACM-SIAM Symposium on Discrete
+Algorithms (SODA) , pp. 2772–2789. SIAM, 2019.
+Song, Z., Zhang, L., and Zhang, R. Training multi-layer
+over-parametrized neural network in subquadratic time.
+arXiv preprint arXiv:2112.07628 , 2021.
+Song, Z., Wang, W., and Yin, C. Fast and efficient
+matching algorithm with deadline instances. CoRR ,
+abs/2305.08353, 2023a.
+Song, Z., Yang, X., Yang, Y ., and Zhang, L. Sketching meets
+differential privacy: fast algorithm for dynamic kronecker
+projection maintenance. In International Conference on
+Machine Learning (ICML) , 2023b.
+Tang, R., Lu, Y ., Liu, L., Mou, L., Vechtomova, O., and Lin,
+J. Distilling task-specific knowledge from bert into simple
+neural networks. arXiv preprint arXiv:1903.12136 , 2019.
+Tillet, P., Kung, H.-T., and Cox, D. Triton: an interme-
+diate language and compiler for tiled neural network
+computations. In Proceedings of the 3rd ACM SIGPLAN
+International Workshop on Machine Learning and
+Programming Languages , pp. 10–19, 2019.
+Touvron, H., Cord, M., Douze, M., Massa, F., Sablayrolles,
+A., and Jégou, H. Training data-efficient image trans-
+formers & distillation through attention. In International
+Conference on Machine Learning , pp. 10347–10357.
+PMLR, 2021.
+Veit, A., Wilber, M. J., and Belongie, S. Residual networks
+behave like ensembles of relatively shallow networks. Ad-
+vances in neural information processing systems , 29, 2016.
+Viterbi, A. Error bounds for convolutional codes and an
+asymptotically optimum decoding algorithm. IEEE trans-
+actions on Information Theory , 13(2):260–269, 1967.
+Wang, B. and Komatsuzaki, A. GPT-J-6B: A
+6 billion parameter autoregressive language
+model. https://github.com/kingoflolz/
+mesh-transformer-jax , May 2021.
+Wang, R. and Woodruff, D. P. Tight bounds for lp oblivious
+subspace embeddings. 2018.
+Wang, X., Xiong, Y ., Wei, Y ., Wang, M., and Li, L. Lightseq:
+A high performance inference library for transformers.
+InProceedings of the 2021 Conference of the North
+American Chapter of the Association for ComputationalLinguistics: Human Language Technologies: Industry
+Papers , pp. 113–120, 2021.
+Woodruff, D. P. Sketching as a tool for numerical linear
+algebra. Foundations and Trends ®in Theoretical
+Computer Science , 10(1–2):1–157, 2014.
+Xiao, G., Lin, J., Seznec, M., Demouth, J., and Han, S.
+Smoothquant: Accurate and efficient post-training
+quantization for large language models. arXiv preprint
+arXiv:2211.10438 , 2022.
+Xie, S. M., Raghunathan, A., Liang, P., and Ma, T.
+An explanation of in-context learning as implicit
+bayesian inference. In International Conference
+on Learning Representations , 2022. URL https:
+//openreview.net/forum?id=RdJVFCHjUMI .
+Xue, H.-J., Dai, X., Zhang, J., Huang, S., and Chen, J. Deep
+matrix factorization models for recommender systems.
+InIJCAI , pp. 3203–3209, 2017.
+Yao, Z., Aminabadi, R. Y ., Zhang, M., Wu, X., Li, C., and
+He, Y . Zeroquant: Efficient and affordable post-training
+quantization for large-scale transformers. arXiv preprint
+arXiv:2206.01861 , 2022.
+Yu, G.-I., Jeong, J. S., Kim, G.-W., Kim, S., and Chun, B.-G.
+Orca: A distributed serving system for {Transformer-
+Based}generative models. In 16th USENIX Symposium
+on Operating Systems Design and Implementation (OSDI
+22), pp. 521–538, 2022.
+Zandieh, A., Han, I., Daliri, M., and Karbasi, A. Kdeformer:
+Accelerating transformers via kernel density estimation.
+arXiv preprint arXiv:2302.02451 , 2023.
+Zhang, L. Speeding up optimizations via data structures:
+Faster search, sample and maintenance. Master’s thesis,
+Carnegie Mellon University, 2022.
+Zhang, M., Wang, W., Liu, X., Gao, J., and He, Y . Navi-
+gating with graph representations for fast and scalable
+decoding of neural language models. Advances in neural
+information processing systems , 31, 2018.
+Zhao, R., Hu, Y ., Dotzel, J., De Sa, C., and Zhang, Z.
+Improving neural network quantization without retraining
+using outlier channel splitting. In International conference
+on machine learning , pp. 7543–7552. PMLR, 2019.
+15
+
+--- PAGE 16 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+Contents: In Section A, we present an extended discussion on LLM inference and related works. In Section B, we provide
+more observation plots for slowly changing activation and further observation on the possibility of sparsifying LLMs via layer
+skipping. In Section C, we provide experiment details. In Section D, we demonstrate implementation details. In Section E,
+we provide detailed benchmarks regarding our implementation. In Section F, we define some basic notations and definitions.
+In Section G, we define subspace embedding and show the norm preserving. In Section H, we introduce distances, angles, and
+inner product. In Section I, we provide the distance between different functions. In Section J, we provide the Near-neighbor
+Search data structure. In Section K, we discuss self-attention as a clustering algorithm in depth.
+A Related Work
+Generative LLM inference. Taking OPT-175B as an example, assume 6 A100 80GB PCIe, based on the hardware
+specifications, we compare two main phases of inference time LLM, namely prompting and token generation in Table 1, and
+two major components, namely Multi-Head-Attention block and MLP block in Table 2. In practice, the token generation
+phase usually dominates the end-to-end test latency due to IO latency. Generating only two tokens is about the same latency as
+prompting. Further, during token generation, the MLP block is 2 ×more expensive in both FLOPs and IO access. The hardware
+is often at low utilization because memory reads and writes are more limited on modern hardware than tensor core computation.
+Given the rapid development of LLM, there is an emergence of systems that are specialized for LLM inference, such as
+Faster Transformer (NVIDIA), Orca (Yu et al., 2022), LightSeq (Wang et al., 2021), PaLM inference (Pope et al., 2022),
+TurboTransformers (Fang et al., 2021), and Deepspeed-Inference (Aminabadi et al., 2022). In practice, the token generation
+phase usually dominates the end-to-end inference time. Although the state-of-the-art systems introduce some helpful system
+optimizations for speedup, there is a lack of careful algorithm and system co-design to unleash the full potential of hardware
+efficiency during the LLM inference computation.
+Near-neighbor Search for Efficient Deep Neural Networks. Near-neighbor Search is a well-studied problem with wide
+applications in recommendation system (Xue et al., 2017; Hall & Attenberg, 2015), question answering (Boytsov et al., 2016;
+Seo et al., 2019; Chang et al., 2020) and natural language processing (Bengio et al., 2003; Lee et al., 2016). There has been a
+line of work using Near-neighbor Search techniques such as Locality-sensitive hashing (Gionis et al., 1999) and Graph-based
+indexing (Malkov et al., 2014) for efficient deep neural network training or inference (Zhang et al., 2018; Chen et al., 2019;
+2020a; Kitaev et al., 2020; Chen et al., 2021b;a; Liu et al., 2022).
+Quantization, pruning, distillation for LLM inference. Various system relaxations have been studied for decades for
+model inference in machine learning. For example, quantization (Han et al., 2015; Jacob et al., 2018; Nagel et al., 2019; Zhao
+et al., 2019), pruning (Molchanov et al., 2016; Liu et al., 2018; He et al., 2019; Hoefler et al., 2021), and distillation (Hinton
+et al., 2015; Cho & Hariharan, 2019; Tang et al., 2019; Touvron et al., 2021) have been applied to speed up the inference of
+the machine learning model. Active research has recently attempted to apply such techniques in LLM inference. For example,
+zeroQuant (Yao et al., 2022) and nuQmm (Park et al., 2022) implement customized CUDA kernels to support tenor-wise
+or group-wise quantization for LLM inference; LLM.int8 (Dettmers et al., 2022) adopts a mixed INT8/FP16 computation to
+diminish the influence of activation outliers; SmoothQuant (Xiao et al., 2022) enables efficient 8-bit weight and activation for
+LLM inference; GPTQ (Frantar et al., 2022) adopts a one-shot weight quantization method based on approximate second-order
+information for accuracy and efficiency; SparseGPT (Frantar & Alistarh, 2023) introduces an approximate sparse regression
+solver to enable the sparsity in LLM inference; (Bansal et al., 2022) has reported that a small set of attention heads can perform
+primitive induction operations associated with in-context learning, and use this property to prune LLM for acceleration.
+Residual connections in neural networks. Residual connection shows great advantages for neural network generalization,
+it provides additional paths for activations to reach the latter parts of the neural network by skipping some layers (He et al.,
+2016). The advancement of residual connections can be viewed as ensembles of multiple shallow neural networks (Veit
+et al., 2016). Plenty of active research has discussed the effectiveness of residual connections (Balduzzi et al., 2017; Bello
+et al., 2021; Allen-Zhu & Li, 2019; Frei et al., 2019). However, as far as we know, there is no former work that leverages
+the property of residual connections to improve the efficiency of LLM inference.
+B Additional Observation on Slowly Changing Observation
+First, we present more plots on the cosine similarity between representations. Figure 9 plots the cosine similarity between
+activation across layers on OPT family. It is evident that similarity is high for the larger models.
+There are two residual connections inside a transformer layer, one around the attention block, and the other one around the
+MLP block. The residual connection can be written as X+F(X), where Fis either the Multi-Head Attention or two MLP
+Layer. Figure 10 plots the cosine similarity between XandX+F(X), which is close to 1.0, and the cosine similarity between
+16
+
+--- PAGE 17 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+0 5 10 15 20
+Transformer Layer0.00.20.40.60.81.0Cosine Similarityn = 1
+n = 2
+n = 4
+n = 8
+(a) OPT-1.3B
+0 510 15 20 25 30
+Transformer Layer0.00.20.40.60.81.0Cosine Similarityn = 1
+n = 2
+n = 4
+n = 8 (b) OPT-6.7B
+05101520253035
+Transformer Layer0.00.20.40.60.81.0Cosine Similarityn = 1
+n = 2
+n = 4
+n = 8 (c) OPT-13B
+0 10 20 30 40
+Transformer Layer0.00.20.40.60.81.0Cosine Similarityn = 1
+n = 2
+n = 4
+n = 8
+(d) OPT-30B
+010 20 30 40 50 60
+Transformer Layer0.00.20.40.60.81.0Cosine Similarityn = 1
+n = 2
+n = 4
+n = 8 (e) OPT-66B
+0 20 40 60 80
+Transformer Layer0.00.20.40.60.81.0Cosine Similarityn = 1
+n = 2
+n = 4
+n = 8 (f) OPT-175B
+Figure 9. Cosine similarity between layer land layer l+1for various model.
+XandF(X), which is close to 0.0. This happens because ∥X∥is significantly greater than ∥F(X)∥, shown in the purple.
+In the first layer, ∥F(X)∥is larger, which explains the low cosine similarity. The magnitude of the L2norm is different across
+models, however, we observe a similar trend with models of different sizes. There exists a normalization layer before F(X)
+and the layer normalization scale ∥X∥to a consistent magnitude across layers (e.g. 85 for OPT-30B, 110 for OPT175B),
+but not necessarily scale down ∥X∥.
+C Additional Experiment Detail
+C.1 Large Batch Size
+To help understand where the speed-up comes from when batch size is greater than 1, we present the Union Contextual Sparsity
+(fraction of neurons/heads that are not used by any of the inputs in the batch) of different batches sizes for MLP and Attention
+blocks, respectively, in Figure 11. Union Contextual Sparsity is calculated as 1.0 - the union of activated MLP neurons or
+Attention heads in the batch / total neurons or heads. The union operation is essential to realize a fast sparse GEMM.
+Surprisingly the number of MLP neurons/Attention heads that DEJAVU activated does not grow linearly with the batch size.
+This suggests a power law distribution rather than a uniform distribution of parameter access from all input examples. Further,
+a larger batch size can easily lead to out-of-memory for long sequence settings due to the limited GPU memory, the giant
+large model size, and the stored KV cache. For example, the total GPU memory of 8 80GB A100 is 640GB. Model parameters
+are around 350GB for OPT175B. The KV cache for a batch size 32 with a sequence longer than 1920 tokens has already
+filled up the GPU memory.
+C.2 Near Neighbor classifier
+In the DEJAVU framework, any near-neighbor search method under the inner product metric would be sufficient to predict
+a sparsity pattern. "Training predictor" is to reduce the cost of on-the-fly prediction, rather than training the model itself.
+17
+
+--- PAGE 18 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+0.00.20.40.60.81.0Cosine SimilarityResidual At Attention
+Cos(X, X+F(X))
+Cos(X, F(X))
+0 5 10 15 20
+Transformer Layer0.00.20.40.60.81.0Cosine SimilarityResidual At MLP
+Cos(X, X+F(X))
+Cos(X, F(X))020406080100120
+Norm||X||
+||F(X)||
+||LN(X)||
+020406080100120
+L2 Norm||X||
+||F(X)||
+||LN(X)||
+(a) OPT-1.3b
+0.00.20.40.60.81.01.2Cosine SimilarityResidual At Attention
+Cos(X, X+F(X))
+Cos(X, F(X))
+0 5 10 15 20 25 30
+Transformer Layer0.00.20.40.60.81.0Cosine SimilarityResidual At MLP
+Cos(X, X+F(X))
+Cos(X, F(X))050100150200250
+Norm||X||
+||F(X)||
+||LN(X)||
+050100150200250
+L2 Norm||X||
+||F(X)||
+||LN(X)|| (b) OPT-6.7b
+0.2
+0.00.20.40.60.81.0Cosine SimilarityResidual At Attention
+Cos(X, X+F(X))
+Cos(X, F(X))
+0 10 20 30 40
+Transformer Layer0.00.20.40.60.81.0Cosine SimilarityResidual At MLP
+Cos(X, X+F(X))
+Cos(X, F(X))050100150200
+Norm||X||
+||F(X)||
+||LN(X)||
+050100150200
+L2 Norm||X||
+||F(X)||
+||LN(X)|| (c) OPT-13B
+0.000.250.500.751.00Cosine SimilarityResidual At Attention
+Cos(X, X+F(X))
+Cos(X, F(X))
+0 10 20 30 40
+Transformer Layer0.00.20.40.60.81.0Cosine SimilarityResidual At MLP
+Cos(X, X+F(X))
+Cos(X, F(X))0100200300
+Norm||X||
+||F(X)||
+||LN(X)||
+0100200300
+L2 Norm||X||
+||F(X)||
+||LN(X)||
+(d) OPT-30B
+0.25
+0.000.250.500.751.00Cosine SimilarityResidual At Attention
+Cos(X, X+F(X))
+Cos(X, F(X))
+0 10 20 30 40 50 60
+Transformer Layer0.2
+0.00.20.40.60.81.0Cosine SimilarityResidual At MLP
+Cos(X, X+F(X))
+Cos(X, F(X))0100200300400
+Norm||X||
+||F(X)||
+||LN(X)||
+0100200300400
+L2 Norm||X||
+||F(X)||
+||LN(X)|| (e) OPT-66B
+0.50
+0.25
+0.000.250.500.751.00Cosine SimilarityResidual At Attention
+Cos(X, X+F(X))
+Cos(X, F(X))
+0 20 40 60 80
+Transformer Layer0.25
+0.000.250.500.751.00Cosine SimilarityResidual At MLP
+Cos(X, X+F(X))
+Cos(X, F(X))0500100015002000
+Norm||X||
+||F(X)||
+||LN(X)||
+05001000150020002500
+L2 Norm||X||
+||F(X)||
+||LN(X)|| (f) OPT-175B
+Figure 10. Cosine similarity between XandF(X), and the cosine similarity between XandX′in orange color. L2norm of XandF(X)
+andXafter layer normalization in purple on the right. Except on the first layer, ∥X∥is significantly higher than ∥F(X)∥.∥F(X)∥is
+higher at the first layer, which corresponds to the low cosine similarity at the first layer.
+For example, in our exploration stage mentioned in Section 4.1, we adopt HNSW, a state-of-art near-neighbor search method,
+to predict MLP sparse pattern, and we can see from the following table there is no drop in the perplexity at 90 % sparsity
+ratio. However, due to the high dimensionality of embedding and HNSW’s reliance on CPU, the time HNSW took to identify
+the sparsity pattern is 10ms, which is longer than the MLP computation.
+In our paper, we choose a neural network classifier as our near neighbor search method to take advantage of the fast matrix
+multiplication on GPU. And training such classifiers to predict sparsity patterns is not only cheaper in terms of training cost
+but also inherently different from the method concept.
+18
+
+--- PAGE 19 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+0 20 40 60 80 96
+Transformer Layer0.50.60.70.80.91.0Union Contextual Sparsity
+Batch size
+2
+4
+8
+16
+32
+(a) MLP
+0 20 40 60 80 96
+Transformer Layer0.40.50.60.70.80.9Union Contextual Sparsity
+Batch size
+2
+4
+8
+16
+32 (b) Attention
+Figure 11. Union contextual sparsity with larger batch size.
+OPT-1.3B OPT-1.3B + HNSW
+Hellaswag 0.4154 0.4314
+C4 14.2 14.4
+Table 8. Sparsify from the Depth: Skipping or parallel entire transformer blocks may not lead to catastrophic drop in accuracy at test time.
+Model COPA Hellaswag Lambada OpenBookQA PIQA Winogrande
+OPT-175B 0.8600 0.7814 0.7584 0.4460 0.8096 0.7261
+- Parallel 2 0.8300 0.7737 0.7762 0.4520 0.8030 0.7096
+- Parallel 4 0.5200 0.2519 0 0.2720 0.5092 0.4870
+- Skip 2/8 0.8000 0.7112 0.6387 0.4220 0.7840 0.6630
+- Skip 2/4 0.6900 0.4409 0.0240 0.3400 0.6882 0.5383
+Bloom 0.8000 0.7460 0.6771 0.4480 0.7949 0.7040
+- Parallel 2 0.8100 0.7404 0.6992 0.4360 0.7813 0.7048
+- Parallel 4 0.6200 0.3176 0.1325 0.2720 0.5593 0.5217
+- Skip 2/8 0.7900 0.6829 0.5936 0.4120 0.7699 0.6614
+- Skip 2/4 0.6600 0.5538 0.3023 0.3580 0.7046 0.5549
+C.3 Future Possibility: Skipping Layer
+Deja Vu currently sparsifies from the perspective of model width. Here, we explore the possibility of sparsification from
+model depth. As observed in Section 3, we show that the activation of large language models changes slowly across blocks.
+This property can be leveraged to increase the efficiency of a trained model by parallelizing, reordering, or skipping certain
+intermediate sub-blocks without significantly impacting the overall accuracy.
+Setting Wiki(ppl) C4(ppl)
+Baseline 11.57 10.17
+Skip every 2 layers 21.16 16.58
+Skip every 4 layers 13.45 11.37
+Improving the inference efficiency of Transformer models is a challenging task due to their sequential execution of
+Transformer layers. Each sub-block depends on the output of the previous one, leading to low hardware efficiency, particularly
+during the token generation phase where each forward pass is computed for only one token. However, the sequential execution
+of blocks and sub-blocks yields computation bubbles, and the latter involves a large amount of communication overhead.
+Here, we present an interesting observation that can potentially alleviate these challenges. We found that the activation of
+the model changes slowly across blocks. Specifically, the cosine similarity of activations between adjacent blocks is often
+above 0.99. This suggests that the blocks might take the previous activation as input – parallelize or reorder the blocks –
+without significantly affecting the output. Slowly changing activations suggest that it may be possible to parallelize, reorder,
+or even skip blocks while maintaining a similar output. Some existing models, such as GPT-J (Wang & Komatsuzaki, 2021),
+GPT-NeoX (Black et al., 2022), and PaLM (Chowdhery et al., 2022) already placed the Attention block and MLP block
+19
+
+--- PAGE 20 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+in parallel in training to facilitate parallel computation and reduce the communication overhead.
+Here we investigate the possibility at inference time. And surprisingly, we found parallelizing those blocks for models that
+are trained in a sequence manner will not hurt the performance of downstream tasks significantly. And surprisingly, we found
+parallelizing those blocks for models that are trained in a sequence manner will not hurt the performance of downstream
+tasks significantly. TableC.3 presents some preliminary results of OPT-175B and Bloom
+Given the activation yand Transformer layer l, we have:
+eyl←yl+MHAl(yl)
+byl←eyl+MLPl(eyl)
+Parallelizing two blocks refers to placing the Attention and MLP blocks in parallel, i.e.:
+byl←y+MHAl(yl)+MLPl(yl)
+Parallelizing four blocks then parallelize the blocks of two Transformer layers, defined as follows:
+byl+1←yl+MHAl(yl)+MLPl(yl)+MHAl+1(yl)+MLPl+1(yl)
+Skipping layers is straightforward, which drops an entire Transformer layer for every nlayers.
+We are surprised to find that parallel two layers preserve accuracy on a series of tasks across models. Besides, randomly
+skipping 25% layers doesn’t lead to catastrophic quality. Our findings suggest from the downstream task perspective, the
+activation patterns within the model are relatively consistent across different blocks, providing a potential avenue for future
+research on model compression and optimization.
+D Implementation Details
+Figure 12 presents a more detailed workflow of DEJAVU . The left diagram shows how an input yperforms the sparse MHA
+with selected indices 0,3, predicted by the head predictor. Similarly, the right diagram shows how an input yperforms the
+sparse MLP with selected indices 0,2, predicted by the neuron predictor of that layer.
+Selected Head Index!! = {0,3}Attention with ""!#,""!$,""!%$%&($)""!'	Output Projection)%*"!($)%(($)""")	!*= {0,2}$σ($"""+)"""+ MLP""($)
+Selected Neurons IndexSparsified AttentionSparsified MLP
+Figure 12. Detailed diagram on the sparsified computation process of MLP and Attention. Notation refers to Section 2.3
+Next, we will present a general explanation of two optimizations we used in DEJAVU implementation. Kernel fusion: A
+standard implementation of sparse matrix-vector multiply (e.g., Wx in PyTorch) that separately indexes a subset of the
+matrix W[idx,:]before multiplying with input xwould incur 3 ×the amount of memory IOs: one to load a subset of Wfrom
+GPU memory, one to write that subset to a different contiguous region in memory, and one to load that (now contiguous)
+subset in again to multiply with x. Similarly, to use sparse matrix multiply routines (e.g., cuSparse), we would first need
+to convert W[idx,:]to sparse format, again incurring more memory IOs. We instead fuse the indexing and the multiplication
+step: we load a subset of W[idx,:]to memory, along with x, perform the multiply, then write down the result. This fused
+implementation (in Triton (Tillet et al., 2019)) yields up to 4 ×speedup compared to a standard PyTorch implementation
+(Section E). Memory coalescing: the weight matrices are conventionally stored in row-major format. This allows us to load
+20
+
+--- PAGE 21 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+W[idx,:]optimally (as the second dimension is contiguous in memory). However, for cases where we need to load W[:,idx]
+(attention output projection and the 2nd weight matrix in the MLP) this format significantly slows down memory loading,
+asidxcould contain indices pointing to non-contiguous memory. A simple solution is to store these matrices in column-major
+format (i.e., storing W⊤in contiguous row-major format), then use the same fused kernel above. This transposition is done
+once when loading the model, and incurs no added cost during generation.
+E Benchmarking Sparse MLP and Sparse Attention
+0.2 0.4 0.6 0.8
+MLP density100200300400Time (us)Sparse MLP benchmark
+Dense MLP
+Sparse MLP baseline (PyTorch)
+Sparse MLP - Deja vu
+Figure 13. Speed benchmarking of the MLP layer of OPT-175B on 8xA100s. Our sparse implementation is up to 4.5 ×faster than the
+baseline implementation in PyTorch. Our sparse MLP implementation remains faster than dense MLP for density up to 0.8.
+We validate that our hardware-aware implementation of sparse MLP and sparse attention (Section 4.4) yields wall-clock
+speed up compared to both dense MLP/attention and compared to the standard implementation in PyTorch.
+Recall that our implementation fuses the sparse indexing and the multiplication (W1
+SM)⊤yfor weight matrices (W1)⊤and
+input vector y. In cases where we need to index W2
+SM, we store the transpose of W2to ensure memory coalescing. For the
+baseline implementation in PyTorch, we index (W1
+SM)⊤as a separate operation before multiplying with y, which incurs
+more memory reads/writes.
+Similarly, we fuse the sparse indexing and the multiplication (WQ
+SA)⊤y,(WK
+SA)⊤y,(WV
+SA)⊤yfor weight matrices (WQ)⊤,
+(WK)⊤,(WV)⊤and input vector y. Note we usually concatenate all three matrices in the standard implementation, but we sep-
+arate them here for clarity. In cases where we need to index WO
+SA, we store the transpose of WOto ensure memory coalescing.
+In Figure 13 and Figure 14, our sparse MLP and attention implementations are 4-5 ×faster than the baseline implementation
+in Pytorch, and remains faster than the dense version for density up to 0.8.
+F Notations and Basic Definitions
+For a positive integer n, let[n]:={1,2,···,n}. For a matrix A∈Rn×n, letAi,:andA:,jbe two column vectors corresponding
+to the i-th row and the j-th column of Arespectively, and Ai,jbe the entry at the i-th row and the j-th column. For a vector
+x∈Rn, let√x∈Rndenote the vector with the i-th entry being√xianddiag( x)∈Rn×ndenote the diagonal matrix with
+thei-th diagonal entry being xi. For two matrices A,W∈Rn×n, let∥A∥W:=(Pn
+i=1Pn
+j=1Wi,jA2
+i,j)1/2andW◦Adenote
+the matrix where (W◦A)i,j=Wi,jAi,j. For matrix W∈Rn×n, letDWi:=diag( Wi,:)withi∈[n].
+For two vectors x∈Rnandw∈Rn
+≥0, let∥x∥w:= (Pn
+i=1wix2
+i)1/2. For a vector x, we denote ∥x∥2:= (Pn
+i=1x2
+i)1/2as its
+21
+
+--- PAGE 22 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+0.2 0.4 0.6 0.8
+Attention density100200300Time (us)Sparse attention benchmark
+Dense attention
+Sparse attention baseline (PyTorch)
+Sparse attention - Deja vu
+Figure 14. Speed benchmarking of the attention layer of OPT-175B on 8xA100s. Our sparse implementation is up to 5 ×faster than the
+baseline implementation in PyTorch. Our sparse attention implementation remains faster than dense MLP for density up to 0.8.
+ℓ2norm. We denote ∥x∥p:=(Pn
+i=1|xi|p)1/pas itsℓpnorm. For a square matrix A, we denote tr[A]as the trace of matrix A.
+For a matrix A∈Rn×k(suppose n≥k), we use ∥A∥to denote its spectral norm, i.e., ∥A∥=supx∥Ax∥2/∥x∥2. We use ∥A∥F
+to denote its Frobenius norm ∥A∥F:=(Pn
+i=1Pk
+j=1A2
+i,j)1/2.
+Suppose matrix A∈Rn×khas SVD decomposition UΣV⊤where U∈Rn×k(this matrix has orthonormal columns),
+Σ∈Rk×kis a diagonal matrix, and V∈Rk×k. We call columns of Uare singular vectors. We use A†∈Rk×nto denote the
+Moore-Penrose pseudoinverse, then A†=VΣ−1U⊤. Suppose Σ∈Rk×kis sorted diagonal matrix, let σ1,···,σkdenote the
+diagonal entries of Σ. Then we call σithei-th singular value of matrix, and we write it as σi(A).
+For any symmetric matrix B∈Rk×k, we define its eigenvalue decomposition as UΛU⊤, where Λis a diagonal matrix. Let
+λ1,···,λkdenote the entries on diagonal of Λ∈Rk×k. We say λiis the i-th eigenvalue. Usually we write it as λi(B).
+The connection between eigenvalues and singular values is
+σ2
+i(A)=λi(A⊤A)
+We use notation A⪰0to denote that matrix Ais positive semidefinite (psd). Mathematically, A⪰0means for all vectors
+x, we have x⊤Ax≥0.
+Similarly, for two squarer matrices AandB, we use A⪰Bto denote the case where for all vectors x,x⊤Ax≥x⊤Bx.
+We use Pr[]andE[]for probability and expectation. We denote max{a,b}as the maximum between aandb. We denote
+min{a,b}(resp. max{a,b}) as the minimum (reps. maximum) between aandb.
+Throughout, for non-negative real numbers a and b, we use the notation a=(1±ϵ)bifa∈[(1−ϵ)b,(1+ϵ)b].
+G Subspace Embeddings and Norm Preserving
+In Section G.1, we show the norm preserving of the soft-max functions. In Section G.2, we show the norm preserving of the
+ReLU function. In Section G.3, we introduce the folded Guassian distribution. In Section G.4, we introduce the ℓ2subspace
+embedding. In Section G.5, we introduce the ℓ1subspace embedding. In Section G.6, we introduce different sketching
+matrices for subspace embedding.
+22
+
+--- PAGE 23 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+G.1 Soft-Max Functions
+LetK∈Rs×dandV∈Rd×s. Inspired by the softmax unit in the attention scheme of large language models. The softmax
+related regression has been studied in many settings (Zandieh et al., 2023; Alman & Song, 2023; Brand et al., 2023; Li et al.,
+2023b; Deng et al., 2023b;a; Gao et al., 2023a; Li et al., 2023a; Gao et al., 2023b). In this work, we follow the standard
+softmax definition. We define σ1:Rs→Rsto be a softmax function, i.e., for any vector y∈Rs, theσ(y)can be written as
+σ1(y)i=exp(yi)
+Pd
+j=1exp(yj),∀i∈[d]
+The standard softmax is ℓ1version. In this work, we also consider the ℓ2generalization. We define σ2:Rs→Rsto be a
+softmax function ( ℓ2version), i.e., for any vector y∈Rs, theσ(y)can be written as
+σ2(y)i=exp(yi)
+(Pd
+j=1exp(2 yj))1/2,∀i∈[d]
+We define function f:Rd→Rd
+f(x)=V·(σ(K·x)) (3)
+Definition G.1. We say X ⊂Rdis a rank- ksubspace, if there is an orthonormal basis U∈Rd×k, for any x∈ X, there is
+y∈Rksuch that
+x=Uy.
+We can have
+Lemma G.2. Letτ∈(0,1). LetX ⊂Rddenote a subspace with rank k. Letfbe defined based on σ2function. Let Vis
+a random Gaussian matrices with d≥Ω(ϵ−2(k+log(1 /δ)))rows. Let V=τV, then we have with probability 1−δ
+(1−ϵ)τ∥x∥2≤∥f(x)∥≤(1+ϵ)τ∥x∥2.
+for all unit vectors x∈X.
+Further, if d=O(k+log(1 /δ)), then we have
+0.5τ∥x∥2≤∥f(x)∥≤2τ∥x∥2.
+Remark G.3.The above condition implies that fis a shrinking operator but also not shrinking arbitrarily small.
+Proof. Given d≥Ω(ϵ−2(k+log(1 /δ))), by using Lemma G.11 , we have
+(1−ϵ)∥y∥2≤∥V y∥2≤(1+ϵ)∥y∥2
+As the input of the function fhere is the output of a softmax function ( ℓ2version), we know that ∥y∥2=1.
+Thus, we have
+(1−ϵ)≤∥V y∥2≤(1+ϵ)
+By rescaling V, we have
+(1−ϵ)∥x∥2≤∥V y∥2≤(1+ϵ)∥x∥2.
+Lemma G.4. Letτ∈(0,1). LetX ⊂Rddenote a subspace with rank k. Letfbe defined based on σ1function. Suppose
+Vis a random Gaussian matrix with d≥Ω((k+log(1 /δ)))rows. Let V=1
+2τV.
+Then we have
+1
+4√sτ·∥x∥2≤∥f(x)∥2≤τ·∥x∥2
+for all unit vectors x.
+Proof. By property of subspace embedding, we know that if d≥Ω(ϵ−2(s+log(1 /δ))),
+(1−ϵ)∥y∥2≤∥V y∥2≤(1+ϵ)∥y∥2
+By property of function of f, we know we only need to care ∥y∥1=1, this implies that
+1√s∥y∥1≤∥y∥2≤∥y∥1
+23
+
+--- PAGE 24 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+On one hand, we have
+∥V y∥2≤(1+ϵ)·∥y∥2
+≤(1+ϵ)·∥y∥1
+= (1+ ϵ), (4)
+where the first step follows from ∥V y∥2≤(1+ϵ)∥y∥2, the second step follows from ∥y∥2≤∥y∥1and the last step follows
+from∥y∥1=1.
+On the other hand, we have
+∥V y∥2≥(1−ϵ)∥y∥2
+≥1√s(1−ϵ)∥y∥1
+=1√s(1−ϵ), (5)
+where the first step follows from (1−ϵ)∥y∥2≤∥V y∥2, the second step follows from1√s∥y∥1≤∥y∥2and the last step follows
+from∥y∥1=1.
+Combining Eq. (5)and Eq. (4) together, we have
+(1−ϵ)1√s≤∥V y∥2≤(1+ϵ)
+Choosing ϵ=1/2, we have
+1
+2√s≤∥V y∥2≤2.
+ByV=1
+2τVand∥x∥2=1, we have
+1
+4√sτ∥x∥2≤∥V y∥2≤τ∥x∥2.
+G.2 ReLU Functions
+We use ϕ:R→Rto denote ReLU function, i.e., ϕ(z)=max {z,0}.
+We define function g:Rd→Rd
+g(x)=V·(ϕ(K·x)) (6)
+LetK∈Rs×dandV∈Rd×s.
+Lemma G.5. LetX ⊂Rddenote a rank- ksubspace. Let Kdenote a random Gaussian matrix. Let Vdenote a random
+Gaussian matrix. Let s≥Ω(ϵ−2klog(1/(δϵ))). Letd≥Ω(ϵ−2(k+log(1 /δ))). Then we know with high probability 1−δ,
+for all unit vector x∈X
+(1−ϵ)∥x∥2≤∥f(x)∥2≤(1+ϵ)∥x∥2
+Proof. Suppose s≥Ω(ϵ−2log(1/δ)).
+Using Lemma G.6, Fact G.7, we can show that for each fixed
+(1−ϵ)∥x∥2≤∥ϕ(Kx)∥2≤(1+ϵ)∥x∥2
+holds with probability 1−δ.
+By a standard ϵ-net argument (Lemma G.9), the net points in Xis at most (10/ϵ)O(k).
+Taking a union bound over all the net points, we can show that for all x∈X
+(1−ϵ)∥x∥2≤∥ϕ(Kx)∥2≤(1+ϵ)∥x∥2
+holds with probability 1−δ/2ands≥Ω(ϵ−2klog(1/(δϵ))).
+Further, we using Lemma G.11, we can show that
+(1−ϵ)∥ϕ(Kx)∥2≤∥f(x)∥2≤(1+ϵ)∥ϕ(Kx)∥2
+holds with probability 1−δ/2.
+Combining together,
+(1−ϵ)2∥x∥2≤∥f(x)∥2≤(1+ϵ)2∥x∥2
+24
+
+--- PAGE 25 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+holds with probability 1−δ.
+Rescaling the ϵ, we complete the proof.
+G.3 Folded Gaussian Distribution
+We state a standard tool from literature,
+Lemma G.6 (Lemma 1 on page 1325 of Laurent and Massart (Laurent & Massart, 2000)) .LetX∼X2
+kbe a chi-squared
+distributed random variable with kdegrees of freedom. Each one has zero means and σ2variance.
+Then,
+Pr[X−kσ2≥(2√
+kt+2t)σ2]≤exp(−t)
+Pr[kσ2−X≥2√
+ktσ2]≤exp(−t)
+Further if k≥Ω(ϵ−2t)andt≥Ω(log(1 /δ)), then we have
+Pr[|X−kσ2|≤ϵkσ2]≤δ.
+We prove the following property,
+Fact G.7. Leth,q∈Rpbe fixed vectors and h̸= 0,W∈Rm×pbe random matrix with i.i.d. entries Wi,j∼ N(0,2
+m), and
+vector v∈Rmdefined as vi=ϕ((Wh)i)=1(W(h+q))i≥0(Wh)i. Then,
+•|vi|follows i.i.d. from the following distribution: with half probability |vi|=0, and with the other half probability |vi|
+follows from folded Gaussian distributions |N(0,2∥h∥2
+m)|.
+•m∥v∥2
+2∥h∥2is in distribution identical to χ2
+ω(chi-square distribution of order ω) where ωfollows from binomial distribution
+B(m,1/2).
+Proof. We assume each vector Wiis generated by first generating a gaussian vector g∼N(0,2I
+m)and then setting Wi=±g
+where the sign is chosen with half-half probability. Now, |⟨Wi,h⟩|=|⟨g,h⟩|only depends on g, and is in distribution identical
+to|N(0,2∥h∥2
+m)|. Next, after the sign is determined, the indicator 1⟨Wi,h+q⟩≥0is1with half probability and 0with another
+half. Therefore, |vi|satisfies the aforementioned distribution. As for ∥v∥2, letting ω∈{0,1,...,m}be the variable indicator
+how many indicators are 1, then ω∼B(m,1/2)andm∥v∥2
+2∥h∥2∼χ2
+ω.
+G.4 ℓ2subspace embedding
+We define a standard notion in sketching technique.3
+Definition G.8 (ℓ2subspace embedding (Sarlos, 2006)) .A(ϵ,δ,ℓ 2)-subspace embedding for the column space of an n×d
+matrix Ais a matrix Sfor which
+Pr[∀x∈Rd,∥SAx∥2
+2=(1±ϵ)∥Ax∥2
+2]≥1−δ.
+The above condition is equivalent to
+Pr[∥U⊤U−U⊤S⊤SU∥≤ϵ]≥1−δ.
+where the Uis the orthonormal basis of A.
+For the reason of above conditions are equivalent, we refer the readers to the survey (Woodruff, 2014).
+We state a standard tool in literature,
+Lemma G.9 (Lemma 5 in (Woodruff, 2014)) .LetX ⊂Rdbe rank k. For any γ∈(0,1), there is a γ-netNofXfor which
+|N|≤(1+4 /γ)k.
+3We remark that sketching technique has widely applied to many applications such as linear regression, low-rank approximation (Clarkson
+& Woodruff, 2013; Nelson & Nguyên, 2013; Lu et al., 2013; Boutsidis et al., 2016; Cohen, 2016; Razenshteyn et al., 2016; Song et al., 2017;
+2019), linear programming (Song & Yu, 2021; Dong et al., 2021; Jiang et al., 2021; Gu & Song, 2022), semi-definite programming (Gu &
+Song, 2022; Song et al., 2023b), empirical risk minimization(Lee et al., 2019; Qin et al., 2023b), training over-parameterized neural network
+(Brand et al., 2021; Song et al., 2021; Alman et al., 2022; Hu et al., 2022; Zhang, 2022).
+25
+
+--- PAGE 26 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+G.5 ℓ1subspace embedding
+When p=1, using Cauchy random variables, Sohler and Woodruff (Sohler & Woodruff, 2011) showed there exist ℓ1oblivious
+subspace embeddings with O(dlogd)rows and κ=O(dlogd). This approach was generalized by using p-stable random
+variables in work of Meng and Mahoney (Meng & Mahoney, 2013) to ℓp-norms when 1<p< 2, where they showed there
+existℓpoblivious subspace embeddings with O(dlogd)rows and κ=O((dlogd)1/p). Unlike the case when p= 2, due to
+the large distortion
+In (Wang & Woodruff, 2018), they show for every 1≤p<2, any oblivious subspace embedding with dimension rhas distortion
+κ=Ω(1
+(1
+d)1/p·log2/pr+(r
+n)1/p−1/2). They also give sparse oblivious subspace embeddings for every 1≤p<2which are optimal
+in dimension and distortion, up to poly (logd)factors. Importantly for p=1, they achieve r=O(dlogd),κ=O(dlogd)and
+s=O(logd)non-zero entries per column.
+Definition G.10 (ℓ1subspace embedding) .Let0<α<β be parameters. We will say a matrix Sis anℓ1subspace embedding
+for an n×dmatrix Aif there are constants c1,c2>0so that for all x∈Rd,
+∥Ax∥≤∥SAx∥1≤dc1∥Ax∥1,
+andShas at most dc2rows.
+G.6 Random Matrices
+Matrices b Time for R·A Reference
+Random Gaussian ϵ−2(d+log(1 /δ)) Tmat(b,n,d) Thm. 6 of (Woodruff, 2014)
+SRHT ϵ−2(√
+d+√logn)2log(d/δ)ndlog(ϵ−1d(logn)) Thm. 7 of (Woodruff, 2014)
+AMS ϵ−2(d+log(1 /δ)) Tmat(b,n,d) Follow from JL guarantee
+Count-sketch ϵ−2δ−1d2nnz(A) Thm. 9 of (Woodruff, 2014)
+Sparse embedding ϵ−2d·polylog(d/(ϵδ)) ϵ−1nnz(A)polylog(d/(ϵδ)) Thm. 10 (2) of (Woodruff, 2014)
+Sparse embedding ϵ−2d1+γϵ−1nnz(A)poly(1 /γ) Thm. 10 (1) of (Woodruff, 2014)
+Table 9. Summary for different sketching matrices for subspace embedding. The sketching matrix Rhas size b×n. The vectors are from the
+column subspace of matrix Awith size n×d.ϵ∈(0,1)is the error parameter, and δ∈(0,1)is the probability parameter. Tmat(a,b,c)denotes
+the running time of fast matrix multiplication of two matrices with size a×bandb×c.In the first sparse embedding matrix, each column has
+s≥ϵ−1polylog(d/(ϵδ))non-zero entries; In the second sparse embedding matrix, each column has s≥ϵ−1poly(1/γ)non-zero entries,
+γ >0is a tunable parameter that gives different trade-offs, and δcan be as small as 1/poly(d).For count-sketch matrices, the subspace
+embedding guarantee is proved from JL moment property, instead of directly from JL guarantee.
+Lemma G.11 (Theorem 6 of (Woodruff, 2014)) .Let0< ϵ,δ < 1andS=1√
+kR∈Rk×nwhere the entries Ri,jofRare
+independent standard normal random variables. Then if k= Θ(ϵ−2(d+log(1 /δ))), then for any fixed n×dmatrix A, with
+probability 1−δ,Sis a(1±ϵ)ℓ2-subspace embedding for A, that is, simultaneously for all x∈Rd,∥SAx∥2=(1±ϵ)∥Ax∥2.
+HereC >0is an absolute constant.
+We consider several standard sketching matrices:
+1. Random Gaussian matrices.
+2. Subsampled randomized Hadamard/Fourier transform (SRHT) matrices (Lu et al., 2013).
+3. AMS sketch matrices (Alon et al., 1996), random {−1,+1}per entry.
+4.Count-Sketch matrices (Charikar et al., 2002), each column only has one non-zero entry, and is −1,+1half probability
+each.
+5.Sparse embedding matrices (Nelson & Nguyên, 2013), each column only has snon-zero entries, and each entry is
+−1√s,+1√shalf probability each.
+6. Uniform sampling matrices.
+Definition G.12 (Random Gaussian matrix) .We say R∈Rb×nis a random Gaussian matrix if all entries are sampled from
+N(0,1/b)independently.
+26
+
+--- PAGE 27 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+Definition G.13 (Subsampled randomized Hadamard/Fourier transform matrix (Lu et al., 2013)) .We say R∈Rb×nis a
+subsampled randomized Hadamard transform (SRHT) matrix4if it is of the form R=p
+n/bSHD , where S∈Rb×nis a random
+matrix whose rows are b uniform samples (without replacement) from the standard basis of Rn,H∈Rn×nis a normalized
+Walsh-Hadamard matrix, and D∈Rn×nis a diagonal matrix whose diagonal elements are i.i.d. Rademacher random variables.
+Definition G.14 (AMS sketch matrix (Alon et al., 1996)) .Leth1,h2,···,hbbebrandom hash functions picking from a 4-wise
+independent hash family H={h:[n]→{−1√
+b,+1√
+b}}. Then R∈Rb×nis a AMS sketch matrix if we set Ri,j=hi(j)
+Definition G.15 (Count-sketch matrix (Charikar et al., 2002)) .Leth:[n]→[b]be a random 2-wise independent hash function
+andσ: [n]→{− 1,+1}be a random 4-wise independent hash function. Then R∈Rb×nis a count-sketch matrix if we set
+Rh(i),i=σ(i)for all i∈[n]and other entries to zero.
+Definition G.16 (Sparse embedding matrix I (Nelson & Nguyên, 2013)) .We say R∈Rb×nis a sparse embedding matrix
+with parameter sif each column has exactly snon-zero elements being ±1/√suniformly at random, whose locations are
+picked uniformly at random without replacement (and independent across columns)5.
+Definition G.17 (Sparse embedding matrix II (Nelson & Nguyên, 2013)) .Leth: [n]×[s]→[b/s]be a random 2-wise
+independent hash function and σ:[n]×[s]→{− 1,1}be a 4-wise independent. Then R∈Rb×nis a sparse embedding matrix
+II with parameter sif we set R(j−1)b/s+h(i,j),i=σ(i,j)/√sfor all (i,j)∈[n]×[s]and all other entries to zero6.
+Definition G.18 (Uniform sampling matrix) .We say R∈Rb×nis a uniform sampling matrix if it is of the form R=p
+n/bSD ,
+where S∈Rb×nis a random matrix whose rows are b uniform samples (without replacement) from the standard basis of
+Rn, andD∈Rn×nis a diagonal matrix whose diagonal elements are i.i.d. Rademacher random variables.
+H Distances, Angles, and Inner Product
+Most of the properties in this section are very standard in literature, e.g., see (Gu et al., 2023).
+LetU∈Rn×kdenote an orthonormal basis, we use U⊥∈Rn×(n−k)denote the matrix such that UU⊤+U⊥U⊤
+⊥=In.
+Definition H.1. LetX∈Rn×kandY∈Rn×k.
+For any matrix X, and for orthogonal matrix Y(Y⊤Y=Ik) we define
+•tanθ(Y,X):=∥Y⊤
+⊥X(Y⊤X)−1∥
+For orthogonal matrices YandX(Y⊤Y=IkandX⊤X=Ik), we define
+•cosθ(Y,X):=σmin(Y⊤X).
+–It is obvious that cos(Y,X)=1/∥(Y⊤X)−1∥andcos(Y,X)≤1.
+•sinθ(Y,X):=∥(I−Y Y⊤)X∥.
+–It is obvious that sinθ(Y,X)=∥Y⊥Y⊤
+⊥X∥=∥Y⊤
+⊥X∥andsinθ(Y,X)≤1.
+•dist(Y,X):=min Q∈Ok∥Y Q−X∥
+where Okis the set of k×korthogonal matrices.
+Lemma H.2 (Structural lemma for orthogonal matrices) .LetX,Y∈Rn×kbe orthogonal matrices. Then
+(Y⊤X)⊥=Y⊤
+⊥X.
+Proof. Let us first compute the Gram of Y⊤X, which is
+X⊤Y Y⊤X=X⊤(I−Y⊥Y⊤
+⊥)X
+=X⊤X−X⊤Y⊥Y⊤
+⊥X
+=Ik−X⊤Y⊥Y⊤
+⊥X,
+4In this case, we require logno be an integer.
+5For our purposes the signs need only be O(logd)-wise independent, and each column can be specified by a O(logd)-wise independent
+permutation, and the seeds specifying the permutations in different columns need only be O(logd)-wise independent.
+6This definition has the same behavior as sparse embedding matrix I for our purpose
+27
+
+--- PAGE 28 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+where the first step follows from Y⊥Y⊤
+⊥+Y Y⊤=I, the second step follows from simple algebra, and the last step follows
+fromXis an orthogonal matrix, so X⊤=X−1.
+This means that (Y⊤X)⊥=Y⊤
+⊥X.
+Lemma H.3 (Orthogonal and inverse share singular vectors) .LetA∈Rk×kbe non-singular, then A⊥andA−1have the
+same set of singular vectors. Consequently, ∥A⊥A−1∥=∥A⊥∥∥A−1∥.
+Proof. LetA∈Rk×kandA⊤A+A⊤
+⊥A⊥=Ik, we will show that ∥A⊥A−1∥=∥A⊥∥∥A−1∥. Let x∈Rkbe the unit
+eigenvector of Athat realizes the spectral norm, note that
+∥A⊥x∥2
+2= 1−∥A∥2,
+we argue that xcorresponds to the smallest singular value of A⊥via contradiction. Suppose there exists some unit vector
+ywith∥A⊥y∥2<∥A⊥x∥2, by definition, we know that ∥A⊥y∥2
+2+∥Ay∥2
+2= 1, this means that ∥Ay∥2>∥Ax∥2=∥A∥,
+contradicts the definition of spectral norm. Similarly, if zis the unit vector that realizes the spectral norm of A⊥, then it is
+also singular vector corresponds to the smallest singular value of A, or equivalently, the spectral norm of A−1. Our above
+argument essentially implies that A⊥andA−1have the same set of singular vectors. The proof is then straightforward:
+suppose A⊥z=λzandA−1z=µz, then
+A⊥A−1z=A⊥µz
+=µ(A⊥z)
+=λµz,
+where the first step follows from our assumption, the second step follows from µis a real number and a real number multiplying
+a matrix is commutative and follows from the associative property, and the third step follows from our assumption.
+Thus, we have ∥A⊥A−1∥=∥A⊥∥∥A−1∥, and we have proved the assertion.
+Lemma H.4. LetX,Y∈Rn×kbe orthogonal matrices, then
+tanθ(Y,X)=sinθ(Y,X)
+cosθ(Y,X).
+Proof. Due to Lemma H.2, we have (Y⊤X)⊥=Y⊤
+⊥X. Thus, tanθ(Y,X)=∥(Y⊤X)⊥(Y⊤X)−1∥. The proof then follows
+straightforwardly from Lemma H.3.
+Lemma H.5. LetX,Y∈Rn×kbe orthogonal matrices, then sin2θ(Y,X)+cos2θ(Y,X)=1 .
+Proof. Recall that cosθ(Y,X) =1
+∥(Y⊤X)−1∥andsinθ(Y,X) =∥Y⊤
+⊥X∥, by Lemma H.2, we know that (Y⊤X)⊥=Y⊤
+⊥X,
+therefore sinθ(Y,X) =∥(Y⊤X)⊥∥. Let A:=Y⊤X, by Lemma H.3, we know that A⊥andA−1have the same singular
+vectors, or equivalently, the singular vector realizing ∥A⊥∥corresponds to the smallest singular value of A. Letz∈Rkbe
+the unit singular vector with singular value ∥A⊥∥, then
+z⊤A⊤Az+z⊤A⊤
+⊥A⊥z= 1,
+∥A⊥∥2+σ2
+min(A)= 1,
+cos2θ(Y,X)+sin2θ(Y,X)= 1.
+This completes the proof.
+H.1 Angle is close
+Lemma H.6. Letϵ∈(0,0.1)Letxdenote a unit vector, i.e., ∥x∥2=1.
+Letz=(x+y)/∥x+y∥2.
+If∥y∥2≤ϵ·∥x∥2, thenp
+1−⟨x,z⟩2≤2√ϵ
+Proof. We have
+∥x+y∥2≥ ∥x∥2−∥y∥2
+≥1−ϵ
+where the first step follows from triangle inequality.
+28
+
+--- PAGE 29 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+We also have
+∥x+y∥2≤ ∥x∥2+∥y∥2
+≤1+ϵ (7)
+We have
+(1−ϵ)2≥1−2ϵ (8)
+We also have1
+(1+ϵ)2≥1−3ϵ (9)
+where ϵ∈(0,0.1).
+Combining Eq. (8) and Eq. (9), we have
+1
+(1+ϵ)2·(1−ϵ)2≥(1−2ϵ)·(1−3ϵ)
+= 1−5ϵ+6ϵ2
+≥1−5ϵ+ϵ
+= 1−4ϵ (10)
+where the first step follows from Eq. (8) and Eq. (9) and the rest of them follow from simple algebra.
+Finally, we have
+1−⟨x,z⟩2= 1−⟨x,x+y
+∥x+y∥2⟩2
+= 1−1
+∥x+y∥2
+2⟨x,x+y⟩2
+= 1−1
+∥x+y∥2
+2·(∥x∥2
+2+⟨x,y⟩)2
+= 1−1
+∥x+y∥2
+2·(1+⟨x,y⟩)2
+≤1−1
+(1+ϵ)2·(1+⟨x,y⟩)2
+≤1−1
+(1+ϵ)2·(1−ϵ)2
+≤1−(1−4ϵ)
+= 4ϵ,
+where the first step follow the definition of z, the second step follows from the reorganization, the third step follows from
+the definition of inner product, the fourth step follows from ∥x∥2=1, the fifth step follows from Eq. (7), the sixth step follows
+from 1+⟨x,y⟩≥1−|⟨x,y⟩|≥1−∥x∥2·∥y∥2≥1−ϵ, the seventh step follows from Eq. (10) and the last step follows from
+simple algebra.
+I Function Approximations
+We first we show the function approximation for two operators in Section I.1, which means that there are two functions. Then
+we show the function approximations for four operators in Section I.2.
+I.1 Function Approximations for Two Operators
+Lemma I.1. Letf1:Rd→Rdand let f2:Rd→Rd.
+Assume the the following conditions
+•Condition 1a. f1is a linear function
+•Condition 1b. ∥f1(x)∥2≤ϵ1∥x∥2(f1is shrinking)
+•Condition 1c. ∥f1(x)−f1(y)∥2≤L1∥x−y∥2(f1is Lipschitz)
+29
+
+--- PAGE 30 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+•Condition 2a. f2is a linear function
+•Condition 2b. ∥f2(x)∥2≤ϵ2∥x∥2(f2is shrinking)
+•Condition 2c. ∥f2(x)−f2(y)∥2≤L2∥x−y∥2(f2is Lipschitz)
+We define three functions
+•
+g1(x)=: (I+f1)·(I+f2)(x)
+=x+f2(x)+f1(x+f2(x))
+•
+g2(x)=: (I+f2)·(I+f1)(x)
+=x+f1(x)+f2(x+f1(x))
+•
+g3(x)=: (I+f1+f2)(x)
+=x+f1(x)+f2(x)
+Then we can show that
+•Part 1. ∥g1(x)−g2(x)∥2≤2ϵ1ϵ2∥x∥2(iff1andf2are linear functions)
+•Part 2. ∥g1(x)−g2(x)∥2≤(ϵ2·L1+ϵ1·L2)∥x∥2(iff1andf2are Lipschitz functions)
+•Part 3. ∥g1(x)−g3(x)∥2≤ϵ1ϵ2∥x∥2(iff1is a linear function)
+•Part 4. ∥g1(x)−g3(x)∥2≤ϵ2·L1∥x∥2(iff1is a Lipschitz function)
+•Part 5. ∥g2(x)−g3(x)∥2≤ϵ1ϵ2∥x∥2(iff2is a linear function)
+•Part 6. ∥g2(x)−g3(x)∥2≤ϵ1·L2∥x∥2(iff2is a Lipschitz function)
+Proof. Part 1.
+We have
+∥g1(x)−g2(x)∥2≤ ∥g1(x)−g3(x)∥2+∥g3(x)−g2(x)∥2
+≤ϵ1ϵ2∥x∥2+ϵ1ϵ2∥x∥2
+= 2ϵ1ϵ2∥x∥2
+where the first step follows from triangular inequality, the second step follows from Part 3 and Part 5 and the last step follows
+from simple algebra.
+Part 2.
+We have
+∥g1(x)−g2(x)∥2≤ ∥g1(x)−g3(x)∥2+∥g3(x)−g2(x)∥2
+≤ϵ2·L1∥x∥2+ϵ1·L2∥x∥2
+= (ϵ2·L1+ϵ1·L2)∥x∥2
+where the first step follows from triangular inequality, the second step follows from Part 4 and Part 6 and the last step follows
+from simple algebra.
+Part 3.
+30
+
+--- PAGE 31 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+We have
+∥g1(x)−g3(x)∥2=∥f1(x+f2(x))−f1(x)∥2
+=∥f1(x+f2(x)−x)∥2
+=∥f1(f2(x))∥2
+≤ϵ1·∥f2(x)∥2
+≤ϵ1·ϵ2·∥x∥2,
+where the first step follows from the definition of g1andg3, the second step follows from the fact that f1is a linear function, the
+third step follows from simple algebra, the fourth step follows from Condition 1b and the last step follows from Condition 2b.
+Part 4.
+∥g1(x)−g3(x)∥2=∥f1(x+f2(x))−f1(x)∥2
+≤L1·∥x+f2(x)−x∥2
+=L1·∥f2(x)∥2
+≤L1·ϵ2∥x∥2,
+where the first step follows from definition of g1andg3, the second step follows from Condition 1c, the third step follows
+from simple algebra and the last step follows from Condition 2b.
+Part 5.
+We have
+∥g2(x)−g3(x)∥2=∥f2(x+f1(x))−f2(x)∥2
+=∥f2(x+f1(x)−x)∥2
+=∥f2(f1(x))∥2
+≤ϵ2·∥f1(x)∥2
+≤ϵ2·ϵ1·∥x∥2,
+where the first step follows from the definition of g2andg3, the second step follows from the fact that f2is a linear function, the
+third step follows from simple algebra, the fourth step follows from Condition 2b and the last step follows from Condition 1b.
+Part 6.
+∥g2(x)−g3(x)∥2=∥f2(x+f1(x))−f2(x)∥2
+≤L2·∥x+f1(x)−x∥2
+=L2·∥f1(x)∥2
+≤L2·ϵ1∥x∥2,
+where the first step follows from definition of g1andg3, the second step follows from Condition 2c, the third step follows from
+simple algebra and the last step follows from Condition 1b.
+I.2 Function Approximations for Four Operators
+Lemma I.2. For each i∈[4], we assume the following conditions
+•i(a)fiis a linear function
+•i(b)∥fi(x)∥2≤ϵi∥x∥2(fiis shriking)
+•i(c)∥fi(x)−fi(y)∥2≤Li∥x−y∥2(fiis Lipschitz)
+We define three functions
+•g1(x):=(I+f1)·(I+f2)·(I+f3)·(I+f4)(x)
+•g2(x):=(I+f1)·(I+f3)·(I+f2)·(I+f4)(x)
+•g3(x):=(I+f1+f2+f3+f4)(x)
+31
+
+--- PAGE 32 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+Then, we can show that
+•Part 1. ∥g1(x)−g2(x)∥2≤2(ϵ1ϵ2+ϵ1ϵ3+ϵ1ϵ4+ϵ2ϵ3+ϵ2ϵ4+ϵ3ϵ4+ϵ1ϵ2ϵ3+ϵ1ϵ2ϵ4+ϵ1ϵ3ϵ4+ϵ2ϵ3ϵ4+ϵ1ϵ2ϵ3ϵ4)∥x∥2
+(iffi,∀i∈[4]are linear functions)
+•Part 2. ∥g1(x)−g2(x)∥2≤(2L1ϵ2+ 2L1ϵ3+ 2L1ϵ4+L2ϵ3+ 2L2ϵ4+ 2L3ϵ4+ 2L1ϵ2ϵ3+ 2L1ϵ2ϵ4+ 2L1ϵ3ϵ4+
+L2ϵ3ϵ4+2L1ϵ2ϵ3ϵ4+L3ϵ2+L3ϵ2ϵ4)∥x∥2(iffi,∀i∈[4]are Lipschitz functions)
+•Part 3. ∥g1(x)−g3(x)∥2≤(ϵ1ϵ2+ϵ1ϵ3+ϵ1ϵ4+ϵ2ϵ3+ϵ2ϵ4+ϵ3ϵ4+ϵ1ϵ2ϵ3+ϵ1ϵ2ϵ4+ϵ1ϵ3ϵ4+ϵ2ϵ3ϵ4+ϵ1ϵ2ϵ3ϵ4)∥x∥2
+(iffi,∀i∈[4]are linear functions)
+•Part 4. ∥g1(x)−g3(x)∥2≤(L1ϵ2+L1ϵ3+L1ϵ4+L2ϵ3+L2ϵ4+L3ϵ4+L1ϵ2ϵ3+L1ϵ2ϵ4+L1ϵ3ϵ4+L2ϵ3ϵ4+
+L1ϵ2ϵ3ϵ4)∥x∥2(iffi,∀i∈[4]are Lipschitz functions)
+•Part 5. ∥g2(x)−g3(x)∥2≤(ϵ1ϵ2+ϵ1ϵ3+ϵ1ϵ4+ϵ2ϵ3+ϵ2ϵ4+ϵ3ϵ4+ϵ1ϵ2ϵ3+ϵ1ϵ2ϵ4+ϵ1ϵ3ϵ4+ϵ2ϵ3ϵ4+ϵ1ϵ2ϵ3ϵ4)∥x∥2
+(iffi,∀i∈[4]are linear functions)
+•Part 6. ∥g2(x)−g3(x)∥2≤(L1ϵ2+L1ϵ3+L1ϵ4+L2ϵ4+L3ϵ2+L3ϵ4+L1ϵ2ϵ3+L1ϵ2ϵ4+L1ϵ3ϵ4+L3ϵ2ϵ4+
+L1ϵ2ϵ3ϵ4)∥x∥2
+(iffi,∀i∈[4]are Lipschitz functions)
+Proof. Part 1.
+We have
+∥g1(x)−g2(x)∥2≤ ∥g1(x)−g3(x)∥2+∥g3(x)−g2(x)∥2
+≤2(ϵ1ϵ2+ϵ1ϵ3+ϵ1ϵ4+ϵ2ϵ3+ϵ2ϵ4+ϵ3ϵ4+ϵ1ϵ2ϵ3+ϵ1ϵ2ϵ4+ϵ1ϵ3ϵ4+ϵ2ϵ3ϵ4+ϵ1ϵ2ϵ3ϵ4)∥x∥2
+where the first step follows from triangular inequality and the last step follows from Part 3 and Part 5.
+Part 2.
+We have
+∥g1(x)−g2(x)∥2≤ ∥g1(x)−g3(x)∥2+∥g3(x)−g2(x)∥2
+≤(2L1ϵ2+2L1ϵ3+2L1ϵ4+L2ϵ3+2L2ϵ4+2L3ϵ4+2L1ϵ2ϵ3+2L1ϵ2ϵ4+2L1ϵ3ϵ4+
+L2ϵ3ϵ4+2L1ϵ2ϵ3ϵ4+L3ϵ2+L3ϵ2ϵ4)∥x∥2
+where the first step follows from triangular inequality and the last step follows from Part 4 and Part 6.
+Part 3. We have
+∥g1(x)−g3(x)∥2=∥(I+f1)·(I+f2)·(I+f3)·(x+f4(x))−(I+f1+f2+f3+f4)(x))∥2
+=∥(x+f4(x)+f3(x+f4(x))+f2(x+f4(x)+
+f3(x+f4(x)))+f1(x+f4(x)+f3(x+f4(x))+f2(x+f4(x)+f3(x+f4(x))))
+−(I+f1+f2+f3+f4)(x)))∥2
+=∥f3(f4(x))+f2(f4(x)+f3(x+f4(x)))+f1(f4(x)+
+f3(x+f4(x))+f2(x+f4(x)+f3(x+f4(x)))))∥2
+=∥f3(f4(x))+f2(f4(x))+f2(f3(x))+f2(f3(f4(x)))+
+f1(f4(x))+f1(f3(x))+f1(f3(f4(x)))+f1(f2(x))+f1(f2(f4(x)))
++f1(f2(f3(x)))+f1(f2(f3(f4(x)))))∥2
+≤ ∥f3(f4(x))∥2+∥f2(f4(x))∥2+∥f2(f3(x))∥2+∥f2(f3(f4(x)))∥2+
+∥f1(f4(x))∥2+∥f1(f3(x))∥2+∥f1(f3(f4(x)))∥2+∥f1(f2(x))∥2+∥f1(f2(f4(x)))∥2+
+∥f1(f2(f3(x)))∥2+∥f1(f2(f3(f4(x))))∥2
+≤(ϵ3ϵ4+ϵ2ϵ4+ϵ2ϵ3+ϵ2ϵ3ϵ4+ϵ1ϵ4+ϵ1ϵ3+ϵ1ϵ3ϵ4+ϵ1ϵ2+ϵ1ϵ2ϵ4+ϵ1ϵ2ϵ3+ϵ1ϵ2ϵ3ϵ4)∥x∥2
+= (ϵ1ϵ2+ϵ1ϵ3+ϵ1ϵ4+ϵ2ϵ3+ϵ2ϵ4+ϵ3ϵ4+ϵ1ϵ2ϵ3+ϵ1ϵ2ϵ4+ϵ1ϵ3ϵ4+ϵ2ϵ3ϵ4+ϵ1ϵ2ϵ3ϵ4)∥x∥2,
+where the first step follows from the definition of g1andg3, the second step follows from simple algebra, the third step follows
+from reorganization, the fourth step follows from the fact that all fi,∀i∈[4]are linear function, the fifth step follows from
+triangular inequality, the sixth step follows from i(b)and the last step follows from reorganization.
+32
+
+--- PAGE 33 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+Part 4. We have
+∥g1(x)−g3(x)∥2=∥(I+f1)·(I+f2)·(I+f3)·(x+f4(x))−(I+f1+f2+f3+f4)(x))∥2
+=∥x+f4(x)+f3(x+f4(x))+f2(x+f4(x)+
+f3(x+f4(x)))+f1(x+f4(x)+f3(x+f4(x))+f2(x+f4(x)+f3(x+f4(x))))
+−(I+f1+f2+f3+f4)(x))∥2
+=∥f3(x+f4(x))+f2(x+f4(x)+f3(x+f4(x)))
++f1(x+f4(x)+f3(x+f4(x))+f2(x+f4(x)+f3(x+f4(x))))
+−f1(x)−f2(x)−f3(x))∥2
+=∥f3(x+f4(x))−f3(x)+f2(x+f4(x)+f3(x+f4(x)))−f2(x)
++f1(x+f4(x)+f3(x+f4(x))+f2(x+f4(x)+f3(x+f4(x))))−f1(x)∥
+≤L3∥x+f4(x)−x∥2+L2∥x+f4(x)+f3(x+f4(x))−x∥2
++L1∥x+f4(x)+f3(x+f4(x))+f2(x+f4(x)+f3(x+f4(x)))−x∥2
+≤L3∥f4(x)∥2+L2∥f4(x)+f3(x+f4(x))∥2
++L1∥f4(x)+f3(x+f4(x))+f2(x+f4(x)+f3(x+f4(x)))∥2
+≤L3ϵ4∥x∥2+L2ϵ4∥x∥2+L2ϵ3∥x+f4(x)∥2
++L1ϵ4∥x∥2+L1ϵ3∥x+f4(x)∥2+L1ϵ2∥x+f4(x)+f3(x+f4(x))∥2
+≤L3ϵ4∥x∥2+L2ϵ4∥x∥2+L2ϵ3∥x∥+L2ϵ3ϵ4∥x∥2
++L1ϵ4∥x∥2+L1ϵ3∥x∥2+L1ϵ3ϵ4∥x∥2+L1ϵ2∥x∥2+L1ϵ2ϵ4∥x∥2+L1ϵ2ϵ3∥x+f4(x)∥2
+≤L3ϵ4∥x∥2+L2ϵ4∥x∥2+L2ϵ3∥x∥+L2ϵ3ϵ4∥x∥2
++L1ϵ4∥x∥2+L1ϵ3∥x∥2+L1ϵ3ϵ4∥x∥2+L1ϵ2∥x∥2+L1ϵ2ϵ4∥x∥2+L1ϵ2ϵ4∥x∥2+L1ϵ2ϵ3ϵ4∥x∥2
+= (L3ϵ4+L2ϵ4+L2ϵ3+L2ϵ3ϵ4+L1ϵ4+L1ϵ3+L1ϵ3ϵ4+L1ϵ2+L1ϵ2ϵ4+L1ϵ2ϵ3+L1ϵ2ϵ3ϵ4)∥x∥2
+= (L1ϵ2+L1ϵ3+L1ϵ4+L2ϵ3+L2ϵ4+L3ϵ4+L1ϵ2ϵ3+L1ϵ2ϵ4+L1ϵ3ϵ4+L2ϵ3ϵ4+L1ϵ2ϵ3ϵ4)∥x∥2
+where the first step follows from the definition of g1andg3, the second step follows from simple algebra, the third step follows
+from simple algebra, the fourth step follows from reorganization, the fifth step follows from the fact that all fi,∀i∈[4]are Lips-
+chitz functions, the sixth step follows from simple algebra, the seventh step follows from i(b), the eighth step follows from trian-
+gular inequality, the ninth step follows from i(b), the tenth step follows from i(b)and the last step follows from reorganization.
+Part 5. We have
+∥g2(x)−g3(x)∥2=∥(I+f1)·(I+f3)·(I+f2)·(x+f4(x))−(I+f1+f2+f3+f4)(x))∥2
+=∥(x+f4(x)+f2(x+f4(x))+f3(x+f4(x)+
+f2(x+f4(x)))+f1(x+f4(x)+f2(x+f4(x))+f3(x+f4(x)+f2(x+f4(x))))
+−(I+f1+f2+f3+f4)(x)))∥2
+=∥f2(f4(x))+f3(f4(x))+
+f3(f2(x+f4(x)))+f1(f4(x))+f1(f2(x+f4(x)))+f1(f3(x+f4(x)+f2(x+f4(x)))))∥2
+≤(ϵ2ϵ4+ϵ3ϵ4+ϵ3ϵ2+ϵ3ϵ2ϵ4+ϵ1ϵ4+ϵ1ϵ2+ϵ1ϵ2ϵ4+ϵ1ϵ3+ϵ1ϵ3ϵ4+ϵ1ϵ3ϵ2+ϵ1ϵ3ϵ2ϵ4)∥x∥2
+= (ϵ1ϵ2+ϵ1ϵ3+ϵ1ϵ4+ϵ2ϵ3+ϵ2ϵ4+ϵ3ϵ4+ϵ1ϵ2ϵ3+ϵ1ϵ2ϵ4+ϵ1ϵ3ϵ4+ϵ2ϵ3ϵ4+ϵ1ϵ2ϵ3ϵ4)∥x∥2,
+where the first step follows from the definition of g2andg3, the second step follows from simple algebra, the third step follows
+from the fact that all fi,∀i∈[4]are linear function, the fourth step follows from triangular inequality and i(b), and the last
+step follows from reorganization.
+33
+
+--- PAGE 34 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+Part 6. We have
+∥g2(x)−g3(x)∥2=∥(I+f1)·(I+f3)·(I+f2)·(x+f4(x))−(I+f1+f2+f3+f4)(x))∥2
+=∥(x+f4(x)+f2(x+f4(x))+f3(x+f4(x)+f2(x+f4(x)))
++f1(x+f4(x)+f2(x+f4(x))+f3(x+f4(x)+f2(x+f4(x))))
+−(I+f1+f2+f3+f4)(x)))∥2
+=∥f2(x+f4(x))−f2(x)+f3(x+f4(x)+f2(x+f4(x)))−f3(x)
++f1(x+f4(x)+f2(x+f4(x))+f3(x+f4(x)+f2(x+f4(x))))−f1(x)∥2
+≤ ∥f2(x+f4(x))−f2(x)∥2+∥f3(x+f4(x)+f2(x+f4(x)))−f3(x)∥2
++∥f1(x+f4(x)+f2(x+f4(x))+f3(x+f4(x)+f2(x+f4(x))))−f1(x)∥2
+≤L2ϵ4∥x∥2+L3ϵ4∥x∥2+L3ϵ2∥x+f4(x)∥2
++L1ϵ4∥x∥2+L1ϵ2∥x+f4(x)∥2+L1ϵ3∥x+f4(x)+f2(x+f4(x))∥2
+≤L2ϵ4∥x∥2+L3ϵ4∥x∥2+L3ϵ2∥x∥2+L3ϵ2ϵ4∥x∥2
++L1ϵ4∥x∥2+L1ϵ2∥x∥2+L1ϵ2ϵ4∥x∥2+L1ϵ3∥x∥+L1ϵ3ϵ4∥x∥2+L1ϵ3ϵ2∥x∥2+L1ϵ3ϵ2ϵ4∥x∥2
+= (L1ϵ2+L1ϵ3+L1ϵ4+L2ϵ4+L3ϵ2+L3ϵ4+L1ϵ2ϵ3+L1ϵ2ϵ4+L1ϵ3ϵ4+L3ϵ2ϵ4+L1ϵ2ϵ3ϵ4)∥x∥2
+where the first step follows from the definition of g2andg3, the second step follows from simple algebra, the third step follows
+from reorganization, the fourth step follows from triangular inequality, the fifth step follows from the fact that all fi,∀i∈[4]are
+Lipschitz functions and i(b), the sixth step follows from triangular inequality, and the last step follows from reorganization.
+J Nearest Neighbor Search Data Structure
+We use the reduction-based approximate MaxIP method with LSH data-structure to achieve sublinear iteration cost. Note
+that we choose this method due to its clear theoretical guarantee on the retrieval results. It is well-known that an LSH
+data-structures is used for approximate nearest neighbor problem. The following definition of approximate nearest neighbor
+search is very standard in literature (Arya & Mount, 1993; Indyk & Motwani, 1998a; Datar et al., 2004; Andoni et al., 2014;
+2015; Andoni & Razenshteyn, 2015; Indyk & Wagner, 2018; Andoni et al., 2017; 2018; Dong et al., 2019; Chen et al., 2020b;
+Li & Li, 2022; Li et al., 2019).
+J.1 LSH andMaxIP
+We start with the defining the Approximate Nearest Neighbor ( ANN ) problem (Arya & Mount, 1993; Indyk & Motwani,
+1998a; Datar et al., 2004; Andoni et al., 2014; 2015; Andoni & Razenshteyn, 2015; Indyk & Wagner, 2018; Andoni et al.,
+2017; 2018; Dong et al., 2019; Chen et al., 2020b) as:
+Definition J.1 (Approximate Nearest Neighbor ( ANN )).Letc>1andr∈(0,2)denote two parameters. Given an n-vector
+setY⊂Sd−1on a unit sphere, the objective of the (c,r)-Approximate Nearest Neighbor ( ANN ) is to construct a data structure
+that, for any query x∈Sd−1such that miny∈Y∥y−x∥2≤r, it returns a vector zfromYthat satisfies ∥z−x∥2≤c·r.
+TheANN problem can be solved via locality sensitive hashing ( LSH) (Indyk & Motwani, 1998a; Datar et al., 2004; Indyk
+& Wagner, 2018). In this paper, we use the standard definitions of LSH (see Indyk and Motwani (Indyk & Motwani, 1998a)).
+Definition J.2 (Locality Sensitive Hashing) .Letc >1denote a parameter. Let p1,p2∈(0,1)denote two parameters and
+p1> p2. We say a function family His(r,c·r,p1,p2)-sensitive if and only if, for any vectors x,y∈Rd, for any hchosen
+uniformly at random from H, we have:
+• if∥x−y∥2≤r, then Prh∼H[h(x)=h(y)]≥p1,
+• if∥x−y∥2≥c·r, then Prh∼H[h(x)=h(y)]≤p2.
+Next, we show that LSH solves ANN problem with sublinear query time complexity.
+Theorem J.3 (Andoni, Laarhoven, Razenshteyn and Waingarten (Andoni et al., 2017)) .Letc>1andr∈(0,2)denote two
+parameters. One can solve (c,r)-ANN on a unit sphere in query time O(d·nρ)using preprocessing time O(dn1+o(1))and
+space O(n1+o(1)+dn), where ρ=2
+c2−1
+c4+o(1).
+34
+
+--- PAGE 35 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+Here we write o(1)is equivalent to O(1/√logn). Note that we could reduce dtono(1)with Johnson–Lindenstrauss
+Lemma (Johnson & Lindenstrauss, 1984). Besides, we could achieve better ρusing LSH in (Andoni & Razenshteyn, 2015)
+if we allowed to have more proprocessing time.
+In this work, we focus on a well-known problem in computational complexity: approximate MaxIP . In this work, we follow
+the standard notation in (Chen, 2018) and define the approximate MaxIP problem as follows:
+Definition J.4 (Approximate MaxIP ).Letc∈(0,1)andτ∈(0,1)denote two parameters. Given an n-vector dataset Y⊂Sd−1
+on a unit sphere, the objective of the (c,τ)-MaxIP is to construct a data structure that, given a query x∈Sd−1such that
+max y∈Y⟨x,y⟩≥τ, it retrieves a vector zfromYthat satisfies ⟨x,z⟩≥c·max y∈Y⟨x,y⟩.
+In many applications, it is more convenient to doing inner product search in a transformed/projected space compared to doing
+inner product search in the original space. Thus, we propose the following definitions (Definition J.5 and Definition J.6)
+Definition J.5 (Projected MaxIP ).Letϕ,ψ:Rd→Rkdenote two transforms. Given a data set Y⊆Rdand a point x∈Rd,
+we define (ϕ,ψ)-MaxIP as follows:
+(ϕ,ψ)-MaxIP (x,Y):=max
+y∈Y⟨ϕ(x),ψ(y)⟩
+Definition J.6 (Projected approximate MaxIP ).Letϕ,ψ:Rd→Rkdenote two transforms. Given an n-vector dataset
+Y⊂Rdso that ψ(Y)⊂Sk−1, the goal of the (c,ϕ,ψ,τ )-MaxIP is to construct a data structure that, given a query x∈Rdand
+ϕ(x)∈Sk−1such that max y∈Y⟨ϕ(x),ψ(y)⟩≥τ, it retrieves a vector z∈Ythat satisfies ⟨ϕ(x),ψ(z)⟩≥c·(ϕ,ψ)-MaxIP (x,Y).
+J.2 Connections
+Fact J.7. Letexdenote the vector that ⟨ex,x⟩≥1−1
+2ϵ2, where both exandxare unit vectors. We have
+∥ex−x∥2≤ϵ
+Proof.
+∥ex−x∥2= (∥ex∥2
+2+∥x∥2
+2−2⟨x,ex⟩)1/2
+= (2−2⟨x,ex⟩)1/2
+≤(2−2(1−1
+2ϵ2))1/2
+=ϵ
+Now, we complete the proof.
+Lemma J.8. Letexdenote the vector that ⟨ex,x⟩≥1−1
+2ϵ2, where both exandxare unit vectors. Let 0.01c·τ >ϵ .
+Suppose there is a z∈Y, where ∥z∥2=1, such that
+⟨x,z⟩≥c·max
+y∈Y⟨x,y⟩
+Note that max y∈Y⟨x,y⟩≥τ. Then, we can find a z∈Ysuch that
+⟨ex,z⟩≥1
+2c·max
+y∈Y⟨x,y⟩
+Proof. We have
+⟨ex,z⟩=⟨x,z⟩+⟨ex−x,z⟩
+≥ ⟨x,z⟩−|⟨ex−x,z⟩|
+≥ ⟨x,z⟩−∥ex−x∥2·∥z∥2
+≥ ⟨x,z⟩−ϵ
+≥c·max
+y∈Y⟨x,y⟩−ϵ
+≥0.99·c·max
+y∈Y⟨x,y⟩
+where the first step follows from simple algebra, the second step follows from the fact that ⟨x, y⟩ ≥ −|⟨ x, y⟩|, the
+third step follows from the property of inner product, the fourth step follows from Fact J.7, the fifth step follows from
+⟨x,z⟩≥c·max y∈Y⟨x,y⟩and the final step follows from the fact that 0.01c·τ >ϵ .
+35
+
+--- PAGE 36 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+J.3 Efficient Transformations
+We have learned from that (c,τ)-MaxIP on a unit sphere Sd−1using LSH forANN . Therefore, the next step is to transform
+the direction search procedure in iterative optimization algorithm into a MaxIP on a unit sphere. To achieve this, we formulate
+the direction search as a projected approximate MaxIP (see Definition J.5). We start with presenting a pair of transformation
+ϕ0,ψ0:Rd→Rd+1such that, given a function g:Rd→R, for any x,yin a convex set K, we have
+ϕ0(x):=[∇g(x)⊤,x⊤∇g(x)]⊤, ψ0(y):=[−y⊤,1]⊤. (11)
+In this way, we show that
+⟨y−x,∇g(x)⟩=−⟨ϕ0(x),ψ0(y)⟩,
+argmin
+y∈Y⟨y−x,∇g(x)⟩= argmax
+y∈Y⟨ϕ0(x),ψ0(y)⟩ (12)
+Therefore, we could transform the direction search problem into a MaxIP problem.
+Next, we present a standard transformations (Neyshabur & Srebro, 2015) that connects the MaxIP toANN in unit sphere.
+For any x,y∈Rd, we propose transformation ϕ1,ψ1:Rd→Rd+2such that
+ϕ1(x)=h
+(D−1
+xx)⊤0q
+1−∥xD−1x∥2
+2i⊤
+ψ1(y)=h
+(D−1
+yy)⊤q
+1−∥yD−1y∥2
+20i⊤
+(13)
+HereDx,Dyare some constant that make sure both x/D xandy/D yhave norms less than 1. Under these transformations,
+bothϕ1(x)andψ1(y)have norm 1andargmax y∈Y⟨ϕ1(x),ψ1(y)⟩=argmax y∈Y⟨x,y⟩.
+Combining transformations in Eq. (11) and Eq. (13), we obtain query transform ϕ:Rd→Rd+3with form ϕ(x)=ϕ1(ϕ0(x))
+and data transform ϕ:Rd→Rd+3with form ψ(y)=ψ1(ψ0(y)). Using ϕandψ, we transform the direction search problem in
+optimization into a MaxIP in unit sphere. Moreover, given a set Y⊂Rdand a query x∈Rd, the solution zof(c,ϕ,ψ,τ )-MaxIP
+over(x,Y)has the propriety that ⟨z−x,∇g(x)⟩≤c·miny∈Y⟨y−x,∇g(x)⟩. Thus, we could approximate the direction search
+withLSH based MaxIP data-structure.
+Note that only MaxIP problem with positive inner product values could be solved by LSH. We found the direction search
+problem naturally satisfies this condition. We show that if gis convex, given a set S⊂Rd, we have mins∈S⟨∇g(x),s−x⟩≤0
+for any x∈B(S), where Bis the convex hull of S. Thus, max y∈Y⟨ϕ0(x),ψ0(y)⟩is non-negative following Eq. (12).
+J.4 Data Structures
+In this section, we present a formal statement that solves (c,τ)-MaxIP problem on unit sphere using LSH for(c,r)-ANN .
+Theorem J.9. Letc∈(0,1)andτ∈(0,1). Given a set of n-vector set Y⊂ Sd−1on the unit sphere, there exists a data
+structure with O(dn1+o(1))preprocessing time and O(n1+o(1)+dn)space so that for any query x∈Sd−1, we take O(d·nρ)
+query time to retrieve the (c,τ)-MaxIP ofxinYwith probability at least 0.97, where ρ:=2(1−τ)2
+(1−cτ)2−(1−τ)4
+(1−cτ)4+o(1)
+Proof. We know that ∥x−y∥2
+2=2−2⟨x,y⟩for all x,y∈Sd−1. In this way, if we have a LSH data-structure for (c,r)-ANN .
+It could be used to solve (c,τ)-MaxIP withτ=1−0.5r2andc=1−0.5c2r2
+1−0.5r2. Next, we write c2as
+c2=1−c(1−0.5r2)
+0.5r2=1−cτ
+1−τ.
+Next, we show that if the LSH is initialized following Theorem J.3, it takes query time O(d·nρ), space O(n1+o(1)+dn)and
+preprocessing time O(dn1+o(1))to solve (c,τ)-MaxIP through solving (c,r)-ANN , where
+ρ=2
+c2−1
+c4+o(1)=2(1−τ)2
+(1−cτ)2−(1−τ)4
+(1−cτ)4+o(1).
+In practice, cis increasing as we set parameter τclose to MaxIP (x,Y). There is also another LSH data structure (Andoni
+& Razenshteyn, 2015) with longer preprocessing time and larger space that could solve the (c,τ)-MaxIP with similar query
+7It is obvious to boost probability from constant to δby repeating the data structure log(1/δ)times.
+36
+
+--- PAGE 37 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+time complexity. We refer readers to Section 8.2 in (Shrivastava et al., 2021) for more details8. Moreover, Corollary J.9 could
+be applied to projected MaxIP problem.
+Theorem J.10. Letc∈(0,1)andτ∈(0,1). Letϕ,ψ:Rd→Rkdenote two transforms. Let Tϕdenote the time to compute
+ϕ(x)andTψdenote the time to compute ψ(y). Given a set of n-points Y∈Rdwithψ(Y)⊂ Sk−1on the sphere, one can
+construct a data structure with O(dn1+o(1)+Tψn)preprocessing time and O(n1+o(1)+dn)space so that for any query
+x∈Rdwithϕ(x)∈Sk−1, we take query time complexity O(d·nρ+Tϕ)to solve (c,ϕ,ψ,τ )-MaxIP with respect to (x,Y)with
+probability at least 0.9, where ρ:=2(1−τ)2
+(1−cτ)2−(1−τ)4
+(1−cτ)4+o(1).
+Proof. The preprocessing phase can be decomposed in two parts.
+• It takes O(Tψn)time to transform every y∈Yintoψ(y).
+• It takes O(O(dn1+o(1))time and O(dn1+o(1)+dn)to index every ψ(y)intoLSH using Theorem J.9.
+The query phase can be decomposed in two parts.
+• It takes O(Tϕ)time to transform every x∈Rdintoϕ(x).
+• It takes O(d·nρ)time perform query for ϕ(x)inLSH using Theorem J.9.
+K Self-attention layer as a clustering algorithm
+The self-attention layer in the Transformer looks like mean-shift clustering. Suppose {(xj,vj)}are a bunch of key and value
+pairs and qis the query. Note that q=Wqx,k=Wkxandv=Wvxare computed by three projection matrices Wk,Wq
+andWvfrom a common x. Then from self-attention we have:
+v=X
+jpjvj=P
+jexp(x⊺W⊺
+qWkxj)WvxjP
+jexp(x⊺W⊺
+qWkxj)=WvP
+jexp(x⊺W⊺
+qWkxj)xjP
+jexp(x⊺W⊺
+qWkxj)(14)
+where∼(q,kj):=exp( q⊺kj)=exp( x⊺W⊺
+qWkxj)andpj=∼(q,kj)/P
+j∼(q,kj).
+On the other hand, mean-shift clustering looks like the following:
+m(x)=P
+jK(xj,x)xjP
+jK(xj,x)(15)
+where K(xj,x)is a kernel matrix that measure the similarity between xjandx. According to the mean-shift algorithm,
+in the next iteration, we will simply replace xwithm(x).
+So in some sense, self-attention is just to do some kind of clustering for the input embedding qandk, plus a transformation of the
+embedding to another place. The term “projection” is due to the fact that there is a projection matrix Wvonxfor the next level.
+Residue connection and LayerNorm . Compared to mean-shift, Transformer layer has residue connection. Therefore, for
+single-headed attention, what you actually get is v+x, followed by a LayerNorm. For the residue connection, the mean-shift
+analog already shows the output m(x)contains x+part. The reason why we need residue connection is that the self-attention
+part might only model the “change” of xin the mean-shift picture, rather than the full update of x.
+L The role of self-attention
+Consider we have a vocabulary of size mandddimensional embedding space. In practice, many papers in NLP have reported
+clustering behaviors of word embeddings: such a clustering of word embedding naturally occurs after training.
+An explanation for the above phenomenon is that, by grouping these word embedding together, we might generalize better, since
+similarity in word now can transfer (e.g., A linked to B, B linked to C, then A might link to C as well) and generalization follows.
+Let’s treat it as a fact and focus on how this is achieved and how self-attention plays a role here.
+8Recently, there a line of work that use fast MaxIP data structure to speedup the iterative-type optimization algorithms (Shrivastava et al.,
+2021; Song & Ye, 2023; Qin et al., 2023a; Song et al., 2023a).
+37
+
+--- PAGE 38 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+L.1 The capacity of embedding layer
+First let us take a look at the following pairwise distance constraints between word embedding (e.g., some words should
+be close to each other, some should be far away from each other) as the following:
+∥xi−xj∥=D(i,j) (16)
+where D(i,j)is large for iandjthat should be far apart and D(i,j)is small for iandjthat are close to each other. In
+visualization, this is called Multidimensional Scaling (MDS) (Cox & Cox, 2008).
+Note that in neural network training, the constraint (Eqn. 16) is not directly enforced during training, but the clustering
+naturally happens. Since we talk about capacity, how we achieve Eqn. 16 doesn’t matter for now.
+In general we cannot find a fixed low-dimensional embedding ( d≪m) to satisfy these constraints, since we only have md
+parameters ( mvectors, each has dentries), but m2constraint. So two vectors that are supposed to be close may not be close
+enough (but hopefully they remain close to each other).
+L.2 The role of self-attention
+For this, the self-attention mechanism comes to the rescue, trading model-size with additional computation. It fulfills what
+(static) embedding cannot achieve: to further group the embedding vectors together in a multi-layer structure.
+Note that one sentence never covers all dvocabularies. Once the words in the sentence are picked, they are grouped together
+via self-attention layers to collectively represent a concept that can be useful for the task.
+L.3 How the clustering happens through self-attention?
+Now one fundamental questions arise: How the static clustering of embedding happens during end-to-end training? In
+practice, no one explicitly enforces the MDS constraint (Eqn. 16).
+Let’s start with a simple example. we have two unit embedding: xandywith the normalization condition that ∥x∥2= 1
+and∥y∥2=1, and a simple self-attention layer (without projection) which output z:
+z=(1−p)x+py (17)
+Where the attention map is:
+p=ex⊺y
+ex⊺x+ex⊺y=1
+1+e1−x⊺y(18)
+Note that here we attend to xso0<p< 1/2always. The last two is due to normalization condition.
+Now we consider a loss function L=−1
+2∥z∥2
+2. The intuition behind is that “for some reason, we found that zis a good
+representation for our task, and want to make sure its length is as long as possible”.
+Under this context, what would be the gradient rule for xandy? Will they cluster together?
+The answer is yes! We could compute
+∂z
+∂x= (1 −p)I+∂p
+∂x(y−x)⊺(19)
+∂z
+∂y=pI+∂p
+∂y(y−x)⊺(20)
+Lett:=1−x⊺yand define the following function with respect to t:
+f(t):=(x−y)⊺z=(1−2p)(1−x⊺y)>0 (21)
+Therefore, we can compute the gradient for xand gradient for y:
+−gx:=−∂L
+∂x=−∂z
+∂x∂L
+∂z=(1−p)2x+p(1−p)(1−f(t))y (22)
+−gy:=−∂L
+∂y=−∂z
+∂y∂L
+∂z=p2y+p(1−p)(1−f(t))x (23)
+Note that since xandyare kept to be normalized, the term (1−p)2xin∂L/∂ xis gone (and similarly p2yforgy). So how
+xandymove depends on the sign of 1−f(t).
+With some computation, we could see 0< f(t)<1when t <1.5424 . In summary, if x⊺y>−0.4576 , then the (negative)
+gradient of xpushes it towards yand pushes xtowards y, and the clustering of static embedding happens during training.
+Note that since both xandyare normalized, −1≤x⊺y≤1, so this is a quite loose condition and can be easily satisfied.
+38
+
+--- PAGE 39 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+L.4 Multiple embeddings
+People might wonder what happen to multiple unit embeddings x,y1,y2,...,yK? In this case, we can similarly define
+self-attention probability pi(note that here we consider the case that every embedding attends to x):
+pi:=ex⊺yi
+ex⊺x+P
+jex⊺yj=ex⊺yi
+1+P
+jex⊺yj(24)
+Define pS:=PK
+i=1pi=1−1
+1+P
+jex⊺yj<1and we have:
+z=(1−pS)x+X
+ipiyi (25)
+Let˜pi:=pi/pSbe the (normalized) probability on yiand¯y:=1
+pSP
+ipiyi=P
+i˜piyibe the weighted mean of {yi}other
+thanx, then we have:
+z=(1−pS)x+pS¯y (26)
+Now we can still compute the partial derivative:
+∂pj
+∂x=pj[−pS¯y+yj] (27)
+∂pj
+∂yi=pi[−pj+I(i=j)]x (28)
+which gives
+∂z
+∂x= (1 −pS)I+X
+j∂pj
+∂x(yj−x)⊺(29)
+∂z
+∂yi=piI+X
+j∂pj
+∂yi(yj−x)⊺(30)
+After some manipulation, we have:
+∂z
+∂x=(1−pS)[I+pS¯y(¯y−x)⊺]+pSQ (31)
+where Q:=P
+j˜pj(yj−¯y)(yj−¯y)⊺is the weighted covariance matrix of data points {yj}.
+Similar to the two unit case, we want to check −gxto see how the embedding xchanges over time.
+−gx=−∂L
+∂x=−∂z
+∂x∂L
+∂z(32)
+= (1 −pS)2x+pS
+(1−2pS)x⊺¯y−(1−pS)+pS∥¯y∥2¯y+pSQz
+If things are already quite clustered, then ∥¯y∥≈1(usually ∥¯y∥2<1since sphere is a convex set), Qz≈0(since Qspans
+on the tangent space of zat the sphere and zis perpendicular to it), and we have:
+−gx≈(1−pS)2x+pS(1−2pS)(x⊺¯y−1)¯y (33)
+It is clear that x⊺¯y<1. When pS>1/2, which is high likely for large K, then−gxhas positive component of ¯yandxwill
+move towards ¯y.
+On the other hand, we could also check
+∂z
+∂yi=pi[I+(1−pS)x(¯y−x)⊺]+pix(yi−¯y)⊺(34)
+which gives an expression of −gy:
+· (35)
+With the same argument, it moves towards ¯y(so all yiwill cluster together) and towards x.
+When there is a WkandWqbefore the embedding, following the same logic, only the column subspace of Wk(orWq) will
+be clustered together. On the other hand, the value part will be different in order to enable encoding of more complicated
+concepts based on co-occurrence of multiple tokens.
+M Link self-attention with generative models.
+Consider the following self-attention structure. Consider an embedding matrix X∈Rn×dand for embedding xiandxj, let
+yij=ϕ(xi;xj):=(1−βij)xi+βijxj, β ij:=ex⊺
+ixj
+ex⊺
+ixi+ex⊺
+ixj(36)
+39
+
+--- PAGE 40 ---
+Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time
+Here ϕ(xi;xj) :=xi+βij(xj−xi)is the self-attention operation. More properties of this operator ϕneed to be explored.
+Then we want to maximize the following objective:
+max
+X,∥xi∥2=1X
+ijkP(k|i,j)y⊺
+ijxk (37)
+or more formally, using a softmax to avoid trivial solution xi≡x, we have:
+max
+X,∥xi∥2=1J:= max
+X,∥xi∥2=1X
+ijkP(k|i,j)logδijk, δijk:=ey⊺
+ijxk
+P
+key⊺
+ijxk(38)
+which is:
+max
+X,∥xi∥2=1X
+ijkP(k|i,j)"
+y⊺
+ijxk−logX
+key⊺
+ijxk#
+(39)
+We can compute its gradient update. Here we assume the index knever appears in index iandj(encoding and decoding
+matrices are decoupled), then by gradient rule, we have:
+˙xk=∂L
+∂xk=P⊥
+xkX
+ijP(k|i,j)(1−δijk)yij (40)
+where P⊥
+xkis the projection matrix that projects a vector to the orthogonal complement space of xk. The projection is due
+to the constraint ∥xk∥2=1. If the training converges ( ˙xk=0), then we know thatX
+ijP(k|i,j)(1−δijk)yij=γxk (41)
+for some γ >0(note that γ <0will be an unstable stationary point).
+Depending on different structure of the generative model specified by P(k|i,j), we might end up learning different embedding
+matrix X.
+The first thing we want to check is independency. Assume that for some specific token kandi, we have P(k|i,j) =P(k|i)
+for any j, which means that the frequency of token khas nothing to do with the second entry j. Furthermore, token kis not
+connected with other token i′̸=i, i.e,P(k|i′,j)≡0. If we just let δijk=δ >0, then we have:
+P(k|i)X
+jyij=γ′xk (42)
+which yields
+P(k|i)nxi+X
+jβij(xj−xi)=γ′xk (43)
+And we could possibly show thatP
+jβij(xj−xi)≈0since βij= 1/(1+e1−x⊺
+ixj)applies equal weights for embeddings
+around xiand they cancel out. Therefore, xkis aligned with xi.
+Another thing we might want to check is identification of two tokens. Assume that there exists two tokens j1andj2and
+specific kandi, so that P(k|i,j1)=P(k|i,j2). For other k,i,j combination P(k|i,j)≡0, then we have:
+P(k|i,j1)yij1=γ1xk (44)
+(not sure how to continue).
+If we have Wq,WkandWv, then the formulation doesn’t change that much. The only difference here is that now
+βij:=ex⊺
+iWpqxj
+ex⊺
+iWpqxi+ex⊺
+iWpqxj(45)
+andy⊺
+ijxknow becomes y⊺
+ijWvxk.
+40
