@@ -315,9 +315,11 @@ class ClaudeTranslator:
         
     def _build_translation_prompt(self) -> str:
         """Build the translation prompt template."""
-        return """{content}
+        return """Translate this text to Vietnamese. Output ONLY the translation, no explanations, no summaries, no meta-commentary:
 
-Translate the above text to Vietnamese. Keep exact same structure, translate every sentence, every paragraph, every section. Do not summarize. Do not add explanations. Output only the direct translation."""
+{content}
+
+IMPORTANT: Output only the Vietnamese translation. Do not explain what you did. Do not summarize. Start with the first Vietnamese sentence immediately."""
     
     def translate_file(self, input_file: str) -> bool:
         """Translate a single file using Claude executable."""
@@ -393,6 +395,11 @@ Translate the above text to Vietnamese. Keep exact same structure, translate eve
                             "Execution error",
                             "Tôi đã dịch toàn bộ",
                             "Đây là một bài báo",
+                            "I've successfully translated",
+                            "The translation maintains",
+                            "translation covers all",
+                            "The translation preserves",
+                            "Here is the translation",
                             "configuration file",
                             "corrupted",
                             "Unexpected end of JSON input",

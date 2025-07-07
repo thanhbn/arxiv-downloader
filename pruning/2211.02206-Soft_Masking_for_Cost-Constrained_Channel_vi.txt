@@ -1,0 +1,163 @@
+# Che mặt mềm cho cắt tỉa kênh có ràng buộc chi phí
+
+Ryan Humble1⋆, Maying Shen2, Jorge Albericio Latorre2, Eric Darve1, và
+Jose Alvarez2
+1Đại học Stanford, Stanford CA 94305, Hoa Kỳ
+{ryhumble,darve }@stanford.edu
+2NVIDIA, Santa Clara CA 95051, Hoa Kỳ
+{mshen,jalbericiola,josea }@nvidia.com
+
+**Tóm tắt.** Cắt tỉa kênh có cấu trúc đã được chứng minh là có thể tăng tốc đáng kể thời gian suy luận cho các mạng nơ-ron tích chập (CNN) trên phần cứng hiện đại, với mức độ mất mát độ chính xác mạng tương đối nhỏ. Các nghiên cứu gần đây vĩnh viễn đặt về không các kênh này trong quá trình huấn luyện, điều mà chúng tôi quan sát thấy làm giảm đáng kể độ chính xác cuối cùng, đặc biệt khi tỷ lệ mạng được cắt tỉa tăng lên. Chúng tôi đề xuất Che mặt mềm cho Cắt tỉa Kênh có ràng buộc chi phí (SMCP) để cho phép các kênh đã cắt tỉa có thể thích ứng trở lại mạng trong khi đồng thời cắt tỉa hướng tới một ràng buộc chi phí mục tiêu. Bằng cách thêm việc tái tham số hóa che mặt mềm của các trọng số và cắt tỉa kênh từ góc độ loại bỏ các kênh đầu vào, chúng tôi cho phép cập nhật gradient cho các kênh đã được cắt tỉa trước đó và cơ hội để các kênh sau này quay trở lại mạng. Sau đó chúng tôi công thức hóa việc cắt tỉa kênh đầu vào như một bài toán phân bổ tài nguyên toàn cục. Phương pháp của chúng tôi vượt trội hơn các nghiên cứu trước đó trên cả bộ dữ liệu phân loại ImageNet và phát hiện PASCAL VOC.
+
+**Từ khóa:** Cắt tỉa mạng nơ-ron, Nén mô hình
+
+## 1 Giới thiệu
+
+Các mạng nơ-ron sâu đã phát triển nhanh chóng trong thập kỷ qua và đã thống trị nhiều thuật toán truyền thống trong một loạt các nhiệm vụ. Đặc biệt, các mạng nơ-ron tích chập (CNN) đã cho thấy kết quả tiên tiến nhất trên một loạt các nhiệm vụ thị giác máy tính, bao gồm phân loại, phát hiện và phân đoạn. Tuy nhiên, các CNN hiện đại đã tăng lên về kích thước, tính toán, yêu cầu năng lượng và độ trễ dự đoán, khi các nhà nghiên cứu đẩy mạnh cải thiện độ chính xác.
+
+Thật không may, những mô hình này giờ đây có thể dễ dàng vượt quá khả năng của nhiều thiết bị điện toán biên và yêu cầu của các nhiệm vụ suy luận thời gian thực, chẳng hạn như những nhiệm vụ được tìm thấy trong các ứng dụng xe tự động.
+
+Vì các mạng nơ-ron đã được chứng minh là có quá nhiều tham số [55], một phương pháp phổ biến để giảm tính toán và độ trễ dự đoán là cắt tỉa (hoặc loại bỏ) các phần của mạng nơ-ron, cuối cùng tạo ra một mô hình với ít tham số hơn. Do yêu cầu nghiêm ngặt cho nhiều ứng dụng triển khai, một phần lớn các tham số thường phải được loại bỏ; chúng tôi tập trung vào chế độ này, mà chúng tôi gọi là chế độ tỷ lệ cắt tỉa cao. Hướng tới mục tiêu này, nhiều phương pháp cắt tỉa đã được đề xuất để xác định và loại bỏ những tham số ít quan trọng nhất cho suy luận [1,16,30,22,32,50,54]. Vì mỗi lớp của mạng liên quan đến một tính toán khác nhau và gánh nặng tính toán liên quan, mỗi tham số không đóng góp như nhau vào chi phí suy luận cuối cùng của mạng, thường được đo bằng FLOP hoặc độ trễ, nên các nghiên cứu gần đây hơn đã tập trung vào việc cắt tỉa mạng tuân theo các ràng buộc chi phí rõ ràng. Để tối đa hóa tăng tốc suy luận trên phần cứng hiện đại (ví dụ: GPU), các nghiên cứu này chủ yếu tập trung vào cắt tỉa kênh [23,30,32,40,45,53].
+
+Tuy nhiên, nói chung, các nghiên cứu cắt tỉa hiện có vĩnh viễn loại bỏ các tham số mạng dọc theo các kênh này, đặt về không các trọng số mạng và ngăn kênh được sử dụng trong phần còn lại của quá trình huấn luyện. Đặc biệt ở tỷ lệ cắt tỉa cao, nơi một phần đáng kể tổng số kênh trong mạng phải được loại bỏ, các quyết định về kênh nào cần loại bỏ sớm trong quá trình cắt tỉa có thể là cận thị. Hơn nữa, khi một số lượng lớn kênh bị loại bỏ, các gradient đến các kênh còn lại trong mỗi lớp bị gián đoạn đáng kể và có thể tăng lên khá nhiều do các lớp chuẩn hóa theo lô phổ biến trong các CNN hiện đại. Điều này can thiệp vào cả việc huấn luyện mạng và xác định kênh nào cần loại bỏ tiếp theo.
+
+Trong nghiên cứu này, chúng tôi giới thiệu một phương pháp cắt tỉa kênh mới cho các mạng nơ-ron đặc biệt phù hợp cho tỷ lệ cắt tỉa lớn. Cốt lõi của phương pháp chúng tôi dựa trên việc thường xuyên tái kết nối độ thưa của mạng, thông qua che mặt mềm của các trọng số mạng, để giảm thiểu độ giảm độ chính xác cho tỷ lệ cắt tỉa lớn. Việc giới thiệu che mặt mềm cho phép các kênh đã được cắt tỉa trước đó sau này có thể được khôi phục về mạng, thay vì bị cắt tỉa vĩnh viễn. Ngoài ra, để giảm thiểu tác động của các độ lớn gradient lớn gây ra bởi việc loại bỏ nhiều kênh, chúng tôi kết hợp một phương pháp tỷ lệ chuẩn hóa theo lô mới. Cuối cùng, chúng tôi công thức hóa việc cắt tỉa kênh dưới ràng buộc chi phí như một bài toán phân bổ tài nguyên và chỉ ra rằng nó có thể được giải quyết một cách hiệu quả. Tất cả cùng nhau, chúng tôi gọi phương pháp này là Che mặt mềm cho Cắt tỉa Kênh có ràng buộc chi phí (SMCP).
+
+Các đóng góp chính của chúng tôi là:
+
+1. Chúng tôi chứng minh rằng độ thưa kênh của mạng có thể được tái kết nối thích ứng, sử dụng tái tham số hóa che mặt mềm của các trọng số mạng, và điều này đòi hỏi việc cắt tỉa kênh phải được thực hiện dọc theo các kênh đầu vào, thay vì đầu ra, xem Mục 3.1.
+
+2. Chúng tôi đề xuất một kỹ thuật tỷ lệ mới cho các trọng số chuẩn hóa theo lô để giảm thiểu sự bất ổn gradient ở tỷ lệ cắt tỉa kênh cao, xem Mục 3.2.
+
+3. Chúng tôi thực hiện cắt tỉa kênh tuân theo ràng buộc chi phí bằng cách mã hóa nó như một bài toán phân bổ tài nguyên, tự động phân bổ chi phí trên toàn mạng thay vì dựa vào tỷ lệ cắt tỉa theo lớp thủ công hoặc dựa trên heuristic. Chúng tôi chỉ ra bài toán phân bổ này là một biến thể của bài toán knapsack 0-1 cổ điển, được gọi là bài toán knapsack đa lựa chọn [41], có thể được giải quyết hiệu quả cho các thí nghiệm của chúng tôi, xem Mục 3.3.
+
+4. Chúng tôi phân tích cải thiện độ chính xác và chi phí của phương pháp chúng tôi cho các bộ dữ liệu ImageNet và PASCAL VOC cho các kiến trúc ResNet, MobileNet và SSD. Chúng tôi vượt trội hơn các phương pháp cắt tỉa trước đó, như được hiển thị trong Hình 1 và mở rộng hơn trong Mục 4. Đặc biệt, ở tỷ lệ cắt tỉa cao cho ResNet50/ResNet101 trên ImageNet, SMCP có thể đạt được tăng tốc bổ sung lên đến 20% ở cùng mức độ chính xác Top-1 hoặc cải thiện độ chính xác Top-1 lên đến 0,6% ở cùng FPS (khung hình trên giây). SMCP cũng có thể cắt tỉa SSD512 với backbone ResNet50 để đạt được tăng tốc 2,12×, vượt quá FPS (khung hình trên giây) của mô hình SSD300-ResNet50 nhỏ hơn 12%, trong khi đồng thời cải thiện mAP của mô hình baseline.
+
+## 2 Nghiên cứu liên quan
+
+### 2.1 Cắt tỉa mềm
+
+Hầu hết các phương pháp cắt tỉa bắt đầu với một mạng đã được huấn luyện trước dày đặc và cắt tỉa lặp đi lặp lại theo một lịch trình để có được một mạng cuối cùng với chi phí mong muốn, trong đó ở mỗi bước cắt tỉa, các tham số được đặt về không vĩnh viễn (hoặc che mặt). Điều này hiệu quả giới hạn khả năng mô hình khi cắt tỉa xảy ra. Stosic và Stosic [42] lập luận rằng bảo tồn khả năng mô hình lớn hơn là quan trọng đối với việc huấn luyện mô hình thưa bằng cách hình thành các đường dẫn mới cho tối ưu hóa không có sẵn cho các mạng được cắt tỉa vĩnh viễn; họ gợi ý rằng việc cho phép luồng gradient đến các tham số đã được cắt tỉa trước đó và tái kết nối độ thưa thỉnh thoảng là quan trọng.
+
+Theo hướng này, một số nghiên cứu đã đề xuất các phương pháp cắt tỉa mềm trong đó các tham số có thể được cắt tỉa và sau đó không cắt tỉa nếu mong muốn. He et al. [15] đặt về không các trọng số trong quá trình cắt tỉa nhưng cho phép gradient cập nhật chúng nhằm duy trì khả năng mô hình. Dettmers và Zettlemoyer [6], Evci et al. [9], Mostafa và Wang [34], và Wortsman et al. [46] cho phép các trọng số đã được cắt tỉa trước đó được tái sinh. Kusupati et al. [21] sử dụng toán tử ngưỡng mềm để đạt được kết quả tiên tiến nhất cho cắt tỉa không có cấu trúc và cấu trúc thứ hạng thấp. Kang và Han [20] giới thiệu cắt tỉa kênh mềm bằng cách thêm một mặt nạ có thể vi phân trong các lớp chuẩn hóa theo lô; tuy nhiên, phương pháp của họ bị giới hạn ở ràng buộc chi phí ngầm về tổng số nơ-ron. Phương pháp của chúng tôi tuy nhiên giống nhất với Guo et al. [11], Lin et al. [25], De Jorge et al. [19], và Zhou et al. [56], sử dụng rõ ràng hoặc ngầm Bộ ước lượng thẳng (STE) [2] để cắt tỉa các tham số thích ứng trong quá trình huấn luyện. Ba phương pháp đầu nhắm đến độ thưa không có cấu trúc, và phương pháp cuối nhắm đến độ thưa có cấu trúc N:M. Trong nghiên cứu của chúng tôi, chúng tôi mở rộng việc sử dụng STE cho cắt tỉa kênh, chỉ ra điều này đòi hỏi cắt tỉa phải được công thức hóa dọc theo các kênh đầu vào, và nhúng che mặt mềm này vào một công thức ràng buộc chi phí rõ ràng có mục đích chung.
+
+### 2.2 Cắt tỉa có ràng buộc chi phí và có cấu trúc
+
+Mục tiêu của hầu hết các phương pháp cắt tỉa là tối đa hóa độ chính xác mạng tuân theo yêu cầu bộ nhớ, tính toán, và/hoặc độ trễ thấp. Mặc dù các phương pháp độ thưa không có cấu trúc đã được chứng minh là rất thành công trong việc loại bỏ hơn 95% trọng số mà không ảnh hưởng đến độ chính xác mạng [13], phần cứng hiện đại có hỗ trợ kém cho độ thưa không có cấu trúc và do đó điều này hiếm khi dẫn đến tăng tốc thực tế. Do đó, việc chọn cấu trúc độ thưa cắt tỉa có thể thực sự được tăng tốc trong phần cứng, thường là cắt tỉa kênh cho CNN, là phổ biến. Hiện tại đã có một số hỗ trợ phần cứng cho các cấu trúc độ thưa khác, chẳng hạn như độ thưa có cấu trúc N:M của [31], nhưng chúng tôi giới hạn trọng tâm của mình vào cắt tỉa kênh trong nghiên cứu này. Cả Li et al. [23] và Yang et al. [48,49] đều chọn mạng tuân thủ ràng buộc tốt nhất từ một số lượng lớn các mạng ứng viên, điều này có thể tốn kém một cách cấm đoán. Yu và Huang et al. [53], Tan et al. [44], và Wu et al. [47] đặt ra các bài toán tối ưu hóa có ràng buộc chi phí nhưng sử dụng lựa chọn tham lam hoặc điểm quan trọng nhận biết chi phí để gần đúng chọn các kênh tốt nhất để cắt tỉa. Chen et al. [3] trình bày một phương pháp tối ưu hóa Bayesian để xác định các siêu tham số nén thỏa mãn ràng buộc chi phí trong khi tối đa hóa độ chính xác mạng. Liu et al. [28] liên kết cắt tỉa mạng với Tìm kiếm Kiến trúc Mạng nơ-ron (NAS), lập luận rằng các kiến trúc đã cắt tỉa kết quả là đóng góp mới thay vì chính các trọng số đã được huấn luyện. Tuy nhiên, hầu hết các phương pháp NAS, chẳng hạn như những phương pháp trong [5,7,43], vẫn tốn kém về mặt tính toán hơn các phương pháp cắt tỉa mạng. Phương pháp của chúng tôi giống nhất với nghiên cứu đồng thời của Shen et al. [40], được gọi là HALP, cũng đặt ra một bài toán phân bổ tài nguyên có ràng buộc chi phí. Tuy nhiên có một số khác biệt chính. Đầu tiên, chúng tôi giảm bài toán phân bổ của mình thành bài toán knapsack đa lựa chọn [41] và giải quyết nó với thuật toán gặp ở giữa, cung cấp cả đảm bảo tối ưu và giải pháp hiệu quả (<1 giây) cho các ràng buộc chi phí chung. HALP giải quyết bài toán phân bổ của họ với một bộ giải knapsack tăng cường tùy chỉnh, không đưa ra đảm bảo tối ưu và đòi hỏi tính toán bổ sung đáng kể (1+ phút cho mỗi bước cắt tỉa trên ResNet50 [14], ngay cả sau một bước nhóm nơ-ron cụ thể GPU lớn). Thứ hai, phương pháp của chúng tôi sử dụng che mặt kênh đầu vào mềm thay vì cắt tỉa kênh đầu ra vĩnh viễn của HALP; chúng tôi chỉ ra rằng chỉ riêng thay đổi này đã mang lại lợi ích hiệu suất trong Mục 4.3. Cuối cùng, chúng tôi sử dụng một kỹ thuật tỷ lệ chuẩn hóa theo lô mới để ổn định việc huấn luyện ở tỷ lệ cắt tỉa cao.
+
+### 2.3 Tác động cắt tỉa lên các lớp chuẩn hóa theo lô
+
+Cắt tỉa kênh có thể có tác động đáng kể đến thống kê chuẩn hóa theo lô, do đó ảnh hưởng mạnh đến gradient mạng đến các kênh còn lại. Hiệu ứng này đặc biệt rõ rệt ở tỷ lệ cắt tỉa cao, vì một số lượng lớn kênh đang bị loại bỏ khỏi hầu hết các lớp. Một số phương pháp cắt tỉa chú ý đến hiện tượng này và mô tả các chiến lược giảm thiểu. Li et al. [23] chứng minh nhu cầu cập nhật thống kê chuẩn hóa theo lô sau khi cắt tỉa, vì chúng có thể bị ảnh hưởng đáng kể, trước khi đánh giá các mạng ứng viên đã cắt tỉa có thể. Phương pháp này tuy nhiên không làm giảm vấn đề gradient lớn. Thay vì ngay lập tức loại bỏ các trọng số đã cắt tỉa và gánh chịu sự gián đoạn, Wang et al. [45] từ từ điều chỉnh chúng đi, nhận thấy lợi ích hiệu suất đáng kể đặc biệt ở tỷ lệ cắt tỉa cao. Họ không kết nối điều này với sự thay đổi đột ngột trong thống kê và gradient chuẩn hóa theo lô gây ra bởi cắt tỉa. Họ cũng sử dụng một tầm quan trọng không dựa trên gradient nên tác động lên tầm quan trọng của các tham số còn lại phần nào được giảm bớt. Vì chúng tôi đang điều chỉnh độ thưa một cách thích ứng và muốn bảo tồn khả năng cho các trọng số đã cắt tỉa trở thành không cắt tỉa sau này, chúng tôi không muốn điều chỉnh các trọng số đã cắt tỉa đi. Thay vào đó, chúng tôi áp dụng một kỹ thuật tỷ lệ trên các trọng số chuẩn hóa theo lô để ổn định việc huấn luyện ở tỷ lệ cắt tỉa cao.
+
+### 2.4 Tính điểm quan trọng tham số
+
+Để quyết định tham số nào của mạng có thể được cắt tỉa với ít tác hại nhất đến độ chính xác mạng, hầu hết các phương pháp cắt tỉa định nghĩa một tầm quan trọng cho mỗi tham số (hoặc tập hợp tham số) xấp xỉ hiệu ứng của việc loại bỏ lên mất mát của mạng. Nhiều điểm quan trọng đã được đề xuất, phần lớn chia thành ba nhóm: (i) dựa trên độ lớn trọng số [1,12,24,27,50,54]; (ii) dựa trên mục tiêu tái tạo [16,30]; và (iii) dựa trên gradient mạng [22,32,33]. Chúng tôi áp dụng tầm quan trọng Taylor bậc nhất [32] do tính đơn giản tính toán và mối tương quan mạnh với tác động thực sự lên mất mát của mạng.
+
+## 3 Che mặt mềm cho cắt tỉa kênh có ràng buộc chi phí
+
+Chúng tôi đề xuất một phương pháp cắt tỉa kênh đầu vào mới hướng tới tỷ lệ cắt tỉa cao. Phương pháp của chúng tôi được khởi tạo với một mô hình CNN đã được huấn luyện trước, và hàm chi phí mạng mong muốn và ràng buộc chi phí mục tiêu. Đầu tiên chúng tôi tái tham số hóa các trọng số mạng với các biến che mặt kênh đầu vào, như được hiển thị trong Mục 3.1, để cho phép cắt tỉa kênh thích ứng. Sau đó, sau một thời gian khởi động, chúng tôi lặp đi lặp lại cắt tỉa mỗi r minibatch bằng cách giải quyết một bài toán tối ưu hóa phân bổ tài nguyên, được thảo luận trong Mục 3.3, để cập nhật các mặt nạ kênh. Sau mỗi lần cập nhật mặt nạ, chúng tôi áp dụng tỷ lệ chuẩn hóa theo lô được mô tả trong Mục 3.2, để ổn định việc huấn luyện ở tỷ lệ cắt tỉa cao. Cuối cùng, chúng tôi cố định các mặt nạ cho một thời gian làm mát và tinh chỉnh. Chúng tôi trình bày thuật toán đầy đủ và mã giả trong Mục 3.4.
+
+### 3.1 Cắt tỉa kênh đầu vào mềm
+
+Chúng tôi cụ thể xem xét cắt tỉa kênh đầu vào, như đã được thực hiện trước đó trong [16] và được hiển thị trong Hình 2, nơi chúng tôi che mặt và sau đó loại bỏ các kênh đầu vào để làm thưa CNN. Như chúng tôi sẽ chỉ ra ngay, cắt tỉa kênh với tái tham số hóa che mặt mềm đòi hỏi nó phải được thực hiện dọc theo các kênh đầu vào, vì phương pháp này không hoạt động khi thực hiện cắt tỉa kênh đầu ra. Đây là sự khác biệt so với nhiều phương pháp cắt tỉa kênh đầu ra. Từ góc nhìn toàn cục của độ thưa mạng, cắt tỉa kênh đầu vào của một lớp tương đương với cắt tỉa kênh đầu ra của lớp trước đó; tuy nhiên, các phương pháp này khác biệt khi xem xét hiệu ứng lên từng lớp riêng lẻ.
+
+Đối với che mặt kênh đầu vào mềm, chúng tôi xem xét một mạng nơ-ron với trọng số W={W(l)}, trong đó W(l)∈RC(l)out×C(l)in×K(l)×K(l) là trọng số cho lớp l của mạng và có C(l)in kênh đầu vào và C(l)out kênh đầu ra. Để cho phép các kênh đầu vào được cắt tỉa và sau đó không cắt tỉa, chúng tôi giới thiệu một mặt nạ kênh đầu vào m(l)∈{0,1}C(l)in cho mỗi lớp l. Sử dụng những mặt nạ này, chúng tôi tái tham số hóa các trọng số sao cho trọng số thưa của mạng là
+
+W̃(l)=W(l)⊙m(l). (1)
+
+trong đó m(l) được phát sóng để khớp với hình dạng của W(l). Thay vì vĩnh viễn đặt về không một kênh khi cắt tỉa, các trọng số mạng cơ bản có thể được bảo tồn và chỉ các mặt nạ được đặt về không. Điều này có hai lợi thế riêng biệt. Đầu tiên, nó giúp bảo tồn toàn bộ khả năng của mô hình gốc trong khi huấn luyện hướng tới một mô hình thưa. Thứ hai, bằng cách cho phép các kênh được khôi phục về giá trị gốc của chúng tại thời điểm sau, các quyết định kém về nơi phân bổ độ thưa trên các lớp có thể được hoàn tác. Điều này đặc biệt quan trọng đối với tỷ lệ cắt tỉa cao nơi một phần lớn các kênh của mạng phải được loại bỏ.
+
+Tuy nhiên, như đã viết, định nghĩa che mặt của chúng tôi sẽ định nghĩa gradient đối với W(l) là gW(l)=gW̃(l)⊙m(l). Điều này che mặt các gradient khi chúng chảy ngược trở lại các trọng số hoàn toàn dày đặc W, khiến các trọng số đã che mặt không được sử dụng trong quá trình chuyển tiếp và không bị ảnh hưởng bởi quá trình chuyển ngược. Theo lập luận của Stosic và Stosic [42] rằng việc cập nhật các tham số hiện không tham gia vào quá trình chuyển tiếp cung cấp các đường dẫn tối ưu hóa bổ sung cải thiện việc huấn luyện các mạng thưa, chúng tôi áp dụng Bộ ước lượng thẳng (STE) [2]. STE đã được sử dụng thành công trong lượng tử hóa mô hình [38] và cắt tỉa có cấu trúc Ampere 2:4 [56] cho cập nhật tham số thưa. STE định nghĩa gradient là
+
+gW(l)=gW̃(l), (2)
+
+trong đó gradient trên các trọng số thưa truyền thẳng qua các trọng số cơ bản, dày đặc. Lưu ý rằng chúng tôi vẫn sử dụng các mặt nạ khi tính gradient đối với bản đồ đặc trưng đầu vào của lớp.
+
+Tuy nhiên, để STE này có tác động hữu ích trong một CNN hiện đại với mẫu Conv-BN-ReLU phổ biến, nó đòi hỏi việc cắt tỉa kênh phải được đặt ra như hướng đầu vào. Vì gW̃(l) được định nghĩa bởi một phép nhân ma trận sử dụng bản đồ đặc trưng đầu vào và gradient của bản đồ đặc trưng đầu ra, một kênh đầu vào đã che mặt vẫn nhận được gradient khác không, ngoại trừ một vài trường hợp đặc biệt. Nếu thay vào đó chúng tôi đã che mặt các kênh đầu ra, các phần tử của gW(l) sẽ là 0 hoặc ∞, tùy thuộc vào giá trị của bias chuẩn hóa theo lô. Ngoài ra, nếu chúng tôi thay vào đó cố gắng trực tiếp che mặt trọng số chuẩn hóa theo lô γ(l) và bias β(l) để mô phỏng cắt tỉa kênh, chúng tôi sẽ nhận được gγ(l)=gβ(l)=0 do ReLU. Trong một trong những trường hợp này, gradient gW(l) không hữu ích.
+
+Cuối cùng, đối với cắt tỉa kênh đầu vào với che mặt mềm, chúng tôi định nghĩa tầm quan trọng của mỗi kênh đầu vào, một proxy cho hiệu ứng của việc loại bỏ kênh này lên mất mát của mạng, theo tầm quan trọng Taylor bậc nhất nhóm của [32]:
+
+I(l)i=∑o,r,s W(l)o,i,r,s gW(l)o,i,r,s (3)
+
+trong đó I(l)i là tầm quan trọng của kênh đầu vào thứ i đến lớp l. Dưới một số điều kiện nhất định, điều này thực tế tương đương với tầm quan trọng Taylor bậc nhất dựa trên chuẩn hóa theo lô của [32], như được hiển thị trong tài liệu bổ sung.
+
+### 3.2 Tỷ lệ chuẩn hóa theo lô
+
+Khi cắt tỉa kênh ở tỷ lệ cao, có nhiều lớp nơi một số lượng đáng kể kênh phải được cắt tỉa. Do kết quả của việc cắt tỉa những kênh này, bằng cách đặt về không chúng hoặc bằng cách áp dụng che mặt, độ lớn gradient tiếp theo đến các kênh chưa được cắt tỉa còn lại có thể quá lớn, điều mà chúng tôi chỉ ra trong tài liệu bổ sung. Chúng tôi đề xuất một kỹ thuật tỷ lệ chuẩn hóa theo lô điều chỉnh trọng số chuẩn hóa theo lô γ(l) của lớp l để giảm thiểu gradient lớn và ổn định độ thưa mạng và việc huấn luyện. Cụ thể, chúng tôi tỷ lệ γ(l) theo tỷ lệ các kênh còn lại chưa được cắt tỉa bởi mặt nạ kênh đầu vào hiện tại m(l)∈{0,1}C(l)in
+
+γ(l)←γ(l)orig ∑i m(l)i / C(l)in. (4)
+
+Trong thực tế, chúng tôi luôn coi γ(l)orig là tham số dưới tối ưu hóa và thay đổi một biến tỷ lệ s(l) để điều chỉnh trọng số được sử dụng bởi mạng.
+
+Điều hòa độ lớn gradient đặc biệt quan trọng vì chúng tôi sử dụng điểm quan trọng dựa trên gradient được hiển thị trong Phương trình (3). Ngay cả khi không có che mặt mềm và STE, các gradient lớn gây ra tích lũy tầm quan trọng trong các kênh còn lại khi cắt tỉa tiến hành lặp đi lặp lại, một cách nhân tạo ức chế các kênh bổ sung trong lớp khỏi việc được cắt tỉa. Khi sử dụng che mặt mềm mà không có kỹ thuật tỷ lệ này, các gradient lớn gây ra thrashing độ thưa mạng lớn. Ví dụ, nếu tại một lần lặp cắt tỉa một số lượng lớn các kênh được cắt tỉa, tầm quan trọng đối với mọi kênh, không chỉ những kênh còn lại chưa được cắt tỉa, được tăng cường bởi độ lớn gradient lớn kết quả. Tại lần lặp cắt tỉa tiếp theo ngay sau đó, những kênh đó xuất hiện khá quan trọng và được khôi phục về mạng, gây ra các phần khác của mạng được cắt tỉa để vẫn đáp ứng ràng buộc chi phí. Điều này có thể dao động, ức chế sự hội tụ mạng và độ chính xác mạng cuối cùng. Hơn nữa, đối với các kiến trúc trong đó cắt tỉa toàn bộ lớp là có thể, chẳng hạn như ResNet do các kết nối bỏ qua, độ lớn gradient vô hạn gây ra tràn số trong việc cập nhật trọng số hoặc thậm chí tính toán tầm quan trọng của các kênh. Như được hiển thị trong các thí nghiệm của chúng tôi trong Mục 4, tỷ lệ chuẩn hóa theo lô được đề xuất là rất quan trọng để vượt qua những vấn đề huấn luyện này.
+
+### 3.3 Cắt tỉa kênh có ràng buộc chi phí
+
+Tại mỗi lần lặp cắt tỉa, chúng tôi tìm cách cả tối thiểu hóa tác động lên mất mát của mạng do kết quả của cắt tỉa và làm thưa mạng hướng tới ràng buộc chi phí cuối cùng (ví dụ: ràng buộc độ trễ). Do đó chúng tôi công thức hóa cắt tỉa như một bài toán tối đa hóa tầm quan trọng có ràng buộc chi phí
+
+max m(2),...,m(L) ∑l=1L ∑i=1C(l)in I(l)i m(l)i (5)
+
+s.t. ∑l=1L T(l)(||m(l)||1, ||m(l+1)||1) ≤ τ
+||m(l)||1 ∈ P(l),
+
+trong đó L là số lớp trong mạng, lớp l có C(l)in kênh đầu vào, I(l)i là tầm quan trọng của kênh đầu vào i của lớp l, m(l)∈{0,1}C(l)in là mặt nạ kênh đầu vào cho lớp l, T(l) là hàm chi phí cho lớp l, τ là ràng buộc chi phí, và P(l) là tập hợp các giá trị được phép cho số kênh được giữ bởi mặt nạ m(l). Theo định nghĩa, m(1)i=1 và m(L+1)i=1 vì đó là các đầu vào và đầu ra không thể cắt tỉa của mạng. Một dẫn xuất hoàn chỉnh của Phương trình (5) có thể được tìm thấy trong tài liệu bổ sung, cũng như một thảo luận về cách xử lý các kết nối bỏ qua trong các kiến trúc như ResNet [14].
+
+Ràng buộc cuối cùng, về tập hợp các giá trị được phép P(l), là tùy chọn nhưng hữu ích trong một số tình huống. Đầu tiên, nó có thể được sử dụng để không cho phép cắt tỉa toàn bộ lớp: bằng cách bỏ qua 0 khỏi P(l) chúng ta ngăn m(l)=0. Như được giải thích trong tài liệu bổ sung, cắt tỉa lớp vi phạm một giả định chính của dẫn xuất Phương trình (5). Thứ hai, nó có thể được sử dụng để đảm bảo số kênh còn lại thân thiện với phần cứng, chẳng hạn như bội số 8× cho tensorcores GPU [35] với P(l)={0,8,16,...,⌊C(l)in/8⌋}.
+
+Chúng tôi có thể tiếp tục giảm điều này thành một tối ưu hóa chỉ trên số kênh p(l), vì các kênh quan trọng nhất sẽ luôn được giữ trong mỗi lớp:
+
+max p(2),...,p(L) ∑l=1L ∑i=1p(l) I(l)(i) (6)
+
+s.t. ∑l=1L T(l)(p(l), p(l+1)) ≤ τ
+p(l) ∈ P(l)
+
+trong đó p(l)=||m(l)||1 và I(l)(i) là giá trị lớn thứ i trong I(l). Chúng tôi cũng xấp xỉ ràng buộc sử dụng số kênh hiện tại p(l) để tách rời tác động chi phí của mặt nạ trong các lớp liên tiếp, điều này cần thiết để đặt ra điều này như một ví dụ của lớp bài toán tối ưu hóa sau đây.
+
+**Bài toán knapsack đa lựa chọn** Bài toán tối ưu hóa trong Phương trình (6) là một ví dụ của tổng quát hóa của bài toán knapsack 0-1 cổ điển được gọi là bài toán knapsack đa lựa chọn (MCK) [41]. Chúng tôi chỉ ra kết nối này một cách rõ ràng trong tài liệu bổ sung. Bài toán MCK có dạng
+
+max x ∑l=1L ∑i=1nl vl,i xl,i (7)
+
+s.t. ∑l=1L ∑i=1nl cl,i xl,i ≤ C
+xl,i ∈ {0,1}, ∑i=1nl xl,i = 1
+
+trong đó L là số nhóm, nhóm l có kích thước nl, và các mục có giá trị vl,i và chi phí cl,i≥0. Ràng buộc bổ sung so với bài toán knapsack 0-1 cổ điển thực thi rằng chúng ta chọn chính xác một mục từ mỗi nhóm.
+
+Chúng tôi giải quyết Phương trình (7) với thuật toán gặp ở giữa được triển khai GPU, được trình bày đầy đủ trong tài liệu bổ sung. Phương pháp của chúng tôi tổng quát hóa thuật toán gặp ở giữa tiêu chuẩn cho bài toán knapsack 0-1 cổ điển, không đòi hỏi chi phí nguyên, và giải quyết rất hiệu quả bài toán MCK cho các trường hợp sử dụng của chúng tôi. Ví dụ, đối với ResNet50 [14], phương pháp của chúng tôi giải quyết bài toán MCK trong dưới 1 giây. Chúng tôi trình bày chi tiết thời gian hoàn chỉnh hơn trong tài liệu bổ sung.
+
+### 3.4 Phương pháp tổng thể
+
+Chúng tôi trình bày phương pháp đầy đủ của mình trong Thuật toán 1. Chúng tôi bắt đầu với một mạng đã được huấn luyện trước, các hàm chi phí theo lớp T(l), và một ràng buộc chi phí toàn cục τ. Chúng tôi định nghĩa lịch trình cắt tỉa của mình bằng: (i) Kw: số epoch khởi động trước khi bắt đầu cắt tỉa; (ii) Kt: số epoch sau khởi động để đạt chi phí mục tiêu τ; (iii) r: số bước giữa việc tính toán lại các mặt nạ kênh; và (iv) Kc: số epoch làm mát nơi các mặt nạ được giữ cố định. Trong những epoch Kt để đạt chi phí mục tiêu, chúng tôi định nghĩa các ràng buộc chi phí trung gian {τe} sử dụng bộ lập lịch mũ của [19]. Ngoài ra, để ổn định các điểm quan trọng, có thể ồn ào do các minibatch ngẫu nhiên, chúng tôi tính toán và tích lũy điểm quan trọng trong Phương trình (3) mỗi minibatch giữa các lần lặp cắt tỉa theo phương pháp động lượng mũ của [32].
+
+## 4 Kết quả
+
+Chúng tôi đánh giá phương pháp của mình trên cả bộ dữ liệu benchmark ImageNet và PASCAL VOC. Chi tiết đầy đủ về cài đặt huấn luyện và kiến trúc có thể được tìm thấy trong tài liệu bổ sung. Chúng tôi sử dụng ràng buộc chi phí độ trễ, được định nghĩa bởi bảng tra cứu theo lớp (LUT) như đã được mô tả trước đó trong [51,40,48]. Chúng tôi nhắm mục tiêu và đo tốc độ độ trễ trên GPU NVIDIA TITAN V với cudNN V7.6.5 [4].
+
+### 4.1 Kết quả ImageNet
+
+Chúng tôi so sánh SMCP với một số nghiên cứu trước đó trên bộ dữ liệu phân loại ImageNet ILSVRC2012 [39]. Trong Bảng 1, chúng tôi so sánh kết quả của việc cắt tỉa ResNet50, ResNet101 [14], và MobileNet-V1 [17] tại một số ngưỡng cắt tỉa. Chúng tôi gọi SMCP-X% là giữ lại X% độ trễ gốc của mô hình đầy đủ và tính toán khung hình trên giây (FPS) và tăng tốc của mạng cuối cùng. Đối với ResNet50, chúng tôi hiển thị kết quả cho hai mô hình baseline khác nhau để so sánh tốt hơn với các nghiên cứu trước đó. Baseline đầu tiên là từ hub mô hình PyTorch [37], với độ chính xác Top-1 là 76,15%; baseline thứ hai là baseline được sử dụng cho EagleEye [23] và có độ chính xác Top-1 là 77,2%. Chúng tôi cắt tỉa và tinh chỉnh theo thiết lập huấn luyện của [36].
+
+Phương pháp của chúng tôi hoạt động tương đương với các nghiên cứu trước đó ở tỷ lệ cắt tỉa thấp và vượt trội hơn chúng đối với tỷ lệ cắt tỉa lớn. Đối với mô hình baseline PyTorch ResNet50, chúng tôi đạt được độ chính xác Top-1 cao hơn 0,3% với FPS cao hơn ở 2G và 1G FLOP với tăng tốc bổ sung 0,04× và 0,19× tương ứng. Đối với baseline EagleEye [23], phương pháp của chúng tôi tạo ra các mô hình gần 1G FLOP có độ chính xác Top-1 cao hơn 0,6% cho FPS gần như tương tự hoặc độ chính xác Top-1 tương tự trong khi nhanh hơn 19% (hoặc 0,5×). Kết quả tương tự cho ResNet101, dựa trên mô hình baseline hub PyTorch. Ở 2G FLOP, chúng tôi nhận được độ chính xác Top-1 cao hơn 0,3% và tăng tốc bổ sung 0,03×. Trên mô hình MobileNet-V1 đã compact, nơi tỷ lệ cắt tỉa mong muốn nhỏ hơn, phương pháp của chúng tôi hoạt động tương đương với các nghiên cứu trước đó; ở tỷ lệ cắt tỉa cao nhất, chúng tôi cho thấy cải thiện FPS nhỏ 0,07× mặc dù số FLOP cao hơn, chứng minh khả năng của bài toán tối ưu hóa trong Mục 3.3 để chọn mặt nạ nhận biết ràng buộc chi phí.
+
+Lợi ích của phương pháp chúng tôi, đặc biệt ở tỷ lệ cắt tỉa cao, có thể dễ dàng nhìn thấy hơn khi vẽ đường cong đánh đổi cho độ chính xác Top-1 so với FPS, như được hiển thị trong Hình 1 cho baseline PyTorch và Hình 3 cho baseline EagleEye. Ví dụ trong Hình 3, ở mức giảm độ trễ 75% (hoặc 3102 FPS), phương pháp của chúng tôi vượt trội hơn mô hình HALP [40] gần nhất với độ chính xác Top-1 cao hơn 0,2% và FPS cao hơn 15%; so với EagleEye [23], chúng tôi cho thấy độ chính xác Top-1 cao hơn 0,23% và FPS cao hơn 26%.
+
+Hơn nữa, phương pháp của chúng tôi có thể cắt tỉa tích cực các mô hình lớn, có quá nhiều tham số để vượt trội hơn các mô hình nhỏ hơn chưa cắt tỉa. Như được hiển thị trong Bảng 1 và Hình 3, ResNet101 được cắt tỉa 50% đạt được cải thiện Top-1 1,6% so với baseline ResNet50, không mất hiệu suất, và ResNet50 được cắt tỉa 80% đạt được Top-1 tương tự với MobileNet-V1 chưa cắt tỉa trong khi đạt được tăng tốc FPS 10%.
+
+Cuối cùng, lợi ích về độ chính xác và hiệu suất một phần do kiến trúc mạng cuối cùng được chọn bởi phương pháp của chúng tôi. Đặc biệt, vì chúng tôi giải quyết một bài toán phân bổ tài nguyên toàn cục trong quá trình huấn luyện, phương pháp của chúng tôi tự động xác định tỷ lệ cắt tỉa theo lớp cho hàm chi phí và ràng buộc đã cho. Ví dụ, trên ResNet50, chúng tôi thấy rằng SMCP tích cực trong việc cắt tỉa các lớp tích chập sớm và để lại các lớp sau được bảo tồn tốt hơn; chúng tôi cung cấp phân tích và hình ảnh bổ sung trong tài liệu bổ sung.
+
+### 4.2 Kết quả PASCAL VOC
+
+Để phân tích phương pháp của chúng tôi ngoài phân loại hình ảnh, chúng tôi cũng phân tích SMCP trên bộ dữ liệu phát hiện đối tượng PASCAL VOC [10]. Cụ thể, chúng tôi xem xét liệu một mô hình lớn, chẳng hạn như SSD512 [26] với backbone ResNet50, có thể được cắt tỉa ở tỷ lệ cao để khớp FPS của các mô hình nhỏ hơn trong khi duy trì mAP (mean average precision) vượt trội. Chúng tôi sử dụng thiết lập huấn luyện và kiểm tra "07+12" của [26] và cắt tỉa cả backbone và các lớp đặc trưng.
+
+Như được hiển thị trong Hình 3, phương pháp của chúng tôi có thể cắt tỉa SSD512-RN50 để có mAP cao hơn mô hình đã huấn luyện trước và FPS nhanh hơn mô hình SSD300-RN50 nhỏ hơn nhiều, một lần nữa cho thấy khả năng của phương pháp chúng tôi để cắt tỉa tích cực các mô hình lớn có quá nhiều tham số để vượt trội hơn các mô hình nhỏ hơn. Đặc biệt, mô hình cắt tỉa nhanh nhất của chúng tôi có điểm mAP cao hơn 2,63 điểm trong khi đạt được FPS cao hơn 12%. Quan trọng, việc giảm độ trễ để đạt được điều này là 75%, chứng minh sức mạnh của phương pháp chúng tôi trong chế độ tỷ lệ cắt tỉa cao. Chúng tôi cũng so sánh và vượt trội hơn một số mô hình detector phổ biến khác.
+
+### 4.3 Nghiên cứu ablation
+
+Chúng tôi cũng nghiên cứu tác động của các đóng góp của chúng tôi lên kết quả độ chính xác được hiển thị ở trên, cụ thể ở tỷ lệ cắt tỉa cao. Chúng tôi chạy phương pháp của mình một lần nữa trên bộ dữ liệu phân loại ImageNet, bắt đầu từ baseline ResNet50 EagleEye [23]. Đầu tiên chúng tôi loại bỏ kỹ thuật tỷ lệ chuẩn hóa theo lô từ Mục 3.2 trong khi giữ tái tham số hóa che mặt kênh đầu vào mềm của Mục 3.1. Sau đó chúng tôi bổ sung loại bỏ che mặt kênh đầu vào mềm, quay trở lại cắt tỉa vĩnh viễn. Chúng tôi giữ bộ giải và ràng buộc độ trễ trong Mục 3.3 không thay đổi. Kết quả ablation được hiển thị trong Hình 4. Loại bỏ tỷ lệ chuẩn hóa theo lô nói chung dẫn đến kết quả kém hơn một chút, do sự bất ổn huấn luyện được mô tả trong Mục 3.2. Bổ sung loại bỏ che mặt đầu vào mềm, do đó sử dụng cắt tỉa kênh vĩnh viễn, làm giảm độ chính xác và hiệu suất thêm nữa.
+
+### 4.4 Lựa chọn ràng buộc chi phí độ trễ
+
+Mặc dù công thức ràng buộc chi phí của chúng tôi là tổng quát cho bất kỳ số hàm chi phí nào, lợi ích của phương pháp chúng tôi được thể hiện rõ nhất dưới các cảnh quan chi phí độ trễ thách thức, phi tuyến (tức là các vách đá độ trễ cho GPU). Các ràng buộc tuyến tính (tức là ràng buộc tham số/FLOP) làm giảm nhu cầu cho che mặt mềm và phân bổ tài nguyên hiệu quả và toàn cục: các kênh đã loại bỏ có nhiều khả năng ở lại cắt tỉa một khi đã loại bỏ và số kênh còn lại trong mỗi lớp có xu hướng thay đổi chậm. Mặc dù huấn luyện chống lại ràng buộc độ trễ, Bảng 1 cho thấy rằng SMCP tương đương hoặc thậm chí vượt trội hơn các phương pháp trước đó dưới ràng buộc FLOP thấp.
+
+## 5 Kết luận
+
+Bằng cách áp dụng cắt tỉa kênh, các CNN hiện đại có thể được tăng tốc đáng kể, với dấu chân bộ nhớ nhỏ hơn, chi phí tính toán và thời gian suy luận. Trong nghiên cứu này, chúng tôi đã trình bày một phương pháp cắt tỉa kênh đầu vào có cấu trúc mới, được gọi là SMCP, kết hợp che mặt mềm của các kênh đầu vào, một kỹ thuật tỷ lệ chuẩn hóa theo lô, và giải pháp cho một bài toán phân bổ tài nguyên để vượt trội hơn các nghiên cứu trước đó. Chúng tôi động lực việc sử dụng từng thành phần của phương pháp chúng tôi và chứng minh hiệu quả của chúng trên cả bộ dữ liệu ImageNet và PASCAL VOC. Mặc dù chúng tôi chỉ xem xét cắt tỉa kênh trong nghiên cứu này, phương pháp của chúng tôi có thể được mở rộng để cùng xem xét cả cắt tỉa kênh và cắt tỉa có cấu trúc N:M [31] để thỏa mãn một ràng buộc chi phí rõ ràng. Điều này có thể được xem như một mở rộng của cả nghiên cứu này và nghiên cứu của [56] và được để lại cho một nghiên cứu tương lai.

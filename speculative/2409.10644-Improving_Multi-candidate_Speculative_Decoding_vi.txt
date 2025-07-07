@@ -1,0 +1,125 @@
+# Cải thiện Giải mã Suy đoán Đa ứng viên
+
+Xiaofan Lu∗, 1, Yixiao Zeng∗, 2, Feiyang Ma3, Zixu Yu4, Marco Levorato5
+Đại học California, Irvine
+{1xiaofl14,2yixiaz8,3feiyangm,4zixuy,5levorato}@uci.edu
+
+## Tóm tắt
+
+Giải mã Suy đoán (SD) là một kỹ thuật để tăng tốc quá trình suy luận của các Mô hình Ngôn ngữ Lớn (LLM) bằng cách sử dụng một mô hình nháp có độ phức tạp thấp hơn để đề xuất các token ứng viên được xác minh bởi một mô hình đích lớn hơn. Để cải thiện hiệu quả hơn nữa, Giải mã Suy đoán Đa ứng viên (MCSD) cải tiến phương pháp này bằng cách lấy mẫu nhiều token ứng viên từ mô hình nháp ở mỗi bước và xác minh chúng song song, do đó tăng cơ hội chấp nhận một token và giảm thời gian tạo. Các phương pháp MCSD hiện tại dựa vào mô hình nháp để khởi tạo các chuỗi đa ứng viên và sử dụng độ dài tĩnh và cấu trúc attention cây cho việc tạo nháp. Tuy nhiên, cách tiếp cận như vậy gặp khó khăn do sự khác biệt phân phối đầu ra của mô hình nháp và mô hình đích, đặc biệt trong bối cảnh tạo động. Trong công trình này, chúng tôi giới thiệu một phiên bản mới của MCSD bao gồm việc tạo đa ứng viên được khởi tạo bởi mô hình đích, một mặt nạ nhân quả nhận biết tô-pô được cắt động để điều chỉnh độ dài động, và các mô hình quyết định để tối ưu hóa việc dừng sớm. Chúng tôi thử nghiệm phương pháp của mình trên Llama 2-7B và các biến thể của nó và quan sát được tăng tốc tối đa 27.5% so với đường cơ sở MCSD của chúng tôi trên ba điểm chuẩn với Llama 2-7B làm mô hình đích và JackFram 68M làm mô hình nháp. Ngoài ra, chúng tôi đánh giá tác động của việc sử dụng quá trình đa ứng viên được khởi tạo bởi mô hình đích với các mô hình nháp khác nhau đối với chất lượng đầu ra. Mã nguồn gốc của chúng tôi có sẵn trên GitHub.
+
+## 1 Giới thiệu
+
+Trong những năm gần đây, các Mô hình Ngôn ngữ Lớn (LLM) như GPT-4[1] đã cải thiện đáng kể các nhiệm vụ xử lý ngôn ngữ khác nhau. Tuy nhiên, các mô hình này đòi hỏi tính toán cao đặc biệt trong giai đoạn suy luận, nơi việc tạo k token đòi hỏi k lần chạy tuần tự của mô hình. Sự không hiệu quả này hạn chế việc triển khai thực tế của các mô hình mạnh mẽ này trong các ứng dụng thời gian thực.
+
+Trong số các phương pháp tối ưu hóa suy luận LLM nghiêm túc, Giải mã Suy đoán (SD)[4] đã được chứng minh là tăng tốc độ suy luận với mất mát chất lượng tạo tối thiểu. Các khung SD đầu tiên tạo các token ứng viên sử dụng một mô hình (mô hình nháp) có độ phức tạp thấp hơn so với mô hình gốc (mô hình đích). Sau đó, mô hình đích xác minh các token được tạo. Hiệu suất của SD chủ yếu được xác định bởi tỷ lệ chấp nhận token α, đo lường tỷ lệ các token ứng viên được tạo bởi mô hình nháp mà mô hình đích chấp nhận. Lợi ích của việc sử dụng mô hình nháp nhanh hơn giảm đi nếu mô hình đích thường xuyên từ chối các token này, có nghĩa là mô hình đích phải tạo lại các token.
+
+Để nâng cao hơn nữa tỷ lệ chấp nhận, Giải mã Suy đoán Đa ứng viên (MCSD)[6,10] đã được giới thiệu. MCSD lấy mẫu nhiều token ứng viên ở mỗi bước tạo và xác minh chúng song song sử dụng mô hình đích. Cách tiếp cận này tăng khả năng ít nhất một trong các token ứng viên sẽ được chấp nhận, do đó cải thiện tỷ lệ chấp nhận tổng thể và hiệu quả. MCSD cũng kết hợp một cơ chế attention cây để quản lý chi phí tính toán và truyền thông bằng cách tổ chức nhiều chuỗi ứng viên thành một chuỗi duy nhất và áp dụng một mặt nạ attention được thiết kế cẩn thận. Tuy nhiên, MCSD vẫn đối mặt với một số thách thức. 1. Tăng Độ phức tạp Tính toán: Xác minh nhiều ứng viên đồng thời tăng tải tính toán, đòi hỏi nhiều bộ nhớ và sức mạnh xử lý hơn. 2. Tạo Mặt nạ Nhân quả Nhận biết Tô-pô Hiệu quả: Tạo và duy trì một mặt nạ nhân quả nhận biết tô-pô cho các cây token đa ứng viên tốn thời gian và giảm khả năng thích ứng của mô hình. 3. Độ dài Tạo Nháp Cố định (γ): Sử dụng độ dài cố định cho các đoạn token được tạo bởi nháp có thể không tối ưu trong tất cả các bối cảnh.
+
+Trong bài báo này, chúng tôi trình bày một phương pháp giới thiệu mặt nạ nhân quả nhận biết tô-pô được cắt động để tạo thuận lợi cho quá trình giải mã suy đoán, cho phép điều chỉnh động độ dài tạo nháp mà không cần tái tạo mặt nạ nhân quả nhận biết tô-pô. Chúng tôi nâng cao tỷ lệ chấp nhận bằng cách khởi tạo cây token đa ứng viên với mô hình đích, do đó cải thiện hiệu quả. Ngoài ra, chúng tôi kết hợp một mô hình quyết định để tối ưu hóa cơ chế dừng sớm trong giai đoạn tạo mô hình nháp. Mô hình này dừng động việc tạo token nháp sớm bằng cách dự đoán khả năng mô hình đích chấp nhận các token, do đó giảm tính toán không cần thiết.
+
+Kết quả thử nghiệm của chúng tôi cho thấy rằng khung của chúng tôi, sự kết hợp của việc tạo đa ứng viên được khởi tạo bởi đích, mặt nạ nhân quả nhận biết tô-pô được cắt động, và dừng sớm với mô hình quyết định, gặp khó khăn trong việc duy trì cả chất lượng tạo và tăng tốc đồng thời. Thay vào đó, chúng tôi thấy rằng việc tạo đa ứng viên được khởi tạo bởi mô hình đích tĩnh của chúng tôi một mình đạt được tăng tốc cao nhất trong khi bảo tồn chất lượng tạo cao nhất trong các thử nghiệm của chúng tôi. Do đó, chúng tôi đang trình bày kết quả tăng tốc từ các thử nghiệm tạo đa ứng viên được khởi tạo bởi mô hình đích tĩnh trong phần 4.1, và kết quả của khung của chúng tôi trong Phụ lục A.1.
+
+Phương pháp tạo đa ứng viên được khởi tạo bởi mô hình đích tĩnh với cấu hình tạo đa ứng viên tối ưu mà chúng tôi tìm thấy thông qua tìm kiếm lưới trên bộ dữ liệu tùy chỉnh cải thiện tốc độ tạo thông qua cải thiện tỷ lệ chấp nhận (α), được định nghĩa là tỷ số của độ dài chuỗi nháp dài nhất được chấp nhận bởi mô hình đích với độ dài chuỗi nháp tối đa. Phương pháp này đạt được tối đa 27.5% tăng tốc tạo so với đường cơ sở MCSD và sử dụng mô hình nháp nhỏ hơn (Llama-68M[6]) trên ba bộ dữ liệu: TriviaQA[3], Alpaca[8] và MT-Bench[12]. Đánh giá chất lượng đầu ra trên MT-Bench tiết lộ rằng quá trình đa ứng viên được khởi tạo bởi mô hình đích không bảo tồn chất lượng đầu ra của mô hình đích; chất lượng đầu ra giảm khi số lượng token được khởi tạo bởi đích tăng, và các mô hình nháp khác nhau ảnh hưởng đáng kể đến chất lượng đầu ra.
+
+Chúng tôi cũng tiến hành một nghiên cứu ablation để đánh giá tác động của mô hình quyết định trong Phụ lục A.2. Ngoài ra, chúng tôi phân tích tại sao khung của chúng tôi không vượt trội hơn việc tạo đa ứng viên được khởi tạo bởi mô hình đích tĩnh một mình trong Phần 5.
+
+## 2 Nền tảng
+
+### 2.1 Giải mã Suy đoán
+
+Giải mã suy đoán là sự hợp tác của hai mô hình: một mô hình nháp nhỏ hơn (thường là một mô hình xấp xỉ hiệu quả hơn) và một mô hình đích lớn hơn. Đầu tiên, mô hình nháp tạo nhiều token ứng viên song song, sử dụng phân phối xác suất của nó để dự đoán các token có thể tiếp theo dựa trên đầu vào. Sau đó, các token này được chuyển đến mô hình đích, mô hình này xác minh chúng bằng cách tính toán phân phối xác suất của chúng trên cùng đầu vào. Nếu mô hình đích chấp nhận các token ứng viên (căn chỉnh xác suất), chúng được hoàn thiện trong chuỗi đầu ra. Ngược lại, mô hình đích thay thế chúng bằng cách tạo các token mới dựa trên phân phối của chính nó. Quá trình giải mã suy đoán đảm bảo rằng phân phối đầu ra vẫn nhất quán với những gì mô hình đích một mình sẽ tạo ra, do đó duy trì chất lượng của nội dung được tạo[4].
+
+Quan trọng là, kỹ thuật này không yêu cầu thay đổi kiến trúc của mô hình hoặc đào tạo lại, làm cho nó trở thành một giải pháp dễ tiếp cận và hiệu quả để tăng tốc suy luận.
+
+### 2.2 Tạo Đa ứng viên
+
+Do sự khác biệt phân phối giữa các mô hình nháp và đích, đường dẫn ứng viên có xác suất cao nhất trong mô hình nháp có thể không luôn dẫn đến các token được chấp nhận nhiều nhất bởi mô hình đích. Do đó, việc xác minh nhiều đường dẫn ứng viên song song tăng tỷ lệ chấp nhận tổng thể α của các token nháp. Bài báo này lấy phương pháp attention cây trong Specinfer[6] làm điểm khởi đầu để xử lý nhiều đường dẫn token ứng viên đồng thời. Không giống như mô hình attention nhân quả truyền thống được thiết kế cho việc tạo chuỗi văn bản đơn, attention cây tính toán điểm attention cho nhiều chuỗi văn bản từ một cây token, đòi hỏi một mặt nạ nhân quả nhận biết tô-pô cộng với các thay đổi trong chỉ số vị trí ứng viên đơn thông thường và cập nhật bộ đệm key-value để hợp nhất tính toán attention cây của tất cả các token trong một kernel duy nhất. Trong Hình 1, chúng tôi minh họa mặt nạ nhân quả nhận biết tô-pô để tính toán attention cây của một chuỗi đa ứng viên với ba đường dẫn token ứng viên, mỗi đường có hai token nháp.
+
+## 3 Phương pháp
+
+Trong khung giải mã suy đoán được đề xuất bởi Leviathan et al.[4], yếu tố cải thiện kỳ vọng (IF) được định nghĩa là:
+
+IF = (1−α)γ+1 / (1−α)(cγ+ 1)
+
+trong đó α đại diện cho kỳ vọng của tỷ lệ chấp nhận, γ đại diện cho độ dài tạo nháp, và c đại diện cho tỷ số giữa thời gian cho một lần chạy đơn của mô hình nháp và thời gian cho một lần chạy đơn của mô hình đích. Dựa trên công thức (1), một α lớn hơn sẽ tăng tốc việc tạo token. Nếu một oracle có thể xác định γ một cách động, yếu tố cải thiện có thể lên đến khoảng 60% lớn hơn yếu tố cải thiện với γ cố định.
+
+Trong công trình này, chúng tôi khám phá ba phương pháp để cải thiện α và xác định γ một cách động để tăng tốc quá trình MCSD:
+
+1. Tạo Đa ứng viên Được Khởi tạo bởi Mô hình Đích: chúng tôi giới thiệu một phương pháp mới để xây dựng các chuỗi đa ứng viên cải thiện α so với các cách tiếp cận hiện có;
+
+2. Mặt nạ Nhân quả Nhận biết Tô-pô Được Cắt Động: chúng tôi giới thiệu một phương pháp để tạo hiệu quả các mặt nạ nhân quả nhận biết tô-pô cho việc tạo đa ứng viên động;
+
+3. Mô hình Quyết định Dừng Sớm: chúng tôi giới thiệu một mô hình MLP độ phức tạp thấp để xác định γ một cách động trong mỗi vòng lặp tạo nháp.
+
+Chúng tôi lưu ý rằng các quá trình trên có thể được tích hợp vào một khung thống nhất. Phương pháp Cây Token Đa ứng viên Được Khởi tạo bởi Mô hình Đích có thể được triển khai riêng lẻ vì nó cải thiện α cho cả MCSD tĩnh và động, trong khi 2 và 3 phụ thuộc lẫn nhau và cần MCSD động.
+
+### 3.1 Tạo Đa ứng viên Được Khởi tạo bởi Mô hình Đích
+
+Các phương pháp giải mã suy đoán đa ứng viên hiện có dựa vào mô hình nháp để tạo toàn bộ cây token đa ứng viên, và sau khi xác minh các token được tạo bởi nháp, chỉ lấy mẫu một token từ mô hình đích hoặc phân phối đầu ra được chuẩn hóa của mô hình đích và nháp. Do sự khác biệt giữa phân phối đầu ra của mô hình nháp và đích, không có tiêu chí cụ thể nào để xác định token nào được lấy mẫu từ mô hình đích sẽ mang lại chuỗi token được chấp nhận dài nhất cho việc tạo mô hình nháp trong tương lai. Do đó, chúng tôi đưa ra giả thuyết rằng việc lấy mẫu nhiều token thay vì một token từ phân phối của mô hình đích để khởi tạo một chuỗi đa ứng viên cho việc tạo mô hình nháp trong tương lai có thể tăng tỷ lệ chấp nhận. Tuy nhiên, khi mô hình đích khởi tạo nhiều hơn một token cho việc tạo đa ứng viên, việc chọn một token được khởi tạo dựa trên chuỗi token nháp được chấp nhận dài nhất tạo ra một phụ thuộc. Điều này có nghĩa là xác suất chấp nhận của các token nháp tuần tự ảnh hưởng đến xác suất chấp nhận token được lấy mẫu từ đích. Do đó, phân phối đầu ra không còn phù hợp với của mô hình đích. Cụ thể, bằng cách chọn token đích ti mang lại chuỗi nháp được chấp nhận dài nhất, xác suất chấp nhận token được lấy mẫu từ đích ti trở thành:
+
+Poutput(ti) = Ptarget(ti) × Pacceptance(ti+1, ti+2,··· |ti)
+
+Trong đó Pacceptance(ti+1, ti+2,··· |ti) là xác suất các token nháp tiếp theo được chấp nhận cho token đích ti. Điều này làm thay đổi phân phối đầu ra, khiến nó khác biệt so với Ptarget(ti). Do đó, chúng tôi đánh giá chất lượng đầu ra của phương pháp chúng tôi sử dụng MT-Bench. Kết quả thực nghiệm chỉ ra rằng mất mát chất lượng phụ thuộc vào số lượng token khởi tạo được điều khiển bởi đích và mô hình nháp. Để biết thêm chi tiết, vui lòng tham khảo phần thực nghiệm.
+
+Hình 1 minh họa cách chúng tôi sửa đổi việc tạo đa ứng viên được khởi tạo bởi nháp hiện có để xây dựng việc tạo đa ứng viên được khởi tạo bởi mô hình đích của chúng tôi. Mặt nạ nhận biết tô-pô cho cây token được khởi tạo bởi đích cần một mặt nạ lớn hơn so với cây token được khởi tạo bởi nháp để xử lý nhiều token ban đầu cho các chuỗi có thể khác nhau được lấy mẫu từ mô hình đích. Kích thước mặt nạ nhân quả nhận biết tô-pô cho cây token được khởi tạo bởi mô hình đích là bình phương của tổng chiều rộng cây token và tổng số token được tạo bởi nháp. Trong Hình 1, kích thước mặt nạ cho cây token được khởi tạo bởi mô hình đích là (3 + 6)² trong khi kích thước cho cây token được khởi tạo bởi nháp là 6². Chúng tôi lưu ý rằng nếu việc tạo đa ứng viên được khởi tạo bởi nháp và được khởi tạo bởi đích có cùng tỷ lệ chấp nhận, thì phương pháp được khởi tạo bởi đích sẽ thực hiện thêm một lần chuyển tiếp đích so với phương pháp được khởi tạo bởi nháp vì đầu vào gốc đi vào mô hình đích thay vì mô hình nháp. Tuy nhiên, nói chung, các nhiệm vụ tạo văn bản thường liên quan đến hàng trăm lần chuyển tiếp đích, và chi phí này là tối thiểu.
+
+### 3.2 Mặt nạ Nhân quả Nhận biết Tô-pô Được Cắt Động
+
+Các phương pháp giải mã suy đoán đa ứng viên hiện có như EAGLE[5] sử dụng các cây token dựa trên mở rộng với các độ sâu và chiều rộng khác nhau cho các nhánh khác nhau để tăng tỷ lệ chấp nhận trung bình của mô hình đích trên các token được tạo bởi nháp. Việc tạo một mặt nạ nhân quả nhận biết tô-pô cho cây token đa ứng viên tốn thời gian; hầu hết các phương pháp giải mã suy đoán đa ứng viên hiện có chỉ xây dựng mặt nạ nhân quả nhận biết tô-pô một lần trong quá trình khởi tạo.
+
+Chúng tôi giới thiệu một mặt nạ nhân quả nhận biết tô-pô được cắt động để cho phép mô hình quyết định quyết định động độ dài tạo token nháp đa ứng viên và tránh tạo mặt nạ nhân quả nhận biết tô-pô mới trong mỗi lần lặp. Ý tưởng chính là xây dựng một mặt nạ nhân quả nhận biết tô-pô lớn trong quá trình khởi tạo. Hình 2 minh họa một mặt nạ nhân quả nhận biết tô-pô cho phép tối đa ba lần tạo token nháp cho mỗi chuỗi ứng viên. Có ba mặt nạ nhân quả được cắt có thể cho giải mã suy đoán đa ứng viên động: mặt nạ khi dừng sớm ở lần lặp đầu tiên (mặt nạ nhân quả 3 x 3 ở góc trên bên trái), dừng sớm ở lần lặp thứ hai (hiển thị trong Hình 2), không dừng sớm (toàn bộ mặt nạ nhân quả 9 x 9).
+
+Trong khung được đề xuất, chúng tôi giữ cây token ở dạng nĩa để mỗi chuỗi token ứng viên không mở rộng thành các chuỗi con mới. Lợi ích chính của việc sử dụng dạng nĩa thay vì cây token dựa trên mở rộng là giảm sử dụng bộ nhớ vì kích thước của mặt nạ nhân quả nhận biết tô-pô cho cây token dựa trên mở rộng tăng theo cấp số nhân. Ngược lại, cây token dạng nĩa sẽ tăng tuyến tính.
+
+### 3.3 Mô hình Quyết định
+
+Chúng tôi thiết kế hai loại mô hình quyết định để xác định động liệu có cần thiết dừng sớm trong quá trình tạo nháp hay không. Loại mô hình quyết định đầu tiên là một MLP ba lớp, lấy các trạng thái ẩn từ mô hình nháp làm đầu vào và max(1,p(x|I)/q(x|I)) (p(x|I) là xác suất mô hình đích dự đoán token x với đầu vào I cho trước và q(x|I) là xác suất mô hình nháp dự đoán token x với đầu vào I cho trước) làm nhãn huấn luyện. Quá trình quyết định có thể được biểu diễn như:
+
+PT1 = MLP(yHi)
+
+Trong đó yHi biểu thị các trạng thái ẩn của mô hình nháp cho token i. Loại mô hình quyết định thứ hai được lấy cảm hứng từ Tandem transformer[7], là một MLP hai lớp với entropy phân phối đầu ra của mô hình nháp lấy xác suất làm đầu vào và kết quả xác minh (không là từ chối, một là chấp nhận) làm nhãn. Quá trình quyết định có thể được biểu diễn như:
+
+PT2 = MLP(ConCat(Topk(yDi), Ent(yDi))
+
+Trong đó yDi biểu thị phân phối đầu ra của mô hình nháp cho token i và được sử dụng để tính toán cả entropy và xác suất top-k cho đầu vào vào MLP hai lớp.
+
+Trong quá trình tạo nháp, mô hình quyết định sẽ suy luận batch đầu vào cho nhiều chuỗi và tính toán xác suất mô hình đích chấp nhận mỗi chuỗi. Nếu xác suất cho tất cả các chuỗi thấp hơn ngưỡng (trong thử nghiệm của chúng tôi, ngưỡng là 0.4 cho cả hai mô hình quyết định), thì việc tạo nháp sẽ dừng sớm; ngược lại, nó sẽ tiếp tục cho đến khi đạt được độ dài tạo nháp tối đa.
+
+## 4 Thử nghiệm
+
+### 4.1 Thiết lập Thử nghiệm
+
+Các thử nghiệm của chúng tôi được thực hiện trên một máy chủ đơn được trang bị GPU Nvidia RTX 4090. Để đảm bảo tính nhất quán với các tham số huấn luyện gốc của mô hình Llama, tất cả các mô hình đích sử dụng độ chính xác Bfloat16, trong khi các mô hình nháp được cấu hình với độ chính xác kép. Thiết lập này cung cấp một môi trường thử nghiệm ổn định: độ chính xác Bfloat16 trên các mô hình nháp thỉnh thoảng dẫn đến các giá trị NaN hoặc Inf trong tính toán softmax trong thư viện PyTorch, nhưng độ chính xác kép cho các mô hình nháp ngăn chặn những vấn đề này khỏi việc gián đoạn thử nghiệm.
+
+Đối với bộ dữ liệu thử nghiệm của chúng tôi, chúng tôi chọn TriviaQA[3], Alpaca[8] và MT-Bench[12]. Trong thử nghiệm sau, đối với TriviaQA và Alpaca, chúng tôi chọn ngẫu nhiên 250 lời nhắc đầu vào. Và đối với MT-bench, chúng tôi thử nghiệm hoàn toàn 80 bộ lời nhắc.
+
+Đối với các mô hình nháp và đích, chúng tôi sử dụng rộng rãi mô hình Llama 2-7B Chat[9] và các mô hình liên quan khác có cùng tokenizer. Đối với các mô hình đích của chúng tôi, chúng tôi chọn LLama 2-7B Chat và phiên bản được tinh chỉnh của nó, Vicuna-7B[2]. Cùng lúc đó, chúng tôi sử dụng hai mô hình khác nhau, Llama-68M từ SpecInfer[6] và TinyLlama-1.1B[11], làm mô hình nháp để thử nghiệm tác động của các phương pháp tăng tốc trên các loại cặp mô hình khác nhau. Độ dài tạo tối đa là 200 token. Chúng tôi áp dụng nhiệt độ 0 cho lấy mẫu tham lam và 0.7 cho lấy mẫu xác suất, với giá trị sau cung cấp một điểm giữa cân bằng sự đánh đổi giữa tốc độ và chất lượng tạo, như quan sát trong các thử nghiệm của chúng tôi.
+
+Hơn nữa, chúng tôi chuẩn hóa cấu hình trên các phương pháp SD khác nhau để đánh giá tỷ lệ chấp nhận và các số liệu hiệu suất khác. Cụ thể, chúng tôi đặt SD thành γ = 4 cố định, trong khi đối với phương pháp MCSD, chúng tôi sử dụng cấu hình k tối ưu của (4,2,2,1) trong môi trường của chúng tôi, vì nó cung cấp tăng tốc lớn hơn so với cấu hình (4,2,2,1,1) được báo cáo trong bài báo gốc[10].
+
+Phương pháp của chúng tôi sử dụng cấu hình MCSD được khởi tạo bởi mô hình đích tĩnh với (2,4,3,1,1), trong đó số đầu tiên (2) trong cấu hình biểu thị số lượng token được khởi tạo bởi mô hình đích, và mô hình nháp sẽ tạo 4 + 4×3 + 4×3×1 + 4×3×1×1 = 40 token nháp cho mỗi token được khởi tạo bởi mô hình đích dẫn đến 2×4×3×1×1 = 24 chuỗi ứng viên khác nhau với độ dài token nháp bằng bốn (γ = 4). Hình 3 hiển thị tỷ lệ tăng tốc trong những hoàn cảnh như vậy. Bảng 1 cho thấy phương pháp của chúng tôi đạt được chất lượng đầu ra cao nhất khi số lượng token được khởi tạo bởi đích được đặt thành hai. Đáng chú ý, khi số lượng token được khởi tạo bởi đích được giảm xuống một, phân phối đầu ra đích vẫn ổn định, và điểm MT-bench được bảo tồn trong phạm vi ±0.05, bất kể mô hình nháp nào được chọn. Do đó, chúng tôi đặt cấu hình MCSD của chúng tôi bắt đầu với 2; thông qua tìm kiếm lưới trong Hình 4, chúng tôi thấy (2,4,3,1,1) mang lại tăng tốc tối ưu trong môi trường thử nghiệm của chúng tôi trên Mt-Bench. Hơn nữa, khi số lượng token được khởi tạo bởi đích bằng hai, lấy mẫu tham lam không mang lại cải thiện đáng kể trong tỷ lệ chấp nhận và kết thúc với kết quả tăng tốc tương tự như đường cơ sở. Do đó, chúng tôi không trình bày kết quả với lấy mẫu tham lam.
+
+Ngoài ra, chúng tôi cũng đặt cấu hình động với D = 5 và W = 16, trong đó W (Chiều rộng) chỉ ra số lượng chuỗi ứng viên được tạo song song ở mỗi bước của cây token, và D (Độ sâu) biểu thị mức độ dự đoán token, tham chiếu đến γ trong SD truyền thống. D = 5 cố định đảm bảo độ dài tạo nháp nhất quán trên tất cả các phương pháp SD. Cùng lúc đó, W = 16 căn chỉnh số lượng chuỗi ứng viên với những chuỗi trong MCSD, cho phép so sánh công bằng giữa các phương pháp.
+
+Do chất lượng của việc tạo, tất cả các thiết lập trong thử nghiệm sau tuân theo cấu hình MCSD tĩnh tối ưu. Chúng tôi sẽ minh họa tốc độ tạo lý tưởng và tỷ lệ chấp nhận tương ứng dựa trên cấu hình động trong phần Phụ lục A.1.
+
+### 4.2 Kết quả Tổng thể
+
+Kết quả thử nghiệm được hiển thị trong Hình 3 chứng minh những cải thiện đáng kể về tốc độ tạo. Tất cả các cấu hình được hiển thị và giải thích trong Phần 4.1. Được tiến hành trên bộ dữ liệu MT-Bench, phương pháp của chúng tôi đạt được tăng tốc tối đa 1.90 lần so với đường cơ sở. Lý do chính mà việc sử dụng LlaMa-68M làm mô hình nháp dẫn đến tăng tốc lớn hơn so với TinyLlama-1.1B là LlaMa-68M đạt được tốc độ suy luận nhanh hơn khoảng 5.5× so với TinyLlama-1.1B. Ngược lại, TinyLlama-1.1B chỉ hiển thị tỷ lệ chấp nhận cao hơn 3.4× với Llama-2-7B so với tỷ lệ chấp nhận của LlaMa-68M.
+
+### 5 Thảo luận
+
+Chúng tôi thừa nhận rằng sự kết hợp của việc tạo đa ứng viên được khởi tạo bởi đích, che mặt nhân quả nhận biết tô-pô được cắt động, và dừng sớm với cây quyết định không vượt trội hơn việc tạo đa ứng viên được khởi tạo bởi mô hình đích tĩnh một mình về tốc độ suy luận trong khi bảo tồn chất lượng tạo cao nhất. Hai yếu tố chính góp phần vào kết quả này:
+
+1. Trong việc tạo MCSD động, chúng tôi sử dụng cây token dạng nĩa. Vì chất lượng tạo cao nhất được duy trì khi số lượng token được khởi tạo bởi mô hình đích được đặt thành hai, cây token dạng nĩa chỉ tạo ra hai chuỗi ứng viên. Điều này dẫn đến tỷ lệ chấp nhận thấp hơn so với cây token dạng cây được sử dụng trong việc tạo đa ứng viên được khởi tạo bởi mô hình đích tĩnh.
+
+2. Các mô hình quyết định mà chúng tôi đào tạo không mang lại tăng tốc đáng kể thông qua γ động (hiển thị trong Phụ lục A.2). Kết quả thử nghiệm chỉ ra rằng mặc dù việc dừng sớm được cung cấp bởi mô hình quyết định giảm thời gian tạo nháp bằng cách tránh các chuỗi có khả năng bị từ chối, nó cũng dừng sớm các chuỗi có thể hợp lệ mở rộng cho độ dài chấp nhận dài hơn, tăng thời gian suy luận mô hình đích. Do đó, chi phí kết hợp từ thời gian suy luận mô hình quyết định và thời gian suy luận mô hình đích mở rộng bù đắp thời gian tiết kiệm trong việc tạo nháp, dẫn đến tăng tốc không đáng kể trong hầu hết các trường hợp. Hình 7 gợi ý tại sao mô hình quyết định của chúng tôi dẫn đến dừng sớm.
+
+Mặc dù chúng tôi có thể giải quyết vấn đề đầu tiên bằng cách lấy mẫu nhiều token nháp cho mỗi token được khởi tạo bởi mô hình đích và xây dựng cây token dạng nĩa dựa trên các token nháp được mở rộng này, điều chỉnh này sẽ không mang lại lợi ích đáng kể mà không có mô hình quyết định có khả năng tăng tốc suy luận MCSD.
+
+Chúng tôi hy vọng công trình của chúng tôi cung cấp những hiểu biết cho các cải thiện trong tương lai trong quá trình giải mã suy đoán. Ví dụ, trong khi quá trình MCSD động có thể về mặt lý thuyết nâng cao tốc độ suy luận, kết quả thử nghiệm của chúng tôi gợi ý rằng việc đào tạo một mô hình quyết định bên ngoài để thực hiện dừng sớm—ngay cả khi nó có thể hoàn hảo tránh dừng sớm và không gây ra chi phí bổ sung cho suy luận mô hình đích—sẽ dẫn đến tăng tốc tổng thể không quá 10% so với một quá trình MCSD tĩnh tối ưu. Hơn nữa, kết quả MT-Bench cho việc tạo đa ứng viên được khởi tạo bởi mô hình đích gợi ý rằng khi nhiều hơn một token được khởi tạo bởi mô hình đích được sử dụng, một mô hình nháp với tỷ lệ chấp nhận cao hơn liên quan đến mô hình đích bảo tồn chất lượng đầu ra đích tốt hơn so với một mô hình có tỷ lệ chấp nhận thấp hơn. Ví dụ, trong thiết lập giải mã suy đoán cơ bản, TinyLlama-1.1B đạt được tỷ lệ chấp nhận cao hơn khoảng 25% với Llama-2-7B so với Llama-68M.
+
+## 6 Kết luận
+
+Trong công trình này, chúng tôi đề xuất một cây token đa ứng viên được khởi tạo bởi đích nâng cao tỷ lệ chấp nhận trong giải mã suy đoán đa ứng viên, với mất mát chất lượng đầu ra bị ảnh hưởng bởi số lượng token được khởi tạo bởi đích và mô hình nháp cụ thể được sử dụng. Ngoài ra, chúng tôi giới thiệu một kỹ thuật cắt mặt nạ động để tránh chi phí tạo mặt nạ nhân quả nhận biết tô-pô cho giải mã suy đoán đa ứng viên động. Trong khi chúng tôi chưa khám phá được mô hình quyết định có thể làm cho giải mã suy đoán đa ứng viên động nhanh hơn so với tĩnh trong tất cả các kịch bản, công trình của chúng tôi có thể giúp nghiên cứu trong tương lai tìm ra một quá trình giải mã suy đoán đa ứng viên hiệu quả hơn.

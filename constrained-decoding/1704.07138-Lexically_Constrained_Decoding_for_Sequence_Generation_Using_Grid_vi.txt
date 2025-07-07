@@ -1,0 +1,145 @@
+# Giải mã có ràng buộc từ vựng cho sinh chuỗi sử dụng Grid Beam Search
+
+Chris Hokamp
+Trung tâm ADAPT
+Đại học Thành phố Dublin
+chris.hokamp@computing.dcu.ie
+
+Qun Liu
+Trung tâm ADAPT
+Đại học Thành phố Dublin
+qun.liu@dcu.ie
+
+## Tóm tắt
+
+Chúng tôi trình bày Grid Beam Search (GBS), một thuật toán mở rộng beam search để cho phép bao gồm các ràng buộc từ vựng được chỉ định trước. Thuật toán có thể được sử dụng với bất kỳ mô hình nào sinh ra chuỗi ŷ = {y₀...y_T} bằng cách tối đa hóa p(y|x) = ∏_t p(y_t|x, {y₀...y_{t-1}}). Các ràng buộc từ vựng có dạng các cụm từ hoặc từ phải có mặt trong chuỗi đầu ra. Đây là một cách rất tổng quát để kết hợp kiến thức bổ sung vào đầu ra của mô hình mà không cần sửa đổi bất kỳ tham số mô hình hoặc dữ liệu huấn luyện nào. Chúng tôi chứng minh tính khả thi và linh hoạt của Giải mã có ràng buộc từ vựng bằng cách tiến hành các thí nghiệm về Dịch thuật Tương tác-Dự đoán Neural, cũng như Thích ứng Miền cho Dịch thuật Máy Neural. Các thí nghiệm cho thấy GBS có thể cung cấp những cải thiện lớn về chất lượng dịch thuật trong các tình huống tương tác, và ngay cả khi không có đầu vào của người dùng, GBS có thể được sử dụng để đạt được những lợi ích đáng kể về hiệu suất trong các tình huống thích ứng miền.
+
+## 1 Giới thiệu
+
+Đầu ra của nhiều mô hình xử lý ngôn ngữ tự nhiên là một chuỗi văn bản. Các ví dụ bao gồm tóm tắt tự động (Rush et al., 2015), dịch thuật máy (Koehn, 2010; Bahdanau et al., 2014), sinh chú thích (Xu et al., 2015), và sinh đối thoại (Serban et al., 2016), cùng nhiều ví dụ khác.
+
+Trong một số tình huống thực tế, thông tin bổ sung có thể cung cấp thông tin cho việc tìm kiếm chuỗi đầu ra tối ưu có thể có sẵn tại thời điểm suy luận. Con người có thể cung cấp các sửa chữa sau khi xem đầu ra ban đầu của hệ thống, hoặc các mô hình phân loại riêng biệt có thể dự đoán các phần của đầu ra với độ tin cậy cao. Khi miền của đầu vào được biết, thuật ngữ miền có thể được sử dụng để đảm bảo các cụm từ cụ thể có mặt trong dự đoán của hệ thống. Mục tiêu của chúng tôi trong công việc này là tìm cách buộc đầu ra của mô hình phải chứa các ràng buộc từ vựng như vậy, trong khi vẫn tận dụng phân phối đã học từ dữ liệu huấn luyện.
+
+Đối với các trường hợp sử dụng Dịch thuật Máy (MT) nói riêng, các bản dịch cuối cùng thường được tạo ra bằng cách kết hợp đầu ra được dịch tự động với đầu vào của người dùng. Các ví dụ bao gồm Sửa chữa Sau (PE) (Koehn, 2009; Specia, 2011) và MT Tương tác-Dự đoán (Foster, 2002; Barrachina et al., 2009; Green, 2014). Những tình huống tương tác này có thể được thống nhất bằng cách xem xét đầu vào của người dùng là các ràng buộc từ vựng hướng dẫn việc tìm kiếm chuỗi đầu ra tối ưu.
+
+Trong bài báo này, chúng tôi hình thức hóa khái niệm ràng buộc từ vựng và đề xuất một thuật toán giải mã cho phép đặc tả các chuỗi con được yêu cầu phải có mặt trong đầu ra của mô hình. Các ràng buộc riêng lẻ có thể là token đơn hoặc cụm từ nhiều từ, và có thể đặc tả bất kỳ số lượng ràng buộc nào đồng thời.
+
+Mặc dù chúng tôi tập trung vào các ứng dụng tương tác cho MT trong các thí nghiệm của mình, giải mã có ràng buộc từ vựng có liên quan đến bất kỳ tình huống nào mà một mô hình được yêu cầu sinh ra chuỗi ŷ = {y₀...y_T} cho cả đầu vào x và tập hợp {c₀...c_n}, trong đó mỗi c_i là một chuỗi con {c_{i0}...c_{ij}} phải xuất hiện ở đâu đó trong ŷ. Điều này làm cho công việc của chúng tôi áp dụng được cho một loạt các tình huống sinh văn bản, bao gồm mô tả hình ảnh, sinh đối thoại, tóm tắt trừu tượng và trả lời câu hỏi.
+
+Phần còn lại của bài báo này được tổ chức như sau: Phần 2 cung cấp nền tảng cần thiết cho cuộc thảo luận về GBS, Phần 3 thảo luận chi tiết về thuật toán giải mã có ràng buộc từ vựng, Phần 4 trình bày các thí nghiệm của chúng tôi, và Phần 5 đưa ra tổng quan về các công việc liên quan chặt chẽ.
+
+## 2 Nền tảng: Beam Search cho Sinh Chuỗi
+
+Dưới một mô hình được tham số hóa bởi θ, cho chuỗi đầu ra tốt nhất ŷ cho đầu vào x là Eq. 1.
+
+ŷ = argmax_{y∈{v^[T]}} p(y|x), (1)
+
+trong đó chúng tôi sử dụng {v^[T]} để biểu thị tập hợp tất cả các chuỗi có độ dài T. Bởi vì số lượng chuỗi có thể có cho một mô hình như vậy là |v|^T, trong đó |v| là số lượng ký hiệu đầu ra, việc tìm kiếm ŷ có thể được làm dễ quản lý hơn bằng cách phân tích p(y|x) thành Eq. 2:
+
+p(y|x) = ∏_{t=0}^T p(y_t|x, {y₀...y_{t-1}}). (2)
+
+Cách tiếp cận tiêu chuẩn do đó là sinh chuỗi đầu ra từ đầu đến cuối, điều kiện hóa đầu ra tại mỗi bước thời gian dựa trên đầu vào x và các ký hiệu đã được sinh ra {y₀...y_{t-1}}.
+
+Tuy nhiên, việc lựa chọn tham lam đầu ra có xác suất cao nhất tại mỗi bước thời gian, tức là:
+
+ŷ_t = argmax_{y_i∈{v}} p(y_i|x, {y₀...y_{t-1}}), (3)
+
+có nguy cơ đưa ra những quyết định tối ưu cục bộ thực tế là không tối ưu toàn cục. Mặt khác, một sự khám phá toàn diện không gian đầu ra sẽ yêu cầu tính điểm |v|^T chuỗi, điều này không khả thi đối với hầu hết các mô hình thực tế. Do đó, một thuật toán tìm kiếm hoặc giải mã thường được sử dụng như một sự thỏa hiệp giữa hai thái cực này. Một giải pháp phổ biến là sử dụng tìm kiếm heuristic để cố gắng tìm đầu ra tốt nhất một cách hiệu quả (Pearl, 1984; Koehn, 2010; Rush et al., 2013). Ý tưởng chính là loại bỏ sớm các lựa chọn xấu, trong khi cố gắng tránh loại bỏ các ứng viên có thể có rủi ro cục bộ nhưng cuối cùng có thể dẫn đến đầu ra tổng thể tốt nhất.
+
+Beam search (Och và Ney, 2004) có lẽ là thuật toán tìm kiếm phổ biến nhất để giải mã chuỗi. Beam search đơn giản để triển khai và linh hoạt theo nghĩa là ngữ nghĩa của đồ thị các beam có thể được điều chỉnh để tận dụng cấu trúc bổ sung có thể có sẵn cho các nhiệm vụ cụ thể. Ví dụ, trong Dịch thuật Thống kê Dựa trên Cụm từ (PB-SMT) (Koehn, 2010), các beam được tổ chức theo số lượng từ nguồn được bao phủ bởi các giả thuyết trong beam - một giả thuyết được "hoàn thành" khi nó đã bao phủ tất cả các từ nguồn. Trong các thuật toán giải mã dựa trên biểu đồ như CYK, các beam cũng được gắn với việc bao phủ đầu vào, nhưng được tổ chức như các ô trong biểu đồ, điều này tạo điều kiện tìm kiếm cấu trúc ẩn tối ưu của đầu ra (Chiang, 2007). Hình 2 trực quan hóa ba cách phổ biến để cấu trúc tìm kiếm. (A) và (B) phụ thuộc vào thông tin cấu trúc rõ ràng giữa đầu vào và đầu ra, (C) chỉ giả định rằng đầu ra là một chuỗi trong đó các ký hiệu sau phụ thuộc vào các ký hiệu trước. Lưu ý cũng rằng (C) tương ứng chính xác với các hàng dưới cùng của Hình 1 và 3.
+
+Với thành công gần đây của các mô hình neural cho sinh văn bản, beam search đã trở thành sự lựa chọn de-facto để giải mã các chuỗi đầu ra tối ưu (Sutskever et al., 2014). Tuy nhiên, với các mô hình chuỗi neural, chúng ta không thể tổ chức các beam theo việc bao phủ rõ ràng đầu vào. Một thay thế đơn giản hơn là tổ chức các beam theo các bước thời gian đầu ra từ t₀ đến t_N, trong đó N là một siêu tham số có thể được đặt heuristic, ví dụ bằng cách nhân một yếu tố với độ dài của đầu vào để đưa ra một dự đoán có căn cứ về độ dài tối đa của đầu ra (Sutskever et al., 2014). Các chuỗi đầu ra thường được coi là hoàn chình khi một token đặc biệt "end-of-sentence" (EOS) đã được sinh ra. Kích thước beam trong những mô hình này cũng thường được giữ nhỏ, và công việc gần đây đã cho thấy hiệu suất của một số kiến trúc thực sự có thể suy giảm với kích thước beam lớn hơn (Tu et al., 2016).
+
+## 3 Grid Beam Search
+
+Mục tiêu của chúng tôi là tổ chức giải mã theo cách mà chúng ta có thể ràng buộc không gian tìm kiếm thành các đầu ra chứa một hoặc nhiều chuỗi con được chỉ định trước. Do đó chúng ta muốn sử dụng phân phối của mô hình để cả "đặt" các ràng buộc từ vựng một cách chính xác và sinh ra các phần của đầu ra không được bao phủ bởi các ràng buộc.
+
+Thuật toán 1 trình bày mã giả cho giải mã có ràng buộc từ vựng, xem Hình 1 và 3 để trực quan hóa quá trình tìm kiếm. Các beam trong lưới được đánh chỉ số bởi t và c. Biến t theo dõi bước thời gian của tìm kiếm, trong khi biến c chỉ ra có bao nhiêu token ràng buộc được bao phủ bởi các giả thuyết trong beam hiện tại. Lưu ý rằng mỗi bước của c bao phủ một token ràng buộc đơn. Nói cách khác, constraints là một mảng các chuỗi, trong đó các token riêng lẻ có thể được đánh chỉ số là constraints[i][j], tức là token j trong constraint i. Tham số numC trong Thuật toán 1 đại diện cho tổng số token trong tất cả các ràng buộc.
+
+Các giả thuyết trong một beam có thể được phân thành hai loại (xem dòng 9-11 và 15-19 của Thuật toán 1):
+
+1. Các giả thuyết mở có thể sinh ra từ phân phối của mô hình hoặc bắt đầu các ràng buộc có sẵn,
+2. Các giả thuyết đóng chỉ có thể sinh ra token tiếp theo cho trong một ràng buộc hiện tại chưa hoàn thành.
+
+Tại mỗi bước của tìm kiếm, beam tại Grid[t][c] được điền với các ứng viên có thể được tạo ra theo ba cách:
+
+1. Các giả thuyết mở trong beam bên trái (Grid[t-1][c]) có thể sinh ra các tiếp tục từ phân phối của mô hình p(y_i|x, {y₀...y_{i-1}}),
+2. Các giả thuyết mở trong beam bên trái và bên dưới (Grid[t-1][c-1]) có thể bắt đầu các ràng buộc mới,
+3. Các giả thuyết đóng trong beam bên trái và bên dưới (Grid[t-1][c-1]) có thể tiếp tục các ràng buộc.
+
+Do đó, mô hình trong Thuật toán 1 triển khai một giao diện với ba hàm: generate, start và continue, tạo ra các giả thuyết mới theo mỗi cách trong ba cách. Lưu ý rằng hàm tính điểm của mô hình không cần biết về sự tồn tại của các ràng buộc, nhưng nó có thể, ví dụ thông qua một đặc trưng chỉ ra liệu một giả thuyết có phải là một phần của ràng buộc hay không.
+
+Các beam ở mức độ cao nhất của lưới (các beam trong đó c = numConstraints) chứa các giả thuyết bao phủ tất cả các ràng buộc. Khi một giả thuyết ở mức độ cao nhất sinh ra token EOS, nó có thể được thêm vào tập hợp các giả thuyết đã hoàn thành. Giả thuyết có điểm cao nhất trong tập hợp các giả thuyết đã hoàn thành là chuỗi tốt nhất bao phủ tất cả các ràng buộc.
+
+### 3.1 Ràng buộc Nhiều token
+
+Bằng cách phân biệt giữa các giả thuyết mở và đóng, chúng ta có thể cho phép các cụm từ nhiều token tùy ý trong tìm kiếm. Do đó, tập hợp các ràng buộc cho một đầu ra cụ thể có thể bao gồm cả token riêng lẻ và cụm từ. Mỗi giả thuyết duy trì một vector bao phủ để đảm bảo rằng các ràng buộc không thể được lặp lại trong một đường dẫn tìm kiếm - các giả thuyết đã bao phủ constraint i chỉ có thể generate hoặc start các ràng buộc chưa được bao phủ.
+
+Lưu ý cũng rằng các ràng buộc từ vựng không liên tục, chẳng hạn như các động từ cụm từ trong tiếng Anh hoặc tiếng Đức, rất dễ dàng được tích hợp vào GBS, bằng cách thêm các bộ lọc vào tìm kiếm, yêu cầu một hoặc nhiều điều kiện phải được đáp ứng trước khi một ràng buộc có thể được sử dụng. Ví dụ, thêm động từ cụm từ "ask <someone> out" làm ràng buộc sẽ có nghĩa là sử dụng "ask" làm constraint 0 và "out" làm constraint 1, với hai bộ lọc: một yêu cầu constraint 1 không thể được sử dụng trước constraint 0, và một yêu cầu khác rằng phải có ít nhất một token được sinh ra giữa các ràng buộc.
+
+### 3.2 Đơn vị Từ phụ
+
+Cả việc tính toán điểm cho một giả thuyết và độ chi tiết của các token (ký tự, từ phụ, từ, v.v...) đều được để cho mô hình cơ bản. Bởi vì bộ giải mã của chúng ta có thể xử lý các ràng buộc tùy ý, có nguy cơ rằng các ràng buộc sẽ chứa các token chưa bao giờ được quan sát trong dữ liệu huấn luyện và do đó không được biết bởi mô hình. Đặc biệt trong các tình huống thích ứng miền, một số ràng buộc do người dùng chỉ định rất có thể chứa các token chưa thấy. Biểu diễn từ phụ cung cấp một cách thanh lịch để vượt qua vấn đề này, bằng cách chia các token không biết hoặc hiếm thành các n-gram ký tự là một phần của từ vựng của mô hình (Sennrich et al., 2016; Wu et al., 2016). Trong các thí nghiệm ở Phần 4, chúng tôi sử dụng kỹ thuật này để đảm bảo rằng không có token đầu vào nào không được biết, ngay cả khi một ràng buộc chứa các từ chưa bao giờ xuất hiện trong dữ liệu huấn luyện.
+
+### 3.3 Hiệu quả
+
+Bởi vì số lượng beam được nhân với số lượng ràng buộc, độ phức tạp thời gian chạy của một triển khai ngây thơ của GBS là O(ktc). Beam search dựa trên thời gian tiêu chuẩn là O(kt); do đó, một số xem xét phải được đưa ra cho hiệu quả của thuật toán này. Lưu ý rằng các beam trong mỗi cột c của Hình 3 là độc lập, có nghĩa là GBS có thể được song song hóa để cho phép tất cả các beam tại mỗi bước thời gian được điền đồng thời. Ngoài ra, chúng tôi thấy rằng thời gian nhiều nhất được dành để tính toán các trạng thái cho các ứng viên giả thuyết, vì vậy bằng cách giữ kích thước beam nhỏ, chúng ta có thể làm cho GBS nhanh hơn đáng kể.
+
+### 3.4 Mô hình
+
+Các mô hình được sử dụng cho các thí nghiệm của chúng tôi là các hệ thống Dịch thuật Máy Neural (NMT) tiên tiến sử dụng triển khai riêng của chúng tôi về NMT với attention trên chuỗi nguồn (Bahdanau et al., 2014). Chúng tôi đã sử dụng Blocks và Fuel để triển khai các mô hình NMT của mình (van Merrinboer et al., 2015). Để tiến hành các thí nghiệm trong phần sau, chúng tôi đã huấn luyện các mô hình dịch thuật cơ bản cho Anh-Đức (EN-DE), Anh-Pháp (EN-FR) và Anh-Bồ Đào Nha (EN-PT). Chúng tôi đã tạo ra một biểu diễn từ phụ chung cho mỗi cặp ngôn ngữ bằng cách trích xuất từ vựng 80000 ký hiệu từ dữ liệu nguồn và đích được nối. Xem Phụ lục để biết thêm chi tiết về dữ liệu huấn luyện và cấu hình siêu tham số cho mỗi cặp ngôn ngữ. Tham số beamSize được đặt thành 10 cho tất cả các thí nghiệm.
+
+Bởi vì các thí nghiệm của chúng tôi sử dụng các mô hình NMT, chúng ta bây giờ có thể rõ ràng hơn về các triển khai của các hàm generate, start và continue cho triển khai GBS này. Đối với một mô hình NMT tại bước thời gian t, generate(hyp_{t-1}) đầu tiên tính toán một vector xác suất đầu ra o_t = softmax(g(y_{t-1}, s_i, c_i)) sử dụng thông tin trạng thái có sẵn từ hyp_{t-1} và trả về k tiếp tục tốt nhất, tức là Eq. 4:
+
+g_t = k-argmax_i o_{t_i}. (4)
+
+Các hàm start và continue đơn giản chỉ mục vào đầu ra softmax của mô hình, chọn các token cụ thể thay vì thực hiện k-argmax trên toàn bộ từ vựng ngôn ngữ đích. Ví dụ, để bắt đầu constraint c_i, chúng ta tìm điểm của token c_{i0}, tức là o_{t_{c_{i0}}}.
+
+## 4 Thí nghiệm
+
+### 4.1 Pick-Revise cho Sửa chữa Sau Tương tác
+
+Pick-Revise là một chu kỳ tương tác cho Sửa chữa Sau MT được đề xuất bởi Cheng et al. (2016). Bắt đầu với giả thuyết dịch thuật gốc, một người dùng (được mô phỏng) trước tiên chọn một phần của giả thuyết không chính xác, sau đó cung cấp bản dịch đúng cho phần đó của đầu ra. Sửa chữa do người dùng cung cấp sau đó được sử dụng như một ràng buộc cho chu kỳ giải mã tiếp theo. Quá trình Pick-Revise có thể được lặp lại nhiều lần khi cần thiết, với một ràng buộc mới được thêm vào tại mỗi chu kỳ.
+
+Chúng tôi sửa đổi các thí nghiệm của Cheng et al. (2016) một chút và giả định rằng người dùng chỉ cung cấp các chuỗi tối đa ba từ bị thiếu từ giả thuyết. Để mô phỏng tương tác người dùng, tại mỗi lần lặp chúng tôi chọn một cụm từ tối đa ba token từ bản dịch tham chiếu không xuất hiện trong các giả thuyết MT hiện tại. Trong thiết lập nghiêm ngặt, cụm từ hoàn chỉnh phải bị thiếu từ giả thuyết. Trong thiết lập nới lỏng, chỉ từ đầu tiên phải bị thiếu. Bảng 1 hiển thị kết quả cho một phiên sửa chữa được mô phỏng với bốn chu kỳ. Khi không thể tìm thấy cụm từ ba token, chúng tôi quay lại cụm từ hai token, sau đó đến token đơn làm ràng buộc. Nếu một giả thuyết đã khớp với tham chiếu, không có ràng buộc nào được thêm vào. Bằng cách chỉ định một ràng buộc mới tối đa ba từ tại mỗi chu kỳ, một sự gia tăng hơn 20 điểm BLEU được đạt được trong tất cả các cặp ngôn ngữ.
+
+### 4.2 Thích ứng Miền thông qua Thuật ngữ
+
+Yêu cầu sử dụng thuật ngữ cụ thể miền là phổ biến trong các ứng dụng thực tế của MT (Crego et al., 2016). Các cách tiếp cận hiện tại tích hợp các token giữ chỗ vào các hệ thống NMT, điều này yêu cầu sửa đổi việc tiền xử lý và hậu xử lý dữ liệu, và huấn luyện hệ thống với dữ liệu chứa cùng các giữ chỗ xuất hiện trong dữ liệu kiểm tra (Crego et al., 2016). Hệ thống MT cũng mất bất kỳ khả năng nào để mô hình hóa các token trong thuật ngữ, vì chúng được biểu diễn bởi các token trừu tượng như "<TERM 1>". Một thay thế hấp dẫn là đơn giản cung cấp ánh xạ thuật ngữ làm ràng buộc, cho phép bất kỳ hệ thống hiện có nào thích ứng với thuật ngữ được sử dụng trong miền kiểm tra mới.
+
+Đối với dữ liệu miền đích, chúng tôi sử dụng kho ngữ liệu Sửa chữa Sau Autodesk (Zhechev, 2012), là một tập dữ liệu được thu thập từ các phiên sửa chữa sau MT thực tế. Kho ngữ liệu tập trung vào bản địa hóa phần mềm, một miền có khả năng rất khác với dữ liệu WMT được sử dụng để huấn luyện các mô hình miền tổng quát của chúng tôi. Chúng tôi chia kho ngữ liệu thành khoảng 100.000 câu huấn luyện và 1000 đoạn kiểm tra, và tự động tạo ra một thuật ngữ bằng cách tính toán Thông tin Tương hỗ Điểm (PMI) (Church và Hanks, 1990) giữa các n-gram nguồn và đích trong tập huấn luyện. Chúng tôi trích xuất tất cả các n-gram từ độ dài 2-5 làm ứng viên thuật ngữ.
+
+pmi(x,y) = log p(x,y)/(p(x)p(y)) (5)
+npmi(x,y) = pmi(x,y)/h(x,y) (6)
+
+Phương trình 5 và 6 hiển thị cách chúng tôi tính toán PMI chuẩn hóa cho một cặp ứng viên thuật ngữ. Điểm PMI được chuẩn hóa về phạm vi [-1, +1] bằng cách chia cho entropy h của xác suất kết hợp p(x,y). Sau đó chúng tôi lọc các ứng viên để chỉ bao gồm các cặp có PMI ≥ 0.9 và cả cụm từ nguồn và đích đều xuất hiện ít nhất năm lần trong kho ngữ liệu. Khi các cụm từ nguồn khớp với thuật ngữ được quan sát trong dữ liệu kiểm tra, cụm từ đích tương ứng được thêm vào các ràng buộc cho đoạn đó. Kết quả được hiển thị trong Bảng 2.
+
+Như một kiểm tra lành mạnh rằng cải thiện trong BLEU không chỉ là do sự hiện diện của các thuật ngữ ở đâu đó trong đầu ra, tức là việc đặt các thuật ngữ bởi GBS là hợp lý, chúng tôi cũng đánh giá kết quả của việc chèn ngẫu nhiên các thuật ngữ vào đầu ra cơ bản, và việc thêm tiền tố các thuật ngữ vào đầu ra cơ bản.
+
+Phương pháp đơn giản này của thích ứng miền dẫn đến một cải thiện đáng kể trong điểm BLEU mà không có bất kỳ can thiệp nào của con người. Một cách đáng ngạc nhiên, ngay cả một thuật ngữ được tạo tự động kết hợp với GBS cũng mang lại cải thiện hiệu suất khoảng +2 điểm BLEU cho En-De và En-Fr, và một lợi ích gần 14 điểm cho En-Pt. Cải thiện lớn cho En-Pt có lẽ là do dữ liệu huấn luyện cho hệ thống này rất khác với miền IT (xem Phụ lục). Cho cải thiện hiệu suất từ thuật ngữ được trích xuất tự động của chúng tôi, các thuật ngữ miền được tạo thủ công với bao phủ tốt của miền kiểm tra có khả năng dẫn đến lợi ích thậm chí lớn hơn. Sử dụng thuật ngữ với GBS có khả năng có lợi trong bất kỳ thiết lập nào mà miền kiểm tra khác đáng kể so với miền của dữ liệu huấn luyện gốc của mô hình.
+
+### 4.3 Phân tích
+
+Phân tích chủ quan của đầu ra bộ giải mã cho thấy rằng các cụm từ được thêm làm ràng buộc không chỉ được đặt chính xác trong chuỗi đầu ra mà còn có tác động toàn cục đến chất lượng dịch thuật. Đây là một tác động mong muốn cho tương tác người dùng, vì nó ngụ ý rằng người dùng có thể bootstrap chất lượng bằng cách thêm các ràng buộc quan trọng nhất (tức là những ràng buộc thiết yếu nhất cho đầu ra) trước. Bảng 3 hiển thị một số ví dụ từ các thí nghiệm trong Bảng 1, nơi việc thêm ràng buộc từ vựng đã có thể hướng dẫn các hệ thống NMT của chúng tôi tránh xa các giả thuyết ban đầu có điểm khá thấp đến các đầu ra hoàn hảo khớp với các bản dịch tham chiếu.
+
+## 5 Công việc Liên quan
+
+Hầu hết công việc liên quan cho đến nay đã trình bày các sửa đổi của các hệ thống SMT cho các trường hợp sử dụng cụ thể ràng buộc đầu ra MT thông qua các đầu vào phụ trợ. Thân công việc lớn nhất xem xét Dịch thuật Máy Tương tác (IMT): một hệ thống MT tìm kiếm hậu tố ngôn ngữ đích tối ưu cho một câu nguồn hoàn chỉnh và một tiền tố mong muốn cho đầu ra đích (Foster, 2002; Barrachina et al., 2009; Green, 2014). IMT có thể được xem như một trường hợp con của giải mã có ràng buộc, nơi chỉ có một ràng buộc được đảm bảo được đặt ở đầu chuỗi đầu ra. Wuebker et al. (2016) giới thiệu giải mã tiền tố, sửa đổi beam search SMT để đầu tiên đảm bảo rằng tiền tố đích được bao phủ, và chỉ sau đó tiếp tục xây dựng giả thuyết cho hậu tố sử dụng các beam được tổ chức theo bao phủ của các cụm từ còn lại trong đoạn nguồn. Wuebker et al. (2016) và Knowles và Koehn (2016) cũng trình bày một sửa đổi đơn giản của các mô hình NMT cho IMT, cho phép các mô hình dự đoán hậu tố cho các tiền tố do người dùng cung cấp.
+
+Gần đây, một số chú ý cũng đã được dành cho giải mã SMT với nhiều ràng buộc từ vựng. Khung Pick-Revise (PRIMT) (Cheng et al., 2016) cho Sửa chữa Sau Tương tác giới thiệu khái niệm các chu kỳ sửa chữa. Các dịch giả chỉ định ràng buộc bằng cách sửa chữa một phần của đầu ra MT không chính xác, sau đó yêu cầu hệ thống đưa ra một giả thuyết mới, phải chứa sửa chữa do người dùng cung cấp. Quá trình này được lặp lại, duy trì các ràng buộc từ các lần lặp trước và thêm các ràng buộc mới khi cần thiết. Quan trọng, cách tiếp cận của họ dựa vào phân đoạn cụm từ được cung cấp bởi hệ thống SMT. Thuật toán giải mã chỉ có thể sử dụng các ràng buộc khớp với ranh giới cụm từ, bởi vì các ràng buộc được triển khai như "quy tắc" thực thi rằng các cụm từ nguồn phải được dịch như các cụm từ đích được căn chỉnh đã được chọn làm ràng buộc. Ngược lại, cách tiếp cận của chúng tôi giải mã ở mức token và không phụ thuộc vào bất kỳ cấu trúc rõ ràng nào trong mô hình cơ bản.
+
+Domingo et al. (2016) cũng xem xét một tình huống tương tác nơi người dùng đầu tiên chọn các phần của giả thuyết MT để giữ, sau đó truy vấn cho một bản dịch cập nhật bảo tồn những phần này. Hệ thống MT giải mã các cụm từ nguồn không được căn chỉnh với các cụm từ do người dùng chọn cho đến khi câu nguồn được bao phủ đầy đủ. Cách tiếp cận này tương tự như hệ thống của Cheng et al., và sử dụng tính năng "XML input" trong Moses (Koehn et al., 2007).
+
+Một số công việc gần đây xem xét việc bao gồm các ràng buộc từ vựng mềm trực tiếp vào các mô hình sâu cho sinh đối thoại, và các trường hợp đặc biệt, chẳng hạn như sinh công thức từ danh sách các thành phần (Wen et al., 2015; Kiddon et al., 2016). Những mô hình nhận thức ràng buộc như vậy bổ sung cho công việc của chúng tôi và có thể được sử dụng với giải mã GBS mà không có bất kỳ thay đổi nào đối với các mô hình cơ bản.
+
+Theo hiểu biết tốt nhất của chúng tôi, của chúng tôi là công việc đầu tiên xem xét giải mã có ràng buộc từ vựng tổng quát cho bất kỳ mô hình nào xuất ra chuỗi, mà không dựa vào các căn chỉnh giữa đầu vào và đầu ra, và mà không sử dụng tìm kiếm được tổ chức theo bao phủ của đầu vào.
+
+## 6 Kết luận
+
+Giải mã có ràng buộc từ vựng là một cách linh hoạt để tích hợp các chuỗi con tùy ý vào đầu ra của bất kỳ mô hình nào sinh ra chuỗi đầu ra từng token một. Một phổ rộng các mô hình sinh văn bản phổ biến có đặc tính này, và GBS nên đơn giản để sử dụng với bất kỳ mô hình nào đã sử dụng beam search.
+
+Trong các giao diện dịch thuật nơi các dịch giả có thể cung cấp sửa chữa cho một giả thuyết hiện có, những đầu vào của người dùng này có thể được sử dụng làm ràng buộc, sinh ra một đầu ra mới mỗi khi người dùng sửa một lỗi. Bằng cách mô phỏng tình huống này, chúng tôi đã chỉ ra rằng quy trình làm việc như vậy có thể cung cấp một cải thiện lớn về chất lượng dịch thuật tại mỗi lần lặp.
+
+Bằng cách sử dụng thuật ngữ cụ thể miền để tạo ra các ràng buộc phía đích, chúng tôi đã chỉ ra rằng một mô hình miền tổng quát có thể được thích ứng với một miền mới mà không cần bất kỳ huấn luyện lại nào. Một cách đáng ngạc nhiên, phương pháp đơn giản này có thể dẫn đến những lợi ích hiệu suất đáng kể, ngay cả khi thuật ngữ được tạo tự động.
+
+Trong công việc tương lai, chúng tôi hy vọng đánh giá GBS với các mô hình bên ngoài MT, chẳng hạn như tóm tắt tự động, tạo chú thích hình ảnh hoặc sinh đối thoại. Chúng tôi cũng hy vọng giới thiệu các mô hình nhận thức ràng buộc mới, ví dụ thông qua các cơ chế attention thứ cấp trên các ràng buộc từ vựng.

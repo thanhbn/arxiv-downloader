@@ -1,0 +1,169 @@
+# SpaceByte: Hướng tới việc loại bỏ Tokenization khỏi Mô hình Ngôn ngữ Lớn
+
+Kevin Slagle
+Đại học Rice
+kevin.slagle@rice.edu
+
+## Tóm tắt
+
+Tokenization được sử dụng rộng rãi trong các mô hình ngôn ngữ lớn vì nó cải thiện đáng kể hiệu suất. Tuy nhiên, tokenization cũng gây ra một số bất lợi, chẳng hạn như sự thiên vị hiệu suất, tăng khả năng bị tấn công adversarial, giảm hiệu suất mô hình hóa ở cấp độ ký tự và tăng độ phức tạp của mô hình. Để giải quyết những bất lợi này mà không ảnh hưởng đến hiệu suất, chúng tôi đề xuất SpaceByte, một kiến trúc decoder cấp độ byte mới thu hẹp khoảng cách hiệu suất giữa mô hình ngôn ngữ tự hồi quy cấp độ byte và cấp độ từ con. SpaceByte bao gồm một mô hình Transformer cấp độ byte, nhưng với các khối transformer lớn hơn được chèn vào giữa các lớp. Chúng tôi thấy rằng hiệu suất được cải thiện đáng kể bằng cách áp dụng các khối lớn hơn này chỉ sau một số byte nhất định, chẳng hạn như ký tự khoảng trắng, thường biểu thị ranh giới từ. Các thí nghiệm của chúng tôi cho thấy rằng với ngân sách tính toán huấn luyện và suy luận cố định, SpaceByte vượt trội hơn các kiến trúc cấp độ byte khác và gần như bằng hiệu suất của các kiến trúc Transformer có tokenization.
+
+## 1. Giới thiệu
+
+Hầu hết các mô hình ngôn ngữ được huấn luyện sử dụng tokenization, phân chia văn bản thành các token thường bao gồm từ hoặc từ con. Tokenization hữu ích vì nó giảm đáng kể chi phí tính toán suy luận và huấn luyện của các mô hình ngôn ngữ lớn. Tuy nhiên, tokenization cũng gây ra một số bất lợi, bao gồm các hình phạt hiệu suất cho các ngôn ngữ ít được ưu tiên bởi tokenizer [1–3]; tăng khả năng bị tấn công adversarial [4]; và hiệu suất mô hình hóa cấp độ ký tự kém hơn [5, 6], và độ phức tạp mô hình bổ sung.
+
+Gần đây, MegaByte [7], MambaByte [6], và nhiều kiến trúc khác [8–12] đã được đề xuất như các mô hình ngôn ngữ tự hồi quy cấp độ byte mới mô hình hóa byte thay vì token. (Xem [13–21] để biết về mô hình hóa cấp độ byte cho encoder và encoder-decoder.) Để giải quyết kích thước ngữ cảnh dài hơn do mô hình hóa byte thay vì token, MegaByte sử dụng mô hình hóa đa tỷ lệ [22–24], trong khi MambaByte sử dụng các khối Mamba [25] thay vì các khối Transformer. Nhưng mặc dù MegaByte và MambaByte đã được chứng minh là hoạt động tốt hơn Transformer cấp độ byte tiêu chuẩn, theo hiểu biết của chúng tôi, không có kiến trúc mô hình ngôn ngữ lớn tự hồi quy cấp độ byte nào được chứng minh là có thể bằng hiệu suất của các mô hình có tokenization khi kiểm soát chi phí tính toán.
+
+Trong công trình này, chúng tôi nghiên cứu hiệu suất của các mô hình tự hồi quy cấp độ byte và cấp độ từ con khi được huấn luyện với ngân sách tính toán cố định. Chúng tôi đo hiệu suất theo cross entropy (đo bằng bit-per-byte), đã được chứng minh là một yếu tố dự báo mạnh mẽ cho hiệu suất downstream [26]. Ngoài việc kiểm soát tính toán huấn luyện, chúng tôi cũng kiểm soát chi phí tính toán suy luận (đo bằng FLOP). Chúng tôi thấy rằng các mô hình Transformer và MegaByte cấp độ byte có thể cần khoảng 10 lần FLOP huấn luyện hơn để đạt được hiệu suất tương tự như Transformer cấp độ từ con. Để thu hẹp khoảng cách hiệu suất đáng kể này, chúng tôi đề xuất một kiến trúc decoder cấp độ byte mới: SpaceByte.
+
+SpaceByte cũng sử dụng mô hình hóa đa tỷ lệ để cải thiện hiệu quả bằng cách nhóm các byte thành patch. Nhưng không giống như MegaByte, sử dụng kích thước patch cố định, SpaceByte sử dụng một quy tắc đơn giản để phân chia động các byte thành các patch được căn chỉnh với ranh giới từ và ngôn ngữ khác. Các thí nghiệm có kiểm soát tính toán của chúng tôi cho thấy rằng sự thay đổi đơn giản này rất quan trọng cho hiệu suất, cho phép SpaceByte vượt trội hơn các kiến trúc cấp độ byte khác và gần như bằng hiệu suất của Transformer từ con trên nhiều phương thức văn bản khác nhau.
+
+Các thí nghiệm của chúng tôi được thực hiện trên các bộ dữ liệu bao gồm sách tiếng Anh, bài báo arXiv được định dạng LaTeX và mã nguồn mở. Đối với các phương thức dữ liệu khác, SpaceByte với quy tắc patching đơn giản của chúng tôi có thể không hiệu quả.
+
+## 2. SpaceByte
+
+Kiến trúc SpaceByte được tóm tắt trong Hình 1. Nói một cách ngắn gọn, SpaceByte có thể được coi như một mô hình Transformer cấp độ byte, nhưng với các khối transformer "toàn cục" bổ sung (với chiều mô hình lớn hơn) được chèn vào giữa, chỉ được áp dụng một phần thời gian. Trong khi kiến trúc MegaByte áp dụng các khối transformer toàn cục mỗi P∼8 byte, chúng tôi đặt giả thuyết rằng khoảng cách cố định này cản trở hiệu suất. Trực giác của chúng tôi là ký tự đầu tiên của một từ thường khó dự đoán hơn đáng kể so với các ký tự tiếp theo. Do đó, chúng tôi mong đợi rằng hiệu suất có thể được cải thiện bằng cách áp dụng các khối toàn cục chủ yếu tại ranh giới từ.
+
+### Quy tắc Chèn Khối Toàn cục
+
+Trong công trình này, chúng tôi xem xét một quy tắc rất đơn giản để quyết định động khi nào áp dụng các khối toàn cục. Chúng tôi giả định rằng các byte văn bản được mã hóa sử dụng mã hóa UTF-8. Chúng tôi định nghĩa một byte là "spacelike" nếu byte đó không mã hóa chữ cái, số hoặc byte tiếp nối UTF-8. Chúng tôi áp dụng các khối toàn cục sau bất kỳ byte spacelike nào không được đi trước bởi byte spacelike khác (và sau bất kỳ token BOS nào). Xem Hình 2 để biết ví dụ.
+
+Byte spacelike phổ biến nhất là ký tự khoảng trắng. Do đó, các khối toàn cục được áp dụng thường xuyên nhất để dự đoán ký tự đầu tiên của một từ, mà chúng tôi mong đợi là ký tự khó dự đoán nhất [27] trong một từ nhất định. Với kích thước patch cố định (ví dụ như trong MegaByte), các khối toàn cục thường được chèn vào giữa một từ, mà chúng tôi mong đợi là không hiệu quả vì việc dự đoán phần còn lại của từ có thể được thực hiện hiệu quả hơn bằng cách sử dụng các khối cục bộ. Chúng tôi định nghĩa các byte tiếp nối là spacelike để các ngôn ngữ không sử dụng khoảng trắng giữa các từ vẫn có thể hưởng lợi từ các khối toàn cục giữa các ký tự nhiều byte (ví dụ: ký tự Trung Quốc gồm ba byte trong UTF-8).
+
+Mặc dù quy tắc "spacelike" rất đơn giản này có thể không phải là quy tắc tối ưu, chúng tôi thấy rằng nó hoạt động hiệu quả đáng ngạc nhiên trong thực tế đối với văn bản tiếng Anh, bài báo định dạng LaTeX và code. Tuy nhiên, một hướng tương lai quan trọng là tối ưu hóa [28,14,9] các quy tắc tốt hơn sử dụng dữ liệu thay vì heuristic đơn giản của chúng tôi.
+
+### Chi tiết quan trọng
+
+Vì các khối toàn cục không được áp dụng thường xuyên như các khối transformer cục bộ, việc sử dụng chiều mô hình lớn hơn cho các khối transformer toàn cục là có lợi. Để tăng chiều của vector kích hoạt trước các khối toàn cục, chúng tôi đơn giản thêm padding vector kích hoạt với số không. Để giảm chiều, chúng tôi cắt bớt vector kích hoạt.
+
+Trong các thí nghiệm của chúng tôi, chúng tôi sử dụng kích thước ngữ cảnh lớn hơn đáng kể so với chiều mô hình Dlocal của các khối transformer cục bộ. Để ngăn cơ chế attention chiếm ưu thế chi phí tính toán cho mô hình cục bộ, chúng tôi sử dụng cửa sổ attention [29–31] có độ dài Dlocal cho các khối transformer cục bộ. Các khối toàn cục sử dụng attention toàn cục attend đến tất cả các khối toàn cục khác.
+
+Xem Phụ lục C để biết pseudocode. Các chi tiết bổ sung cụ thể cho thí nghiệm của chúng tôi được cung cấp trong Phần 4.1 và 4.2 và Phụ lục A.
+
+## 3. Công trình liên quan
+
+Hệ quả trực tiếp nhất của việc mô hình hóa byte thay vì token từ con là độ dài của một chuỗi thường tăng khoảng bốn lần. Độ dài chuỗi tăng này làm tăng chi phí tính toán huấn luyện và suy luận cho việc mô hình hóa một chuỗi văn bản dài nhất định cho Transformer do tỷ lệ bậc hai của attention.
+
+### MegaByte
+
+Kiến trúc MegaByte cố gắng sử dụng mô hình hóa Transformer đa tỷ lệ để giảm bớt những vấn đề hiệu suất này. Cụ thể, MegaByte nhóm các byte thành các patch có kích thước patch cố định P. Mỗi patch byte được vector hóa và sau đó đưa vào mô hình Transformer "toàn cục". Đầu ra của mô hình toàn cục sau đó được đưa vào mô hình Transformer "cục bộ" xuất ra các logit cấp độ byte tự hồi quy. [7]
+
+Đối với kích thước ngữ cảnh T byte, mô hình Transformer toàn cục của MegaByte nén ngữ cảnh chỉ còn T/P patch, có thể giảm đáng kể chi phí tính toán để mô hình hóa các chuỗi dài. Tương tự như Yu et al. [7], chúng tôi cũng thấy rằng MegaByte vượt trội hơn Transformer cấp độ byte tiêu chuẩn. Tuy nhiên, chúng tôi thấy rằng hiệu suất của MegaByte rất gần với baseline Transformer cấp độ byte mạnh hơn chỉ đơn giản sử dụng cơ chế attention cửa sổ trượt [29–31] để tăng kích thước ngữ cảnh mà không tăng chi phí tính toán.
+
+Yu et al. [7] không so sánh MegaByte với Transformer cấp độ từ con trong các thí nghiệm có kiểm soát tính toán. Trong các thí nghiệm có kiểm soát tính toán của chúng tôi, chúng tôi thấy rằng hiệu suất của MegaByte tụt hậu đáng kể so với Transformer cấp độ từ con.
+
+So với MegaByte, SpaceByte thực hiện thay đổi quan trọng là các patch được định kích thước động để tương ứng với văn bản, ví dụ với ranh giới từ. Chúng tôi cũng thêm một mô hình cục bộ bổ sung trước mô hình toàn cục (trong khi MegaByte chỉ sử dụng một mô hình cục bộ duy nhất sau mô hình toàn cục) để giúp mô hình xử lý kích thước patch động. Chúng tôi cũng sử dụng cửa sổ attention dài hơn đáng kể cho các mô hình cục bộ của chúng tôi. Chúng tôi thấy rằng những thay đổi này cho phép SpaceByte cải thiện đáng kể so với hiệu suất của MegaByte và gần như bằng hiệu suất của Transformer cấp độ từ con.
+
+### MambaByte
+
+Kiến trúc MambaByte [6] có cách tiếp cận thay thế để tránh tỷ lệ tính toán bậc hai của cơ chế attention bằng cách thay thế khối Transformer bằng khối Mamba [25]. Wang et al. [6] thấy rằng các mô hình MambaByte cấp độ byte của họ vượt trội hơn các mô hình Transformer cấp độ byte và MegaByte cấp độ byte. Họ thực hiện một thí nghiệm có kiểm soát với mô hình từ con, nơi họ thấy rằng MambaByte hoạt động tốt hơn Mamba (sử dụng token) một chút khi kiểm soát số lượng tham số mô hình và dữ liệu huấn luyện (14 epoch của bộ dữ liệu PG-19). Nhưng thí nghiệm này không được kiểm soát về tính toán vì MambaByte được huấn luyện sử dụng khoảng bốn lần tính toán hơn Mamba. Chúng tôi xem các kiến trúc Mamba và MambaByte là bổ sung cho công việc của chúng tôi, vì khối Mamba có thể được tích hợp vào SpaceByte (hoặc MegaByte) thay cho các khối Transformer.
+
+### Layer Skipping
+
+SpaceByte có thể được coi như một Transformer sử dụng một loại layer skipping phụ thuộc văn bản mới [32–38] trên các lớp giữa.
+
+### Word Boundary
+
+Các công trình trước đây đã chứng minh tính hữu ích trong việc sử dụng ranh giới từ để phân chia patch cho mô hình hóa byte đa tỷ lệ tự hồi quy [9,8,11] (và cũng [18] cho mô hình hóa encoder-decoder). Tuy nhiên, những công trình này không so sánh các mô hình byte tự hồi quy với các mô hình cấp độ từ con, cũng không xác định quy tắc phân chia patch có thể được áp dụng chung cho văn bản mã hóa UTF-8. Đóng góp chính của chúng tôi vượt ra ngoài những công trình trước đây này là chỉ ra cách mở rộng mô hình hóa byte ranh giới từ cho các phương thức văn bản đa dạng hơn trong khi gần như bằng hiệu suất của các mô hình cấp độ từ con trong các thí nghiệm có kiểm soát tính toán.
+
+Nawrot et al. [9] và Fleshman và Van Durme [11] sử dụng kiến trúc Hourglass Transformer [23]. Kiến trúc SpaceByte tương tự như Hourglass Transformer, ngoại trừ SpaceByte sử dụng kỹ thuật đơn giản hơn để rút ngắn và nâng cấp các kích hoạt trước và sau các khối toàn cục, và SpaceByte sử dụng attention cửa sổ trượt [29–31] trong các khối cục bộ để cải thiện hiệu suất cho kích thước ngữ cảnh dài.
+
+## 4. Thiết lập thí nghiệm
+
+Các thí nghiệm của chúng tôi so sánh hiệu suất của kiến trúc SpaceByte cấp độ byte với các kiến trúc Transformer cấp độ từ con và Transformer và MegaByte cấp độ byte. Để so sánh công bằng hiệu suất giữa các mô hình cấp độ byte và từ con, chúng tôi đo cross-entropy của bộ dữ liệu kiểm tra theo bit-per-byte. Với sự biến đổi đáng kể trong chi phí tính toán suy luận giữa các mô hình chúng tôi nghiên cứu, chúng tôi cũng so sánh chi phí tính toán suy luận của chúng để cung cấp đánh giá toàn diện hơn. Chúng tôi sử dụng FLOP-per-byte như một proxy đơn giản độc lập với phần mềm và phần cứng cho chi phí tính toán suy luận, đó là số FLOP (xem Phụ lục A.1) cần thiết để mô hình hóa một byte văn bản.
+
+Lưu ý rằng bằng cách kiểm soát cả tổng tính toán huấn luyện và FLOP-per-byte, chúng tôi cũng đang kiểm soát lượng dữ liệu huấn luyện vì (byte được huấn luyện) = (FLOP huấn luyện)/(FLOP-per-byte huấn luyện). FLOP-per-byte trong quá trình huấn luyện bằng ba lần FLOP-per-byte trong quá trình suy luận (do backward pass trong quá trình huấn luyện).
+
+Do đó, chúng tôi nghiên cứu biên Pareto của bit-per-byte thấp nhất và FLOP-per-byte thấp nhất. Chúng tôi huấn luyện tất cả các mô hình sử dụng thiết lập có kiểm soát tính toán, sử dụng 10^18 hoặc 10^19 FLOP. Để khám phá hiệu quả biên Pareto này, chúng tôi huấn luyện các mô hình sử dụng lưới các chiều mô hình và số lượng lớp khác nhau, như được chỉ định trong Phụ lục B.3.
+
+### Bộ dữ liệu
+
+Theo các thí nghiệm MegaByte [7] và MambaByte [6], chúng tôi đánh giá các mô hình của chúng tôi trên một loạt các bộ dữ liệu dạng dài đa dạng: PG-19 (sách tiếng Anh viết trước 1919) [41]; arXiv (bài báo từ ArXiv viết bằng LaTeX, được trích xuất từ thành phần arXiv của The Pile [42]); và Github (kho mã nguồn mở, được trích xuất từ thành phần Github của The Pile [42]).
+
+## 4.1 Mô hình
+
+Các mô hình chúng tôi nghiên cứu có xu hướng hoạt động tốt nhất khi chi phí tính toán được chia đều giữa các lớp attention và feedforward. Để đảm bảo điều này, chúng tôi cố định kích thước ngữ cảnh (hoặc cửa sổ attention) bằng chiều mô hình cho mỗi lớp. Chúng tôi mô tả chi tiết thiết lập mô hình của chúng tôi bên dưới.
+
+### Ký hiệu
+
+Đối với tất cả các mô hình, chúng tôi sử dụng T để biểu thị độ dài ngữ cảnh, và D để biểu thị chiều mô hình (của mô hình toàn cục cho SpaceByte và MegaByte).
+
+Đối với SpaceByte và MegaByte, Dlocal là chiều của mô hình cục bộ, và Tglobal là kích thước ngữ cảnh tối đa cho mô hình toàn cục. Kích thước patch P là số byte giữa các khối toàn cục. Nếu kích thước patch cố định (luôn luôn như vậy đối với MegaByte), chúng tôi tự nhiên đặt kích thước ngữ cảnh là T = P × Tglobal.
+
+Dưới đây, chúng tôi mô tả từng kiến trúc mô hình mà chúng tôi so sánh trong các thí nghiệm.
+
+### SpaceByte
+
+Chúng tôi cố định kích thước ngữ cảnh toàn cục và chiều mô hình toàn cục bằng nhau, Tglobal = D, và chúng tôi đặt cửa sổ attention cục bộ Wlocal bằng chiều mô hình cục bộ, Wlocal = Dlocal. Đối với bộ dữ liệu PG-19 và arXiv, kích thước patch trung bình là khoảng 6, vì vậy chúng tôi lấy T = 6 × Tglobal cho các bộ dữ liệu này; đối với bộ dữ liệu Github, kích thước patch trung bình là khoảng 8, vì vậy chúng tôi thay vào đó lấy T = 8 × Tglobal cho bộ dữ liệu Github.
+
+Để đơn giản, chúng tôi cố định số khối transformer toàn cục Lglobal bằng tổng số khối cục bộ, L(1)local + L(2)local, và chúng tôi chia đều số khối cục bộ trước (L(1)local) và sau (L(2)local) các khối toàn cục, tức là chúng tôi cố định L(1)local = L(2)local = 1/2 × Lglobal.
+
+### SpaceByte (patch cố định)
+
+Để chứng minh rõ ràng tính hữu ích của việc căn chỉnh động ranh giới patch trong SpaceByte, chúng tôi cũng huấn luyện một phiên bản đơn giản hóa của SpaceByte nơi tất cả các patch đều có kích thước cố định. Để gần như khớp với kích thước patch trung bình của SpaceByte, chúng tôi lấy kích thước patch cố định là P = 6 cho tất cả các bộ dữ liệu ngoại trừ bộ dữ liệu Github, mà chúng tôi sử dụng P = 8. Chúng tôi lại sử dụng Tglobal = D và T = P × Tglobal.
+
+### Transformer cấp độ Byte
+
+Để so sánh baseline đơn giản (theo Yu et al. [7]), chúng tôi huấn luyện các mô hình Transformer cấp độ byte. Chúng tôi lấy kích thước ngữ cảnh bằng chiều mô hình, T = D.
+
+Lưu ý rằng trong thiết lập của chúng tôi, một Transformer với chiều mô hình D chỉ thấy kích thước ngữ cảnh D, nhỏ hơn đáng kể so với kích thước ngữ cảnh PD cho SpaceByte (và MegaByte) với kích thước patch P.
+
+### Transformer cấp độ Byte (Window Attention)
+
+Vì ngữ cảnh ngắn hơn là một bất lợi đáng kể cho các bộ dữ liệu dạng dài, chúng tôi cũng so sánh với baseline Transformer mạnh hơn sử dụng attention cửa sổ trượt [29–31] để tăng kích thước ngữ cảnh một cách hiệu quả mà không tăng chi phí tính toán. Chúng tôi huấn luyện mỗi Transformer tăng cường window attention sử dụng kích thước ngữ cảnh T = PD và kích thước cửa sổ attention trượt bằng D, với P = 6 cho tất cả các bộ dữ liệu ngoại trừ bộ dữ liệu Github mà P = 8.
+
+### MegaByte
+
+Chúng tôi cũng so sánh với MegaByte [7]. Mặc dù MegaByte ban đầu được huấn luyện sử dụng kích thước patch P = 8, chúng tôi thấy rằng kích thước patch P = 4 thường tốt hơn trong thiết lập của chúng tôi. Do đó, chúng tôi bao gồm cả hai kích thước patch này (4 và 8) trong lưới siêu tham số cho MegaByte. Để đơn giản, chúng tôi cố định số lượng lớp trong các khối toàn cục và cục bộ bằng nhau, Lglobal = Llocal, gần với những gì được sử dụng bởi Yu et al. [7]. Tương tự như SpaceByte, chúng tôi đặt kích thước ngữ cảnh T = PD, trong đó D là chiều mô hình toàn cục.
+
+### Transformer từ con
+
+Baseline quan trọng nhất của chúng tôi là Transformer từ con tiêu chuẩn. Chúng tôi huấn luyện Transformer từ con sử dụng hai tokenizer khác nhau (cả hai đều có kích thước từ vựng 50,257): (1) tokenizer GPT2 [43], và (2) tokenizer SentencePiece [44] sử dụng mô hình byte-pair-encoding [45] được huấn luyện riêng cho từng bộ dữ liệu. Như thường lệ, chúng tôi đặt kích thước ngữ cảnh bằng chiều mô hình, T = D.
+
+## 4.2 Chi tiết khác
+
+Chúng tôi sử dụng các khối Transformer Pre-LN [46,30,47] [48] khá tiêu chuẩn không có bias term. Vì MegaByte sử dụng Rotary Position Embedding (RoPE) [49], chúng tôi cũng sử dụng RoPE cho tất cả các mô hình (cải thiện một chút loss). Để ngăn chặn loss divergence trong quá trình huấn luyện, chúng tôi sử dụng qk-layernorm [50–52] (mà chúng tôi rất khuyến nghị) cho tất cả các mô hình; tức là chúng tôi thêm layer-normalization bổ sung cho các vector query và key trong các lớp self-attention.
+
+Tất cả các siêu tham số đã được điều chỉnh cẩn thận sử dụng tìm kiếm lưới và ngẫu nhiên. Xem Phụ lục A và B để biết thêm chi tiết.
+
+## 5. Kết quả
+
+Bây giờ chúng tôi trình bày dữ liệu thí nghiệm so sánh các kiến trúc mô hình khác nhau trong thiết lập có kiểm soát tính toán. Hình 3 vẽ biên Pareto của cross-entropy bit-per-byte thấp nhất và FLOP-per-byte thấp nhất (tức là chi phí tính toán suy luận) cho mỗi kiến trúc và ngân sách tính toán huấn luyện.
+
+Chúng tôi giả định rằng biên Pareto là lồi. Do đó, cho mỗi kiến trúc và ngân sách tính toán, chúng tôi thực hiện tìm kiếm lưới về chiều mô hình và số lượng lớp; sau đó chúng tôi vẽ một đường tuyến tính từng khúc kết nối các mô hình tốt nhất (tức là tập con tối thiểu của) sao cho tất cả các mô hình khác (không hiển thị trong hình) nằm ở phía trên và bên phải của đường. Bảng 1 tóm tắt kết quả cho bit-per-byte thấp nhất tổng thể cho mỗi kiến trúc.
+
+Trên tất cả các bộ dữ liệu, ngân sách tính toán huấn luyện và ngân sách tính toán suy luận (tức là FLOP-per-byte), SpaceByte vượt trội đáng kể so với tất cả các kiến trúc cấp độ byte khác. SpaceByte cũng liên tục vượt trội hơn Transformer từ con khi sử dụng token GPT2, và với biên độ lớn trên các bộ dữ liệu arXiv và Github. SpaceByte gần như bằng hiệu suất của baseline cạnh tranh nhất, Transformer từ con sử dụng tokenizer SentencePiece, với SpaceByte hoạt động tốt hơn một chút trên các bộ dữ liệu arXiv và Github. Hình 3 cũng gợi ý rằng hiệu suất của SpaceByte cải thiện nhanh hơn Transformer từ con khi ngân sách tính toán huấn luyện tăng.
+
+Các kiến trúc cấp độ byte khác ngoài SpaceByte hoạt động kém hơn đáng kể so với SpaceByte hoặc SentencePiece Transformer. Ví dụ, đối với PG-19, kiến trúc cấp độ byte tốt nhất tiếp theo là MegaByte; tuy nhiên, MegaByte được huấn luyện sử dụng 10^19 FLOP (đường dày màu xanh lá cây trong Hình 3a) hoạt động kém hơn trên gần như toàn bộ biên Pareto so với SentencePiece Transformer được huấn luyện chỉ sử dụng 10% FLOP huấn luyện (đường mỏng màu đen). Mặc dù Transformer cấp độ byte tiêu chuẩn (là baseline chính được sử dụng bởi Yu et al. [7], màu xanh dương trong Hình 3) hoạt động kém hơn đáng kể so với các mô hình cấp độ byte khác, chúng tôi lưu ý rằng bằng cách chỉ đơn giản sử dụng cơ chế attention cửa sổ trượt để tăng kích thước ngữ cảnh gần hơn với các mô hình cấp độ byte khác, baseline mạnh hơn này (màu tím) hoạt động gần như tốt bằng MegaByte. Tuy nhiên, SpaceByte vẫn vượt trội đáng kể so với baseline mạnh hơn này.
+
+Để xác minh tầm quan trọng của kích thước patch động đối với hiệu suất của SpaceByte, chúng tôi so sánh SpaceByte với một biến thể của SpaceByte có kích thước patch cố định (màu cam trong Hình 3). Chúng tôi quan sát thấy rằng việc cố định kích thước patch làm giảm đáng kể hiệu suất của SpaceByte.
+
+Lưu ý rằng trên các bộ dữ liệu arXiv và Github, Transformer từ con hoạt động kém hơn đáng kể khi sử dụng token GPT2 (được huấn luyện trên WebText [43]) so với token SentencePiece (được huấn luyện sử dụng bộ dữ liệu cụ thể). Điều này minh họa sự thiên vị mà tokenization có thể đưa vào các phân phối dữ liệu khác với những gì tokenizer được huấn luyện.
+
+## 6. So sánh với các công trình khác
+
+Chúng tôi cũng so sánh hiệu suất SpaceByte với các mô hình cấp độ byte được huấn luyện trong các công trình khác. Yu et al. [7] huấn luyện các mô hình Transformer, PerceiverAR và MegaByte, mỗi mô hình sử dụng cùng lượng tính toán, FLOP-per-byte và dữ liệu (80B byte). Wang et al. [6] bổ sung huấn luyện một mô hình MambaByte sử dụng cùng FLOP-per-byte nhưng chỉ 30B byte dữ liệu. Chúng tôi huấn luyện SpaceByte-793M+184M (D = 1536, Dlocal = 768, Llocal = 26, Lglobal = 28) sử dụng khoảng cùng FLOP-per-byte suy luận (728M) nhưng cũng chỉ 30B byte dữ liệu (theo Wang et al. [6]). Việc huấn luyện các mô hình này do đó yêu cầu khoảng 3 × 728M FLOP-per-byte × 30B byte ≈ 6.5 × 10^19 FLOP, trong đó hệ số ba đến từ việc chuyển đổi FLOP-per-byte suy luận sang FLOP-per-byte huấn luyện (cần thêm backward pass). Cho thí nghiệm này, chúng tôi đặt kích thước ngữ cảnh của SpaceByte là 8192 byte để theo các công trình trước. Xem Phụ lục A để biết thêm chi tiết.
+
+Chúng tôi cũng huấn luyện các mô hình Transformer-1B từ con (D = 1536) sử dụng tokenizer SentencePiece (ngoại trừ bộ dữ liệu Stories, mà chúng tôi sử dụng tokenizer GPT2). Số byte trung bình mỗi token cho các bộ dữ liệu PG-19, Stories, arXiv và Github lần lượt là 4.05, 4.39, 3.73 và 3.31. Để khớp FLOP-per-byte của các mô hình Transformer-1B từ con với các mô hình cấp độ byte, chúng tôi đặt số lượng lớp là 40, 44, 37 hoặc 31, cho Transformer-1B trên bốn bộ dữ liệu tương ứng này.
+
+Kết quả được hiển thị trong Bảng 2. Chúng tôi hiển thị các thí nghiệm cho các bộ dữ liệu PG-19 [41], Stories [53], arXiv (được trích xuất từ The Pile [42]) và Github (được trích xuất từ The Pile [42]). Yu et al. [7] sử dụng các bộ dữ liệu "arXiv" và "Code" độc quyền, mà chúng tôi không có quyền truy cập. Theo Wang et al. [6], chúng tôi so sánh kết quả của Yu et al. [7] với các thành phần arXiv và Github tương tự (nhưng có thể hơi khác) của The Pile [42]. Tuy nhiên, Wang et al. [6] sử dụng các split test riêng của họ để đánh giá MambaByte-353M trên Stories, arXiv và Github. Do các split test khá nhỏ (~100MB cho các bộ dữ liệu arXiv và Github), sự khác biệt này có thể đáng kể. Ví dụ, bit-per-byte validation (và test) cho SpaceByte-793M+184M trên các bộ dữ liệu Stories, arXiv và Github là 0.877 (0.833), 0.658 (0.663) và 0.397 (0.411), khác nhau +5%, -1% và -3% tương ứng. Với sự biến thiên này, bit-per-byte của MambaByte-353M và SpaceByte-793M+184M không khác biệt về mặt thống kê trên các bộ dữ liệu arXiv hoặc Github.
+
+Nhìn chung, chúng tôi thấy rằng SpaceByte vượt trội hơn các mô hình cấp độ byte được huấn luyện trong các công trình khác. SpaceByte vượt trội hơn MegaByte, mặc dù MegaByte được huấn luyện sử dụng gấp 2.7 lần tính toán và dữ liệu. Hơn nữa, hiệu suất của SpaceByte cạnh tranh với Transformer-1B từ con.
+
+## 7. Kết luận
+
+Chúng tôi đã đề xuất một kiến trúc Transformer decoder cấp độ byte mới, SpaceByte. Các thí nghiệm có kiểm soát tính toán của chúng tôi cho thấy SpaceByte vượt trội hơn tất cả các kiến trúc cấp độ byte khác và gần như bằng hiệu suất của Transformer cấp độ từ con.
+
+### Hạn chế
+
+SpaceByte sử dụng quy tắc phân chia byte đơn giản dựa trên các byte "spacelike", chẳng hạn như khoảng trắng thường biểu thị ranh giới từ. Do đó, SpaceByte không được kỳ vọng hoạt động tốt trên các chuỗi byte tùy ý, chẳng hạn như hình ảnh hoặc âm thanh. Một số ngôn ngữ, chẳng hạn như tiếng Trung, không sử dụng khoảng trắng giữa các từ. SpaceByte phần nào mạnh mẽ với những ngôn ngữ này, vì ví dụ ký tự Trung Quốc được mã hóa sử dụng ba byte trong UTF-8, mà SpaceByte sẽ nhóm lại với nhau. Tuy nhiên, các thí nghiệm sơ bộ của chúng tôi gợi ý rằng SpaceByte hoạt động kém hơn transformer từ con trên văn bản tiếng Trung. Do đó, sẽ là mong muốn để cải thiện và tổng quát hóa quy tắc chèn khối toàn cục của SpaceByte.
+
+Khoảng cách biến đổi giữa các khối toàn cục làm cho việc thiết kế và triển khai thuật toán sampling suy luận batch hiệu quả cho SpaceByte trở nên thách thức hơn.
+
+### Công việc tương lai
+
+SpaceByte sử dụng mô hình hóa đa tỷ lệ nơi mô hình cục bộ hoạt động trên các byte trong khi mô hình toàn cục thường hoạt động trên các từ. Một mở rộng tự nhiên khác của công việc chúng tôi là thử áp dụng đệ quy mô hình hóa đa tỷ lệ ở các tỷ lệ thậm chí dài hơn, chẳng hạn như cấp độ câu hoặc đoạn văn. Cũng sẽ có ích để điều tra xem các khối Mamba [25] có thể cải thiện thêm hiệu suất của SpaceByte hay không.
+
+## Lời cảm ơn và Tiết lộ Tài trợ
+
+Chúng tôi cảm ơn Tushaar Gangavarapu, Junxiong Wang và Lili Yu cho những cuộc trò chuyện hữu ích. Công việc này được hỗ trợ một phần bởi NSF Campus Cyberinfrastructure grant CC* Compute: Interactive Data Analysis Platform OAC-2019007 và bởi Trung tâm Tính toán Nghiên cứu (CRC) của Đại học Rice.

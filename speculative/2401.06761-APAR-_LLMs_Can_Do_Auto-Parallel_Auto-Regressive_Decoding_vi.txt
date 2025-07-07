@@ -1,0 +1,146 @@
+# APAR: Các Mô hình Ngôn ngữ Lớn Có thể Thực hiện Giải mã Tự động Song song Tự hồi quy
+
+Mingdao Liu1,†,∗, Aohan Zeng1,2,∗, Bowen Wang1,†, Peng Zhang2, Jie Tang1, Yuxiao Dong1
+1Đại học Thanh Hoa 2Zhipu AI
+
+## Tóm tắt
+
+Việc áp dụng rộng rãi các mô hình ngôn ngữ lớn (LLM) đòi hỏi các chiến lược triển khai hiệu quả. Tuy nhiên, quá trình giải mã tự hồi quy, là nền tảng của cách hầu hết các LLM tạo văn bản, đặt ra thách thức để đạt được dịch vụ hiệu quả. Trong nghiên cứu này, chúng tôi giới thiệu một phương pháp tạo tự hồi quy song song. Bằng cách tinh chỉnh hướng dẫn trên dữ liệu miền tổng quát có chứa cấu trúc phân cấp, chúng tôi cho phép các LLM lập kế hoạch độc lập cho quá trình tạo của chúng và thực hiện tạo tự động song song tự hồi quy (APAR), giảm đáng kể số bước tạo. APAR đơn thuần có thể đạt được tăng tốc lên đến 2×, và khi kết hợp với giải mã suy đoán, tăng tốc có thể đạt lên đến 4×. Ngoài ra, APAR giảm tiêu thụ bộ nhớ đệm key-value và tính toán attention trong quá trình tạo. Điều này dẫn đến tăng thông lượng 20-70% và giảm độ trễ 20-35% trong các tình huống thông lượng cao, so với các framework phục vụ tiên tiến nhất.
+
+## 1 Giới thiệu
+
+Các mô hình ngôn ngữ lớn (LLM) (OpenAI, 2023; Touvron et al., 2023; Zeng et al., 2022) ngày càng trở thành nền tảng cho các ứng dụng AI khác nhau (Richards, 2023; Nakajima, 2023; Park et al., 2023; Zhou et al., 2023). Việc áp dụng rộng rãi này đã dẫn đến nhu cầu ngày càng tăng về triển khai mô hình hiệu quả, tức là độ trễ thấp và thông lượng cao (Aminabadi et al., 2022). Tuy nhiên, cấu trúc tự hồi quy (AR) nội tại của các mô hình này đặt ra những thách thức đáng kể trong việc đạt được dịch vụ hiệu quả hơn (Radford et al., 2018).
+
+Đầu tiên, mỗi token mới được tạo tự hồi quy dựa trên toàn bộ tập hợp các token đã tạo trước đó. Quá trình giải mã tăng dần này dẫn đến tốc độ tạo không tối ưu, vì mỗi bước tạo đòi hỏi truy cập số lượng lớn các tham số của LLM (Aminabadi et al., 2022). Do đó, khi kích thước batch tạo không đủ lớn, quá trình này trở nên bị giới hạn bởi bộ nhớ, dẫn đến việc sử dụng chưa tối ưu tính toán GPU.
+
+Thứ hai, việc tính toán attention trên tất cả các token trước đó trong Transformer (Vaswani et al., 2017) cũng giới hạn thông lượng phục vụ. Trong các tình huống thông lượng cao, nhiều chuỗi đang tạo song song và quá trình tạo trở nên bị giới hạn bởi tính toán. Trong khi đó, chi phí tính toán attention tăng tuyến tính với độ dài chuỗi, điều này cản trở các cải thiện thêm về thông lượng, đặc biệt cho các phản hồi dài. Ngoài ra, việc lưu trữ các tensor key và value (KV cache) cho các token đã tạo, bất chấp những tiến bộ trong các thuật toán hiệu quả bộ nhớ (Kwon et al., 2023), tăng tuyến tính với độ dài chuỗi, hạn chế số lượng yêu cầu đồng thời mà một hệ thống có thể xử lý.
+
+Nhận thức được những thách thức này, chúng tôi giới thiệu chiến lược giải mã Tự động Song song Tự hồi quy (APAR) với mục tiêu cải thiện hiệu quả suy luận của các LLM. APAR tận dụng cấu trúc có thể song song hóa vốn có trong việc tạo LLM, tận dụng khả năng hiểu cấu trúc văn bản của LLM. Bằng cách tinh chỉnh LLM trên các tập dữ liệu có cấu trúc phân cấp, các mô hình có thể học cách tự động khởi tạo các luồng tạo song song khi gặp phải các cấu trúc phản hồi có thể song song hóa. Cách tiếp cận này biến đổi việc tạo tuyến tính thông thường thành cấu trúc cây đoạn văn có thể song song hóa. Điều này không chỉ tạo điều kiện thuận lợi cho khả năng song song giải mã lớn hơn mà còn giảm độ dài attention thông qua các cơ chế attention dựa trên cây, và cho phép giải phóng sớm bộ nhớ KV cache đã tiêu thụ.
+
+Chúng tôi thực hiện thí nghiệm trên họ mô hình Vicuna. Trong các tình huống bị giới hạn bởi bộ nhớ, APAR có thể giúp giảm độ trễ mô hình và đạt được tăng tốc độ tạo trung bình 2× trên Vicuna Bench (Chiang et al., 2023). Hơn nữa, thiết kế của APAR bổ sung cho hầu hết các phương pháp tăng tốc suy luận hiện có. Ví dụ, khi kết hợp với Medusa (Cai et al., 2023), một chiến lược giải mã suy đoán, các mô hình dựa trên APAR mang lại cải thiện tốc độ lên đến 4× trên Vicuna Bench. Trong một số danh mục cụ thể, sự kết hợp này thậm chí đạt được tăng tốc lên đến 6×.
+
+Trong các tình huống thông lượng cao, khả năng tương thích của APAR với vLLM cho phép giải phóng bộ nhớ sớm, giảm yêu cầu KV cache lên đến 50% trong khi vẫn duy trì cùng mức độ thông lượng. Ngoài ra, APAR giảm số lượng token tham gia vào tính toán attention. Bằng cách sử dụng cùng lượng bộ nhớ KV cache, nó có được cải thiện 20-70% về thông lượng so với quá trình AR gốc, và đạt được giảm 20-35% độ trễ trong khi duy trì cùng mức độ đồng thời phục vụ.
+
+Quan trọng là, chất lượng tạo với APAR không bị ảnh hưởng. Các đánh giá trên nhiều danh mục trên MT Bench và Vicuna Bench (Zheng et al., 2023) cho thấy chất lượng phản hồi vẫn phần lớn nhất quán, với các biến đổi trong phạm vi ±2% so với các đối tác AR của nó. Điều này cho thấy các mô hình dựa trên APAR giữ lại khả năng tạo theo ngữ cảnh trong khi tăng cường tốc độ và hiệu quả giải mã.
+
+## 2 Giải mã Tự động Song song Tự hồi quy
+
+### 2.1 Tổng quan
+
+Các cấu trúc có thể song song hóa có mặt khắp nơi trong phản hồi của LLM. Ví dụ, trong tập dữ liệu ShareGPT, 58% các cuộc đối thoại chứa ít nhất một phản hồi danh sách có thứ tự hoặc không có thứ tự từ ChatGPT, và khoảng 32% phản hồi chứa cấu trúc danh sách. Hầu hết các cấu trúc danh sách đều phù hợp tự nhiên cho việc tạo song song, vì các chi tiết của một đoạn văn được phân mục thường được điều kiện hóa bởi câu hoặc cụm từ dẫn đầu của nó.
+
+Ý tưởng chính của APAR là làm cho LLM nhận thức rõ ràng về các cấu trúc có thể song song hóa như vậy, và sinh ra các luồng giải mã tự động song song tự hồi quy tương ứng. Cụ thể, APAR bao gồm hai thành phần chính. Đầu tiên, chúng tôi post-train các LLM với các cấu trúc văn bản phân cấp, mà chúng tôi gọi là các nút đoạn văn (Phần 2.2). Thứ hai, chúng tôi thiết kế thuật toán giải mã để hỗ trợ các hoạt động giải mã song song, bao gồm duy trì cấu trúc phân cấp trong việc tạo và khôi phục nó thành một chuỗi tuyến tính (Phần 2.3).
+
+### 2.2 Định dạng Đầu vào
+
+Phần này giới thiệu các tập dữ liệu được sử dụng để tinh chỉnh các mô hình APAR, bao gồm cấu trúc cây, cơ chế attention và các token điều khiển. Xem Phần 3.2 để biết chi tiết xử lý trước dữ liệu.
+
+**Cây đoạn văn.** Như được minh họa trong Hình 2, một cây đoạn văn được sử dụng để biểu diễn một chuỗi có cấu trúc phân cấp. Mỗi nút trong cây, được gọi là nút đoạn văn trong các phần tiếp theo, biểu thị một thành phần của phản hồi tạo. Mỗi nút đoạn văn có 0 hoặc 2 con trỏ. Một con trỏ của nút đoạn văn được gọi là first child (mũi tên xanh trong Hình 2), trỏ đến các văn bản chi tiết (đoạn con) của đoạn văn; con trỏ child khác là next sibling (mũi tên đỏ trong Hình 2), trỏ đến đoạn văn tiếp theo của cùng cấp độ phân cấp.
+
+**Token điều khiển.** Để cho phép mô hình ngôn ngữ sinh ra một luồng giải mã song song, 2 token điều khiển được thêm vào từ vựng.
+
+• **Fork Identifier.** [Fork] được sử dụng để chỉ ra một cấu trúc có thể song song trong phản hồi. Các mô hình được huấn luyện để xuất ra một token [Fork] khi chúng phát hiện rằng những gì theo sau được coi là thông tin chi tiết (hoặc một đoạn con) và do đó có thể được giải mã cùng với đoạn tiếp theo của cùng cấp độ. Khi hệ thống suy luận phát hiện token [Fork] được xuất ra bởi mô hình, nó tạo ra một luồng giải mã song song chia sẻ cùng prefix cho đến token [Fork] đó. Token này hoạt động giống như cuộc gọi hệ thống fork() được sử dụng trong các hệ điều hành.
+
+• **Child Identifier.** [Child] luôn theo sau [Fork], và được sử dụng để chỉ ra rằng nội dung sau đây là phần đầu của một đoạn con được dẫn dắt bởi nội dung trước đó, giống như giá trị trả về zero của fork() trong một số hệ điều hành. Cụ thể, [Child] được attend to nhưng không được tính loss trong quá trình huấn luyện. Do đó, mô hình không bao giờ học cách xuất ra token này, nhưng học cách xuất ra nội dung của đoạn con khi [Child] được chèn vào ngữ cảnh (tức là một chuỗi [Fork] [Child] xuất hiện trong ngữ cảnh). Mặt khác, khi [Fork] xuất hiện mà không được theo sau bởi [Child], mô hình sẽ tạo ra đoạn tiếp theo của cùng cấp độ.
+
+**Training attention.** Để các đoạn văn có thể được tạo song song, tất cả các nút chỉ attend to các tổ tiên của chúng, và chính chúng với một mặt nạ causal, như được thể hiện trong Hình 2.
+
+### 2.3 Quy trình Giải mã
+
+Tổng quan về quá trình tạo được minh họa trong Hình 3 và thuật toán được xây dựng trong Thuật toán 1. Chúng tôi đầu tiên giới thiệu khái niệm về chuỗi và nhóm chuỗi theo cách triển khai trong Kwon et al. (2023), sau đó trình bày các quy trình tạo của thuật toán giải mã APAR.
+
+**Chuỗi và nhóm chuỗi.** Một chuỗi được định nghĩa là một danh sách có thứ tự các token. Một nhóm chuỗi là tập hợp tất cả các chuỗi được tạo cho cùng một chuỗi prompt và được khởi tạo chỉ với chuỗi prompt. Trong thuật toán giải mã APAR, mỗi nhóm chuỗi tương ứng với một cây đoạn văn.
+
+Mặt khác, mỗi chuỗi là một luồng tạo và được liên kết với một nút lá trong cây đoạn văn.
+
+**Giải mã.** Như được mô tả trong Thuật toán 1, chúng tôi bắt đầu giải mã với chuỗi prompt người dùng p và xây dựng một nhóm chuỗi G được khởi tạo là {p}. Chúng tôi khởi tạo cây đoạn văn tương ứng với G với nút gốc r và liên kết chuỗi p với r (hiện tại là một nút lá). Sau đó, chúng tôi lặp lại thực hiện APARDECODE trên nhóm chuỗi G cho đến khi tất cả các chuỗi trong G đã hoàn thành. Cuối cùng, cây đoạn văn được duyệt để khôi phục đầu ra tuần tự g.
+
+Tiếp theo, chúng tôi đi sâu vào chi tiết cho APARDECODE, thực hiện một bước giải mã duy nhất cho nhóm chuỗi G với mô hình ngôn ngữ Θ. Đối với mỗi chuỗi chưa hoàn thành s trong G, nếu token cuối cùng là [Fork], điều đó có nghĩa là mô hình gọi một luồng tạo mới, và bây giờ là lúc để fork chuỗi s'. Chuỗi được fork chia sẻ cùng các token prefix với chuỗi cha. Khi triển khai với paged attention (Kwon et al., 2023), hoạt động fork tạo ra một ánh xạ bộ nhớ chia sẻ cho prefix được chia sẻ (hộp đỏ chấm trong Hình 3), sao chép nhiều nhất 1 khối KV cache và chia sẻ tất cả các khối khác. Sau hoạt động fork, s' được thêm vào một token [Child] bắt buộc để xác định chuỗi này với mô hình ngôn ngữ như một chuỗi con. Ngoài ra, hai nút lá mới được tạo và s và s' được đặt để theo dõi các nút lá mới nhất.
+
+Cuối cùng, token mới được lấy mẫu x được thêm vào s. Nếu token [EOS] được lấy mẫu, việc tạo chuỗi s được coi là hoàn thành, và KV cache chỉ thuộc về s được giải phóng (hộp đỏ chấm trong Hình 3).
+
+### 2.4 Đặc điểm
+
+Dựa trên thuật toán giải mã đã nêu ở trên và phân phối các truy vấn người dùng, chúng tôi xác định ba đặc điểm chính của giải mã APAR dẫn đến hiệu suất vượt trội về độ trễ suy luận, thông lượng và tiêu thụ bộ nhớ.
+
+1. **Cấu trúc giải mã song song giảm độ trễ.** Thông qua huấn luyện trên các cây đoạn văn, mô hình ngôn ngữ trở thành một trình khai thác trực tuyến tự động cho cấu trúc có thể song song và các luồng tạo đồng thời được phát hành tương ứng. Việc tạo song song giảm các bước tạo. Trong các tình huống bị giới hạn bởi bộ nhớ, độ trễ trong mỗi bước vẫn gần như không thay đổi đối với các mức độ khác nhau của khả năng song song giải mã (tức là kích thước batch động) và do đó độ trễ có thể được giảm tỷ lệ thuận (Hình 4).
+
+2. **Giải phóng sớm KV cache con giảm tiêu thụ bộ nhớ.** Trong quá trình tạo tự hồi quy, KV cache của tất cả các token phải được giữ lại trước khi chuỗi được tạo hoàn toàn. Tuy nhiên, trong APAR, một khi chuỗi được fork (tức là một luồng tạo) hoàn thành việc tạo, KV cache chỉ thuộc về chuỗi được fork có thể được giải phóng ngay lập tức, trong khi phần còn lại của việc tạo tiếp tục. Dưới tác động của chiến lược giải phóng sớm, như được thể hiện trong Hình 5a sau này, lên đến 50% cache tạo có thể được tiết kiệm trong khi thông lượng vẫn giữ nguyên.
+
+3. **Giảm độ dài attention tiết kiệm tính toán.** Việc tạo tự hồi quy yêu cầu một token attend to tất cả các token đã tạo trước đó. Trong APAR, mặt khác, một token mới chỉ attend to các token dọc theo đường dẫn của nó đến gốc của cây đoạn văn, điều này giảm tính toán attention trong việc tạo. Trong một thiết lập tạo được batch hóa nhiều, độ trễ phát sinh bởi truy cập bộ nhớ được phân bổ bởi tính toán batch hóa chuyên sâu, làm cho quá trình tạo chủ yếu bị giới hạn bởi tính toán. Do đó, việc giảm tính toán trong mỗi token dẫn đến cải thiện thông lượng trên các mức sử dụng bộ nhớ khác nhau (Hình 5a), cũng như giảm độ trễ với các mức độ đồng thời khác nhau (Hình 5b).
+
+## 3 Thí nghiệm
+
+### 3.1 Xử lý trước Dữ liệu
+
+Chúng tôi áp dụng một phiên bản mã nguồn mở của tập dữ liệu ShareGPT¹ làm tập dữ liệu hướng dẫn. Dữ liệu tinh chỉnh được cấu thành như sau.
+
+**Danh sách có thứ tự.** Nhiều phản hồi được biểu diễn dưới dạng danh sách có thứ tự với mẫu root - detail cho mỗi điểm đầu dòng, trong đó root thường là một cụm từ giới thiệu và detail là nội dung chi tiết của điểm cụ thể đó. Do đó, root được trích xuất làm nội dung cho nút gốc và detail làm nội dung trong nút chi tiết, như được minh họa trong Hình 2.
+
+**Đoạn văn.** Hầu hết các đoạn văn phản hồi của LLM được cấu trúc theo định dạng root-and-details, ngay cả khi không được trình bày dưới dạng danh sách có thứ tự, trong đó câu đầu tiên của đoạn văn thường tóm tắt ý chính của đoạn văn đó. Do đó, chúng tôi trích xuất câu đầu tiên của đoạn văn làm root cho phần đó, trong khi phần còn lại của nội dung phục vụ làm detail.
+
+**Dữ liệu không có cấu trúc.** Để trích xuất chính xác cấu trúc phân cấp, các phản hồi có định dạng gây nhầm lẫn, như dữ liệu mã và toán học, được loại trừ trong quá trình trích xuất cấu trúc đã nêu ở trên. Tuy nhiên, trong khi học cách tạo ra các luồng giải mã song song, một mô hình cũng phải học cách không tạo ra [Fork] trong các trường hợp mà attention mạch lạc là cần thiết để dự đoán chính xác token tiếp theo. Do đó, một số cuộc trò chuyện đã lọc được thêm vào làm ví dụ âm tính để ngăn mô hình khỏi việc phát hành [Fork] quá mức. Phần dữ liệu này được tổ chức như một nút đoạn văn duy nhất không có hậu duệ.
+
+Xem Phụ lục B để biết các quy trình và quy tắc chi tiết được sử dụng trong xử lý trước dữ liệu.
+
+### 3.2 Thiết lập Thí nghiệm
+
+**Mô hình.** Để đánh giá tốc độ tạo, thông lượng và chất lượng, chúng tôi áp dụng tinh chỉnh APAR trên các mô hình vicuna-v1.3-{7B,13B}, tạo ra APAR-{7B,13B}. Trong phần này, các mô hình Vicuna gốc sẽ được gọi là Original-{7B,13B} (O-{7B,13B} như viết tắt) và các mô hình APAR đã tinh chỉnh sẽ được gọi là APAR-{7B,13B} (A-{7B,13B} như viết tắt).
+
+**Triển khai.** Chúng tôi triển khai 3 thiết lập để đánh giá, bao gồm
+
+• **Vanilla-APAR.** Vanilla-APAR được triển khai trực tiếp với transformers (Wolf et al., 2020), một nền tảng học sâu python được áp dụng rộng rãi cho các mô hình dựa trên transformer.
+
+• **Medusa-APAR.** Medusa-APAR được triển khai với Medusa (Cai et al., 2023), một thuật toán giải mã suy đoán mã nguồn mở theo mô hình dự đoán - xác minh cho giải mã. Medusa áp dụng một đầu mô hình ngôn ngữ phụ nhẹ để dự đoán một vài token tiếp theo và xác minh việc tạo bằng cách sử dụng tree attention. Thiết lập này được sử dụng để kiểm tra tác động kết hợp của APAR và thuật toán giải mã suy đoán.
+
+• **Batched-APAR.** Batched-APAR được triển khai với vLLM (Kwon et al., 2023), một engine suy luận thông lượng cao và hiệu quả bộ nhớ sử dụng cơ chế paged-attention. Thiết lập này được sử dụng để kiểm tra APAR trong các tình huống phục vụ thực tế, nơi chúng tôi không chỉ quan tâm đến độ trễ mà còn cả thông lượng và hiệu quả bộ nhớ.
+
+**Thiết lập huấn luyện.** Trong quá trình tinh chỉnh, chúng tôi lấy mẫu từ dữ liệu có cấu trúc (danh sách có thứ tự và đoạn văn được đề cập ở trên, 16k mẫu) và dữ liệu không có cấu trúc (9k mẫu) với tỷ lệ lấy mẫu 1:1. Các mô hình được tinh chỉnh với kích thước batch 128, tốc độ học 2e-5 trong 2000 bước. Sau khi tinh chỉnh, chúng tôi huấn luyện 2 đầu medusa với tốc độ học 1e-3 trong 2000 bước sử dụng cùng dữ liệu như tinh chỉnh. Xem Phụ lục A để biết các thiết lập siêu tham số chi tiết.
+
+**Tập dữ liệu đánh giá.** Một số tập dữ liệu được sử dụng để đánh giá thống kê tạo và chất lượng.
+
+• **Vicuna Bench** (Chiang et al., 2023) là một benchmark để đánh giá LLM về hiểu biết ngôn ngữ, lý luận và nhận thức ngữ cảnh. Nó bao gồm 9 danh mục và chứa 80 truy vấn một lượt. Để có bố cục rõ ràng hơn, chúng tôi viết tắt 2 tên danh mục dài trong Vicuna Bench trong các hình và bảng sau, tức là Commonsense thành CS, Counterfactual thành CF.
+
+• **MT Bench** (Zheng et al., 2023) là một benchmark gồm 80 câu hỏi nhiều lượt. Nó bao gồm 8 danh mục phổ biến và có thể được sử dụng để đánh giá khả năng trò chuyện nhiều lượt và tuân theo hướng dẫn của LLM.
+
+• **APAR Test Set** gồm 1000 truy vấn người dùng được lấy mẫu từ tập dữ liệu ShareGPT để mô phỏng phân phối truy vấn trong tình huống triển khai thực tế sử dụng cùng quy tắc chúng tôi trích xuất dữ liệu huấn luyện có cấu trúc. Do số lượng lớn, việc đánh giá chất lượng tạo cho tất cả các truy vấn tập kiểm tra trên tất cả các mô hình sẽ quá tốn kém. Do đó, tập kiểm tra APAR chỉ được sử dụng để đo lường thống kê tạo.
+
+### 3.3 Kết quả trong Tình huống Bị giới hạn Bộ nhớ
+
+Chúng tôi kiểm tra cách APAR giảm độ trễ tạo trong tình huống bị giới hạn bộ nhớ (tức là kích thước batch nhỏ), cũng như tác động tăng tốc kết hợp của nó với giải mã suy đoán. Xét rằng mô hình được huấn luyện lại và độ dài đầu ra có thể khác nhau trên cùng một prompt, chúng tôi chuẩn hóa độ trễ tạo với các token đã tạo, áp dụng token mỗi giây làm metric cho tốc độ tạo. Kết quả được báo cáo với kích thước batch cố định là 1 và chia sẻ prefix không được bật.
+
+Như được thể hiện trong Hình 4, Vanilla-APAR đạt được tăng tốc trung bình 2× trong Vicuna Bench và tăng tốc trung bình 1.4× trên MT Bench. Các mô hình APAR học cách sinh ra luồng tạo song song trong và chỉ trong các danh mục tồn tại cấu trúc có thể song song. Ví dụ, APAR-{7B,13B} hiếm khi cố gắng phát hành các luồng tạo song song trong các truy vấn liên quan đến mã hóa và toán học, thường yêu cầu lý luận từng bước cẩn thận hoặc định dạng nghiêm ngặt, dẫn đến không có tăng tốc. Mặt khác, trên các danh mục như common-sense, generic và knowledge, tăng tốc là đáng kể. Khi kết hợp với giải mã suy đoán, Medusa-APAR đạt được tăng tốc trung bình ấn tượng 4× trong Vicuna Bench và tăng tốc trung bình 2.9× trong MT Bench, thể hiện việc giảm mạnh độ trễ tạo.
+
+### 3.4 Kết quả trong Tình huống Thông lượng Cao
+
+Trong các tình huống phục vụ hiệu suất cao, việc tăng thông lượng và giảm bộ nhớ phục vụ cũng quan trọng. Chúng tôi sử dụng Batched-APAR để phục vụ các truy vấn trong tập kiểm tra APAR với các lượng bộ nhớ GPU khác nhau có sẵn. Tổng quan về thông lượng tạo và độ trễ mỗi token được tóm tắt trong Hình 5. Các điểm trong biểu đồ thể hiện giá trị trung bình và các thanh lỗi biểu thị percentile 25% và 75% trong mỗi thiết lập.
+
+Như được thể hiện trong Hình 5a, thông lượng của các mô hình Batched-APAR vượt qua thông lượng tối đa của các mô hình gốc chỉ với 20% KV Cache được sử dụng, thể hiện hiệu quả bộ nhớ. Khi sử dụng lượng bộ nhớ tương tự, thông lượng được tăng nhất quán 20% ∼ 70% trên các mức sử dụng cache khác nhau. Các mô hình Batched-APAR cũng thể hiện việc giảm độ trễ đáng kể trong các tình huống bị giới hạn tính toán. Như được thể hiện trong Hình 5b, Batched-APAR giảm 20% ∼ 35% độ trễ trung bình khi phục vụ cùng số lượng yêu cầu đồng thời. Độ trễ của Batched-APAR-13B thậm chí tương tự với mô hình Original-7B.
+
+Việc cải thiện độ trễ và thông lượng có thể được giải thích tốt nhất bởi đặc điểm 2 và 3 như được mô tả trong Phần 2.4. Chúng tôi đo lường định lượng bao nhiêu tính toán và bộ nhớ cache có thể được tiết kiệm bằng cách sử dụng thuật toán giải mã APAR. Chúng tôi áp dụng các metric sau.
+
+• **Max cached tokens** được định nghĩa là số lượng tối đa các slot KV cache cần thiết để tạo một phản hồi. Đối với việc tạo tự hồi quy, các token prompt và tất cả các token đã tạo cần được cache trước khi tạo token [EOS].
+
+• **Attended tokens** được định nghĩa là số lượng token được attend to khi dự đoán một token cụ thể. Đối với việc tạo tự hồi quy, tất cả các token trước đó là cần thiết khi dự đoán token tiếp theo.
+
+Vì độ dài phản hồi khác nhau giữa các mô hình APAR và các mô hình gốc, chúng tôi làm phẳng cây đoạn văn được tạo bởi các mô hình APAR làm đầu ra tham chiếu. Khi tính trung bình, chúng tôi loại trừ các danh mục không được tăng tốc bởi APAR, tức là Coding, Extraction và Math.
+
+Như được tóm tắt trong Bảng 1 và Bảng 2, so với các kết quả đã làm phẳng, APAR giảm max cached tokens 12% ∼ 27% và giảm attended tokens 15% ∼ 35%. Kết quả chi tiết cho tất cả các danh mục được báo cáo trong Phụ lục D.3 và Phụ lục D.2.
+
+### 3.5 Chất lượng Tạo
+
+Để đo lường chất lượng tạo của các mô hình APAR so với các mô hình gốc, chúng tôi áp dụng MT Bench và Vicuna Bench làm khung đánh giá. Đối với mỗi phản hồi, chúng tôi cung cấp cho GPT-4 lịch sử trò chuyện, truy vấn người dùng và phản hồi mô hình, yêu cầu GPT-4 chấm điểm phản hồi với điểm số từ 1 đến 10 và chúng tôi tuân theo mẫu prompt được sử dụng bởi Zheng et al. (2023).
+
+Điểm chất lượng của mỗi danh mục được tóm tắt trong Bảng 3 và Bảng 4. So với các mô hình gốc, các mô hình APAR khác biệt -2% ∼ +2% trong điểm số tổng thể MT Bench và Vicuna Bench, thể hiện thay đổi chất lượng tổng thể không đáng kể.
+
+## 4 Các Nghiên cứu Liên quan
+
+Phần này thảo luận về sự khác biệt và kết nối của APAR với các nghiên cứu trước đó liên quan đến tăng tốc suy luận.
+
+**Tính toán được tối ưu hóa.** Các tối ưu hóa trên toán tử (Dao et al., 2022) và đồ thị tính toán (Aminabadi et al., 2022) là các lĩnh vực nghiên cứu tích cực. Nén mô hình được sử dụng rộng rãi trong triển khai, như lượng tử hóa (Dettmers et al., 2022; Frantar et al., 2022) và cắt tỉa (Frantar và Alistarh, 2023; Ma et al., 2023). Một dòng nghiên cứu khác sửa đổi kiến trúc mô hình, bao gồm attention hiệu quả (Kitaev et al., 2020) cho độ phức tạp tính toán và multi-query attention (Shazeer, 2019) cho IO được tối ưu hóa. Khác với các nghiên cứu trước, APAR không thực hiện sửa đổi nào đối với toán tử hoặc kiến trúc mô hình mà giảm tính toán bằng cách áp dụng cấu trúc cây attention. APAR do đó trực giao với và có thể được áp dụng cùng với các nghiên cứu đã nêu ở trên.
+
+**Cải thiện khả năng song song.** Các chiến lược lập lịch, bao gồm dynamic batching (Yu et al., 2022) và paged-attention (Kwon et al., 2023), cải thiện thông lượng tạo tối đa. Một dòng nghiên cứu khác khám phá giải mã suy đoán (SD) (Leviathan et al., 2023; Yang et al., 2023; Cai et al., 2023), xác minh nhiều token được suy đoán song song, giảm độ trễ tạo trong các kích thước batch nhỏ. Việc tạo không tự hồi quy (Gu et al., 2018) đề xuất lấy mẫu nhiều token tạo song song, thường yêu cầu huấn luyện lại và áp dụng cho các tình huống hạn chế. APAR có thể được kết hợp thuận tiện với lập lịch hiệu quả và các phương pháp SD để đạt được hiệu quả được tăng cường như được thể hiện bởi Medusa-APAR và Batched-APAR. Khác với các phương pháp trước, APAR đề xuất khai thác khả năng tổ chức nội tại của LLM để tự động phát hành các luồng tạo song song, và có thể áp dụng cho nhiều tình huống. Đáng chú ý, SoT (Ning et al., 2023) đề xuất cho phép khả năng song song bằng prompting, tạo ra khung xương của phản hồi và sau đó mở rộng từng điểm song song. Khác với SoT, đòi hỏi một bộ phân loại bên ngoài và tính toán lại KV cache giữa các giai đoạn, APAR yêu cầu tính toán phụ không đáng kể (2 token điều khiển cho một luồng) và không tính toán lại, và do đó không ảnh hưởng đến thông lượng tạo.
+
+## 5 Kết luận
+
+Bài báo này giới thiệu APAR, một phương pháp giải mã mới cho phép LLM tự động cấu trúc quá trình giải mã và tạo động các luồng giải mã song song, mà không ảnh hưởng đến chất lượng tạo. APAR không chỉ tăng cường khả năng song song trong việc tạo, mà còn giảm tính toán và tiêu thụ bộ nhớ KV cache. Các thí nghiệm cho thấy APAR có thể được tích hợp liền mạch với các framework suy luận hiện có, giảm đáng kể độ trễ tạo trên các tình huống khác nhau trong khi cải thiện thông lượng phục vụ trong các tình huống liên quan đến kích thước batch cực đại và mức độ đồng thời.

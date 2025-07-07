@@ -1,0 +1,399 @@
+Bạn Chỉ Cache Một Lần:
+Kiến Trúc Decoder-Decoder cho Mô Hình Ngôn Ngữ
+
+Yutao Sun∗†‡Li Dong∗†Yi Zhu†Shaohan Huang†
+Wenhui Wang†Shuming Ma†Quanlu Zhang†Jianyong Wang‡Furu Wei†⋄
+†Microsoft Research‡Tsinghua University
+https://aka.ms/GeneralAI
+
+Tóm tắt
+Chúng tôi giới thiệu một kiến trúc decoder-decoder, YOCO, cho các mô hình ngôn ngữ lớn,
+chỉ cache các cặp key-value một lần. Nó bao gồm hai thành phần, tức là một cross-
+decoder được xếp chồng lên một self-decoder. Self-decoder mã hóa hiệu quả các
+cache key-value (KV) toàn cục được tái sử dụng bởi cross-decoder thông qua cross-attention.
+Mô hình tổng thể hoạt động như một Transformer chỉ có decoder, mặc dù YOCO
+chỉ cache một lần. Thiết kế này giảm đáng kể nhu cầu bộ nhớ GPU, nhưng vẫn
+giữ được khả năng attention toàn cục. Ngoài ra, luồng tính toán cho phép prefilling
+thoát sớm mà không thay đổi đầu ra cuối cùng, từ đó tăng tốc đáng kể giai đoạn prefill.
+Kết quả thí nghiệm cho thấy YOCO đạt được hiệu suất tốt so với Transformer trong
+các cài đặt khác nhau về việc mở rộng kích thước mô hình và số lượng token huấn luyện.
+Chúng tôi cũng mở rộng YOCO đến độ dài ngữ cảnh 1M với độ chính xác truy xuất needle
+gần như hoàn hảo. Kết quả profiling cho thấy YOCO cải thiện bộ nhớ suy luận, độ trễ prefill,
+và throughput theo bậc độ lớn trên các độ dài ngữ cảnh và kích thước mô hình. Mã nguồn
+có sẵn tại https://aka.ms/YOCO .
+
+1 Giới thiệu
+Transformer chỉ có decoder [VSP+17] đã trở thành kiến trúc de facto cho các mô hình ngôn ngữ.
+Nhiều nỗ lực đã tiếp tục phát triển các kiến trúc phù hợp cho việc mô hình hóa ngôn ngữ. Đã có
+những hướng khám phá chính. Thứ nhất, các mô hình ngôn ngữ chỉ có encoder, như BERT [DCLT19],
+mã hóa chuỗi đầu vào theo cả hai hướng. Thứ hai, các mô hình encoder-decoder, như T5 [RSR+20],
+sử dụng encoder hai chiều để mã hóa đầu vào và decoder một chiều để tạo ra đầu ra. Cả hai
+bố cục trên đều gặp khó khăn với việc tạo sinh tự hồi quy do tính hai chiều. Cụ thể,
+encoder phải mã hóa lại toàn bộ token đầu vào và đầu ra cho bước tạo sinh tiếp theo.
+Mặc dù encoder-decoder chỉ có thể sử dụng decoder để tạo sinh, các token đầu ra không tận dụng
+đầy đủ các tham số của encoder, đặc biệt là cho cuộc hội thoại nhiều lượt. Thứ ba, các mô hình ngôn ngữ
+chỉ có decoder, như GPT [BMR+20], tạo sinh token một cách tự hồi quy. Bằng cách cache các
+vector key/value đã tính toán trước đó, mô hình có thể tái sử dụng chúng cho bước tạo sinh hiện tại.
+Cache key-value (KV) tránh việc mã hóa lại lịch sử cho mỗi token, cải thiện đáng kể tốc độ suy luận.
+Tính năng hấp dẫn này thiết lập mô hình ngôn ngữ chỉ có decoder như tùy chọn tiêu chuẩn.
+
+Tuy nhiên, khi số lượng token phục vụ tăng lên, các cache KV chiếm rất nhiều bộ nhớ GPU,
+khiến việc suy luận của các mô hình ngôn ngữ lớn bị giới hạn bởi bộ nhớ [PDC+22]. Ví dụ
+của một mô hình ngôn ngữ kích thước 65B (được tăng cường với grouped-query attention [ALTdJ+23]
+và lượng tử hóa KV 8-bit), 512K token chiếm khoảng 86GB bộ nhớ GPU, thậm chí còn lớn hơn
+dung lượng của một GPU H100-80GB. Ngoài ra, độ trễ prefilling của đầu vào chuỗi dài
+cực kỳ cao. Ví dụ, sử dụng bốn GPU H100, mô hình ngôn ngữ 7B (được tăng cường với
+Flash-Decoding [DHMS23] và kernel fusion) cần khoảng 110 giây để prefill 450K token, và
+380 giây cho độ dài 1M. Các nút thắt cổ chai trên khiến việc triển khai các mô hình ngôn ngữ
+ngữ cảnh dài trong thực tế trở nên khó khăn.
+
+Trong công trình này, chúng tôi đề xuất một kiến trúc decoder-decoder, YOCO, cho các mô hình ngôn ngữ lớn,
+chỉ cache các cặp KV một lần. Cụ thể, chúng tôi xếp chồng cross-decoder lên self-decoder.
+Với một chuỗi đầu vào, self-decoder sử dụng self-attention hiệu quả để thu được cache KV.
+Sau đó các lớp cross-decoder sử dụng cross-attention để tái sử dụng cache KV được chia sẻ.
+Kiến trúc decoder-decoder về mặt khái niệm tương tự như encoder-decoder, nhưng toàn bộ mô hình
+hoạt động giống như một mô hình chỉ có decoder từ góc nhìn bên ngoài. Vì vậy, nó tự nhiên
+phù hợp với các tác vụ tạo sinh tự hồi quy, như mô hình hóa ngôn ngữ. Thứ nhất, vì YOCO
+chỉ cache một lần², việc tiêu thụ bộ nhớ GPU của cache KV được giảm đáng kể. Thứ hai,
+luồng tính toán của kiến trúc decoder-decoder cho phép prefilling thoát sớm trước khi vào
+self-decoder. Thuộc tính tốt này tăng tốc giai đoạn prefill một cách đáng kể, cải thiện trải nghiệm
+người dùng cho các mô hình ngôn ngữ ngữ cảnh dài. Thứ ba, YOCO cho phép thiết kế hệ thống
+hiệu quả hơn cho việc huấn luyện chuỗi dài phân tán. Ngoài ra, chúng tôi đề xuất gated retention
+cho self-decoder, tăng cường retention [SDH+23] với một cơ chế gating được kiểm soát bởi dữ liệu.
+
+Chúng tôi tiến hành các thí nghiệm rộng rãi để cho thấy YOCO đạt được hiệu suất mô hình hóa ngôn ngữ
+tốt và có nhiều ưu điểm về hiệu quả suy luận. Kết quả thí nghiệm cho thấy YOCO có thể được
+mở rộng với nhiều token huấn luyện hơn, kích thước mô hình lớn hơn, và độ dài ngữ cảnh dài hơn.
+Cụ thể, chúng tôi mở rộng mô hình YOCO 3B đến hàng nghìn tỷ token huấn luyện, đạt được kết quả
+ngang bằng với các mô hình ngôn ngữ Transformer nổi bật, như StableLM [TBMR]. Hơn nữa, các
+đường cong scaling từ 160M đến 13B cho thấy YOCO có khả năng cạnh tranh so với Transformer.
+Chúng tôi cũng mở rộng độ dài ngữ cảnh của YOCO đến 1M token, đạt được độ chính xác truy xuất
+needle gần như hoàn hảo. Trong thử nghiệm multi-needle, YOCO đạt được kết quả cạnh tranh thậm chí
+so với các Transformer lớn hơn.
+
+Ngoài hiệu suất tốt trên các tác vụ khác nhau, kết quả profiling cho thấy YOCO cải thiện dung lượng
+bộ nhớ GPU, độ trễ prefill, throughput, và khả năng phục vụ. Đặc biệt, bộ nhớ của cache KV
+có thể được giảm khoảng 80× cho các mô hình 65B. Thậm chí đối với mô hình 3B, việc tiêu thụ
+bộ nhớ suy luận tổng thể có thể được giảm hai lần cho 32K token và hơn chín lần cho 1M token.
+Giai đoạn prefill được tăng tốc 71.8× cho ngữ cảnh 1M và 2.87× cho đầu vào 32K. Ví dụ,
+cho ngữ cảnh 512K, YOCO giảm độ trễ prefilling của Transformer từ 180 giây xuống dưới sáu giây.
+Kết quả đặt YOCO như một ứng cử viên mạnh mẽ cho kiến trúc mô hình cho các mô hình ngôn ngữ lớn
+tương lai với hỗ trợ chuỗi dài nguyên bản.
+
+2 You Only Cache Once (YOCO)
+Kiến trúc được đề xuất, có tên YOCO, được thiết kế cho mô hình hóa tự hồi quy, như các mô hình ngôn ngữ lớn (LLM).
+Như được thể hiện trong Hình 2, kiến trúc decoder-decoder có hai phần, tức là self-decoder và cross-decoder.
+Cụ thể, YOCO được xếp chồng với L khối, trong đó L/2 lớp đầu tiên là self-decoder trong khi các module
+còn lại là cross-decoder. Với một chuỗi đầu vào x=x1···x|x|, các embedding đầu vào được đóng gói thành
+X0= [x1,···,x|x|]∈R|x|×dmodel, trong đó dmodel là chiều ẩn. Chúng tôi đầu tiên thu được các biểu diễn
+vector ngữ cảnh hóa Xl= Self-Decoder(Xl−1), l∈[1,L/2], trong đó XL/2 được sử dụng để tạo ra
+cache KV K̂,V̂ cho cross-decoder. Sau đó chúng tôi tính toán Xl= Cross-Decoder(Xl−1,K̂,V̂), l∈[L/2+ 1, L]
+để có được các vector đầu ra XL.
+
+Cả self- và cross-decoder đều tuân theo bố cục khối tương tự (tức là attention và feed-forward network
+xen kẽ) như trong Transformer [VSP+17]. Chúng tôi cũng bao gồm pre-RMSNorm [ZS19], SwiGLU [Sha20],
+và grouped-query attention [ALTdJ+23] như những cải tiến. Sự khác biệt giữa hai phần nằm ở các module attention.
+Self-decoder (Phần 2.1) sử dụng self-attention hiệu quả (ví dụ: sliding-window attention). Ngược lại,
+cross-decoder (Phần 2.2) sử dụng global cross-attention để attend đến cache KV được chia sẻ do
+đầu ra của self-decoder tạo ra.
+
+2.1 Self-Decoder
+Self-decoder nhận embedding token X0 làm đầu vào và tính toán biểu diễn vector trung gian M=XL/2:
+
+Yl= ESA(LN(Xl)) +Xl
+Xl+1= SwiGLU(LN(Yl)) +Yl  (1)
+
+trong đó ESA(·) đại diện cho efficient self-attention, SwiGLU(X) = (swish(XWG)⊙XW1)W2, và
+RMSNorm [ZS19] được sử dụng cho LN(·). Causal masking được sử dụng cho efficient self-attention.
+
+Thuộc tính chính của module efficient self-attention là bộ nhớ suy luận O(1), tức là số lượng cache KV
+không đổi. Ví dụ, kích thước cache của sliding-window attention [CGRS19] phụ thuộc vào kích thước
+cửa sổ thay vì độ dài đầu vào. Các lựa chọn thiết kế khác (ví dụ: gated retention) của module
+efficient self-attention được mô tả chi tiết trong Phần 3.
+
+2.2 Cross-Decoder
+Đầu tiên, đầu ra của self-decoder XL/2 tạo ra cache KV toàn cục K̂,V̂ cho cross-decoder:
+
+K̂= LN(XL/2)WK,V̂= LN(XL/2)WV  (2)
+
+trong đó WK, WV∈Rd×d là các trọng số có thể học được. Sau đó, các lớp cross-decoder được xếp chồng
+sau self-decoder để thu được các vector đầu ra cuối cùng XL. Cache KV K̂,V̂ được tái sử dụng bởi
+tất cả L/2 module cross-decoder:
+
+Q̂l= LN(Xl)WlQ
+Yl= Attention(Q̂l,K̂,V̂) +Xl
+Xl+1= SwiGLU(LN(Yl)) +Yl  (3)
+
+trong đó Attention(·) là multi-head attention tiêu chuẩn [VSP+17], và WlQ∈Rd×d là một ma trận
+có thể học được. Causal masking cũng được sử dụng cho cross-attention. Vì cross-attention tương thích
+với group query attention [ALTdJ+23], chúng ta có thể tiết kiệm thêm việc tiêu thụ bộ nhớ của cache KV.
+Sau khi thu được XL, một bộ phân loại softmax thực hiện dự đoán token tiếp theo.
+
+2.3 Ưu điểm Suy luận
+Ngoài kết quả mô hình hóa ngôn ngữ cạnh tranh, YOCO giảm đáng kể chi phí phục vụ và cải thiện hiệu suất suy luận.
+Chúng tôi báo cáo so sánh suy luận chi tiết trong Phần 4.4.
+
+Tiết kiệm Bộ nhớ GPU và Phục vụ Nhiều Token hơn. Bảng 1 so sánh độ phức tạp bộ nhớ giữa Transformer
+và YOCO. Cụ thể, vì cache KV toàn cục được tái sử dụng và efficient self-attention cần cache không đổi,
+số lượng cache là O(N+CL), trong đó N là độ dài đầu vào, C là một hằng số (ví dụ: kích thước cửa sổ trượt),
+và L là số lượng lớp. Đối với chuỗi dài, CL nhỏ hơn nhiều so với N, vì vậy khoảng O(N) cache được yêu cầu,
+tức là bạn chỉ cache một lần.
+
+Ngược lại, decoder Transformer phải lưu trữ N×L key và value trong quá trình suy luận. Vì vậy YOCO
+tiết kiệm khoảng L lần bộ nhớ GPU cho cache so với decoder Transformer. Vì nút thắt cổ chai khả năng
+suy luận trở thành cache KV (Hình 7b), phương pháp của chúng tôi cho phép chúng ta phục vụ nhiều token
+hơn mà không bị hết bộ nhớ GPU. Kích thước batch tăng cũng có lợi cho throughput suy luận.
+
+Giảm Thời gian Prefilling và Cải thiện Throughput. Như được thể hiện trong Hình 3, vì cross-decoder
+tái sử dụng đầu ra của self-decoder, chúng ta có thể thoát sớm trước khi vào cross-decoder trong giai đoạn prefill.
+Thuộc tính hấp dẫn của phụ thuộc tính toán tăng tốc đáng kể tốc độ prefilling.
+
+Thứ nhất, chỉ cần một nửa số lớp cho tính toán forward, tức là ít nhất giảm một nửa độ trễ prefilling.
+Thứ hai, các module attention hiệu quả của self-decoder thường nhanh. Ví dụ với độ dài ngữ cảnh 512K,
+chúng ta có thể giảm độ trễ prefilling từ 180 giây (Transformer với suy luận tối ưu, như Flash-Decoding
+và kernel fusion) xuống dưới 6 giây (Hình 9). Thậm chí với độ dài 32K, YOCO có khoảng ba lần tăng tốc
+về thời gian prefilling. Bảng 2 so sánh độ phức tạp thời gian prefilling của các module attention
+giữa Transformer và YOCO.
+
+3 Lựa chọn Thiết kế của Self-Decoder
+Chúng ta có thể chọn các phương pháp efficient self-attention khác nhau cho self-decoder. Miễn là module
+chỉ yêu cầu bộ nhớ suy luận không đổi, độ phức tạp bộ nhớ cache của self-decoder phụ thuộc vào số lượng lớp.
+Hơn nữa, một lựa chọn module tốt cải thiện cả chi phí huấn luyện và triển khai. Trong công trình này,
+chúng tôi sử dụng gated retention (Phần 3.1) hoặc sliding-window attention (Phần 3.2).
+
+3.1 Gated Retention
+Gated retention (gRet, còn gọi là gRetNet hoặc RetNet-3) tăng cường retention [SDH+23] với một cơ chế
+gating phụ thuộc dữ liệu, đạt được song song huấn luyện, hiệu suất tốt, và chi phí suy luận thấp đồng thời
+cho mô hình hóa chuỗi. Chúng tôi sử dụng gRet làm module efficient self-attention mặc định trong các thí nghiệm.
+Phương pháp này thống nhất các paradigm tính toán song song, hồi quy, và chunkwise hồi quy. Ba biểu diễn
+này tương đương và có thể thu được cùng kết quả tính toán. Quá trình huấn luyện thường sử dụng paradigm
+song song hoặc chunkwise hồi quy, trong khi giai đoạn suy luận có thể sử dụng paradigm hồi quy cho bộ nhớ KV
+không đổi. Chúng tôi mô tả ba biểu diễn như sau:
+
+Biểu diễn Song song Gated retention được định nghĩa là:
+Q= (XWQ)⊙Θ, K = (XWK)⊙Θ, V =XWV,Θn=einθ
+γ= sigmoid(XWγ)1/τ, D nm=∏i=m+1^n γi, n≥m; 0, n < m
+gRet(X) = (QK⊺⊙D)V  (4)
+
+trong đó WQ, WK, WV∈Rd×d và Wγ∈Rd×1 là các trọng số có thể học được, và số hạng nhiệt độ τ
+khuyến khích γ về 1 để ghi nhớ tốt hơn [YWS+23]. Sự suy giảm được kiểm soát bởi dữ liệu là theo head [Kat23]
+thay vì theo phần tử để tính toán có thể tận dụng đầy đủ tensor core của NVIDIA. Tham khảo [SDH+23]
+để biết thêm chi tiết về các thiết kế khác.
+
+Biểu diễn Hồi quy Tương đương với Phương trình (4), đầu ra của gated retention có thể được tính toán
+một cách hồi quy. Đối với bước thời gian thứ n, đầu ra được thu được thông qua:
+
+Sn=γnSn−1+K⊺nVn
+gRet(Xn) =QnSn, n = 1,···,|x|  (5)
+
+trong đó Q, K, V, γ giống như trong Phương trình (4). Trong quá trình suy luận tự hồi quy, self-decoder
+duy trì Sn như trạng thái trung gian cho một quá trình tạo sinh hiệu quả.
+
+Biểu diễn Chunkwise Hồi quy Biểu diễn chunk-wise là một công thức thống nhất của biểu diễn hồi quy
+và song song. Với kích thước chunk B, các đầu ra được tính toán chunk theo chunk. Tính toán được chia
+thành các phần inner-chunk và cross-chunk. Ký hiệu [i] là chunk thứ i, tức là x[i]=x(i−1)B+1,···, xiB,
+chúng ta tính toán chunk thứ i như:
+
+β(i−1)B+j=∏k=(i−1)B+1^(i−1)B+j γk, D[i](j, k) =β(i−1)B+k/β(i−1)B+j nếu j≤k khác 0
+Ri=K⊺[i](V[i]⊙βiB/β[i]) +βiBRi−1, β[i](j, k) =β(i−1)B+j
+gRet(X) = (Q[i]K⊺[i]⊙D[i])V[i] + (Q[i]Ri−1)⊙β[i]  (6)
+           Inner-Chunk                 Cross-Chunk
+
+trong đó Ri là trạng thái trung gian của chunk thứ i, và β tóm tắt sự suy giảm được kiểm soát bởi dữ liệu γ.
+Bằng chứng trong Phụ lục B cho thấy sự tương đương giữa các paradigm tính toán. Paradigm chunkwise
+kết hợp điều tốt nhất của song song và hồi quy, tức là tiết kiệm FLOP so với tính toán hoàn toàn song song
+và giảm số lần lặp so với tính toán hồi quy. Trong giai đoạn huấn luyện và prefill, biểu diễn chunk-wise
+tăng throughput và giảm tiêu thụ bộ nhớ GPU.
+
+Multi-Head Gated Retention Tương tự như multi-head attention [VSP+17] và multi-scale retention [SDH+23],
+chúng tôi áp dụng gated retention cho mỗi head và kết hợp các đầu ra lại với nhau:
+
+headi= gRet(X)
+Y= GroupNormh(Concat(head1,···,headn))
+MHGR(X) = (swish(XWG)⊙Y)WO  (7)
+
+trong đó WG, WO∈Rd×d là các ma trận có thể học được, và GroupNorm [WH18] chuẩn hóa mỗi head [WMH+23].
+Chúng tôi cũng áp dụng swish gate để tăng tính phi tuyến [SDH+23].
+
+3.2 Sliding-Window Attention
+Sliding-window attention [CGRS19] hạn chế phạm vi attention vào một kích thước cửa sổ cố định C.
+Ngược lại, decoder Transformer vanilla attend đến tất cả các token trước đó. Trong quá trình suy luận,
+độ phức tạp bộ nhớ cache KV có thể được giảm từ O(N) xuống O(C), tức là việc sử dụng bộ nhớ là không đổi
+thay vì tăng theo độ dài chuỗi. Tương tự như multi-head self-attention [VSP+17], chúng tôi tính toán
+đầu ra của sliding-window attention thông qua:
+
+Q=XWQ, K =XWK, V =XWV
+headi= softmax(Q[i]K⊺[i]+B)V
+Bij=0, i −C < j ≤i; − ∞, khác
+Y= Concat(head1,···,headh)
+SWA(X) =Y WO  (8)
+
+trong đó WQ, WK, WV, WO∈Rd×d là các ma trận có thể học được, và mặt nạ causal cửa sổ B kiểm soát
+mỗi query chỉ attend đến các key trước đó có khoảng cách nhỏ hơn C. Pre-normalization và residual connection
+cũng được áp dụng cho module.
+
+4 Thí nghiệm
+Chúng tôi đánh giá YOCO cho các mô hình ngôn ngữ lớn từ các góc độ sau. Thứ nhất, chúng tôi tuân theo
+cài đặt của StableLM-3B-4E1T [TBMR] để mở rộng token huấn luyện (Phần 4.1). Thứ hai, chúng tôi trình bày
+các đường cong scaling của các kiến trúc được đề xuất (Phần 4.2). Thứ ba, chúng tôi mở rộng mô hình YOCO
+đến độ dài ngữ cảnh 1M và đánh giá khả năng mô hình hóa chuỗi dài của nó (Phần 4.3). Thứ tư, chúng tôi
+phân tích các ưu điểm triển khai, bao gồm dung lượng bộ nhớ GPU, khả năng phục vụ, thời gian prefilling,
+và throughput (Phần 4.4). Kết quả thí nghiệm cho thấy YOCO đạt được hiệu suất cạnh tranh trên các
+chỉ số đánh giá khác nhau. Quan trọng hơn, phương pháp được đề xuất giảm đáng kể chi phí suy luận.
+
+4.1 Đánh giá Mô hình hóa Ngôn ngữ
+Chúng tôi huấn luyện các mô hình ngôn ngữ YOCO kích thước 3B bằng cách mở rộng số lượng token huấn luyện.
+Sau đó chúng tôi so sánh các checkpoint với các mô hình ngôn ngữ dựa trên Transformer mạnh.
+
+Thiết lập Chúng tôi sử dụng công thức huấn luyện tương tự như trong StableLM-3B-4E1T [TBMR]. Chúng tôi
+điều chỉnh chiều head thành 128 thay vì 80 như trong StableLM để hỗ trợ kernel tốt hơn. Để giữ kích thước
+mô hình không đổi, chúng tôi đặt kích thước ẩn thành 3072 và số lượng lớp thành 26. Grouped-query attention [ALTdJ+23]
+được sử dụng, trong đó số lượng query head là 24, và số lượng key-value head là 8. Chúng tôi huấn luyện YOCO
+với gated retention (Phần 3.1). Số lượng tham số non-embedding là 2.8B. So sánh, StableLM-3B-4E1T là 2.7B
+và OpenLLaMA-v2-3B [GL23] là 3.2B. Độ dài chuỗi huấn luyện là 4096. Kích thước batch là 4M token.
+Chúng tôi sử dụng optimizer AdamW [LH19] với β= 0.9,0.95. Tốc độ học tối đa là 3.2e-4 với 1000 bước warmup
+và giảm tuyến tính xuống 1.28e-5. Lịch trình tổng thể được đặt thành 5T token. Chúng tôi huấn luyện mô hình
+với 400k bước (tức là 1.6T token) với ngân sách tài nguyên. Corpus huấn luyện được tuyển chọn tương tự [TBMR].
+Chúng tôi sử dụng tiktoken-cl100k_base làm tokenizer. Các siêu tham số chi tiết được mô tả trong Phụ lục C.
+
+Kết quả Bảng 3 so sánh các checkpoint YOCO với OpenLLaMA-v2-3B [GL23], StableLM-base-alpha-3B-v2 [Tow],
+và StableLM-3B-4E1T [TBMR]. Chúng tôi sử dụng LM Eval Harness [GTA+23] để đánh giá hiệu suất zero-shot
+trên các tác vụ downstream khác nhau. OpenLLaMA-v2-3B và StableLM-base-alpha-3B-v2 được huấn luyện với 1T token.
+Các số trung gian của StableLM-3B-4E1T được lấy từ báo cáo kỹ thuật của nó [TBMR]. Kết quả thí nghiệm
+trên các tác vụ cuối cho thấy YOCO đạt được kết quả so sánh với các mô hình ngôn ngữ Transformer được
+điều chỉnh tốt trước đó. Cả checkpoint được huấn luyện với 1T token và 1.6T token đều đạt được xu hướng
+nhất quán. Hơn nữa, kết quả cho thấy YOCO có thể mở rộng về số lượng token huấn luyện.
+
+4.2 Khả năng Mở rộng So với Transformer
+Chúng tôi so sánh các đường cong scaling giữa Llama Transformer [VSP+17,TLI+23], YOCO với gated retention
+(YOCOgRet; Phần 3.1), và YOCO với sliding-window attention (YOCOSWA; Phần 3.2). Chúng tôi huấn luyện
+các mô hình ngôn ngữ với các kích thước khác nhau (tức là 160M, 400M, 830M, 1.4B, 2.7B, 6.8B, và 13B)
+sử dụng cùng dữ liệu và cài đặt huấn luyện. Loss xác thực được sử dụng làm chỉ số đánh giá. Luật scaling [KMH+20]
+được cho là có thể ngoại suy hiệu suất kích thước lớn hơn.
+
+Thiết lập Chúng tôi tăng cường kiến trúc Transformer với các cải tiến của Llama [TLI+23], như RMSNorm [ZS19],
+SwiGLU [Sha20], và loại bỏ bias. Kích thước cửa sổ trượt của YOCOSWA là 1,024. Chúng tôi căn chỉnh số lượng
+tham số bằng cách điều chỉnh chiều trung gian FFN. Kích thước batch huấn luyện là 0.25M token với độ dài
+chuỗi 2k. Chúng tôi huấn luyện các mô hình với 40k bước, tức là 10B token. Trong thực tế, chúng tôi thấy rằng
+cài đặt này hiệu quả cho sự hội tụ loss, và các luật scaling có thể được fit tốt. Nhiều siêu tham số được
+mô tả chi tiết trong Phụ lục D.
+
+Kết quả Hình 4 báo cáo validation loss với các số lượng tham số khác nhau. Chúng tôi cũng fit các đường cong
+scaling như trong [KMH+20]. YOCO đạt được hiệu suất so sánh từ 160M đến 13B so với kiến trúc transformer
+được tối ưu hóa Llama. Các phát hiện cho thấy YOCO scaling hiệu quả về kích thước mô hình. Hơn nữa,
+YOCOgRet vượt trội so với Transformer và YOCOSWA. Những lợi ích đến từ kiến trúc hybrid của attention
+và retention, có bias quy nạp có xu hướng bổ sung cho nhau. Chúng tôi quan sát thấy những lợi ích tương tự
+bằng cách xen kẽ các module attention và retention (1:3). Các kiến trúc hybrid gần đây [LLB+24] cũng xác nhận
+những phát hiện tương tự.
+
+4.3 Đánh giá Ngữ cảnh Dài
+Chúng tôi mở rộng độ dài ngữ cảnh của YOCO-3B (Phần 4.1) đến 1M token. Chúng tôi đánh giá các mô hình
+ngữ cảnh dài trên các tác vụ truy xuất needle và mô hình hóa ngôn ngữ.
+
+Chúng tôi tiếp tục huấn luyện mô hình với độ dài dài hơn một cách tiến bộ. Lịch trình độ dài là 64K, 256K,
+và 1M token. Kích thước batch được giữ nguyên như trước. Tốc độ học và RoPE [SLP+21] θ được đặt như
+trong Bảng 7. Dữ liệu huấn luyện được up-sample theo độ dài chuỗi [FPN+24]. Để so sánh công bằng,
+chúng tôi không sử dụng dữ liệu điều chỉnh hướng dẫn dài. Thêm chi tiết huấn luyện được mô tả trong Phụ lục E.
+Một thuật toán song song chunk cho YOCO được đề xuất trong Phụ lục A, giảm overhead giao tiếp và
+phân mảnh bộ nhớ GPU trong các thí nghiệm của chúng tôi với độ dài 1M.
+
+Needle In A Haystack Thử nghiệm áp lực đánh giá liệu các mô hình có thể truy xuất "needle" từ một tài liệu dài [Kam23].
+Chúng tôi tuân theo cài đặt đánh giá của Gemini 1.5 [RST+24] và LWM [LYZA24]. Các needle được xây dựng
+như một thành phố với một số ma thuật. Chúng tôi chạy 10 lần ở cùng độ sâu và độ dài. Độ chính xác trung bình
+được báo cáo. Hình 5 cho thấy YOCO-3B-1M vượt qua thử nghiệm Needle-In-A-Haystack với độ chính xác
+gần như hoàn hảo. Kết quả cho thấy YOCO có khả năng mô hình hóa ngữ cảnh dài mạnh.
+
+Multi-Needle Retrieval Ngoài truy xuất single-needle ở trên, chúng tôi tiến hành đánh giá multi-needle.
+Chúng tôi so sánh YOCO-3B-1M với các mô hình ngôn ngữ ngữ cảnh dài trước đó, bao gồm MiniCPM-128K [HTH+24],
+ChatGLM3-128K [ZLD+22], YaRN-Mistral-128K [PQFS23], và LWM-1M-text [LYZA24]. Đánh giá được tiến hành
+trong độ dài chuỗi 128K, vì hầu hết các mô hình trước đó được điều chỉnh với độ dài này.
+
+Bảng 4 báo cáo độ chính xác với N needle. Trong số các mô hình này, LWM-1M-text và YOCO-3B-1M được
+huấn luyện với độ dài ngữ cảnh 1M, trong khi những mô hình khác ở độ dài 128K. Mặc dù LWM-1M-text
+tiếp tục huấn luyện của Llama-2-7B, YOCO-3B-1M vẫn có thể đạt được hiệu suất so sánh với một nửa kích thước mô hình.
+Hơn nữa, YaRN-Mistral-128K [PQFS23] kích thước 7B được thu được bằng nội suy vị trí tụt lại phía sau
+các mô hình khác. So với MiniCPM-128K và ChatGLM3-128K, YOCO-3B-1M cũng vượt trội so với các mô hình
+ngôn ngữ được huấn luyện tốt này.
+
+Perplexity trên Chuỗi Dài Hình 6 cho thấy cumulative average negative log-likelihood (NLL) như một hàm
+của độ dài ngữ cảnh. Chúng tôi đánh giá cả dữ liệu sách và mã cấp repository. Chúng tôi tuân theo cài đặt
+của [RST+24] và lọc dữ liệu xác thực dài hơn 1M token. NLL giảm nhất quán với độ dài chuỗi dài hơn.
+Kết quả cho thấy YOCO có thể sử dụng hiệu quả phụ thuộc khoảng cách xa cho mô hình hóa ngôn ngữ.
+Chúng tôi cũng quan sát thấy các đường cong NLL-độ dài có xu hướng phù hợp với luật lũy thừa, trong đó
+các khoảng cách bị ảnh hưởng bởi nhiễu trong các ví dụ xác thực.
+
+4.4 Ưu điểm Suy luận
+Chúng tôi phân tích hiệu quả suy luận từ các góc độ khác nhau, như dung lượng bộ nhớ GPU, độ trễ prefilling,
+throughput, và khả năng phục vụ. Chúng tôi chứng minh rằng YOCO giảm chi phí triển khai theo bậc độ lớn,
+đặc biệt là cho suy luận chuỗi dài. Quan trọng hơn, trải nghiệm người dùng (như độ trễ) được cải thiện
+trong khi duy trì hiệu suất tốt và giảm chi phí.
+
+Chúng tôi so sánh YOCOgRet với Transformer. Cấu hình mô hình mặc định tuân theo Phần 4.1. Lưu ý rằng
+Transformer sử dụng grouped-query attention [ALTdJ+23], Flash-Decoding [DHMS23], và kernel fusion
+để so sánh công bằng. Như được mô tả trong Phần 3.1, gated retention sử dụng biểu diễn chunk-recurrent
+trong giai đoạn prefill, và biểu diễn recurrent trong giai đoạn generation. Kích thước chunk được đặt thành 256.
+Chúng tôi implement một kernel Triton [TC19] cho gated retention. Độ dài chuỗi đánh giá từ 32K đến 1M.
+1,024 token cuối cùng được cho là được tạo sinh, trong khi các token trước đó là ngữ cảnh đầu vào đã cho.
+Các thí nghiệm được tiến hành với card GPU H100-80GB.
+
+Bộ nhớ GPU Việc tiêu thụ bộ nhớ suy luận được tạo thành từ ba phần, cụ thể là trọng số mô hình, activation
+trung gian, và cache KV. Hình 7b trình bày kết quả profiling bộ nhớ breakdown. Cùng với sự tăng lên của
+độ dài ngữ cảnh, nút thắt cổ chai bộ nhớ chính trở thành cache KV, trong khi trọng số mô hình tiêu thụ
+bộ nhớ không đổi. Kết quả cho thấy YOCOgRet giảm thiểu chi phí activation và dung lượng bộ nhớ cache KV.
+
+Như được thể hiện trong Hình 7a, chi phí bộ nhớ được giảm đáng kể khi sử dụng YOCO. Hơn nữa, việc tiêu thụ
+bộ nhớ của YOCO tăng chậm theo độ dài chuỗi. Ví dụ với độ dài 1M, việc sử dụng bộ nhớ suy luận tổng thể
+chỉ là 12.4GB, trong khi Transformer chiếm 9.4× bộ nhớ GPU. YOCO làm cho việc triển khai mô hình hóa
+chuỗi dài trên GPU cấp khách hàng trở nên khả thi. Thậm chí với độ dài chuỗi 32K, YOCO yêu cầu khoảng
+2× ít bộ nhớ hơn Transformer. Mặc dù chúng tôi so sánh các mô hình kích thước 3B ở đây, tỷ lệ giảm trở nên
+lớn hơn khi số lượng lớp tăng.
+
+Hình 8 báo cáo việc tiêu thụ bộ nhớ GPU của cache KV cho mỗi token. Vì YOCO chỉ cache một lớp cặp
+key-value toàn cục, nó cần khoảng L lần ít bộ nhớ hơn so với Transformer. Ví dụ, YOCO có thể phục vụ
+128K token với 1GB bộ nhớ GPU, trong khi Transformer với GQA [ALTdJ+23] chỉ có thể hỗ trợ 1.6K token
+ở kích thước mô hình 65B.
+
+Độ trễ Prefilling Trong giai đoạn prefill, mô hình mã hóa token đầu vào song song. Như được thể hiện trong
+Hình 9, độ trễ prefilling là một điểm đau của trải nghiệm người dùng cho các mô hình ngữ cảnh dài. Đối với
+chuỗi đầu vào độ dài 512K và 1M, Transformer cần khoảng 180 giây và 300 giây, tương ứng. Độ phức tạp
+tính toán của Transformer là O(N2), yêu cầu một số lượng lớn FLOP cho ngữ cảnh dài. Ngược lại, thời gian
+prefilling của YOCO là O(N), tăng tuyến tính (Phần 2.3) theo độ dài chuỗi.
+
+Hình 9 cho thấy YOCO giảm thời gian prefilling của Transformer từ 180 giây xuống dưới 6 giây cho ngữ cảnh 512K.
+Như được mô tả trong Phần 2.3, giai đoạn prefill có thể thoát sớm trước khi vào cross-decoder. Vì vậy,
+có ít nhất hai lần tăng tốc độ trễ prefilling thậm chí cho ngữ cảnh ngắn. Ví dụ, YOCO nhanh hơn 2.87×
+so với Transformer cho độ dài 32K.
+
+Throughput Throughput cho biết có bao nhiêu token mô hình có thể xử lý mỗi giây, bao gồm cả thời gian
+pre-filling và generation. Hình 10 cho thấy YOCO đạt được throughput cao hơn trên các độ dài ngữ cảnh
+so với Transformer. Ví dụ với truy vấn 512K, throughput của Transformer là 4.5 token/s trong khi YOCO
+đạt 43.1 token/s, tức là đạt được 9.6× tăng tốc. Throughput được cải thiện vì các lý do sau. Thứ nhất,
+YOCO giảm thời gian cần thiết cho prefilling như đã chứng minh trước đó. Thứ hai, vì việc tiêu thụ bộ nhớ
+được giảm, chúng ta có thể sử dụng kích thước batch lớn hơn cho suy luận, điều này cũng góp phần cải thiện throughput.
+
+5 Kết luận
+Trong công trình này, chúng tôi đề xuất một kiến trúc decoder-decoder (YOCO) cho mô hình hóa ngôn ngữ lớn.
+YOCO đạt được hiệu quả suy luận tốt hơn đáng kể và hiệu suất cạnh tranh so với Transformer. Kết quả thí nghiệm
+cho thấy YOCO đạt được kết quả tốt cho các mô hình ngôn ngữ lớn trong các cài đặt khác nhau, tức là mở rộng
+số lượng token huấn luyện, mở rộng kích thước mô hình, và mở rộng độ dài ngữ cảnh đến 1M token. Kết quả
+profiling cũng cho thấy YOCO cải thiện hiệu quả suy luận theo bậc độ lớn, đặc biệt là cho mô hình hóa chuỗi dài.
+
+Công trình có thể được phát triển từ các góc độ sau:
+•YOCO + BitNet + Groq. Groq đạt được throughput rất cao bằng cách đặt tất cả mọi thứ trong SRAM.
+Tuy nhiên, nút thắt cổ chai dung lượng bộ nhớ hạn chế kích thước mô hình và số lượng token đầu vào.
+Hiện tại, hàng trăm chip được kết nối để host chỉ một mô hình. Như một giải pháp, YOCO giảm bộ nhớ cache KV,
+và BitNet giảm bộ nhớ trọng số mô hình. Chi phí triển khai LLM được kỳ vọng sẽ được giảm theo bậc độ lớn
+sử dụng kết hợp trên.
+
+•YOCO cho Mô hình Ngôn ngữ Lớn Đa phương thức. Bố cục YOCO là tổng quát cho việc sử dụng nhiều self-decoder.
+Các lớp cross-attention là tự nhiên cho fusion đa phương thức [BWD+22, WBD+22]. Phụ thuộc causal của
+self-decoder cũng phù hợp hoàn hảo trong streaming video. Các mô hình ngôn ngữ lớn đa phương thức async
+có thể tránh các luồng dữ liệu khác nhau chặn lẫn nhau, điều này quan trọng cho các ứng dụng thời gian thực,
+như robotics.
+
+•Cơ chế Tối ưu cho Module Cache KV. Hình 2 làm nổi bật rõ ràng cache KV, mở ra các cơ hội mới để phát triển
+các cơ chế bộ nhớ nguyên bản. Thứ nhất, chúng ta có thể tích hợp một cơ chế nén cache để có được bộ nhớ
+compact hơn. Thứ hai, chúng ta có thể xây dựng một chỉ mục [WDC+23] cho truy xuất key-value hiệu quả.
+Vì YOCO tái sử dụng cache, nó cho phép chúng ta duy trì chỉ một chỉ mục thay vì tạo một chỉ mục cho mỗi lớp.
+Thứ ba, mô hình hóa tách biệt hỗ trợ pre-caching ngữ cảnh, có thể hữu ích cho RAG nguyên bản và
+các công cụ tìm kiếm LLM-native.

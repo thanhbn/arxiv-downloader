@@ -1,0 +1,144 @@
+# Cắt tỉa Mạng Nơ-ron Tự động bảo tồn hiệu quả Độ chính xác của Mô hình
+
+Thibault Castells và Seul-Ki Yeom*
+Nota AI GmbH
+Friedrichstrasse 200, 10117 Berlin, Germany
+thibault@nota.ai, skyeom@nota.ai
+
+## Tóm tắt
+
+Hiệu suất của mạng nơ-ron đã được cải thiện đáng kể trong vài năm qua, với cái giá là số lượng phép toán dấu phẩy động (FLOPs) ngày càng tăng. Khi tài nguyên tính toán bị hạn chế, nhiều FLOPs hơn trở thành một vấn đề. Như một nỗ lực để giải quyết vấn đề này, cắt tỉa bộ lọc là một giải pháp phổ biến, nhưng hầu hết các phương pháp cắt tỉa hiện có không bảo tồn độ chính xác mô hình một cách hiệu quả và do đó đòi hỏi một số lượng lớn các epoch tinh chỉnh. Trong bài báo này, chúng tôi đề xuất một phương pháp cắt tỉa tự động học được nơ-ron nào cần bảo tồn để duy trì độ chính xác mô hình trong khi giảm FLOPs xuống một mục tiêu được định trước. Để hoàn thành nhiệm vụ này, chúng tôi giới thiệu một nút thắt có thể huấn luyện chỉ yêu cầu 25.6% (CIFAR-10) hoặc 15.0% (ILSVRC2012) của tập dữ liệu trong một epoch duy nhất để học được bộ lọc nào cần cắt tỉa. Các thí nghiệm trên nhiều kiến trúc và tập dữ liệu khác nhau cho thấy phương pháp đề xuất không chỉ có thể bảo tồn độ chính xác sau khi cắt tỉa mà còn vượt trội hơn các phương pháp hiện có sau khi tinh chỉnh. Với việc giảm 52.00% FLOPs trên ResNet-50, chúng tôi đạt được độ chính xác Top-1 là 47.51% sau khi cắt tỉa và độ chính xác tốt nhất hiện tại (SOTA) là 76.63% sau khi tinh chỉnh trên ILSVRC2012. Mã nguồn có sẵn tại https://github.com/nota-github/autobot AAAI23.
+
+## 1 Giới thiệu
+
+Trong thập kỷ qua, độ phổ biến của Mạng Nơ-ron Sâu (DNNs) đã tăng theo cấp số nhân khi kết quả được cải thiện, và hiện tại chúng được sử dụng trong nhiều ứng dụng khác nhau như phân loại, phát hiện, v.v. Tuy nhiên, những cải tiến này thường phải đối mặt với việc tăng độ phức tạp của mô hình, dẫn đến nhu cầu về nhiều tài nguyên tính toán hơn. Nhiều nỗ lực để làm cho các mô hình nặng trở nên nhỏ gọn hơn đã được đề xuất, dựa trên các phương pháp nén khác nhau như chưng cất tri thức (Polino, Pascanu, và Alistarh 2018; Guo et al. 2020), cắt tỉa (Li et al. 2017; Lin et al. 2020a,b; Yeom et al. 2021), lượng tử hóa (Qu et al. 2020), tìm kiếm kiến trúc mạng nơ-ron (NAS) (Yang et al. 2021), v.v. Cắt tỉa mạng, bao gồm việc loại bỏ các kết nối dư thừa và không quan trọng, đã nhận được sự quan tâm lớn từ ngành công nghiệp vì nó là một giải pháp đơn giản và hiệu quả. Trong khi thách thức chính của phương pháp này là tìm tiêu chí cắt tỉa tốt, một khó khăn khác là xác định tỷ lệ phần trăm của mỗi lớp nên được cắt tỉa. Vì tìm kiếm thủ công là một quá trình tốn thời gian đòi hỏi chuyên môn của con người, các nghiên cứu gần đây đã đề xuất các phương pháp tự động cắt tỉa các bộ lọc dư thừa khắp mạng để đáp ứng một ràng buộc nhất định như số lượng tham số, FLOPs, hoặc nền tảng phần cứng (Liu et al. 2017; You et al. 2019; Li et al. 2021; Molchanov et al. 2019; Lin et al. 2020b; Yeom et al. 2021; Yu et al. 2018; Dai et al. 2018; Zheng et al. 2021). Để tự động tìm kiếm các kiến trúc được cắt tỉa tốt nhất, các phương pháp này dựa vào nhiều chỉ số khác nhau như khai triển Taylor bậc 2 (Molchanov et al. 2019), điểm số lan truyền liên quan theo lớp (Yeom et al. 2021), v.v. Để biết thêm chi tiết, vui lòng xem Phần 2. Mặc dù các chiến lược này đã được cải thiện theo thời gian, chúng thường không nhắm mục tiêu rõ ràng để bảo tồn độ chính xác mô hình, hoặc chúng thực hiện điều đó theo cách tốn kém về tính toán.
+
+Trong bài báo này, chúng tôi đưa ra giả thuyết rằng, với cùng một mức nén, kiến trúc được cắt tỉa có thể dẫn đến độ chính xác tốt nhất sau khi tinh chỉnh là kiến trúc bảo tồn độ chính xác một cách hiệu quả nhất trong quá trình cắt tỉa (xem Phần 4.5). Do đó, chúng tôi giới thiệu một phương pháp cắt tỉa tự động, được gọi là AutoBot, sử dụng các nút thắt có thể huấn luyện để bảo tồn độ chính xác mô hình một cách hiệu quả trong khi giảm thiểu FLOPs, như được thể hiện trong Hình 1. Các nút thắt này chỉ yêu cầu một epoch huấn luyện duy nhất với 25.6% (CIFAR-10) hoặc 15.0% (ILSVRC2012) của tập dữ liệu để học một cách hiệu quả bộ lọc nào cần cắt tỉa. Chúng tôi so sánh AutoBot với nhiều phương pháp cắt tỉa khác nhau, và cho thấy sự cải thiện đáng kể của các mô hình được cắt tỉa trước khi tinh chỉnh, dẫn đến độ chính xác SOTA sau khi tinh chỉnh. Chúng tôi cũng thực hiện một bài kiểm tra triển khai thực tế trên nhiều thiết bị biên để chứng minh sự cải thiện tốc độ của các mô hình được cắt tỉa.
+
+Tóm lại, những đóng góp của chúng tôi như sau:
+• Chúng tôi giới thiệu AutoBot, một phương pháp cắt tỉa tự động mới sử dụng nút thắt có thể huấn luyện để học một cách hiệu quả bộ lọc nào cần cắt tỉa nhằm tối đa hóa độ chính xác trong khi giảm thiểu FLOPs của mô hình. Phương pháp này có thể được triển khai dễ dàng và trực quan bất kể tập dữ liệu hoặc kiến trúc mô hình.
+• Chúng tôi chứng minh rằng việc bảo tồn độ chính xác trong quá trình cắt tỉa có tác động mạnh mẽ đến độ chính xác của mô hình được tinh chỉnh (Phần 4.5).
+• Các thí nghiệm mở rộng cho thấy AutoBot bảo tồn độ chính xác một cách hiệu quả sau khi cắt tỉa (trước khi tinh chỉnh), và vượt trội hơn các phương pháp cắt tỉa trước đây một khi được tinh chỉnh.
+
+## 2 Các Nghiên cứu Liên quan
+
+Trong phần này, chúng tôi tóm tắt một số nghiên cứu liên quan so với phương pháp đề xuất của chúng tôi. Theo truyền thống, cắt tỉa dựa trên độ lớn nhằm khai thác các đặc tính vốn có của mạng để xác định tiêu chí cắt tỉa, mà không sửa đổi các tham số mạng. Các tiêu chí phổ biến bao gồm lp-norm (Li et al. 2017; Lin et al. 2021; Li et al. 2020), khai triển Taylor (Molchanov et al. 2019), Gradient (Liu và Wu 2019), Phân tích Giá trị Đơn (Lin et al. 2020a), độ thưa của bản đồ đặc trưng đầu ra (Hu et al. 2016), trung vị hình học (He et al. 2019), v.v. Gần đây, Tang et al. (2020) đã đề xuất một phương pháp cắt tỉa kiểm soát khoa học, được gọi là SCOP, giới thiệu các đặc trưng knockoff như nhóm kiểm soát. Ngược lại, cắt tỉa thích ứng cần phải huấn luyện lại các mạng từ đầu với mất mát huấn luyện được sửa đổi hoặc kiến trúc thêm các ràng buộc mới. Một số nghiên cứu (Liu et al. 2017; Luo, Wu, và Lin 2017; Ye et al. 2018) thêm các tham số có thể huấn luyện vào mỗi kênh bản đồ đặc trưng để có được độ thưa kênh dựa trên dữ liệu, cho phép mô hình tự động xác định các bộ lọc dư thừa. Luo, Wu, và Lin (2017) giới thiệu Thinet chính thức thiết lập cắt tỉa bộ lọc như một bài toán tối ưu hóa và cắt tỉa bộ lọc dựa trên thông tin thống kê được tính toán từ lớp tiếp theo của nó, không phải lớp hiện tại. Lin et al. (2019) đề xuất một phương pháp cắt tỉa có cấu trúc cắt tỉa cùng lúc bộ lọc và các cấu trúc khác bằng cách giới thiệu mặt nạ mềm với điều chuẩn độ thưa. Tuy nhiên, việc huấn luyện lại mô hình từ đầu là một quá trình tốn thời gian và tài nguyên không cải thiện đáng kể độ chính xác so với cắt tỉa dựa trên độ lớn. Mặc dù hai chiến lược cắt tỉa này trực quan, tỷ lệ cắt tỉa phải được xác định thủ công từng lớp một, đây là một quá trình tốn thời gian đòi hỏi chuyên môn của con người. Thay vào đó, trong bài báo này, chúng tôi tập trung vào cắt tỉa tự động.
+
+Như tên gọi đã gợi ý, cắt tỉa mạng tự động loại bỏ các bộ lọc dư thừa khắp mạng một cách tự động dưới bất kỳ ràng buộc nào như số lượng tham số, FLOPs, hoặc nền tảng phần cứng. Về khía cạnh này, một số lượng lớn các phương pháp cắt tỉa tự động đã được đề xuất. Liu et al. (2017) tối ưu hóa hệ số tỷ lệ γ trong lớp batch-norm như một chỉ báo lựa chọn kênh để quyết định kênh nào không quan trọng. You et al. (2019) đề xuất một phương pháp cắt tỉa tự động, được gọi là Gate Decorator, biến đổi các mô-đun CNN bằng cách nhân đầu ra của chúng với các hệ số tỷ lệ theo kênh và áp dụng một khung cắt tỉa lặp được gọi là Tick-Tock để tăng độ chính xác cắt tỉa. Li et al. (2021) đề xuất một phương pháp nén hợp tác kết hợp lẫn nhau giữa cắt tỉa kênh và phân tích tensor. Molchanov et al. (2019) ước tính đóng góp của một bộ lọc vào mất mát cuối cùng bằng cách sử dụng khai triển Taylor bậc 2 và lặp lại loại bỏ những bộ lọc có điểm số nhỏ hơn. Lin et al. (2020b) đề xuất ABCPruner để tìm cấu trúc được cắt tỉa tối ưu một cách tự động bằng cách cập nhật tập cấu trúc và tính toán lại độ phù hợp. Các phương pháp lan truyền ngược (Yeom et al. 2021; Yu et al. 2018) tính toán điểm số liên quan của mỗi bộ lọc bằng cách theo dõi luồng thông tin từ đầu ra mô hình. Dai et al. (2018) và Zheng et al. (2021) áp dụng lý thuyết thông tin để bảo tồn thông tin giữa biểu diễn ẩn và đầu vào hoặc đầu ra.
+
+Hầu hết các phương pháp hiện có đều tốn kém về tính toán và thời gian vì chúng hoặc yêu cầu huấn luyện lại mô hình từ đầu (Liu et al. 2017), áp dụng cắt tỉa lặp (You et al. 2019; Molchanov et al. 2019; Yeom et al. 2021; Yu et al. 2018; Li et al. 2021) hoặc tinh chỉnh mô hình trong khi cắt tỉa (Lin et al. 2020b; Dai et al. 2018). Khi mô hình không được huấn luyện lại hoặc tinh chỉnh trong quá trình cắt tỉa, chúng thường không bảo tồn độ chính xác mô hình sau khi cắt tỉa (Zheng et al. 2021; Yeom et al. 2021; Yu et al. 2018), và do đó yêu cầu được tinh chỉnh trong một số lượng lớn các epoch. Trái ngược với các phương pháp cắt tỉa tự động khác, AutoBot nổi bật bởi tốc độ và khả năng bảo tồn độ chính xác của mô hình trong quá trình cắt tỉa.
+
+## 3 Phương pháp
+
+Được thúc đẩy bởi một số phương pháp nút thắt (Tishby, Pereira, và Bialek 2000; Alemi et al. 2017; Schulz et al. 2020), phương pháp của chúng tôi kiểm soát luồng thông tin khắp mạng được huấn luyện trước bằng cách sử dụng Nút thắt Có thể Huấn luyện được chèn vào mô hình. Hàm mục tiêu của việc huấn luyện nút thắt có thể huấn luyện là tối đa hóa luồng thông tin từ đầu vào đến đầu ra trong khi giảm thiểu mất mát bằng cách điều chỉnh lượng thông tin trong mô hình dưới các ràng buộc nhất định. Trong quá trình huấn luyện, chỉ các tham số của nút thắt có thể huấn luyện được cập nhật trong khi tất cả các tham số được huấn luyện trước của mô hình được đóng băng.
+
+So với các phương pháp cắt tỉa khác được truyền cảm hứng từ nút thắt thông tin (Dai et al. 2018; Zheng et al. 2021), chúng tôi không xem xét việc nén thông tin tương hỗ giữa đầu vào/đầu ra và các biểu diễn ẩn để đánh giá luồng thông tin. Các phương pháp như vậy là trực giao với AutoBot, vốn định lượng rõ ràng có bao nhiêu thông tin được truyền qua mỗi lớp. Việc định lượng rõ ràng này dẫn đến việc huấn luyện nhanh hơn –chúng tôi tối ưu hóa các nút thắt có thể huấn luyện chỉ trên một phần của một epoch duy nhất– và khả năng cải thiện để bảo tồn độ chính xác. Quá trình cắt tỉa AutoBot của chúng tôi được tóm tắt trong Thuật toán 1.
+
+### 3.1 Nút thắt Có thể Huấn luyện
+
+Chúng tôi định nghĩa chính thức khái niệm nút thắt có thể huấn luyện như một toán tử có thể hạn chế luồng thông tin khắp mạng trong quá trình truyền xuôi, sử dụng các tham số có thể huấn luyện. Về mặt toán học, nó có thể được công thức hóa như:
+
+Xi+1 = B(θi; Xi)  (1)
+
+trong đó B đại diện cho nút thắt có thể huấn luyện, θi biểu thị các tham số nút thắt của toán tử thứ i, và Xi và Xi+1 biểu thị bản đồ đặc trưng đầu vào và đầu ra của nút thắt tại toán tử thứ i, tương ứng. Ví dụ, Schulz et al. (Schulz et al. 2020) kiểm soát lượng thông tin vào mô hình bằng cách chèn nhiễu vào nó. Trong trường hợp này, B được biểu diễn như B(θi; Xi) = θi ⊙ Xi + (1 − θi) ⊙ ε trong đó ε biểu thị nhiễu.
+
+Được truyền cảm hứng từ khái niệm nút thắt thông tin (Tishby, Pereira, và Bialek 2000; Alemi et al. 2017), chúng tôi công thức hóa một nút thắt tổng quát không chỉ giới hạn trong lý thuyết thông tin mà có thể được tối ưu hóa để thỏa mãn bất kỳ ràng buộc nào như sau:
+
+min_θ L_CE(Y; f(X; θ)) s.t. r(θ) ≤ C  (2)
+
+trong đó L_CE đại diện cho mất mát entropy chéo, X và Y đại diện cho đầu vào và đầu ra mô hình, θ là tập hợp các tham số nút thắt (θ = [θ1, θ2, ..., θL]) trong mô hình, r là một hàm ràng buộc, và C là ràng buộc mong muốn.
+
+### 3.2 Chiến lược Cắt tỉa
+
+Trong phần tiếp theo, chúng tôi định nghĩa một khối tích chập như một lớp tích chập, cộng với tất cả các toán tử sau đó bảo tồn số lượng và thứ tự của các kênh. Nó có thể chứa nhiều tích chập nếu đầu ra của chúng được hợp nhất (trong trường hợp kết nối bỏ qua). Trong nghiên cứu này, chúng tôi chèn một nút thắt vào mỗi khối tích chập khắp mạng sao cho luồng thông tin của mô hình ước tính để được cắt tỉa được định lượng bằng cách hạn chế các tham số có thể huấn luyện theo từng lớp.
+
+So với các nghiên cứu trước đây, hàm nút thắt B(θi; Xi) của chúng tôi (Phương trình 1) không sử dụng nhiễu để kiểm soát luồng thông tin:
+
+Xi+1 = θi ⊙ Xi  (3)
+
+trong đó θi ∈ [0, 1]. Do đó phạm vi của Xi+1 thay đổi từ [−∞, Xi] thành [0, Xi]. Đối với cắt tỉa, điều này có liên quan hơn vì việc thay thế đầu vào toán tử bằng số không tương đương với việc cắt tỉa toán tử (tức là cắt tỉa đầu ra tương ứng của toán tử trước đó).
+
+Theo hàm mục tiêu tổng quát của nút thắt có thể huấn luyện (Phương trình 2), chúng tôi giới thiệu một điều chuẩn g để ràng buộc FLOPs của kiến trúc được cắt tỉa:
+
+min_θ L_CE(Y; f(X; θ)) s.t. g(θ) = TF  (4)
+
+trong đó TF là FLOPs mục tiêu (được cố định thủ công), và g(θ) ước tính FLOPs của mô hình được gia quyền bởi θ. Chính thức, cho một mạng nơ-ron bao gồm nhiều khối tích chập, chúng tôi định nghĩa g như sau:
+
+g(θ) = Σ(i=1 to L) Σ(j=1 to Ji) g_j^i(θi, θi-1)  (5)
+
+trong đó θi là vector các tham số của nút thắt thông tin theo sau khối tích chập thứ i, g_j^i là hàm tính toán FLOPs của toán tử thứ j của khối tích chập thứ i được gia quyền bởi θi, L là tổng số khối tích chập trong mô hình và Ji là tổng số toán tử trong khối tích chập thứ i. Ví dụ, nếu g_j^i dành cho một toán tử tích chập không có bias và padding, nó được biểu diễn như:
+
+g_j^i(θi, θi-1) = sum(θi) · sum(θi-1) · h · w · k · k  (6)
+
+trong đó h và w là chiều cao và chiều rộng của bản đồ đặc trưng đầu ra của tích chập, và k là kích thước kernel của nó. Lưu ý rằng trong khối tích chập thứ i, tất cả các toán tử chia sẻ θi. Nghĩa là, ở cấp độ khối, tất cả các toán tử thuộc cùng một khối tích chập được cắt tỉa cùng nhau.
+
+Để giải quyết bài toán tối ưu hóa được định nghĩa trong Phương trình 4, chúng tôi giới thiệu L_g, một thành phần mất mát được thiết kế để thỏa mãn ràng buộc g từ Phương trình 5. Chúng tôi công thức hóa L_g như sau:
+
+L_g = {
+  (g(θ) - TF) / (MF - TF), nếu g(θ) ≥ TF
+  (1 - g(θ)) / TF, ngược lại
+}  (7)
+
+trong đó MF là FLOPs của mô hình gốc, và TF là FLOPs mục tiêu được định trước.
+
+Trái ngược với g, thành phần mất mát này được chuẩn hóa sao cho quy mô của mất mát luôn giống nhau. Kết quả là, đối với một tập dữ liệu nhất định, các tham số huấn luyện ổn định trên các kiến trúc khác nhau. Bài toán tối ưu hóa để cập nhật các nút thắt thông tin đề xuất cho cắt tỉa tự động có thể được tóm tắt như sau:
+
+min_θ L_CE(Y; f(X; θ)) + λ · L_g(θ)  (8)
+
+trong đó λ là một siêu tham số chỉ ra tầm quan trọng tương đối của mục tiêu liên quan của nó.
+
+**Từ θ đến mặt nạ cắt tỉa** Một khi các nút thắt được huấn luyện, θ có thể được sử dụng trực tiếp làm tiêu chí cắt tỉa. Do đó, chúng tôi đề xuất một cách để nhanh chóng tìm ngưỡng mà dưới đó các nơ-ron nên được cắt tỉa. Vì nút thắt của chúng tôi cho phép chúng tôi nhanh chóng và chính xác tính toán FLOPs có trọng số (Phương trình 5), chúng tôi có thể ước tính FLOPs của mô hình sẽ được cắt tỉa mà không cần cắt tỉa thực tế. Điều này được thực hiện bằng cách đặt θ bằng không cho các bộ lọc sẽ được cắt tỉa, hoặc một trong các trường hợp khác. Chúng tôi gọi quá trình này là cắt tỉa giả. Để tìm ngưỡng tối ưu, chúng tôi khởi tạo một ngưỡng là 0.5 và cắt tỉa giả tất cả các bộ lọc có θ thấp hơn ngưỡng này. Sau đó chúng tôi tính toán FLOPs có trọng số, và áp dụng thuật toán tìm kiếm nhị phân để giảm thiểu một cách hiệu quả khoảng cách giữa FLOPs hiện tại và mục tiêu. Quá trình này được lặp lại cho đến khi khoảng cách đủ nhỏ. Quá trình này được tóm tắt trong Thuật toán 2.
+
+Một khi chúng tôi đã tìm được ngưỡng tối ưu, chúng tôi cắt bỏ tất cả các nút thắt khỏi mô hình và cuối cùng cắt tỉa tất cả các bộ lọc có θ thấp hơn ngưỡng này để có được mô hình nén với FLOPs mục tiêu. Toàn bộ quá trình này mất ít hơn một giây trên CPU vì nó dựa trên thuật toán tìm kiếm nhị phân, có độ phức tạp O(log n), n là số lượng FLOPs trong trường hợp này.
+
+**Tham số hóa** Theo Schulz et al. (2020), chúng tôi không tối ưu hóa trực tiếp θ vì điều này sẽ yêu cầu sử dụng cắt để duy trì trong khoảng [0, 1]. Thay vào đó, chúng tôi tham số hóa θ = sigmoid(ψ), trong đó các phần tử của ψ nằm trong ℝ.
+
+**Dữ liệu huấn luyện giảm** Chúng tôi quan sát thực nghiệm rằng việc huấn luyện cho các nút thắt có thể hội tụ nhanh chóng trước khi kết thúc epoch đầu tiên. Ví dụ, chúng tôi có thể quan sát trên Hình 3 rằng khoảng 200 batch là cần thiết (25.6% của tập dữ liệu) để hội tụ trên CIFAR-10. Đối với ILSVRC2012, cùng một quan sát được thực hiện với 15.0% của tập dữ liệu. Do đó, nó gợi ý rằng bất kể kích thước mô hình (tức là FLOPs), kiến trúc được cắt tỉa tối ưu có thể được ước tính một cách hiệu quả chỉ sử dụng một phần nhỏ của tập dữ liệu.
+
+## 4 Thí nghiệm
+
+### 4.1 Cài đặt Thí nghiệm
+
+Để chứng minh hiệu quả của AutoBot trên nhiều cài đặt thí nghiệm khác nhau, các thí nghiệm được tiến hành trên hai tập dữ liệu chuẩn phổ biến và năm kiến trúc CNN thông thường, 1) CIFAR-10 (Krizhevsky, Hinton et al. 2009) với VGG-16 (Simonyan và Zisserman 2015), ResNet-56/110 (He et al. 2016), DenseNet (Huang et al. 2017), và GoogLeNet (Szegedy et al. 2015), và 2) ILSVRC2012 (ImageNet) (Deng et al. 2009) với ResNet-50.
+
+Các thí nghiệm được thực hiện trong khung PyTorch và torchvision (Paszke et al. 2017) dưới Intel(R) Xeon(R) Silver 4210R CPU 2.40GHz và NVIDIA RTX 2080 Ti với 11GB cho xử lý GPU.
+
+Đối với CIFAR-10, chúng tôi huấn luyện các nút thắt trong 200 vòng lặp với kích thước batch là 64, tốc độ học 0.6 và λ bằng 5.5, và chúng tôi tinh chỉnh mô hình trong 200 epoch với tốc độ học ban đầu là 0.02 được lên lịch bởi bộ lên lịch ủ cosine và với kích thước batch là 256. Đối với ImageNet, chúng tôi huấn luyện các nút thắt trong 3000 vòng lặp với kích thước batch là 64, tốc độ học 0.4 và λ bằng 13, và chúng tôi tinh chỉnh mô hình trong 200 epoch với kích thước batch là 512 và với tốc độ học ban đầu là 0.006 được lên lịch bởi bộ lên lịch ủ cosine. Các nút thắt được tối ưu hóa thông qua bộ tối ưu hóa Adam. Tất cả các mạng được huấn luyện lại thông qua bộ tối ưu hóa Stochastic Gradient Descent (SGD), với động lượng 0.9 và hệ số phân rã 2×10^-3 cho CIFAR-10 và với động lượng 0.99 và hệ số phân rã 1×10^-4 cho ImageNet.
+
+### 4.2 Chỉ số Đánh giá
+
+Trước tiên chúng tôi đánh giá độ chính xác của các mô hình. Chúng tôi đo nó sau khi tinh chỉnh, như thông thường trong tài liệu cắt tỉa DNN. Tuy nhiên, khác với các nghiên cứu khác, chúng tôi cũng đo nó ngay sau bước cắt tỉa (trước khi tinh chỉnh) để cho thấy phương pháp của chúng tôi bảo tồn hiệu quả các bộ lọc quan trọng so với các phương pháp khác. Ngoài ra, chúng tôi áp dụng FLOPs và số lượng tham số để đo hiệu quả tính toán và kích thước mô hình.
+
+### 4.3 Cắt tỉa Tự động trên CIFAR-10
+
+Để chứng minh sự cải thiện của phương pháp chúng tôi, trước tiên chúng tôi tiến hành cắt tỉa tự động với một số mạng nơ-ron tích chập phổ biến nhất, cụ thể là VGG-16, ResNet-56/110, GoogLeNet, và DenseNet-40. Bảng 1 chỉ ra kết quả thí nghiệm với các kiến trúc này trên CIFAR-10 cho số lượng FLOPs khác nhau.
+
+**VGG-16** Chúng tôi thực hiện trên kiến trúc VGG-16 với ba tỷ lệ cắt tỉa khác nhau. Bảng 1 chứng minh rằng AutoBot có thể bảo tồn hiệu quả độ chính xác Top-1 ban đầu trước khi tinh chỉnh, ngay cả dưới cùng mức giảm FLOPs (ví dụ 82.73% (phương pháp đề xuất) so với 10.00% từ 65.4% (HRank), 68.6% (ITPruner), và 73.7% (ABCPruner) giảm FLOPs), do đó dẫn đến độ chính xác SOTA sau khi tinh chỉnh. Ví dụ, chúng tôi nhận được 71.24% và 93.62% độ chính xác trước và sau khi tinh chỉnh tương ứng khi giảm FLOPs 76.9%. Phương pháp của chúng tôi thậm chí vượt trội hơn baseline 0.05% và 0.23% khi giảm FLOPs lần lượt 65.4% và 53.7%. Như được nhấn mạnh trong Hình 2, tỷ lệ cắt tỉa bộ lọc theo lớp được xác định tự động bởi phương pháp của chúng tôi, theo FLOPs mục tiêu.
+
+**ResNet** ResNet là một kiến trúc được đặc trưng bởi các kết nối dư. Mô hình được cắt tỉa với phương pháp của chúng tôi có thể cải thiện độ chính xác từ 85.58% trước khi tinh chỉnh lên 93.76% sau khi tinh chỉnh dưới mức giảm FLOPs 55.9% cho ResNet-56, và từ 84.37% trước khi tinh chỉnh lên 94.15% sau khi tinh chỉnh dưới mức giảm FLOPs 66.6% cho ResNet-110. Dưới FLOPs tương tự hoặc thậm chí nhỏ hơn, phương pháp của chúng tôi đạt được độ chính xác Top-1 xuất sắc so với các phương pháp cắt tỉa dựa trên độ lớn hoặc thích ứng hiện có khác và vượt quá hiệu suất mô hình baseline (93.27% cho ResNet-56 và 93.50% cho ResNet-110).
+
+**GoogLeNet** GoogLeNet là một kiến trúc lớn được đặc trưng bởi các nhánh song song. Không có bất kỳ xử lý thêm nào, độ chính xác ban đầu 90.18% của chúng tôi sau khi cắt tỉa dưới mức giảm FLOPs 70.6% (so với 10% cho HRank và ABCPruner cho tỷ lệ nén tương tự) dẫn đến độ chính xác SOTA 95.23% sau khi tinh chỉnh, vượt trội hơn các bài báo gần đây như DCFF và CC. Hơn nữa, chúng tôi cũng đạt được sự cải thiện đáng kể về giảm tham số (73.1%), mặc dù đây không phải là trọng tâm chính của phương pháp chúng tôi.
+
+**DenseNet-40** Như ResNet, DenseNet-40 là một kiến trúc dựa trên kết nối dư. Chúng tôi thí nghiệm với hai FLOPs mục tiêu khác nhau, như được thể hiện trong Bảng 1. Đáng chú ý, chúng tôi có độ chính xác 83.2% trước khi tinh chỉnh và 94.41% sau khi tinh chỉnh dưới mức giảm FLOPs 55.4%.
+
+### 4.4 Cắt tỉa Tự động trên ImageNet
+
+Để cho thấy hiệu suất của phương pháp chúng tôi trên ILSVRC-2012, chúng tôi chọn kiến trúc ResNet-50, bao gồm 53 lớp tích chập theo sau bởi một lớp kết nối đầy đủ. Do độ phức tạp của tập dữ liệu này (1,000 lớp và hàng triệu hình ảnh), nhiệm vụ này thách thức hơn so với việc nén các mô hình trên CIFAR-10. Trong khi các phương pháp cắt tỉa hiện có yêu cầu xác định thủ công tỷ lệ cắt tỉa cho mỗi lớp đạt hiệu suất hợp lý, phương pháp cắt tỉa toàn cục của chúng tôi cho phép kết quả cạnh tranh trong tất cả các chỉ số đánh giá bao gồm độ chính xác Top-1 và Top-5, giảm FLOPs cũng như giảm số lượng tham số, như được báo cáo trong Bảng 2. Dưới mức nén FLOPs cao 72.3%, chúng tôi thu được độ chính xác 74.68%, vượt trội hơn các nghiên cứu gần đây bao gồm GAL (69.31%) và CURL (73.39%) với mức nén tương tự. Và dưới mức nén 52%, phương pháp của chúng tôi thậm chí vượt trội hơn baseline 0.5% và để lại tất cả các phương pháp trước đây ít nhất 1% bằng cách làm như vậy. Do đó, phương pháp đề xuất cũng hoạt động tốt trên một tập dữ liệu phức tạp.
+
+### 4.5 Nghiên cứu Ablation
+
+**Tác động của Việc Bảo tồn Độ chính xác** Để làm nổi bật tác động của việc bảo tồn độ chính xác trong quá trình cắt tỉa, chúng tôi so sánh độ chính xác trước và sau khi tinh chỉnh của AutoBot với các chiến lược cắt tỉa khác nhau trong Hình 4. Để cho thấy sự ưu việt của một kiến trúc được tìm thấy bằng cách bảo tồn độ chính xác so với thiết kế thủ công, một nghiên cứu so sánh được tiến hành bằng cách thiết kế thủ công ba chiến lược khác nhau: 1) Cùng Cắt tỉa, Các Kênh Khác nhau (SPDC), 2) Cắt tỉa Khác nhau, Các Kênh Khác nhau (DPDC), và 3) Đảo ngược.
+
+DPDC có cùng FLOPs như kiến trúc được tìm thấy bởi AutoBot nhưng sử dụng tỷ lệ cắt tỉa theo lớp khác nhau được đề xuất bởi Lin et al. (Lin et al. 2020a). Để cho thấy tác động của độ chính xác ban đầu kém cho việc tinh chỉnh, chúng tôi đề xuất chiến lược SPDC có cùng tỷ lệ cắt tỉa theo lớp như kiến trúc được tìm thấy bởi AutoBot nhưng với các bộ lọc được chọn ngẫu nhiên. Chúng tôi cũng đề xuất đảo ngược thứ tự tầm quan trọng của các bộ lọc được chọn bởi AutoBot sao cho chỉ các bộ lọc ít quan trọng hơn được cắt tỉa. Bằng cách làm như vậy, chúng tôi có thể đánh giá tốt hơn tầm quan trọng của các điểm số được trả về bởi AutoBot. Trong Hình 4, chúng tôi định nghĩa chiến lược này là Đảo ngược. Chiến lược này đưa ra tỷ lệ cắt tỉa theo lớp khác nhau so với kiến trúc được tìm thấy bởi AutoBot. Chúng tôi đánh giá ba chiến lược trên VGG-16 với tỷ lệ cắt tỉa 65.4%, và chúng tôi sử dụng cùng điều kiện tinh chỉnh cho tất cả. Chúng tôi chọn độ chính xác tốt nhất trong 3 lần chạy. Như được thể hiện trong Hình 4, ba chiến lược khác nhau này đưa ra độ chính xác ban đầu 10%. Trong khi chiến lược DPDC đưa ra độ chính xác 93.18% sau khi tinh chỉnh, chiến lược SPDC hiển thị độ chính xác 93.38%, do đó cho thấy rằng một kiến trúc được tìm thấy bằng cách bảo tồn độ chính xác ban đầu mang lại hiệu suất tốt hơn. Trong khi đó, chiến lược Đảo ngược thu được 93.24%, tốt hơn đáng ngạc nhiên so với kiến trúc thủ công nhưng, như mong đợi, nó kém hiệu suất hơn kiến trúc được tìm thấy bởi AutoBot, ngay cả khi chúng tôi áp dụng chiến lược SPDC.
+
+**Kiểm tra Triển khai** Để làm nổi bật sự cải thiện trong các tình huống thực tế, chúng tôi so sánh tăng tốc suy luận của các mạng nén được triển khai trên các thiết bị biên dựa trên GPU (NVIDIA Jetson Nano) và dựa trên CPU (Raspberry Pi 4, Raspberry Pi 3, và Raspberry Pi 2). Thông số kỹ thuật của các thiết bị này có sẵn trong Bảng 4 trong phụ lục. Các mô hình được cắt tỉa được chuyển đổi sang định dạng ONNX. Hình 5 cho thấy nghiên cứu so sánh về thời gian suy luận giữa các mô hình được huấn luyện trước gốc và các mô hình nén của chúng tôi. Chúng tôi có thể cho thấy rằng thời gian suy luận cho các mô hình được cắt tỉa của chúng tôi được cải thiện trong mọi thiết bị biên mục tiêu (ví dụ GoogleNet nhanh hơn 2.85 lần trên Jetson-Nano và nhanh hơn 2.56 lần trên Raspberry Pi 4B với độ chính xác tăng 0.22%). Đặc biệt, tốc độ tốt hơn đáng kể trên các thiết bị dựa trên GPU cho các mô hình chuỗi lớp đơn (ví dụ VGG-16 và GoogLeNet) trong khi nó cải thiện nhiều nhất trên các thiết bị dựa trên CPU cho các mô hình có kết nối bỏ qua. Kết quả chi tiết hơn có sẵn trong Bảng 5.
+
+## 5 Hạn chế
+
+Trong khi cắt tỉa với Autobot là một quá trình nhanh, việc tìm các siêu tham số bảo tồn độ chính xác một cách hiệu quả nhất đòi hỏi một bước tối ưu hóa siêu tham số. Tuy nhiên, các thí nghiệm của chúng tôi làm nổi bật sự ổn định tương đối của các siêu tham số này cho các mô hình khác nhau trên cùng một tập dữ liệu. Ví dụ, tất cả kết quả của chúng tôi trên CIFAR10 được trình bày trong Bảng 1 đều được thu được với cùng các siêu tham số.
+
+Đối với các kiến trúc phức tạp, việc đặt các nút thắt thủ công có thể thách thức vì nó yêu cầu xác định các hoạt động nào phải được cắt tỉa cùng nhau. Thú vị là điều này có thể được giải quyết bằng tự động hóa vì các phụ thuộc này tuân theo các quy tắc đơn giản (ví dụ, trong trường hợp kết nối bỏ qua, nếu các nhánh được cộng thì chúng nên được cắt tỉa cùng nhau).
+
+## 6 Kết luận
+
+Trong bài báo này, chúng tôi đã giới thiệu AutoBot, một phương pháp cắt tỉa tự động mới tập trung vào giảm FLOPs. Để xác định bộ lọc nào cần cắt tỉa, AutoBot sử dụng các nút thắt có thể huấn luyện được thiết kế để bảo tồn các kênh tối đa hóa độ chính xác mô hình trong khi giảm thiểu FLOPs. Đáng chú ý, các nút thắt này chỉ yêu cầu một epoch trên 25.6% (CIFAR-10) hoặc 15.0% (ILSVRC2012) của tập dữ liệu để được huấn luyện. Các thí nghiệm mở rộng trên nhiều kiến trúc CNN khác nhau chứng minh rằng phương pháp đề xuất vượt trội hơn các phương pháp cắt tỉa kênh trước đây cả trước và sau khi tinh chỉnh. Bài báo của chúng tôi là đầu tiên so sánh độ chính xác trước khi tinh chỉnh.

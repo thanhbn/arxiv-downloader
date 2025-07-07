@@ -1,0 +1,371 @@
+# spade: Tổng hợp Các Khẳng định Chất lượng Dữ liệu cho Các Pipeline Mô hình Ngôn ngữ Lớn
+
+Shreya Shankar1, Haotian Li2, Parth Asawa1, Madelon Hulsebos1, Yiming Lin1, J.D. Zamfirescu-Pereira1, Harrison Chase3, Will Fu-Hinthorn3, Aditya G. Parameswaran1, Eugene Wu4
+1UC Berkeley,2HKUST,3LangChain,4Columbia University
+{shreyashankar,pgasawa,madelon,yiminglin,zamfi,adityagp}@berkeley.edu
+haotian.li@connect.ust.hk, {harrison,wfh}@langchain.dev, ewu@cs.columbia.edu
+
+TÓM TẮT
+
+Các mô hình ngôn ngữ lớn (LLM) đang được triển khai ngày càng nhiều như một phần của các pipeline xử lý hoặc tạo ra dữ liệu nào đó một cách lặp đi lặp lại. Tuy nhiên, một rào cản thường gặp đối với việc triển khai là những lỗi thường xuyên và không thể dự đoán được gây ra bởi các LLM. Thừa nhận tính không thể tránh khỏi của những lỗi này, chúng tôi đề xuất các khẳng định chất lượng dữ liệu để xác định khi nào LLM có thể đang mắc lỗi. Chúng tôi trình bày spade, một phương pháp tự động tổng hợp các khẳng định chất lượng dữ liệu để xác định các đầu ra LLM xấu. Chúng tôi đưa ra quan sát rằng các nhà phát triển thường xuyên xác định các vấn đề chất lượng dữ liệu trong quá trình tạo mẫu thử nghiệm trước khi triển khai, và cố gắng giải quyết chúng bằng cách thêm hướng dẫn vào prompt LLM theo thời gian. Do đó spade phân tích lịch sử các phiên bản prompt theo thời gian để tạo ra các hàm khẳng định ứng viên và sau đó chọn một tập hợp tối thiểu thỏa mãn cả yêu cầu về độ bao phủ và độ chính xác. Trong thử nghiệm trên chín pipeline LLM thực tế khác nhau, spade giảm hiệu quả số lượng khẳng định 14% và giảm các lỗi sai 21% khi so sánh với các baseline đơn giản hơn. spade đã được triển khai như một dịch vụ trong LangSmith, trung tâm pipeline LLM của LangChain, và đã được sử dụng để tạo ra các khẳng định chất lượng dữ liệu cho hơn 2000 pipeline trên nhiều ngành công nghiệp.
+
+1 GIỚI THIỆU
+
+Có rất nhiều sự phấn khích xung quanh việc sử dụng các mô hình ngôn ngữ lớn (LLM) để xử lý, hiểu và tạo ra dữ liệu [18]. Mà không cần các tập dữ liệu được gán nhãn lớn, người ta có thể dễ dàng tạo ra một pipeline LLM cho bất kỳ tác vụ nào trên một tập hợp các mục dữ liệu - đơn giản bằng cách tạo ra một prompt ngôn ngữ tự nhiên hướng dẫn LLM phải làm gì với từng mục. Điều này có thể bao gồm các tác vụ xử lý dữ liệu truyền thống, chẳng hạn như tóm tắt từng tài liệu trong một tập hợp tài liệu, trích xuất thực thể từ từng bài báo trong một tập hợp các bài báo, hoặc thậm chí điền vào dữ liệu bị thiếu cho từng tuple trong một quan hệ [36]. LLM cũng cho phép các tác vụ xử lý dữ liệu mới và phức tạp hơn liên quan đến việc tạo ra dữ liệu, ví dụ, một LLM có thể viết lời giải thích tại sao một sản phẩm được đề xuất cho người dùng, soạn email cho các khách hàng tiềm năng, hoặc viết nháp các bài đăng blog cho marketing và tiếp cận. Trong tất cả các tác vụ xử lý dữ liệu này, triển khai những pipeline LLM này ở quy mô lớn - hoặc offline, trên từng batch các mục dữ liệu, hoặc online, khi có các mục mới đến - đưa ra những thách thức đáng kể, do các lỗi chất lượng dữ liệu được tạo ra bởi LLM dường như một cách ngẫu nhiên [25] - với LLM thường bỏ qua hướng dẫn, mắc lỗi với định dạng đầu ra, hoặc ảo giác về các sự kiện [50, 64].
+
+Một cách tiếp cận để bắt các lỗi trong các pipeline LLM đã được triển khai là thông qua các khẳng định chất lượng dữ liệu. Thực vậy, nhiều bài báo gần đây [28,43,55] và các hệ thống tạo pipeline LLM [23,29,33] cung cấp các cơ chế để nhúng các khẳng định được cung cấp thủ công hoặc được chọn như một phần của các pipeline LLM để bắt lỗi trong quá trình triển khai. Tuy nhiên, việc xác định khẳng định nào cần thêm vào vẫn là một vấn đề mở - và là một điểm đau khách hàng lớn dựa trên kinh nghiệm của chúng tôi tại LangChain - một công ty giúp mọi người xây dựng các pipeline LLM. Các nhà phát triển thường thấy khó khăn để xác định tập hợp khẳng định đúng cho các tác vụ tùy chỉnh của họ [40]. Các thách thức bao gồm dự đoán tất cả các chế độ thất bại có thể của LLM, tính chất tốn thời gian của việc viết khẳng định với các phương pháp đặc tả khác nhau (như các hàm Python hoặc các cuộc gọi LLM), sự cần thiết về độ chính xác trong các khẳng định (đặc biệt là những khẳng định liên quan đến các cuộc gọi LLM), và thực tế là nhiều nhà phát triển pipeline LLM thiếu chuyên môn kỹ thuật phần mềm hoặc kinh nghiệm lập trình [28,64]. Hơn nữa, nếu có các khẳng định không có thông tin hoặc quá nhiều trong số chúng, các nhà phát triển có thể bị choáng ngợp khi theo dõi kết quả của những khẳng định này. Mặc dù có một số công việc về việc tự động phát hiện lỗi trong các pipeline ML truyền thống [5,41,48,49], dòng công việc này hoạt động trên nhiều bản ghi có cấu trúc cùng một lúc, và không áp dụng cho một môi trường không có cấu trúc. Vì vậy, chúng tôi nhắm đến câu hỏi sau: liệu chúng ta có thể xác định các khẳng định chất lượng dữ liệu cho các pipeline LLM với ít nỗ lực nhất từ các nhà phát triển không?
+
+Ví dụ Pipeline LLM. Xem xét một pipeline LLM cho một nền tảng phát trực tuyến phim, nơi tác vụ là tạo ra một đoạn văn bản giải thích tại sao một bộ phim cụ thể được đề xuất cho một người dùng cụ thể. Một nhà phát triển có thể viết một mẫu prompt như: "Cho thông tin sau về người dùng, {personal_info}, và thông tin về một bộ phim, {movie_info}: viết một ghi chú cá nhân hóa về lý do người dùng nên xem bộ phim này" để được thực thi cho nhiều cặp người dùng-phim. Về lý thuyết, prompt này có vẻ đầy đủ, nhưng nhà phát triển có thể quan sát một số vấn đề chất lượng dữ liệu khi thử nghiệm nó trên các đầu vào khác nhau: đầu ra LLM có thể tham chiếu đến một bộ phim mà người dùng chưa bao giờ xem, trích dẫn một thuộc tính nhạy cảm (ví dụ, chủng tộc hoặc dân tộc), hoặc thậm chí thể hiện một vấn đề cơ bản bằng cách quá ngắn. Để sửa chữa những vấn đề này, các nhà phát triển thường thêm hướng dẫn vào prompt để bắt những vấn đề chất lượng dữ liệu này, chẳng hạn như "Đừng tham chiếu đến chủng tộc trong câu trả lời của bạn". Tuy nhiên, LLM vẫn có thể vi phạm những hướng dẫn này một cách không thể dự đoán được đối với một số mục dữ liệu, đòi hỏi các khẳng định được áp dụng cho các đầu ra LLM sau đó, trong quá trình triển khai.
+
+Phân tích Lịch sử Phiên bản Prompt. Để tự động tổng hợp các khẳng định cho các nhà phát triển, hiểu biết đầu tiên của chúng tôi là chúng ta có thể khai thác lịch sử phiên bản prompt để xác định tiêu chí khẳng định cho các pipeline LLM, vì các nhà phát triển ngầm nhúng các yêu cầu chất lượng dữ liệu thông qua các thay đổi đối với prompt, hoặc các delta prompt, theo thời gian. Trong ví dụ trên của chúng tôi, các hướng dẫn như "Đảm bảo phản hồi của bạn có ít nhất 3 câu" hoặc "Đừng tham chiếu đến chủng tộc trong câu trả lời của bạn" mỗi cái có thể tương ứng với một khẳng định ứng viên. Để hiểu các loại delta prompt trong các pipeline LLM và xác minh tính hữu ích của chúng cho các khẳng định chất lượng dữ liệu, chúng tôi trình bày một phân tích về lịch sử phiên bản prompt của 19 pipeline tùy chỉnh từ người dùng LangChain. Sử dụng phân tích này, chúng tôi xây dựng một phân loại các delta prompt (Hình 2), có thể có ích độc lập cho các nhà nghiên cứu và thực hành viên nghiên cứu cách xây dựng tốt nhất các pipeline LLM.
+
+Sự Dư thừa trong Các Khẳng định Chất lượng Dữ liệu. Hiểu biết thứ hai của chúng tôi từ việc phân tích những pipeline này là nếu chúng ta tạo ra các khẳng định ứng viên từ các delta prompt, giả sử, sử dụng một LLM, có thể có quá nhiều khẳng định - thường vượt quá 50 chỉ cho một vài delta prompt. Nhiều trong số những khẳng định này (hoặc tương đương, các delta prompt) là dư thừa, trong khi một số quá không chính xác hoặc mơ hồ để hữu ích (ví dụ, "trả về một phản hồi ngắn gọn"). Việc giảm sự dư thừa này không hề đơn giản, ngay cả đối với các kỹ sư: bản thân các khẳng định có thể liên quan đến các cuộc gọi LLM với độ chính xác khác nhau, thúc đẩy một thành phần tự động có thể lọc ra các ứng viên xấu. Một cách tiếp cận là sử dụng một số ít các đầu ra LLM được gán nhãn bởi nhà phát triển để ước tính tỷ lệ dương tính giả và âm tính giả của mỗi khẳng định chất lượng dữ liệu - nhưng việc xác định tập hợp đúng các khẳng định có thể bắt được hầu hết các lỗi, trong khi gắn cờ sai ít đầu ra nhất có thể, không phải là đơn giản.
+
+spade: Framework Tạo Khẳng định Chất lượng Dữ liệu của Chúng tôi. Trong bài báo này, chúng tôi tận dụng những hiểu biết nói trên để phát triển spade (Hệ thống Phân tích Prompt và Đánh giá Dựa trên Delta, Hình 1). Mục tiêu của spade là chọn một tập hợp các khẳng định boolean với sự chồng chéo tối thiểu, trong khi tối đa hóa độ bao phủ của các đầu ra xấu và tối thiểu hóa các lỗi sai (các đầu ra đúng bị gắn cờ sai) cho sự kết hợp của các khẳng định được chọn. Chúng tôi phân tách spade thành hai thành phần - tạo khẳng định ứng viên và lọc.
+
+Thành phần 1: Delta Prompt cho Tạo Khẳng định Ứng viên. Để tạo ra các khẳng định ứng viên, thay vì trực tiếp truy vấn một LLM để "viết khẳng định cho prompt x," điều này khiến LLM bỏ lỡ một số phần nhất định của prompt, chúng tôi tạo ra các ứng viên từ mỗi delta prompt, thường chỉ ra các chế độ thất bại cụ thể của LLM. spade tận dụng phân loại delta prompt nói trên mà chúng tôi đã xây dựng bằng cách đầu tiên tự động phân loại các delta sử dụng phân loại, sau đó tổng hợp các hàm Python (có thể bao gồm các cuộc gọi LLM) như các khẳng định ứng viên. Tại LangChain, chúng tôi công khai phát hành thành phần này của spade - đã được sử dụng tiếp theo cho hơn 2000 pipeline trên hơn 10 lĩnh vực như tài chính, y học và IT [52]. Chúng tôi trình bày một phân tích về việc sử dụng này trong Mục 2.4.
+
+Thành phần 2: Lọc Các Khẳng định Ứng viên với Dữ liệu Hạn chế. Để lọc ra các khẳng định ứng viên không chính xác và dư thừa, thay vì yêu cầu lựa chọn thủ công cồng kềnh hoặc thậm chí fine-tuning các mô hình riêng biệt [45,58], chúng tôi đề xuất một cách tiếp cận tự động chỉ yêu cầu một số ít ví dụ được gán nhãn, thường đã có sẵn trong hầu hết các ứng dụng mục tiêu. Sử dụng những ví dụ này, chúng ta có thể ước tính tỷ lệ lỗi sai của mỗi khẳng định (FFR), tức là, khẳng định gắn cờ lỗi sai bao lâu một lần, và loại bỏ các khẳng định cá nhân vượt quá một ngưỡng nhất định. Tuy nhiên, do chúng ta đang chọn một tập hợp khẳng định, tập hợp vẫn có thể vượt quá ngưỡng FFR và gắn cờ quá nhiều lỗi sai, và sự dư thừa có thể vẫn tồn tại. Chúng tôi chỉ ra rằng việc chọn một tập con nhỏ các khẳng định để đáp ứng tiêu chí bao phủ lỗi và FFR là NP-hard. Tuy nhiên, chúng ta có thể biểu diễn vấn đề như một chương trình tuyến tính nguyên (ILP) và sử dụng một solver ILP để xác định một giải pháp trong thời gian hợp lý với kích thước vấn đề của chúng ta (hàng trăm đến hàng nghìn biến).
+
+Trong một số trường hợp, khi có ít ví dụ do nhà phát triển cung cấp, chúng tôi thấy rằng các đầu ra LLM được gán nhãn có thể không bao gồm tất cả các chế độ thất bại, dẫn đến việc bỏ sót các khẳng định chất lượng dữ liệu có giá trị. Ví dụ, trong kịch bản đề xuất phim của chúng tôi, một khẳng định xác minh chính xác nếu đầu ra dưới 200 từ sẽ bị loại bỏ nếu tất cả đầu ra trong mẫu được gán nhãn bởi nhà phát triển của chúng ta tôn trọng giới hạn này. Để mở rộng độ bao phủ, các cách tiếp cận học tích cực và giám sát yếu có thể được sử dụng để lấy mẫu và gán nhãn các cặp đầu vào-đầu ra LLM mới cho mỗi khẳng định ứng viên [7,42], nhưng điều này có thể tốn kém hoặc không thể tiếp cận được đối với những người không phải lập trình viên. Chúng tôi giới thiệu subsumption khẳng định như một cách đảm bảo độ bao phủ toàn diện: nếu một khẳng định không bao gồm các chế độ thất bại của khẳng định khác, cả hai có thể được chọn. Như vậy, spade chọn một tập hợp tối thiểu các khẳng định tôn trọng các ràng buộc bao phủ lỗi, độ chính xác và subsumption.
+
+Nhìn chung, chúng tôi đóng góp như sau:
+• Chúng tôi xác định lịch sử phiên bản prompt như một nguồn phong phú cho tính đúng đắn của đầu ra LLM, tạo ra một phân loại tiêu chí khẳng định từ 19 pipeline LLM đa dạng (Mục 2),
+• Chúng tôi giới thiệu spade, hệ thống tự động tạo ra các khẳng định chất lượng dữ liệu cho các pipeline LLM. Trong một bản phát hành công khai của thành phần tạo khẳng định ứng viên của spade¹, chúng tôi quan sát và phân tích 2000+ triển khai (Mục 2.4),
+• Chúng tôi trình bày một phương pháp để chọn một tập hợp tối thiểu các khẳng định trong khi đáp ứng các yêu cầu bao phủ và độ chính xác, được sử dụng bởi spade để giảm số lượng khẳng định. Đối với các cài đặt dữ liệu thấp, chúng tôi giới thiệu subsumption khẳng định như một proxy mới cho độ bao phủ (Mục 3), và
+• Chúng tôi chứng minh hiệu quả của spade trên chín pipeline LLM thực tế (tám trong số đó chúng tôi mã nguồn mở). Trong cài đặt dữ liệu thấp của chúng tôi (khoảng 75 đầu vào và đầu ra mỗi pipeline), giải pháp dựa trên subsumption của chúng tôi vượt trội hơn các baseline đơn giản hơn không xem xét tương tác giữa các khẳng định bằng cách giảm số lượng khẳng định 14% và giảm tỷ lệ lỗi sai 21% (Mục 4).
+
+2 XÁC ĐỊNH CÁC KHẲNG ĐỊNH ỨNG VIÊN
+
+Mục tiêu đầu tiên của chúng tôi là tạo ra một tập hợp các khẳng định ứng viên. Chúng tôi mô tả cách các delta prompt có thể thông báo cho các khẳng định ứng viên và giải thích cách suy ra các khẳng định ứng viên từ chúng.
+
+2.1 Delta Prompt
+
+Một pipeline LLM một bước bao gồm một mẫu prompt P, được định dạng với một tuple đầu vào được chuỗi hóa t để tạo ra một prompt được đưa vào một LLM, trả về một phản hồi. Có thể có nhiều phiên bản của P, tùy thuộc vào cách một nhà phát triển lặp lại trên mẫu prompt của họ. Gọi P₀ là chuỗi rỗng, phiên bản thứ 0, và gọi Pᵢ là phiên bản thứ i của một mẫu. Trong ví dụ đề xuất phim từ phần giới thiệu, giả sử có 7 phiên bản, trong đó P₇ như sau: "Cho thông tin sau về người dùng, {personal_info}, và thông tin về một bộ phim, {movie_info}: viết một ghi chú cá nhân hóa về lý do người dùng nên xem bộ phim này. Đảm bảo ghi chú đề xuất ngắn gọn, không vượt quá 100 từ. Đề cập đến thể loại của bộ phim và bất kỳ thành viên diễn viên chung nào giữa {movie_name} và các bộ phim khác mà người dùng đã xem. Đề cập đến bất kỳ giải thưởng hoặc sự công nhận phê bình nào mà {movie_name} nhận được. Không đề cập đến bất cứ điều gì liên quan đến chủng tộc, dân tộc của người dùng, hoặc bất kỳ thuộc tính nhạy cảm nào khác."
+
+Chúng tôi định nghĩa một delta prompt ΔPᵢ₊₁ là diff (hoặc khác biệt) giữa Pᵢ và Pᵢ₊₁. Cụ thể, một delta prompt ΔP là một tập hợp các câu, trong đó mỗi câu được gắn thẻ là một phép cộng (tức là, "+") hoặc phép trừ (tức là, "-"). Bảng 1 cho thấy các ΔP cho một số phiên bản cho ví dụ của chúng tôi. Mỗi câu trong ΔPᵢ được tạo thành từ các phép cộng (tức là, các câu mới trong Pᵢ không tồn tại trong Pᵢ₋₁) và các phép trừ (tức là, các câu trong Pᵢ₋₁ không tồn tại trong Pᵢ). Một sửa đổi cho một câu được biểu diễn bằng một phép trừ và phép cộng - ví dụ, ΔP₆ trong Bảng 1 chứa một số hướng dẫn mới được thêm vào một câu từ P₅. Mỗi phép cộng trong ΔPᵢ chỉ ra tiêu chí khẳng định có thể, như được hiển thị trong cột ngoài cùng bên phải của Bảng 1.
+
+2.2 Phân tích Delta Prompt
+
+Để hiểu những khẳng định mà các nhà phát triển có thể quan tâm, chúng tôi chuyển sang các pipeline LLM thực tế. Chúng tôi đã phân tích 19 pipeline LLM được thu thập từ người dùng LangChain, mỗi pipeline bao gồm từ ba đến 11 phiên bản mẫu prompt lịch sử. Những pipeline này trải rộng trên nhiều tác vụ khác nhau trên hơn năm lĩnh vực (ví dụ, tài chính, marketing, lập trình, giáo dục, sức khỏe), từ tạo ra các bản tóm tắt tập luyện đến một chatbot hoạt động như một gia sư thống kê. Bảng 7 trong Phụ lục B cho thấy tóm tắt các pipeline, bao gồm mô tả về từng pipeline và số lượng phiên bản prompt. Đối với mỗi pipeline, chúng tôi phân loại các delta prompt, tức là, ΔPᵢ, thành các loại khác nhau - ví dụ, hướng dẫn LLM bao gồm một cụm từ mới trong mỗi phản hồi (tức là, bao gồm), hoặc hướng dẫn LLM phản hồi với một giọng điệu nhất định (tức là, tiêu chí định tính). Hai tác giả đã lặp lại trên các danh mục 4 lần thông qua một quá trình mã hóa mở và trục, cuối cùng tạo ra phân loại trong Hình 2. Tập dữ liệu các phiên bản prompt được chú thích phân loại có thể được tìm thấy trực tuyến².
+
+Chúng tôi chia các delta thành hai danh mục cấp cao chính: Cấu trúc và Dựa trên Nội dung. Khoảng 35% danh mục được xác định trên tất cả các delta trong tập dữ liệu của chúng tôi là Cấu trúc, và 65% là Dựa trên Nội dung. Các delta cấu trúc chỉ ra một sự tái cấu trúc nhỏ của prompt, mà không thay đổi bất kỳ tiêu chí nào của một phản hồi tốt (ví dụ, thêm một dòng mới cho khả năng đọc), hoặc đặc tả của đầu ra dự định (ví dụ, JSON hoặc Markdown). Tiêu chí khẳng định hợp lý dựa trên các delta cấu trúc sẽ kiểm tra xem đầu ra LLM có tuân thủ cấu trúc do người dùng chỉ định hay không. Mặt khác, các delta dựa trên nội dung chỉ ra một thay đổi trong ý nghĩa hoặc định nghĩa của tác vụ. Các delta dựa trên nội dung bao gồm mô tả các bước quy trình làm việc mà LLM nên thực hiện (ví dụ, "đầu tiên, làm X, sau đó, nghĩ ra Y"), hướng dẫn về các cụm từ cụ thể để bao gồm hoặc loại trừ trong phản hồi, hoặc các chỉ số định tính của phản hồi tốt (ví dụ, "duy trì giọng điệu chuyên nghiệp"). Danh mục con Tích hợp Dữ liệu (dưới các delta Dựa trên Nội dung) liên quan đến việc thêm các nguồn ngữ cảnh mới vào prompt - ví dụ, thêm một biến mới như "{movie_info}" vào prompt, chỉ ra một loại thông tin mới cần được phân tích cùng với nội dung khác trong prompt. Đối với một số ví dụ minh họa về các delta prompt cho mỗi danh mục, chúng tôi phân loại các delta prompt trong Bảng 1, và trong Bảng 2, chúng tôi hiển thị các delta prompt mẫu cho mỗi danh mục trong phân loại của chúng tôi. Phân loại này có thể có ích độc lập đối với các nhà nghiên cứu nghiên cứu quá trình kỹ thuật prompt, cũng như các thực hành viên tìm cách xác định các cách để cải thiện prompt của họ cho các pipeline LLM sản xuất.
+
+Nhìn chung, bài tập xây dựng phân loại này của chúng tôi tiết lộ hai phát hiện chính. Đầu tiên, các nhà phát triển trên các pipeline LLM đa dạng lặp lại trên các prompt theo những cách tương tự như được mã hóa như các nút trong phân loại, nhiều trong số đó tương ứng với các khía cạnh có thể được kiểm tra rõ ràng thông qua các khẳng định. Thứ hai, chúng tôi thấy rằng một cách tiếp cận tự động để tổng hợp các khẳng định chất lượng dữ liệu có thể hứa hẹn, vì phân loại của chúng tôi tiết lộ nhiều trường hợp như vậy trong đó delta prompt có thể trực tiếp tương ứng với một khẳng định bắt giữ cùng một yêu cầu. Ví dụ, nhiều delta tương ứng với các hướng dẫn bao gồm hoặc loại trừ các cụm từ cụ thể, chỉ ra rằng các nhà phát triển có thể hưởng lợi từ các khẳng định rõ ràng xác minh việc bao gồm hoặc loại trừ những cụm từ như vậy trong các đầu ra LLM.
+
+Tuy nhiên, nếu chúng ta sử dụng một LLM để tự động tạo ra tiêu chí khẳng định dựa trên phân loại delta của chúng tôi, chúng ta cũng cần kiểm tra xem LLM có thể chính xác xác định các danh mục tương ứng với một delta hay không. Do đó, chúng tôi đã xác nhận phân loại đúng của GPT-4 về các delta prompt (tính đến tháng 10 năm 2023): chúng tôi gán các danh mục sự thật cơ bản cho tất cả các delta prompt từ 19 pipeline, và GPT-4 đạt được điểm F1 là 0.8135. Prompt được sử dụng để trích xuất danh mục từ các delta prompt được chi tiết trong Phụ lục C.
+
+2.3 Từ Phân loại đến Khẳng định
+
+Như chúng ta đã thấy trước đó, delta prompt được phân loại thành các nút trong phân loại của chúng tôi thường tương ứng với tiêu chí khẳng định có ý nghĩa. Tiếp theo, chúng ta cần một phương pháp để tự động tổng hợp các khẳng định chất lượng dữ liệu từ các delta prompt. Một ý tưởng tự nhiên là prompt một LLM để tạo ra các hàm khẳng định tương ứng với các danh mục liên quan trong phân loại của chúng tôi cho các delta prompt. Chúng tôi đã thử cách tiếp cận này với GPT-4 vào tháng 1 năm 2024 và quan sát thấy một số khẳng định bị bỏ sót rõ ràng tương ứng với các danh mục trong phân loại của chúng tôi. Do đó, chúng tôi áp dụng một quy trình prompting hai bước trong cách tiếp cận của chúng tôi, vì nó đã được chứng minh rằng việc chia nhỏ các tác vụ thành các bước có thể tăng cường độ chính xác của LLM [22,60,62]. Trong bước đầu tiên, chúng tôi prompt GPT-4 cho các mô tả ngôn ngữ tự nhiên của tiêu chí khẳng định, và trong bước thứ hai, chúng tôi prompt GPT-4 để tạo ra các hàm Python thực hiện những tiêu chí như vậy. Tuy nhiên, đáng chú ý rằng với những tiến bộ hàng ngày trong LLM, một quy trình một bước có thể đã khả thi. Ngoài ra, trong khi phân loại dựa trên phân loại của chúng tôi hướng dẫn các khẳng định được tạo ra bởi LLM bây giờ, các LLM tương lai có thể ngầm học những danh mục này thông qua học tăng cường từ phản hồi của con người [13]. Tuy nhiên, biết các danh mục dựa trên phân loại liên quan đến các khẳng định ứng viên có thể giúp lọc chúng.
+
+Cụ thể hơn, đối với mỗi delta prompt ΔPᵢ, chúng tôi đầu tiên prompt một LLM để đề xuất càng nhiều tiêu chí càng tốt cho các khẳng định - mỗi cái phù hợp với một danh mục phân loại từ Hình 3. Một tiêu chí được định nghĩa lỏng lẻo như một biểu thức ngôn ngữ tự nhiên nào đó hoạt động trên một đầu ra hoặc ví dụ cho trước và đánh giá thành True hoặc False (ví dụ, "kiểm tra tính ngắn gọn"). Phương pháp của chúng tôi phân tích mọi ΔPᵢ thay vì chỉ phiên bản prompt cuối cùng vì một số lý do: các nhà phát triển thường loại bỏ hướng dẫn khỏi prompt để giảm chi phí trong khi mong đợi cùng một hành vi [40], prompt chứa những mơ hồ vốn có và ngụ ý nhiều cách đánh giá một số tiêu chí, và prompt phức tạp có thể dẫn đến các khẳng định bị bỏ lỡ nếu chỉ phân tích một phiên bản. Do đó, việc phân tích mỗi ΔPᵢ tăng khả năng tạo ra các khẳng định liên quan.
+
+Đối với mỗi delta, phương pháp của chúng tôi thu thập các tiêu chí được xác định và prompt một LLM một lần nữa để tạo ra các hàm khẳng định Python. Các hàm được tổng hợp có thể sử dụng các thư viện Python bên ngoài hoặc đặt các truy vấn nhị phân cho một LLM cho các tiêu chí phức tạp. Đối với tổng hợp hàm, LLM được hướng dẫn rằng nếu tiêu chí được chỉ định một cách mơ hồ hoặc mở để giải thích, chẳng hạn như "kiểm tra tính ngắn gọn," nó có thể tạo ra nhiều hàm mà mỗi hàm đánh giá tiêu chí. Trong ví dụ ngắn gọn này, LLM có thể trả về nhiều hàm - một hàm chia phản hồi thành các câu và đảm bảo rằng không có nhiều hơn, giả sử, 3 câu, một hàm chia phản hồi thành các từ và đảm bảo rằng không có nhiều hơn, giả sử, 25 từ, hoặc một hàm gửi phản hồi đến một LLM và hỏi xem phản hồi có ngắn gọn hay không. Kết quả tổng thể của điều này là một multiset các hàm ứng viên F={f₁,...,f_m}. Hai prompt để tạo ra tiêu chí khẳng định và hàm có thể được tìm thấy trong Phụ lục C.
+
+2.4 Triển khai Ban đầu
+
+Để đánh giá tiềm năng của các khẳng định được tự động tạo ra của chúng tôi, vào tháng 11 năm 2023, chúng tôi đã phát hành một nguyên mẫu ban đầu của framework tạo khẳng định ứng viên của spade thông qua một ứng dụng Streamlit³. Tại thời điểm phát hành công khai, ứng dụng Streamlit có một bộ prompt khác nhau để tạo ra các khẳng định; những prompt này tạo ra tương đối ít khẳng định so với số lượng khẳng định được tạo ra trong phiên bản spade của bài báo này. Tuy nhiên, phân loại vẫn giữ nguyên. Trong ứng dụng Streamlit, một nhà phát triển có thể dán mẫu prompt của họ mà họ muốn tạo ra khẳng định, hoặc họ có thể trỏ đến mẫu prompt LangChain Hub của họ (chứa lịch sử phiên bản prompt thông qua các commit). Ứng dụng sau đó hiển thị các danh mục phân loại được xác định trong prompt của người dùng và hiển thị các khẳng định ứng viên, như được hiển thị trong ảnh chụp màn hình trong Hình 4.
+
+Thông tin Chi tiết Sử dụng Công cụ và Phản hồi. Từ sự đón nhận ứng dụng Streamlit của chúng tôi, chúng tôi thấy sự quan tâm đáng kể đến các khẳng định chất lượng dữ liệu được tự động tạo ra cho các pipeline LLM: đã có hơn 2000 lần chạy ứng dụng cho các mẫu prompt tùy chỉnh (tức là, không phải mẫu prompt mặc định mẫu trong ứng dụng). Những lần chạy này trải rộng trên nhiều lĩnh vực, bao gồm y học, giáo dục, nấu ăn và tài chính - cung cấp thông tin chi tiết từ sự đa dạng của các trường hợp sử dụng cho các pipeline LLM. Hình 5 cho thấy sự phân chia thô của các trường hợp sử dụng mà mọi người muốn tạo ra khẳng định; tuy nhiên, điều quan trọng cần lưu ý là một số lần chạy có thể không phù hợp gọn gàng vào một danh mục duy nhất (ví dụ, một chatbot cho các câu hỏi liên quan đến telehealth cho một nhà cung cấp y tế có thể nằm trong "hỗ trợ khách hàng" và "sức khỏe"). Thú vị là, 8% tác vụ liên quan đến trợ lý đối thoại, và chúng tôi quan sát thấy các trường hợp của ít nhất bốn công ty khác nhau tạo ra khẳng định cho chatbot của họ, cho rằng tên công ty có trong prompt. Người dùng cho 48 trong số những lần chạy này đã nhấp vào nút "tải xuống khẳng định", tải xuống các khẳng định ứng viên như một file Python. Chúng tôi lưu ý rằng người dùng cũng có thể trực tiếp sao chép mã khẳng định được hiển thị, thay vì tải xuống các khẳng định như một file Python, và chúng tôi không đo lường các sự kiện sao chép. Không có người dùng nào nhấp vào nút "thumbs down" - điều này không có nghĩa là các khẳng định được tạo ra là hoàn hảo. Thực tế, một cách giai thoại, chúng tôi đã thấy chất lượng khẳng định ứng viên cải thiện trong vài tháng qua khi GPT-4 liên tục cải thiện. Trung bình, 3.3 khẳng định được tạo ra mỗi lần chạy, với tối thiểu 1 và tối đa 10 khẳng định được tạo ra cho một lần chạy. Hầu hết các lần chạy tương ứng với một phiên bản prompt duy nhất. Sau khi ứng dụng Streamlit của chúng tôi được phát hành, chúng tôi thấy một đánh giá không được thúc đẩy về các khẳng định được tạo ra bởi spade từ một người dùng LangChain đã xây dựng một công cụ "chat-with-your-pdf"⁴: theo lời của họ, "Khi tôi thấy nó, tôi không tin nó có thể hoạt động tốt như vậy, nhưng nó thực sự đã làm được và làm cho quá trình đánh giá trở nên thú vị và dễ dàng."
+
+Quan sát về Tiêu chí Khẳng định. Trên 2000+ lần chạy, liên quan đến phân loại của chúng tôi, tiêu chí khẳng định được bắt nguồn phổ biến nhất từ các hướng dẫn bao gồm và loại trừ. Ví dụ, đối với một trợ lý mua sắm, nơi mục tiêu là tìm sản phẩm liên quan nhất liên quan đến truy vấn của khách hàng, phản hồi được yêu cầu bao gồm "tất cả các tính năng [khách hàng] yêu cầu." Trong một ví dụ đại lý hỗ trợ khách hàng khác, phản hồi được yêu cầu bao gồm "trích dẫn chính xác trong [ngữ cảnh] liên quan đến câu hỏi [của khách hàng]...từng từ một." Một hướng dẫn loại trừ phổ biến trên các tác vụ liên quan đến chat là tránh bất kỳ cuộc thảo luận nào không liên quan đến câu hỏi của người dùng cuối; tuy nhiên, chúng tôi nhận thấy rằng GPT-4 gặp khó khăn trong việc tạo ra tiêu chí khẳng định xung quanh một hướng dẫn loại trừ chung như vậy. Chúng tôi thấy các hàm Python được tạo ra để thực hiện các tiêu chí như "tránh các ý tưởng không liên quan", không sử dụng LLM để kiểm tra tiêu chí. Thay vào đó, họ kiểm tra sự hiện diện của các cụm từ cụ thể như "không liên quan" và "Tôi xin lỗi, tôi không tìm thấy bất cứ điều gì liên quan" trong phản hồi. Những lỗi như vậy chỉ ra những hạn chế của LLM tiên tiến hiện tại và có thể gợi ý sự cần thiết cho các LLM chuyên biệt, được fine-tuned để tạo ra các khẳng định trong công việc tương lai; ở đây, chúng tôi làm việc với những hạn chế của LLM tiên tiến hiện tại. Chúng tôi thảo luận thêm về điều này trong Mục 4.4.
+
+Một mẫu mới mà chúng tôi nhận thấy sau khi triển khai, không được thấy trong phân tích ban đầu của chúng tôi, là các nhà phát triển thường muốn ẩn một số phần nhất định của quy trình làm việc LLM trong các đầu ra. Điều này có thể được xem như một trường hợp đặc biệt của danh mục loại trừ trong phân loại của chúng tôi. Ví dụ, trong một prompt liên quan đến tự động hóa doanh nghiệp, hướng dẫn đầu tiên là viết một truy vấn nhắm đến một cơ sở dữ liệu cụ thể (ví dụ, "Viết một truy vấn SQL để lấy bảng liên quan nhất từ cơ sở dữ liệu MySQL"). Tuy nhiên, một hướng dẫn khác trong prompt chỉ định rằng tên của cơ sở dữ liệu không nên xuất hiện trong bản tóm tắt cuối cùng được trả về cho người dùng cuối (ví dụ, "Không đề cập rằng bạn đã truy vấn bảng MySQL X"). Chúng tôi đã ngạc nhiên một cách thú vị khi thấy rằng quy trình của chúng tôi để tạo ra tiêu chí đã thành công xác định và thực hiện những hướng dẫn loại trừ như vậy một cách chính xác.
+
+Quan sát về Khẳng định. Trong các pipeline LLM với nhiều phiên bản prompt, chúng tôi quan sát thấy hai mẫu chính. Đầu tiên, kỹ thuật prompt thường dẫn đến nhiều khẳng định tương tự, và sự dư thừa có thể là một rắc rối khi triển khai khi một nhà phát triển phải theo dõi rất nhiều khẳng định. Ví dụ, một pipeline để tóm tắt bản ghi bài giảng⁵ có 14 phiên bản prompt, với nhiều chỉnh sửa được địa phương hóa vào đoạn văn cung cấp hướng dẫn về tiêu đề, diễn giả và ngày tháng, tạo ra nhiều khẳng định chồng chéo. 10 khẳng định đánh giá luận đề trung tâm của bài giảng; hai như sau:
+
+```python
+async def assert_response_articulates_central_thesis(
+    example: dict, prompt: str, response: str
+):
+    return "Central Thesis:" in response
+
+async def assert_response_completeness(example: dict,
+    prompt: str, response: str):
+    required_elements = [
+        "Context:",
+        "Central Thesis:",
+        "Key Points:",
+        "Conclusions and Takeaways:",
+        "Glossary of Important Terms:",
+    ]
+    return all(element in response for element in
+        required_elements)
+```
+
+Thứ hai, nhiều khẳng định có thể không chính xác, gây ra lỗi runtime hoặc lỗi sai. Việc đánh giá độ chính xác của những khẳng định này là thách thức, đặc biệt đối với những khẳng định phức tạp hoặc gọi chính các LLM, nơi ngay cả các nhà phát triển có kinh nghiệm cũng có thể không thể đánh giá hiệu quả của chúng mà không xem kết quả của các hàm trên nhiều ví dụ. Ngay cả khi các khẳng định không sai, chúng vẫn có thể có tỷ lệ thất bại hoặc độ bao phủ không mong muốn, thường khó cho một nhà phát triển lý luận cùng với các khẳng định khác. Vì có thể có 50+ khẳng định được tạo ra chỉ cho một số ít phiên bản prompt (như được chứng minh trong Mục 4), việc lọc thủ công chúng bằng cách nhìn tỷ lệ thất bại cho mỗi tập con khẳng định là không thực tế. Do đó, chúng tôi áp dụng một cách tiếp cận tự động để lọc, như được thảo luận trong phần sau.
+
+3 LỌC CÁC KHẲNG ĐỊNH ỨNG VIÊN
+
+Như chúng ta đã thấy trong phần trước, chúng ta thường có các khẳng định dư thừa và không chính xác, đặc biệt trong các pipeline với nhiều phiên bản prompt. Ở đây, chúng tôi tập trung vào việc lọc tập hợp ứng viên này thành một số nhỏ hơn, điều này không chỉ cải thiện hiệu quả và giảm chi phí khi triển khai các khẳng định để chạy trong sản xuất, mà còn giảm gánh nặng nhận thức cho nhà phát triển.
+
+3.1 Định nghĩa
+
+Xem xét eᵢ như một ví dụ thực thi end-to-end (tức là, chạy) của một pipeline LLM trên một đầu vào nào đó. Cho mục đích của phần này, chúng tôi giả định mẫu prompt P được cố định là phiên bản prompt cuối cùng mà nhà phát triển cuối cùng quyết định. Chúng tôi ký hiệu yᵢ ∈ {0,1} để biểu diễn liệu nhà phát triển coi eᵢ là thành công (1) hay thất bại (0).
+
+Gọi E là tập hợp tất cả các ví dụ chạy như vậy (tập hợp này không được cung cấp trước, như chúng ta sẽ xử lý ngay). Chúng tôi định nghĩa một hàm khẳng định f: E → {0,1}, trong đó 1 chỉ ra rằng ví dụ đã được xử lý thành công bởi LLM và 0 ngược lại. Gọi F' = {f₁, f₂, ..., fₖ} là một tập hợp k khẳng định chất lượng dữ liệu. Một ví dụ eᵢ được coi là thành công bởi F' nếu và chỉ nếu nó thỏa mãn tất cả các khẳng định trong F'. Cụ thể:
+
+ŷᵢ = {
+    1 nếu f(eᵢ) = 1 ∀f ∈ F', // Được coi là thành công bởi tất cả F'
+    0 ngược lại. // Được coi là thất bại bởi ≥1 của F'
+}
+
+Cho tất cả m khẳng định ứng viên F = {f₁, f₂, ..., f_m}, mục tiêu là chọn F' ⊆ F sao cho ŷᵢ = yᵢ cho hầu hết các ví dụ trong E, với F' nhỏ nhất có thể. Mục tiêu này liên quan đến việc tối đa hóa độ bao phủ thất bại và tối thiểu hóa tỷ lệ lỗi sai và số lượng hàm được chọn, được biểu diễn như sau:
+
+Định nghĩa 3.1. Độ bao phủ cho một tập hợp F' là tỷ lệ thất bại thực tế được xác định chính xác bởi F', được định nghĩa là:
+
+Coverage_F' = (Σᵢ I[ŷᵢ=0 ∧ yᵢ=0]) / (Σᵢ I[yᵢ=0]) // Thất bại được bắt bởi F'
+
+Định nghĩa 3.2. Tỷ lệ Lỗi Sai (FFR) cho một tập hợp F' là phần nhỏ của các ví dụ mà F' đánh giá sai là thất bại (ŷᵢ=0) khi chúng thực sự thành công (yᵢ=1), được định nghĩa là:
+
+FFR_F' = (Σᵢ I[ŷᵢ=0 ∧ yᵢ=1]) / (Σᵢ I[yᵢ=1]) // Không thất bại được gắn cờ bởi F'
+
+Trong cả hai định nghĩa trên, ŷᵢ biểu diễn dự đoán của tập hợp F' cho ví dụ thứ i, yᵢ là kết quả thực tế, trong khi I là hàm chỉ thị. Trong thực tế, độ bao phủ và FFR là không thể tính toán vì vũ trụ các ví dụ E là không rõ. Vì vậy, hiện tại, chúng tôi giả định truy cập vào một tập con E' ⊂ E của các phản hồi LLM được gán nhãn, trong đó E' là một tập hợp các ví dụ chạy được cung cấp thủ công và có thể không chứa tất cả các loại thất bại mà pipeline LLM có thể quan sát - một vấn đề chúng ta sẽ xử lý trong Mục 3.3. Do đó, chúng tôi thay thế Định nghĩa 3.1 và Định nghĩa 3.2 bằng Coverage^E'_F' và FFR^E'_F', bỏ qua chỉ số E' để ngắn gọn. Bảng 8 trong Phụ lục A tóm tắt ký hiệu được sử dụng trong suốt phần này.
+
+3.2 Công thức Vấn đề Bao phủ
+
+Mục tiêu của chúng tôi do đó là chọn một tập hợp tối thiểu các khẳng định F' ⊆ F dựa trên một mẫu E' = {e₁, ..., eₙ} ⊂ E. Chính thức:
+
+minimize |F'|
+subject to: Coverage(F') ≥ α, FFR(F') ≤ τ
+
+Vấn đề trên có thể không khả thi với một số giá trị của α, vì nhiều lý do. Để thấy điều này, hãy xem xét trường hợp không có khẳng định nào bắt được một thất bại cụ thể, trong khi α được đặt thành 1. Chúng tôi bỏ qua điều này (và các trường hợp tương tự) hiện tại và hoãn cuộc thảo luận của họ đến Mục 4. Để mở rộng ra như trên, chúng tôi giới thiệu một ma trận M (kích thước n×m) để theo dõi kết quả của mỗi khẳng định trên mỗi ví dụ eᵢ, trong đó Mᵢⱼ=1 nếu fⱼ(eᵢ)=1 (tức là, Fⱼ coi eᵢ là thành công) và Mᵢⱼ=0 ngược lại.
+
+Chúng tôi cũng định nghĩa các biến nhị phân xⱼ và wᵢⱼ để biểu diễn liệu một khẳng định có được chọn hay không và nếu nó đánh dấu một ví dụ là thất bại: wᵢⱼ = 1 - Mᵢⱼ · xⱼ, được dựa trên việc liệu fⱼ có biểu thị eᵢ là thất bại hay không và fⱼ có được bao gồm trong F' hay không. Chúng tôi bổ sung giới thiệu biến nhị phân uᵢ để biểu diễn liệu một ví dụ thất bại có được bao phủ bởi bất kỳ khẳng định được chọn nào hay không:
+
+uᵢ ≤ Σⱼ₌₁ᵐ wᵢⱼ, ∀i ∈ [1,n]: yᵢ = 0. // Bao phủ thất bại eᵢ
+
+Sau đó, ràng buộc bao phủ có thể được viết như:
+
+(Σᵢ:yᵢ=0 uᵢ) / (Σᵢ I[yᵢ=0]) ≥ α.
+
+Bây giờ, chúng tôi công thức hóa ràng buộc FFR. Quan sát rằng FFR có thể được phân tách thành như sau:
+
+(Σⁿᵢ₌₁ yᵢ · maxⱼ wᵢⱼ) / (Σⁿᵢ₌₁[yᵢ=1]) ≤ τ. (1)
+
+Tích wᵢⱼ = 1 - Mᵢⱼ · xⱼ trong tử số là 1 nếu fⱼ được bao gồm trong F' và đánh dấu sai một ví dụ tốt là thất bại. Hàm max đảm bảo rằng miễn là có một số hàm được chọn fⱼ đánh dấu eᵢ là thất bại, tích là 1. Nhân yᵢ với kết quả max đảm bảo rằng tử số chỉ được tăng khi yᵢ = 1, hoặc khi ví dụ eᵢ thực sự không phải là thất bại. Tử số này do đó tương đương với tử số trong Định nghĩa 3.2, tức là, yᵢ = 1 ∧ ŷᵢ = 0. Toàn bộ phân số nhỏ hơn ngưỡng τ, biểu diễn tỷ lệ lỗi sai tối đa được phép trên các ví dụ. Để công thức hóa FFR theo (1), chúng tôi giới thiệu một biến nhị phân mới zᵢ, định nghĩa liệu F' có biểu thị eᵢ là thất bại trong khi eᵢ thực sự là một ví dụ thành công hay không (tức là, lỗi sai):
+
+zᵢ ≥ yᵢ · wᵢⱼ, ∀i ∈ [1,n]; ∀j ∈ [1,m]. // eᵢ là lỗi sai
+
+Sau đó, ràng buộc FFR là:
+
+(Σⁿᵢ₌₁ zᵢ) / (Σⁿᵢ₌₁ I[yᵢ=1]) ≤ τ.
+
+Chúng ta sau đó có thể phát biểu vấn đề tối thiểu hóa số lượng khẳng định trong khi đáp ứng các ràng buộc bao phủ E' và FFR như một Chương trình Tuyến tính Nguyên (ILP):
+
+minimize Σⱼ₌₁ᵐ xⱼ
+subject to: wᵢⱼ = (1-Mᵢⱼ)·xⱼ, ∀i ∈ [1,n], ∀j ∈ [1,m];
+            uᵢ ≤ Σⱼ₌₁ᵐ wᵢⱼ, ∀i ∈ [1,n] where yᵢ = 0;
+            (Σᵢ:yᵢ=0 uᵢ) / (Σᵢ I[yᵢ=0]) ≥ α;
+            zᵢ ≥ yᵢ · wᵢⱼ, ∀i ∈ [1,n], ∀j ∈ [1,m];
+            (Σⁿᵢ₌₁ zᵢ) / (Σⁿᵢ₌₁ I[yᵢ=1]) ≤ τ;
+            xⱼ, uᵢ, zᵢ, wᵢⱼ ∈ {0,1}, ∀i ∈ [1,n], ∀j ∈ [1,m].
+
+Chúng tôi gọi một giải pháp cho ILP này là spade_cov. Tầm thường, vấn đề là NP-hard cho τ = 0 và α = 1, thông qua một phép rút gọn đơn giản từ set cover, và nằm trong NP, vì nó có thể được phát biểu dưới dạng ILP. Trong trường hợp của chúng tôi, với hàng chục khẳng định ứng viên và ít hơn 100 ví dụ eᵢ, các ILP có xu hướng có kích thước hợp lý (tức là, hàng nghìn biến). Hầu hết các solver ILP có thể giải quyết hiệu quả và nhanh chóng những chương trình như vậy.
+
+3.3 Công thức Vấn đề Subsumption
+
+Cho đến nay, chúng tôi đã giả định rằng nhà phát triển sẵn sàng cung cấp một tập hợp toàn diện các ví dụ chạy được gán nhãn E'. Trong các cài đặt mà nhà phát triển không sẵn sàng làm như vậy, và nơi E' không bao gồm tất cả các loại thất bại trong E, spade_cov có thể bỏ qua các khẳng định hữu ích trong F chỉ bắt thất bại trong E\E' - như được hiển thị thực nghiệm trong Mục 4. Chúng tôi ban đầu đã xem xét sử dụng học tích cực [7] để lấy mẫu thêm các phản hồi LLM cho mỗi khẳng định và giám sát yếu để gán nhãn các phản hồi [42]. Tuy nhiên, cách tiếp cận này có thể tốn kém với các LLM tiên tiến, và nó đòi hỏi nỗ lực thủ công đáng kể để cân bằng các ví dụ thất bại và thành công cho mỗi khẳng định, đảm bảo FFR có ý nghĩa, và tránh việc loại trừ các khẳng định do các loại thất bại được đại diện thiếu. Đối với cài đặt này, chúng tôi bổ sung giới thiệu khái niệm subsumption. Giả định rằng tất cả các hàm khẳng định ứng viên bao gồm càng nhiều chế độ thất bại càng tốt, mục tiêu của chúng tôi là chọn F' ⊆ F sao cho các khẳng định trong F\F' được subsume bởi F'. Chính thức, một tập hợp hàm S subsume một hàm f nào đó nếu sự kết hợp của các hàm trong S ngụ ý logic sự kết hợp của các hàm trong S và f. Tức là,
+
+Định nghĩa 3.3. Một tập hợp hàm S ⟹ f nếu và chỉ nếu ∀e ∈ E, ∃s ∈ S sao cho s(e) ⟹ f(e). Nói cách khác, nếu S ⟹ f, thì f không bắt thất bại mới nào mà S chưa bắt.
+
+Một ví dụ đơn giản về subsumption như sau: giả sử tập hợp hàm S của chúng ta chỉ chứa một hàm f, phân tích đầu ra LLM thành một danh sách JSON để kiểm tra rằng danh sách có ít nhất 2 phần tử. f có thể được tạo ra như một kết quả của một hướng dẫn liên quan đến số đếm từ phân loại delta prompt của chúng tôi. Bây giờ, gọi g là một hàm khác chỉ kiểm tra xem đầu ra có thể được chuyển thành một danh sách JSON hay không. g có thể đã được tạo ra do một delta loại "Hướng dẫn Định dạng Phản hồi". Nếu g thất bại cho một số đầu ra LLM, f - và do đó S - cũng phải thất bại đầu ra đó; do đó S ⟹ g.
+
+3.3.1 ILP với Các Ràng buộc Subsumption. Chúng tôi tái công thức hóa vấn đề với các ràng buộc subsumption. Gọi G là tập hợp các hàm trong F\F' không được subsume bởi F':
+
+minimize |F'| + |G|
+subject to: Coverage(F') ≥ α, FFR(F') ≤ τ
+
+Để biểu diễn G, chúng tôi giới thiệu các biến nhị phân và một ma trận K để biểu thị các mối quan hệ subsumption. Kᵢⱼ = 1 nếu và chỉ nếu fᵢ ⟹ fⱼ. Chúng tôi thảo luận cách chúng tôi xây dựng K chi tiết hơn trong Mục 3.3.2.
+
+Nhớ lại rằng xⱼ biểu diễn liệu fⱼ có được chọn trong F' hay không. Đối với mỗi hàm fⱼ, một biến nhị phân rⱼ chỉ ra nếu nó được subsume bởi F'.
+
+xᵢ · Kᵢⱼ ≤ rⱼ ≤ Σᵢ₌₁ᵐ (i≠j) xᵢ · Kᵢⱼ, ∀j ∈ [1,m], i ≠ j.
+
+Bây giờ, sⱼ sẽ biểu thị nếu fⱼ không nằm trong F' cũng không được subsume bởi F'. Chúng tôi chia điều này thành ba phần. Đầu tiên,
+
+sⱼ ≤ 1 - xⱼ, ∀j ∈ [1,m],
+
+chỉ ra rằng fⱼ ∉ F' nếu sⱼ được phép là 1 (tức là, fⱼ ∉ F' khi xⱼ = 0). Ràng buộc thứ hai,
+
+sⱼ ≤ 1 - rⱼ, ∀j ∈ [1,m],
+
+bắt điều kiện mà fⱼ không được subsume bởi F'. Ở đây, nếu rⱼ = 0, gợi ý không có subsumption, thì sⱼ có thể là 1. Cuối cùng, để kết hợp những điều kiện này, chúng tôi sử dụng ràng buộc,
+
+sⱼ ≥ 1 - xⱼ - rⱼ, ∀j ∈ [1,m],
+
+đảm bảo rằng sⱼ chỉ có thể là 1 nếu cả hai điều kiện trước được thỏa mãn: fⱼ không nằm trong F' cũng không được subsume bởi F'.
+
+Cuối cùng, mục tiêu của chúng tôi là tối thiểu hóa tổng số lượng hàm trong F' và các hàm không được subsume G. Công thức ILP sau đó trở thành (với các thay đổi được đánh dấu màu xanh):
+
+minimize Σⱼ₌₁ᵐ xⱼ + Σⱼ₌₁ᵐ sⱼ
+subject to: wᵢⱼ = 1 - Mᵢⱼ · xⱼ, ∀i ∈ [1,n], ∀j ∈ [1,m];
+            uᵢ ≤ Σⱼ₌₁ᵐ wᵢⱼ, ∀i ∈ [1,n] where yᵢ = 0;
+            (Σᵢ:yᵢ=0 uᵢ) / (Σᵢ I[yᵢ=0]) ≥ α;
+            zᵢ ≥ yᵢ · wᵢⱼ, ∀i ∈ [1,n], ∀j ∈ [1,m];
+            (Σⁿᵢ₌₁ zᵢ) / (Σⁿᵢ₌₁ I[yᵢ=1]) ≤ τ;
+            xᵢ · Kᵢⱼ ≤ rⱼ ≤ Σᵢ₌₁ᵐ (i≠j) (xᵢ · Kᵢⱼ), ∀j ∈ [1,m], i ≠ j;
+            sⱼ ≤ 1 - xⱼ, sⱼ ≤ 1 - rⱼ, ∀j ∈ [1,m];
+            sⱼ ≥ 1 - xⱼ - rⱼ, ∀j ∈ [1,m];
+            xⱼ, uᵢ, zᵢ, wᵢⱼ, rⱼ, sⱼ ∈ {0,1}, ∀i ∈ [1,n], ∀j ∈ [1,m].
+
+Chúng tôi gọi một giải pháp cho ILP này là spade_sub. Chúng tôi duy trì ràng buộc bao phủ vì cách tiếp cận subsumption một mình không vốn có tính toán phân phối hoặc tầm quan trọng của các loại thất bại khác nhau. Ví dụ, nếu một loại thất bại cụ thể tạo thành một phần quan trọng của E', một cách tiếp cận dựa trên subsumption có thể bỏ qua nó. Để thấy điều này trong trường hợp đơn giản nhất, hãy xem xét α = 1: đơn giản chỉ tối ưu hóa cho tổng |F'| + |G| không đảm bảo tất cả thất bại trong E' được bao phủ. Trong thực tế, spade_sub ít nhạy cảm hơn với α so với spade_cov, như chúng ta sẽ thảo luận thêm trong Mục 4.
+
+3.3.2 Đánh giá Subsumption. Ở đây, chúng tôi chi tiết cách xây dựng K, ma trận của chúng tôi biểu diễn các mối quan hệ subsumption giữa các cặp hàm fᵢ, fⱼ. Đối với các hàm Python thuần túy, người ta có thể sử dụng phân tích tĩnh để xác định subsumption. Tuy nhiên, nó trở nên phức tạp khi xử lý các khẳng định bao gồm các cuộc gọi LLM hoặc một hỗn hợp các khẳng định Python thuần túy và gọi LLM. Đối với những cái này, spade sử dụng GPT-4 để xác định các subsumption tiềm năng {a} ⟹ b cho các cặp hàm a, b. Đối với bất kỳ pipeline nào, chỉ có hai cuộc gọi đến LLM để xác định tất cả subsumption: đầu tiên, tất cả các hàm khẳng định được kết hợp thành một prompt duy nhất cho GPT-4, hướng dẫn nó liệt kê càng nhiều mối quan hệ subsumption càng có thể xác định, sau đó prompt nó một lần nữa để chuyển đổi phản hồi của nó thành một danh sách có thể phân tích các cặp a ⟹ b. Chi tiết của prompt subsumption LLM này có trong Phụ lục C.
+
+Để tối đa hóa độ chính xác của các mối quan hệ ⟹ được xác định, chúng tôi sử dụng một số heuristic. Đầu tiên, E' có thể lọc các subsumption: đối với fᵢ và fⱼ, quan sát rằng:
+
+∃eᵢ ∈ E': (fᵢ(eᵢ) = 1) ∧ fⱼ(eᵢ) = 0 ⟹ {..., fᵢ, ...} ≠⟹ fⱼ.
+
+Nói cách khác, bất kỳ tập hợp nào chứa fᵢ chắc chắn không subsume fⱼ nếu fⱼ gắn cờ một thất bại mà {fᵢ} không gắn. Tiếp theo, chúng tôi sử dụng ngưỡng FFR để bỏ qua việc đánh giá subsumption. Quan sát rằng, đối với bất kỳ tập hợp khẳng định S và f ∉ S,
+
+max(FFR(S), FFR({f})) ≤ FFR(S ∪ {f}),
+FFR(S ∪ {f}) ≤ FFR(S) + FFR({f}). (2)
+
+Như vậy, chúng ta không cần đánh giá {fᵢ} ⟹ fⱼ nếu FFR({fᵢ}) ≥ τ hoặc FFR{fⱼ} ≥ τ. Cuối cùng, chúng tôi sử dụng tính bắc cầu của ngụ ý để tỉa thêm các kiểm tra: nếu x ⟹ y và y ⟹ z, thì x ⟹ z cũng đúng.
+
+3.3.3 Subsumption không có Ví dụ. Để hoàn chỉnh, chúng tôi cũng xem xét trường hợp mà chúng ta không có ví dụ E' được cung cấp bởi nhà phát triển. Trong trường hợp này, chúng ta chỉ dựa vào các mối quan hệ subsumption của chúng ta để chọn tập hợp F' của chúng ta. Vấn đề của chúng ta sau đó có thể được phát biểu lại như sau:
+
+minimize Σⱼ₌₁ᵐ xⱼ + Σⱼ₌₁ᵐ sⱼ
+subject to: xᵢ · Kᵢⱼ ≤ rⱼ ≤ Σᵢ₌₁ᵐ (i≠j) (xᵢ · Kᵢⱼ), ∀j ∈ [1,m];
+            sⱼ ≤ 1 - xⱼ, sⱼ ≤ 1 - rⱼ, ∀j ∈ [1,m];
+            sⱼ ≥ 1 - xⱼ - rⱼ, ∀j ∈ [1,m];
+            xⱼ, rⱼ, sⱼ ∈ {0,1}, ∀j ∈ [1,m].
+
+Tuy nhiên, hóa ra vấn đề này không còn NP-Hard nữa. Xem xét ví dụ trong Hình 6, nơi một cạnh chỉ ra subsumption. Ví dụ a → b có nghĩa là b bắt một tập con các thất bại của a, và do đó được subsume bởi a. Ở đây, nếu chúng ta tối thiểu hóa Σⱼ(xⱼ + sⱼ), chúng ta sẽ đơn giản chọn a và e là một phần của F', vì phần còn lại của các hàm sẽ được subsume (do đó sⱼ = 0 của chúng - nhớ lại rằng sⱼ = 1 cho các khẳng định không được subsume cũng không được chọn), và metric tổng thể của chúng ta sẽ đánh giá thành 2. Một cách trực quan để xem vấn đề này là bắt đầu bằng cách giữ tất cả các nút như không được chọn, tức là, xⱼ = 0, sⱼ = 1, và sau đó bằng cách thêm chúng từng cái một theo thứ tự được định nghĩa trước vào F', chúng ta đặt xⱼ = 1, sⱼ = 0, và cùng lúc, chúng ta cũng tác động đến sⱼ (di chuyển chúng từ 1 đến 0) cho tất cả các hàm khác sau đó trở thành được subsume như một kết quả.
+
+Tổng quát hơn, các mối quan hệ subsumption có thể được biểu diễn dưới dạng Đồ thị Có hướng Không chu trình (DAG), như trong ví dụ của chúng ta ở trên. (Chúng tôi bỏ qua trường hợp tầm thường nơi hai hoặc nhiều hàm tương đương, đó là trường hợp duy nhất có thể có chu trình; trong tất cả các trường hợp khác chúng ta có một DAG.) Trong DAG này, chúng ta đơn giản chọn tất cả các nút không có cạnh đến và thêm chúng vào F'. Chúng ta có thể thấy rằng phần còn lại của các nút được subsume, vì chúng có ít nhất một cạnh đến. Chúng ta chắc chắn có thể loại trừ một nút không có bất kỳ cạnh đến nào khỏi F', nhưng việc thêm nó vào F' không làm tệ hơn mục tiêu vì không có cách nào mà nút đó sẽ được subsume bởi một nút khác. Vì vậy, nhìn chung, chúng ta cần thực hiện một sắp xếp tô pô của đồ thị subsumption và chọn các nút "ở đầu". Do đó, vấn đề nằm trong PTIME khi không có ví dụ nào được cung cấp.
+
+4 ĐÁNH GIÁ
+
+Chúng tôi đầu tiên thảo luận về các pipeline LLM và tập dữ liệu (tức là, E'); sau đó, chúng tôi thảo luận về các phương pháp và metric và trình bày kết quả của chúng tôi. Mã thử nghiệm, tập dữ liệu và phản hồi LLM được lưu trữ trên GitHub⁶.
+
+4.1 Mô tả Pipeline và Tập dữ liệu
+
+Chúng tôi đánh giá spade trên chín pipeline LLM - tám từ LangChain Hub⁷, một tập hợp mã nguồn mở các pipeline LLM, và 1 pipeline độc quyền. Mỗi pipeline bao gồm một mẫu prompt cho LLM và tập hợp khoảng 75 ví dụ (tức là, đầu vào và đầu ra trong E') với nhãn cho liệu đầu ra có tốt hay xấu. Tất cả chín pipeline đến từ người dùng LangChain. Sáu pipeline được sử dụng trong việc phát triển phân loại delta prompt của chúng tôi (Mục 2.2), mỗi cái đại diện cho một lĩnh vực khác nhau (ví dụ, lập trình, tài chính, marketing). Hai pipeline đến từ triển khai Streamlit của spade (Mục 2.4). Chúng tôi bao gồm một pipeline độc quyền cuối cùng (pipeline thời trang) trong các thử nghiệm của chúng tôi vì nó có số lượng phiên bản mẫu prompt lớn nhất và các khẳng định của spade đã được triển khai trong sản xuất cho hàng chục nghìn lần chạy hàng ngày.
+
+Bảng 3 cung cấp chi tiết về mỗi pipeline LLM và tập hợp tương ứng các ví dụ tốt và xấu. Đối với pipeline thời trang, các ví dụ tốt và xấu được cung cấp bởi một nhà phát triển tại startup tương ứng. Trong khi chúng tôi sử dụng các mẫu prompt do người dùng thực cung cấp và lịch sử (từ 3 đến 16 phiên bản prompt) cho 8 pipeline khác, chúng tôi đã xây dựng và chú thích các ví dụ đầu vào-đầu ra của riêng chúng tôi để có thể phát hành chúng công khai. Đối với hai pipeline, chúng tôi lấy nguồn ví dụ từ Kaggle. Đối với sáu pipeline khác, chúng tôi tạo ra tổng hợp các tập dữ liệu khác sử dụng Chat GPT Pro (dựa trên GPT-4) và xem xét thủ công chúng. Ví dụ, đối với pipeline codereviews sử dụng LLM để xem xét các pull request, chúng tôi yêu cầu Chat GPT tạo ra các pull request ví dụ bao gồm nhiều ngôn ngữ lập trình, loại ứng dụng và kích thước diff khác nhau. Trung bình, chúng tôi thu thập 75 ví dụ mỗi pipeline. Sau đó chúng tôi thực thi các pipeline LLM trên những đầu vào này và gán nhãn thủ công các phản hồi để đánh giá xem chúng có đáp ứng hướng dẫn prompt hay không.
+
+4.2 So sánh Phương pháp và Metric
+
+Như trước, gọi E' là một tập dữ liệu của các cặp prompt-phản hồi ví dụ, cũng như các nhãn tương ứng về việc phản hồi có tốt (tức là, 1) hay xấu (tức là, 0). Gọi τ là ngưỡng FFR và F là tập hợp các khẳng định ứng viên được tạo ra bởi bước đầu tiên của spade (Mục 2). Nếu một hàm ứng viên f dẫn đến lỗi runtime cho một số ví dụ e, chúng tôi biểu thị f(e) = 0 (tức là, thất bại). Tất cả mã của chúng tôi được viết bằng Python, sử dụng gói Python PuLP để tìm giải pháp cho các ILP. Chúng tôi sử dụng cấu hình PuLP mặc định, sử dụng solver CBC [19].
+
+Baseline đơn giản nhất liên quan đến việc tạo ra các khẳng định ứng viên và chọn tất cả chúng, nhưng nó tỏ ra không hiệu quả, mang lại 100% độ bao phủ và 100% FFR do ít nhất một khẳng định thất bại tất cả các thử nghiệm. Thất bại do lỗi hoặc điều kiện quá cụ thể mà, về lý thuyết, có thể vượt qua một số đầu ra (ví dụ, yêu cầu một cụm từ chính xác trong một trường hợp nhất định) nhưng, trong thực tế, không bao giờ khớp với bất kỳ đầu ra LLM thực tế nào. Như vậy, chúng tôi đánh giá hai phiên bản của spade so với một baseline đơn giản chỉ lọc các khẳng định ứng viên vượt quá ngưỡng FFR cá nhân:
+
+• baseline chọn tất cả hàm f trong F nơi FFR({f}) ≤ τ
+• spade_cov là một giải pháp cho ILP được định nghĩa trong Mục 3.2
+• spade_sub là một giải pháp cho ILP được định nghĩa trong Mục 3.3.1
+
+Gọi F' biểu diễn tập hợp các khẳng định được chọn bởi bất kỳ phiên bản nào của spade. Chúng tôi đo bốn metric:
+
+(1) Phần nhỏ Khẳng định được Chọn (tức là, |F'|/|F|)
+(2) Phần nhỏ Hàm Loại trừ Không được Subsume (tức là, |G|/|F|, nơi G = {g | g ∈ F\F' và F' ≠⟹ g})
+(3) Tỷ lệ Lỗi Sai (Định nghĩa 3.2)
+(4) Độ bao phủ trên E' (Định nghĩa 3.1)
+
+Ngoài ra, một khía cạnh quan trọng của thành công của spade_sub là hiệu quả của đánh giá subsumption giữa tất cả các cặp khẳng định. Vì chúng tôi không có sự thật cơ bản cho subsumption, chúng tôi tập trung vào độ chính xác, được tính như tỷ lệ các cặp được subsume được xác định chính xác ra khỏi tất cả các cặp được subsume được xác định bởi LLM. Chúng tôi không đánh giá recall - liệu GPT-4 có xác định được mọi subsumption có thể hay không - do tính không thực tế của việc gán nhãn có thể hàng chục nghìn cặp khẳng định mỗi pipeline. Hơn nữa, độ chính xác quan trọng hơn recall hoặc độ chính xác, vì việc xác định ngay cả một số subsumption cho phép spade_sub đạt được một giải pháp với ít khẳng định được chọn hơn so với baseline.
+
+4.3 Kết quả và Thảo luận
+
+Đầu tiên, chúng tôi thảo luận ngắn gọn liệu các thành phần cá nhân của spade có thực tế hay không (ví dụ, xác định subsumption, giải quyết các ILP). Việc sử dụng GPT-4 để đánh giá subsumption dẫn đến độ chính xác trung bình 0.82 trên tất cả pipeline, như được thấy trong Bảng 5, xác nhận hiệu quả của nó. Thời gian chạy ILP trong Bảng 6 đều dưới một giây, ngoại trừ 1.197 giây cho spade_sub cho pipeline thời trang. Thời gian chạy tương đối nhỏ này chứng minh tính khả thi của cách tiếp cận của chúng tôi.
+
+Trong phần còn lại của phần này, chúng tôi sẽ tập trung vào các khẳng định được chọn bởi các phương pháp khác nhau.
+
+Để đơn giản, chúng tôi đặt ngưỡng bao phủ và FFR giống nhau trên tất cả pipeline (α = 0.6, τ = 0.25). Chúng tôi báo cáo kết quả cho ba phương pháp trong Bảng 4. Xem xét pipeline codereviews, ví dụ, sử dụng LLM để xem xét một pull request cho bất kỳ kho mã nào. Ở đây, baseline chọn 20 khẳng định, spade_cov chọn hai khẳng định, và spade_sub chọn 15 khẳng định. Bằng cách chọn nhiều hàm hơn, spade_sub đảm bảo rằng tất cả các hàm không được subsume được bao gồm. Cả ba cách tiếp cận đều tôn trọng ràng buộc bao phủ E', nhưng baseline vi phạm ràng buộc FFR trong 4 trong số 9 pipeline, trong khi các cách tiếp cận spade không vi phạm ràng buộc FFR.
+
+Đối với khối lượng công việc của chúng tôi, spade_sub chọn khoảng 14% ít khẳng định hơn so với baseline và cho thấy FFR thấp hơn đáng kể, giảm nó khoảng 21% so với baseline. spade_cov loại trừ, trung bình, khoảng 44% hàm không được subsume bởi F'. Việc chọn một triển khai spade chủ yếu phụ thuộc vào có bao nhiêu dữ liệu được gán nhãn có sẵn. Chúng tôi tiếp theo thảo luận các đánh đổi giữa các triển khai spade khác nhau.
+
+Subsumption so với Bao phủ E'. spade_cov và spade_sub là bổ sung, cái trước hữu ích hơn nếu E' toàn diện hơn. Đối với các tập dữ liệu của chúng tôi, E' không toàn diện: Bảng 4 tiết lộ rằng, trung bình, 44% hàm bị loại trừ bởi spade_cov không được subsume bởi các hàm được chọn, mặc dù chính xác trong ngưỡng FFR. Điều này không đáng ngạc nhiên cho rằng mỗi tác vụ chỉ có trung bình 34 ví dụ xấu (tức là, thất bại). Trong khi các tổ chức lớn hơn hoặc trưởng thành hơn có thể có các tập dữ liệu rộng lớn và có thể nhận được kết quả có ý nghĩa từ spade_cov, khả năng của spade_sub để chọn các khẳng định bao gồm các thất bại tiềm năng không được đại diện có thể có lợi trong các cài đặt khan hiếm dữ liệu. Ví dụ, đây là mẫu của 3 khẳng định cho pipeline codereviews bị bỏ qua bởi spade_cov nhưng được bao gồm trong spade_sub (với các bình luận bị loại trừ để ngắn gọn):
+
+```python
+async def assert_includes_code_improvement_v2(
+    example: dict, prompt: str, response: str
+):
+    question = "Does the response include suggestions for code improvements?"
+    return await ask_llm(prompt, response, question)
+
+async def assert_contains_brief_answers_v1(example:
+    dict, prompt: str, response: str):
+    question = "Is the response brief and to the point without unnecessary elaboration?"
+    return await ask_llm(prompt, response, question)
+
+async def assert_responds_to_correct_pull_request(
+    example: dict, prompt: str, response: str
+):
+    pr_title = example["title"]
+    question = (
+        f"Is the response a review focused on the Pull Request titled '{pr_title}'?"
+    )
+    return ask_llm(prompt, response, presence_question) and ask_llm(prompt, response, accuracy_question)
+```
+
+Subsumption như một Phương tiện để Giảm Dư thừa. Một số pipeline thể hiện một sự khác biệt lớn giữa các hàm được chọn trong baseline và spade_sub, điều này xảy ra khi có nhiều ứng viên dư thừa. Ví dụ, trong 8 phiên bản prompt của pipeline codereviews, nhà phát triển đã lặp lại nhiều lần trên hướng dẫn để đưa ra một đánh giá rõ ràng và ngắn gọn, dẫn đến năm khẳng định kiểm tra cùng một điều (hai trong số đó được hiển thị bên dưới):
+
+```python
+async def assert_response_is_concise_v1(
+    example: dict, prompt: str, response: str
+) -> bool:
+    question = "Is the LLM response concise and to the point?"
+    return await ask_llm(prompt, response, question)
+
+async def assert_response_is_concise_and_clear(
+    example: dict, prompt: str, response: str
+):
+    question = "Is this pull request review response concise and clear?"
+    return await ask_llm(prompt, response, question)
+
+async def assert_clear_professional_language_v1(
+    example: dict, prompt: str, response: str
+):
+    question = "Is the response professional, clear, and without unnecessary jargon or overly complex vocabulary?"
+    return await ask_llm(prompt, response, question)
+```
+
+Vì tất cả năm khẳng định đáp ứng ràng buộc FFR, cá nhân, baseline sẽ chọn tất cả chúng, điều này không mong muốn vì tất cả đều làm cùng một việc, nhưng spade_sub sẽ chọn cái tương thích nhất với ràng buộc FFR, miễn là subsumption được đánh giá chính xác. Mặt khác, trong khi đánh giá subsumption, LLM có thể không nhớ lại tất cả subsumption, vì vậy spade_sub có thể có các khẳng định trùng lặp. Ví dụ, pipeline codereviews chứa các khẳng định có tiêu đề assert_includes_code_improvement_v1 và assert_includes_code_improvement_v2.
+
+Độ nhạy Ngưỡng α và τ. Tính khả thi của các giải pháp từ solver ILP trong spade phụ thuộc vào các ngưỡng α và τ được chọn. Nếu một giải pháp khả thi không được tìm thấy, các nhà phát triển có thể cần điều chỉnh những giá trị này một cách tìm kiếm nhị phân. Trong trường hợp của chúng tôi, tất cả 9 pipeline LLM đều mang lại các giải pháp khả thi với α = 0.6 và τ = 0.25. Tuy nhiên, kích thước nhỏ của E' làm cho spade_cov đặc biệt nhạy cảm với α. Trong các pipeline, chúng tôi quan sát rằng từ một đến năm khẳng định bao gồm 60% thất bại của E'. Ví dụ, spade_cov chỉ chọn một khẳng định cho pipeline emails:
+
+```python
+async def assert_encouragement_to_contact_company(
+    example: dict, prompt: str, response: str
+) -> bool:
+    contact_phrases = [
+        "reach out",
+        "don't hesitate to contact",
+        "looking forward to hearing from you",
+        "if you have any questions",
+        "need help getting started",
+    ]
+    return any(phrase in response for phrase in contact_phrases)
+```
+
+Nếu E' đầy đủ về các chế độ thất bại và đại diện cho phân phối thất bại (ví dụ, cho pipeline emails, hầu hết thất bại thực sự do phản hồi thiếu khuyến khích liên hệ với công ty), spade_cov có thể là một giải pháp thỏa đáng. Tuy nhiên, các tập dữ liệu E' của chúng tôi rõ ràng không đầy đủ, xem xét rằng spade_sub luôn chọn các khẳng định bổ sung. spade_sub ít nhạy cảm hơn với α, vì nó rõ ràng chọn các khẳng định dựa trên tiềm năng của chúng để bao gồm các thất bại mới (tức là, subsumption) mà không vượt quá FFR, ngay cả khi ràng buộc về bao phủ không còn chặt chẽ.
+
+Đánh đổi FFR. Xem xét rằng sự khác biệt giữa phần nhỏ hàm được chọn cho baseline và spade_sub nhỏ hơn 10% cho ba pipeline LLM, người ta có thể tự hỏi liệu sự phức tạp của spade_sub có đáng không. spade_sub thường được ưa thích hơn vì baseline thất bại trong việc đáp ứng nhất quán ngưỡng FFR τ. Chúng tôi quan sát rằng khi các phiên bản prompt tăng, số lượng khẳng định cũng tăng, tác động đến baseline một cách bất lợi. FFR tệ nhất của một tập hợp là tổng của các FFR cá nhân, như được hiển thị trong Phương trình (2). Do đó, với số lượng lớn các khẳng định độc lập, FFR tổng có khả năng vượt quá ngưỡng. Vấn đề này rõ ràng trong các pipeline thời trang và lecturesummaries, nơi mặc dù mỗi trong số 67 và 32 khẳng định đáp ứng ràng buộc FFR cá nhân, FFR tổng cho baseline đạt 88% và 53%, tương ứng. Trong thực tế, nếu spade được triển khai trong một hệ thống tương tác, nơi spade có thể quan sát mỗi cuộc gọi LLM theo thời gian thực (ví dụ, như một wrapper xung quanh OpenAI API), vô số phiên bản prompt tiếp tục cần thiết lọc các khẳng định dựa trên FFR tổng thể. Điều này nhấn mạnh sự cần thiết cho các cách tiếp cận spade_cov hoặc spade_sub phức tạp hơn.
+
+4.4 Hạn chế và Công việc Tương lai
+
+Cải thiện Chất lượng LLM. Trong khi LLM (cả đóng và mã nguồn mở) đang cải thiện nhanh chóng, và chúng tôi không nghiên cứu rõ ràng các chiến lược kỹ thuật prompt cho spade, một ý tưởng nghiên cứu bổ sung là khám phá những chiến lược như vậy hoặc fine-tune các mô hình mã nguồn mở nhỏ để tạo ra các khẳng định. Hơn nữa, chúng tôi đề xuất subsumption như một proxy bao phủ nhưng không khám phá kỹ thuật prompt hoặc thậm chí các chiến lược không-LLM (ví dụ, nguồn gốc khẳng định) để đánh giá subsumption. Mặc dù có những tiến bộ của LLM, giai đoạn lọc của spade vẫn quan trọng để giảm dư thừa và đảm bảo độ chính xác, đặc biệt vì các khẳng định có thể liên quan đến LLM.
+
+Thu thập Ví dụ được Gán nhãn. Việc thu thập dữ liệu được gán nhãn (E') là khó khăn. Hầu hết các tập dữ liệu của chúng tôi có rất ít phiên bản prompt (chỉ những cái được commit vào LangChain Hub), nhưng trong thực tế, các nhà phát triển có thể lặp lại trên prompt của họ hàng chục hoặc hàng trăm lần. Công việc tương lai có thể liên quan đến thu thập ví dụ thụ động thông qua các wrapper API LLM hoặc thu thập phản hồi của nhà phát triển về các khẳng định. Ưu tiên các loại khẳng định khác nhau và chính thức hóa những ưu tiên này trong spade là một lĩnh vực khác để khám phá. Ngoài ra, đánh giá độ chính xác của ước tính FFR với E' hạn chế và khám phá các phương pháp để tăng cường độ chính xác FFR trong trường hợp không có các tập dữ liệu được gán nhãn lớn (ví dụ, thông qua suy luận được cung cấp dự đoán [2]), trình bày một lĩnh vực thú vị cho công việc tương lai.
+
+Hỗ trợ Các Pipeline LLM Phức tạp Hơn. Nghiên cứu của chúng tôi tập trung vào các pipeline LLM một prompt, nhưng các pipeline phức tạp hơn, chẳng hạn như những cái liên quan đến nhiều prompt, tài nguyên bên ngoài và tương tác con người, trình bày các cơ hội để tự động tạo ra các khẳng định cho từng thành phần pipeline. Ví dụ, trong các pipeline tăng cường truy xuất [31], các khẳng định có thể được áp dụng cho ngữ cảnh được truy xuất trước khi các phản hồi LLM thậm chí được tạo ra.
+
+5 CÔNG VIỆC LIÊN QUAN
+
+Chúng tôi khảo sát công việc từ kỹ thuật prompt, đánh giá ML và LLM, LLM cho thử nghiệm phần mềm, và thử nghiệm các pipeline ML.
+
+Kỹ thuật Prompt. Đối với cả người dùng không kỹ thuật [64] và kỹ thuật [39,53], kỹ thuật prompt khó khăn vì một số lý do: những thay đổi nhỏ trong cách diễn đạt prompt [4,32] hoặc thứ tự của hướng dẫn hoặc ngữ cảnh [34] có thể ảnh hưởng đáng kể đến đầu ra. Hơn nữa, khi LLM thay đổi dưới nắp capô của API (tức là, drift prompt), đầu ra có thể thay đổi mà không nhận thức của nhà phát triển [10]. Các công cụ và bài báo đang nổi lên để hỗ trợ quản lý prompt và thử nghiệm, và thậm chí sử dụng LLM để viết prompt [3,12,61,62,66]. Hơn nữa, các prompt được triển khai giới thiệu những thách thức mới, như "cân bằng nhiều ngữ cảnh hơn với ít token hơn" và "xử lý đầu ra prompt" để đáp ứng tiêu chí do người dùng định nghĩa [40]. Công việc của chúng tôi không tập trung rõ ràng vào việc giúp các nhà phát triển tạo ra các prompt tốt hơn, nhưng nó có thể gián tiếp hỗ trợ các nhà phát triển bằng cách giúp xác định các lỗi.
+
+Đánh giá ML và LLM. Đánh giá và theo dõi các mô hình ML được triển khai được biết là thách thức [38,51]. Đánh giá LLM trong một cài đặt triển khai thậm chí còn thách thức hơn vì LLM thường được sử dụng cho các tác vụ sinh, nơi các đầu ra là tự do [14]. Một số loại pipeline LLM, như hỏi-đáp với các pipeline tăng cường truy xuất [31], có thể sử dụng các metric tự động, tiêu chuẩn [15,45], nhưng những loại khác đối mặt với thách thức do các metric không rõ và thiếu các tập dữ liệu được gán nhãn [9,40,63]. Thường thì, các tổ chức dựa vào các đánh giá viên con người cho các đầu ra LLM [20,40,59], nhưng các nghiên cứu gần đây gợi ý LLM có thể tự đánh giá hiệu quả với "scorecard" chi tiết [8,28,65]. Tuy nhiên, việc viết những scorecard này có thể thách thức [40], thúc đẩy các đánh giá viên được tự động tạo ra. Công việc gần đây [28,43,55] và các công cụ ngành [23,29,33] đề xuất sử dụng các khẳng định để bắt các lỗi trong các pipeline LLM, trong khi yêu cầu người dùng chọn những khẳng định này.
+
+LLM cho Thử nghiệm Phần mềm. LLM đang được sử dụng ngày càng nhiều trong thử nghiệm phần mềm, chủ yếu để tạo ra các unit test và test case [30,46,54,56,57]. Nghiên cứu khám phá cách các chiến lược prompting, ảo giác và tính không xác định của LLM ảnh hưởng đến độ chính xác mã hoặc test [11,16,17,37]. Công việc của chúng tôi là bổ sung và tận dụng LLM để tạo ra các khẳng định dựa trên mã cho các pipeline LLM.
+
+Thử nghiệm và Xác thực trong Các Pipeline ML. Các pipeline ML khó quản lý trong sản xuất. Phần lớn văn học về thử nghiệm ML hướng tới việc xác thực dữ liệu có cấu trúc, thông qua phân tích chất lượng dữ liệu [6,24,48,49] hoặc nguồn gốc [35,47]. Các nền tảng cho thử nghiệm ML thường cung cấp theo dõi thử nghiệm tự động và phòng ngừa chống overfitting [1,44], cũng như các công cụ để debug phân phối dữ liệu [21]. Các khẳng định cụ thể mô hình thường yêu cầu đặc tả con người [27], hoặc ít nhất là lượng lớn dữ liệu để huấn luyện các khẳng định được học [26]. Các chuỗi hoặc pipeline LLM là một lớp mới của pipeline ML, và bản thân LLM có thể tạo ra các khẳng định với ít dữ liệu. Một nghiên cứu gần đây nhấn mạnh khó khăn của việc thử nghiệm các pipeline LLM cho các sản phẩm "copilot"-như: các nhà phát triển muốn đảm bảo độ chính xác trong khi tránh sử dụng tài nguyên quá mức, chẳng hạn như chạy hàng trăm khẳng định [40] - thúc đẩy lọc khẳng định.
+
+6 KẾT LUẬN VÀ CÔNG VIỆC TƯƠNG LAI
+
+Chúng tôi giới thiệu một vấn đề mới về tự động tạo ra các khẳng định để bắt thất bại trong các pipeline LLM, cũng như spade, framework của chúng tôi để làm như vậy. spade bao gồm hai thành phần: đầu tiên, nó tổng hợp các khẳng định ứng viên, và sau đó nó lọc chúng xuống thành một tập con dễ quản lý hơn. Để tổng hợp các khẳng định ứng viên, chúng tôi đã phân tích lịch sử phiên bản prompt và học được rằng các delta prompt thường là một nguồn phong phú của yêu cầu và do đó các khẳng định ứng viên. Chúng tôi đã phát triển một phân loại của các delta prompt cho tổng hợp khẳng định, chứng minh giá trị của nó thông qua tích hợp và triển khai với LangChain, với hơn 2000 lần chạy trên các lĩnh vực. Đối với vấn đề sau của lọc khẳng định ứng viên, chúng tôi biểu diễn việc chọn một tập hợp tối ưu các khẳng định, bao gồm hầu hết thất bại trong khi giới thiệu ít thất bại sai nhất có thể như một Chương trình Tuyến tính Nguyên (ILP). Chúng tôi đề xuất subsumption khẳng định để bao gồm thất bại trong các kịch bản khan hiếm dữ liệu và kết hợp điều này vào ILP của chúng tôi. Chúng tôi cũng nghiên cứu cài đặt nơi không có ví dụ nào và chứng minh rằng nó rút gọn thành một sắp xếp tô pô trên đồ thị subsumption. Hệ thống tự động tạo ra khẳng định của chúng tôi, spade, đã được đánh giá trên chín pipeline LLM tạo dữ liệu thực tế. Chúng tôi đã công khai mã và tập dữ liệu của chúng tôi để nghiên cứu và phân tích thêm.
+
+Có một số câu hỏi mở trong nỗ lực của chúng tôi để làm cho các pipeline LLM sản xuất mạnh mẽ hơn. Ví dụ, trong khi đáp ứng tiêu chí do nhà phát triển cung cấp (α, τ) hữu ích, đôi khi các nhà phát triển muốn kiểm tra các khẳng định được tạo ra và được chọn theo cách giúp họ tự đưa ra các đánh đổi, thúc đẩy một giao diện human-in-the-loop để hỗ trợ các nhà phát triển trong việc định nghĩa chất lượng dữ liệu cho các pipeline LLM. Một giao diện như vậy cũng có thể là một phương tiện để các nhà phát triển gán nhãn ví dụ khi đang bay. Xác định ví dụ được gán nhãn nào sẽ giúp tốt nhất chọn từ tập hợp các khẳng định là một câu hỏi mở gợi nhớ đến học tích cực. Cuối cùng, chúng ta cũng có thể hình dung việc tự động cập nhật các tập hợp khẳng định trong các pipeline được triển khai, khi các chế độ thất bại mới không thể tránh khỏi xuất hiện trong sản xuất.

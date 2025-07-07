@@ -1,0 +1,137 @@
+# Clover: Giải mã Suy đoán Hồi quy Nhẹ với Kiến thức Tuần tự
+
+Bin Xiao¹ Chunan Shi² Xiaonan Nie¹² Fan Yang¹ Xiangwei Deng²
+Lei Su¹ Weipeng Chen¹ Bin Cui²
+¹Baichuan Inc. ²Đại học Bắc Kinh
+{xiaobin, yangfan, sulei, chenweipeng}@baichuan-inc.com
+{spirited_away, xiaonan.nie, bin.cui}@pku.edu.cn, dengxiangwei@stu.pku.edu.cn
+
+## Tóm tắt
+
+Các mô hình ngôn ngữ lớn (LLM) gặp vấn đề hiệu suất thấp do sự không khớp giữa yêu cầu giải mã tự hồi quy và thiết kế của hầu hết GPU hiện đại. Cụ thể, hàng tỷ đến hàng nghìn tỷ tham số phải được tải lên bộ nhớ đệm GPU thông qua băng thông bộ nhớ hạn chế để tính toán, nhưng chỉ một lô nhỏ token được tính toán thực tế. Do đó, GPU dành phần lớn thời gian cho việc truyền bộ nhớ thay vì tính toán. Gần đây, giải mã song song, một loại thuật toán giải mã suy đoán, đang trở nên phổ biến hơn và đã chứng minh được cải thiện hiệu suất ấn tượng trong việc sinh text. Nó giới thiệu các đầu giải mã bổ sung cho các mô hình lớn, cho phép chúng dự đoán nhiều token tiếp theo đồng thời và xác minh các ứng cử viên tiếp nối này trong một bước giải mã duy nhất. Tuy nhiên, cách tiếp cận này lệch khỏi mục tiêu huấn luyện dự đoán token tiếp theo được sử dụng trong quá trình tiền huấn luyện, dẫn đến tỷ lệ trúng thấp cho các token ứng cử viên.
+
+Trong bài báo này, chúng tôi đề xuất một thuật toán giải mã suy đoán mới, Clover, tích hợp kiến thức tuần tự vào quá trình giải mã song song. Cải tiến này nâng cao tỷ lệ trúng của các bộ suy đoán và do đó tăng hiệu suất tổng thể. Clover truyền kiến thức tuần tự từ các token được suy đoán trước thông qua Kết nối Hồi quy, sau đó sử dụng Bộ giải mã Attention để tích hợp các token được suy đoán này. Ngoài ra, Clover kết hợp một Khối Tăng cường sửa đổi các trạng thái ẩn để phù hợp hơn với mục đích sinh suy đoán thay vì dự đoán token tiếp theo. Chúng tôi đã tiến hành thí nghiệm trên cả Baichuan-Small (với 7B tham số) và Baichuan-Large (với hơn 100B tham số). Kết quả cho thấy Clover đạt hiệu suất vượt trội so với các phương pháp hiện có trên các kích thước mô hình khác nhau. Cụ thể, Clover vượt qua baseline lên đến 91% trên Baichuan-Small và 146% trên Baichuan-Large, và vượt qua hiệu suất của phương pháp có hiệu suất cao nhất trước đây, Medusa, lên đến 37% trên Baichuan-Small và 57% trên Baichuan-Large.
+
+## 1. Giới thiệu
+
+Các mô hình ngôn ngữ lớn sinh tạo (LLM) như GPT, đại diện cho một bước đột phá quan trọng trong trí tuệ nhân tạo. Chúng đã chứng minh khả năng đáng kể trên nhiều ứng dụng đa dạng, từ sáng tác các tác phẩm văn học sáng tạo đến tạo ra các cuộc đối thoại giống con người trong chatbot. Khả năng hiểu và tạo ra ngôn ngữ của chúng đã mở ra những con đường mới cho tương tác người-máy, tự động hóa các tác vụ đòi hỏi hiểu biết về ngữ cảnh và sắc thái.
+
+Tuy nhiên, mặc dù có khả năng mạnh mẽ, LLM cũng đặt ra những thách thức đáng kể liên quan đến hiệu suất sinh thấp trên GPU. Cụ thể, các mô hình này tạo văn bản tuần tự bằng cách sinh ra một token đầu ra cho mỗi bước, phản hồi truy vấn của người dùng trong hai giai đoạn riêng biệt: giai đoạn tiền điền và giai đoạn giải mã. (1) Trong giai đoạn tiền điền, mô hình xử lý tất cả token trong prompt đầu vào hoặc ngữ cảnh trong một lần lặp duy nhất để tạo ra token đầu ra ban đầu. (2) Trong giai đoạn giải mã, mô hình, được thông báo bởi prompt/ngữ cảnh và các token được tạo trước đó, tiếp tục tạo ra các token đầu ra tiếp theo từng token một thông qua nhiều lần lặp cho đến khi phản hồi hoàn thành.
+
+Do giai đoạn giải mã bao gồm nhiều vòng tạo, trong đó mỗi vòng chỉ xử lý một lô nhỏ token, tài nguyên tính toán của GPU bị sử dụng dưới mức nghiêm trọng.
+
+Giải mã suy đoán là một kỹ thuật tăng tốc được sử dụng để giảm thiểu các vấn đề hiệu suất được đề cập. Nó tăng mật độ tính toán bằng cách tạo nhiều token trong một bước duy nhất trong khi đảm bảo đầu ra vẫn hoàn toàn nhất quán. Cụ thể, giải mã suy đoán bao gồm một hoặc nhiều mô hình nháp nhẹ suy đoán nhiều token tiếp theo với chi phí không đáng kể. Các suy đoán này sau đó được xác minh bởi mô hình đích ban đầu, tạo ra nhiều token trong một lần lặp duy nhất. Giải mã suy đoán tạo nhiều token dựa trên các suy đoán ban đầu. Độ chính xác của các bộ suy đoán này là quan trọng đối với tốc độ giải mã, trong khi các bộ suy đoán phức tạp hơn tăng chi phí suy luận, từ đó kéo dài độ trễ. Nhiều nghiên cứu đã khám phá việc tăng cường độ trễ và thông lượng bằng cách sử dụng các mô hình nháp độc lập làm bộ suy đoán. Ngoài ra, các cuộc thảo luận gần đây đã nêu bật lợi thế của các bộ suy đoán tích hợp, lưu ý tính chất nhẹ và dễ triển khai của chúng.
+
+Giải pháp Medusa tận dụng các đầu nhẹ làm bộ suy đoán. Như được hiển thị trong Hình 1a, nó có nhiều lớp MLP (Multi-Layer Perceptron) song song nhận đầu vào từ các trạng thái ẩn của khối transformer cuối cùng. Mỗi lớp được thiết kế để dự đoán một token tiếp theo duy nhất và sử dụng quy trình xác minh dựa trên cây để đồng thời tạo nhiều token và khởi tạo các suy đoán mới. Cơ chế đầu nhẹ này đã dẫn đến cải thiện đáng kể về tốc độ suy luận.
+
+Tuy nhiên, Medusa vẫn gặp phải một số thách thức có thể cản trở hiệu suất của nó. Thứ nhất, đầu Medusa chỉ bao gồm một lớp MLP duy nhất nhận đầu vào chỉ từ các trạng thái ẩn cuối cùng. Mỗi lớp độc lập suy đoán về một từ tại một vị trí được chỉ định ngoài vị trí tiếp theo, bỏ qua các phụ thuộc tuần tự từ các token được dự đoán trước đó, điều này thường dẫn đến giảm độ chính xác. Thứ hai, vì các đầu Medusa hoạt động độc lập, các token mà chúng suy đoán được kết hợp bằng tích Cartesian để tạo thành một cây token lớn theo cấp số nhân. Cách tiếp cận này có thể dẫn đến hiệu suất dưới tối ưu khi giai đoạn giải mã không bị ràng buộc bởi bộ nhớ, vì nó tạo ra một lượng dư thừa token, đặc biệt khi kích thước lô tăng lên. Ngoài ra, việc thiếu thông tin tuần tự làm tổn hại hiệu quả của thuật toán cắt tỉa cây, ảnh hưởng thêm đến hiệu suất.
+
+Trong các tình huống phục vụ thời gian thực, nơi kích thước lô suy luận thường lớn, giải mã suy đoán thường phải đối mặt với các ràng buộc tính toán, dẫn đến suy giảm hiệu suất. Hình 2 minh họa xu hướng này: giải mã suy đoán vượt trội đáng kể so với giải mã tự hồi quy khi số lượng token được tính toán thấp. Tuy nhiên, khi số lượng token tăng lên, tốc độ tăng tốc do giải mã suy đoán cung cấp đạt đến một điểm uốn và giảm dần do hạn chế tính toán. Do đó, kích thước thực tế của cây token trong thực tế thường nhỏ hơn so với những gì được giả định trong các nghiên cứu trước đây.
+
+Để giải quyết những vấn đề này, chúng tôi giới thiệu Clover, một cải tiến của khung Medusa. Clover kết hợp một khối attention hồi quy vào giai đoạn suy đoán và giới thiệu Kết nối Hồi quy (Mục 3.1), Bộ giải mã Attention (Mục 3.2), và Khối Tăng cường (Mục 3.3). Các thành phần này cho phép các bộ suy đoán sử dụng kiến thức tuần tự bổ sung, tăng cường độ chính xác của chúng. Hơn nữa, kiến trúc hồi quy không chỉ cải thiện độ chính xác của các suy đoán mà còn tạo ra một cây token với thông tin phụ thuộc toàn diện hơn.
+
+Chúng tôi đánh giá Clover trong một thiết lập gần gũi hơn với tình huống thực tế, bao gồm các kích thước lô lớn khác nhau và một cây token nhỏ hơn. Kết quả trên họ mô hình Baichuan cho thấy phương pháp Clover đạt được cải thiện thông lượng tối đa 2.56× so với giải mã vanilla và 1.25×-1.43× so với giải mã Medusa. Hơn nữa, Clover thể hiện cải thiện 11.7%-26.4% về độ chính xác trên các đầu suy đoán, với mức tăng đáng chú ý hơn 20% ở các đầu sau. Ngoài ra, nó tạo ra 50%-76% token bổ sung nhiều hơn (ngoại trừ token đầu tiên) mỗi bước so với phương pháp Medusa, nhờ vào cơ chế hồi quy.
+
+Tóm lại, những đóng góp của chúng tôi có thể được phác thảo như sau:
+• Chúng tôi đề xuất Clover, một thuật toán giải mã suy đoán mới kết hợp một khối attention tự hồi quy bổ sung để tạo thuận lợi cho việc xem xét kiến thức tuần tự.
+• Chúng tôi giới thiệu ba thành phần chính để cải thiện các thuật toán giải mã song song ban đầu, bao gồm Kết nối Hồi quy để sử dụng thông tin tuần tự từ các token được suy đoán trước đó, Bộ giải mã Attention để kết hợp các token được suy đoán với đầu vào hiện tại, và Khối Tăng cường để sửa đổi các trạng thái ẩn nhằm phù hợp hơn với mục đích sinh suy đoán.
+• Các đánh giá được tiến hành trên cả Baichuan-Small (với 7B tham số) và Baichuan-Large (với hơn 100B tham số). Và kết quả cho thấy Clover của chúng tôi đạt được hiệu suất tốt hơn so với các phương pháp hiện có, chẳng hạn như Medusa.
+
+## 2. Kiến thức nền
+
+### 2.1 Giải mã Suy đoán
+
+Giải mã suy đoán, được mô tả trong Hình 3b, là một kỹ thuật tiên tiến tăng tốc suy luận LLM bằng cách tận dụng tài nguyên tính toán phần cứng hiệu quả hơn. Phương pháp này phân biệt với giải mã tự hồi quy truyền thống bằng cách tính toán và tạo ra nhiều token đồng thời trong mỗi lần lặp.
+
+Cốt lõi của giải mã suy đoán là một thành phần suy đoán, thường là một mô hình nhỏ hơn thường được gọi là mô hình nháp, dự đoán nhiều token tiếp theo. Cách tiếp cận này trái ngược với giải mã tự hồi quy, nơi chỉ token được tạo cuối cùng được đưa vào hệ thống. Trong giải mã suy đoán, LLM ban đầu (mô hình đích) nhận tất cả các token được suy đoán làm đầu vào. Điều này cho phép mô hình đích tính toán điểm attention và tạo ra logit trên nhiều token một cách hiệu quả, đảm bảo rằng nó có thể tạo ra đầu ra nhất quán trong một lần lặp duy nhất. Giai đoạn này được gọi là giai đoạn xác minh, trong đó mô hình đích loại bỏ bất kỳ token không chính xác nào từ các suy đoán. Kết quả là, suy luận suy đoán có thể tạo ra đầu ra tương đương với ít bước giải mã hơn, từ đó tăng hiệu suất độ trễ.
+
+### 2.2 Tree Attention
+
+Tree Attention được sử dụng để tính toán điểm attention cho nhiều suy đoán song song. Bằng cách áp dụng khớp tiền tố cho các chuỗi suy đoán khác nhau, kết quả suy đoán được tổ chức thành một cây token, được biểu diễn dưới dạng ma trận 2-D (Hình 4).
+
+Điều quan trọng cần lưu ý là khối attention là thành phần duy nhất trong kiến trúc LLM hiện đại yêu cầu kiến thức về phụ thuộc tuần tự. Việc chấm điểm các token có cấu trúc cây là một tác vụ tương đối đơn giản và có thể đạt được bằng cách cấu hình Causal-Mask của attention để phù hợp với ma trận topological. Tree Attention tạo thuận lợi cho việc tích hợp nhiều suy đoán với chi phí tính toán tối thiểu, một tính năng được triển khai rộng rãi trong nhiều hệ thống giải mã suy đoán.
+
+### 2.3 Giải mã Medusa
+
+Hình 1a minh họa kiến trúc Medusa, có một số đầu MLP độc lập và song song. Mỗi đầu này, được chỉ định là đầu thứ i, được tinh chỉnh đặc biệt để dự đoán token next-i theo sau token đầu ra thực tế trong mỗi lần lặp. Những đầu nhẹ này tạo thành thành phần suy đoán của hệ thống Medusa, được tích hợp liền mạch vào mô hình đích. Việc tích hợp này cho phép suy đoán và xác minh đồng thời trong quá trình giải mã. Thiết kế của những đầu này cho phép Medusa quản lý hiệu quả sự cân bằng giữa hiệu suất tính toán và độ chính xác dự đoán, đảm bảo rằng mỗi token được tạo ra đóng góp tối ưu vào tính mạch lạc tổng thể của chuỗi và tính phù hợp của ngữ cảnh.
+
+## 3. Thiết kế Clover
+
+Hình 5 cho thấy cách Clover được tích hợp vào LLM hiện có làm bộ suy đoán. Clover giới thiệu ba thành phần tăng dần để tận dụng kiến thức tuần tự: Kết nối Hồi quy, Bộ giải mã Attention và Khối Tăng cường. Kết nối Hồi quy cho phép phụ thuộc tuần tự từ các token được suy đoán trước đó được xem xét khi một bộ suy đoán tạo ra token tiếp theo. Bộ giải mã Attention là khối hồi quy thực tế trong Clover, kết hợp các trạng thái ẩn từ khối transformer cuối cùng và token được suy đoán trước đó, hợp nhất kiến thức tuần tự giữa các token được suy đoán trước và toàn bộ câu đầu vào. Trong khi Khối Tăng cường là một khối transformer hoặc self-attention bổ sung được thêm vào mô hình đích, được sử dụng để tăng cường các đặc trưng chuỗi nhằm cải thiện độ chính xác của bộ suy đoán.
+
+### 3.1 Kết nối Hồi quy
+
+Mỗi đầu Medusa chịu trách nhiệm suy đoán token tại vị trí được chỉ định, mà không xem xét suy đoán được tạo trước, như được hiển thị trong Hình 1a. Mặc dù sự độc lập như vậy cho phép nhiều đầu tính toán song song, việc bỏ qua các phụ thuộc chuỗi hạn chế tỷ lệ trúng của suy đoán, và làm tăng thêm độ trễ suy luận.
+
+Clover áp dụng kết nối hồi quy cho bộ suy đoán, được mô tả dưới dạng các đường chấm màu xanh trong Hình 5. Các vector embedding của các token được suy đoán hiện tại sẽ được sử dụng một cách hồi quy để dự đoán token tại vị trí tiếp theo. Việc giới thiệu kiến thức phụ thuộc tuần tự như vậy mang lại hai lợi ích: Thứ nhất, các đầu suy đoán có thể tạo ra dự đoán chính xác hơn với các token trước đó đã biết, do đó giảm độ trễ suy luận. Mặc dù đường dẫn quan trọng của tính toán trở nên tỷ lệ thuận với độ sâu của suy đoán và mất một lượng tính song song nhất định, sự gia tăng độ chính xác suy đoán thực sự cải thiện độ trễ tổng thể.
+
+Thứ hai, vì mỗi token được suy đoán ở vị trí sau có một token ở vị trí trước của nó làm tiền thân, cây token cho giai đoạn xác minh có thể có mật độ thông tin lớn hơn. Trái ngược với cây token có kích thước theo cấp số nhân do sự độc lập của các từ tại mỗi vị trí, cây token nhỏ hơn với thông tin phụ thuộc chuỗi dễ cắt tỉa và ít có khả năng gặp phải ràng buộc tính toán trên GPU hiện đại, trong khi giới thiệu mất mát thông tin không đáng kể.
+
+### 3.2 Bộ giải mã Attention
+
+Clover giới thiệu bộ giải mã cross attention làm khối hồi quy thực tế. Bộ giải mã nhận hai vector làm đầu vào: vector embedding từ token trước đó, và các trạng thái ẩn trong suốt quá trình suy đoán. Cụ thể, xem xét luồng tính toán trên đầu thứ i, để tạo ra token next-i (được ký hiệu là toki), các đầu vào của bộ giải mã cross attention là: vector embedding được chuẩn hóa của token toki−1 (được ký hiệu là ei−1), và các trạng thái ẩn từ bước suy đoán cuối cùng (được ký hiệu là hi−1). Tính toán có thể được công thức hóa như sau:
+
+Qi = WQ · normalize(hi−1), Ki = WK · ei−1, Vi = WV · ei−1, (1)
+hi = hi−1 + Attention(Qi, Ki, Vi), (2)
+
+trong đó hi là đầu ra của bộ giải mã cross attention, được đưa vào lớp MLP tương ứng để tạo ra toki. Đối với đầu đầu tiên, các trạng thái ẩn h0 đến từ khối transformer cuối cùng của mô hình LLM đích (hoặc Khối Tăng cường, xem bên dưới), và embedding e0 đến từ token next-0 t0 được tạo bởi mô hình đích.
+
+Các trạng thái ẩn hi được truyền đệ quy trong toàn bộ giai đoạn suy đoán, mang theo các đặc trưng từ toàn bộ câu đầu vào. Vai trò của Bộ giải mã Attention của Clover là kết hợp và giải quyết thông tin từ cả câu đầu vào và các token được suy đoán trước đó, hỗ trợ lớp MLP tiếp theo suy đoán token tại vị trí hiện tại với nhiều kiến thức tuần tự hơn.
+
+Chúng tôi cũng khám phá hiệu quả của việc sử dụng lớp MLP làm khối hồi quy, nhưng đạt được hiệu suất dưới tối ưu (chi tiết hơn trong Mục 4.3), điều này có thể là do việc đơn giản nối các vector đầu vào làm cho việc học và trích xuất các đặc trưng hợp lệ trở nên khó khăn hơn. Bộ giải mã Attention của Clover có chi phí không đáng kể do thực tế là các đầu vào chỉ là hai vector cho mỗi yêu cầu hoặc beam.
+
+### 3.3 Khối Tăng cường
+
+LLM đích ban đầu được tiền huấn luyện chỉ để dự đoán token tiếp theo. Để trích xuất thêm thông tin cho các bộ suy đoán dự đoán nhiều token tiếp theo hơn, chúng tôi thêm một khối transformer bổ sung để tăng cường các đặc trưng từ toàn bộ câu đầu vào. Đầu ra của khối tăng cường bổ sung này (tức là h0) được đưa vào Bộ giải mã Attention. Việc giới thiệu một lớp hoàn chỉnh như vậy chỉ phát sinh một chi phí tính toán nhỏ (ví dụ: khoảng 1/Nlayer thời gian suy luận), trong khi lợi ích độ chính xác từ khối tăng cường vượt xa thời gian nó tiêu thụ.
+
+Chúng tôi khám phá các kiến trúc khác nhau để xây dựng khối tăng cường này, và phát hiện ra hiện tượng rằng khối attention đóng góp lợi ích độ chính xác lớn nhất cho tất cả các đầu suy đoán. Chúng tôi cũng nhận thấy rằng khối MLP chỉ thêm khoảng 1% lợi ích độ chính xác, vì vậy chúng tôi để lớp MLP trong Khối Tăng cường là tùy chọn. Chúng tôi vẫn thêm khối MLP trong triển khai Clover của chúng tôi vì nó thực sự tăng độ chính xác, trong khi chỉ phát sinh chi phí không đáng kể. Kết quả đánh giá liên quan được thảo luận trong Mục 4.3.
+
+### 3.4 Chi tiết khác
+
+Mỗi đầu medusa được trang bị một đầu LM riêng, chứa một lượng lớn tham số (tức là kích thước ẩn nhân với kích thước từ vựng) và làm cho việc huấn luyện tốn thời gian hơn. Trong Clover, tất cả các đầu suy đoán chia sẻ đầu LM ban đầu trong mô hình đích. Hơn nữa, trong kết nối hồi quy, vector embedding của token được tạo cuối cùng được cung cấp bởi đầu LM (mũi tên look up trong Hình 1b). Cụ thể, vector embedding ei được cung cấp bởi: vector one-hot của token ti nhân với ma trận trọng số được chuẩn hóa chuyển vị trong đầu LM. So với việc tra cứu từ bảng embedding, chúng tôi tin rằng phân phối embedding như vậy gần gũi hơn nhiều với các trạng thái ẩn từ khối transformer cuối cùng, nơi các trọng số được sử dụng để khởi tạo khối tăng cường, giảm khó khăn của việc tinh chỉnh.
+
+## 4. Đánh giá
+
+### 4.1 Thiết lập Thí nghiệm
+
+**Mô hình và baseline** Cả hai phương pháp Medusa và Clover đều được áp dụng trên các mô hình Baichuan Small (với 7B tham số) và Baichuan Large (với hơn 100B tham số) với số lượng đầu lm là 3, được đặt tên là Medusa(Baichuan) và Clover Baichuan. Để đảm bảo tính công bằng của so sánh, cùng một engine suy luận, xây dựng cây và thuật toán lấy mẫu cây được sử dụng cho tất cả các tình huống. Chúng tôi cũng đánh giá giải mã tự hồi quy trong cùng hoàn cảnh.
+
+**Dữ liệu** Chúng tôi sử dụng tập dữ liệu tinh chỉnh có giám sát (SFT) nội bộ của Baichuan, chứa khoảng 0.15B token, 95% trong số đó là tiếng Trung, để huấn luyện cả Medusa(Baichuan) và Clover(Baichuan). Sau đó chúng tôi đánh giá hiệu suất suy luận trên một tập dữ liệu nội bộ Baichuan khác, bao gồm nhiều tác vụ: tăng cường truy xuất (RA), cuộc trò chuyện nhiều lượt (MC), mã (Code), xử lý thông tin (IP), sáng tạo (CA), lý luận logic (RS), toán (Math), dạng bảng (Tab), hỏi đáp (QA) và tư vấn y tế (Med). Mỗi trong mười tác vụ chứa 100 cuộc đối thoại.
+
+**Huấn luyện** Cả hai mô hình đều được huấn luyện với tất cả trọng số bị đóng băng trong mô hình đích. Đối với Medusa(Baichuan), các thiết lập trọng số ban đầu tương ứng với cấu hình được đưa ra trong báo cáo kỹ thuật Medusa. Trong khi đối với Clover(Baichuan), các trọng số ban đầu trong Khối Tăng cường giống hệt với khối transformer cuối cùng trong mô hình đích, và việc khởi tạo lớp MLP giống như trong phương pháp Medusa. Đối với Bộ giải mã Attention, các trọng số của Q và K được khởi tạo với ma trận giống nhau với nhiễu Gaussian được thêm vào, trong khi ma trận V được đặt thành tất cả là không. Chúng tôi huấn luyện các đầu trong 1 epoch, với (β1 = 0.9, β2 = 0.999) cho bộ tối ưu AdamW. Tốc độ học được đặt thành 1e-3 cho Baichuan Small, và 6e-4 cho Baichuan Large. Đối với cả hai mô hình được trang bị Clover, các tham số có thể huấn luyện là khoảng 0.2B và 2B, mất 2 giờ để huấn luyện trên 8x A800 NVIDIA GPU và 32x H800 NVIDIA.
+
+**Chỉ số** Chúng tôi chọn tokens/step và tokens/second làm chỉ số chính, theo các công trình giải mã suy đoán trước đây. Chỉ số đầu tiên đo lường độ dài được chấp nhận, cho biết độ chính xác của các bộ suy đoán, trong khi chỉ số thứ hai báo cáo thông lượng hệ thống tổng thể. Chúng tôi báo cáo độ chính xác top-k của mỗi đầu trong nghiên cứu ablation để có cái nhìn trực quan hơn về kiến trúc mô hình đa dạng.
+
+### 4.2 Kết quả End-to-end
+
+Chúng tôi đánh giá hiệu suất end-to-end tại các kích thước lô khác nhau. Như đã đề cập trong Mục 1, trong môi trường phục vụ thời gian thực, hệ thống cần tính toán các yêu cầu với kích thước lô lớn và dễ dàng gặp phải ràng buộc tính toán. Do đó chúng tôi đặt kích thước cây token thành 4 cho cả hai phương pháp giải mã suy đoán. Chúng tôi cũng điều tra và phát hiện rằng việc mở rộng thêm kích thước lấy mẫu cây dẫn đến hiệu ứng biên (xem Phụ lục A.2).
+
+Hình 6 minh họa số lượng token trung bình được tạo ra mỗi bước cho các phương pháp Clover và Medusa trên các tác vụ khác nhau. Lưu ý rằng giá trị trên trục dọc là các token bổ sung mỗi bước, loại trừ token thực tế được tạo bởi mô hình đích, điều này phản ánh chính xác hơn hiệu suất của bộ suy đoán. Clover tạo ra 50% - 76% token bổ sung nhiều hơn mỗi bước so với phương pháp Medusa trên tất cả các tác vụ, nêu bật tính ưu việt của nó so với kiến trúc Medusa về độ chính xác bộ suy đoán.
+
+Kết quả thông lượng end-to-end (tức là tokens/second) được hiển thị trong Bảng 1. Cả hai phương pháp giải mã suy đoán Clover và Medusa đều vượt trội so với giải mã tự hồi quy (tối đa 2.05×-2.56× về thông lượng trên mô hình Baichuan Large) do sử dụng phần cứng hiệu quả trong hầu hết các tình huống. Chúng tôi cũng phát hiện rằng lợi thế của cả hai phương pháp giải mã suy đoán thường giảm với kích thước lô tăng. Điều này là do giải mã suy đoán với kích thước lô lớn hơn đang tiến gần đến ràng buộc tính toán. Sự biến động hiệu suất là do các yếu tố ngẫu nhiên không thể dự đoán trong quá trình suy luận và việc triển khai engine của chúng tôi chưa được tối ưu hóa hoàn toàn. Kết quả chi tiết hơn cho các tác vụ khác có thể được tìm thấy trong Phụ lục A.1, Clover(Baichuan) vẫn duy trì hiệu suất tốt nhất so với Medusa(Baichuan) và giải mã tự hồi quy trong tất cả các danh mục.
+
+Hơn nữa, giải mã Clover tạo ra nhiều token hơn mỗi bước và đạt được thông lượng cao hơn so với giải mã Medusa trong tất cả các tình huống (tối đa 1.26× và 1.47× cho Baichuan Small và Baichuan Large), vì lợi ích về độ chính xác đầu từ các thành phần bổ sung được đề xuất trong Clover vượt qua chi phí tính toán của chúng. Lợi thế của hệ thống chúng tôi so với Medusa thậm chí còn rõ rệt hơn đối với các kích thước mô hình lớn hơn, vì mô-đun suy đoán chiếm tỷ lệ nhỏ hơn trong tổng thể mô hình. Kiến thức tuần tự từ các token suy đoán được tạo trước giúp đầu hiện tại dự đoán token suy đoán tiếp theo chính xác hơn, đặc biệt khi suy đoán một cụm từ nhiều token dài xuất hiện đầu tiên trong đầu đầu tiên, nhưng không ở token next-0 (tức là token đầu ra thực tế).
+
+### 4.3 Nghiên cứu Ablation
+
+Trong nghiên cứu Ablation, chúng tôi sử dụng độ chính xác top-k của mỗi đầu làm chỉ số để hiểu trực quan cách mỗi thành phần ảnh hưởng đến độ chính xác.
+
+**Ablation về các Thành phần** Chúng tôi bắt đầu từ Clover(Baichuan) hoàn chỉnh và dần dần loại bỏ: Bộ giải mã Attention, Kết nối Hồi quy và Khối Tăng cường. Lưu ý rằng sau khi loại bỏ tất cả ba thành phần, kiến trúc mô hình trở nên giống hệt với Medusa(Baichuan). Hình 7a cho thấy độ chính xác của Clover(Baichuan) với các thành phần khác nhau được bật.
+
+Bằng cách loại bỏ Bộ giải mã Attention, lấy lớp MLP làm khối hồi quy thay thế, độ chính xác top-5 của ba đầu giảm (4.8%, 9.0%, 11.5%). Điều này là do bản thân lớp MLP sẽ không phân biệt các vector embedding khác nhau, làm cho việc học kiến thức tuần tự hợp lệ từ toàn bộ câu trở nên khó khăn. Nếu chúng tôi tiếp tục vô hiệu hóa Kết nối Hồi quy, độ chính xác cũng giảm (ví dụ: 2.6%, 4.6%, 6.0% mất độ chính xác top-5 thêm từ ba đầu). Việc loại bỏ kết nối hồi quy chỉ ra việc loại bỏ kiến thức phụ thuộc tuần tự của các token được tạo trước, dẫn đến mất độ chính xác. Cuối cùng, Clover(Baichuan) trở thành Medusa(Baichuan) sau khi tiếp tục vô hiệu hóa Khối Tăng cường, mất thêm (4.3%, 8.1%, 8.9%) độ chính xác top-5 từ tất cả các đầu. Việc thiếu kiến thức tuần tự tăng cường làm cho việc thực hiện suy đoán trở nên khó khăn hơn.
+
+Nhìn chung so sánh Clover(Baichuan) với Medusa(Baichuan), phương pháp Clover mang lại kiến thức tuần tự từ các token suy đoán được tạo trước cũng như câu đầu vào, cải thiện hiệu suất của tất cả các đầu suy đoán, đặc biệt là hai đầu sau. Quan sát tương tự cũng được xác nhận trong Hình 7b.
+
+**Khám phá về Khối Tăng cường** Chúng tôi tiếp tục khám phá các biến thể tiềm năng của Khối Tăng cường, bao gồm: một khối transformer hoàn chỉnh (kiến trúc thực tế trong Clover(Baichuan)), chỉ khối attention, chỉ khối MLP và không có Khối Tăng cường. Hình 7b cho thấy độ chính xác của Clover với các loại Khối Tăng cường khác nhau được trang bị. Khối transformer đóng góp (4.9%, 9.0%, 9.4%) độ chính xác top-5 cho các đầu so với không có khối tăng cường, trong đó khối attention đóng vai trò chính (tăng 1.9%, 4.4%, 5.1% độ chính xác top-5 khi chỉ bật khối attention cho Khối Tăng cường). Trong khi khối MLP chỉ cung cấp (1.0%, 1.2%, 0.7%) cải thiện độ chính xác, do đó chúng tôi để nó như một thành phần tùy chọn.
+
+Cơ chế attention tập trung vào việc trích xuất mối quan hệ giữa các token trong câu, làm cho việc học tăng cường đặc trưng trở nên dễ dàng hơn. Mặc dù lợi ích hiệu suất từ việc kết hợp MLP không đáng kể, chúng tôi chọn bật nó để cải thiện độ chính xác dự đoán, vì nó có chi phí thời gian và bộ nhớ tối thiểu.
+
+## 5. Công trình Liên quan
+
+**Suy luận Suy đoán** Kể từ khi Giải mã suy đoán cho LLM đầu tiên được đề xuất, nhiều công nghệ tối ưu hóa đã được nghiên cứu. Tree attention đã được khám phá và được áp dụng rộng rãi để xác minh nhiều suy đoán trong một bước duy nhất. Một số công trình đầu đã nghiên cứu cách cải thiện các mô hình nháp riêng biệt, và một số công trình cũng khám phá kiến trúc mô hình nháp không cần huấn luyện, trong khi các công trình gần đây hơn cũng thu hút nhiều sự chú ý đến mô hình nháp tích hợp. Clover là một trong những phần mở rộng dựa trên bộ suy đoán nhẹ như vậy.
+
+**Bộ Suy đoán Hồi quy** Có một số phương pháp gần đây cũng khám phá tính ưu việt tiềm năng của bộ suy đoán hồi quy. Zhang et al. sử dụng một lớp MLP làm khối hồi quy, và Hydra cũng giới thiệu một khối bổ sung trong triển khai của họ. Eagle cũng giới thiệu một khối transformer hồi quy để suy đoán. Chimera đề xuất Trigram Encoder và Full Context Encoder làm bộ suy đoán hồi quy. Sự khác biệt chính của Clover là việc sử dụng Bộ giải mã Attention chéo và khám phá về Khối Tăng cường, với mục đích tối ưu hóa việc sử dụng kiến thức tuần tự có nguồn gốc từ cả các token được chỉ định trước và câu đầu vào. Ngoài ra, Clover tập trung vào cải thiện thông lượng tại các kích thước lô lớn hơn và kích thước cây nhỏ hơn, điều này chưa được giải quyết đầy đủ trong công việc giải mã suy đoán trước đây.
+
+## 6. Kết luận
+
+Chúng tôi trình bày Clover, một phần mở rộng của phương pháp Medusa xem xét kiến thức tuần tự trong việc tạo suy đoán. Clover khai thác kiến thức tuần tự từ các token suy đoán được tạo trước (Mục 3.1), toàn bộ câu đầu vào (Mục 3.3) và sự kết hợp của chúng (Mục 3.2), đạt được 11.7%-26.4% độ chính xác top-5 nhiều hơn cho các đầu suy đoán và cải thiện thông lượng 1.26×-1.47× khi triển khai Clover trên mô hình Baichuan Large so với phương pháp Medusa (với 50% - 76% token suy đoán được chấp nhận nhiều hơn), và tối đa 2.56× với giải mã tự hồi quy vanilla. Đóng góp chính cho độ chính xác đến từ các đầu sau (+21.7%-+26.4%) so với +11.7% cho đầu đầu tiên. Bằng chứng như vậy hỗ trợ quan điểm rằng cơ chế tự hồi quy là một phương pháp hiệu quả để cải thiện độ chính xác của suy đoán.

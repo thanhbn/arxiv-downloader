@@ -1,0 +1,129 @@
+# Kiến trúc Neural Không phụ thuộc Miền cho Học liên tục Tăng dần Lớp trong Nền tảng Xử lý Tài liệu
+
+Mateusz Wójcik1,2, Witold Ko ´sciukiewicz1,2, Mateusz Baran1,2,
+Tomasz Kajdanowicz1, Adam Gonczarek2
+1Đại học Khoa học và Công nghệ Wroclaw 2Alphamoon Ltd., Wrocław
+{mateusz.wojcik,tomasz.kajdanowicz}@pwr.edu.pl
+adam.gonczarek@alphamoon.ai
+
+## Tóm tắt
+
+Triển khai sản xuất trong các hệ thống phức tạp đòi hỏi các kiến trúc ML phải có hiệu quả cao và có thể sử dụng cho nhiều tác vụ. Đặc biệt khó khăn là các bài toán phân loại trong đó dữ liệu đến theo dạng luồng và mỗi lớp được trình bày riêng biệt. Các phương pháp gần đây với học gradient ngẫu nhiên đã được chứng minh là gặp khó khăn trong các thiết lập như vậy hoặc có những hạn chế như bộ đệm bộ nhớ, và bị giới hạn trong các miền cụ thể khiến việc sử dụng trong các tình huống thực tế bị vô hiệu hóa. Vì lý do này, chúng tôi trình bày một kiến trúc hoàn toàn có thể vi phân dựa trên mô hình Mixture of Experts, cho phép huấn luyện các bộ phân loại hiệu suất cao khi các ví dụ từ mỗi lớp được trình bày riêng biệt. Chúng tôi đã tiến hành các thí nghiệm toàn diện chứng minh khả năng áp dụng trong nhiều miền khác nhau và khả năng học trực tuyến trong môi trường sản xuất. Kỹ thuật được đề xuất đạt được kết quả SOTA mà không cần bộ đệm bộ nhớ và vượt trội rõ ràng so với các phương pháp tham chiếu.
+
+## 1 Giới thiệu
+
+Các giải pháp dựa trên mạng neural sâu đã tìm thấy ứng dụng trong hầu hết mọi miền có thể được tự động hóa. Một phần thiết yếu của chúng là NLP, sự phát triển của nó đã có được động lực đặc biệt với sự bắt đầu của kỷ nguyên transformers (Vaswani et al., 2017). Các mô hình phức tạp và mạnh mẽ đã làm cho việc giải quyết các vấn đề như phân loại văn bản với độ chính xác chưa từng đạt được trước đây trở thành khả thi. Tuy nhiên, khai thác khả năng của những kiến trúc như vậy trong các hệ thống thực tế đòi hỏi học trực tuyến sau triển khai. Điều này đặc biệt khó khăn trong môi trường thay đổi động đòi hỏi các mô hình phải được huấn luyện lại thường xuyên do sự thay đổi miền hoặc thiết lập lớp. Một ví dụ về môi trường như vậy là Alphamoon Workspace1 nơi kiến trúc được trình bày sẽ được triển khai như một mô hình để phân loại tài liệu vì chúng tôi nhận thấy nhu cầu mới nổi cho học trực tuyến. Chúng tôi quan sát thấy rằng dữ liệu của người dùng trong quá trình phân loại tài liệu thay đổi thường xuyên và những thay đổi như vậy thường làm giảm độ chính xác của mô hình. Kết quả là, chúng tôi phải huấn luyện lại các mô hình thủ công dẫn đến một quá trình tốn thời gian. Mục tiêu của chúng tôi là thiết kế một phương pháp hiệu quả để học tăng dần sẽ được sử dụng trong mô-đun học liên tục của hệ thống (Hình 1).
+
+Gần đây, các kiến trúc neural đã trở nên hiệu quả và được sử dụng rộng rãi trong các bài toán phân loại (Devlin et al., 2018; Rawat and Wang, 2017). Quá trình tối ưu hóa tham số dựa trên gradient descent hoạt động tốt khi tập dữ liệu đủ lớn và hoàn toàn có sẵn trong quá trình huấn luyện. Nếu không, hiện tượng quên thảm khốc (French, 1999) có thể xảy ra, khiến mạng neural không thể được huấn luyện tăng dần. Học liên tục nhằm phát triển các phương pháp cho phép tích lũy kiến thức mới mà không quên kiến thức đã học trước đó.
+
+Trong bài báo này, chúng tôi trình bày một kiến trúc không phụ thuộc miền cho học liên tục tăng dần lớp trực tuyến được gọi là DE&E (Deep Encoders and Ensembles). Lấy cảm hứng từ phương pháp E&E (Shanahan et al., 2021), chúng tôi đề xuất một phương pháp tăng độ chính xác, cung cấp khả năng vi phân hoàn toàn, và quan trọng nhất, có thể giải quyết hiệu quả các bài toán phân loại thực tế trong môi trường sản xuất. Đóng góp của chúng tôi như sau: 1) chúng tôi đã giới thiệu một lớp KNN có thể vi phân (Xie et al., 2020) vào kiến trúc mô hình, 2) chúng tôi đề xuất một phương pháp mới để tổng hợp các dự đoán của bộ phân loại trong ensemble, 3) chúng tôi thực hiện các thí nghiệm toàn diện cho thấy khả năng học tăng dần và khả năng sử dụng thực tế, 4) chúng tôi chứng minh hiệu quả của kiến trúc được đề xuất bằng cách đạt được kết quả SOTA trên nhiều bộ dữ liệu khác nhau mà không cần bộ đệm bộ nhớ.
+
+## 2 Nghiên cứu liên quan
+
+### 2.1 Học liên tục
+
+#### 2.1.1 Phương pháp
+
+Hiện tại, các phương pháp có bộ đệm bộ nhớ như GEM (Lopez-Paz and Ranzato, 2017), A-GEM (Chaudhry et al., 2019a) hoặc DER (Buzzega et al., 2020) thường đạt được hiệu suất cao nhất trong tất cả các tình huống học liên tục (Mai et al., 2022). Những phương pháp như vậy lưu trữ một phần dữ liệu trong bộ nhớ và dữ liệu này được phát lại liên tiếp trong quá trình huấn luyện trên các ví dụ mới, chưa thấy. Tuy nhiên, yêu cầu lưu trữ dữ liệu trong bộ nhớ loại bỏ những phương pháp này trong nhiều ứng dụng thực tế do chính sách bảo mật hoặc kích thước dữ liệu (Salem et al., 2018). Điều này buộc phải chú ý đến các phương pháp khác, chẳng hạn như điều chỉnh tham số. Các phương pháp phổ biến nhất trong nhóm này bao gồm EWC (Kirkpatrick et al., 2016) và LWF (Li and Hoiem, 2017). Khi nhận được một liều kiến thức mới, những phương pháp này cố gắng ảnh hưởng đến quy trình cập nhật tham số mô hình để ít xâm lấn nhất. Như nghiên cứu cho thấy (Van de Ven and Tolias, 2019), các phương pháp dựa trên điều chỉnh thất bại trong các tình huống tăng dần lớp khiến chúng không hiệu quả trong nhiều trường hợp thực tế.
+
+#### 2.1.2 Phương pháp cho NLP
+
+Hầu hết tất cả các nghiên cứu trước đây tập trung vào việc phát triển các phương pháp học liên tục trong miền thị giác máy tính (Delange et al., 2021). Nghiên cứu về học liên tục cho NLP bị hạn chế và, như Biesialska et al. (2020) quan sát, phần lớn các phương pháp NLP hiện tại là dành riêng cho tác vụ. Hơn nữa, những phương pháp này thường sử dụng bộ đệm bộ nhớ (de Masson D'Autume et al., 2019) hoặc liên quan đến chính mô hình ngôn ngữ (Ke et al., 2021). Để giải quyết khoảng trống này, các phương pháp không phụ thuộc miền phải trở nên phổ biến hơn nhiều trong tương lai gần.
+
+### 2.2 Phương pháp ensemble
+
+Các phương pháp ensemble rất phổ biến trong thế giới học máy (Zhang and Ma, 2012). Bằng cách sử dụng dự đoán của nhiều học viên yếu, có thể có được một mô hình hoạt động tốt một cách đáng ngạc nhiên về tổng thể. Việc áp dụng rộng rãi các phương pháp (Cao et al., 2020; Li and Pan, 2022; Yang et al., 2021) chứng minh hiệu quả của các kỹ thuật ensemble trong nhiều tác vụ khác nhau. Ensemble cũng đã được sử dụng thành công trong lĩnh vực học liên tục, như được chứng minh bởi BatchEnsemble (Wen et al., 2020) hoặc CN-DPM (Lee et al., 2020). Các đóng góp khác có mặt trong tài liệu (Doan et al., 2022) có xu hướng tập trung mạnh vào việc cải thiện hiệu suất mô hình hơn là tăng hiệu quả mô hình. Hơn nữa, các phương pháp ensemble cũng có thể được sử dụng gián tiếp thông qua dropout (Srivastava et al., 2014) hoặc tổng hợp trọng số (Wortsman et al., 2022).
+
+### 2.3 Mixture of Experts
+
+Mixture of Experts (ME) (Jacobs et al., 1991) là một kỹ thuật dựa trên mô hình chia để trị. Nó giả định việc chia không gian bài toán giữa một số mô hình chuyên biệt (experts). Các experts được giám sát bởi mạng gating lựa chọn chúng dựa trên chiến lược được định nghĩa. Sự khác biệt giữa các ensemble là các phương pháp ME tập trung vào việc lựa chọn một vài experts thay vì kết hợp dự đoán của tất cả các mô hình có sẵn. Các kỹ thuật ME đã tìm thấy nhiều ứng dụng trong các miền khác nhau (Masoudnia and Ebrahimpour, 2014), bao gồm học liên tục (Shanahan et al., 2021), và thậm chí ngày nay những phương pháp như vậy được sử dụng rộng rãi trong NLP (Gao et al., 2022; Ravaut et al., 2022).
+
+### 2.4 Hệ thống NLP thực tế
+
+Trong vài năm qua, số lượng ứng dụng NLP thực tế đã tăng nhanh chóng (Sarker, 2022). Mặc dù có những thành công lớn trong ứng dụng thực tế của các công nghệ ngôn ngữ như Google Translate, Amazon Alexa, và ChatGPT, việc triển khai sản xuất và bảo trì những mô hình như vậy vẫn là một thách thức. Các nhà nghiên cứu đã chỉ ra (Nowakowski et al., 2022; Karakanta et al., 2021), rằng có một số vấn đề liên quan đến việc duy trì các mô hình NLP, bao gồm các hạn chế kỹ thuật, độ trễ, và đánh giá hiệu suất. Tuy nhiên, vấn đề quan trọng là sự thay đổi miền dữ liệu buộc các mô hình phải được huấn luyện lại và triển khai lại theo thời gian (Hu et al., 2020). Đây là một hạn chế lớn trong môi trường thay đổi động nơi người dùng mong đợi các mô hình nhanh chóng thích ứng với họ. Hiện tại, vấn đề này đã được giải quyết trong một số hệ thống (Afzal et al., 2019; Hancock et al., 2019), nhưng nhiều giải pháp ngăn cản việc duy trì độ chính xác mô hình khi huấn luyện tăng dần khiến chúng không đủ.
+
+## 3 Phương pháp của chúng tôi
+
+### 3.1 Công thức bài toán
+
+Học liên tục tăng dần lớp bao gồm việc huấn luyện một mô hình phân loại f(·) : X → Y trên một chuỗi T tác vụ. Mô hình được huấn luyện trên từng tác vụ riêng biệt (một tác vụ tại một thời điểm). Mỗi tác vụ Dt chứa các điểm dữ liệu Dt = {(x¹t, y¹t), . . . , (x^Nt_t, y^Nt_t)}, trong đó Nt là độ dài của Dt, x^(i)_t ∈ R^D, và y^(i)_t ∈ Yt. Yt là một tập nhãn cho tác vụ t và Yt ∩ Yt' = ∅ cho t ≠ t'. Chúng tôi muốn mô hình tiếp tục hoạt động tốt trên tất cả các tác vụ trước đó sau mỗi cập nhật, và chúng tôi giả định đang làm việc trong thiết lập thách thức nhất (Van de Ven and Tolias, 2019), nơi một tác vụ bao gồm dữ liệu từ một lớp.
+
+### 3.2 Phương pháp
+
+Chúng tôi trình bày một kiến trúc linh hoạt và hiệu quả không phụ thuộc miền có thể được sử dụng để giải quyết nhiều bài toán phân loại khác nhau. Kiến trúc được trình bày trong Hình 2.
+
+**Bộ trích xuất đặc trưng.** Thành phần đầu tiên của kiến trúc được đề xuất là một bộ trích xuất đặc trưng đa lớp biến đổi dữ liệu đầu vào thành không gian nhúng. Nó có thể được mô tả bằng ánh xạ sau z = F(x), trong đó x ∈ R^D là một ví dụ đầu vào và z ∈ R^M là một nhúng M chiều. Phương pháp chúng tôi theo giả định sử dụng một mô hình được huấn luyện trước với các tham số được đóng băng. Quy trình như vậy làm cho việc hoàn toàn ngăn chặn bộ trích xuất quên kiến thức bằng cách cô lập việc học không gian đặc trưng khỏi quá trình phân loại trở thành khả thi.
+
+**Khóa và bộ phân loại.** Chúng tôi sử dụng một ensemble gồm N bộ phân loại fn(·), trong đó mỗi bộ ánh xạ nhúng thành một vector đầu ra K chiều ŷn = fn(z). Với mỗi bộ phân loại, có một vector khóa liên kết kn ∈ R^M với cùng chiều với nhúng. Các khóa giúp lựa chọn những mô hình phù hợp nhất để chuyên biệt hóa đối với ví dụ đầu vào hiện đang được xử lý. Chúng được khởi tạo ngẫu nhiên từ phân phối chuẩn. Chúng tôi sử dụng các mạng neural một lớp đơn giản làm bộ phân loại, với fan-in variance scaling làm chiến lược khởi tạo trọng số. Đầu ra mạng được kích hoạt bởi hàm tang hyperbolic (tanh).
+
+**Lớp soft κ-nearest neighbors.** Thuật toán KNN tiêu chuẩn thường được triển khai sử dụng các phép toán sắp xếp thông thường khiến việc xác định đạo hàm riêng đối với đầu vào trở thành không thể. Nó loại bỏ khả năng sử dụng KNN như một phần của các mô hình neural đầu cuối. Tuy nhiên, có thể thu được một xấp xỉ có thể vi phân của mô hình KNN bằng cách giải quyết Bài toán Vận chuyển Tối ưu (Peyré et al., 2019). Dựa trên khái niệm này, chúng tôi thêm một lớp có thể vi phân vào kiến trúc mô hình. Chúng tôi gọi lớp này là soft κ-nearest neighbors (soft KNN). Để xác định xấp xỉ KNN, trước tiên chúng tôi tính một vector khoảng cách cosine c ∈ R^N giữa nhúng và các khóa:
+
+cn = 1 - cos(z,kn), (1)
+
+trong đó cos(·,·) biểu thị độ tương tự cosine. Tiếp theo, chúng tôi theo ý tưởng của toán tử soft top-κ được trình bày trong (Xie et al., 2020), trong đó κ biểu thị số lượng hàng xóm gần nhất. Đặt E ∈ R^N×2 là ma trận khoảng cách Euclidean với các phần tử sau:
+
+en,0 = (cn)², en,1 = (cn-1)² (2)
+
+Và đặt G ∈ R^N×2 biểu thị ma trận tương tự thu được bằng cách áp dụng hạt nhân Gaussian cho E:
+
+G = exp(-E/σ), (3)
+
+trong đó σ biểu thị độ rộng hạt nhân. Các toán tử exp được áp dụng theo từng phần tử cho ma trận E.
+
+Sau đó chúng tôi sử dụng phương pháp Bregman, một thuật toán được thiết kế để giải quyết các bài toán tối ưu ràng buộc lồi, để tính L vòng lặp của các phép chiếu Bregman nhằm xấp xỉ các điểm dừng của chúng:
+
+p^(l+1) = μ ⊙ Gq^(l), q^(l+1) = ν ⊙ G^⊤p^(l+1), (4)
+
+trong đó l = 0, . . . , L-1, μ = 1N/N, ν = [κ/N, (N-κ)/N]^⊤, q^(0) = 12/2, và 1i biểu thị vector toàn số một i-phần tử. Cuối cùng, đặt Γ biểu thị ma trận kế hoạch vận chuyển tối ưu và được cho bởi:
+
+Γ = diag(p^(L)) · G · diag(q^(L)) (5)
+
+Như kết quả cuối cùng γ ∈ R^N của toán tử soft κ-nearest neighbor, chúng tôi lấy cột thứ hai của Γ nhân với N tức là γ = NΓ:,2. γ là một xấp xỉ mềm của vector zero-one chỉ ra κ trong số N instance nào là hàng xóm gần nhất. Việc giới thiệu soft KNN cho phép huấn luyện các phần của mô hình đã được đóng băng cho đến nay.
+
+**Lớp bỏ phiếu.** Chúng tôi sử dụng cả cn và γ để cân nhắc các dự đoán bằng cách tạo tác động cao hơn cho các bộ phân loại với khóa tương tự như các đặc trưng được trích xuất. Xấp xỉ thu được γ có hai chức năng chính. Nó loại bỏ các dự đoán từ các bộ phân loại ngoài κ hàng xóm gần nhất và cân nhắc kết quả. Vì phương pháp Bregman không phải lúc nào cũng hội tụ hoàn toàn, vector κ chứa các giá trị liên tục gần với 1 cho các bộ phân loại có liên quan nhất. Chúng tôi tận dụng tính chất này trong quy trình bỏ phiếu ensemble. Giá trị κ càng cao cho một bộ phân loại đơn lẻ, đóng góp của nó vào quyết định ensemble cuối cùng càng cao. Dự đoán cuối cùng được thu được như sau:
+
+ŷ = (∑^N_{n=1} γncnŷn) / (∑^N_{n=1} cn) (6)
+
+**Huấn luyện** Để tối ưu hóa hiệu quả các tham số mô hình, chúng tôi theo quy trình huấn luyện được trình bày trong (Shanahan et al., 2021). Nó giả định sử dụng một hàm mất mát cụ thể là tích vô hướng giữa dự đoán ensemble và nhãn được mã hóa one-hot:
+
+L(y,ŷ) = -y^⊤ŷ (7)
+
+Tối ưu hóa tiêu chí này mang lại lợi thế của việc sử dụng hàm kích hoạt tanh, giảm đáng kể hiện tượng quên thảm khốc (Shanahan et al., 2021). Theo phương pháp tham chiếu, chúng tôi cũng sử dụng một bộ tối ưu loại bỏ giá trị của gradient và chỉ sử dụng dấu của nó để xác định hướng cập nhật. Kết quả là, các tham số được thay đổi bằng một bước cố định trong quá trình huấn luyện.
+
+## 4 Thí nghiệm
+
+### 4.1 Thiết lập
+
+Để đảm bảo tính tái sản xuất của thí nghiệm, chúng tôi đánh giá phương pháp của mình trên các bộ dữ liệu phổ biến và có sẵn công khai.
+
+**Bộ dữ liệu** Chúng tôi sử dụng ba bộ dữ liệu phân loại văn bản phổ biến với các đặc điểm khác nhau - Newsgroups (Lang, 2008), BBC News (Greene and Cunningham, 2006), và Consumer Finance Complaints². Mục tiêu của các thí nghiệm là đánh giá phương pháp của chúng tôi trên các tác vụ với các mức độ khó khác nhau. Chúng tôi cũng tiến hành thí nghiệm cho phân loại âm thanh sử dụng bộ dữ liệu Speech Commands (Warden, 2018). Với mục đích đánh giá, chúng tôi chọn 10 lớp đại diện nhất từ Newsgroups, Complaints và Speech Commands. Cuối cùng, chúng tôi cũng tiến hành thí nghiệm trên các bộ dữ liệu MNIST và CIFAR-10 phổ biến như đại diện cho miền hình ảnh. Tóm tắt bộ dữ liệu được trình bày trong Bảng 1. Trong tất cả các thí nghiệm, chúng tôi đã sử dụng tập huấn luyện để huấn luyện mô hình tăng dần, và sau đó chúng tôi thực hiện đánh giá tiêu chuẩn sử dụng tập kiểm tra.
+
+**Bộ trích xuất đặc trưng** Đối với tất cả các bộ dữ liệu văn bản, chúng tôi sử dụng Distilbert (Sanh et al., 2019), một lựa chọn thay thế nhẹ nhưng vẫn rất hiệu quả cho các mô hình ngôn ngữ lớn. Tiếp theo, đối với Speech Commands, chúng tôi sử dụng Pyannote (Bredin et al., 2020), một mô hình được huấn luyện trước để tạo ra các đặc trưng âm thanh có ý nghĩa. Đối với các bộ dữ liệu hình ảnh, chúng tôi sử dụng các bộ trích xuất khác nhau. Các đặc trưng MNIST được tạo ra bởi VAE được huấn luyện trước và CIFAR-10 có một mô hình BYOL chuyên dụng (xem A.4 để biết thêm chi tiết).
+
+### 4.2 Kết quả
+
+Kết quả đánh giá được trình bày trong Bảng 2. Đối với tất cả các thiết lập được đánh giá, mô hình của chúng tôi hoạt động tốt nhất cải thiện kết quả của phương pháp tham chiếu chính (E&E) lên đến 3 điểm phần trăm (pp.). Quy mô cải thiện khác nhau giữa các bộ dữ liệu. Chúng tôi cũng quan sát một sự khác biệt đáng kể trong độ chính xác đạt được giữa DE&E và các phương pháp học liên tục tiêu chuẩn. Các phương pháp dựa trên điều chỉnh đơn giản hoàn toàn thất bại trong tình huống tăng dần lớp. Nó cho thấy việc huấn luyện mô hình tăng dần đòi hỏi như thế nào khi một tập hợp các lớp không được cố định, điều thường xảy ra trong các tình huống thực tế. Hơn nữa, phương pháp của chúng tôi đạt được những kết quả này mà không phát lại các ví dụ huấn luyện đã thấy trong quá khứ, khiến nó thực tế hơn so với các phương pháp dựa trên bộ nhớ SOTA (GEM, A-GEM, Replay) lưu trữ mẫu từ mọi lớp. Đối với ensemble gồm 128 bộ phân loại và bộ dữ liệu Speech Commands, kiến trúc của chúng tôi đạt độ chính xác hơn 59 pp. cao hơn so với phương pháp tốt nhất có bộ đệm bộ nhớ.
+
+Một trong những siêu tham số quan trọng nhất của mô hình là số lượng bộ phân loại (experts). Để điều tra cách nó ảnh hưởng đến độ chính xác, chúng tôi đánh giá kiến trúc của mình trong ba biến thể: nhỏ - 64, bình thường - 128, và lớn - 1024 bộ phân loại. Kết quả đánh giá được trình bày trong Hình 3. Chúng tôi quan sát thấy rằng việc tăng kích thước ensemble dẫn đến độ chính xác cao hơn, và mức tăng phụ thuộc vào thiết lập và đặc điểm dữ liệu. Cải thiện đáng kể nhất được quan sát trên BBC và CIFAR-10 nơi mô hình lớn đạt độ chính xác khoảng 20pp. tốt hơn so với mô hình nhỏ. Đối với các bộ dữ liệu còn lại và thiết lập tương tự, mức tăng lên đến 5pp. Chúng tôi giải thích hiện tượng này như hiệu ứng của mức độ chuyên biệt hóa không đủ đạt được bởi các ensemble nhỏ hơn. Nếu các experts bị buộc phải giải quyết các tác vụ quá phức tạp, chúng thường mắc lỗi. Tăng số lượng experts cho phép chia không gian đặc trưng thành các tiểu tác vụ đơn giản hơn. Tuy nhiên, quy trình như vậy có các hạn chế tự nhiên liên quan đến bộ trích xuất đặc trưng. Nếu các đặc trưng có chất lượng thấp, việc tăng số lượng experts sẽ không hiệu quả. Để chọn kích thước ensemble tối ưu, chúng tôi đề xuất sử dụng quy tắc khuỷu tay ngăn chặn mô hình khỏi việc tham số hóa quá mức và đảm bảo độ chính xác hợp lý. Tuy nhiên, nói chung, chúng tôi khuyến nghị chọn các ensemble lớn hơn phù hợp hơn để xử lý các trường hợp thực tế.
+
+Vì môi trường thực tế đòi hỏi các mô hình được triển khai nhanh chóng thích ứng với sự thay đổi miền, chúng tôi đã kiểm tra phương pháp của mình trong tình huống tăng dần miền. Trong thiết lập như vậy, mỗi batch dữ liệu có thể cung cấp các ví dụ từ nhiều lớp có thể là đã biết hoặc mới (Van de Ven and Tolias, 2019). Theo cách này, mô hình cần học tăng dần, dễ bị ảnh hưởng bởi các thay đổi miền thường xuyên. Như được hiển thị trong Bảng 3, phương pháp được đề xuất xử lý cả hai tình huống với độ chính xác tương đương. Chúng tôi quan sát độ chính xác được cải thiện cho BBC News, nhưng giảm cho các bộ dữ liệu còn lại. Tính chất như vậy có thể có lợi khi có kiến thức trước hạn chế về dữ liệu hoặc luồng không cân bằng (Aguiar et al., 2022).
+
+Chúng tôi cũng đã điều tra tầm quan trọng của phương pháp lựa chọn expert được trình bày. Chúng tôi huấn luyện phương pháp DE&E và đối với mỗi ví dụ huấn luyện, chúng tôi cho phép nó chọn các experts ngẫu nhiên (thay vì những cái có liên quan nhất) với xác suất cố định p. Như được hiển thị trong Hình 4, phương pháp lựa chọn có ảnh hưởng mạnh đến hiệu suất mô hình. Độ chính xác giảm tỷ lệ thuận với p trên tất cả các bộ dữ liệu được nghiên cứu. Kỹ thuật lựa chọn expert phù hợp là quan trọng đối với phương pháp được trình bày. Đáng chú ý là các bộ dữ liệu tương đối dễ hơn ít bị ảnh hưởng bởi mất độ chính xác hơn so với những bộ khó vì ngay cả các experts được chọn ngẫu nhiên vẫn có thể phân loại dữ liệu bằng cách học các mẫu tổng quát đơn giản. Trong những trường hợp khó khăn hơn như bộ dữ liệu Newsgroups và Complaints, hiệu suất mô hình có thể so sánh với việc đoán ngẫu nhiên khi p > 0.5.
+
+## 5 Kết luận
+
+Trong bài báo này, chúng tôi đã đề xuất một kiến trúc không phụ thuộc miền cho học liên tục với quy trình huấn luyện chuyên biệt trong các vấn đề tăng dần lớp thách thức. Kiến trúc được trình bày dựa trên kỹ thuật Mixture of Experts và xử lý nhiều vấn đề thực tế liên quan đến việc triển khai các mô hình phân loại văn bản trong các hệ thống thực tế không tầm thường. Như đóng góp chính của chúng tôi, chúng tôi đã giới thiệu một lớp soft KNN hoàn toàn có thể vi phân và một chiến lược cân nhắc dự đoán mới. Bằng cách tiến hành các thí nghiệm toàn diện, chúng tôi cho thấy cải thiện độ chính xác cho tất cả các trường hợp được nghiên cứu và đạt được kết quả SOTA mà không sử dụng bộ đệm bộ nhớ. Điều này cho phép huấn luyện hiệu quả và an toàn, đặc biệt khi làm việc với dữ liệu văn bản nhạy cảm. Kiến trúc được trình bày có tính linh hoạt cao, có thể giải quyết hiệu quả các bài toán phân loại trong nhiều miền, và có thể được áp dụng cho các hệ thống học máy thực tế đòi hỏi cải thiện liên tục. Công việc như vậy cho phép các nhà nghiên cứu thực hiện các bước tiếp theo hướng tới việc vượt qua nhiều thách thức hiện tại liên quan đến các ứng dụng công nghệ ngôn ngữ.
+
+## Hạn chế
+
+Những hạn chế chính của kiến trúc được đề xuất liên quan đến sự hiện diện của bộ trích xuất đặc trưng được đóng băng. Độ chính xác của mô-đun phân loại tỷ lệ thuận với chất lượng của các đặc trưng. Vì các học viên yếu ensemble là các mạng neural một lớp, toàn bộ quá trình trích xuất đặc trưng dựa vào một mô hình được huấn luyện trước hạn chế mạnh mẽ giới hạn trên của độ chính xác phân loại. Phương pháp như vậy giảm độ phức tạp của phương pháp, nhưng cũng khiến nó dễ bị lỗi khi các nhúng có chất lượng thấp. Đạt được độ chính xác ở mức độ thỏa đáng, điều quan trọng trong các hệ thống thực tế, đòi hỏi việc sử dụng các bộ trích xuất đặc trưng chất lượng cao. Hiện tại, rất nhiều mô hình SOTA được huấn luyện trước có sẵn miễn phí trong các miền như phân loại văn bản hoặc hình ảnh, nhưng nếu bộ trích xuất như vậy không có sẵn, không tạo ra các đặc trưng hợp lý hoặc quá đắt để sử dụng, kiến trúc của chúng tôi có thể không phải là lựa chọn tốt nhất.
+
+Một vấn đề khác là thời gian huấn luyện tương đối dài so với các phương pháp tham chiếu (xem A.3). Việc giới thiệu lớp soft KNN có thể vi phân dẫn đến nỗ lực tính toán bổ sung ảnh hưởng rõ ràng đến độ phức tạp mô hình. Điều này hạn chế việc sử dụng trong các hệ thống độ trễ thấp với các mô hình học máy được huấn luyện trực tuyến.
+
+## Tuyên bố đạo đức
+
+Các tác giả không thấy trước những mối quan tâm đạo đức với công việc được trình bày trong bài báo này, đặc biệt liên quan đến bất kỳ loại tổn hại và phân biệt đối xử nào. Vì kiến trúc được trình bày có thể có nhiều cách sử dụng khác nhau, các tác giả không chịu trách nhiệm cho bất kỳ ứng dụng không đạo đức nào của công việc này.
+
+## Lời cảm ơn
+
+Nghiên cứu được tiến hành dưới chương trình Tiến sĩ Triển khai của Bộ Khoa học và Giáo dục Đại học Ba Lan và cũng được tài trợ một phần bởi Khoa Trí tuệ Nhân tạo, Wroclaw Tech và bởi Liên minh Châu Âu dưới chương trình tài trợ Horizon Europe OMINO (số tài trợ 101086321). Nó cũng được đồng tài trợ một phần bởi Quỹ Phát triển Khu vực Châu Âu trong Trục Ưu tiên 1 "Doanh nghiệp và đổi mới", Biện pháp 1.2. "Doanh nghiệp đổi mới, tiểu biện pháp 1.2.1. "Doanh nghiệp đổi mới – cạnh tranh ngang" như một phần của ROP WD 2014-2020, hợp đồng hỗ trợ số RPDS.01.02.01-02-0063/20-00.
