@@ -20,7 +20,7 @@ class PaperTranslator:
     def __init__(self):
         # Lấy API key từ environment
         self.client = openai.OpenAI()
-        self.base_dir = Path("/home/admin88/arxiv-downloader")
+        self.base_dir = Path(".")
         os.chdir(self.base_dir)  # Change working directory to arxiv-downloader
         
         # Prompt dịch thuật chuyên nghiệp

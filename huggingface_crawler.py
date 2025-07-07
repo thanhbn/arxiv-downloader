@@ -136,7 +136,7 @@ def process_collection(url, base_dir):
 
 def main():
     """Main function to process all collections"""
-    base_dir = Path("/home/admin88/arxiv-downloader")
+    base_dir = Path(".")
     collections_file = base_dir / "huggingface_collections_links.txt"
     
     if not collections_file.exists():

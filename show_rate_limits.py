@@ -16,7 +16,7 @@ def show_rate_limits():
     try:
         result = subprocess.run([
             'bash', '-c', 
-            'source /home/admin88/arxiv-downloader/download_config.sh && show_config'
+            'source ./download_config.sh && show_config'
         ], capture_output=True, text=True)
         
         if result.returncode == 0:
@@ -58,7 +58,7 @@ def show_rate_limits():
     
     # Analyze actual collections
     try:
-        sys.path.append('/home/admin88/arxiv-downloader')
+        sys.path.append('.')
         from arxiv_orchestrator import ArxivOrchestrator
         
         orchestrator = ArxivOrchestrator()
@@ -70,7 +70,7 @@ def show_rate_limits():
         
         for url in collection_urls:
             collection_name = orchestrator.extract_collection_name(url)
-            links_file = f"/home/admin88/arxiv-downloader/{collection_name}/arxiv_links.txt"
+            links_file = f"./{collection_name}/arxiv_links.txt"
             
             try:
                 with open(links_file, 'r') as f:

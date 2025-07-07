@@ -13,7 +13,7 @@ def extract_arxiv_id(url):
 
 def check_multimodal():
     """Check multimodal collection"""
-    base_dir = "/home/admin88/arxiv-downloader"
+    base_dir = "."
     multimodal_dir = os.path.join(base_dir, "multimodal")
     
     # Read URLs from arxiv_links.txt

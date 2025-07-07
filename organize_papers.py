@@ -32,7 +32,7 @@ def find_paper_in_directories(arxiv_id, base_dir):
 
 def organize_papers():
     """Main function to organize papers"""
-    base_dir = "/home/admin88/arxiv-downloader"
+    base_dir = "."
     os.chdir(base_dir)
     
     # Find all arxiv_links.txt files

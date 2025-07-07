@@ -175,7 +175,7 @@ def main():
     parser = argparse.ArgumentParser(description='Check and move papers to correct collections')
     parser.add_argument('--execute', action='store_true', 
                        help='Actually move files (default is dry run)')
-    parser.add_argument('--base-dir', default='/home/admin88/arxiv-downloader',
+    parser.add_argument('--base-dir', default='.',
                        help='Base directory to search')
     parser.add_argument('--collections', nargs='+',
                        help='Specific collections to process (default: all)')

@@ -5,7 +5,7 @@ Test version of ArXiv Orchestrator to verify functionality with one collection
 
 import sys
 import os
-sys.path.append('/home/admin88/arxiv-downloader')
+sys.path.append('.')
 
 from arxiv_orchestrator import ArxivOrchestrator
 

@@ -4,7 +4,7 @@ Quick status checker for all collections
 """
 
 import sys
-sys.path.append('/home/admin88/arxiv-downloader')
+sys.path.append('.')
 
 from arxiv_orchestrator import ArxivOrchestrator
 
@@ -27,7 +27,7 @@ def check_all_status():
             progress = orchestrator.load_progress(collection_name)
             
             # Check if arxiv_links.txt exists and count links
-            links_file = f"/home/admin88/arxiv-downloader/{collection_name}/arxiv_links.txt"
+            links_file = f"./{collection_name}/arxiv_links.txt"
             try:
                 with open(links_file, 'r') as f:
                     link_count = len([line for line in f if line.strip()])

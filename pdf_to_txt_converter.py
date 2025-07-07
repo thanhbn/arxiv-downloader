@@ -499,7 +499,7 @@ def process_all_collections(max_workers=4):
     """
     Process all collection directories automatically with parallel processing
     """
-    base_dir = "/home/admin88/arxiv-downloader"
+    base_dir = "."
     collections = [d for d in os.listdir(base_dir) 
                   if os.path.isdir(os.path.join(base_dir, d)) 
                   and not d.startswith('.') 
@@ -535,8 +535,8 @@ def main():
     """
     Main function to convert all PDFs in directory and rename TXT files
     """
-    # Working directory - use arxiv-downloader directory
-    working_dir = "/home/admin88/arxiv-downloader"
+    # Working directory - use current directory
+    working_dir = "."
     
     # Check if working directory exists
     if not os.path.exists(working_dir):

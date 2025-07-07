@@ -23,7 +23,7 @@ import re
 class ArxivOrchestrator:
     def __init__(self):
         # Define fixed paths
-        self.base_dir = Path("/home/admin88/arxiv-downloader")
+        self.base_dir = Path(".")
         self.collections_file = self.base_dir / "huggingface_collections_links.txt"
         self.download_script = self.base_dir / "download_arxiv.sh"
         self.progress_dir = self.base_dir / "progress"
