@@ -28,6 +28,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import signal
 import glob
 import re
+from datetime import datetime
 
 # Configure logging
 logging.basicConfig(
@@ -46,6 +47,30 @@ class TranslationQueueManager:
     def __init__(self, queue_file: str = "translation_queue.txt"):
         self.queue_file = Path(queue_file)
         self.lock_file = Path(f"{queue_file}.lock")
+        self.stale_threshold = 30 * 60  # 30 minutes in seconds
+        self.lock_fd = None  # Initialize lock file descriptor
+        
+    def _generate_timestamp(self) -> str:
+        """Generate timestamp in yyyymmdd-HH24Mi format."""
+        return datetime.now().strftime("%Y%m%d-%H%M")
+    
+    def _parse_timestamp(self, timestamp_str: str) -> Optional[datetime]:
+        """Parse timestamp from yyyymmdd-HH24Mi format."""
+        try:
+            return datetime.strptime(timestamp_str, "%Y%m%d-%H%M")
+        except ValueError:
+            return None
+    
+    def _is_stale_processing(self, processing_line: str) -> bool:
+        """Check if a processing line is stale (older than 30 minutes)."""
+        # Format: [Processing] timestamp filename
+        parts = processing_line.split(' ', 2)
+        if len(parts) >= 3 and parts[0] == '[Processing]':
+            timestamp_dt = self._parse_timestamp(parts[1])
+            if timestamp_dt:
+                age_seconds = (datetime.now() - timestamp_dt).total_seconds()
+                return age_seconds > self.stale_threshold
+        return False
         
     def _extract_arxiv_id(self, filename: str) -> Optional[str]:
         """Extract arxiv ID from filename."""
@@ -86,22 +111,94 @@ class TranslationQueueManager:
     def _acquire_lock(self):
         """Acquire file lock for safe concurrent access."""
         try:
+            # Close any existing lock file descriptor first
+            if hasattr(self, 'lock_fd') and self.lock_fd and not self.lock_fd.closed:
+                try:
+                    self.lock_fd.close()
+                except:
+                    pass
+            
             self.lock_fd = open(self.lock_file, 'w')
             fcntl.flock(self.lock_fd.fileno(), fcntl.LOCK_EX)
             return True
         except Exception as e:
             logger.error(f"Failed to acquire lock: {e}")
+            # Clean up on failure
+            if hasattr(self, 'lock_fd') and self.lock_fd:
+                try:
+                    self.lock_fd.close()
+                except:
+                    pass
+                self.lock_fd = None
             return False
             
     def _release_lock(self):
         """Release file lock."""
         try:
-            fcntl.flock(self.lock_fd.fileno(), fcntl.LOCK_UN)
-            self.lock_fd.close()
-            if self.lock_file.exists():
-                self.lock_file.unlink()
+            if hasattr(self, 'lock_fd') and self.lock_fd and not self.lock_fd.closed:
+                try:
+                    fcntl.flock(self.lock_fd.fileno(), fcntl.LOCK_UN)
+                except:
+                    pass  # Ignore unlock errors
+                try:
+                    self.lock_fd.close()
+                except:
+                    pass  # Ignore close errors
+            self.lock_fd = None  # Reset the file descriptor
+            
+            # Clean up lock file
+            try:
+                if self.lock_file.exists():
+                    self.lock_file.unlink()
+            except:
+                pass  # Ignore file deletion errors
         except Exception as e:
             logger.error(f"Failed to release lock: {e}")
+            # Ensure lock_fd is reset even on error
+            self.lock_fd = None
+    
+    def clean_stale_processing(self) -> int:
+        """Clean up stale processing entries (older than 30 minutes). Returns count of cleaned entries."""
+        if not self._acquire_lock():
+            return 0
+            
+        try:
+            if not self.queue_file.exists():
+                return 0
+                
+            lines = self.queue_file.read_text().strip().split('\n')
+            lines = [line for line in lines if line.strip()]
+            
+            cleaned_count = 0
+            updated_lines = []
+            
+            for line in lines:
+                if line.startswith('[Processing]') and self._is_stale_processing(line):
+                    # Remove timestamp and [Processing] prefix from stale entries
+                    parts = line.split(' ', 2)
+                    if len(parts) >= 3:
+                        clean_line = parts[2].strip()  # Extract just the filename
+                        updated_lines.append(clean_line)
+                        cleaned_count += 1
+                        logger.info(f"Cleaned stale processing entry: {clean_line}")
+                    else:
+                        # Malformed line, keep as-is but log warning
+                        updated_lines.append(line)
+                        logger.warning(f"Malformed processing line: {line}")
+                else:
+                    updated_lines.append(line)
+            
+            if cleaned_count > 0:
+                self.queue_file.write_text('\n'.join(updated_lines) + '\n' if updated_lines else '')
+                logger.info(f"Cleaned {cleaned_count} stale processing entries")
+            
+            return cleaned_count
+            
+        except Exception as e:
+            logger.error(f"Error cleaning stale processing entries: {e}")
+            return 0
+        finally:
+            self._release_lock()
             
     def get_next_file(self, blocking: bool = True) -> Optional[str]:
         """Get the next file to process from the queue.
@@ -140,8 +237,9 @@ class TranslationQueueManager:
                             continue
                     
                     if blocking:
-                        # Mark as processing
-                        lines[i] = f"[Processing] {filename}"
+                        # Mark as processing with timestamp
+                        timestamp = self._generate_timestamp()
+                        lines[i] = f"[Processing] {timestamp} {filename}"
                         # Write back to file
                         self.queue_file.write_text('\n'.join(lines) + '\n')
                     
@@ -168,9 +266,32 @@ class TranslationQueueManager:
             lines = self.queue_file.read_text().strip().split('\n')
             original_count = len(lines)
             
-            # Remove lines containing this filename (with or without [Processing])
-            lines = [line for line in lines if line.strip() and 
-                    not (filename in line or line.endswith(filename))]
+            # Remove lines containing this filename (with or without [Processing] and timestamp)
+            filtered_lines = []
+            for line in lines:
+                if not line.strip():
+                    continue
+                # Check if line contains the filename
+                if filename in line or line.endswith(filename):
+                    continue
+                # For processing lines, extract the actual filename part
+                if line.startswith('[Processing]'):
+                    parts = line.split(' ', 2)
+                    if len(parts) >= 3:
+                        # New format: [Processing] timestamp filename
+                        actual_filename = parts[2].strip()
+                    elif len(parts) == 2:
+                        # Old format: [Processing] filename
+                        actual_filename = parts[1].strip()
+                    else:
+                        actual_filename = ""
+                    
+                    if actual_filename == filename or actual_filename.endswith(filename):
+                        continue
+                
+                filtered_lines.append(line)
+            
+            lines = filtered_lines
             
             self.queue_file.write_text('\n'.join(lines) + '\n' if lines else '')
             
@@ -226,8 +347,18 @@ class TranslationQueueManager:
             
             for line in lines:
                 if line.startswith('[Processing]'):
-                    # Remove [Processing] prefix
-                    clean_line = line.replace('[Processing] ', '').strip()
+                    # Remove [Processing] prefix and timestamp if present
+                    parts = line.split(' ', 2)
+                    if len(parts) >= 3:
+                        # New format: [Processing] timestamp filename
+                        clean_line = parts[2].strip()
+                    elif len(parts) == 2:
+                        # Old format: [Processing] filename
+                        clean_line = parts[1].strip()
+                    else:
+                        # Malformed line, try basic replacement
+                        clean_line = line.replace('[Processing] ', '').strip()
+                    
                     updated_lines.append(clean_line)
                     reset_count += 1
                 else:
@@ -261,7 +392,20 @@ class TranslationQueueManager:
             arxiv_groups = {}
             
             for line in lines:
-                clean_line = line.replace('[Processing] ', '').strip()
+                # Extract clean filename from line (handling both old and new formats)
+                if line.startswith('[Processing]'):
+                    parts = line.split(' ', 2)
+                    if len(parts) >= 3:
+                        # New format: [Processing] timestamp filename
+                        clean_line = parts[2].strip()
+                    elif len(parts) == 2:
+                        # Old format: [Processing] filename
+                        clean_line = parts[1].strip()
+                    else:
+                        clean_line = line.replace('[Processing] ', '').strip()
+                else:
+                    clean_line = line.strip()
+                
                 arxiv_id = self._extract_arxiv_id(clean_line)
                 
                 if arxiv_id:
@@ -274,13 +418,38 @@ class TranslationQueueManager:
             removed_count = 0
             
             for line in lines:
-                clean_line = line.replace('[Processing] ', '').strip()
+                # Extract clean filename from line (handling both old and new formats)
+                if line.startswith('[Processing]'):
+                    parts = line.split(' ', 2)
+                    if len(parts) >= 3:
+                        # New format: [Processing] timestamp filename
+                        clean_line = parts[2].strip()
+                    elif len(parts) == 2:
+                        # Old format: [Processing] filename
+                        clean_line = parts[1].strip()
+                    else:
+                        clean_line = line.replace('[Processing] ', '').strip()
+                else:
+                    clean_line = line.strip()
+                
                 arxiv_id = self._extract_arxiv_id(clean_line)
                 
                 if arxiv_id and arxiv_id in arxiv_groups:
                     # Find the longest filename for this arxiv_id
                     group_lines = arxiv_groups[arxiv_id]
-                    longest_line = max(group_lines, key=lambda x: len(x.replace('[Processing] ', '').strip()))
+                    
+                    def extract_filename(line):
+                        if line.startswith('[Processing]'):
+                            parts = line.split(' ', 2)
+                            if len(parts) >= 3:
+                                return parts[2].strip()
+                            elif len(parts) == 2:
+                                return parts[1].strip()
+                            else:
+                                return line.replace('[Processing] ', '').strip()
+                        return line.strip()
+                    
+                    longest_line = max(group_lines, key=lambda x: len(extract_filename(x)))
                     
                     if line == longest_line:
                         cleaned_lines.append(line)
@@ -588,6 +757,7 @@ class TranslationManager:
         self.warmup_threshold = 300  # 5 minutes in seconds
         self.last_status = (0, 0, 0)  # Track last status to reduce logging
         self.last_status_log = 0  # Track when we last logged status
+        self.last_stale_cleanup = 0  # Track when we last cleaned stale entries
         
     def verify_claude_executable(self) -> bool:
         """Verify that Claude executable is available."""
@@ -631,6 +801,15 @@ class TranslationManager:
                     total, processing, pending = self.queue_manager.get_queue_status()
                     current_time = time.time()
                     
+                    # Periodically clean stale processing entries (every 5 minutes)
+                    if current_time - self.last_stale_cleanup > 300:  # 5 minutes
+                        stale_cleaned = self.queue_manager.clean_stale_processing()
+                        if stale_cleaned > 0:
+                            logger.info(f"Cleaned {stale_cleaned} stale processing entries")
+                            # Refresh queue status after cleaning
+                            total, processing, pending = self.queue_manager.get_queue_status()
+                        self.last_stale_cleanup = current_time
+                    
                     # Only log status if it changed or 60 seconds have passed
                     status_changed = (total, processing, pending) != self.last_status
                     time_for_update = current_time - self.last_status_log > 60
@@ -650,7 +829,14 @@ class TranslationManager:
                     
                     # If we have pending work but no futures, something went wrong
                     if pending > 0 and len(futures) == 0:
-                        logger.warning(f"No active workers but {pending} pending files. Attempting to start workers...")
+                        logger.warning(f"No active workers but {pending} pending files. Checking for stale entries and attempting to start workers...")
+                        # Clean stale entries first
+                        stale_cleaned = self.queue_manager.clean_stale_processing()
+                        if stale_cleaned > 0:
+                            logger.info(f"Cleaned {stale_cleaned} additional stale processing entries")
+                            # Refresh queue status after cleaning
+                            total, processing, pending = self.queue_manager.get_queue_status()
+                        
                         # Try to start at least one worker before continuing
                         filename = self.queue_manager.get_next_file()
                         if filename:
@@ -791,6 +977,8 @@ def main():
                        help="Enable verbose logging")
     parser.add_argument("--clean-only", action="store_true",
                        help="Only clean duplicates and already-translated files from queue, don't start translation")
+    parser.add_argument("--clean-stale", action="store_true",
+                       help="Only clean stale processing entries (>30 minutes) from queue, don't start translation")
     
     args = parser.parse_args()
     
@@ -834,6 +1022,19 @@ def main():
         
         logger.info(f"Scanned {scanned_count} files, marked {skipped_count} as already translated")
         logger.info("Queue cleanup completed successfully")
+        sys.exit(0)
+    
+    # If clean-stale mode, just clean stale entries and exit
+    if args.clean_stale:
+        logger.info("Running in clean-stale mode...")
+        logger.info("Cleaning stale processing entries (>30 minutes) from translation queue...")
+        stale_cleaned = manager.queue_manager.clean_stale_processing()
+        logger.info(f"Cleaned {stale_cleaned} stale processing entries")
+        
+        # Show queue status after cleaning
+        total, processing, pending = manager.queue_manager.get_queue_status()
+        logger.info(f"Queue status after cleanup - Total: {total}, Processing: {processing}, Pending: {pending}")
+        logger.info("Stale cleanup completed successfully")
         sys.exit(0)
     
     # Run the translation process
