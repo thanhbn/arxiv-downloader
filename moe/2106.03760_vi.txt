@@ -1,0 +1,460 @@
+DSelect-k: Lựa chọn khả vi trong Mixture of Experts với ứng dụng cho học đa nhiệm vụ
+Hussein Hazimeh1, Zhe Zhao1, Aakanksha Chowdhery1, Maheswaran Sathiamoorthy1
+Yihua Chen1,Rahul Mazumder2,Lichan Hong1,Ed H. Chi1
+1Google, {hazimeh,zhezhao,chowdhery,nlogn,yhchen,lichan,edchi}@google.com
+2Massachusetts Institute of Technology, rahulmaz@mit.edu
+
+Tóm tắt
+Kiến trúc Mixture-of-Experts (MoE) đang cho thấy kết quả đầy hứa hẹn trong việc cải thiện chia sẻ tham số trong học đa nhiệm vụ (MTL) và trong việc mở rộng quy mô các mạng thần kinh có dung lượng cao. Các mô hình MoE tiên tiến sử dụng một "cổng thưa" có thể huấn luyện để chọn một tập con của các chuyên gia cho mỗi ví dụ đầu vào. Mặc dù có tính hấp dẫn về mặt khái niệm, các cổng thưa hiện có, như Top-k, không mượt mà. Việc thiếu tính mượt mà có thể dẫn đến các vấn đề về hội tụ và hiệu suất thống kê khi huấn luyện bằng các phương pháp dựa trên gradient. Trong bài báo này, chúng tôi phát triển DSelect-k: một cổng liên tục khả vi và thưa cho MoE, dựa trên một công thức mã hóa nhị phân mới. Cổng có thể được huấn luyện bằng các phương pháp bậc một, như stochastic gradient descent, và cung cấp khả năng kiểm soát rõ ràng số lượng chuyên gia cần chọn. Chúng tôi chứng minh hiệu quả của DSelect-k trên cả dữ liệu MTL tổng hợp và thực tế với tối đa 128 nhiệm vụ. Các thí nghiệm của chúng tôi cho thấy DSelect-k có thể đạt được những cải thiện có ý nghĩa thống kê trong dự đoán và lựa chọn chuyên gia so với các cổng MoE phổ biến. Đáng chú ý, trên một hệ thống gợi ý quy mô lớn trong thế giới thực, DSelect-k đạt được cải thiện hơn 22% về hiệu suất dự đoán so với Top-k. Chúng tôi cung cấp một triển khai mã nguồn mở của DSelect-k1.
+
+1 Giới thiệu
+Mixture of Experts (MoE) [14] là nền tảng của nhiều mô hình học sâu tiên tiến. Ví dụ, các lớp dựa trên MoE đang được sử dụng để thực hiện tính toán hiệu quả trong các mạng thần kinh có dung lượng cao và để cải thiện chia sẻ tham số trong học đa nhiệm vụ (MTL) [33,22,21]. Ở dạng đơn giản nhất, một MoE bao gồm một tập hợp các chuyên gia (mạng thần kinh) và một cổng có thể huấn luyện. Cổng gán trọng số cho các chuyên gia trên cơ sở từng ví dụ, và MoE xuất ra một tổ hợp có trọng số của các chuyên gia. Cơ chế gán trọng số theo từng ví dụ này cho phép các chuyên gia chuyên môn hóa trong các phân vùng khác nhau của không gian đầu vào, điều này có tiềm năng cải thiện hiệu suất dự đoán và khả năng diễn giải. Trong Hình 1 (trái), chúng tôi hiển thị một ví dụ về kiến trúc MoE đơn giản có thể được sử dụng như một bộ học độc lập hoặc như một lớp trong mạng thần kinh.
+
+Tài liệu về MoE truyền thống tập trung vào các cổng dựa trên softmax, trong đó tất cả các chuyên gia được gán trọng số khác không [17]. Để tăng cường hiệu quả tính toán và khả năng diễn giải của các mô hình MoE, các nghiên cứu gần đây sử dụng các cổng thưa chỉ gán trọng số khác không cho một tập con nhỏ của các chuyên gia [1,33,29,21]. Các cổng thưa hiện có không khả vi, và các thuật toán học tăng cường thường được sử dụng để huấn luyện [1,29]. Trong một nghiên cứu thú vị, [33] đã giới thiệu một cổng thưa mới (cổng Top-k) và đề xuất huấn luyện nó bằng stochastic gradient descent (SGD). Khả năng huấn luyện cổng bằng SGD rất hấp dẫn vì nó cho phép huấn luyện end-to-end. Tuy nhiên, cổng Top-k không liên tục, điều này có thể dẫn đến các vấn đề hội tụ trong SGD ảnh hưởng đến hiệu suất thống kê (như chúng tôi chứng minh trong các thí nghiệm của mình).
+
+1https://github.com/google-research/google-research/tree/master/dselect_k_moe
+35th Conference on Neural Information Processing Systems (NeurIPS 2021).arXiv:2106.03760v3  [cs.LG]  31 Dec 2021
+
+--- TRANG 2 ---
+Hình 1: (Trái): Một ví dụ về MoE có thể được sử dụng như một bộ học độc lập hoặc lớp trong mạng thần kinh. Ở đây "Ei" biểu thị chuyên gia thứ i. (Phải): Một MoE đa cổng để học hai nhiệm vụ đồng thời. "Task i NN" là một mạng thần kinh tạo ra đầu ra của Nhiệm vụ i.
+
+Trong bài báo này, chúng tôi giới thiệu DSelect-k: một cổng liên tục khả vi và thưa cho MoE. Với một tham số k do người dùng chỉ định, cổng chọn tối đa k trong số n chuyên gia. Khả năng kiểm soát rõ ràng về độ thưa này dẫn đến một bài toán tối ưu hóa có ràng buộc cardinality, điều này là thách thức về mặt tính toán. Để vượt qua thách thức này, chúng tôi đề xuất một tái diễn đạt không ràng buộc mới tương đương với bài toán gốc. Bài toán tái diễn đạt sử dụng một sơ đồ mã hóa nhị phân để ngầm áp đặt ràng buộc cardinality. Chúng tôi chứng minh rằng bằng cách làm mượt cẩn thận các biến mã hóa nhị phân, bài toán tái diễn đạt có thể được tối ưu hóa hiệu quả bằng các phương pháp bậc một như SGD. DSelect-k có một lợi thế độc đáo so với các phương pháp hiện có về mặt gọn gàng và hiệu quả tính toán. Số lượng tham số được sử dụng bởi DSelect-k là logarithmic theo số lượng chuyên gia, trái ngược với tuyến tính trong các cổng hiện có như Top-k. Hơn nữa, đầu ra của DSelect-k có thể được tính toán hiệu quả thông qua một biểu thức dạng đóng đơn giản. Ngược lại, các phương pháp khả vi tiên tiến cho lựa chọn k-subset ngẫu nhiên và các phép thư giãn Top-k, như [26,40]2, yêu cầu giải một bài toán con tối ưu hóa (cho mỗi ví dụ đầu vào) để tính toán đầu ra của cổng.
+
+DSelect-k hỗ trợ hai cơ chế cổng: theo từng ví dụ và tĩnh. Cổng theo từng ví dụ là kỹ thuật cổng cổ điển được sử dụng trong các mô hình MoE, trong đó các trọng số được gán cho các chuyên gia là một hàm của ví dụ đầu vào [14,33]. Trong cổng tĩnh, một tập con các chuyên gia được chọn và các trọng số tương ứng không phụ thuộc vào đầu vào [29]. Dựa trên các thí nghiệm của chúng tôi, mỗi cơ chế cổng có thể vượt trội hơn cơ chế kia trong một số thiết lập nhất định. Do đó, chúng tôi nghiên cứu cả hai cơ chế và ủng hộ việc thử nghiệm với từng cơ chế.
+
+MTL là một lĩnh vực quan trọng mà các mô hình MoE nói chung, và cổng của chúng tôi nói riêng, có thể hữu ích. Mục tiêu của MTL là học nhiều nhiệm vụ đồng thời bằng cách sử dụng một mô hình được chia sẻ. So với học nhiệm vụ đơn thông thường, MTL có thể đạt được hiệu suất tổng quát hóa tốt hơn thông qua việc khai thác các mối quan hệ nhiệm vụ [4]. Một vấn đề chính trong MTL là cách chia sẻ tham số mô hình giữa các nhiệm vụ [31]. Ví dụ, chia sẻ tham số giữa các nhiệm vụ không liên quan có thể làm giảm hiệu suất. MoE đa cổng [22] là một kiến trúc linh hoạt cho phép học những gì cần chia sẻ giữa các nhiệm vụ. Hình 1 (phải) hiển thị một ví dụ về MoE đa cổng, trong trường hợp đơn giản của hai nhiệm vụ. Ở đây, mỗi nhiệm vụ có cổng riêng của nó để kiểm soát thích ứng mức độ chia sẻ tham số. Trong các thí nghiệm của chúng tôi, chúng tôi nghiên cứu hiệu quả của DSelect-k trong bối cảnh của MoE đa cổng.
+
+Đóng góp: Ở mức độ cao, đóng góp chính của chúng tôi là DSelect-k: một cổng liên tục khả vi và thưa mới cho MoE, có thể được huấn luyện trực tiếp bằng các phương pháp bậc một. Các đóng góp kỹ thuật của chúng tôi có thể được tóm tắt như sau. (i) Cổng chọn (tối đa) k trong số n chuyên gia, trong đó k là một tham số do người dùng chỉ định. Điều này dẫn đến một bài toán tối ưu hóa có ràng buộc cardinality đầy thách thức. Để đối phó với thách thức này, chúng tôi phát triển một tái diễn đạt không ràng buộc mới, và chúng tôi chứng minh rằng nó tương đương với bài toán gốc. Tái diễn đạt sử dụng một sơ đồ mã hóa nhị phân ngầm áp đặt ràng buộc cardinality bằng các mã nhị phân có thể học. (ii) Để làm cho tái diễn đạt không ràng buộc mượt mà, chúng tôi thư giãn và làm mượt các biến nhị phân. Chúng tôi chứng minh rằng, với khởi tạo và chính quy hóa cẩn thận, bài toán kết quả có thể được tối ưu hóa bằng các phương pháp bậc một như SGD. (iii) Chúng tôi thực hiện một loạt thí nghiệm trên các bộ dữ liệu MTL tổng hợp và thực tế, cho thấy cổng của chúng tôi có tính cạnh tranh với các cổng tiên tiến về mặt chia sẻ tham số và hiệu suất dự đoán. (iv) Chúng tôi cung cấp một triển khai mã nguồn mở của DSelect-k.
+
+2Các phương pháp này không được thiết kế đặc biệt cho MoE.
+
+--- TRANG 3 ---
+1.1 Nghiên cứu liên quan
+
+MoE và Tính toán có điều kiện: Kể từ khi MoE được giới thiệu bởi [14], một khối lượng nghiên cứu thú vị đã mở rộng và nghiên cứu mô hình này, ví dụ, xem [17,13,16]. Gần đây, các mô hình dựa trên MoE đang cho thấy thành công trong học sâu. Ví dụ, [33] đã giới thiệu cổng Top-k thưa cho MoE và cho thấy những cải thiện tính toán đáng kể trong các nhiệm vụ dịch máy; chúng tôi thảo luận các kết nối chính xác với cổng này trong Phần 2. Cổng Top-k cũng đã được sử dụng trong một số mô hình học sâu tiên tiến xem xét các nhiệm vụ MTL, ví dụ, [21,28,9]. Nghiên cứu của chúng tôi cũng liên quan đến các mô hình tính toán có điều kiện kích hoạt các phần của mạng thần kinh dựa trên đầu vào [2,1,33,12,36]. Không giống như DSelect-k, những nghiên cứu này dựa trên các mô hình không khả vi, hoặc heuristics mà các mô hình huấn luyện và suy luận khác nhau.
+
+Lựa chọn k-Subset ngẫu nhiên và Thư giãn Top-k: Một dòng nghiên cứu liên quan tập trung vào lựa chọn k-subset ngẫu nhiên trong mạng thần kinh, ví dụ, xem [26,5,39] và các tài liệu tham khảo trong đó. Cụ thể, các nghiên cứu này đề xuất các phương pháp khả vi để lấy mẫu k-subsets từ phân phối categorical, dựa trên các mở rộng hoặc tổng quát hóa của thủ thuật Gumbel-softmax [23,15]. Tuy nhiên, trong MoE chúng tôi xem xét lựa chọn tập con xác định—tính xác định là một giả định phổ biến trong các mô hình MoE có thể cải thiện khả năng diễn giải và cho phép triển khai hiệu quả [14,17,33]. Ngược lại, các phương pháp ngẫu nhiên được mô tả ở trên phù hợp trong các ứng dụng có phân phối lấy mẫu cơ bản, như trong suy luận biến phân [19]. Một nghiên cứu liên quan khác là phép thư giãn khả vi của toán tử Top-k được đề xuất bởi [40]. Tất cả các nghiên cứu nói trên thực hiện huấn luyện dày đặc (tức là gradient của tất cả các chuyên gia, ngay cả khi không được chọn, sẽ phải được tính toán trong quá trình lan truyền ngược), trong khi DSelect-k có thể (ở một mức độ nào đó) khai thác độ thưa để tăng tốc huấn luyện, như chúng tôi sẽ thảo luận trong các Phần 2 và 3. Hơn nữa, framework lựa chọn k-subset ngẫu nhiên trong [26] (bao gồm một số nghiên cứu trước đó) và phép thư giãn Top-k trong [40] yêu cầu giải một bài toán con tối ưu hóa để tính toán đầu ra cổng—mỗi ví dụ sẽ yêu cầu giải một bài toán con riêng biệt trong thiết lập cổng theo từng ví dụ, điều này có thể tốn kém về mặt tính toán. Ngược lại, đầu ra của DSelect-k được tính toán hiệu quả thông qua một biểu thức dạng đóng.
+
+Biến đổi thưa đến Simplex: Đây là các biến thể thưa của hàm softmax có thể xuất ra các vector xác suất thưa, ví dụ, xem [24,27,6,3]. Mặc dù tương tự như nghiên cứu của chúng tôi ở chỗ chúng xuất ra các vector xác suất thưa, những biến đổi này không thể kiểm soát mức độ thưa một cách chính xác như DSelect-k (thông qua ràng buộc cardinality). Do đó, những biến đổi này có thể gán cho một số ví dụ hoặc nhiệm vụ các tổ hợp thưa và những cái khác các tổ hợp dày đặc.
+
+MTL: Trong Phụ lục A, chúng tôi xem xét tài liệu liên quan về MTL.
+
+2 Cổng trong Mixture of Experts
+
+Trong phần này, chúng tôi đầu tiên xem xét kiến trúc MoE và các cổng phổ biến, sau đó thảo luận cách các cổng này so sánh với đề xuất của chúng tôi. Chúng tôi sẽ giả định rằng các đầu vào của MoE thuộc về một không gian X⊆Rp. Ở dạng đơn giản nhất, MoE bao gồm một tập hợp n chuyên gia (mạng thần kinh) fi:X→Ru, i∈{1;2;...;n}, và một cổng g:X→Rn gán trọng số cho các chuyên gia. Đầu ra của cổng được giả định là một vector xác suất, tức là, g(x)≥0 và ∑ni=1g(x)i = 1, với bất kỳ x∈X nào. Cho một ví dụ x∈X, đầu ra tương ứng của MoE là một tổ hợp có trọng số của các chuyên gia:
+
+∑ni=1fi(x)g(x)i: (1)
+
+Tiếp theo, chúng tôi thảo luận hai lựa chọn phổ biến cho cổng g(·) có thể được tối ưu hóa trực tiếp bằng SGD.
+
+Cổng Softmax: Một mô hình cổ điển cho g(x) là cổng softmax: σ(Ax+b), trong đó σ(·) là hàm softmax, A∈Rn×p là ma trận trọng số có thể huấn luyện, và b∈Rn là vector bias [17]. Cổng này dày đặc, theo nghĩa là tất cả các chuyên gia được gán xác suất khác không. Lưu ý rằng cổng tĩnh (tức là cổng không phụ thuộc vào ví dụ đầu vào) có thể được thu được bằng cách đặt A = 0.
+
+Cổng Top-k: Đây là một biến thể thưa của cổng softmax trả về một vector xác suất chỉ với k entry khác không [33]. Cổng Top-k được định nghĩa bởi σ(KeepTopK(Ax+b)), trong đó với bất kỳ vector v nào, KeepTopK(v)i := vi nếu vi nằm trong k phần tử hàng đầu của v, và KeepTopK(v)i := -∞ ngược lại3. Cổng này hấp dẫn về mặt khái niệm vì nó cho phép kiểm soát trực tiếp số lượng chuyên gia cần chọn
+
+3Để cân bằng tải trên các chuyên gia, [33] thêm nhiễu và regularizers bổ sung vào mô hình.
+
+--- TRANG 4 ---
+Hình 2: Trọng số chuyên gia được xuất ra bởi Top-k (trái) và DSelect-k (phải) trong quá trình huấn luyện trên dữ liệu tổng hợp được tạo từ một MoE, dưới cổng tĩnh. Mỗi màu đại diện cho một chuyên gia riêng biệt. Ở đây DSelect-k khôi phục các chuyên gia thực được sử dụng bởi mô hình tạo dữ liệu, trong khi Top-k không khôi phục và thể hiện hành vi dao động. Xem Phụ lục C.2 để biết chi tiết về dữ liệu và thiết lập.
+
+và được huấn luyện bằng SGD. Hơn nữa, cổng Top-k hỗ trợ huấn luyện có điều kiện: trong lan truyền ngược, đối với mỗi ví dụ đầu vào, chỉ cần tính toán gradient của loss đối với k phần tử hàng đầu. Với triển khai cẩn thận, huấn luyện có điều kiện có thể dẫn đến tiết kiệm tính toán. Tuy nhiên, cổng Top-k không liên tục, điều này ngụ ý rằng gradient không tồn tại tại một số đầu vào nhất định. Điều này có thể có vấn đề khi huấn luyện được thực hiện bằng các phương pháp dựa trên gradient. Để có thêm hiểu biết, trong Hình 2 (trái), chúng tôi vẽ các trọng số chuyên gia được chọn bởi cổng Top-k trong quá trình huấn luyện với SGD. Kết quả cho thấy hành vi dao động trong đầu ra của cổng Top-k, có thể được quy cho tính chất không liên tục của nó: một thay đổi nhỏ trong đầu vào có thể dẫn đến "nhảy" trong đầu ra.
+
+So sánh với DSelect-k: Chúng tôi phát triển DSelect-k trong Phần 3. Ở đây chúng tôi trình bày so sánh ở mức cao giữa DSelect-k và Top-k. Tương tự như Top-k, DSelect-k có thể chọn k trong số n chuyên gia và có thể được huấn luyện bằng các phương pháp tối ưu hóa dựa trên gradient. Một lợi thế lớn của DSelect-k so với Top-k là nó liên tục khả vi, điều này dẫn đến lựa chọn chuyên gia ổn định hơn trong quá trình huấn luyện—xem Hình 2 (phải). Trong quá trình suy luận, DSelect-k chỉ cần đánh giá một tập con của các chuyên gia, điều này có thể dẫn đến tiết kiệm tính toán. Tuy nhiên, DSelect-k chỉ hỗ trợ huấn luyện có điều kiện một phần. Ở đầu quá trình huấn luyện, nó sử dụng tất cả các chuyên gia có sẵn, vì vậy huấn luyện có điều kiện không thể thực hiện được. Như chúng tôi thảo luận trong Phần 3, sau một thời điểm nhất định trong quá trình huấn luyện, DSelect-k hội tụ về một tập con nhỏ của các chuyên gia, và sau đó huấn luyện có điều kiện trở nên khả thi. Các thí nghiệm của chúng tôi cho thấy DSelect-k có thể có lợi thế đáng kể so với Top-k về hiệu suất dự đoán và lựa chọn chuyên gia, vì vậy việc hỗ trợ đầy đủ cho huấn luyện có điều kiện trong Top-k dường như đi kèm với chi phí của hiệu suất thống kê.
+
+3 Cổng khả vi và thưa
+
+Trong phần này, chúng tôi phát triển DSelect-k, cho cả thiết lập cổng tĩnh và theo từng ví dụ. Đầu tiên, chúng tôi giới thiệu thiết lập bài toán và ký hiệu. Để đơn giản hóa việc trình bày, chúng tôi sẽ phát triển cổng cho một nhiệm vụ học có giám sát duy nhất, và chúng tôi lưu ý rằng cùng một cổng có thể được sử dụng trong các mô hình MTL. Chúng tôi giả định rằng nhiệm vụ có không gian đầu vào X⊆Rp, không gian đầu ra Y, và một hàm loss liên quan ℓ:Y×R→R. Chúng tôi ký hiệu tập hợp N ví dụ huấn luyện bởi D={(xi,yi)∈X×Y}Ni=1. Chúng tôi xem xét một mô hình học được định nghĩa bởi MoE trong Phương trình (1). Để đơn giản, chúng tôi giả định rằng các chuyên gia có giá trị vô hướng và thuộc về một lớp các hàm liên tục H. Chúng tôi giả định rằng số lượng chuyên gia n = 2m với một số nguyên m—trong Phụ lục B.2, chúng tôi thảo luận cách cổng có thể được mở rộng đến n tùy ý. Để thuận tiện, cho một số nguyên không âm i, chúng tôi ký hiệu tập hợp {1;2;...;i} bởi [i].
+
+Trong Phần 3.1, chúng tôi phát triển DSelect-k cho thiết lập cổng tĩnh. Sau đó, trong Phần 3.2, chúng tôi tổng quát hóa nó đến thiết lập theo từng ví dụ.
+
+3.1 DSelect-k cho Cổng tĩnh
+
+Mục tiêu của chúng tôi ở đây là phát triển một cổng tĩnh chọn một tổ hợp lồi của tối đa k trong số n chuyên gia. Đầu ra của cổng có thể được coi như một vector xác suất w với tối đa k entry khác không, trong đó wi là trọng số được gán cho chuyên gia fi. Một cách tự nhiên để tối thiểu hóa rủi ro thực nghiệm của mô hình MoE là bằng cách giải bài toán sau:
+
+--- TRANG 5 ---
+min[f1,...fn,w] (1/N)∑[(x,y)∈D] ℓ(y, ∑[i=1]^n fi(x)wi) (2a)
+s.t: ||w||0 ≤ k (2b)
+∑[i=1]^n wi = 1, w ≥ 0: (2c)
+
+Trong phần trên, chuẩn L0 của w, ||w||0, bằng số lượng entry khác không trong w. Do đó, ràng buộc cardinality (2b) đảm bảo rằng cổng chọn tối đa k chuyên gia. Bài toán (2) là một bài toán tối ưu hóa tổ hợp không phù hợp với SGD do ràng buộc cardinality (2b) và các ràng buộc simplex trong (2c). Trong phần còn lại của phần này, chúng tôi đầu tiên biến đổi Bài toán (2) thành một bài toán tối ưu hóa không ràng buộc tương đương, dựa trên một sơ đồ mã hóa nhị phân. Tuy nhiên, bài toán không ràng buộc không thể được xử lý trực tiếp bằng SGD do sự hiện diện của các biến nhị phân. Do đó, trong một biến đổi thứ hai, chúng tôi làm mượt các biến nhị phân, điều này dẫn đến một bài toán tối ưu hóa phù hợp với SGD.
+
+Lộ trình: Trong Phần 3.1.1, chúng tôi giới thiệu bộ chọn chuyên gia đơn: một cấu trúc để chọn 1 trong số n chuyên gia bằng cách sử dụng mã hóa nhị phân. Trong Phần 3.1.2, chúng tôi tận dụng bộ chọn chuyên gia đơn để biến đổi Bài toán (2) thành một bài toán không ràng buộc. Sau đó, trong Phần 3.1.3, chúng tôi làm mượt bài toán không ràng buộc và thảo luận cách SGD có thể được áp dụng.
+
+3.1.1 Lựa chọn chuyên gia đơn sử dụng mã hóa nhị phân
+
+Bộ chọn chuyên gia đơn (viết tắt là selector) là một cấu trúc cơ bản mà chúng tôi sẽ sử dụng sau để chuyển đổi Bài toán (2) thành một bài toán tối ưu hóa không ràng buộc. Ở mức độ cao, bộ chọn chuyên gia đơn chọn chỉ số của 1 trong số n chuyên gia và trả về một mã hóa one-hot của lựa chọn. Ví dụ, trong trường hợp 4 chuyên gia, selector có thể chọn chuyên gia đầu tiên bằng cách trả về vector nhị phân [1 0 0 0]T. Nói chung, selector có thể chọn bất kỳ chuyên gia nào, và lựa chọn của nó được xác định bởi một tập hợp các biến mã hóa nhị phân, như chúng tôi sẽ mô tả tiếp theo.
+
+Selector được tham số hóa bởi m (nhớ rằng m = log2 n) biến nhị phân, z1;z2;...;zm, trong đó chúng tôi xem các biến này một cách tập thể như một số nhị phân: zmzm-1...z1. Số nguyên được biểu diễn bởi số nhị phân sau xác định chuyên gia nào cần chọn. Chính thức hơn, cho l là số nguyên được biểu diễn bởi số nhị phân zmzm-1...z1. Selector là một hàm r:R^m→{0,1}^n ánh xạ z:=[z1;z2;...;zm]T thành một mã hóa one-hot của số nguyên (l+1). Ví dụ, nếu tất cả zi đều là 0, thì selector trả về một mã hóa one-hot của số nguyên 1. Tiếp theo, chúng tôi định nghĩa selector r(z). Để trình bày dễ dàng hơn, chúng tôi bắt đầu với trường hợp đặc biệt của 4 chuyên gia và sau đó tổng quát hóa đến n chuyên gia.
+
+Trường hợp đặc biệt của 4 chuyên gia: Trong trường hợp này, selector sử dụng hai biến nhị phân z1 và z2. Cho l là số nguyên được biểu diễn bởi số nhị phân z2z1. Sau đó, selector nên trả về một mã hóa one-hot của số nguyên (l+1). Để đạt được điều này, chúng tôi định nghĩa selector r(z) như sau:
+
+r(z) = [z̄1z̄2; z1z̄2; z̄1z2; z1z2]T (3)
+
+trong đó z̄i := 1-zi. Theo cách xây dựng, chính xác một entry trong r(z) là 1 (cụ thể, r(z)l+1 = 1) và các entry còn lại là zero. Ví dụ, nếu z1=z2=0, thì r(z)1 = 1 và r(z)i = 0, i∈{2,3,4}.
+
+Trường hợp tổng quát của n chuyên gia: Ở đây chúng tôi tổng quát hóa selector r(z) đến trường hợp n chuyên gia. Để hỗ trợ việc trình bày, chúng tôi đưa ra định nghĩa sau. Với bất kỳ số nguyên không âm l nào, chúng tôi định nghĩa B(l) là tập hợp các chỉ số của các entry khác không trong biểu diễn nhị phân của l (trong đó chúng tôi giả định rằng bit ít quan trọng nhất được đánh chỉ số bởi 1). Ví dụ, B(0) = ∅, B(1) = {1}, B(2) = {2}, và B(3) = {1,2}. Với mọi i∈[n], chúng tôi định nghĩa entry thứ i của r(z) như sau:
+
+r(z)i = ∏[j∈B(i-1)] (zj) ∏[j∈[m]\B(i-1)] (1-zj) (4)
+
+Trong phần trên, r(z)i là một tích của m biến nhị phân, bằng 1 khi và chỉ khi số nguyên (i-1) được biểu diễn bởi số nhị phân zmzm-1...z1. Do đó, r(z) trả về một mã hóa one-hot của chỉ số của chuyên gia được chọn. Lưu ý rằng khi n = 4, các định nghĩa (3) và (4) là tương đương.
+
+3.1.2 Lựa chọn nhiều chuyên gia thông qua tối thiểu hóa không ràng buộc
+
+Trong phần này, chúng tôi phát triển một cổng tổ hợp cho phép biến đổi Bài toán (2) thành một bài toán tối ưu hóa không ràng buộc. Chúng tôi thiết kế cổng này bằng cách tạo k instances của selector chuyên gia đơn r(·), và sau đó lấy một tổ hợp lồi của k instances này. Chính thức hơn, với mọi i∈[k], cho z(i)∈{0,1}^m là một vector nhị phân (có thể học), sao cho đầu ra của instance thứ i của selector là r(z(i)). Cho Z là ma trận k×m có hàng thứ i là z(i). Hơn nữa, cho α∈R^k là một vector các tham số có thể học. Chúng tôi định nghĩa cổng tổ hợp q như sau:
+
+q(α,Z) = ∑[i=1]^k σ(α)i r(z(i)),
+
+trong đó chúng tôi nhớ lại rằng σ(·) là hàm softmax. Vì với mọi i∈[k], r(z(i)) là một vector one-hot, chúng tôi có ||q(α,Z)||0 ≤ k. Hơn nữa, vì các trọng số của các selectors được thu được bằng softmax, chúng tôi có q(α,Z) ≥ 0 và ∑[i=1]^n q(α,Z)i = 1. Do đó, q(α,Z) có cùng diễn giải của w trong Bài toán (2), mà không yêu cầu bất kỳ ràng buộc nào. Vì vậy, chúng tôi đề xuất thay thế w trong mục tiêu của Bài toán (2) bằng q(α,Z) và loại bỏ tất cả các ràng buộc. Việc thay thế này dẫn đến một bài toán tối ưu hóa không ràng buộc tương đương, như chúng tôi nêu trong mệnh đề tiếp theo.
+
+Mệnh đề 1. Bài toán (2) tương đương4 với:
+
+min[f1,...fn,α,Z] (1/N)∑[(x,y)∈D] ℓ(y, ∑[i=1]^n fi(x)q(α,Z)i)
+z(i) ∈ {0,1}^m, i∈[k] (5)
+
+Chứng minh của Mệnh đề 1 có trong Phụ lục B.1. Không giống như Bài toán (2), Bài toán (5) không liên quan đến bất kỳ ràng buộc nào, ngoài việc yêu cầu các biến nhị phân. Tuy nhiên, những biến nhị phân này không thể được xử lý trực tiếp bằng các phương pháp bậc một. Tiếp theo, chúng tôi thảo luận cách làm mượt các biến nhị phân để thu được một phép thư giãn liên tục của Bài toán (5).
+
+3.1.3 Cổng mượt
+
+Trong phần này, chúng tôi trình bày một quy trình để làm mượt các biến nhị phân trong Bài toán (5) và thảo luận cách bài toán kết quả có thể được tối ưu hóa bằng các phương pháp bậc một. Quy trình dựa vào hàm smooth-step, mà chúng tôi định nghĩa tiếp theo.
+
+Hàm Smooth-step: Đây là một hàm liên tục khả vi và có dạng S, tương tự về hình dạng với hàm logistic. Tuy nhiên, không giống như hàm logistic, hàm smooth-step có thể xuất ra 0 và 1 chính xác cho các độ lớn đầu vào đủ lớn. Các hàm smooth-step và logistic được mô tả trong Phụ lục B.3. Chính thức hơn, cho một tham số tỷ lệ không âm β, hàm smooth-step, Sβ:R→R, là một đa thức từng khúc bậc ba được định nghĩa như sau:
+
+Sβ(t) = {
+  0 nếu t ≤ -β/2
+  (2/β³)t³ + (3/2β)t + 1/2 nếu -β/2 < t < β/2
+  1 nếu t ≥ β/2
+}
+
+Tham số β kiểm soát độ rộng của vùng phân số (tức là vùng mà hàm nằm nghiêm ngặt giữa 0 và 1). Lưu ý rằng Sβ(t) liên tục khả vi tại mọi điểm—điều này theo sau vì tại các điểm biên β/2, chúng tôi có: S'β(-β/2) = S'β(β/2) = 0. Hàm này gần đây đã được sử dụng cho tính toán có điều kiện trong soft trees [11] và phổ biến trong tài liệu đồ họa máy tính [8, 30].
+
+Làm mượt: Chúng tôi thu được DSelect-k từ cổng tổ hợp q(α,Z) bằng (i) thư giãn mọi biến nhị phân trong Z để liên tục trong khoảng (-∞,+∞), tức là Z∈R^(k×m), và (ii) áp dụng hàm smooth-step cho Z theo từng phần tử. Chính thức, DSelect-k là một hàm q̃ được định nghĩa như sau:
+
+q̃(α,Z) := q(α,Sβ(Z)) = ∑[i=1]^k σ(α)i r(Sβ(z(i))), (6)
+
+trong đó ma trận Sβ(Z) được thu được bằng cách áp dụng Sβ(·) cho Z theo từng phần tử. Lưu ý rằng q̃(α,Z) liên tục khả vi nên nó phù hợp với các phương pháp bậc một. Nếu Sβ(Z) là nhị phân, thì q̃(α,Z)
+
+4Tương đương có nghĩa là hai bài toán có cùng mục tiêu tối ưu, và cho một nghiệm tối ưu cho một bài toán, chúng ta có thể xây dựng một nghiệm tối ưu cho bài toán kia.
+
+--- TRANG 6 ---
+chọn tối đa k chuyên gia (điều này đúng vì q̃(α,Z) = q(α,Sβ(Z)), và từ Phần 3.1.2, q chọn tối đa k chuyên gia khi ma trận mã hóa của nó là nhị phân). Tuy nhiên, khi Sβ(Z) có bất kỳ entry nào không nhị phân, thì có thể chọn nhiều hơn k chuyên gia, có nghĩa là ràng buộc cardinality sẽ không được tôn trọng. Trong phần sau, chúng tôi thảo luận cách cổng có thể được tối ưu hóa bằng các phương pháp bậc một, đồng thời đảm bảo rằng Sβ(Z) hội tụ về một ma trận nhị phân sao cho ràng buộc cardinality được thực thi.
+
+Chúng tôi đề xuất sử dụng q̃(α,Z) trong MoE, điều này dẫn đến bài toán tối ưu hóa sau:
+
+min[f1,...fn,α,Z] (1/N)∑[(x,y)∈D] ℓ(y, ∑[i=1]^n fi(x)q̃(α,Z)i): (7)
+
+Bài toán (7) có thể được xem như một phép thư giãn liên tục của Bài toán (5). Nếu các chuyên gia khả vi, thì mục tiêu của Bài toán (7) khả vi. Do đó, chúng tôi đề xuất tối ưu hóa MoE end-to-end bằng các phương pháp bậc một. Chúng tôi lưu ý rằng q̃(α,Z) sử dụng (k + k log n) tham số có thể học. Ngược lại, các cổng Top-k và softmax (được thảo luận trong Phần 2) sử dụng n tham số. Do đó, với k tương đối nhỏ, đề xuất của chúng tôi sử dụng số lượng tham số nhỏ hơn. Tiếp theo, chúng tôi thảo luận cách các tham số của DSelect-k nên được khởi tạo để đảm bảo rằng nó có thể huấn luyện được.
+
+Khởi tạo: Theo định nghĩa của hàm smooth-step, nếu Sβ(Zij) là nhị phân thì S'β(Zij) = 0, và do đó ∂ℓ/∂Zij = 0. Điều này ngụ ý rằng, trong quá trình tối ưu hóa, nếu Sβ(Zij) trở thành nhị phân, biến Zij sẽ không được cập nhật trong bất kỳ lần lặp tiếp theo nào. Do đó, chúng ta phải cẩn thận về việc khởi tạo Z. Ví dụ, nếu Z được khởi tạo sao cho Sβ(Z) là một ma trận nhị phân thì cổng sẽ không được huấn luyện. Để đảm bảo rằng cổng có thể huấn luyện được, chúng tôi khởi tạo mỗi Zij sao cho 0 < Sβ(Zij) < 1. Bằng cách này, các Zij có thể có gradient khác không ở đầu quá trình tối ưu hóa.
+
+Tăng tốc hội tụ về nghiệm nhị phân: Nhớ lại rằng chúng ta cần Sβ(Z) hội tụ về một ma trận nhị phân, để cổng q̃ tôn trọng ràng buộc cardinality (tức là chọn tối đa k chuyên gia). Theo kinh nghiệm, chúng tôi quan sát thấy rằng nếu optimizer chạy trong một số lần lặp đủ lớn, thì Sβ(Z) thường hội tụ về một ma trận nhị phân. Tuy nhiên, việc dừng sớm optimizer có thể được mong muốn trong thực tế vì các cân nhắc về tính toán và thống kê, và điều này có thể ngăn cản Sβ(Z) hội tụ. Để khuyến khích hội tụ nhanh hơn về một Sβ(Z) nhị phân, chúng tôi sẽ thêm một regularizer entropy vào Bài toán (7). Mệnh đề sau cần thiết trước khi chúng tôi giới thiệu regularizer.
+
+Mệnh đề 2. Với bất kỳ z∈R^m, α∈R^k, và Z∈R^(k×m), r(Sβ(z)) và q̃(α,Z) thuộc về probability simplex.
+
+Chứng minh của mệnh đề có trong Phụ lục B.1. Mệnh đề 2 ngụ ý rằng, trong quá trình huấn luyện, đầu ra của mỗi selector chuyên gia đơn được sử dụng bởi q̃(α,Z), tức là r(Sβ(z(i))) với i∈[k], thuộc về probability simplex. Lưu ý rằng entropy của mỗi r(Sβ(z(i))) được tối thiểu hóa bởi bất kỳ vector mã hóa one-hot nào. Do đó, với mỗi r(Sβ(z(i))), chúng tôi thêm một hạng chính quy hóa entropy khuyến khích hội tụ về các vector mã hóa one-hot; tương đương, điều này khuyến khích hội tụ về một Sβ(Z) nhị phân. Cụ thể, chúng tôi giải biến thể chính quy hóa sau của Bài toán (7):
+
+min[f1,...fn,α,Z] ∑[(x,y)∈D] (1/N)ℓ(y, ∑[i=1]^n fi(x)q̃(α,Z)i) + λΩ(Z)
+
+trong đó Ω(Z) := ∑[i=1]^k h(r(Sβ(z(i)))) và h(·) là hàm entropy. Siêu tham số λ không âm và kiểm soát tốc độ mỗi selector hội tụ về một mã hóa one-hot. Trong các thí nghiệm của chúng tôi, chúng tôi điều chỉnh trong một khoảng giá trị λ. Khi chọn siêu tham số tốt nhất từ việc điều chỉnh, chúng tôi bỏ qua bất kỳ λ nào mà nghiệm tương ứng không có Sβ(Z) nhị phân. Trong Phụ lục C.3, chúng tôi báo cáo số bước huấn luyện cần thiết để Sβ(Z) hội tụ về một ma trận nhị phân, trên một số bộ dữ liệu thực.
+
+Các lựa chọn thay thế khác để đảm bảo rằng Sβ(Z) hội tụ về một ma trận nhị phân cũng có thể. Một lựa chọn thay thế là chính quy hóa entropy của mỗi entry trong Sβ(Z) riêng biệt. Một lựa chọn thay thế khác là annealing tham số β của hàm smooth-step về zero.
+
+Lựa chọn thay thế dựa trên Softmax cho mã hóa nhị phân: Nhớ lại rằng các selectors được đề xuất của chúng tôi trong (6), tức là r(Sβ(z(i))), i∈[k], học các vector one-hot chính xác (bằng cách sử dụng mã hóa nhị phân). Một lựa chọn thay thế thực tế để học một vector one-hot là bằng cách sử dụng hàm softmax với temperature annealing. Về mặt lý thuyết, lựa chọn thay thế này không thể trả về một vector one-hot, nhưng sau khi huấn luyện, đầu ra softmax có thể được biến đổi thành một vector one-hot bằng cách sử dụng một heuristic (ví dụ, bằng cách lấy argmax). Trong Phụ lục C.1, chúng tôi thực hiện một nghiên cứu ablation trong đó chúng tôi thay thế các selectors trong DSelect-k bằng các hàm softmax (cùng với temperature annealing hoặc chính quy hóa entropy).
+
+--- TRANG 7 ---
+3.2 DSelect-k cho Cổng theo từng ví dụ
+
+Trong phần này, chúng tôi tổng quát hóa phiên bản tĩnh của DSelect-k, q̃(α,Z), đến thiết lập cổng theo từng ví dụ. Ý tưởng chính là làm cho các tham số α và Z của cổng trở thành hàm của đầu vào, sao cho cổng có thể đưa ra quyết định trên cơ sở từng ví dụ. Lưu ý rằng nhiều dạng hàm có thể cho các tham số này. Để đơn giản và dựa trên các thí nghiệm của chúng tôi, chúng tôi chọn làm cho α và Z trở thành các hàm tuyến tính của ví dụ đầu vào. Chính thức hơn, cho G∈R^(k×p), W^(i)∈R^(m×p), i∈[k], là một tập hợp các tham số có thể học. Cho một ví dụ đầu vào x∈R^p, chúng tôi đặt α = Gx và z^(i) = W^(i)x trong q̃(α,Z) (để đơn giản hóa việc trình bày, chúng tôi không bao gồm các hạng bias). Do đó, phiên bản theo từng ví dụ của DSelect-k là một hàm v được định nghĩa như sau:
+
+v(G,W,x) = ∑[i=1]^k σ(Gx)_i r(S_β(W^(i)x)).
+
+Trong phần trên, hạng r(S_β(W^(i)x)) đại diện cho selector chuyên gia đơn thứ i, có đầu ra phụ thuộc vào ví dụ x; do đó các ví dụ khác nhau tự do chọn các chuyên gia khác nhau. Hạng σ(Gx)_i xác định trọng số phụ thuộc vào đầu vào được gán cho selector thứ i. Cổng v(G,W,x) liên tục khả vi trong các tham số G và W, vì vậy chúng tôi đề xuất tối ưu hóa nó bằng các phương pháp bậc một. Tương tự như trường hợp cổng tĩnh, nếu S_β(W^(i)x) là nhị phân với mọi i∈[k], thì mỗi r(S_β(W^(i)x)) sẽ chọn chính xác một chuyên gia, và ví dụ x sẽ được gán cho tối đa k chuyên gia.
+
+Để khuyến khích S_β(W^(i)x), i∈[k] trở thành nhị phân, chúng tôi giới thiệu một regularizer entropy, tương tự về bản chất với cổng tĩnh. Tuy nhiên, không giống như cổng tĩnh, regularizer ở đây phải theo cơ sở từng ví dụ, sao cho mỗi ví dụ tôn trọng ràng buộc cardinality. Theo Mệnh đề 2, với bất kỳ i∈[k], r(S_β(W^(i)x)) thuộc về probability simplex. Do đó, với mỗi ví dụ x trong dữ liệu huấn luyện, chúng tôi giới thiệu một hạng chính quy hóa có dạng: Ω(W,x) := ∑[i∈[k]] h(r(S_β(W^(i)x))), và tối thiểu hóa hàm mục tiêu sau:
+
+∑[(x,y)∈D] [(1/N)ℓ(y, ∑[i=1]^n f_i(x)v(G,W,x)_i) + λΩ(W,x)],
+
+trong đó λ là một siêu tham số không âm. Tương tự như trường hợp cổng tĩnh, chúng tôi điều chỉnh trong một khoảng giá trị λ, và chúng tôi chỉ xem xét các lựa chọn λ buộc số lượng chuyên gia được chọn trung bình mỗi ví dụ phải nhỏ hơn hoặc bằng k. Nếu ứng dụng yêu cầu ràng buộc cardinality được thỏa mãn nghiêm ngặt cho mọi ví dụ (không chỉ trung bình), thì annealing β trong hàm smooth-step về zero thực thi điều này.
+
+4 Thí nghiệm
+
+Chúng tôi nghiên cứu hiệu suất của DSelect-k trong bối cảnh MTL và so sánh với các cổng tiên tiến và baselines. Trong phần còn lại của phần này, chúng tôi trình bày các thí nghiệm trên các bộ dữ liệu MTL thực sau: MovieLens, Multi-MNIST, Multi-Fashion MNIST, và trên một hệ thống gợi ý quy mô lớn trong thế giới thực. Hơn nữa, trong Phụ lục C, chúng tôi trình bày một thí nghiệm bổ sung trên dữ liệu tổng hợp (với tối đa 128 nhiệm vụ), trong đó chúng tôi nghiên cứu hiệu suất thống kê và thực hiện các nghiên cứu ablation.
+
+Các phương pháp cạnh tranh: Chúng tôi tập trung vào MoE đa cổng, và nghiên cứu các cổng DSelect-k và Top-k trong cả thiết lập cổng tĩnh và theo từng ví dụ. Đối với cổng tĩnh, chúng tôi cũng xem xét một cổng dựa trên Gumbel-softmax [34]—không giống như DSelect-k, cổng này không thể kiểm soát mức độ thưa một cách rõ ràng (xem phần bổ sung để biết chi tiết). Ngoài ra, chúng tôi xem xét hai baselines MTL. Baseline đầu tiên là một MoE với cổng softmax (sử dụng tất cả các chuyên gia có sẵn). Baseline thứ hai là một mô hình shared bottom [4], trong đó tất cả các nhiệm vụ chia sẻ cùng các lớp dưới, sau đó được kết nối với các mạng thần kinh cụ thể cho từng nhiệm vụ.
+
+Thiết lập thí nghiệm: Tất cả các mô hình cạnh tranh được triển khai trong TensorFlow 2. Chúng tôi sử dụng Adam [18] và Adagrad [7] để tối ưu hóa, và chúng tôi điều chỉnh các siêu tham số chính bằng random grid search (với trung bình 5 lần thử mỗi điểm lưới). Chi tiết đầy đủ về thiết lập có trong Phụ lục D.
+
+4.1 MovieLens
+
+Bộ dữ liệu: MovieLens [10] là một bộ dữ liệu gợi ý phim chứa các bản ghi cho 4,000 phim và 6,000 người dùng. Theo [37], với mỗi cặp người dùng-phim, chúng tôi xây dựng hai nhiệm vụ. Nhiệm vụ 1 là một bài toán phân loại nhị phân để dự đoán liệu người dùng có xem một bộ phim cụ thể hay không. Nhiệm vụ 2 là một bài toán hồi quy để dự đoán xếp hạng của người dùng (trong {1,2,...,5}) cho một bộ phim nhất định. Chúng tôi sử dụng 1.6 triệu ví dụ để huấn luyện và 200,000 cho mỗi tập validation và testing.
+
+Chi tiết thí nghiệm: Chúng tôi sử dụng cross-entropy và squared error losses cho nhiệm vụ 1 và 2, tương ứng. Chúng tôi tối ưu hóa một trung bình có trọng số của hai losses, tức là hàm loss cuối cùng là η(Loss của Nhiệm vụ 1) + (1-η)(Loss của Nhiệm vụ 2), và chúng tôi báo cáo kết quả cho η∈{0.1,0.5,0.9}. Cùng một hàm loss cũng được sử dụng để điều chỉnh và kiểm tra. Kiến trúc bao gồm một MoE đa cổng với 8 chuyên gia, trong đó mỗi chuyên gia và mạng cụ thể cho từng nhiệm vụ được cấu thành từ các lớp dense được kích hoạt bởi ReLU. Với mỗi η, chúng tôi điều chỉnh các siêu tham số tối ưu hóa và cụ thể cho cổng, bao gồm số lượng chuyên gia cần chọn (tức là k trong DSelect-k và Top-k). Sau khi điều chỉnh, chúng tôi huấn luyện mỗi mô hình cho 100 lần lặp lại (sử dụng khởi tạo ngẫu nhiên) và báo cáo kết quả trung bình. Để biết chi tiết đầy đủ, xem Phụ lục D.1.
+
+Kết quả: Trong Bảng 1, chúng tôi báo cáo test loss và số lượng chuyên gia được chọn trung bình. Kết quả cho thấy rằng với tất cả các giá trị η, một trong các cổng DSelect-k của chúng tôi (tĩnh hoặc theo từng ví dụ) vượt trội hơn các phương pháp cạnh tranh, về cả test loss và số lượng chuyên gia được chọn. Trong thiết lập cổng tĩnh, dường như không có người chiến thắng rõ ràng giữa ba phương pháp cạnh tranh (Top-k, DSelect-k, và Gumbel Softmax), nhưng chúng tôi lưu ý rằng DSelect-k vượt trội hơn cả Top-k và Gumbel Softmax cho hai trong số ba lựa chọn η. Đáng chú ý, softmax MoE bị vượt trội đồng nhất bởi các cổng DSelect-k và Top-k, vì vậy độ thưa trong cổng dường như có lợi trên bộ dữ liệu này. Giả thuyết của chúng tôi là softmax MoE đang overfitting và các phương pháp cổng thưa đang giảm thiểu vấn đề này. Trong Bảng C.5 trong phụ lục, chúng tôi additionally báo cáo các chỉ số nhiệm vụ riêng lẻ (loss và accuracy).
+
+[THIS IS TABLE: Bảng hiển thị kết quả test loss và số lượng chuyên gia cho các phương pháp khác nhau với các giá trị η khác nhau]
+
+4.2 Multi-MNIST và Multi-Fashion MNIST
+
+Bộ dữ liệu: Chúng tôi xem xét hai bộ dữ liệu phân loại hình ảnh: Multi-MNIST và Multi-Fashion [32], là các biến thể đa nhiệm vụ của các bộ dữ liệu MNIST [20] và Fashion MNIST [38]. Chúng tôi xây dựng bộ dữ liệu Multi-MNIST tương tự như [32]: lấy mẫu đồng nhất hai hình ảnh từ MNIST và đặt chồng chúng lên nhau, và (ii) dịch chuyển một chữ số về phía góc trên-trái và chữ số kia về phía góc dưới-phải (bằng 4 pixels theo mỗi hướng). Quy trình này dẫn đến các hình ảnh 36×36 với một số chồng lấp giữa các chữ số. Multi-Fashion được xây dựng theo cách tương tự bằng cách đặt chồng các hình ảnh từ bộ dữ liệu Fashion MNIST. Với mỗi bộ dữ liệu, chúng tôi xem xét hai nhiệm vụ phân loại: Nhiệm vụ 1 là phân loại item trên-trái và Nhiệm vụ 2 là phân loại item dưới-phải. Chúng tôi sử dụng 100,000 ví dụ để huấn luyện, và 20,000 ví dụ cho mỗi tập validation và testing.
+
+Chi tiết thí nghiệm: Chúng tôi sử dụng cross-entropy loss cho mỗi nhiệm vụ và tối ưu hóa tổng của các losses5. Mô hình là một MoE đa cổng với 8 chuyên gia, trong đó mỗi chuyên gia là một mạng thần kinh tích chập và mỗi mạng cụ thể cho từng nhiệm vụ được cấu thành từ một số lớp dense. Chúng tôi điều chỉnh các siêu tham số tối ưu hóa và cụ thể cho cổng, bao gồm số lượng chuyên gia cần chọn, và sử dụng trung bình của accuracies nhiệm vụ như chỉ số điều chỉnh. Sau khi điều chỉnh, chúng tôi huấn luyện mỗi mô hình cho 100 lần lặp lại (sử dụng khởi tạo ngẫu nhiên) và báo cáo kết quả trung bình. Để biết chi tiết đầy đủ, xem Phụ lục D.2.
+
+Kết quả: Trong Bảng 2, chúng tôi báo cáo test accuracy và số lượng chuyên gia được chọn cho các bộ dữ liệu Multi-MNIST và Multi-Fashion. Trên Multi-MNIST, DSelect-k (tĩnh) vượt trội hơn Top-k và Gumbel Softmax, về cả accuracies nhiệm vụ và số lượng chuyên gia được chọn. Ví dụ, nó đạt được cải thiện hơn 1% trong accuracy của Nhiệm vụ 2 so với Top-k (tĩnh). DSelect-k (tĩnh) gần với hiệu suất của Softmax MoE, nhưng sử dụng ít chuyên gia hơn (~1.7 vs. 8 chuyên gia). Ở đây DSelect-k (theo từng ví dụ) không cung cấp cải thiện so với biến thể tĩnh (không giống như bộ dữ liệu MovieLens). Trên Multi-Fashion, chúng tôi lại thấy rằng DSelect-k (tĩnh) hoạt động tốt nhất về accuracy.
+
+5Do tính đối xứng trong bài toán, việc gán cho hai nhiệm vụ trọng số bằng nhau là một lựa chọn hợp lý.
+
+--- TRANG 9 ---
+[THIS IS TABLE: Bảng 2 hiển thị test accuracy và số lượng chuyên gia được chọn trên Multi-MNIST/Fashion]
+
+4.3 Một hệ thống gợi ý quy mô lớn
+
+Chúng tôi nghiên cứu hiệu suất của DSelect-k và Top-k trong một hệ thống gợi ý nội dung quy mô lớn trong thế giới thực. Hệ thống bao gồm hàng trăm triệu items độc đáo và hàng tỷ người dùng.
+
+Kiến trúc và Bộ dữ liệu: Hệ thống bao gồm một bộ tạo ứng viên theo sau bởi một mô hình ranking đa nhiệm vụ, và nó áp dụng một framework tương tự như [41,35]. Mô hình ranking đưa ra dự đoán cho 6 nhiệm vụ phân loại và 2 nhiệm vụ hồi quy. Chúng có thể được phân loại thành hai danh mục: (i) nhiệm vụ engagement (ví dụ, dự đoán clicks của người dùng, bad clicks, thời gian engagement), và (ii) nhiệm vụ satisfaction (ví dụ, dự đoán các hành vi satisfaction của người dùng như likes và dislikes). Chúng tôi xây dựng bộ dữ liệu từ các logs người dùng của hệ thống (chứa thông tin lịch sử về người dùng và nhãn cho 8 nhiệm vụ). Bộ dữ liệu bao gồm hàng tỷ ví dụ (chúng tôi không báo cáo số chính xác vì lý do bảo mật). Chúng tôi sử dụng phân chia ngẫu nhiên 90/10 cho tập huấn luyện và đánh giá.
+
+Chi tiết thí nghiệm: Chúng tôi sử dụng cross-entropy và squared error losses cho các nhiệm vụ phân loại và hồi quy, tương ứng. Mô hình ranking dựa trên MoE đa cổng, trong đó mỗi nhiệm vụ sử dụng một cổng tĩnh riêng biệt. MoE sử dụng 8 chuyên gia, mỗi chuyên gia được cấu thành từ các lớp dense. Cho cả các mô hình dựa trên DSelect-k và Top-k, chúng tôi điều chỉnh learning rate và kiến trúc của các chuyên gia. Sau đó, sử dụng các siêu tham số tốt nhất, chúng tôi huấn luyện các mô hình cuối cùng cho 5 lần lặp lại (sử dụng khởi tạo ngẫu nhiên). Để biết chi tiết bổ sung, xem Phụ lục D.3.
+
+Kết quả: Trong Bảng 3, chúng tôi báo cáo các chỉ số hiệu suất out-of-sample cho 8 nhiệm vụ. Kết quả cho thấy DSelect-k vượt trội hơn Top-k trên tất cả các nhiệm vụ, với các cải thiện nổi bật nhất trên các nhiệm vụ satisfaction. Trong Hình 3, chúng tôi hiển thị một heatmap của các trọng số chuyên gia được chọn bởi các cổng DSelect-k. Đáng chú ý, đối với DSelect-k, tất cả các nhiệm vụ engagement chia sẻ ít nhất một chuyên gia, và hai trong số các nhiệm vụ satisfaction chia sẻ cùng một chuyên gia.
+
+[THIS IS TABLE: Bảng 3 hiển thị hiệu suất trung bình trên hệ thống gợi ý với 8 nhiệm vụ]
+
+[THIS IS FIGURE: Hình 3 hiển thị trọng số chuyên gia của các cổng DSelect-k trên hệ thống gợi ý]
+
+5 Kết luận
+
+Chúng tôi đã giới thiệu DSelect-k: một cổng liên tục khả vi và thưa cho MoE, có thể được huấn luyện bằng các phương pháp bậc một. Cho một tham số k do người dùng chỉ định, cổng chọn tối đa k trong số n chuyên gia. Việc kiểm soát trực tiếp mức độ thưa như vậy thường được xử lý trong tài liệu bằng cách thêm một ràng buộc cardinality vào bài toán tối ưu hóa. Một trong những ý tưởng chính mà chúng tôi đã giới thiệu là một sơ đồ mã hóa nhị phân cho phép chọn k chuyên gia, mà không yêu cầu bất kỳ ràng buộc nào trong bài toán tối ưu hóa. Chúng tôi đã nghiên cứu hiệu suất của DSelect-k trong các thiết lập MTL, trên cả dữ liệu tổng hợp và thực. Các thí nghiệm của chúng tôi cho thấy DSelect-k có thể đạt được những cải thiện đáng kể trong dự đoán và lựa chọn chuyên gia, so với các cổng MoE tiên tiến và baselines MTL.
+
+Tác động xã hội: Các mô hình MoE được sử dụng trong nhiều ứng dụng khác nhau (như đã thảo luận trong phần giới thiệu). DSelect-k có thể cải thiện khả năng diễn giải và hiệu quả của các mô hình MoE, do đó có lợi cho các ứng dụng cơ bản. Chúng tôi không thấy các tác động xã hội tiêu cực trực tiếp từ đề xuất của chúng tôi.
+
+--- TRANG 10 ---
+Lời cảm ơn: Nghiên cứu được tiến hành khi Hussein Hazimeh đang ở Google, và một phần của việc viết được thực hiện trong thời gian ông ở MIT. Tại MIT, Hussein Hazimeh và Rahul Mazumder ghi nhận tài trợ nghiên cứu từ Văn phòng Nghiên cứu Hải quân [Grant ONR-N000141812298].
+
+Tài liệu tham khảo
+[1] Emmanuel Bengio, Pierre-Luc Bacon, Joelle Pineau, và Doina Precup. Conditional computation in neural networks for faster models. CoRR, abs/1511.06297, 2015. URL http://arxiv.org/abs/1511.06297.
+
+[2] Yoshua Bengio, Nicholas Léonard, và Aaron Courville. Estimating or propagating gradients through stochastic neurons for conditional computation. arXiv preprint arXiv:1308.3432, 2013.
+
+[3] Mathieu Blondel, Andre Martins, và Vlad Niculae. Learning classifiers with fenchel-young losses: Generalized entropies, margins, and algorithms. In The 22nd International Conference on Artificial Intelligence and Statistics, pages 606–615. PMLR, 2019.
+
+[4] Rich Caruana. Multitask learning. Machine learning, 28(1):41–75, 1997.
+
+[5] Jianbo Chen, Le Song, Martin Wainwright, và Michael Jordan. Learning to explain: An information-theoretic perspective on model interpretation. In International Conference on Machine Learning, pages 883–892. PMLR, 2018.
+
+[6] Gonçalo M Correia, Vlad Niculae, và André FT Martins. Adaptively sparse transformers. In Proceedings of the 2019 Conference on Empirical Methods in Natural Language Processing and the 9th International Joint Conference on Natural Language Processing (EMNLP-IJCNLP), pages 2174–2184, 2019.
+
+[7] John Duchi, Elad Hazan, và Yoram Singer. Adaptive subgradient methods for online learning and stochastic optimization. Journal of machine learning research, 12(7), 2011.
+
+[8] David S Ebert, F Kenton Musgrave, Darwyn Peachey, Ken Perlin, và Steven Worley. Texturing & modeling: a procedural approach. Morgan Kaufmann, 2003.
+
+[9] William Fedus, Barret Zoph, và Noam Shazeer. Switch transformers: Scaling to trillion parameter models with simple and efficient sparsity. arXiv preprint arXiv:2101.03961, 2021.
+
+[10] F Maxwell Harper và Joseph A Konstan. The movielens datasets: History and context. Acm transactions on interactive intelligent systems (tiis), 5(4):1–19, 2015.
+
+[11] Hussein Hazimeh, Natalia Ponomareva, Petros Mol, Zhenyu Tan, và Rahul Mazumder. The tree ensemble layer: Differentiability meets conditional computation. In Hal Daumé III và Aarti Singh, editors, Proceedings of the 37th International Conference on Machine Learning, volume 119 of Proceedings of Machine Learning Research, pages 4138–4148, Virtual, 13–18 Jul 2020. PMLR.
+
+[12] Yani Ioannou, Duncan Robertson, Darko Zikic, Peter Kontschieder, Jamie Shotton, Matthew Brown, và Antonio Criminisi. Decision forests, convolutional networks and the models in-between. arXiv preprint arXiv:1603.01250, 2016.
+
+[13] Robert A Jacobs. Bias/variance analyses of mixtures-of-experts architectures. Neural computation, 9(2):369–383, 1997.
+
+[14] Robert A Jacobs, Michael I Jordan, Steven J Nowlan, và Geoffrey E Hinton. Adaptive mixtures of local experts. Neural computation, 3(1):79–87, 1991.
+
+[15] Eric Jang, Shixiang Gu, và Ben Poole. Categorical reparameterization with gumbel-softmax. arXiv preprint arXiv:1611.01144, 2016.
+
+[16] Wenxin Jiang và Martin A Tanner. On the identifiability of mixtures-of-experts. Neural Networks, 12(9):1253–1258, 1999.
+
+[17] Michael I Jordan và Robert A Jacobs. Hierarchical mixtures of experts and the em algorithm. Neural computation, 6(2):181–214, 1994.
+
+--- TRANG 11 ---
+[18] Diederik P. Kingma và Jimmy Ba. Adam: A method for stochastic optimization. In Yoshua Bengio và Yann LeCun, editors, 3rd International Conference on Learning Representations, ICLR 2015, San Diego, CA, USA, May 7-9, 2015, Conference Track Proceedings, 2015.
+
+[19] Diederik P Kingma và Max Welling. Auto-encoding variational bayes. arXiv preprint arXiv:1312.6114, 2013.
+
+[20] Yann LeCun, Corinna Cortes, và CJ Burges. Mnist handwritten digit database. ATT Labs [Online]. Available: http://yann.lecun.com/exdb/mnist, 2, 2010.
+
+[21] Dmitry Lepikhin, HyoukJoong Lee, Yuanzhong Xu, Dehao Chen, Orhan Firat, Yanping Huang, Maxim Krikun, Noam Shazeer, và Zhifeng Chen. Gshard: Scaling giant models with conditional computation and automatic sharding. arXiv preprint arXiv:2006.16668, 2020.
+
+[22] Jiaqi Ma, Zhe Zhao, Xinyang Yi, Jilin Chen, Lichan Hong, và Ed H Chi. Modeling task relationships in multi-task learning with multi-gate mixture-of-experts. In Proceedings of the 24th ACM SIGKDD International Conference on Knowledge Discovery & Data Mining, pages 1930–1939, 2018.
+
+[23] Chris J Maddison, Andriy Mnih, và Yee Whye Teh. The concrete distribution: A continuous relaxation of discrete random variables. arXiv preprint arXiv:1611.00712, 2016.
+
+[24] Andre Martins và Ramon Astudillo. From softmax to sparsemax: A sparse model of attention and multi-label classification. In International Conference on Machine Learning, pages 1614–1623. PMLR, 2016.
+
+[25] Krzysztof Maziarz, Efi Kokiopoulou, Andrea Gesmundo, Luciano Sbaiz, Gabor Bartok, và Jesse Berent. Gumbel-matrix routing for flexible multi-task learning. arXiv preprint arXiv:1910.04915, 2019.
+
+[26] Max Paulus, Dami Choi, Daniel Tarlow, Andreas Krause, và Chris J Maddison. Gradient estimation with stochastic softmax tricks. In H. Larochelle, M. Ranzato, R. Hadsell, M. F. Balcan, và H. Lin, editors, Advances in Neural Information Processing Systems, volume 33, pages 5691–5704. Curran Associates, Inc., 2020. URL https://proceedings.neurips.cc/paper/2020/file/3df80af53dce8435cf9ad6c3e7a403fd-Paper.pdf.
+
+[27] Ben Peters, Vlad Niculae, và André FT Martins. Sparse sequence-to-sequence models. In Proceedings of the 57th Annual Meeting of the Association for Computational Linguistics, pages 1504–1519, 2019.
+
+[28] Prajit Ramachandran và Quoc V Le. Diversity and depth in per-example routing models. In International Conference on Learning Representations, 2018.
+
+[29] Clemens Rosenbaum, Tim Klinger, và Matthew Riemer. Routing networks: Adaptive selection of non-linear functions for multi-task learning. In International Conference on Learning Representations, 2018.
+
+[30] Randi J Rost, Bill Licea-Kane, Dan Ginsburg, John Kessenich, Barthold Lichtenbelt, Hugh Malan, và Mike Weiblen. OpenGL shading language. Pearson Education, 2009.
+
+[31] Sebastian Ruder. An overview of multi-task learning in deep neural networks. arXiv preprint arXiv:1706.05098, 2017.
+
+[32] Sara Sabour, Nicholas Frosst, và Geoffrey E Hinton. Dynamic routing between capsules. In Advances in neural information processing systems, pages 3856–3866, 2017.
+
+[33] Noam Shazeer, Azalia Mirhoseini, Krzysztof Maziarz, Andy Davis, Quoc V. Le, Geoffrey E. Hinton, và Jeff Dean. Outrageously large neural networks: The sparsely-gated mixture-of-experts layer. In 5th International Conference on Learning Representations, ICLR 2017, Toulon, France, April 24-26, 2017, Conference Track Proceedings, 2017.
+
+--- TRANG 12 ---
+[34] Ximeng Sun, Rameswar Panda, Rogerio Feris, và Kate Saenko. Adashare: Learning what to share for efficient deep multi-task learning. In H. Larochelle, M. Ranzato, R. Hadsell, M. F. Balcan, và H. Lin, editors, Advances in Neural Information Processing Systems, volume 33, pages 8728–8740. Curran Associates, Inc., 2020. URL https://proceedings.neurips.cc/paper/2020/file/634841a6831464b64c072c8510c7f35c-Paper.pdf.
+
+[35] Hongyan Tang, Junning Liu, Ming Zhao, và Xudong Gong. Progressive layered extraction (ple): A novel multi-task learning (mtl) model for personalized recommendations. In Fourteenth ACM Conference on Recommender Systems, pages 269–278, 2020.
+
+[36] Xin Wang, Fisher Yu, Zi-Yi Dou, Trevor Darrell, và Joseph E Gonzalez. Skipnet: Learning dynamic routing in convolutional networks. In Proceedings of the European Conference on Computer Vision (ECCV), pages 409–424, 2018.
+
+[37] Yuyan Wang, Zhe Zhao, Bo Dai, Christopher Fifty, Dong Lin, Lichan Hong, và Ed H Chi. Small towers make big differences. arXiv preprint arXiv:2008.05808, 2020.
+
+[38] Han Xiao, Kashif Rasul, và Roland Vollgraf. Fashion-mnist: a novel image dataset for benchmarking machine learning algorithms. arXiv preprint arXiv:1708.07747, 2017.
+
+[39] Sang Michael Xie và Stefano Ermon. Reparameterizable subset sampling via continuous relaxations. In International Joint Conference on Artificial Intelligence, 2019.
+
+[40] Yujia Xie, Hanjun Dai, Minshuo Chen, Bo Dai, Tuo Zhao, Hongyuan Zha, Wei Wei, và Tomas Pfister. Differentiable top-k with optimal transport. Advances in Neural Information Processing Systems, 33, 2020.
+
+[41] Zhe Zhao, Lichan Hong, Li Wei, Jilin Chen, Aniruddh Nath, Shawn Andrews, Aditee Kumthekar, Maheswaran Sathiamoorthy, Xinyang Yi, và Ed Chi. Recommending what video to watch next: a multitask ranking system. In Proceedings of the 13th ACM Conference on Recommender Systems, pages 43–51, 2019.
+
+--- TRANG 13 ---
+A Nghiên cứu liên quan bổ sung
+
+MTL: Trong MTL, các kiến trúc dựa trên học sâu thực hiện chia sẻ tham số mềm, tức là chia sẻ tham số mô hình một phần, đang chứng minh hiệu quả trong việc khai thác cả điểm chung và sự khác biệt giữa các nhiệm vụ [31]. Một kiến trúc linh hoạt cho chia sẻ tham số mềm là MoE đa cổng [22]. Chúng tôi sử dụng MoE đa cổng trong các thí nghiệm của mình và so sánh cả cổng thưa và dày đặc—[22] chỉ xem xét cổng dày đặc. Ngoài ra, một số nghiên cứu gần đây đã xem xét các cấu trúc giống như cổng cho chia sẻ tham số linh hoạt trong MTL. Ví dụ, [34,25] cho mỗi nhiệm vụ tính linh hoạt để sử dụng hoặc bỏ qua các thành phần bên trong mạng thần kinh. Các quyết định được mô hình hóa bằng các biến ngẫu nhiên nhị phân, và các phân phối xác suất tương ứng được học bằng SGD và thủ thuật Gumbel-softmax [15]. Phương pháp này tương tự như cổng tĩnh, nhưng nó không hỗ trợ cổng theo từng ví dụ. Hơn nữa, số lượng nonzeros không thể được kiểm soát trực tiếp (trái ngược với cổng của chúng tôi). Nghiên cứu của chúng tôi cũng liên quan đến [29] người đã giới thiệu "routers" (tương tự như cổng) có thể chọn lớp nào hoặc thành phần nào của lớp để kích hoạt mỗi nhiệm vụ. Các routers trong nghiên cứu sau không khả vi và yêu cầu reinforcement learning.
+
+B Chi tiết phương pháp
+
+B.1 Chứng minh
+
+B.1.1 Chứng minh Mệnh đề 1
+
+Cho f = {fi}i∈[n]. Để chứng minh tương đương, chúng ta cần thiết lập hai hướng sau: (I) một nghiệm tối ưu (f*,α*,Z*) của Bài toán (5) có thể được sử dụng để xây dựng một nghiệm khả thi (f*,w*) cho Bài toán (2) và cả hai nghiệm có cùng mục tiêu, và (II) một nghiệm tối ưu (f*,w*) của Bài toán (2) có thể được sử dụng để xây dựng một nghiệm khả thi (f*,α*,Z*) cho Bài toán (5) và cả hai nghiệm có cùng mục tiêu. Hướng (I) là tầm thường: nghiệm được định nghĩa bởi f = f* và w = q(α*,Z*) khả thi cho Bài toán (2) và có cùng mục tiêu với (f*,α*,Z*).
+
+Tiếp theo, chúng tôi chỉ ra Hướng (II). Cho s = ||w*||0 và ký hiệu bởi tj chỉ số của phần tử lớn thứ j trong w*, tức là các entry khác không trong w* là w*t1 > w*t2 > ... > w*ts. Với mọi i∈[s], đặt z(i) thành biểu diễn nhị phân của ti-1. Nếu s < k, thì chúng tôi đặt các z(i) còn lại (chưa được đặt) như sau: với i∈{s+1,s+2,...,k} đặt z(i) thành biểu diễn nhị phân của ts-1. Bằng cách xây dựng này, các chỉ số khác không được chọn bởi r(z(i)), i∈[k] chính xác là các chỉ số khác không của w*.
+
+Để xây dựng α*, có hai trường hợp cần xem xét: (i) s = k và (ii) s < k. Nếu s = k, thì đặt αi* = log(w*ti) với i∈[k]. Do đó, σ(α*)i = w*ti với i∈[k], và do đó q(α*,Z*) = w*. Ngược lại, nếu s < k, thì đặt αi* = log(w*ti) với i∈[s-1] và αi* = log(w*ts/(k-s)) với i∈[s,s+1,...,k]. Do đó, với i∈[s-1], chúng ta có σ(α*)i = w*ti, tức là trọng số của các chỉ số khác không tj, j∈[s-1] trong q(α*,Z*) bằng với những trọng số trong w*. Trọng số được gán cho chỉ số khác không ts trong q(α*,Z*) là: ∑i∈[s,s+1,...,k] σ(α*)i = ∑i∈[s,s+1,...,k] w*ts/(k-s) = w*ts. Do đó, q(α*,Z*) = w*. Trong cả (i) và (ii), chúng ta có q(α*,Z*) = w*, vì vậy nghiệm (f*,α*,Z*) khả thi và có cùng mục tiêu với (f*,w*).
+
+B.1.2 Chứng minh Mệnh đề 2
+
+Đầu tiên, chúng tôi sẽ sử dụng quy nạp để chỉ ra rằng r(Sβ(z)) thuộc về probability simplex. Cụ thể, chúng tôi sẽ chứng minh rằng với bất kỳ số nguyên t≥1 và z∈Rt, r(Sβ(z)) thuộc về probability simplex.
+
+Trường hợp cơ sở của chúng tôi là t = 1. Trong trường hợp này, có một biến mã hóa nhị phân duy nhất z1∈R và 2 chuyên gia. Selector chuyên gia đơn r(Sβ(z1)) được định nghĩa như sau: r(Sβ(z1))1 = 1-Sβ(z1) và r(Sβ(z1))2 = Sβ(z1). Hai hạng sau không âm và tổng bằng 1. Do đó, r(Sβ(z1)) thuộc về probability simplex.
+
+Giả thuyết quy nạp của chúng tôi là với một số t≥1 và bất kỳ z∈Rt, r(Sβ(z)) thuộc về probability simplex. Với bước quy nạp, chúng ta cần chỉ ra rằng với bất kỳ v∈Rt+1, r(Sβ(v)) thuộc về probability simplex. Từ định nghĩa của r(·), điều sau đây đúng:
+
+r(Sβ(v))i = r(Sβ([v1,v2,...,vt]T))i(1-Sβ(vt+1)) i∈[2t]
+r(Sβ([v1,v2,...,vt]T))i-2t Sβ(vt+1) i∈[2t+1]\[2t] (B.8)
+
+Theo giả thuyết quy nạp, chúng ta có r(Sβ([v1,v2,...,vt]T))i ≥ 0 với bất kỳ i nào. Hơn nữa, Sβ(·) là một hàm không âm. Do đó, r(Sβ(v))i ≥ 0 với bất kỳ i nào. Còn lại cần chỉ ra rằng tổng của các entry trong r(Sβ(v)) bằng 1, mà chúng tôi thiết lập tiếp theo:
+
+--- TRANG 14 ---
+∑[i=1]^[2^(t+1)] r(S_β(v))_i = ∑[i=1]^[2^t] r(S_β(v))_i + ∑[i=2^t+1]^[2^(t+1)] r(S_β(v))_i
+
+(B.8)= ∑[i=1]^[2^t] r(S_β([v_1,...,v_t]^T))_i(1-S_β(v_(t+1))) + ∑[i=2^t+1]^[2^(t+1)] r(S_β([v_1,v_2,...,v_t]^T))_(i-2^t) S_β(v_(t+1))
+(B.9)
+
+Sử dụng phép thay đổi biến, tổng thứ hai trong phần trên có thể được viết lại như sau: ∑[i=2^t+1]^[2^(t+1)] r(S_β([v_1,v_2,...,v_t]^T))_(i-2^t) S_β(v_(t+1)) = ∑[i=1]^[2^t] r(S_β([v_1,v_2,...,v_t]^T))_i S_β(v_(t+1)). Thay đẳng thức sau vào (B.9) và đơn giản hóa, chúng ta nhận được ∑[i=1]^[2^(t+1)] r(S_β(v))_i = 1. Do đó, r(S_β(v)) thuộc về probability simplex, điều này thiết lập bước quy nạp. Cuối cùng, chúng tôi lưu ý rằng q̃(α,Z) thuộc về probability simplex vì nó là một tổ hợp lồi của các vector xác suất.
+
+B.2 Mở rộng DSelect-k đến n tùy ý
+
+Giả sử rằng số lượng chuyên gia n không phải là lũy thừa của 2. Để cổng DSelect-k q̃(α,Z) hoạt động trong thiết lập này, chúng ta cần mỗi selector chuyên gia đơn r được sử dụng bởi cổng có thể xử lý n chuyên gia. Tiếp theo, chúng tôi thảo luận cách r có thể xử lý n khi nó không phải là lũy thừa của 2. Cho m là số nguyên nhỏ nhất sao cho n < 2^m. Sau đó, chúng tôi xử lý bài toán như thể có 2^m chuyên gia và sử dụng vector mã hóa nhị phân z∈R^m. Với i∈[n], chúng tôi cho entry r(z)_i là trọng số của chuyên gia i trong MoE. Lưu ý rằng các entry r(z)_i, i∈{n+1,n+2,...,2^m}, không liên quan đến bất kỳ chuyên gia nào. Để tránh tình huống mà r(z) gán xác suất khác không cho các entry sau, chúng tôi thêm penalty sau vào hàm mục tiêu: λ∑[i∉[n]] r(z)_i trong đó λ là một tham số không âm được sử dụng để kiểm soát cường độ của penalty. Penalty này khuyến khích r(z)_i, i∈[n] (tức là các entry liên quan đến n chuyên gia) nhận được nhiều xác suất hơn. Trong các thí nghiệm của chúng tôi, chúng tôi quan sát thấy ∑[i∈[n]] r(z)_i hội tụ về 1, khi λ đủ lớn. Penalty được mô tả ở trên là một phần của triển khai TensorFlow của chúng tôi cho DSelect-k. Chúng tôi cũng lưu ý rằng có các lựa chọn thay thế tiềm năng khác để xử lý các entry r(z)_i, i∈{n+1,n+2,...,2^m}, mà không thêm penalty vào hàm mục tiêu. Ví dụ, một lựa chọn thay thế là gán ngẫu nhiên mỗi r(z)_i, i∈{n+1,n+2,...,2^m} cho một trong n chuyên gia.
+
+B.3 Hàm Smooth-step
+
+Trong Hình B.4, chúng tôi vẽ hàm smooth-step [11] và hàm logistic L(x) = (1 + e^(-6x))^(-1). Lưu ý rằng hàm logistic được tái chia tỷ lệ để có cùng thang đo với hàm smooth-step.
+
+[THIS IS FIGURE: Hình B.4: Các hàm Smooth-step (β = 1) và Logistic.]
+
+--- TRANG 15 ---
+C Kết quả thí nghiệm bổ sung
+
+C.1 Hiệu suất dự đoán và lựa chọn chuyên gia trên dữ liệu tổng hợp
+
+Trong thí nghiệm này, chúng tôi nhằm mục đích (i) hiểu cách số lượng chuyên gia và nhiệm vụ ảnh hưởng đến hiệu suất dự đoán và lựa chọn chuyên gia cho các cổng khác nhau, và (ii) định lượng lợi ích từ mã hóa nhị phân trong cổng của chúng tôi thông qua một nghiên cứu ablation. Chúng tôi tập trung vào thiết lập cổng tĩnh, trong đó chúng tôi xem xét các cổng DSelect-k và Top-k, cùng với hai biến thể của cổng DSelect-k được sử dụng cho ablation. Để định lượng tốt hơn hiệu suất lựa chọn chuyên gia và tránh việc chỉ định sai mô hình, chúng tôi sử dụng dữ liệu tổng hợp được tạo từ MoE đa cổng. Đầu tiên, chúng tôi mô tả quy trình tạo dữ liệu của mình.
+
+Tạo dữ liệu tổng hợp: Chúng tôi xem xét 128 nhiệm vụ hồi quy, được phân chia thành bốn nhóm loại trừ lẫn nhau: {G_i}_(i∈[4]), trong đó G_i là tập hợp các chỉ số của các nhiệm vụ trong nhóm i. Như chúng tôi sẽ thảo luận tiếp theo, các nhiệm vụ được xây dựng theo cách sao cho các nhiệm vụ trong mỗi nhóm có mối quan hệ cao, trong khi các nhiệm vụ giữa các nhóm chỉ có mối quan hệ cận biên. Việc xây dựng như vậy bắt chước các ứng dụng thế giới thực trong đó các nhiệm vụ có thể được phân cụm theo mức độ liên quan.
+
+Mỗi nhóm bao gồm 16 nhiệm vụ được tạo từ một MoE cụ thể cho nhóm. MoE cụ thể cho nhóm bao gồm 4 chuyên gia: {f_i}_(i∈[4]). Mỗi chuyên gia là tổng của 4 đơn vị được kích hoạt bởi ReLU. Đầu ra của mỗi nhiệm vụ trong nhóm là một tổ hợp lồi của 4 chuyên gia. Cụ thể, với mỗi nhiệm vụ t∈[16] trong nhóm, cho w^(t)∈R^4 là một vector trọng số cụ thể cho nhiệm vụ. Sau đó, cho một vector đầu vào x, đầu ra của nhiệm vụ t được định nghĩa như sau:
+
+y^(t)(x) := ∑[i=1]^4 (w^(t))_i f_i(x)
+
+Với mỗi nhóm, chúng tôi tạo một instance của MoE cụ thể cho nhóm được mô tả ở trên, trong đó chúng tôi khởi tạo tất cả các trọng số ngẫu nhiên và độc lập với các nhóm khác. Cụ thể, chúng tôi lấy mẫu các trọng số của mỗi chuyên gia độc lập từ phân phối normal chuẩn. Để khuyến khích mối quan hệ giữa các nhiệm vụ trong mỗi nhóm, chúng tôi lấy mẫu các trọng số nhiệm vụ [w^(1);w^(2)...w^(16)] từ phân phối normal đa biến với mean zero trong đó chúng tôi đặt tương quan giữa bất kỳ hai trọng số nhiệm vụ nào là 0.8.
+
+Để tạo dữ liệu, chúng tôi lấy mẫu một ma trận dữ liệu X, với 140,000 quan sát và 10 đặc trưng, từ phân phối normal chuẩn. Ma trận dữ liệu được chia sẻ bởi tất cả 128 nhiệm vụ và các đầu ra hồi quy được thu được bằng cách sử dụng X làm đầu vào cho mỗi MoE cụ thể cho nhóm. Chúng tôi sử dụng 100,000 quan sát cho tập huấn luyện và 20,000 quan sát cho mỗi tập validation và testing.
+
+Thiết kế thí nghiệm: Chúng tôi xem xét MoE đa cổng và so sánh các cổng tĩnh sau: cổng DSelect-k, cổng Top-k, và một cổng "ablation" (sẽ được thảo luận sau trong phần này). Mục tiêu của chúng tôi là nghiên cứu cách, với mỗi cổng, số lượng nhiệm vụ ảnh hưởng đến hiệu suất dự đoán và lựa chọn chuyên gia. Vì mục đích này, chúng tôi xem xét 4 bài toán hồi quy, mỗi bài cho một tập con khác nhau của 128 nhiệm vụ; cụ thể, chúng tôi xem xét dự đoán các nhiệm vụ trong (i) G_1 (16 nhiệm vụ), (ii) G_1∪G_2 (32 nhiệm vụ), (iii) G_1∪G_2∪G_3 (64 nhiệm vụ), và (iv) G_1∪G_2∪G_3∪G_4 (128 nhiệm vụ). Trong mỗi bài toán trong số bốn bài toán, chúng tôi sử dụng MoE đa cổng để dự đoán đầu ra của các nhiệm vụ tương ứng đồng thời. MoE có cùng số lượng chuyên gia được sử dụng để tạo dữ liệu, tức là nếu T là tổng số nhiệm vụ trong bài toán, MoE bao gồm T/4 chuyên gia, trong đó các chuyên gia tương tự như những chuyên gia được sử dụng trong việc tạo dữ liệu (nhưng có thể huấn luyện). Mỗi nhiệm vụ được liên kết với một cổng cụ thể cho nhiệm vụ, chọn một tổ hợp lồi của 4 trong số T/4 chuyên gia. Lưu ý rằng không giống như kiến trúc được sử dụng để tạo dữ liệu, mỗi cổng nhiệm vụ ở đây được kết nối với tất cả các chuyên gia, ngay cả những chuyên gia thuộc về các nhóm không liên quan. Kiến trúc được sử dụng để tạo dữ liệu có thể được phục hồi nếu các cổng nhiệm vụ giữa các nhóm không chia sẻ chuyên gia, và các cổng nhiệm vụ trong mỗi nhóm chia sẻ cùng 4 chuyên gia. Chúng tôi sử dụng squared error loss để huấn luyện và điều chỉnh.
+
+Ablation: Ngoài việc so sánh các cổng DSelect-k và Top-k, chúng tôi thực hiện một nghiên cứu ablation để có cái nhìn sâu sắc về vai trò của mã hóa nhị phân trong cổng DSelect-k. Nhớ lại rằng trong cổng DSelect-k, chúng tôi đã giới thiệu selector chuyên gia đơn học một vector mã hóa one-hot (sử dụng sơ đồ mã hóa nhị phân). Trong tài liệu, một cách phổ biến để học các vector mã hóa one-hot như vậy là bằng cách sử dụng softmax (với các heuristics bổ sung như temperature annealing để đảm bảo rằng xác suất tập trung vào một entry). Do đó, trong nghiên cứu ablation của chúng tôi, chúng tôi xem xét cổng DSelect-k q̃(α,Z), và chúng tôi thay thế mỗi selector chuyên gia đơn r(·) bằng một selector dựa trên softmax. Chính xác hơn, cho α∈R^k và γ^(i)∈R^n, i∈[k], là các vector tham số có thể học. Sau đó, chúng tôi xem xét "cổng ablation" sau: h(α,Γ) := ∑[i=1]^k σ(α)_i σ(γ^(i)). Ở đây, σ(α)_i xác định trọng số được gán cho selector i, và σ(γ^(i)) đóng vai trò như một surrogate cho selector chuyên gia đơn r(S_β(z^(i))). Để đảm bảo rằng σ(γ^(i)) chọn một chuyên gia duy nhất (tức là dẫn đến một mã hóa one-hot), chúng tôi xem xét hai lựa chọn thay thế: (i) annealing temperature của σ(γ^(i)) trong quá trình huấn luyện^6, và (ii) tăng cường mục tiêu với một hạng chính quy hóa entropy (tương tự như của cổng DSelect-k) để tối thiểu hóa entropy của mỗi σ(γ^(i)). Trong kết quả của chúng tôi, chúng tôi gọi (i) là "Ablation (Annealing)" và (ii) là "Ablation (Entropy)". Lưu ý rằng hai lựa chọn thay thế ablation này có thể hội tụ về một mã hóa one-hot asymptotically (do tính chất của softmax), trong khi cổng được đề xuất của chúng tôi có thể hội tụ trong một số bước hữu hạn.
+
+Đo lường hiệu suất lựa chọn chuyên gia: Để định lượng sự tương tự giữa các chuyên gia được chọn bởi các nhiệm vụ khác nhau, chúng tôi sử dụng chỉ số Jaccard. Cho hai nhiệm vụ, cho A và B là các tập hợp chuyên gia được chọn bởi nhiệm vụ thứ nhất và thứ hai, tương ứng. Chỉ số Jaccard của hai tập hợp này được định nghĩa bởi: |A∩B|/|A∪B|. Trong các thí nghiệm của chúng tôi, chúng tôi tính toán: (i) chỉ số Jaccard trung bình cho các nhiệm vụ liên quan, và (ii) chỉ số Jaccard trung bình cho các nhiệm vụ không liên quan. Cụ thể, chúng tôi thu được (i) bằng cách tính toán chỉ số Jaccard cho mỗi cặp nhiệm vụ liên quan, và sau đó lấy trung bình. Chúng tôi thu được (ii) bằng cách tính toán chỉ số Jaccard trên tất cả các cặp nhiệm vụ thuộc về các nhóm khác nhau (tức là các cặp trong cùng nhóm bị bỏ qua), và sau đó lấy trung bình.
+
+Kết quả: Sau khi điều chỉnh, chúng tôi huấn luyện mỗi mô hình cạnh tranh, với các siêu tham số tốt nhất, cho 100 lần lặp lại với khởi tạo ngẫu nhiên. Trong Hình C.5, chúng tôi vẽ các thước đo hiệu suất (trung bình trên các lần lặp lại) theo số lượng nhiệm vụ. Trong biểu đồ bên trái, chúng tôi báo cáo MSE trên tập test. Trong các biểu đồ giữa và phải, chúng tôi báo cáo chỉ số Jaccard (trung bình) cho các nhiệm vụ liên quan và không liên quan, tương ứng. Trong hai biểu đồ sau, chúng tôi cũng xem xét một cổng ngẫu nhiên chọn 4 chuyên gia đồng nhất ngẫu nhiên, và vẽ giá trị kỳ vọng của chỉ số Jaccard của nó. Trong Hình C.5 (giữa), chỉ số lớn hơn là tốt hơn vì các nhiệm vụ liên quan sẽ chia sẻ nhiều chuyên gia hơn. Ngược lại, trong Hình C.5 (phải), chỉ số thấp hơn được ưa thích vì các nhiệm vụ không liên quan sẽ chia sẻ ít chuyên gia hơn. Với tất cả các phương pháp, chỉ số Jaccard trong Hình C.5 (giữa) và (phải) giảm theo số lượng nhiệm vụ. Điều này là trực quan, vì khi số lượng nhiệm vụ tăng, chúng ta sử dụng nhiều chuyên gia hơn, cho bất kỳ hai cổng nhất định nào nhiều linh hoạt hơn trong việc chọn các tập con loại trừ lẫn nhau của các chuyên gia.
+
+Nhìn chung, kết quả cho thấy cổng DSelect-k vượt trội đáng kể so với Top-k trong tất cả các thước đo hiệu suất được xem xét, và sự khác biệt trở nên rõ rệt hơn khi số lượng nhiệm vụ tăng. Ví dụ, ở 128 nhiệm vụ, DSelect-k đạt được cải thiện hơn 40% về MSE và 76% cải thiện về chỉ số Jaccard cho các nhiệm vụ liên quan, so với Top-k. Cổng DSelect-k cũng vượt trội hơn
+
+6Có các trường hợp bệnh lý mà việc annealing temperature trong softmax sẽ hội tụ về nhiều hơn một entry khác không. Điều này có thể xảy ra khi nhiều entry trong đầu vào của softmax có chính xác cùng giá trị.
+
+--- TRANG 16 ---
+hai cổng ablation trong đó chúng tôi thay thế mã hóa nhị phân bằng một selector dựa trên Softmax. Sự cải thiện sau cho thấy rằng sơ đồ mã hóa nhị phân được đề xuất tương đối hiệu quả trong việc chọn các chuyên gia đúng. Chúng tôi cũng đã điều tra hiệu suất kém của cổng Ablation (Entropy), và hóa ra các selector chuyên gia đơn dựa trên Softmax, tức là các σ(γ^(i)), có xu hướng chọn cùng một chuyên gia. Cụ thể, chúng tôi đặt k = 4 trong cổng ablation, nhưng nó kết thúc việc chọn 2 chuyên gia trong nhiều lần lặp lại huấn luyện. Ngược lại, các cổng DSelect-k và Top-k chọn 4 chuyên gia.
+
+C.2 Hình ảnh hóa cổng
+
+C.2.1 MovieLens
+
+Trong Hình C.6, chúng tôi vẽ các trọng số chuyên gia trong quá trình huấn luyện trên bộ dữ liệu MovieLens, cho các cổng Top-k và DSelect-k (sau khi điều chỉnh cả hai mô hình). Các biểu đồ cho thấy Top-k thể hiện các "nhảy" thường xuyên, trong đó trong một bước huấn luyện duy nhất, trọng số của một chuyên gia có thể thay đổi đột ngột từ giá trị khác không thành zero. Những nhảy này tiếp tục xảy ra cho đến cuối quá trình huấn luyện (khoảng 10^5 bước huấn luyện). Ngược lại, DSelect-k có các chuyển tiếp mượt mà trong quá trình huấn luyện. Chi tiết bổ sung về bộ dữ liệu MovieLens và kiến trúc MoE được sử dụng có thể được tìm thấy trong Phần 4.1 của bài báo.
+
+[THIS IS FIGURE: Hình C.6: Trọng số chuyên gia trong quá trình huấn luyện trên bộ dữ liệu MovieLens. Mỗi màu tương ứng với một chuyên gia riêng biệt. Các biểu đồ dành cho các mô hình tốt nhất thu được sau khi điều chỉnh.]
+
+C.2.2 Dữ liệu tổng hợp
+
+Ở đây chúng tôi xem xét một bộ dữ liệu phân loại nhị phân được tạo từ một MoE tĩnh bao gồm 4 chuyên gia. Chúng tôi huấn luyện một mô hình MoE khác sử dụng 16 chuyên gia: 4 trong số các chuyên gia này là bản sao (tức là có chính xác cùng trọng số) của 4 chuyên gia được sử dụng trong việc tạo dữ liệu, và phần còn lại của các chuyên gia được khởi tạo ngẫu nhiên. Chúng tôi đông kết tất cả các chuyên gia và chỉ huấn luyện trên các tham số cổng. Trong thiết lập đơn giản này, chúng tôi mong đợi cổng có thể khôi phục 4 chuyên gia đã được sử dụng để tạo dữ liệu. Chúng tôi huấn luyện hai mô hình MoE: một dựa trên Top-k và một dựa trên DSelect-k. Sau khi điều chỉnh cả hai mô hình, Top-k chỉ khôi phục được 1 chuyên gia đúng (và mắc 3 lỗi), trong khi mô hình của chúng tôi khôi phục tất cả 4 chuyên gia. Trong Hình C.7 và C.8, chúng tôi vẽ các trọng số chuyên gia trong quá trình huấn luyện, cho các cổng Top-k và DSelect-k, tương ứng. Top-k thể hiện hành vi dao động mạnh trong quá trình huấn luyện, trong khi DSelect-k có các chuyển tiếp mượt mà.
+
+Chi tiết bổ sung về việc tạo dữ liệu và mô hình: Chúng tôi xem xét một MoE "tạo dữ liệu" được khởi tạo ngẫu nhiên với 4 chuyên gia (mỗi chuyên gia là một lớp dense được kích hoạt bởi ReLU với 4 đơn vị). Đầu ra của MoE được thu được bằng cách lấy trung bình của 4 chuyên gia và đưa điều đó vào một đơn vị logistic duy nhất. Chúng tôi tạo một ma trận dữ liệu đa biến normal X với 20,000 quan sát và 10 đặc trưng (10,000 quan sát được phân bổ cho mỗi tập huấn luyện và validation). Để tạo nhãn phân loại nhị phân, chúng tôi sử dụng X làm đầu vào cho MoE tạo dữ liệu và áp dụng hàm sign cho đầu ra tương ứng. Để huấn luyện và điều chỉnh, chúng tôi xem xét kiến trúc MoE với 16 chuyên gia: 4 trong số các chuyên gia này là bản sao của các chuyên gia được sử dụng trong việc tạo dữ liệu, và phần còn lại của các chuyên gia được khởi tạo ngẫu nhiên. Tất cả các chuyên gia được đông kết (không thể huấn luyện). Một cổng có thể huấn luyện chọn 4 trong số 16 chuyên gia, và kết quả cuối cùng được đưa vào một đơn vị logistic duy nhất. Chúng tôi tối ưu hóa cross-entropy loss bằng Adam với batch size 256, và điều chỉnh learning rate trong {10^(-1), 10^(-2),..., 10^(-5)}.
+
+--- TRANG 17 ---
+[THIS IS FIGURE: Two graphs showing expert weights during training on synthetic data generated from MoE - labeled as "Top-k gate"]
+
+Hình C.7: Trọng số chuyên gia trong quá trình huấn luyện trên dữ liệu tổng hợp được tạo từ MoE. Mỗi màu tương ứng với một chuyên gia riêng biệt. Biểu đồ bên trái là phiên bản phóng to của biểu đồ bên phải. Các biểu đồ dành cho mô hình tốt nhất thu được sau khi điều chỉnh.
+
+[THIS IS FIGURE: Two graphs showing expert weights during training on synthetic data generated from MoE - labeled as "DSelect-k gate"]
+
+Hình C.8: Trọng số chuyên gia trong quá trình huấn luyện trên dữ liệu tổng hợp được tạo từ MoE. Mỗi màu tương ứng với một chuyên gia riêng biệt. Biểu đồ bên trái là phiên bản phóng to của biểu đồ bên phải. Các biểu đồ dành cho mô hình tốt nhất thu được sau khi điều chỉnh.
+
+C.3 Hội tụ cổng và FLOPS
+
+Trong Bảng C.4, chúng tôi báo cáo phần trăm các bước huấn luyện cần thiết để S_β(Z) hội tụ về một ma trận nhị phân trong cổng DSelect-k, trên một số bộ dữ liệu thực. Những kết quả này dựa trên các mô hình đã được điều chỉnh được thảo luận trong Phần 4 của bài báo. Chúng tôi cũng báo cáo số lượng phép toán dấu phẩy động (FLOPS) được yêu cầu bởi MoE dựa trên DSelect-k so với MoE dựa trên Top-k, trong quá trình huấn luyện. Kết quả cho thấy số lượng bước huấn luyện cho đến khi hội tụ về một ma trận nhị phân phụ thuộc vào bộ dữ liệu cụ thể: dao động từ chỉ 0.04% trên bộ dữ liệu MovieLens đến 80% trên Multi-Fashion MNIST. Hơn nữa, trên một số bộ dữ liệu (MovieLens với η = 0.9 và Multi-MNIST), DSelect-k yêu cầu ít FLOPS hơn trong quá trình huấn luyện so với Top-k, tức là DSelect-k hiệu quả trong huấn luyện có điều kiện (trên những bộ dữ liệu cụ thể này).
+
+[THIS IS TABLE: Bảng C.4 showing training steps percentages and FLOPS ratios for different datasets]
+
+C.4 MovieLens
+
+Trong Bảng C.5, chúng tôi báo cáo accuracy cho nhiệm vụ 1 (phân loại) và loss cho nhiệm vụ 2 (hồi quy) cho các phương pháp cạnh tranh trên bộ dữ liệu MovieLens.
+
+[THIS IS TABLE: Bảng C.5 showing test loss and accuracy results for MovieLens dataset across different methods and η values]
+
+--- TRANG 18 ---
+D Chi tiết thí nghiệm
+
+Thiết lập tính toán: Chúng tôi chạy các thí nghiệm trên một cluster tự động phân bổ tài nguyên tính toán. Chúng tôi không báo cáo thông số kỹ thuật chính xác của cluster vì lý do bảo mật.
+
+Cổng Gumbel-softmax: [34,25] trình bày một phương pháp để học lớp nào trong mạng thần kinh cần kích hoạt trên cơ sở từng nhiệm vụ. Quyết định chọn mỗi lớp được mô hình hóa bằng một biến ngẫu nhiên nhị phân có phân phối được học bằng thủ thuật Gumbel-softmax. Lưu ý rằng phương pháp sau không xem xét mô hình MoE. Ở đây chúng tôi điều chỉnh phương pháp sau cho MoE; cụ thể chúng tôi xem xét một cổng Gumbel-softmax sử dụng các biến nhị phân để xác định chuyên gia nào cần chọn. Cho n chuyên gia {f_i}^n_{i=1}, cổng này sử dụng n biến ngẫu nhiên nhị phân {U_i}^n_{i=1}, trong đó U_i xác định liệu chuyên gia f_i có được chọn hay không. Hơn nữa, cổng sử dụng một vector có thể học bổ sung α∈R^n xác định trọng số của các chuyên gia. Cụ thể, cổng là một hàm d(α,U) có thành phần thứ i (với bất kỳ i∈[n]) được cho bởi:
+
+d(α,U)_i = σ(α)_i U_i
+
+Để học phân phối của các U_i, chúng tôi sử dụng thủ thuật Gumbel-softmax như được mô tả trong [34]. Hơn nữa, theo [34], chúng tôi thêm penalty khuyến khích độ thưa sau vào hàm mục tiêu: λ∑^n_{i=1} log p_i, trong đó p_i là tham số phân phối Bernoulli của U_i, và λ là một tham số không âm được sử dụng để kiểm soát số lượng nonzeros được chọn bởi cổng. Lưu ý rằng penalty sau không thể kiểm soát trực tiếp số lượng nonzeros như trong DSelect-k hoặc Top-k.
+
+D.1 MovieLens
+
+Kiến trúc: Đối với các mô hình dựa trên MoE, chúng tôi xem xét kiến trúc MoE đa cổng (xem Hình 1), trong đó mỗi nhiệm vụ được liên kết với một cổng riêng biệt. MoE sử dụng 8 chuyên gia, mỗi chuyên gia là một lớp dense được kích hoạt bởi ReLU với 256 đơn vị, theo sau bởi một lớp dropout (với tỷ lệ dropout 0.5). Với mỗi nhiệm vụ trong hai nhiệm vụ, tổ hợp lồi tương ứng của các chuyên gia được đưa vào một mạng con cụ thể cho nhiệm vụ. Mạng con được cấu thành từ một lớp dense (được kích hoạt bởi ReLU với 256 đơn vị) theo sau bởi một đơn vị duy nhất tạo ra đầu ra cuối cùng của nhiệm vụ. Mô hình shared bottom sử dụng một lớp dense (có số lượng đơn vị là một siêu tham số) được chia sẻ bởi hai nhiệm vụ, theo sau bởi một lớp dropout (với tỷ lệ 0.5). Với mỗi nhiệm vụ, đầu ra của lớp chia sẻ được đưa vào một mạng con cụ thể cho nhiệm vụ (giống như của các mô hình dựa trên MoE).
+
+Siêu tham số và Điều chỉnh: Chúng tôi điều chỉnh mỗi mô hình bằng random grid search, với trung bình 5 lần thử mỗi điểm lưới. Chúng tôi sử dụng Adagrad với batch size 128 và xem xét các siêu tham số và khoảng sau: Learning Rate: {0.001, 0.01, 0.1, 0.2, 0.3}, Epochs: {5, 10, 20, 30, 40, 50}, k cho Top-k và DSelect-k: {2, 4}, λ cho DSelect-k: {0.1, 1, 10}, β cho smooth-step: {1, 10}, Đơn vị trong Shared bottom: {32, 256, 2048, 4096, 8192}, λ trong Gumbel-softmax: {10^(-6), 10^(-5),..., 10}. Với Gumbel-softmax, chúng tôi chọn nghiệm tốt nhất có số lượng nonzeros kỳ vọng nhỏ hơn hoặc bằng 4.
+
+D.2 Multi-MNIST và Multi-Fashion MNIST
+
+Kiến trúc: Các mô hình dựa trên MoE sử dụng MoE đa cổng (như trong Hình 1). Mỗi chuyên gia trong 8 chuyên gia là một CNN được cấu thành (theo thứ tự) từ: (i) convolutional layer 1 (kernel size = 5, số lượng filters = 10, được kích hoạt bởi ReLU) theo sau bởi max pooling, (ii) convolutional layer 2 (kernel size = 5, số lượng filters = 20, được kích hoạt bởi ReLU) theo sau bởi max pooling, và (iii) một stack các lớp dense được kích hoạt bởi ReLU với 50 đơn vị mỗi lớp (số lượng lớp là một siêu tham số). Mạng con cụ thể cho mỗi nhiệm vụ được cấu thành từ một stack 3 lớp dense: hai lớp đầu có 50 đơn vị được kích hoạt bởi ReLU và lớp thứ ba có 10 đơn vị theo sau bởi một softmax. Mô hình shared bottom sử dụng một CNN chia sẻ (với cùng kiến trúc như CNN trong MoE). Với mỗi nhiệm vụ, đầu ra của CNN chia sẻ được đưa vào một mạng con cụ thể cho nhiệm vụ (giống như của các mô hình dựa trên MoE).
+
+Siêu tham số và Điều chỉnh: Chúng tôi điều chỉnh mỗi mô hình bằng random grid search, với trung bình 5 lần thử mỗi điểm lưới. Chúng tôi sử dụng Adam với batch size 256 và xem xét các siêu tham số và khoảng sau: Learning Rate: {0.01, 0.001, 0.0001, 0.00001}, Epochs: {25, 50, 75, 100}, k cho Top-k và DSelect-k: {2, 4}, β cho smooth-step: {0.1, 1, 10}, Số lượng lớp dense trong CNN: {1, 3, 5}, λ trong Gumbel-softmax: {0, 10^(-3), 10^(-2), 10^(-1), 1, 10, 1000}. Với Gumbel-softmax, chúng tôi chọn nghiệm tốt nhất có số lượng nonzeros kỳ vọng nhỏ hơn hoặc bằng 4.
+
+D.3 Hệ thống gợi ý
+
+Mỗi chuyên gia trong 8 chuyên gia trong MoE bao gồm một stack các lớp dense được kích hoạt bởi ReLU với 256 đơn vị mỗi lớp. Chúng tôi cố định k = 2 trong cả DSelect-k và Top-k. Chúng tôi điều chỉnh learning rate và kiến trúc. Với cả hai mô hình, quá trình huấn luyện được kết thúc khi không có cải thiện đáng kể nào trong validation loss.
+
+D.4 Dữ liệu tổng hợp
+
+Chúng tôi điều chỉnh mỗi mô hình bằng random grid search, với trung bình 5 lần thử mỗi điểm lưới. Chúng tôi sử dụng Adam với batch size 256 và xem xét các siêu tham số và khoảng sau: Learning rate: {0.001, 0.01, 0.1}, Epochs {25, 50, 75, 100}, β cho smooth-step: {5, 10, 15}, λ cho DSelect-k: {0.001, 0.005, 0.01, 0.1}, λ cho Ablation (Entropy): {10^(-6), 10^(-5), 10^(-4), 10^(-3), 10^(-2), 10^(-1), 1, 100}. Hơn nữa, với Ablation (Annealing), chúng tôi anneal temperature của softmax bắt đầu từ một siêu tham số τ_s xuống 10^(-16) (các temperatures được phân bố đều trên thang logarithmic). Chúng tôi điều chỉnh starting temperature τ_s trên {10^(-6), 10^(-5), 5×10^(-5), 10^(-4), 2.5×10^(-4), 5×10^(-4), 7.5×10^(-4), 10^(-3), 5×10^(-3), 10^(-2)} (lưu ý rằng một lưới tinh như vậy là cần thiết để annealing hoạt động cho cổng ablation).

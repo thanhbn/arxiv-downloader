@@ -26,6 +26,8 @@ import tempfile
 import shutil
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import signal
+import glob
+import re
 
 # Configure logging
 logging.basicConfig(
@@ -44,6 +46,42 @@ class TranslationQueueManager:
     def __init__(self, queue_file: str = "translation_queue.txt"):
         self.queue_file = Path(queue_file)
         self.lock_file = Path(f"{queue_file}.lock")
+        
+    def _extract_arxiv_id(self, filename: str) -> Optional[str]:
+        """Extract arxiv ID from filename."""
+        # Extract the directory and filename
+        path = Path(filename)
+        filename_only = path.name
+        
+        # Pattern to match arxiv ID (YYMM.NNNNN)
+        match = re.match(r'(\d{4}\.\d{5})', filename_only)
+        if match:
+            return match.group(1)
+        return None
+        
+    def _has_vietnamese_translation(self, filename: str) -> bool:
+        """Check if file already has a Vietnamese translation."""
+        path = Path(filename)
+        
+        if not path.exists():
+            return False
+            
+        arxiv_id = self._extract_arxiv_id(filename)
+        if not arxiv_id:
+            return False
+            
+        # Check for any file with the pattern: arxiv_id*_vi.txt in the same directory
+        parent_dir = path.parent
+        pattern = f"{arxiv_id}*_vi.txt"
+        
+        # Use glob to find matching files
+        matches = list(parent_dir.glob(pattern))
+        
+        if matches:
+            logger.info(f"Found existing Vietnamese translation for {filename}: {[str(m) for m in matches]}")
+            return True
+        
+        return False
         
     def _acquire_lock(self):
         """Acquire file lock for safe concurrent access."""
@@ -65,14 +103,19 @@ class TranslationQueueManager:
         except Exception as e:
             logger.error(f"Failed to release lock: {e}")
             
-    def get_next_file(self) -> Optional[str]:
-        """Get the next file to process from the queue."""
+    def get_next_file(self, blocking: bool = True) -> Optional[str]:
+        """Get the next file to process from the queue.
+        
+        Args:
+            blocking: If True, marks file as processing. If False, just returns next available file.
+        """
         if not self._acquire_lock():
             return None
             
         try:
             if not self.queue_file.exists():
-                logger.warning(f"Queue file {self.queue_file} does not exist")
+                if blocking:
+                    logger.warning(f"Queue file {self.queue_file} does not exist")
                 return None
                 
             lines = self.queue_file.read_text().strip().split('\n')
@@ -81,18 +124,34 @@ class TranslationQueueManager:
             # Find first line without [Processing] tag
             for i, line in enumerate(lines):
                 if line.strip() and not line.startswith('[Processing]'):
-                    # Mark as processing
-                    lines[i] = f"[Processing] {line.strip()}"
+                    filename = line.strip()
                     
-                    # Write back to file
-                    self.queue_file.write_text('\n'.join(lines) + '\n')
+                    # Check if this file already has a Vietnamese translation
+                    if self._has_vietnamese_translation(filename):
+                        if blocking:
+                            logger.info(f"Skipping {filename} - already has Vietnamese translation")
+                            # Remove from queue since it's already translated
+                            lines.pop(i)
+                            self.queue_file.write_text('\n'.join(lines) + '\n' if lines else '')
+                            # Recursively call to get next file
+                            return self.get_next_file(blocking)
+                        else:
+                            # In non-blocking mode, just continue to next file
+                            continue
                     
-                    return line.strip()
+                    if blocking:
+                        # Mark as processing
+                        lines[i] = f"[Processing] {filename}"
+                        # Write back to file
+                        self.queue_file.write_text('\n'.join(lines) + '\n')
+                    
+                    return filename
                     
             return None
             
         except Exception as e:
-            logger.error(f"Error reading queue file: {e}")
+            if blocking:
+                logger.error(f"Error reading queue file: {e}")
             return None
         finally:
             self._release_lock()
@@ -182,6 +241,67 @@ class TranslationQueueManager:
             
         except Exception as e:
             logger.error(f"Error resetting processing status: {e}")
+            return 0
+        finally:
+            self._release_lock()
+            
+    def clean_duplicate_arxiv_ids(self) -> int:
+        """Remove duplicate arxiv_id.txt entries from queue, keeping only the longer filename versions."""
+        if not self._acquire_lock():
+            return 0
+            
+        try:
+            if not self.queue_file.exists():
+                return 0
+                
+            lines = self.queue_file.read_text().strip().split('\n')
+            lines = [line for line in lines if line.strip()]
+            
+            # Group lines by arxiv_id
+            arxiv_groups = {}
+            
+            for line in lines:
+                clean_line = line.replace('[Processing] ', '').strip()
+                arxiv_id = self._extract_arxiv_id(clean_line)
+                
+                if arxiv_id:
+                    if arxiv_id not in arxiv_groups:
+                        arxiv_groups[arxiv_id] = []
+                    arxiv_groups[arxiv_id].append(line)
+            
+            # Keep only the longest filename for each arxiv_id
+            cleaned_lines = []
+            removed_count = 0
+            
+            for line in lines:
+                clean_line = line.replace('[Processing] ', '').strip()
+                arxiv_id = self._extract_arxiv_id(clean_line)
+                
+                if arxiv_id and arxiv_id in arxiv_groups:
+                    # Find the longest filename for this arxiv_id
+                    group_lines = arxiv_groups[arxiv_id]
+                    longest_line = max(group_lines, key=lambda x: len(x.replace('[Processing] ', '').strip()))
+                    
+                    if line == longest_line:
+                        cleaned_lines.append(line)
+                    else:
+                        removed_count += 1
+                        logger.info(f"Removing duplicate: {clean_line}")
+                    
+                    # Mark this arxiv_id as processed to avoid duplicates
+                    del arxiv_groups[arxiv_id]
+                else:
+                    # Keep lines that don't have arxiv_id (shouldn't happen, but safe)
+                    cleaned_lines.append(line)
+            
+            if removed_count > 0:
+                self.queue_file.write_text('\n'.join(cleaned_lines) + '\n' if cleaned_lines else '')
+                logger.info(f"Removed {removed_count} duplicate arxiv_id entries from queue")
+            
+            return removed_count
+            
+        except Exception as e:
+            logger.error(f"Error cleaning duplicate arxiv_ids: {e}")
             return 0
         finally:
             self._release_lock()
@@ -375,6 +495,79 @@ def translate_worker(args: Tuple[str, str]) -> Tuple[str, bool]:
         worker_logger.error(f"Traceback: {traceback.format_exc()}")
         return (filename, False)
 
+def idle_worker(args: Tuple[str, str]) -> Tuple[Optional[str], bool]:
+    """Idle worker function that polls for new files and processes them."""
+    queue_file, claude_path = args
+    worker_pid = os.getpid()
+    
+    # Set up worker-specific logger
+    worker_logger = logging.getLogger(f"idle_worker_{worker_pid}")
+    worker_logger.setLevel(logging.INFO)
+    
+    # Create worker-specific handler if not exists
+    if not worker_logger.handlers:
+        worker_handler = logging.StreamHandler()
+        worker_formatter = logging.Formatter(
+            f'%(asctime)s - IDLE-WORKER-{worker_pid} - %(levelname)s - %(message)s'
+        )
+        worker_handler.setFormatter(worker_formatter)
+        worker_logger.addHandler(worker_handler)
+        worker_logger.propagate = False
+    
+    worker_logger.info("Idle worker started, waiting for files...")
+    
+    # Set up signal handler for graceful shutdown
+    def signal_handler(signum, frame):
+        worker_logger.info("Idle worker received shutdown signal")
+        sys.exit(0)
+        
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    try:
+        queue_manager = TranslationQueueManager(queue_file)
+        translator = ClaudeTranslator(claude_path)
+        
+        # Poll for files every 5 seconds
+        poll_interval = 5
+        max_idle_time = 300  # 5 minutes max idle time
+        idle_start = time.time()
+        
+        while True:
+            # Check if we've been idle too long
+            if time.time() - idle_start > max_idle_time:
+                worker_logger.info("Max idle time reached, shutting down idle worker")
+                return (None, True)
+            
+            # Try to get a file (blocking mode to mark as processing)
+            filename = queue_manager.get_next_file(blocking=True)
+            
+            if filename:
+                worker_logger.info(f"Idle worker picked up file: {filename}")
+                # Reset idle timer since we got work
+                idle_start = time.time()
+                
+                # Process the file
+                result = translator.translate_file(filename)
+                
+                if result:
+                    worker_logger.info(f"Successfully translated {filename}")
+                    queue_manager.mark_completed(filename)
+                    return (filename, True)
+                else:
+                    worker_logger.error(f"Failed to translate {filename}")
+                    queue_manager.mark_completed(filename)
+                    return (filename, False)
+            else:
+                # No files available, sleep and try again
+                time.sleep(poll_interval)
+                
+    except Exception as e:
+        worker_logger.error(f"Idle worker exception: {e}")
+        import traceback
+        worker_logger.error(f"Traceback: {traceback.format_exc()}")
+        return (None, False)
+
 class TranslationManager:
     """Main translation manager orchestrating the entire process."""
     
@@ -416,6 +609,12 @@ class TranslationManager:
         logger.info(f"Claude executable verified: {self.claude_path}")
         logger.info(f"Maximum workers: {self.max_workers}")
         
+        # Clean duplicate arxiv_id entries from queue before starting
+        logger.info("Cleaning duplicate arxiv_id entries from translation queue...")
+        removed_count = self.queue_manager.clean_duplicate_arxiv_ids()
+        if removed_count > 0:
+            logger.info(f"Removed {removed_count} duplicate entries from queue")
+        
         try:
             with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
                 futures = {}
@@ -434,12 +633,12 @@ class TranslationManager:
                         self.last_status = (total, processing, pending)
                         self.last_status_log = current_time
                     
-                    # Check if we're done
-                    if pending == 0 and len(futures) == 0:
+                    # Check if we're done (only if we have no processing items left)
+                    if pending == 0 and processing == 0 and len(futures) == 0:
                         if total == 0:
                             logger.info("Queue is empty. Nothing to process.")
                         else:
-                            logger.info("All files processed or currently processing.")
+                            logger.info("All files completed successfully.")
                         break
                     
                     # If we have pending work but no futures, something went wrong
@@ -449,7 +648,7 @@ class TranslationManager:
                         filename = self.queue_manager.get_next_file()
                         if filename:
                             future = executor.submit(translate_worker, (filename, self.claude_path))
-                            futures[future] = filename
+                            futures[future] = ('file', filename)
                             self.worker_start_times[future] = time.time()
                             logger.info(f"Emergency restart: submitted {filename} for translation")
                         else:
@@ -463,39 +662,40 @@ class TranslationManager:
                         reset_count = self.queue_manager.reset_processing_status()
                         if reset_count > 0:
                             logger.info(f"Reset {reset_count} orphaned items back to pending status")
+                            # Force refresh of queue status after reset
+                            time.sleep(0.5)
                         continue
                     
-                    # Submit new jobs if we have capacity and pending files
-                    while len(futures) < self.max_workers and pending > 0:
-                        filename = self.queue_manager.get_next_file()
-                        if filename:
-                            future = executor.submit(translate_worker, (filename, self.claude_path))
-                            futures[future] = filename
-                            self.worker_start_times[future] = time.time()  # Track start time
-                            logger.info(f"Submitted {filename} for translation")
-                        else:
-                            break
-                    
-                    # Check for long-running workers that need warmup
-                    current_time = time.time()
-                    long_running_futures = []
-                    for future, start_time in self.worker_start_times.items():
-                        if current_time - start_time > self.warmup_threshold:
-                            long_running_futures.append(future)
-                    
-                    # If we have long-running workers and capacity, start warmup workers
-                    if long_running_futures and len(futures) < self.max_workers and pending > 0:
-                        logger.info(f"Found {len(long_running_futures)} workers running >5min, starting warmup workers")
-                        warmup_count = min(len(long_running_futures), self.max_workers - len(futures))
-                        for _ in range(warmup_count):
+                    # Submit new jobs if we have capacity
+                    while len(futures) < self.max_workers:
+                        if pending > 0:
+                            # Try to get a file for immediate processing
                             filename = self.queue_manager.get_next_file()
                             if filename:
                                 future = executor.submit(translate_worker, (filename, self.claude_path))
-                                futures[future] = filename
+                                futures[future] = ('file', filename)  # Mark as file worker
                                 self.worker_start_times[future] = time.time()
-                                logger.info(f"Started warmup worker for {filename}")
-                            else:
-                                break
+                                logger.info(f"Submitted {filename} for translation")
+                                continue
+                        
+                        # No pending files, but we have worker capacity - start idle worker
+                        future = executor.submit(idle_worker, (str(self.queue_manager.queue_file), self.claude_path))
+                        futures[future] = ('idle', f'idle_worker_{len(futures)}')  # Mark as idle worker
+                        self.worker_start_times[future] = time.time()
+                        logger.info(f"Started idle worker {len(futures)} (total workers: {len(futures)})")
+                        
+                        # Only start one idle worker per loop iteration to avoid flooding
+                        break
+                    
+                    # Monitor worker health - log long-running workers for visibility
+                    current_time = time.time()
+                    long_running_count = 0
+                    for future, start_time in self.worker_start_times.items():
+                        if current_time - start_time > self.warmup_threshold:
+                            long_running_count += 1
+                    
+                    if long_running_count > 0 and current_time - self.last_status_log > 300:  # Log every 5 minutes
+                        logger.info(f"Status: {long_running_count} workers running >5min, total active workers: {len(futures)}")
                     
                     # Check completed jobs
                     completed_futures = []
@@ -507,29 +707,35 @@ class TranslationManager:
                         pass
                         
                     for future in completed_futures:
-                        filename = futures[future]
+                        worker_type, worker_id = futures[future]
                         try:
                             result_filename, success = future.result()
-                            if success:
-                                logger.info(f"Successfully completed: {result_filename}")
-                                self.queue_manager.mark_completed(result_filename)
-                                
-                                # Start warmup worker immediately after completion if there's pending work
-                                if pending > 1 and len(futures) <= self.max_workers:
-                                    warmup_filename = self.queue_manager.get_next_file()
-                                    if warmup_filename:
-                                        warmup_future = executor.submit(translate_worker, (warmup_filename, self.claude_path))
-                                        futures[warmup_future] = warmup_filename
-                                        self.worker_start_times[warmup_future] = time.time()
-                                        logger.info(f"Started immediate warmup worker for {warmup_filename}")
-                            else:
-                                logger.error(f"Failed to translate: {result_filename}")
-                                # Note: We still remove failed files from queue to avoid infinite loops
-                                # In production, you might want to move them to a failed queue
-                                self.queue_manager.mark_completed(result_filename)
+                            
+                            if worker_type == 'file':
+                                # File worker completed
+                                if success and result_filename:
+                                    logger.info(f"Successfully completed: {result_filename}")
+                                    # No need to mark completed here - worker already did it
+                                elif result_filename:
+                                    logger.error(f"Failed to translate: {result_filename}")
+                                    # No need to mark completed here - worker already did it
+                            elif worker_type == 'idle':
+                                # Idle worker completed
+                                if success and result_filename:
+                                    logger.info(f"Idle worker successfully completed: {result_filename}")
+                                elif result_filename:
+                                    logger.error(f"Idle worker failed to translate: {result_filename}")
+                                else:
+                                    logger.info(f"Idle worker {worker_id} shut down (no work or timeout)")
+                                    
                         except Exception as e:
-                            logger.error(f"Error processing result for {filename}: {e}")
-                            self.queue_manager.mark_completed(filename)
+                            logger.error(f"Error processing result for {worker_id}: {e}")
+                            # For file workers, try to clean up if we know the filename
+                            if worker_type == 'file':
+                                try:
+                                    self.queue_manager.mark_completed(worker_id)
+                                except:
+                                    pass
                         
                         # Clean up tracking
                         if future in self.worker_start_times:
@@ -576,6 +782,8 @@ def main():
                        help="Path to translation queue file (default: translation_queue.txt)")
     parser.add_argument("--verbose", "-v", action="store_true",
                        help="Enable verbose logging")
+    parser.add_argument("--clean-only", action="store_true",
+                       help="Only clean duplicates and already-translated files from queue, don't start translation")
     
     args = parser.parse_args()
     
@@ -593,6 +801,33 @@ def main():
         claude_path=args.claude_path,
         max_workers=args.workers
     )
+    
+    # If clean-only mode, just clean and exit
+    if args.clean_only:
+        logger.info("Running in clean-only mode...")
+        logger.info("Cleaning duplicate arxiv_id entries from translation queue...")
+        removed_count = manager.queue_manager.clean_duplicate_arxiv_ids()
+        logger.info(f"Removed {removed_count} duplicate entries from queue")
+        
+        # Also scan and mark already-translated files
+        logger.info("Scanning for files with existing Vietnamese translations...")
+        scanned_count = 0
+        skipped_count = 0
+        
+        while True:
+            filename = manager.queue_manager.get_next_file()
+            if not filename:
+                break
+            scanned_count += 1
+            # The get_next_file method already handles skipping translated files
+            # If we reach here, it means the file was skipped (already translated)
+            # So we need to mark it as completed to remove it from queue
+            manager.queue_manager.mark_completed(filename)
+            skipped_count += 1
+        
+        logger.info(f"Scanned {scanned_count} files, marked {skipped_count} as already translated")
+        logger.info("Queue cleanup completed successfully")
+        sys.exit(0)
     
     # Run the translation process
     success = manager.run()
