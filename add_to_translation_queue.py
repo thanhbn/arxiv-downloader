@@ -83,7 +83,8 @@ class QueueManager:
             failed_files = []
             
             for file_path in files:
-                file_path = str(Path(file_path).resolve())
+                # Use relative path to avoid hardcoded absolute paths
+                file_path = str(Path(file_path))
                 
                 # Check if file exists
                 if not Path(file_path).exists():
