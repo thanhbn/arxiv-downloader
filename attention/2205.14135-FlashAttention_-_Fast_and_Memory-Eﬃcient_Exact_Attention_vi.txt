@@ -1,0 +1,287 @@
+# FlashAttention: Cơ Chế Attention Chính Xác, Nhanh và Hiệu Quả Bộ Nhớ với Nhận Thức IO
+
+Tri Dao†, Daniel Y. Fu†, Stefano Ermon†, Atri Rudra‡, và Christopher Ré†
+†Khoa Khoa học Máy tính, Đại học Stanford
+‡Khoa Khoa học Máy tính và Kỹ thuật, Đại học Buffalo, SUNY
+{trid,danfu}@cs.stanford.edu, ermon@stanford.edu, atri@buffalo.edu,
+chrismre@cs.stanford.edu
+
+24 tháng 6, 2022
+
+## Tóm tắt
+
+Transformers chạy chậm và tốn bộ nhớ trên các chuỗi dài, vì độ phức tạp thời gian và bộ nhớ của self-attention có dạng bậc hai theo độ dài chuỗi. Các phương pháp attention xấp xỉ đã cố gắng giải quyết vấn đề này bằng cách đánh đổi chất lượng mô hình để giảm độ phức tạp tính toán, nhưng thường không đạt được tăng tốc thời gian thực. Chúng tôi lập luận rằng nguyên tắc còn thiếu là làm cho các thuật toán attention có nhận thức IO—tính đến việc đọc và ghi giữa các cấp độ bộ nhớ GPU. Chúng tôi đề xuất FlashAttention, một thuật toán attention chính xác có nhận thức IO sử dụng kỹ thuật tiling để giảm số lần đọc/ghi bộ nhớ giữa bộ nhớ băng thông cao GPU (HBM) và SRAM on-chip GPU. Chúng tôi phân tích độ phức tạp IO của FlashAttention, cho thấy nó yêu cầu ít lần truy cập HBM hơn so với attention tiêu chuẩn, và là tối ưu cho một phạm vi kích thước SRAM. Chúng tôi cũng mở rộng FlashAttention cho block-sparse attention, tạo ra một thuật toán attention xấp xỉ nhanh hơn bất kỳ phương pháp attention xấp xỉ nào hiện có. FlashAttention huấn luyện Transformers nhanh hơn các baseline hiện có: tăng tốc 15% end-to-end wall-clock trên BERT-large (độ dài seq. 512) so với kỷ lục tốc độ huấn luyện MLPerf 1.1, tăng tốc 3× trên GPT-2 (độ dài seq. 1K), và tăng tốc 2.4× trên long-range arena (độ dài seq. 1K-4K). FlashAttention và block-sparse FlashAttention cho phép ngữ cảnh dài hơn trong Transformers, mang lại các mô hình chất lượng cao hơn (0.7 perplexity tốt hơn trên GPT-2 và 6.4 điểm cải thiện trong phân loại tài liệu dài) và các khả năng hoàn toàn mới: Transformers đầu tiên đạt được hiệu suất tốt hơn ngẫu nhiên trên thử thách Path-X (độ dài seq. 16K, độ chính xác 61.4%) và Path-256 (độ dài seq. 64K, độ chính xác 63.1%).
+
+## 1 Giới thiệu
+
+Các mô hình Transformer [82] đã trở thành kiến trúc được sử dụng rộng rãi nhất trong các ứng dụng như xử lý ngôn ngữ tự nhiên và phân loại hình ảnh. Transformers đã trở nên lớn hơn [5] và sâu hơn [83], nhưng trang bị chúng với ngữ cảnh dài hơn vẫn còn khó khăn [80], vì mô-đun self-attention ở trung tâm của chúng có độ phức tạp thời gian và bộ nhớ bậc hai theo độ dài chuỗi. Một câu hỏi quan trọng là liệu việc làm cho attention nhanh hơn và hiệu quả bộ nhớ hơn có thể giúp các mô hình Transformer giải quyết các thách thức về thời gian chạy và bộ nhớ cho các chuỗi dài hay không.
+
+Nhiều phương pháp attention xấp xỉ đã nhằm mục đích giảm yêu cầu tính toán và bộ nhớ của attention. Các phương pháp này từ xấp xỉ thưa thớt [51,74] đến xấp xỉ rank thấp [12,50,84], và các kết hợp của chúng [3,9,92]. Mặc dù các phương pháp này giảm yêu cầu tính toán xuống tuyến tính hoặc gần tuyến tính theo độ dài chuỗi, nhiều trong số chúng không hiển thị tăng tốc wall-clock so với attention tiêu chuẩn và chưa được áp dụng rộng rãi. Một lý do chính là chúng tập trung vào việc giảm FLOP (có thể không tương quan với tốc độ wall-clock) và có xu hướng bỏ qua overhead từ truy cập bộ nhớ (IO).
+
+Trong bài báo này, chúng tôi lập luận rằng nguyên tắc còn thiếu là làm cho các thuật toán attention có nhận thức IO [1]—tức là, tính toán cẩn thận việc đọc và ghi đến các cấp độ khác nhau của bộ nhớ nhanh và chậm (ví dụ, giữa SRAM on-chip GPU nhanh và bộ nhớ băng thông cao GPU tương đối chậm, hoặc HBM [45], Hình 1 trái). Trên GPU hiện đại, tốc độ tính toán đã vượt qua tốc độ bộ nhớ [61,62,63], và hầu hết các hoạt động trong Transformers bị nghẽn cổ chai bởi việc truy cập bộ nhớ [43]. Các thuật toán có nhận thức IO đã rất quan trọng cho các hoạt động bị ràng buộc bộ nhớ tương tự, khi việc đọc và ghi dữ liệu có thể chiếm một phần lớn thời gian chạy—như database joins [71], xử lý hình ảnh [70], đại số tuyến tính số [4], và nhiều hơn nữa [40,85]. Tuy nhiên, các giao diện Python phổ biến cho deep learning như PyTorch và TensorFlow không cho phép kiểm soát chi tiết việc truy cập bộ nhớ.
+
+Chúng tôi đề xuất FlashAttention, một thuật toán attention mới tính toán attention chính xác với ít lần truy cập bộ nhớ hơn nhiều. Mục tiêu chính của chúng tôi là tránh đọc và ghi ma trận attention từ và đến HBM. Điều này yêu cầu (i) tính toán việc giảm softmax mà không truy cập toàn bộ đầu vào (ii) không lưu trữ ma trận attention trung gian lớn cho backward pass. Chúng tôi áp dụng hai kỹ thuật đã được thiết lập để giải quyết những thách thức này. (i) Chúng tôi tái cấu trúc tính toán attention để chia đầu vào thành các khối và thực hiện nhiều lần qua các khối đầu vào, do đó thực hiện việc giảm softmax từng bước (còn được gọi là tiling). (ii) Chúng tôi lưu trữ hệ số chuẩn hóa softmax từ forward pass để nhanh chóng tính toán lại attention on-chip trong backward pass, nhanh hơn phương pháp tiêu chuẩn là đọc ma trận attention trung gian từ HBM. Chúng tôi triển khai FlashAttention trong CUDA để đạt được kiểm soát chi tiết việc truy cập bộ nhớ và hợp nhất tất cả các hoạt động attention vào một GPU kernel. Ngay cả với việc tăng FLOPs do tính toán lại, thuật toán của chúng tôi vừa chạy nhanh hơn (lên đến 7.6× trên GPT-2 [67], Hình 1 phải) vừa sử dụng ít bộ nhớ hơn—tuyến tính theo độ dài chuỗi—so với attention tiêu chuẩn, nhờ việc giảm đáng kể lượng truy cập HBM.
+
+Chúng tôi phân tích độ phức tạp IO [1] của FlashAttention, chứng minh rằng nó yêu cầu O(N²d²M⁻¹) lần truy cập HBM trong đó d là chiều head và M là kích thước SRAM, so với Ω(Nd + N²) của attention tiêu chuẩn. Đối với các giá trị điển hình của d và M, FlashAttention yêu cầu ít lần truy cập HBM hơn nhiều lần so với attention tiêu chuẩn (lên đến 9× ít hơn, như được hiển thị trong Hình 2). Hơn nữa, chúng tôi cung cấp một cận dưới, cho thấy không có thuật toán attention chính xác nào có thể cải thiện tiệm cận số lần truy cập HBM trên tất cả kích thước SRAM.
+
+Chúng tôi cũng cho thấy rằng FlashAttention có thể phục vụ như một primitive hữu ích để nhận ra tiềm năng của các thuật toán attention xấp xỉ bằng cách khắc phục các vấn đề của chúng với overhead truy cập bộ nhớ. Như một bằng chứng khái niệm, chúng tôi triển khai block-sparse FlashAttention, một thuật toán attention thưa thớt nhanh hơn 2-4× so với ngay cả FlashAttention, mở rộng lên độ dài chuỗi 64k. Chúng tôi chứng minh rằng block-sparse FlashAttention có độ phức tạp IO tốt hơn FlashAttention theo một hệ số tỷ lệ với tỷ lệ thưa thớt. Chúng tôi thảo luận các mở rộng thêm cho các hoạt động khác (attention trên multi-GPU, kernel regression, nhân ma trận block-sparse) trong Phần 5. Chúng tôi mã nguồn mở FlashAttention để làm cho việc xây dựng trên primitive này dễ dàng hơn.
+
+Chúng tôi xác thực thực nghiệm rằng FlashAttention tăng tốc huấn luyện mô hình và cải thiện chất lượng mô hình bằng cách mô hình hóa ngữ cảnh dài hơn. Chúng tôi cũng đánh giá hiệu suất runtime và memory footprint của FlashAttention và block-sparse FlashAttention so với các implementation attention trước đó.
+
+• **Huấn luyện Nhanh hơn.** FlashAttention huấn luyện các mô hình Transformer nhanh hơn về thời gian wall-clock. Chúng tôi huấn luyện BERT-large (độ dài seq. 512) nhanh hơn 15% so với kỷ lục tốc độ huấn luyện trong MLPerf 1.1 [58], GPT-2 (độ dài seq. 1K) nhanh hơn 3× so với implementation baseline từ HuggingFace [87] và Megatron-LM [77], và long-range arena (độ dài seq. 1K-4K) nhanh hơn 2.4×.
+
+• **Mô hình Chất lượng Cao hơn.** FlashAttention mở rộng Transformers đến các chuỗi dài hơn, cải thiện chất lượng của chúng và cho phép các khả năng mới. Chúng tôi quan sát được cải thiện 0.7 perplexity trên GPT-2 và 6.4 điểm cải thiện từ việc mô hình hóa các chuỗi dài hơn trong phân loại tài liệu dài [13]. FlashAttention cho phép Transformer đầu tiên có thể đạt được hiệu suất tốt hơn ngẫu nhiên trên thử thách Path-X [80], chỉ từ việc sử dụng độ dài chuỗi dài hơn (16K). Block-sparse FlashAttention cho phép Transformer mở rộng đến các chuỗi thậm chí dài hơn (64K), dẫn đến mô hình đầu tiên có thể đạt được hiệu suất tốt hơn ngẫu nhiên trên Path-256.
+
+• **Đánh giá Attention.** FlashAttention nhanh hơn lên đến 3× so với implementation attention tiêu chuẩn trên các độ dài chuỗi phổ biến từ 128 đến 2K và mở rộng lên đến 64K. Lên đến độ dài chuỗi 512, FlashAttention vừa nhanh hơn vừa hiệu quả bộ nhớ hơn bất kỳ phương pháp attention hiện có nào, trong khi đối với độ dài chuỗi vượt quá 1K, một số phương pháp attention xấp xỉ (ví dụ, Linformer) bắt đầu trở nên nhanh hơn. Mặt khác, block-sparse FlashAttention nhanh hơn tất cả các phương pháp attention xấp xỉ hiện có mà chúng tôi biết.
+
+## 2 Nền tảng
+
+Chúng tôi cung cấp một số nền tảng về các đặc tính hiệu suất của các hoạt động deep learning phổ biến trên phần cứng hiện đại (GPU). Chúng tôi cũng mô tả implementation tiêu chuẩn của attention.
+
+### 2.1 Hiệu suất Phần cứng
+
+Chúng tôi tập trung vào GPU ở đây. Hiệu suất trên các bộ tăng tốc phần cứng khác tương tự [46, 48].
+
+**Hệ thống Phân cấp Bộ nhớ GPU.** Hệ thống phân cấp bộ nhớ GPU (Hình 1 trái) bao gồm nhiều dạng bộ nhớ có kích thước và tốc độ khác nhau, với bộ nhớ nhỏ hơn nhanh hơn. Ví dụ, GPU A100 có 40-80GB bộ nhớ băng thông cao (HBM) với băng thông 1.5-2.0TB/s và 192KB SRAM on-chip cho mỗi trong số 108 streaming multiprocessors với băng thông ước tính khoảng 19TB/s [44,45]. SRAM on-chip nhanh hơn một bậc độ lớn so với HBM nhưng nhỏ hơn nhiều bậc độ lớn về kích thước. Khi tính toán trở nên nhanh hơn so với tốc độ bộ nhớ [61,62,63], các hoạt động ngày càng bị nghẽn cổ chai bởi việc truy cập bộ nhớ (HBM). Do đó việc khai thác SRAM nhanh trở nên quan trọng hơn.
+
+**Mô hình Thực thi.** GPU có một số lượng lớn threads để thực thi một hoạt động (được gọi là kernel). Mỗi kernel tải đầu vào từ HBM vào registers và SRAM, tính toán, sau đó ghi đầu ra vào HBM.
+
+**Đặc tính hiệu suất.** Tùy thuộc vào sự cân bằng giữa tính toán và truy cập bộ nhớ, các hoạt động có thể được phân loại là compute-bound hoặc memory-bound. Điều này thường được đo bằng arithmetic intensity [85], là số hoạt động số học trên mỗi byte truy cập bộ nhớ.
+
+1. **Compute-bound:** thời gian thực hiện hoạt động được xác định bởi số hoạt động số học, trong khi thời gian truy cập HBM nhỏ hơn nhiều. Các ví dụ điển hình là nhân ma trận với chiều trong lớn, và convolution với số lượng kênh lớn.
+
+2. **Memory-bound:** thời gian thực hiện hoạt động được xác định bởi số lần truy cập bộ nhớ, trong khi thời gian tính toán nhỏ hơn nhiều. Ví dụ bao gồm hầu hết các hoạt động khác: elementwise (ví dụ, activation, dropout), và reduction (ví dụ, sum, softmax, batch norm, layer norm).
+
+**Kernel fusion.** Phương pháp phổ biến nhất để tăng tốc các hoạt động memory-bound là kernel fusion: nếu có nhiều hoạt động được áp dụng cho cùng một đầu vào, đầu vào có thể được tải một lần từ HBM, thay vì nhiều lần cho mỗi hoạt động. Compilers có thể tự động hợp nhất nhiều hoạt động elementwise [53,65,75]. Tuy nhiên, trong ngữ cảnh huấn luyện mô hình, các giá trị trung gian vẫn cần được ghi vào HBM để lưu cho backward pass, giảm hiệu quả của kernel fusion đơn giản.
+
+### 2.2 Implementation Attention Tiêu chuẩn
+
+Cho các chuỗi đầu vào Q, K, V ∈ ℝᴺˣᵈ trong đó N là độ dài chuỗi và d là chiều head, chúng ta muốn tính đầu ra attention O ∈ ℝᴺˣᵈ:
+
+S = QK^T ∈ ℝᴺˣᴺ
+P = softmax(S) ∈ ℝᴺˣᴺ  
+O = PV ∈ ℝᴺˣᵈ
+
+trong đó softmax được áp dụng theo hàng.
+
+Các implementation attention tiêu chuẩn cụ thể hóa các ma trận S và P vào HBM, chiếm O(N²) bộ nhớ. Thường N ≫ d (ví dụ, đối với GPT2, N = 1024 và d = 64). Chúng tôi mô tả implementation attention tiêu chuẩn trong Thuật toán 0. Vì một số hoặc hầu hết các hoạt động là memory-bound (ví dụ, softmax), số lượng lớn truy cập bộ nhớ dẫn đến thời gian wall-clock chậm.
+
+Vấn đề này được làm trầm trọng hơn bởi các hoạt động elementwise khác được áp dụng cho ma trận attention, chẳng hạn như masking áp dụng cho S hoặc dropout áp dụng cho P. Do đó, đã có nhiều nỗ lực để hợp nhất một số hoạt động elementwise, chẳng hạn như hợp nhất masking với softmax [77].
+
+Trong Phần 3.2, chúng tôi sẽ cho thấy rằng implementation attention tiêu chuẩn thực hiện các lần truy cập HBM bậc hai theo độ dài chuỗi N. Chúng tôi cũng so sánh số FLOP và số lần truy cập HBM của attention tiêu chuẩn và phương pháp của chúng tôi (FlashAttention).
+
+**Thuật toán 0 Implementation Attention Tiêu chuẩn**
+Yêu cầu: Ma trận Q, K, V ∈ ℝᴺˣᵈ trong HBM.
+1: Tải Q, K theo khối từ HBM, tính S = QK^T, ghi S vào HBM.
+2: Đọc S từ HBM, tính P = softmax(S), ghi P vào HBM.
+3: Tải P và V theo khối từ HBM, tính O = PV, ghi O vào HBM.
+4: Trả về O.
+
+## 3 FlashAttention: Thuật toán, Phân tích và Mở rộng
+
+Chúng tôi cho thấy cách tính toán attention chính xác với ít lần đọc/ghi HBM hơn và không lưu trữ các ma trận trung gian lớn cho backward pass. Điều này tạo ra một thuật toán attention vừa hiệu quả bộ nhớ vừa nhanh hơn về thời gian wall-clock. Chúng tôi phân tích độ phức tạp IO của nó, cho thấy phương pháp của chúng tôi yêu cầu ít lần truy cập HBM hơn nhiều so với attention tiêu chuẩn. Chúng tôi tiếp tục cho thấy rằng FlashAttention có thể phục vụ như một primitive hữu ích bằng cách mở rộng nó để xử lý block-sparse attention.
+
+Chúng tôi tập trung vào forward pass ở đây để dễ trình bày; Phụ lục B chứa chi tiết cho backward.
+
+### 3.1 Thuật toán Attention Hiệu quả với Tiling và Recomputation
+
+Cho các đầu vào Q, K, V ∈ ℝᴺˣᵈ trong HBM, chúng ta nhằm tính toán đầu ra attention O ∈ ℝᴺˣᵈ và ghi nó vào HBM. Mục tiêu của chúng ta là giảm lượng truy cập HBM (xuống dưới bậc hai theo N).
+
+Chúng tôi áp dụng hai kỹ thuật đã được thiết lập (tiling, recomputation) để vượt qua thách thức kỹ thuật của việc tính toán attention chính xác trong các lần truy cập HBM dưới bậc hai. Chúng tôi mô tả điều này trong Thuật toán 1. Ý tưởng chính là chúng ta chia các đầu vào Q, K, V thành các khối, tải chúng từ HBM chậm vào SRAM nhanh, sau đó tính toán đầu ra attention đối với những khối đó. Bằng cách chia tỷ lệ đầu ra của mỗi khối bằng hệ số chuẩn hóa phù hợp trước khi cộng chúng lại, chúng ta có được kết quả chính xác cuối cùng.
+
+**Tiling.** Chúng ta tính toán attention theo khối. Softmax kết nối các cột của K, vì vậy chúng ta phân tách softmax lớn với việc chia tỷ lệ [51, 60, 66]. Để ổn định số học, softmax của vector x ∈ ℝᴮ được tính như:
+
+m(x) := max_i x_i
+f(x) := [e^(x₁-m(x)), ..., e^(xₚ-m(x))]
+ℓ(x) := ∑_i f(x)_i
+softmax(x) := f(x)/ℓ(x)
+
+Đối với các vector x⁽¹⁾, x⁽²⁾ ∈ ℝᴮ, chúng ta có thể phân tách softmax của x = [x⁽¹⁾, x⁽²⁾] ∈ ℝ²ᴮ được ghép nối như:
+
+m(x) = m([x⁽¹⁾, x⁽²⁾]) = max(m(x⁽¹⁾), m(x⁽²⁾))
+f(x) = [e^(m(x⁽¹⁾)-m(x))f(x⁽¹⁾), e^(m(x⁽²⁾)-m(x))f(x⁽²⁾)]
+ℓ(x) = ℓ([x⁽¹⁾, x⁽²⁾]) = e^(m(x⁽¹⁾)-m(x))ℓ(x⁽¹⁾) + e^(m(x⁽²⁾)-m(x))ℓ(x⁽²⁾)
+softmax(x) = f(x)/ℓ(x)
+
+Do đó nếu chúng ta theo dõi một số thống kê bổ sung (m(x), ℓ(x)), chúng ta có thể tính toán softmax từng khối một. Chúng ta do đó chia các đầu vào Q, K, V thành các khối (Thuật toán 1 dòng 3), tính toán các giá trị softmax cùng với thống kê bổ sung (Thuật toán 1 dòng 10), và kết hợp các kết quả (Thuật toán 1 dòng 12).
+
+**Recomputation.** Một trong những mục tiêu của chúng ta là không lưu trữ O(N²) giá trị trung gian cho backward pass. Backward pass thường yêu cầu các ma trận S, P ∈ ℝᴺˣᴺ để tính toán gradients đối với Q, K, V. Tuy nhiên, bằng cách lưu trữ đầu ra O và thống kê chuẩn hóa softmax (m, ℓ), chúng ta có thể dễ dàng tính toán lại ma trận attention S và P trong backward pass từ các khối Q, K, V trong SRAM. Điều này có thể được xem như một dạng selective gradient checkpointing [10,34]. Mặc dù gradient checkpointing đã được đề xuất để giảm lượng bộ nhớ tối đa cần thiết [66], tất cả các implementation (mà chúng tôi biết) phải đánh đổi tốc độ để có bộ nhớ. Ngược lại, ngay cả với nhiều FLOP hơn, việc tính toán lại của chúng tôi tăng tốc backward pass do giảm truy cập HBM (Hình 2). Mô tả đầy đủ backward pass trong Phụ lục B.
+
+**Chi tiết implementation: Kernel fusion.** Tiling cho phép chúng tôi triển khai thuật toán của mình trong một CUDA kernel, tải đầu vào từ HBM, thực hiện tất cả các bước tính toán (nhân ma trận, softmax, tùy chọn masking và dropout, nhân ma trận), sau đó ghi kết quả trở lại HBM (masking và dropout trong Phụ lục B). Điều này tránh việc đọc và ghi lặp lại các đầu vào và đầu ra từ và đến HBM.
+
+**Thuật toán 1 FlashAttention**
+Yêu cầu: Ma trận Q, K, V ∈ ℝᴺˣᵈ trong HBM, SRAM on-chip có kích thước M.
+1: Đặt kích thước khối B_c = ⌊M/(4d)⌋, B_r = min(⌊M/(4d)⌋, d).
+2: Khởi tạo O = (0)_Nxd ∈ ℝᴺˣᵈ, ℓ = (0)_N ∈ ℝᴺ, m = (-∞)_N ∈ ℝᴺ trong HBM.
+3: Chia Q thành T_r = ⌈N/B_r⌉ khối Q₁, ..., Q_Tr có kích thước B_r × d mỗi khối, và chia K, V thành T_c = ⌈N/B_c⌉ khối K₁, ..., K_Tc và V₁, ..., V_Tc, có kích thước B_c × d mỗi khối.
+4: Chia O thành T_r khối O₁, ..., O_Tr có kích thước B_r × d mỗi khối, chia ℓ thành T_r khối ℓ₁, ..., ℓ_Tr có kích thước B_r mỗi khối, chia m thành T_r khối m₁, ..., m_Tr có kích thước B_r mỗi khối.
+5: for 1 ≤ j ≤ T_c do
+6:    Tải K_j, V_j từ HBM vào SRAM on-chip.
+7:    for 1 ≤ i ≤ T_r do
+8:        Tải Q_i, O_i, ℓ_i, m_i từ HBM vào SRAM on-chip.
+9:        Trên chip, tính S_ij = Q_i K_j^T ∈ ℝᴮʳˣᴮᶜ.
+10:       Trên chip, tính m̃_ij = rowmax(S_ij) ∈ ℝᴮʳ, P̃_ij = exp(S_ij - m̃_ij) ∈ ℝᴮʳˣᴮᶜ (pointwise), ℓ̃_ij = rowsum(P̃_ij) ∈ ℝᴮʳ.
+11:       Trên chip, tính m_i^new = max(m_i, m̃_ij) ∈ ℝᴮʳ, ℓ_i^new = e^(m_i-m_i^new)ℓ_i + e^(m̃_ij-m_i^new)ℓ̃_ij ∈ ℝᴮʳ.
+12:       Ghi O_i ← diag(ℓ_i^new)⁻¹(diag(ℓ_i)e^(m_i-m_i^new)O_i + e^(m̃_ij-m_i^new)P̃_ij V_j) vào HBM.
+13:       Ghi ℓ_i ← ℓ_i^new, m_i ← m_i^new vào HBM.
+14:   end for
+15: end for
+16: Trả về O.
+
+Chúng tôi cho thấy tính đúng đắn, runtime và yêu cầu bộ nhớ của FlashAttention (chứng minh trong Phụ lục C).
+
+**Định lý 1.** Thuật toán 1 trả về O = softmax(QK^T)V với O(N²d) FLOP và yêu cầu O(N) bộ nhớ bổ sung ngoài đầu vào và đầu ra.
+
+### 3.2 Phân tích: Độ phức tạp IO của FlashAttention
+
+Chúng tôi phân tích độ phức tạp IO của FlashAttention, cho thấy việc giảm đáng kể các lần truy cập HBM so với attention tiêu chuẩn. Chúng tôi cũng cung cấp một cận dưới, chứng minh rằng không có thuật toán attention chính xác nào có thể cải thiện tiệm cận các lần truy cập HBM.
+
+**Định lý 2.** Cho N là độ dài chuỗi, d là chiều head, và M là kích thước SRAM với d ≤ M ≤ Nd. Attention tiêu chuẩn (Thuật toán 0) yêu cầu Θ(Nd + N²) lần truy cập HBM, trong khi FlashAttention (Thuật toán 1) yêu cầu Θ(N²d²M⁻¹) lần truy cập HBM.
+
+Đối với các giá trị điển hình của d (64-128) và M (khoảng 100KB), d² nhỏ hơn M nhiều lần, và do đó FlashAttention yêu cầu ít lần truy cập HBM hơn nhiều lần so với implementation tiêu chuẩn. Điều này dẫn đến cả thực thi nhanh hơn và footprint bộ nhớ thấp hơn, mà chúng tôi xác thực trong Phần 4.3.
+
+Ý tưởng chính của chứng minh là cho kích thước SRAM là M, chúng ta có thể tải các khối K, V có kích thước Θ(M) mỗi khối (Thuật toán 1 dòng 6). Đối với mỗi khối K và V, chúng ta lặp qua tất cả các khối Q (Thuật toán 1 dòng 8) để tính toán các giá trị trung gian, dẫn đến Θ(NdM⁻¹) lần qua Q. Mỗi lần qua tải Θ(Nd) phần tử, tương ứng với Θ(N²d²M⁻¹) lần truy cập HBM. Chúng tôi tương tự chứng minh rằng backward pass của attention tiêu chuẩn yêu cầu Θ(Nd + N²) lần truy cập HBM trong khi backward pass của FlashAttention yêu cầu Θ(N²d²M⁻¹) lần truy cập HBM (Phụ lục B).
+
+Chúng tôi chứng minh một cận dưới: người ta không thể cải thiện tiệm cận số lần truy cập HBM cho tất cả các giá trị M (kích thước SRAM) khi tính toán attention chính xác.
+
+**Mệnh đề 3.** Cho N là độ dài chuỗi, d là chiều head, và M là kích thước SRAM với d ≤ M ≤ Nd. Không tồn tại thuật toán để tính toán attention chính xác với o(N²d²M⁻¹) lần truy cập HBM cho tất cả M trong khoảng [d, Nd].
+
+Chứng minh dựa trên thực tế rằng đối với M = Θ(Nd), bất kỳ thuật toán nào cũng phải thực hiện Ω(N²d²M⁻¹) = Ω(Nd) lần truy cập HBM. Loại cận dưới này trên một phạm vi con của M phổ biến trong tài liệu thuật toán streaming [88]. Chúng tôi để việc chứng minh các cận dưới độ phức tạp tham số [27] theo M như công việc tương lai thú vị.
+
+Chúng tôi xác thực rằng số lần truy cập HBM là yếu tố xác định chính của runtime attention. Trong Hình 2 (trái), chúng ta thấy rằng mặc dù FlashAttention có số FLOP cao hơn so với attention tiêu chuẩn (do recomputation trong backward pass), nó có ít lần truy cập HBM hơn nhiều, dẫn đến runtime nhanh hơn nhiều. Trong Hình 2 (giữa), chúng tôi thay đổi kích thước khối B_c của FlashAttention, dẫn đến số lượng truy cập HBM khác nhau, và đo runtime của forward pass. Khi kích thước khối tăng, số lần truy cập HBM giảm (vì chúng ta thực hiện ít lần qua đầu vào hơn), và runtime giảm. Đối với kích thước khối đủ lớn (vượt quá 256), runtime sau đó bị nghẽn cổ chai bởi các yếu tố khác (ví dụ, các hoạt động số học). Hơn nữa, kích thước khối lớn hơn sẽ không vừa với kích thước SRAM nhỏ.
+
+### 3.3 Mở rộng: Block-Sparse FlashAttention
+
+Chúng tôi mở rộng FlashAttention cho attention xấp xỉ: chúng tôi đề xuất block-sparse FlashAttention, có độ phức tạp IO nhỏ hơn FlashAttention theo một hệ số tỷ lệ với độ thưa thớt.
+
+Cho các đầu vào Q, K, V ∈ ℝᴺˣᵈ và ma trận mask M̃ ∈ {0,1}ᴺˣᴺ, chúng ta muốn tính toán:
+
+S = QK^T ∈ ℝᴺˣᴺ
+P = softmax(S ⊙ M̃) ∈ ℝᴺˣᴺ  
+O = PV ∈ ℝᴺˣᵈ
+
+trong đó (S ⊙ M̃)ₖₗ = Sₖₗ nếu M̃ₖₗ = 1 và -∞ nếu M̃ₖₗ = 0. Chúng tôi yêu cầu M̃ có dạng khối: đối với một số kích thước khối B_r, B_c, đối với tất cả k, l, M̃ₖₗ = Mᵢⱼ với i = ⌊k/B_r⌋, j = ⌊l/B_c⌋ đối với một số M ∈ {0,1}^(N/Br)×(N/Bc).
+
+Cho một mask thưa thớt khối được định nghĩa trước M ∈ {0,1}^(N/Br)×(N/Bc), chúng ta có thể dễ dàng điều chỉnh Thuật toán 1 để chỉ tính toán các khối khác không của ma trận attention. Thuật toán giống hệt Thuật toán 1, ngoại trừ chúng ta bỏ qua các khối zero. Chúng tôi tái tạo mô tả thuật toán trong Thuật toán 5 trong Phụ lục B.
+
+Chúng tôi cũng phân tích độ phức tạp IO của block-sparse FlashAttention.
+
+**Mệnh đề 4.** Cho N là độ dài chuỗi, d là chiều head, và M là kích thước SRAM với d ≤ M ≤ Nd. Block-sparse FlashAttention (Thuật toán 5) yêu cầu Θ(Nd + N²d²M⁻¹s) lần truy cập HBM trong đó s là phần của các khối khác không trong mask thưa thớt khối.
+
+Chúng ta thấy rằng việc áp dụng block-sparsity mang lại cải thiện trực tiếp theo độ thưa thớt cho hạng lớn hơn trong độ phức tạp IO. Đối với độ dài chuỗi lớn N, s thường được đặt là N^(-1/2) [11] hoặc N^(-1)logN [3,17,92], dẫn đến độ phức tạp IO Θ(N√N) hoặc Θ(NlogN). Đối với các thí nghiệm downstream, chúng tôi sử dụng pattern thưa thớt butterfly cố định [17], đã được chứng minh là có thể xấp xỉ độ thưa thớt tùy ý [16].
+
+Trong Hình 2 (phải), chúng tôi xác thực rằng khi độ thưa thớt tăng, runtime của block-sparse FlashAttention cải thiện tỷ lệ thuận. Trên benchmark LRA, block-sparse FlashAttention đạt được tăng tốc 2.8×, trong khi thực hiện ngang bằng với attention tiêu chuẩn (Phần 4).
+
+## 4 Thí nghiệm
+
+Chúng tôi đánh giá tác động của việc sử dụng FlashAttention để huấn luyện các mô hình Transformer. Chúng tôi xác thực hai khẳng định về thời gian huấn luyện và độ chính xác mô hình, và báo cáo các benchmark runtime và memory của attention.
+
+• **Tốc độ Huấn luyện.** FlashAttention vượt trội hơn kỷ lục tốc độ MLPerf 1.1 [58] cho BERT 15%, và tăng tốc GPT-2 lên đến 3× so với HuggingFace [87] và 1.8× so với Megatron [77] trên các Transformers tiêu chuẩn. FlashAttention tăng tốc benchmark long-range arena (LRA) 2.4×.
+
+• **Chất lượng.** FlashAttention mở rộng Transformers đến các chuỗi dài hơn, cải thiện chất lượng của chúng và cho phép các khả năng mới. Chúng tôi quan sát được cải thiện 0.7 perplexity trên GPT-2 và 6.4 điểm cải thiện từ việc mô hình hóa các chuỗi dài hơn trong phân loại tài liệu dài [13]. FlashAttention cho phép Transformer đầu tiên có thể đạt được hiệu suất tốt hơn ngẫu nhiên trên thử thách Path-X [80], chỉ từ việc sử dụng độ dài chuỗi dài hơn (16K). Block-sparse FlashAttention cho phép Transformer mở rộng đến các chuỗi thậm chí dài hơn (64K), dẫn đến mô hình đầu tiên mà chúng tôi biết có thể đạt được hiệu suất tốt hơn ngẫu nhiên trên Path-256.
+
+• **Đánh giá Attention.** FlashAttention nhanh hơn lên đến 3× so với implementation attention tiêu chuẩn trên các độ dài chuỗi phổ biến từ 128 đến 2K và mở rộng lên đến 64K. Lên đến độ dài chuỗi 512, FlashAttention vừa nhanh hơn vừa hiệu quả bộ nhớ hơn bất kỳ phương pháp attention hiện có nào, trong khi đối với độ dài chuỗi vượt quá 1K, một số phương pháp attention xấp xỉ (ví dụ, Linformer) bắt đầu trở nên nhanh hơn. Mặt khác, block-sparse FlashAttention nhanh hơn tất cả các phương pháp attention xấp xỉ hiện có mà chúng tôi biết.
+
+Chi tiết thí nghiệm bổ sung trong Phụ lục E.
+
+### 4.1 Mô hình Nhanh hơn với FlashAttention
+
+**BERT.** FlashAttention mang lại tốc độ huấn luyện BERT single-node nhanh nhất mà chúng tôi biết. Chúng tôi huấn luyện mô hình BERT-large [22] với FlashAttention trên Wikipedia. Bảng 1 so sánh thời gian huấn luyện của chúng tôi với implementation từ Nvidia đã thiết lập kỷ lục tốc độ huấn luyện cho MLPerf 1.1 [58]. Implementation của chúng tôi nhanh hơn 15%.
+
+**Bảng 1:** Thời gian huấn luyện BERT-large, bắt đầu từ cùng một khởi tạo được cung cấp bởi benchmark MLPerf, để đạt độ chính xác mục tiêu 72.0% trên masked language modeling. Trung bình trên 10 lần chạy trên 8 GPU A100.
+
+| Implementation BERT | Thời gian huấn luyện (phút) |
+|---------------------|---------------------------|
+| Nvidia MLPerf 1.1 [58] | 20.0±1.5 |
+| FlashAttention (của chúng tôi) | 17.4±1.4 |
+
+**GPT-2.** FlashAttention mang lại thời gian huấn luyện nhanh hơn cho GPT-2 [67] trên tập dữ liệu OpenWebtext lớn [32] so với các implementation được sử dụng rộng rãi của HuggingFace [87] và Megatron-LM [77]. Bảng 2 cho thấy tăng tốc end-to-end lên đến 3× so với Huggingface và 1.7× so với Megatron-LM. FlashAttention đạt được cùng perplexity như hai implementation khác, vì chúng tôi không thay đổi định nghĩa mô hình. Phụ lục E bao gồm các biểu đồ validation perplexity trong suốt quá trình huấn luyện, xác nhận rằng FlashAttention ổn định về số học như các baseline và tạo ra cùng các đường cong huấn luyện/validation.
+
+**Bảng 2:** GPT-2 small và medium sử dụng FlashAttention đạt được tăng tốc lên đến 3× so với implementation Huggingface và lên đến 1.7× so với Megatron-LM. Thời gian huấn luyện được báo cáo trên 8 GPU A100.
+
+| Implementation mô hình | OpenWebText (ppl) | Thời gian huấn luyện (tăng tốc) |
+|------------------------|-------------------|--------------------------------|
+| GPT-2 small - Huggingface [87] | 18.2 | 9.5 ngày (1.0×) |
+| GPT-2 small - Megatron-LM [77] | 18.2 | 4.7 ngày (2.0×) |
+| GPT-2 small - FlashAttention | 18.2 | 2.7 ngày (3.5×) |
+| GPT-2 medium - Huggingface [87] | 14.2 | 21.0 ngày (1.0×) |
+| GPT-2 medium - Megatron-LM [77] | 14.3 | 11.5 ngày (1.8×) |
+| GPT-2 medium - FlashAttention | 14.3 | 6.9 ngày (3.0×) |
+
+**Long-range Arena.** Chúng tôi so sánh vanilla Transformer (với implementation tiêu chuẩn hoặc FlashAttention) trên benchmark long-range arena (LRA [80]). Chúng tôi đo độ chính xác, throughput và thời gian huấn luyện của tất cả các mô hình. Mỗi nhiệm vụ có độ dài chuỗi khác nhau từ 1024 đến 4096. Chúng tôi tuân theo implementation và cài đặt thí nghiệm trong Tay et al. [80] và Xiong et al. [90]. Bảng 3 cho thấy FlashAttention đạt được tăng tốc lên đến 2.4× so với attention tiêu chuẩn. Block-sparse FlashAttention nhanh hơn tất cả các phương pháp attention xấp xỉ mà chúng tôi đã thử nghiệm.
+
+**Bảng 3:** Hiệu suất của attention tiêu chuẩn, FlashAttention, block-sparse FlashAttention, và các baseline attention xấp xỉ trên các benchmark Long-Range-Arena.
+
+| Mô hình | ListOps | Text | Retrieval | Image | Pathfinder | Avg | Tăng tốc |
+|---------|---------|------|-----------|-------|------------|-----|----------|
+| Transformer | 36.0 | 63.6 | 81.6 | 42.3 | 72.7 | 59.3 | - |
+| FlashAttention | 37.6 | 63.9 | 81.4 | 43.5 | 72.7 | 59.8 | 2.4× |
+| Block-sparse FlashAttention | 37.0 | 63.0 | 81.3 | 43.6 | 73.3 | 59.6 | 2.8× |
+| Linformer [84] | 35.6 | 55.9 | 77.7 | 37.8 | 67.6 | 54.9 | 2.5× |
+| Linear Attention [50] | 38.8 | 63.2 | 80.7 | 42.6 | 72.5 | 59.6 | 2.3× |
+| Performer [12] | 36.8 | 63.6 | 82.2 | 42.1 | 69.9 | 58.9 | 1.8× |
+| Local Attention [80] | 36.1 | 60.2 | 76.7 | 40.6 | 66.6 | 56.0 | 1.7× |
+| Reformer [51] | 36.5 | 63.8 | 78.5 | 39.6 | 69.4 | 57.6 | 1.3× |
+| Smyrf [19] | 36.1 | 64.1 | 79.0 | 39.6 | 70.5 | 57.9 | 1.7× |
+
+### 4.2 Mô hình Tốt hơn với Chuỗi Dài hơn
+
+**Mô hình Ngôn ngữ với Ngữ cảnh Dài.** Runtime và hiệu quả bộ nhớ của FlashAttention cho phép chúng tôi tăng độ dài ngữ cảnh của GPT-2 lên 4× trong khi vẫn chạy nhanh hơn implementation được tối ưu hóa từ Megatron-LM. Bảng 4 cho thấy GPT-2 với FlashAttention và độ dài ngữ cảnh 4K vẫn nhanh hơn 30% so với GPT-2 từ Megatron với độ dài ngữ cảnh 1K, trong khi đạt được perplexity tốt hơn 0.7.
+
+**Bảng 4:** GPT-2 small với FlashAttention, với độ dài ngữ cảnh lớn hơn 4× so với Megatron-LM, vẫn nhanh hơn 30% trong khi đạt được perplexity tốt hơn 0.7. Thời gian huấn luyện trên 8 GPU A100 được báo cáo.
+
+| Implementation mô hình | Độ dài ngữ cảnh | OpenWebText (ppl) | Thời gian huấn luyện (tăng tốc) |
+|------------------------|-----------------|-------------------|--------------------------------|
+| GPT-2 small - Megatron-LM | 1k | 18.2 | 4.7 ngày (1.0×) |
+| GPT-2 small - FlashAttention | 1k | 18.2 | 2.7 ngày (1.7×) |
+| GPT-2 small - FlashAttention | 2k | 17.6 | 3.0 ngày (1.6×) |
+| GPT-2 small - FlashAttention | 4k | 17.5 | 3.6 ngày (1.3×) |
+
+**Phân loại Tài liệu Dài.** Huấn luyện Transformers với các chuỗi dài hơn với FlashAttention cải thiện hiệu suất trên các tập dữ liệu MIMIC-III [47] và ECtHR [6,7]. MIMIC-III chứa các bản tóm tắt xuất viện của bệnh nhân chăm sóc tích cực, mỗi cái được chú thích với nhiều nhãn. ECtHR chứa các vụ án pháp lý từ Tòa án Nhân quyền Châu Âu, mỗi vụ được ánh xạ đến các điều khoản của Công ước Nhân quyền bị cáo buộc vi phạm. Cả hai tập dữ liệu này đều chứa các tài liệu văn bản rất dài; số token trung bình trong MIMIC là 2,395 token, và tài liệu dài nhất chứa 14,562 token, trong khi số trung bình và dài nhất trong ECtHR lần lượt là 2,197 và 49,392. Chúng tôi đánh giá sự cải thiện từ việc tăng độ dài chuỗi của mô hình RoBERTa được pretrain [56] (chúng tôi lặp lại các positional embeddings, như trong Beltagy et al. [3]). Bảng 5 cho thấy độ dài chuỗi 16K vượt trội hơn độ dài 512 4.3 điểm trên MIMIC, và độ dài 8K vượt trội hơn độ dài 512 8.5 điểm trên ECtHR. Sự khác biệt có thể do các distribution shift tinh tế: MIMIC-III chứa văn bản y tế chuyên môn và do đó có thể dễ bị ảnh hưởng hơn bởi distribution shift trong độ dài tài liệu, trong khi ECtHR chứa ngôn ngữ chung.
+
+**Bảng 5:** Hiệu suất Tài liệu Dài (micro F1) ở các độ dài chuỗi khác nhau sử dụng FlashAttention.
+
+| | 512 | 1024 | 2048 | 4096 | 8192 | 16384 |
+|---------|-----|------|------|------|------|-------|
+| MIMIC-III [47] | 52.8 | 50.7 | 51.7 | 54.6 | 56.4 | 57.1 |
+| ECtHR [6] | 72.2 | 74.3 | 77.1 | 78.6 | 80.7 | 79.2 |
+
+**Bảng 6:** Chúng tôi báo cáo mô hình Transformer đầu tiên có thể đạt được hiệu suất không ngẫu nhiên trên Path-X và Path-256.
+
+| Mô hình | Path-X | Path-256 |
+|---------|--------|----------|
+| Transformer | ✗ | ✗ |
+| Linformer [84] | ✗ | ✗ |
+| Linear Attention [50] | ✗ | ✗ |
+| Performer [12] | ✗ | ✗ |
+| Local Attention [80] | ✗ | ✗ |
+| Reformer [51] | ✗ | ✗ |
+| SMYRF [19] | ✗ | ✗ |
+| FlashAttention | 61.4 | ✗ |
+| Block-sparse FlashAttention | 56.0 | 63.1 |
+
+**Path-X và Path-256.** Các benchmark Path-X và Path-256 là những nhiệm vụ thách thức từ benchmark long-range arena được thiết kế để kiểm tra ngữ cảnh dài. Nhiệm vụ là phân loại xem hai điểm trong một hình ảnh đen trắng 128×128 (hoặc 256×256) có đường nối chúng hay không, và các hình ảnh được đưa vào transformer từng pixel một. Trong công trình trước, tất cả các mô hình transformer đã hết bộ nhớ, hoặc chỉ đạt được hiệu suất ngẫu nhiên [80]. Đã có sự tìm kiếm các kiến trúc thay thế có thể mô hình hóa ngữ cảnh dài như vậy [37]. Chúng tôi trình bày ở đây kết quả đầu tiên của các mô hình Transformer có thể giải quyết Path-X và Path-256 (Bảng 6). Chúng tôi pretrain một transformer trên Path-64, và sau đó chuyển đến Path-X bằng cách nội suy không gian các positional embeddings. FlashAttention đạt được độ chính xác 61.4% trên Path-X. Ngoài ra, block-sparse FlashAttention cho phép Transformers mở rộng đến độ dài chuỗi 64K, đạt được độ chính xác 63.1% trên Path-256.
+
+### 4.3 Đánh giá Attention
+
+Chúng tôi thay đổi độ dài chuỗi và đo runtime và việc sử dụng bộ nhớ của FlashAttention và block-sparse FlashAttention so với các baseline attention khác nhau trên một GPU A100 với 40 GB HBM, với dropout và padding mask. Chúng tôi so sánh với các implementation tham chiếu cho exact attention, approximate attention, và sparse attention. Chúng tôi báo cáo một tập con các baseline trong phần chính; Phụ lục E chứa nhiều baseline hơn và chi tiết đầy đủ.
+
+**Runtime.** Hình 3 (trái) báo cáo runtime tính bằng milliseconds của forward + backward pass của FlashAttention và block-sparse FlashAttention so với các baseline trong exact, approximate, và sparse attention (số chính xác trong Phụ lục E). Runtime tăng bậc hai với độ dài chuỗi, nhưng FlashAttention chạy nhanh hơn đáng kể so với các baseline exact attention, lên đến 3× nhanh hơn implementation PyTorch. Runtime của nhiều cơ chế approximate/sparse attention tăng tuyến tính với độ dài chuỗi, nhưng FlashAttention vẫn chạy nhanh hơn approximate và sparse attention cho các chuỗi ngắn do ít truy cập bộ nhớ hơn. Runtime của approximate attention bắt đầu vượt qua FlashAttention ở các chuỗi giữa 512 và 1024. Mặt khác, block-sparse FlashAttention nhanh hơn tất cả các implementation của exact, sparse, và approximate attention mà chúng tôi biết, trên tất cả độ dài chuỗi.
+
+**Memory Footprint.** Hình 3 (phải) cho thấy memory footprint của FlashAttention và block-sparse FlashAttention so với các baseline exact, approximate, và sparse attention khác nhau. FlashAttention và block-sparse FlashAttention có cùng memory footprint, tăng tuyến tính với độ dài chuỗi. FlashAttention hiệu quả bộ nhớ hơn lên đến 20× so với các baseline exact attention, và hiệu quả bộ nhớ hơn các baseline approximate attention. Tất cả các thuật toán khác ngoại trừ Linformer hết bộ nhớ trên GPU A100 trước 64K, và FlashAttention vẫn hiệu quả hơn 2× so với Linformer.
+
+## 5 Hạn chế và Hướng Tương lai
+
+Chúng tôi thảo luận các hạn chế của phương pháp và hướng tương lai. Công trình liên quan được đưa ra trong Phụ lục A.
+
+**Biên dịch sang CUDA.** Phương pháp hiện tại của chúng tôi để xây dựng các implementation attention có nhận thức IO yêu cầu viết một CUDA kernel mới cho mỗi implementation attention mới. Điều này yêu cầu viết thuật toán attention trong một ngôn ngữ cấp thấp hơn đáng kể so với PyTorch, và yêu cầu nỗ lực kỹ thuật đáng kể. Các implementation cũng có thể không chuyển đổi được giữa các kiến trúc GPU. Những hạn chế này gợi ý nhu cầu về một phương pháp hỗ trợ viết các thuật toán attention trong ngôn ngữ cấp cao (ví dụ, PyTorch), và biên dịch thành các implementation có nhận thức IO trong CUDA—tương tự như các nỗ lực như Halide trong xử lý hình ảnh [70].
+
+**Deep Learning có Nhận thức IO.** Chúng tôi tin rằng phương pháp có nhận thức IO có thể mở rộng ra ngoài attention. Attention là tính toán tốn bộ nhớ nhất trong Transformers, nhưng mỗi layer trong mạng sâu đều chạm vào GPU HBM. Chúng tôi hy vọng công trình của chúng tôi truyền cảm hứng cho các implementation có nhận thức IO của các module bổ sung. Chúng tôi thảo luận những mở rộng tiềm năng này trong Phụ lục D.
+
+**Phương pháp có Nhận thức IO Multi-GPU.** Implementation có nhận thức IO của attention của chúng tôi là tối ưu trong các hằng số để tính toán attention trên một GPU duy nhất. Tuy nhiên, tính toán attention có thể được song song hóa trên nhiều GPU [72]. Sử dụng nhiều GPU thêm một layer bổ sung vào phân tích IO—tính đến việc truyền dữ liệu giữa các GPU. Chúng tôi hy vọng công trình của chúng tôi truyền cảm hứng cho công trình tương lai theo hướng này.
+
+## Lời cảm ơn
+
+Implementation của chúng tôi sử dụng mã FMHA của Apex (https://github.com/NVIDIA/apex/tree/master/apex/contrib/csrc/fmha) làm điểm khởi đầu. Chúng tôi cảm ơn Young-Jun Ko vì lời giải thích sâu sắc về implementation FMHA của anh ấy và vì những câu trả lời chu đáo cho các câu hỏi của chúng tôi về CUDA. Chúng tôi cảm ơn Sabri Eyuboglu, Megan Leszczynski, Laurel Orr, Yuhuai Wu, Beidi Chen, và Xun Huang vì phản hồi mang tính xây dựng và đề xuất của họ về các bản thảo đầu của bài báo. Chúng tôi cảm ơn Markus Rabe và Charles Staats vì thảo luận hữu ích về thuật toán attention của họ.
+
+Chúng tôi biết ơn sự hỗ trợ của NIH dưới số U54EB020405 (Mobilize), NSF dưới số CCF1763315 (Beyond Sparsity), CCF1563078 (Volume to Velocity), và 1937301 (RTML); ARL dưới số W911NF-21-2-0251 (Interactive Human-AI Teaming); ONR dưới số N000141712266 (Unifying Weak Supervision); ONR N00014-20-1-2480: Understanding and Applying Non-Euclidean Geometry in Machine Learning; N000142012275 (NEPTUNE); NXP, Xilinx, LETI-CEA, Intel, IBM, Microsoft, NEC, Toshiba, TSMC, ARM, Hitachi, BASF, Accenture, Ericsson, Qualcomm, Analog Devices, Google Cloud, Salesforce, Total, chương trình HAI-GCP & HAI-Azure Cloud Credits for Research, Stanford Data Science Initiative (SDSI), Department of Defense (DoD) thông qua National Defense Science and Engineering Graduate Fellowship (NDSEG) Program, và các thành viên của dự án Stanford DAWN: Facebook, Google, và VMWare. Chính phủ Hoa Kỳ được ủy quyền tái tạo và phân phối các bản in lại cho mục đích Chính phủ bất chấp bất kỳ ký hiệu bản quyền nào trên đó. Bất kỳ ý kiến, phát hiện, và kết luận hoặc khuyến nghị nào được thể hiện trong tài liệu này là của các tác giả và không nhất thiết phản ánh quan điểm, chính sách, hoặc sự chứng thực, được thể hiện rõ ràng hay ngụ ý, của NIH, ONR, hoặc Chính phủ Hoa Kỳ. Nghiên cứu của Atri Rudra được hỗ trợ bởi tài trợ NSF CCF-1763481.

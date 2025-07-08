@@ -1,0 +1,617 @@
+# 2409.04431.pdf
+# Chuyển đổi từ PDF sang TXT
+# Đường dẫn nguồn: /home/admin88/arxiv-downloader/attention/2409.04431.pdf
+# Kích thước tệp: 6617975 bytes
+
+===============================================
+NỘI DUNG TỆP PDF
+===============================================
+
+
+--- TRANG 1 ---
+Lý thuyết, Phân tích và Thực hành Tốt nhất cho
+Sigmoid Self-Attention
+Jason Ramapuram∗Federico Danieli∗Eeshan Dhekane∗Floris Weers∗
+Dan Busbridge∗Pierre Ablin∗Tatiana Likhomanenko∗
+Jagrit Digani Zijin Gu Amitis Shidani Russ Webb
+Apple
+{jramapuram, f_danieli, eeshan, floris_weers, dbusbridge,
+p_ablin, antares, digani, zgu26, amitis_shidani, rwebb}@apple.com
+Tóm tắt
+Attention là một phần quan trọng của kiến trúc transformer. Đây là ánh xạ sequence-to-sequence biến đổi mỗi phần tử chuỗi thành tổng có trọng số của các giá trị. Các trọng số thường được tính như softmax của tích vô hướng giữa keys và queries. Các nghiên cứu gần đây đã khám phá các phương án thay thế cho softmax attention trong transformers, như kích hoạt ReLU và sigmoid. Trong nghiên cứu này, chúng tôi xem xét lại sigmoid attention và tiến hành phân tích lý thuyết và thực nghiệm sâu sắc. Về mặt lý thuyết, chúng tôi chứng minh rằng transformers với sigmoid attention là bộ xấp xỉ hàm vạn năng và có lợi từ tính đều đặn được cải thiện so với softmax attention. Thông qua phân tích thực nghiệm chi tiết, chúng tôi xác định việc ổn định các norm attention ban đầu lớn trong giai đoạn đầu huấn luyện là yếu tố quan trọng để huấn luyện thành công các mô hình với sigmoid attention, vượt trội hơn các nỗ lực trước đây. Chúng tôi cũng giới thiệu FLASH-SIGMOID, một triển khai hiệu quả về bộ nhớ và nhận thức phần cứng của sigmoid attention mang lại tăng tốc kernel suy luận 17% so với FLASH ATTENTION 2 trên GPU H100. Các thí nghiệm trên ngôn ngữ, thị giác và giọng nói cho thấy sigmoid attention được chuẩn hóa đúng cách có hiệu suất tương đương với softmax attention mạnh mẽ trên nhiều lĩnh vực và quy mô khác nhau, điều mà các nỗ lực trước đây về sigmoid attention không thể đạt được hoàn toàn. Nghiên cứu của chúng tôi thống nhất các nghiên cứu trước và thiết lập thực hành tốt nhất cho sigmoid attention như một sự thay thế trực tiếp cho softmax trong transformers.
+
+1 Giới thiệu
+Thành công của machine learning hiện đại có thể được quy cho phần lớn cho cơ chế attention (Bahdanau et al., 2015; Vaswani et al., 2017). Attention sử dụng ánh xạ sequence-to-sequence (seq-to-seq) để xây dựng các biểu diễn token nhận thức ngữ cảnh. Theo cách cổ điển, attention dựa vào hàm softmax (SoftmaxAttn) để khôi phục các biểu diễn token như tổ hợp lồi phụ thuộc dữ liệu của các giá trị. Mặc dù được sử dụng rộng rãi và hiệu quả, softmax trong SoftmaxAttn không phải không có hạn chế. Ví dụ, hàm softmax đôi khi có thể dẫn đến tập trung attention chỉ vào một vài đặc trưng (Yang et al., 2018; Ganea et al., 2019), có thể bỏ qua các khía cạnh thông tin khác của
+
+∗Đóng góp chính. Để biết chi tiết về đóng góp của các tác giả, xem Phụ lục H.
+²Mã nguồn có sẵn tại https://github.com/apple/ml-sigmoid-attention .
+Preprint. Under review.arXiv:2409.04431v2 [cs.LG] 22 Jan 2025
+
+--- TRANG 2 ---
+dữ liệu đầu vào. Hơn nữa, việc áp dụng SoftmaxAttn yêu cầu thực hiện phép rút gọn theo hàng dọc theo chiều dài của chuỗi đầu vào, điều này trong trường hợp các kernel attention hiệu quả (Dao et al., 2022; Dao, 2023), làm chậm tính toán. Trong nghiên cứu này, chúng tôi nới lỏng ràng buộc này bằng cách thay thế phép toán softmax theo hàng bằng phi tuyến sigmoid theo phần tử. Chúng tôi nhấn mạnh rằng vấn đề trung tâm với sigmoid attention ngây thơ (SigmoidAttn) là các norm attention ban đầu lớn và đề xuất giải pháp để giảm thiểu nó. Các đóng góp của chúng tôi như sau:
+
+(1) Chúng tôi chứng minh SigmoidAttn là bộ xấp xỉ hàm vạn năng trên các tác vụ seq-to-seq (Mục 3.1).
+(2) Chúng tôi phân tích tính đều đặn của SigmoidAttn và cung cấp cận trên Jacobian trường hợp xấu nhất (Mục 3.2).
+(3) Chúng tôi mở rộng FLASH ATTENTION 2 (Dao et al., 2022; Dao, 2023) với kernel sigmoid, giảm thời gian wall-clock kernel suy luận lên đến 17% và suy luận thực tế lên đến 8% (Mục 4).
+(4) Chúng tôi cho thấy SigmoidAttn tương đương với SoftmaxAttn trong các tác vụ và lĩnh vực khác nhau (Mục 5).
+
+2 Sigmoid Attention
+Cho X ∈ Rn×d là chuỗi đầu vào gồm n vector, mỗi vector có chiều d. Chúng ta định nghĩa ba ma trận trọng số có thể học Wq ∈ Rd×dqk, Wk ∈ Rd×dqk, và Wv ∈ Rd×dv, được sử dụng để tính queries Q ∈ Rn×dqk, keys K ∈ Rn×dqk, và values V ∈ Rn×dv như sau:
+
+Q = XWq, K = XWk, và V = XWv. (1)
+
+Self-attention (Bahdanau et al., 2015; Vaswani et al., 2017) có thể được viết gọn như
+
+SoftmaxAttn(X) = Softmax(QKT/√dqk)V, (2)
+
+trong đó hàm Softmax chuẩn hóa mỗi hàng của ma trận đầu vào. Chúng ta thay thế Softmax bằng
+
+SigmoidAttn(X) = σ(QKT/√dqk)V,
+
+với σ : u ↦ sigmoid(u + b) := (1 + e^(-(u+b)))^(-1). (3)
+
+Ở đây, σ được áp dụng theo phần tử cho ma trận đầu vào trong (3). Hàm kích hoạt σ có siêu tham số b ∈ R. Trong Phụ lục E, chúng tôi thảo luận cách trực quan để chọn bias term tối ưu theo thứ tự, dẫn đến b = -log(n). Lựa chọn b này cho phép chúng ta hiểu được SigmoidAttn cho bất kỳ chiều dài chuỗi nào. Thật vậy, cho (y₁, ..., yn) = SigmoidAttn(X) là chuỗi đầu ra, chúng ta có
+
+yi = Σⱼ₌₁ⁿ [exp(⟨Wqxi, Wkxj⟩)/(exp(⟨Wqxi, Wkxj⟩) + n)] Wvxj --n→+∞-→ ∫ exp(⟨Wqxi, Wkx⟩)Wvx dμ(x), (4)
+
+trong đó μ = (1/n)Σⱼ₌₁ⁿ δxⱼ là độ đo thực nghiệm tương ứng với X. Đáng chú ý, (4) vẫn có ý nghĩa trong giới hạn chiều dài vô hạn, nơi độ đo μ không phải là tổng của các Dirac. Wortsman et al. (2023a) không sử dụng bias và đề xuất chuẩn hóa n⁻¹ cho các kích hoạt attention khác nhau, như sigmoid và ReLU, nhưng để nguyên lý do như một câu hỏi mở. Bias biến thiên của chúng tôi có hiệu ứng tương tự trong giới hạn n lớn, và chúng tôi cho rằng việc khôi phục giới hạn đầu ra hữu hạn khi n tăng là lý do tại sao nó hoạt động trong thực tế.
+
+Phiên bản multi-head của (3) được thu được bằng cách kết hợp đầu ra của nhiều SigmoidAttn, như sau:
+
+[SigmoidAttn₁(X), ..., SigmoidAttnh(X)]Wo, (5)
+
+cho ma trận trọng số đầu ra có thể học Wo ∈ Rhdv×d, trong đó h biểu thị số head.
+
+3 Tính chất Lý thuyết của Sigmoid Attention
+Chúng tôi phân tích SigmoidAttn với hai mục tiêu: (1) chỉ ra rằng kiến trúc transformer vẫn là bộ xấp xỉ hàm vạn năng khi SigmoidAttn thay thế SoftmaxAttn, và (2) khôi phục thước đo tính đều đặn của SigmoidAttn bằng cách tính hằng số Lipschitz của nó.
+
+--- TRANG 3 ---
+3.1 Transformers với Sigmoid Attention có phải là Bộ xấp xỉ Vạn năng không?
+
+Yun et al. (2020) chứng minh rằng transformers cổ điển có thể xấp xỉ các hàm sequence-to-sequence liên tục với độ chính xác tùy ý, một tính chất được biết đến như Tính chất Xấp xỉ Vạn năng (UAP). UAP rất được mong muốn vì nó cung cấp bằng chứng về khả năng tổng quát hóa và biểu diễn của kiến trúc. Vì SigmoidAttn sửa đổi kiến trúc transformer, việc đảm bảo lý thuyết rằng sự sửa đổi này không ảnh hưởng đến khả năng biểu diễn và UAP được giữ nguyên là rất quan trọng. Chúng tôi cung cấp đảm bảo này với định lý sau.
+
+Định lý 3.1 (UAP cho SigmoidAttn). Chúng ta ký hiệu với T^(h,d_v,r)_σ lớp mạng transformer có thể thu được bằng cách kết hợp số lượng tùy ý các lớp SigmoidAttn (mỗi lớp có h head với chiều d_v) theo sau bởi các lớp FFN có chiều ẩn r. Với bất kỳ hàm liên tục, bất biến hoán vị f: Ω ⊂ R^(n×d) → R^(n×d) với hỗ trợ compact Ω, và với bất kỳ lỗi nhỏ tùy ý ε, tồn tại một mạng transformer g ∈ T^(4,1,4)_σ sao cho
+
+∫_Ω ||f(X) - g(X)||^p_p dX ≤ ε, với 1 ≤ p < ∞. (6)
+
+Định lý 3.1 là bản sao chính xác của (Yun et al., 2020, Thm. 2), chỉ ra UAP cho transformers cổ điển. Chứng minh của chúng tôi phần lớn theo cùng con đường, với outline của chứng minh gốc được cung cấp trong Phụ lục C. Ở đây, chúng tôi trình bày tổng quan về các điều chỉnh chính cần thiết để chứng minh Định lý 3.1 cho SigmoidAttn, với chi tiết thêm trong Phụ lục C.1 và C.2.
+
+Các lớp Sigmoid Attention có thể triển khai ánh xạ ngữ cảnh: Một bước quan trọng trong việc chứng minh Định lý 3.1 là chỉ ra rằng, ngay cả với SigmoidAttn, một chuỗi các khối transformer có thể triển khai Ánh xạ Ngữ cảnh (Yun et al., 2020, Def. 3.1). Ánh xạ ngữ cảnh mô tả một hàm ánh xạ mỗi phần tử chuỗi đầu vào thành đầu ra phụ thuộc duy nhất vào toàn bộ chuỗi. Tính chất này cho phép transformer nắm bắt và lưu trữ ngữ cảnh toàn cục trong mỗi token, ngay cả khi mỗi lớp chỉ thực hiện so sánh theo cặp. Các lớp tiếp theo sau đó có thể sử dụng thông tin toàn cục này để ánh xạ các token riêng lẻ thành đầu ra chính xác, cuối cùng xấp xỉ bất kỳ hàm sequence-to-sequence tùy ý nào.
+
+Trong Yun et al. (2020), ánh xạ ngữ cảnh được lắp ráp bằng cách sửa đổi các khối transformer riêng lẻ: mỗi khối được điều chỉnh để phản ứng với một token đầu vào cụ thể. Bằng cách xếp chồng một chuỗi các khối này, transformer có thể được biến thành bộ tích lũy, ánh xạ một chuỗi token đầu vào cho trước thành chỉ số toàn cục duy nhất. Kết quả này được đạt được thông qua một lớp selective shift (Yun et al., 2020, App. B.5):
+
+Ψ(X; b, b')_(i,1) := {max_k X_(k,1) - min_k X_(k,1) nếu b < X_(i,1) < b'
+                      0 nếu ngược lại}, (7)
+
+và có thể được xấp xỉ bằng attention cổ điển. Mặc dù SigmoidAttn không thể xấp xỉ trực tiếp (7), định nghĩa accumulator của chúng tôi dựa vào một phép toán selective shift tương đương:
+
+Ψ_σ(X; b, b')_(i,1) := {∑_(k:X_(k,1)>b') X_(k,1) nếu b < X_(i,1) < b'
+                        0 nếu ngược lại}, (8)
+
+có thể được xấp xỉ bởi SigmoidAttn (được mô tả trong Phụ lục C.1). Trong Phụ lục C.2.4, chúng tôi chỉ ra rằng (8) chia sẻ các tính chất tương tự với (7), cho phép chúng tôi sử dụng khung chứng minh gốc trong Yun et al. (2020) và chứng minh rằng UAP cũng đúng trong trường hợp của chúng tôi.
+
+Chứng minh của chúng tôi phần lớn tương đương với của Yun et al. (2020), với hai điểm khác biệt liên quan: để xấp xỉ (8), chúng tôi yêu cầu SigmoidAttn với ít nhất bốn head và shifts được bao gồm trong cả định nghĩa query và key. Ngược lại, SoftmaxAttn yêu cầu ít nhất hai head để xấp xỉ (7), với shifts chỉ trong định nghĩa query. Tuy nhiên, đây chủ yếu là yêu cầu lý thuyết cho chứng minh và không ảnh hưởng đến hiệu suất. Đáng chú ý, tổng số tham số cần thiết bởi cả hai kiến trúc cho xấp xỉ tuân theo cùng quy mô chặt chẽ của Yun et al. (2020).
+
+3.2 Tính Đều đặn của Sigmoid Attention
+
+Như với bất kỳ lớp nào trong mạng neural, tính đều đặn của SigmoidAttn là quan trọng để nghiên cứu, vì nó cung cấp cái nhìn sâu sắc về tính bền vững của mạng tương ứng và tính dễ dàng tối ưu hóa nó. Cách tiêu chuẩn nhất để định lượng tính đều đặn của hàm lớp φ là tính hằng số Lipschitz của nó trên tập X, tức là hằng số C > 0 sao cho với mọi X, Y ∈ X, ta có ||φ(X) - φ(Y)|| ≤ C||X - Y||,
+
+--- TRANG 4 ---
+trong đó || · || là chuẩn Frobenius tiêu chuẩn. Hằng số Lipschitz cục bộ là chuẩn phổ của Jacobian của φ tại X. Hai điều này có liên quan: hằng số Lipschitz của φ trên X là hằng số Lipschitz cục bộ lớn nhất cho tất cả X ∈ X. Chúng ta chuyển đến định lý đưa ra tính đều đặn của SigmoidAttn:
+
+Định lý 3.2. Định nghĩa A = {⟨Wqxi, Wkxj⟩ | i, j ∈ {1, ..., n}} ⊂ R tập hợp các trọng số attention, và các chuẩn kích hoạt có tỷ lệ σ∞ = n × sup{u∈A} |σ(u)| và σ'∞ = n × sup{u∈A} |σ'(u)|. Khi đó, Jacobian của SigmoidAttn tại X = (x₁, ..., xn) có chuẩn phổ tối đa:
+
+||Wv||₂ [σ∞ + 2σ'∞||W^T_q Wk||₂ (1/n ∑ᵢ₌₁ⁿ ||xi||²₂)]. (9)
+
+Chứng minh được tìm thấy trong Phụ lục D. Trong SigmoidAttn, nếu chúng ta giả định rằng các trọng số attention ⟨Wqxi, Wkxj⟩ đều bị chặn bởi hằng số μ - điều này đúng, ví dụ, nếu các kích hoạt bị chặn - chúng ta có σ∞ ≤ exp(μ) và σ'∞ ≤ exp(μ) nhờ vào lựa chọn b = -log(n). Cận trong Định lý 3.2 chỉ phụ thuộc vào chuẩn bình phương trung bình của chuỗi đầu vào xi, trong khi các kết quả cổ điển cho nghiên cứu attention đều dựa vào giá trị lớn nhất của ||xi||²₂ (Kim et al., 2021; Castin et al., 2023). Đây là hệ quả khác của tính đơn giản của sigmoid attention và do việc loại bỏ hằng số chuẩn hóa trong SoftmaxAttn. Kết quả của chúng tôi ngụ ý rằng nếu tất cả xi nằm trong quả cầu bán kính R thì hằng số Lipschitz của SigmoidAttn tăng nhiều nhất như R², nhưng nó mạnh hơn vì chúng ta có thể áp dụng điều này cho các phân phối xi không bị chặn; chỉ quan trọng là mômen bậc hai bị chặn. Kết quả này tương phản mạnh với các cận thu được cho SoftmaxAttn: Castin et al. (2023, Thm. 3.4.) chỉ ra rằng tồn tại chuỗi X = (x₁, ..., xn) với ||xi||₂ ≤ R cho tất cả i sao cho chuẩn phổ của Jacobian của Attn tại X ít nhất là cR²exp(cR²) cho hằng số c > 0 nào đó. Mặt khác, cận của chúng tôi tỷ lệ theo R²: điều này có nghĩa là hằng số Lipschitz cục bộ của SigmoidAttn thấp hơn nhiều so với hằng số Lipschitz cục bộ trường hợp xấu nhất của SoftmaxAttn. Lưu ý rằng kết quả này không thông báo cho chúng ta về hằng số Lipschitz trường hợp trung bình thực tế, có thể thấp hơn nhiều cho cả Softmax và Sigmoid attention. Các cận trên của hằng số Lipschitz của SigmoidAttn đặc biệt thú vị để nghiên cứu động lực của attention, như được thực hiện, ví dụ, trong (Geshkovski et al., 2024, 2023).
+
+3.3 Độ Phức tạp Tính toán của Sigmoid và Softmax.
+
+Bảng 1: Phép toán floating point forward trên mỗi token trên mỗi head attention. nctx và dhead lần lượt là chiều dài ngữ cảnh và chiều head. Δ đo sự khác biệt tính toán giữa sigmoid và softmax. c tính đến causal (c = (nctx + 1)/2nctx ∼ 1/2), hoặc attention tiêu chuẩn (c = 1). Giá trị điển hình từ kết quả LLM 1B là nctx = 2048, dhead = 64. Sigmoid và softmax chia sẻ cùng số phép toán floating point (softmax: trừ max (2), mũ, tổng, chia; Sigmoid: cộng bias, đảo dấu, mũ, cộng, chia). Các khác biệt còn lại do chi tiết triển khai, và là thứ yếu (~1%) so với các phép toán attention khác như tính attention logits L (hiển thị bên dưới). Phân tích này loại trừ cải thiện nhận thức phần cứng (Mục 4).
+
+L = QK^T | Softmax(L) | σ(L + b) | Δ
+Expression | 2cnctxdhead | 5cnctx | 5cnctx | 0
+
+4 FLASH SIGMOID: Triển khai Nhận thức Phần cứng
+
+Tốc độ bộ nhớ đã không theo kịp những cải tiến gần đây về tốc độ tính toán (Choquette, 2023; Jouppi et al., 2017; Hannun et al., 2023). Do đó, các tính toán attention trên kiến trúc hiện đại đã bị giới hạn IO bởi truy cập bộ nhớ (Ivanov et al., 2021). FLASH ATTENTION (Dao et al., 2022) và FLASH ATTENTION 2 (Dao, 2023) giải quyết những thiếu sót này bằng cách tối ưu hóa việc sử dụng phân cấp bộ nhớ GPU để tăng tốc tính toán attention. Được thúc đẩy bởi tăng tốc được cung cấp bởi các phương pháp này, chúng tôi phát triển FLASH SIGMOID, một triển khai nhận thức phần cứng của SigmoidAttn. Giống như các nghiên cứu trước, FLASH SIGMOID sử dụng ba ý tưởng cốt lõi:
+
+Tiling: Phương pháp Chia để Trị cho Attention: Tương tự như FLASH ATTENTION và FLASH ATTENTION 2, FLASH SIGMOID xử lý các phần đầu vào song song để tính đầu ra attention theo khối, kết hợp hiệu quả các kết quả từng phần để tạo ra đầu ra attention cuối cùng.
+
+Kernel Fusion: Giống như FLASH ATTENTION và FLASH ATTENTION 2, FLASH SIGMOID triển khai các bước tính toán của cả lượt đi và lượt về của SigmoidAttn như các kernel GPU đơn lẻ,
+
+--- TRANG 5 ---
+0 10000 20000 30000 40000 50000 60000 70000
+Tokens 
+02505007501000125015001750Kernel GPU Time (ms) 
+FlashAttention2 (Full)
+FlashSigmoid (Full)
+FlashAttention2 (Causal)
+FlashSigmoid (Causal)(a) Kernel inference mode trên H100.
+
+0 10000 20000 30000 40000 50000 60000 70000
+Tokens 
+0100020003000400050006000Kernel GPU Time (ms) 
+FlashAttention2 (Full)
+FlashSigmoid (Full)
+FlashAttention2 (Causal)
+FlashSigmoid (Causal) (b) Kernel training mode trên H100.
+
+Hình 1: Tăng tốc kernel trung bình của FLASH SIGMOID so với FLASH ATTENTION 2 cho chiều dài chuỗi 64–78k. Inference nhanh hơn 17.39% cho self-attention và 18.76% cho causal attention. Training nhanh hơn 6.53% cho self-attention và 9.46% cho causal attention.
+
+giảm thiểu truy cập bộ nhớ và cải thiện hiệu quả bộ nhớ bằng cách tránh vật chất hóa các kích hoạt trung gian trên High-Bandwidth Memory (HBM).
+
+Activation Recomputation: Lượt về của sigmoid attention yêu cầu ma trận kích hoạt sigmoid, mà nếu được vật chất hóa trên GPU HBM, dẫn đến triển khai chậm hơn và kém hiệu quả bộ nhớ. FLASH SIGMOID giải quyết điều này bằng cách chỉ giữ lại các tensor query, key và value để tính toán lại ma trận kích hoạt sigmoid trong lượt về. Mặc dù tăng FLOP, phương pháp này chứng minh nhanh hơn về thời gian wall-clock cũng như hiệu quả bộ nhớ hơn so với phương pháp thay thế là vật chất hóa và giữ lại ma trận attention.
+
+Các thuật toán lượt đi và lượt về của FLASH SIGMOID có thể được tìm thấy trong Phụ lục F.1. Ở đây, chúng tôi nêu bật những khác biệt chính giữa FLASH SIGMOID và FLASH ATTENTION/FLASH ATTENTION 2. Bản chất pointwise của SigmoidAttn dẫn đến triển khai nhanh hơn và hiệu quả bộ nhớ hơn bằng cách loại bỏ nhu cầu tính toán chuẩn hóa softmax và vật chất hóa nó lên HBM. Việc giảm số lần gọi kernel cũng làm tăng tốc FLASH SIGMOID. Hơn nữa, FLASH SIGMOID không yêu cầu tích lũy và theo dõi các biến trung gian (tổng hàng và maximum của các khối) trong lượt đi và lượt về, điều này tiết kiệm chi phí tính toán và giảm áp lực register. Chúng tôi sử dụng sigmoid(x) = 0.5·(1 + tanh(0.5·x)) để tối ưu hóa tính toán sigmoid trên GPU. Tăng tốc trong FLASH SIGMOID so với FLASH ATTENTION phát sinh từ việc tối ưu hóa bottleneck phần cứng; về mặt lý thuyết, SigmoidAttn chậm hơn SoftmaxAttn (Mục 3.3).
+
+Để đo hiệu suất cải thiện của FLASH SIGMOID, chúng tôi so sánh thời gian của các kernel trong lượt đi và lượt về với của FLASH ATTENTION 2. Chi tiết về benchmarking này trên GPU H100 và A100 có thể được tìm thấy trong Phụ lục F.2. Đo thời gian tính toán GPU, chúng tôi quan sát tăng tốc 17.39% trong inference và tăng tốc 6.53% trong training cho attention trên dữ liệu được khởi tạo ngẫu nhiên trên GPU H100 (Hình 1). Trong thực tế, những cải thiện này có thể bị ảnh hưởng bởi các bottleneck khác, như di chuyển tensor giữa bộ nhớ CPU hoặc GPU, tính toán trong các lớp khác, và overhead giao tiếp trong training và inference phân tán. Tuy nhiên, chúng tôi chứng minh rằng FLASH SIGMOID tăng tốc training khoảng 4% và inference khoảng 8% trong thiết lập end-to-end thực tế. Chi tiết về cải thiện thời gian wall-clock với FLASH SIGMOID được trình bày trong Phụ lục F.3. Chúng tôi cũng lưu ý rằng quy trình machine learning thực tế được thống trị bởi inference hơn là training.
+
+5 Thí nghiệm
+
+Để xác thực thực nghiệm SigmoidAttn, chúng tôi đánh giá trên nhiều lĩnh vực: phân loại ảnh có giám sát sử dụng vision transformers (Dosovitskiy et al., 2021), học biểu diễn ảnh tự giám sát với SimCLR (Chen et al., 2020; Zhai et al., 2023a), Bootstrap Your Own Latent (BYOL) (Grill et al., 2020; Busbridge et al., 2023) và Masked AutoEncoders (MAE) (He et al., 2022) cũng như nhận dạng giọng nói tự động (ASR) (Synnaeve et al., 2020; Gulati et al., 2020b) và mô hình hóa ngôn ngữ auto-regressive (LM) (Brown et al., 2020). Chúng tôi cũng xác thực khả năng tổng quát hóa chiều dài chuỗi trên TED-LIUM v3 (Hernandez et al., 2018) cho ASR và trong thí nghiệm tổng hợp quy mô nhỏ
+
+--- TRANG 6 ---
+0 200 400 600
+Epoch-0.00.10.30.50.7Train LossBYOL ViT-B/16
+0 100 200 300
+Epoch0.82.84.86.88.8SimCLR ViT-B/16
+0 200 400
+Epoch0.40.50.60.80.9MAE ViT-L/16
+0 100 200 300
+Epoch2.33.54.75.97.1Train LossSupervised ViT-B/16
+100000 200000 300000
+Steps23.032.241.550.860.0255M ASR Transformer
+0 100000 200000 300000
+Steps1.61.92.22.52.8
+1B
+7B H-Norm1B & 7B LLM
+Sigmoid
+SoftmaxHình 2: Train losses so sánh SigmoidAttn với SoftmaxAttn.
+
+trong Phụ lục G.5.4. Trên tất cả các lĩnh vực và thuật toán này, chúng tôi chứng minh rằng SigmoidAttn có hiệu suất tương đương với SoftmaxAttn (Hình 2 và 22), đồng thời cung cấp tăng tốc training và inference như được nêu bật trong Mục 4. Thực nghiệm, chúng tôi đưa ra những quan sát sau:
+
+(1) SigmoidAttn hiệu quả cho các tác vụ thị giác mà không cần bias (trừ MAE), nhưng dựa vào LayerScale (Touvron et al., 2021) để có hiệu suất tương đương với SoftmaxAttn baseline (Hình 10-a) theo cách không có siêu tham số. Tất cả kết quả được trình bày cho SoftmaxAttn cũng công bằng thêm LayerScale trừ khi được chỉ định.
+
+(2) LM và ASR nhạy cảm với norm ban đầu ||σ(QKT/√dqk)V||. Điều chế cần thiết thông qua (a) relative positional embeddings như ALiBi (Press et al., 2022), làm giảm norm attention ban đầu bằng cách dịch chuyển khối lượng logit gần zero dưới SigmoidAttn, (b) khởi tạo thích hợp của b để đạt được hiệu ứng tương tự – cho phép sử dụng bất kỳ positional embedding nào, (c) sử dụng hybrid-norm (Phụ lục G.3.3, G.4 và G.6) với chi phí một lớp chuẩn hóa thêm.
+
+5.1 Ablations
+
+Chúng tôi bắt đầu với ablations để phân tích lợi ích của từng thành phần được giới thiệu. Để có cái nhìn trực quan về SigmoidAttn, chúng tôi đã phát triển một framework training auto-regressive (AR) LM thân thiện với nghiên cứu để đo tất cả các thành phần của attention và xác thực hiệu ứng của LayerScale, LayerNorm được áp dụng cho Q và K (QK norm), các kỹ thuật positional embedding khác nhau, và giá trị khởi tạo cho b.
+
+Giảm thiểu Norm Attention Lớn Chúng tôi huấn luyện một khối transformer AR đơn lớp (E=3072, D_FF=12288) trên phần realnews của C4 (Raffel et al., 2020). Chúng tôi huấn luyện trong 2¹⁶ bước sử dụng batch size 6 và chiều dài chuỗi tối đa 4096 sử dụng lịch học tập (LR) cosine một chu kỳ mà không có weight decay. SigmoidAttn ban đầu kém hiệu quả hơn SoftmaxAttn khi sử dụng absolute sinusoidal (SinCos) (Hình 3) hoặc relative (Hình 4) positional embeddings (PE), mà chúng tôi quy cho các norm attention Frobenius ban đầu cao, ||σ(QKT/√d)V||. Sự phát triển tương ứng của phân phối attention và độ thưa thớt có thể được xem trong Phụ lục Hình 32 và Hình 33 về một tác vụ tổng hợp. Để giải quyết những norm attention lớn hơn này, chúng tôi đề xuất: (a) sử dụng ALiBi (Press et al., 2022) có bias tương đối di chuyển khối lượng logit attention ban đầu đến vùng zero dưới kích hoạt sigmoid, tạo ra
+
+Hình 3: SigmoidAttn với SinCos.
+Hình 4: SigmoidAttn với RoPE.
+Hình 5: SigmoidAttn với ALiBi.
+Hình 6: SigmoidAttn với RoPE, b=-10.
+
+--- TRANG 7 ---
+negative log-likelihoods tương đương (Hình 5); hoặc (b) đặt bias logit attention b thành offset âm tỷ lệ với chiều dài chuỗi, b ∝ -ln n (xem Phụ lục G.1.2 cho ablation về b). Điều này cho phép sử dụng các kỹ thuật PE khác như RoPE (Su et al., 2024) (Hình 6).
+
+Hình 7: Phân tích tính đều đặn so sánh SigmoidAttn vs. SoftmaxAttn (10× thử nghiệm trên mỗi n). Cận lý thuyết SoftmaxAttn nằm ngoài tỷ lệ và do đó bị bỏ qua.
+
+Phân tích Thực nghiệm về Tính Đều đặn Attention Để xác thực phân tích lý thuyết của chúng tôi (Mục 3.2), chúng tôi đo các norm Jacobian của SigmoidAttn và SoftmaxAttn trên các chiều dài chuỗi (Hình 7). Sử dụng autograd, chúng tôi tính các norm Jacobian chính xác cho cả hai cơ chế, có và không có HybridNorm (Phụ lục G.3.3 và G.6), so sánh chúng với các cận lý thuyết (cận SoftmaxAttn bị bỏ qua vì vượt quá tỷ lệ). Cả hai biến thể đều cho thấy norm thực nghiệm (đường liền) thấp hơn nhiều so với cận lý thuyết của chúng (đường đứt nét). Với khởi tạo bias đề xuất của chúng tôi (b = -ln(n)), SigmoidAttn đạt được norm thấp hơn SoftmaxAttn trong cả hai thiết lập, gợi ý tính đều đặn được cải thiện. Điều này phù hợp với hiệu suất tác vụ mạnh mẽ của nó (Mục 5). Ngoài ra, HybridNorm (Hình 7, phải) làm giảm norm cho cả hai cơ chế so với baseline (trái), nêu bật vai trò của chuẩn hóa trong ổn định attention ở các chuỗi dài hơn.
+
+LayerScale Để xác thực nhu cầu về LayerScale, chúng tôi theo Wortsman et al. (2023b) để định lượng tác động đến tính ổn định. Tất cả các mô hình được huấn luyện với RoPE với b ∝ -ln n, sử dụng AdamW (Loshchilov & Hutter, 2017) trên phần realnews của C4 với (β₁, β₂) = (0.9, 0.95), ε = 10⁻⁸, wd = 0, batch size 24, chiều dài chuỗi token tối đa 512 từ T5 tokenizer (Raffel et al., 2020), lịch LR cosine 2¹⁴ bước bao gồm warmup tuyến tính 2¹⁰ bước. Các mô hình có nheads = κ, nlayers = 2×κ, dmodel = 64×κ và dfeed-forward = 256×κ cho giá trị tỷ lệ κ ∈ {1,2,4,8,16} dẫn đến các mô hình với {2.2, 4.9, 15.0, 67.0, 440.0}M tham số có thể huấn luyện không phải embedding. Theo Wortsman et al. (2023b), chúng tôi quét learning rates η ∈ {3×10⁻⁴, 1×10⁻³, 3×10⁻³, 1×10⁻², 3×10⁻², 1×10⁻¹, 3×10⁻¹}. Độ nhạy LR được định nghĩa là Eη∈[a,b][min(ℓ(A(η)), ℓ₀) - ℓ*] trong đó ℓ(A(η)) là loss đạt được bởi thuật toán học A với LR η, ℓ₀ là loss tại khởi tạo, và ℓ* là loss đạt được bởi LR tốt nhất. LayerScale được khởi tạo tại 10⁻⁴. Không như các tác vụ thị giác, nơi LayerScale cải thiện hiệu suất (Hình 10-a), trong LM, chúng tôi quan sát rằng SoftmaxAttn có lợi ích nhẹ từ LayerScale, trong khi hiệu suất của SigmoidAttn phần lớn không bị ảnh hưởng.
+
+--- TRANG 8 ---
+103
+102
+101
+Learning rate3.03.54.04.55.05.56.06.57.07.5Final loss
+use_layer_scale=False
+which_attn_act_name
+sigmoid
+softmaxNon-embed
+Params (M)
+2.2
+4.9
+15.0
+67.0
+440.0Non-embed
+Params (M)
+2.2
+4.9
+15.0
+67.0
+440.0
+103
+102
+101
+Learning rate
+use_layer_scale=True
+which_attn_act_name
+sigmoid
+softmaxNon-embed
+Params (M)
+2.2
+4.9
+15.0
+67.0
+440.0Non-embed
+Params (M)
+2.2
+4.9
+15.0
+67.0
+440.0
+107108
+Non-embed Params (M)101
+LR sensitivity
+which_attn_act_name
+sigmoid
+softmaxwhich_attn_act_name
+sigmoid
+softmax
+107108
+Non-embed Params (M)
+which_attn_act_name
+sigmoid
+softmaxwhich_attn_act_name
+sigmoid
+softmax
+Hình 8: Ablation độ nhạy LR LayerScale.
+
+103
+102
+101
+Learning rate3.03.54.04.55.05.56.06.57.07.5Final loss
+qk_norm=False
+which_attn_act_name
+sigmoid
+softmaxNon-embed
+Params (M)
+2.2
+4.9
+15.0
+67.0
+440.0Non-embed
+Params (M)
+2.2
+4.9
+15.0
+67.0
+440.0
+103
+102
+101
+Learning rate
+qk_norm=True
+which_attn_act_name
+sigmoid
+softmaxNon-embed
+Params (M)
+2.2
+4.9
+15.0
+67.0
+440.0Non-embed
+Params (M)
+2.2
+4.9
+15.0
+67.0
+440.0
+107108
+Non-embed Params (M)101
+100LR sensitivity
+which_attn_act_name
+sigmoid
+softmaxwhich_attn_act_name
+sigmoid
+softmax
+107108
+Non-embed Params (M)
+which_attn_act_name
+sigmoid
+softmaxwhich_attn_act_name
+sigmoid
+softmax Hình 9: Ablation độ nhạy LR QK norm.
+
+50 100 150 200 250 300
+Epoch
+(a)65707580Test Top-1%+LayerScale,+QKNorm
++LayerScale,-QKNorm
+-LayerScale,+QKNorm
+n−a,-LayerScale,+QKNorm
+n−a,-LayerScale,-QKNorm
+50 100 150 200 250 300
+Epoch
+(b)MHA Softmax
+MHA Sigmoid
+MQA Softmax
+MQA Sigmoid
+50 100 150 200 250 300
+Epoch
+(c)Softmax, +LayerScale,+QKNorm
+Sigmoid, +LayerScale,+QKNorm
+TanH, +LayerScale,+QKNorm
+ReLU, +LayerScale,+QKNorm
+GeLU, +LayerScale,+QKNorm
+ReLU2, +LayerScale, +QKNorm
+ReLU2, -LayerScale, -QKNorm
+Hình 10: Phân loại ImageNet1k ViT-B/16. (a) SigmoidAttn bền vững mà không có QK norm (+LayerScale, -QKNorm). Loại bỏ LayerScale giảm độ chính xác 1.0% (-LayerScale, +/-QKNorm). Chuẩn hóa n⁻ᵅ (Wortsman et al., 2023a) kém hiệu quả mà không có LayerScale. (b) SigmoidAttn multi-query attention (MQA) (Shazeer, 2019) với một head tương đương multi-head attention (MHA). (c) Sigmoid với LayerScale và QK norm hoạt động tương đương với các kích hoạt khác, trừ TanH. ReLU2 (Hua et al., 2022) kém hiệu quả mà không có LayerScale và QK norm.
+
+Ổn định với QK Norm Để khám phá tính ổn định của SoftmaxAttn vs. SigmoidAttn, chúng tôi lặp lại phân tích của Wortsman et al. (2023b), như được mô tả trong phân tích LayerScale, để điều tra tác động của QK norm (Dehghani et al., 2023). Đối với mô hình hóa ngôn ngữ, cả SigmoidAttn và SoftmaxAttn đều thể hiện độ nhạy cảm với các thay đổi learning rate mà không có QK norm. Tuy nhiên, việc kết hợp QK norm làm ổn định hiệu suất đáng kể (Hình 9). Trong các tác vụ thị giác, SigmoidAttn chứng minh tính bền vững có và không có QK norm (Hình 10-a) và không cần chuẩn hóa n⁻ᵅ từ Wortsman et al. (2023a).
+
+Multi-query attention (MQA) Trong Hình 10-b, chúng tôi khám phá MQA (Shazeer, 2019) cho thị giác chỉ sử dụng một head cho {K,V}. Chúng tôi thấy rằng cả SigmoidAttn và SoftmaxAttn đều hoạt động tốt như nhau có hoặc không có nhiều head ngay cả ở quy mô nhỏ của ViT-B/16.
+
+Ablations Hàm Kích hoạt Như trong Wortsman et al. (2023a), các hàm kích hoạt khác nhau, khi kết hợp với LayerScale và QK norm, hoạt động tốt như nhau cho các tác vụ thị giác (Hình 10-c). Tuy nhiên, đối với các tác vụ quan trọng về chuỗi như ASR, các hàm kích hoạt như ReLU gây ra sự không ổn định và kém hiệu quả. Trong cùng hình, chúng tôi cũng so sánh với đề xuất ReLU2 từ Hua et al. (2022) và thấy rằng nó kém hiệu quả mà không có LayerScale và QK norm.
+
+5.2 Phân loại Ảnh Có Giám sát
+
+Vision transformers (Dosovitskiy et al., 2021) mở rộng transformers (Vaswani et al., 2017) để xử lý lưới ảnh K×K như các token riêng biệt. Tất cả các token được tinh chế qua các lớp self-attention tuần tự, được gộp lại bằng token CLS hoặc lớp global average pooling, và được tối ưu hóa bằng negative log likelihood, ln p(y|x). Chúng tôi huấn luyện các mô hình ViT-B/16 sử dụng ảnh R²²⁴ˣ²²⁴ˣ³ trong 300 epoch sử dụng công thức được cung cấp trong Phụ lục G.2.4. Chúng tôi sử dụng cùng bộ siêu tham số huấn luyện cho cả SoftmaxAttn và SigmoidAttn, chỉ thay đổi hàm kích hoạt giữa các thử nghiệm. Train negative log-likelihood được báo cáo trong Hình 2 và test top-1% được báo cáo trong Hình 22. Chúng tôi thấy rằng SigmoidAttn tương đương với cả động lực huấn luyện và hiệu suất đánh giá của SoftmaxAttn.
+
+5.3 Học Biểu diễn Ảnh Tự Giám sát
+
+Học biểu diễn tự giám sát (SSL) khai thác lượng lớn dữ liệu không có nhãn để học các biểu diễn ngữ nghĩa dựa trên bias quy nạp như bất biến augmentation (SimCLR Chen et al. (2020), BYOL (Grill et al., 2020)) hoặc tái tạo từ biểu diễn nén (MAE (He et al., 2022)). Chúng tôi sử dụng công thức huấn luyện vision transformer từ Zhai et al. (2023a) và Busbridge et al. (2023) (Phụ lục G.2.4) cho SimCLR và BYOL. Như với học có giám sát, chúng tôi sử dụng cùng bộ siêu tham số huấn luyện cho cả SoftmaxAttn và SigmoidAttn, chỉ thay đổi hàm kích hoạt giữa các thử nghiệm. Hình 2 báo cáo train losses, và Hình 22 nêu bật linear probe và finetuned test top-1%. Mặc dù có các mục tiêu huấn luyện đa dạng trong SSL, SigmoidAttn tương đương với SoftmaxAttn đồng thời cải thiện throughput huấn luyện và inference (Mục 4).
+
+5.4 Nhận dạng Giọng nói Tự động (ASR)
+
+Chúng tôi benchmark ASR sử dụng dữ liệu LibriSpeech (Panayotov et al., 2015) trên thiết lập 100h và 960h của các cặp giọng nói và phiên âm văn bản. Các triển khai PyTorch của vanilla transformer dựa encoder (Synnaeve et al., 2020) và conformer (Gulati et al., 2020a) được huấn luyện với Connectionist Temporal Classification (CTC) (Graves et al., 2006) w/ BF16 mixed precision, w/o QK norm và w/o LayerScale. Sau khi điều chỉnh kỹ lưỡng các baseline SoftmaxAttn, chúng tôi chuyển sang SigmoidAttn theo (3) mà không có thay đổi nào khác. Chúng tôi điều tra hiệu ứng của post/pre-LayerNorm, độ sâu mô hình, loại optimizer, chế độ dữ liệu nhỏ, và kết nối với local attention, với chi tiết trong Phụ lục G.4.
+
+Các phát hiện chính của chúng tôi là: i) CAPE (Likhomanenko et al., 2021) PE là không ổn định nhất cho SigmoidAttn; ii) các mô hình post-LayerNorm với SoftmaxAttn khó khớp với SigmoidAttn ổn định; iii) w/o QK norm SigmoidAttn không ổn định và có những spike đáng kể trong cả gradient norms và training loss; iv) LayerScale cần thiết cho tổng quát hóa; v) bias có thể học b = -10 không có loss và gradient norms spikes trong khi khớp với SoftmaxAttn (không được hưởng lợi từ throughput cải thiện của FLASH SIGMOID); vi) thêm bias có thể học, b = -5, vào Q thay vì attention logits cũng giải quyết các norm attention ban đầu lớn cho CAPE và ALiBi nhưng không cho RoPE; vii) b = -log n có gradient norms spikes hiếm (2-5 lần) biên trong khi loss mượt mà khớp với SoftmaxAttn.
+
+--- TRANG 9 ---
+Bảng 2: Tỷ lệ lỗi từ (%) trên các bộ test LibriSpeech và TED-LIUM v3 (Hernandez et al., 2018) ("TED", bộ validation và test chung được chia theo thời lượng) cho transformer (255M params) với SoftmaxAttn hoặc SigmoidAttn (LayerScale và QK norm được sử dụng với b=-log n) được huấn luyện trên dữ liệu LibriSpeech 960h (thời lượng trung bình là 10-15s). Siêu tham số trong Phụ lục G.4.
+
+ATTN PE TEST-CLEAN TEST-OTHER TED 0-10S TED 10-20S TED 20-30S TED 30S+
+SOFTMAX
+CAPE 2.3 5.7 12.4 10.5 11.9 9.1
+SIGMOID 2.4 5.5 12.4 10.3 12.3 9.7
+- QK NORM KHÔNG ỔN ĐỊNH, GRADIENT NORM VÀ LOSS SPIKES
+- LAYER SCALE 2.5 6.1 13.6 11.5 13.4 8.9
+SIGMOID (b=-10, CÓ THỂ HỌC) 2.3 5.5 12.1 10.5 13.0 9.3
+SIGMOID (b=-5 TRONG Q, CÓ THỂ HỌC) 2.3 5.4 12.2 10.8 12.4 9.9
+- QK NORM KHÔNG ỔN ĐỊNH, GRADIENT NORM VÀ LOSS SPIKES
+SOFTMAX
+ROPE 2.2 5.5 12.7 10.6 12.8 9.5
+SIGMOID 2.3 5.4 12.3 10.1 12.3 8.6
+SIGMOID (b=-10, CÓ THỂ HỌC) 2.2 5.2 12.4 10.5 12.3 21.8
++α=1 2.7 6.6 14.1 12.0 14.5 14.9
+SIGMOID (b=-5 TRONG Q, CÓ THỂ HỌC) KHÔNG ỔN ĐỊNH, GRADIENT NORM VÀ LOSS SPIKES
+SOFTMAX
+ALIBI 2.2 5.4 12.3 10.7 12.1 8.6
+SIGMOID 2.3 5.1 12.3 10.5 12.6 9.1
+SIGMOID (b=-10, CÓ THỂ HỌC) 2.2 5.2 12.4 10.4 11.7 9.1
++α=1 2.6 6.6 13.9 11.9 14.2 8.6
+SIGMOID (b=-5 TRONG Q, CÓ THỂ HỌC) 2.2 5.2 12.1 10.4 12.0 8.2
+
+Bảng 2 cho thấy kết quả chính cho các transformer pre-LayerNorm với CAPE, RoPE, và ALiBi, nơi SigmoidAttn sử dụng LayerScale, QK norm, b = -log n, và không có chuẩn hóa chuỗi. Bias được ablate với bias có thể học (một cho mỗi lớp) trong attention hoặc Q có hoặc không có chuẩn hóa chuỗi. SigmoidAttn được ổn định với bias trong khi khớp với SoftmaxAttn, và b = -log n hoạt động tốt. Trong hầu hết các trường hợp, bias cho phép tổng quát hóa đến chuỗi dài hơn mà không có chuẩn hóa chuỗi, trừ RoPE nơi nó giúp cho chuỗi dài hơn nhưng gây hại cho hiệu suất tổng thể.
+
+5.5 Mô hình hóa Ngôn ngữ Lớn Autoregressive
+
+Bảng 3: Đánh giá LLM tiếng Anh. Tất cả các mô hình sử dụng ALiBi. Ablations chi tiết trong Phụ lục G.3.3.
+
+MODEL SIZE SEQ. LEN. ARC EASY ARC CHAL. HELLA-SWAG PIQA SCIQ WINO-GRANDE LAMBADA OPENAI TRIVIA QA (1-SHOT) WEBQS (1-SHOT) AVG STEP TIME (S)
+SOFTMAX 1B 2K 62.2 26.8 42.4 59.0 72.3 88.1 58.4 19.9 15.4 49.4 0.38
+SIGMOID 1B 2K 62.8 28.8 42.5 59.7 70.3 88.6 59.7 19.1 13.8 49.5 0.34
+SOFTMAX 1B 4K 62.6 27.7 42.4 58.6 71.1 88.2 58.6 18.9 14.7 49.2 0.84
+SIGMOID 1B 4K 60.5 27.3 41.3 57.8 70.5 87.0 57.6 18.9 12.6 48.2 0.67
+SOFT (H-NORM) 1B 4K 61.7 26.8 43.4 59.4 70.6 88.6 60.8 20.5 12.9 49.4 -
+SIGM. (H-NORM) 1B 4K 63.5 28.1 43.5 60.7 70.8 88.9 59.0 20.9 16.0 50.2 -
+SOFT (H-NORM) 7B 4K 71.2 39.9 53.2 65.5 75.6 91.8 67.2 37.7 21.8 59.0 3.85
+SIGM. (H-NORM) 7B 4K 72.7 40.5 53.5 66.2 76.0 92.5 66.5 39.5 21.8 59.6 3.4
+
+Chúng tôi huấn luyện tất cả các mô hình sử dụng công thức Llama2 (Touvron et al., 2023) (với ALiBi thay vì RoPE) và bộ dữ liệu RedPajama (Computer, 2023) trong JAX mà không có FLASH ATTENTION sử dụng framework AXLearn (Phụ lục G.3 cho siêu tham số chi tiết). Thí nghiệm ban đầu ở 85M tham số thiết lập các yêu cầu ổn định cơ bản (Hình 27), với attention bias b = -log(n) (n = 4096) cung cấp kết quả hiệu quả. Ở quy mô 1B n = 2048 với b = -log(n), SigmoidAttn khớp train NLL (Hình 2) và kết quả đánh giá của SoftmaxAttn (Bảng 3 hàng trên) đồng thời cải thiện throughput 1.12×.
+
+Ở quy mô 1B n = 4096, chỉ sử dụng b = -log(n) chúng tôi quan sát tăng tốc 1.25×; tuy nhiên, những bất ổn nhẹ ngăn SigmoidAttn khớp với hiệu suất mạnh mẽ của SoftmaxAttn (Bảng 3 hàng thứ hai). Chúng tôi giải quyết những vấn đề này thông qua hybrid-norm, một lớp chuẩn hóa thêm được áp dụng trên đầu ra của phép toán attention (x + norm(σ(QKT/√dqk)V, chi tiết thêm trong Phụ lục G.3 và G.6). Với hybrid-norm, SigmoidAttn khớp train NLL và vượt trội nhẹ so với SoftmaxAttn trên kết quả đánh giá tiếng Anh (50.2% vs. 49.4% – Bảng 3 hàng thứ ba). Trong Phụ lục G.3.3, chúng tôi ablate các lựa chọn thiết kế khác nhau ở quy mô 1B, bao gồm cấu trúc norm, kỹ thuật position embedding, và cấu hình attention bias.
+
+Ở 7B n = 4096, SigmoidAttn với hybrid-norm chứng minh lợi thế hấp dẫn so với SoftmaxAttn với hybrid-norm: nó khớp train NLL của SoftmaxAttn (Hình 2), đồng thời mang lại tăng tốc 1.13×  (Bảng 3 hàng cuối). Mô hình cho thấy cải thiện biên trên các tác vụ thách thức, bao gồm cả lý luận (ARC-Challenge: 40.5% vs 39.9%) và truy xuất kiến thức (TriviaQA: 39.5% vs 37.7%), với hiệu suất trung bình tốt hơn trên tất cả benchmarks (59.6% vs 59.0%). Những kết quả này thiết lập SigmoidAttn với hybrid-norm như một phương án hiệu quả cho mô hình hóa ngôn ngữ quy mô lớn.
+
+6 Nghiên cứu Liên quan
+
+Các nghiên cứu gần đây trong phân loại ảnh có giám sát (Wightman et al., 2021) và học tự giám sát (SSL), bao gồm các phương pháp như SigLIP (Zhai et al., 2023b), đang chuyển đổi huấn luyện machine learning quy mô lớn từ phân phối categorical có điều kiện đầu ra, truyền thống được tham số hóa bởi các hàm softmax, sang các điều kiện Bernoulli pointwise phong phú hơn được tham số hóa bởi các hàm sigmoid. Trong nghiên cứu này, trọng tâm của chúng tôi chuyển sang tinh chỉnh cơ chế nội bộ của mô hình, cụ thể bằng cách thay thế thành phần softmax của cơ chế attention bằng hàm sigmoid pointwise.
+
+Nghiên cứu trước đã khám phá việc thay thế softmax bằng kích hoạt ReLU trong cả thiết lập thực tế (Shen et al., 2023; Hron et al., 2020) và lý thuyết (Bai et al., 2023; Fu et al., 2023). Các nghiên cứu khác khám phá việc sử dụng kích hoạt ReLU2 (Hua et al., 2022), khám phá attention hoàn toàn tuyến tính (Katharopoulos et al., 2020; Lu et al., 2021; Koohpayegani & Pirsiavash, 2024) hoặc attention dựa cosine-similarity (Luo et al., 2018; Liu et al., 2022). Nghiên cứu của chúng tôi xây dựng dựa trên những khám phá này, đặc biệt là Wortsman et al. (2023a), thay thế softmax bằng các hàm kích hoạt khác nhau được tỷ lệ bởi n^(-α), trong đó n tương ứng với chiều dài chuỗi và α, một siêu tham số. Tuy nhiên, chúng tôi thấy rằng công thức của họ không khớp với hiệu suất mong đợi mà không có khởi tạo b thích hợp và việc sử dụng LayerScale (Hình 10-a, Phụ lục G.1.1).
+
+7 Kết luận
+
+Trong nghiên cứu này, chúng tôi trình bày một nghiên cứu lý thuyết và thực nghiệm toàn diện về sigmoid attention như một phương án thay thế cho softmax attention trong transformers. Chúng tôi chứng minh rằng transformers với sigmoid attention là bộ xấp xỉ hàm vạn năng với tính đều đặn được cải thiện, và xác định LayerScale và việc ngăn chặn các norm attention ban đầu lớn là yếu tố chính cho huấn luyện thành công. Chúng tôi giới thiệu FLASH SIGMOID, một biến thể hiệu quả bộ nhớ cung cấp tăng tốc kernel inference 17%. Các thí nghiệm rộng rãi trên ngôn ngữ, thị giác và giọng nói chứng minh rằng sigmoid attention được chuẩn hóa đúng cách có hiệu suất tương đương với softmax attention trên các tác vụ và quy mô khác nhau. Các phát hiện của chúng tôi thiết lập sigmoid attention như một phương án khả thi, thống nhất nghiên cứu trước và thiết lập thực hành tốt nhất cho ứng dụng của nó trong transformers.
+
+8 Lời cảm ơn
+
+Chúng tôi cảm ơn Zakaria Aldeneh, Samy Bengio, Navdeep Jaitly, David Koski, Pau Rodriguez Lopez, Hadi Pouransari, và Skyler Seto vì phản hồi hữu ích và thảo luận quan trọng của họ trong suốt quá trình viết bài báo này; Okan Akalin, Hassan Babaie, Michael Brooks, Brian Gamp, Denise Hui, Mubarak Seyed Ibrahim, Li Li, Rajat Phull, Evan Samanas, Guillaume Seguin, và đội ngũ cơ sở hạ tầng Apple rộng lớn hơn vì hỗ trợ phát triển và chạy mã có thể mở rộng, chịu lỗi. Tên được sắp xếp theo thứ tự bảng chữ cái theo họ trong nhóm.
+
+Tài liệu tham khảo
+
+Dzmitry Bahdanau, Kyunghyun Cho, và Yoshua Bengio. Neural machine translation by jointly learning to align and translate. Trong Yoshua Bengio và Yann LeCun (eds.), 3rd International Conference on Learning Representations, ICLR 2015, San Diego, CA, USA, May 7-9, 2015, Conference Track Proceedings, 2015. URL http://arxiv.org/abs/1409.0473.
+
+--- TRANG 11 ---
+
+Yu Bai, Fan Chen, Huan Wang, Caiming Xiong, và Song Mei. Transformers as statisticians: Provable in-context learning with in-context algorithm selection. Trong Alice Oh, Tristan Naumann, Amir Globerson, Kate Saenko, Moritz Hardt, và Sergey Levine (eds.), Advances in Neural Information Processing Systems 36: Annual Conference on Neural Information Processing Systems 2023, NeurIPS 2023, New Orleans, LA, USA, December 10 - 16, 2023, 2023. URL http://papers.nips.cc/paper_files/paper/2023/hash/b2e63e36c57e153b9015fece2352a9f9-Abstract-Conference.html.
+
+Tom B. Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared Kaplan, Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, Sandhini Agarwal, Ariel Herbert-Voss, Gretchen Krueger, Tom Henighan, Rewon Child, Aditya Ramesh, Daniel M. Ziegler, Jeffrey Wu, Clemens Winter, Christopher Hesse, Mark Chen, Eric Sigler, Mateusz Litwin, Scott Gray, Benjamin Chess, Jack Clark, Christopher Berner, Sam McCandlish, Alec Radford, Ilya Sutskever, và Dario Amodei. Language models are few-shot learners. Trong Hugo Larochelle, Marc'Aurelio Ranzato, Raia Hadsell, Maria-Florina Balcan, và Hsuan-Tien Lin (eds.), Advances in Neural Information Processing Systems 33: Annual Conference on Neural Information Processing Systems 2020, NeurIPS 2020, December 6-12, 2020, virtual, 2020. URL https://proceedings.neurips.cc/paper/2020/hash/1457c0d6bfcb4967418bfb8ac142f64a-Abstract.html.
+
+Dan Busbridge, Jason Ramapuram, Pierre Ablin, Tatiana Likhomanenko, Eeshan Gunesh Dhekane, Xavier Suau Cuadros, và Russell Webb. How to scale your EMA. Trong Alice Oh, Tristan Naumann, Amir Globerson, Kate Saenko, Moritz Hardt, và Sergey Levine (eds.), Advances in Neural Information Processing Systems 36: Annual Conference on Neural Information Processing Systems 2023, NeurIPS 2023, New Orleans, LA, USA, December 10 - 16, 2023, 2023. URL http://papers.nips.cc/paper_files/paper/2023/hash/e7681dd6fe16052433ab68cd1555bdc9-Abstract-Conference.html.
+
+Mathilde Caron, Hugo Touvron, Ishan Misra, Hervé Jégou, Julien Mairal, Piotr Bojanowski, và Armand Joulin. Emerging properties in self-supervised vision transformers. Trong 2021 IEEE/CVF International Conference on Computer Vision, ICCV 2021, Montreal, QC, Canada, October 10-17, 2021, pp. 9630–9640. IEEE, 2021. doi: 10.1109/ICCV48922.2021.00951. URL https://doi.org/10.1109/ICCV48922.2021.00951.
+
+Valérie Castin, Pierre Ablin, và Gabriel Peyré. Understanding the regularity of self-attention with optimal transport. arXiv preprint arXiv:2312.14820, 2023.
+
+Ting Chen, Simon Kornblith, Mohammad Norouzi, và Geoffrey E. Hinton. A simple framework for contrastive learning of visual representations. Trong Proceedings of the 37th International Conference on Machine Learning, ICML 2020, 13-18 July 2020, Virtual Event, volume 119 of Proceedings of Machine Learning Research, pp. 1597–1607. PMLR, 2020. URL http://proceedings.mlr.press/v119/chen20j.html.
+
+Xinlei Chen, Saining Xie, và Kaiming He. An empirical study of training self-supervised vision transformers. Trong 2021 IEEE/CVF International Conference on Computer Vision, ICCV 2021, Montreal, QC, Canada, October 10-17, 2021, pp. 9620–9629. IEEE, 2021. doi: 10.1109/ICCV48922.2021.00950. URL https://doi.org/10.1109/ICCV48922.2021.00950.
+
+Jack Choquette. NVIDIA hopper H100 GPU: scaling performance. IEEE Micro, 43(3):9–17, 2023. doi: 10.1109/MM.2023.3256796. URL https://doi.org/10.1109/MM.2023.3256796.
+
+Jack Choquette, Wishwesh Gandhi, Olivier Giroux, Nick Stam, và Ronny Krashinsky. NVIDIA A100 tensor core GPU: performance and innovation. IEEE Micro, 41(2):29–35, 2021. doi: 10.1109/MM.2021.3061394. URL https://doi.org/10.1109/MM.2021.3061394.
+
+Krzysztof Marcin Choromanski, Valerii Likhosherstov, David Dohan, Xingyou Song, Andreea Gane, Tamás Sarlós, Peter Hawkins, Jared Quincy Davis, Afroz Mohiuddin, Lukasz Kaiser, David Benjamin Belanger, Lucy J. Colwell, và Adrian Weller. Rethinking attention with performers. Trong 9th International Conference on Learning Representations, ICLR 2021, Virtual Event, Austria, May 3-7, 2021. OpenReview.net, 2021. URL https://openreview.net/forum?id=Ua6zuk0WRH.
+
+--- TRANG 12 ---
+
+Together Computer. Redpajama: An open source recipe to reproduce llama training dataset, April 2023. URL https://github.com/togethercomputer/RedPajama-Data.
+
+Ekin Dogus Cubuk, Barret Zoph, Jonathon Shlens, và Quoc Le. Randaugment: Practical automated data augmentation with a reduced search space. Trong Hugo Larochelle, Marc'Aurelio Ranzato, Raia Hadsell, Maria-Florina Balcan, và Hsuan-Tien Lin (eds.), Advances in Neural Information Processing Systems 33: Annual Conference on Neural Information Processing Systems 2020, NeurIPS 2020, December 6-12, 2020, virtual, 2020. URL https://proceedings.neurips.cc/paper/2020/hash/d85b63ef0ccb114d0a3bb7b7d808028f-Abstract.html.
+
+Tri Dao. Flashattention-2: Faster attention with better parallelism and work partitioning. CoRR, abs/2307.08691, 2023. doi: 10.48550/ARXIV.2307.08691. URL https://doi.org/10.48550/arXiv.2307.08691.
+
+Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, và Christopher Ré. Flashattention: Fast and memory-efficient exact attention with io-awareness. Trong Sanmi Koyejo, S. Mohamed, A. Agarwal, Danielle Belgrave, K. Cho, và A. Oh (eds.), Advances in Neural Information Processing Systems 35: Annual Conference on Neural Information Processing Systems 2022, NeurIPS 2022, New Orleans, LA, USA, November 28 - December 9, 2022, 2022. URL http://papers.nips.cc/paper_files/paper/2022/hash/67d57c32e20fd0a7a302cb81d36e40d5-Abstract-Conference.html.
+
+Mostafa Dehghani, Josip Djolonga, Basil Mustafa, Piotr Padlewski, Jonathan Heek, Justin Gilmer, Andreas Peter Steiner, Mathilde Caron, Robert Geirhos, Ibrahim Alabdulmohsin, Rodolphe Jenatton, Lucas Beyer, Michael Tschannen, Anurag Arnab, Xiao Wang, Carlos Riquelme Ruiz, Matthias Minderer, Joan Puigcerver, Utku Evci, Manoj Kumar, Sjoerd van Steenkiste, Gamaleldin Fathy Elsayed, Aravindh Mahendran, Fisher Yu, Avital Oliver, Fantine Huot, Jasmijn Bastings, Mark Collier, Alexey A. Gritsenko, Vighnesh Birodkar, Cristina Nader Vasconcelos, Yi Tay, Thomas Mensink, Alexander Kolesnikov, Filip Pavetic, Dustin Tran, Thomas Kipf, Mario Lucic, Xiaohua Zhai, Daniel Keysers, Jeremiah J. Harmsen, và Neil Houlsby. Scaling vision transformers to 22 billion parameters. Trong Andreas Krause, Emma Brunskill, Kyunghyun Cho, Barbara Engelhardt, Sivan Sabato, và Jonathan Scarlett (eds.), International Conference on Machine Learning, ICML 2023, 23-29 July 2023, Honolulu, Hawaii, USA, volume 202 of Proceedings of Machine Learning Research, pp. 7480–7512. PMLR, 2023. URL https://proceedings.mlr.press/v202/dehghani23a.html.
+
+Jia Deng, Wei Dong, Richard Socher, Li-Jia Li, Kai Li, và Li Fei-Fei. Imagenet: A large-scale hierarchical image database. Trong 2009 IEEE Computer Society Conference on Computer Vision and Pattern Recognition (CVPR 2009), 20-25 June 2009, Miami, Florida, USA, pp. 248–255. IEEE Computer Society, 2009. doi: 10.1109/CVPR.2009.5206848. URL https://doi.org/10.1109/CVPR.2009.5206848.
+
+Alexey Dosovitskiy, Lucas Beyer, Alexander Kolesnikov, Dirk Weissenborn, Xiaohua Zhai, Thomas Unterthiner, Mostafa Dehghani, Matthias Minderer, Georg Heigold, Sylvain Gelly, Jakob Uszkoreit, và Neil Houlsby. An image is worth 16x16 words: Transformers for image recognition at scale. Trong 9th International Conference on Learning Representations, ICLR 2021, Virtual Event, Austria, May 3-7, 2021. OpenReview.net, 2021. URL https://openreview.net/forum?id=YicbFdNTTy.
+
+Hengyu Fu, Tianyu Guo, Yu Bai, và Song Mei. What can a single attention layer learn? A study through the random features lens. Trong Alice Oh, Tristan Naumann, Amir Globerson, Kate Saenko, Moritz Hardt, và Sergey Levine (eds.), Advances in Neural Information Processing Systems 36: Annual Conference on Neural Information Processing Systems 2023, NeurIPS 2023, New Orleans, LA, USA, December 10 - 16, 2023, 2023. URL http://papers.nips.cc/paper_files/paper/2023/hash/274db6bf1b01d8b4f07feaeb8c46f474-Abstract-Conference.html.
+
+Octavian Ganea, Sylvain Gelly, Gary Bécigneul, và Aliaksei Severyn. Breaking the softmax bottleneck via learnable monotonic pointwise non-linearities. Trong Kamalika Chaudhuri và Ruslan Salakhutdinov (eds.), Proceedings of the 36th International Conference on Machine Learning, ICML 2019, 9-15 June 2019, Long Beach, California, USA, volume 97 of Proceedings of Machine Learning Research, pp. 2073–2082. PMLR, 2019. URL http://proceedings.mlr.press/v97/ganea19a.html.
+
+--- TRANG 13 ---
+
+Borjan Geshkovski, Cyril Letrouit, Yury Polyanskiy, và Philippe Rigollet. A mathematical perspective on transformers. arXiv preprint arXiv:2312.10794, 2023.
+
+Borjan Geshkovski, Cyril Letrouit, Yury Polyanskiy, và Philippe Rigollet. The emergence of clusters in self-attention dynamics. Advances in Neural Information Processing Systems, 36, 2024.
+
+Google. Praxis. https://github.com/google/praxis, 2024.
+
+Alex Graves, Santiago Fernández, Faustino J. Gomez, và Jürgen Schmidhuber. Connectionist temporal classification: labelling unsegmented sequence data with recurrent neural networks. Trong William W. Cohen và Andrew W. Moore (eds.), Machine Learning, Proceedings of the Twenty-Third International Conference (ICML 2006), Pittsburgh, Pennsylvania, USA, June 25-29, 2006, volume 148 of ACM International Conference Proceeding Series, pp. 369–376. ACM, 2006. doi: 10.1145/1143844.1143891. URL https://doi.org/10.1145/1143844.1143891.
+
+Jean-Bastien Grill, Florian Strub, Florent Altché, Corentin Tallec, Pierre H. Richemond, Elena Buchatskaya, Carl Doersch, Bernardo Ávila Pires, Zhaohan Guo, Mohammad Gheshlaghi Azar, Bilal Piot, Koray Kavukcuoglu, Rémi Munos, và Michal Valko. Bootstrap your own latent - A new approach to self-supervised learning. Trong Hugo Larochelle, Marc'Aurelio Ranzato, Raia Hadsell, Maria-Florina Balcan, và Hsuan-Tien Lin (eds.), Advances in Neural Information Processing Systems 33: Annual Conference on Neural Information Processing Systems 2020, NeurIPS 2020, December 6-12, 2020, virtual, 2020. URL https://proceedings.neurips.cc/paper/2020/hash/f3ada80d5c4ee70142b17b8192b2958e-Abstract.html.
+
+Anmol Gulati, James Qin, Chung-Cheng Chiu, Niki Parmar, Yu Zhang, Jiahui Yu, Wei Han, Shibo Wang, Zhengdong Zhang, Yonghui Wu, và Ruoming Pang. Conformer: Convolution-augmented transformer for speech recognition. Trong Helen Meng, Bo Xu, và Thomas Fang Zheng (eds.), Interspeech 2020, 21st Annual Conference of the International Speech Communication Association, Virtual Event, Shanghai, China, 25-29 October 2020, pp. 5036–5040. ISCA, 2020a. doi: 10.21437/INTERSPEECH.2020-3015. URL https://doi.org/10.21437/Interspeech.2020-3015.
+
+Anmol Gulati, James Qin, Chung-Cheng Chiu, Niki Parmar, Yu Zhang, Jiahui Yu, Wei Han, Shibo Wang, Zhengdong Zhang, Yonghui Wu, et al. Conformer: Convolution-augmented transformer for speech recognition. Trong Proc. Interspeech, 2020b.
+
+Awni Hannun, Jagrit Digani, Angelos Katharopoulos, và Ronan Collobert. MLX: Efficient and flexible machine learning on apple silicon, 2023. URL https://github.com/ml-explore.
+
+Kaiming He, Xinlei Chen, Saining Xie, Yanghao Li, Piotr Dollár, và Ross B. Girshick. Masked autoencoders are scalable vision learners. Trong IEEE/CVF Conference on Computer Vision and Pattern Recognition, CVPR 2022, New Orleans, LA, USA, June 18-24, 2022, pp. 15979–15988. IEEE, 2022. doi: 10.1109/CVPR52688.2022.01553. URL https://doi.org/10.1109/CVPR52688.2022.01553.
+
+François Hernandez, Vincent Nguyen, Sahar Ghannay, Natalia Tomashenko, và Yannick Esteve. Ted-lium 3: Twice as much data and corpus repartition for experiments on speaker adaptation. Trong Speech and Computer: 20th International Conference, SPECOM 2018, Leipzig, Germany, September 18–22, 2018, Proceedings 20, pp. 198–208. Springer, 2018.
+
+Jiri Hron, Yasaman Bahri, Jascha Sohl-Dickstein, và Roman Novak. Infinite attention: NNGP and NTK for deep attention networks. Trong Proceedings of the 37th International Conference on Machine Learning, ICML 2020, 13-18 July 2020, Virtual Event, volume 119 of Proceedings of Machine Learning Research, pp. 4376–4386. PMLR, 2020. URL http://proceedings.mlr.press/v119/hron20a.html.
+
+Weizhe Hua, Zihang Dai, Hanxiao Liu, và Quoc V. Le. Transformer quality in linear time. Trong Kamalika Chaudhuri, Stefanie Jegelka, Le Song, Csaba Szepesvári, Gang Niu, và Sivan Sabato (eds.), International Conference on Machine Learning, ICML 2022, 17-23 July 2022, Baltimore, Maryland, USA, volume 162 of Proceedings of Machine Learning Research, pp. 9099–9117. PMLR, 2022. URL https://proceedings.mlr.press/v162/hua22a.html.
+
+--- TRANG 14 ---
+
+Niall P. Hurley và Scott T. Rickard. Comparing measures of sparsity, 2009.
+
+Andrei Ivanov, Nikoli Dryden, Tal Ben-Nun, Shigang Li, và Torsten Hoefler. Data movement is all you need: A case study on optimizing transformers. Trong Alex Smola, Alex Dimakis, và Ion Stoica (eds.), Proceedings of Machine Learning and Systems 2021, MLSys 2021, virtual, April 5-9, 2021. mlsys.org, 2021. URL https://proceedings.mlsys.org/paper/2021/hash/c9e1074f5b3f9fc8ea15d152add07294-Abstract.html.
+
+Charles H. Jones. Generalized hockey stick identities and n-dimensional blockwalking. 1994. URL https://api.semanticscholar.org/CorpusID:2088017.
+
+Norman P. Jouppi, Cliff Young, Nishant Patil, David A. Patterson, Gaurav Agrawal, Raminder Bajwa, Sarah Bates, Suresh Bhatia, Nan Boden, Al Borchers, Rick Boyle, Pierre-luc Cantin, Clifford Chao, Chris Clark, Jeremy Coriell, Mike Daley, Matt Dau, Jeffrey Dean, Ben Gelb, Tara Vazir Ghaemmaghami, Rajendra Gottipati, William Gulland, Robert Hagmann, C. Richard Ho, Doug Hogberg, John Hu, Robert Hundt, Dan Hurt, Julian Ibarz, Aaron Jaffey, Alek Jaworski, Alexander Kaplan, Harshit Khaitan, Daniel Killebrew, Andy Koch, Naveen Kumar, Steve Lacy, James Laudon, James Law, Diemthu Le, Chris Leary, Zhuyuan Liu, Kyle Lucke, Alan Lundin, Gordon MacKean, Adriana Maggiore, Maire Mahony, Kieran Miller, Rahul Nagarajan, Ravi Narayanaswami, Ray Ni, Kathy Nix, Thomas Norrie, Mark Omernick, Narayana Penukonda, Andy Phelps, Jonathan Ross, Matt Ross, Amir Salek, Emad Samadiani, Chris Severn, Gregory Sizikov, Matthew Snelham, Jed Souter, Dan Steinberg, Andy Swing, Mercedes Tan, Gregory Thorson, Bo Tian, Horia Toma, Erick Tuttle, Vijay Vasudevan, Richard Walter, Walter Wang, Eric Wilcox, và Doe Hyun Yoon. In-datacenter performance analysis of a tensor processing unit. Trong Proceedings of the 44th Annual International Symposium on Computer Architecture, ISCA 2017, Toronto, ON, Canada, June 24-28, 2017, pp. 1–12. ACM, 2017. doi: 10.1145/3079856.3080246. URL https://doi.org/10.1145/3079856.3080246.
+
+Angelos Katharopoulos, Apoorv Vyas, Nikolaos Pappas, và François Fleuret. Transformers are rnns: Fast autoregressive transformers with linear attention. Trong Proceedings of the 37th International Conference on Machine Learning, ICML 2020, 13-18 July 2020, Virtual Event, volume 119 of Proceedings of Machine Learning Research, pp. 5156–5165. PMLR, 2020. URL http://proceedings.mlr.press/v119/katharopoulos20a.html.
+
+Hyunjik Kim, George Papamakarios, và Andriy Mnih. The lipschitz constant of self-attention. Trong International Conference on Machine Learning, pp. 5562–5571. PMLR, 2021.
+
+Soroush Abbasi Koohpayegani và Hamed Pirsiavash. Sima: Simple softmax-free attention for vision transformers. Trong IEEE/CVF Winter Conference on Applications of Computer Vision, WACV 2024, Waikoloa, HI, USA, January 3-8, 2024, pp. 2595–2605. IEEE, 2024. doi: 10.1109/WACV57701.2024.00259. URL https://doi.org/10.1109/WACV57701.2024.00259.
+
+Minchul Lee, Kijong Han, và Myeong Cheol Shin. Littlebird: Efficient faster & longer transformer for question answering. Trong Proceedings of the 2022 Conference on Empirical Methods in Natural Language Processing, pp. 5261–5277, 2022.
+
+Jimmy Lei Ba, Jamie Ryan Kiros, và Geoffrey E Hinton. Layer normalization. ArXiv e-prints, pp. arXiv–1607, 2016.
+
+Tatiana Likhomanenko, Qiantong Xu, Gabriel Synnaeve, Ronan Collobert, và Alex Rogozhnikov. CAPE: encoding relative positions with continuous augmented positional embeddings. Trong Marc'Aurelio Ranzato, Alina Beygelzimer, Yann N. Dauphin, Percy Liang, và Jennifer Wortman Vaughan (eds.), Advances in Neural Information Processing Systems 34: Annual Conference on Neural Information Processing Systems 2021, NeurIPS 2021, December 6-14, 2021, virtual, pp. 16079–16092, 2021. URL https://proceedings.neurips.cc/paper/2021/hash/865bf46435bd84fa5d89f64cf3ba7347-Abstract.html.
+
+Ze Liu, Han Hu, Yutong Lin, Zhuliang Yao, Zhenda Xie, Yixuan Wei, Jia Ning, Yue Cao, Zheng Zhang, Li Dong, Furu Wei, và Baining Guo. Swin transformer V2: scaling up capacity and resolution. Trong IEEE/CVF Conference on Computer Vision and Pattern Recognition, CVPR 2022, New Orleans, LA, USA, June 18-24, 2022, pp. 11999–12009. IEEE, 2022. doi: 10.1109/CVPR52688.2022.01170. URL https://doi.org/10.1109/CVPR52688.2022.01170.
+
+--- TRANG 15 ---
+
+Ilya Loshchilov và Frank Hutter. Decoupled weight decay regularization. arXiv preprint arXiv:1711.05101, 2017.
+
+Jiachen Lu, Jinghan Yao, Junge Zhang, Xiatian Zhu, Hang Xu, Weiguo Gao, Chunjing Xu, Tao Xiang, và Li Zhang. SOFT: softmax-free transformer with linear complexity. Trong Marc'Aurelio Ranzato, Alina Beygelzimer, Yann N. Dauphin, Percy Liang, và Jennifer Wortman Vaughan (eds.), Advances in Neural Information Processing Systems 34: Annual Conference on Neural Information Processing Systems 2021, NeurIPS 2021, December 6-14, 2021, virtual, pp. 21297–21309, 2021. URL https://proceedings.neurips.cc/paper/2021/hash/b1d10e7bafa4421218a51b1e1f1b0ba2-Abstract.html.
+
+Chunjie Luo, Jianfeng Zhan, Xiaohe Xue, Lei Wang, Rui Ren, và Qiang Yang. Cosine normalization: Using cosine similarity instead of dot product in neural networks. Trong Vera Kurková, Yannis Manolopoulos, Barbara Hammer, Lazaros S. Iliadis, và Ilias Maglogiannis (eds.), Artificial Neural Networks and Machine Learning - ICANN 2018 - 27th International Conference on Artificial Neural Networks, Rhodes, Greece, October 4-7, 2018, Proceedings, Part I, volume 11139 of Lecture Notes in Computer Science, pp. 382–391. Springer, 2018. doi: 10.1007/978-3-030-01418-6\_38. URL https://doi.org/10.1007/978-3-030-01418-6_38.
+
+OpenAI. GPT-4 technical report. CoRR, abs/2303.08774, 2023. doi: 10.48550/ARXIV.2303.08774. URL https://doi.org/10.48550/arXiv.2303.08774.
+
+Vassil Panayotov, Guoguo Chen, Daniel Povey, và Sanjeev Khudanpur. Librispeech: An ASR corpus based on public domain audio books. Trong 2015 IEEE International Conference on Acoustics, Speech and Signal Processing, ICASSP 2015, South Brisbane, Queensland, Australia, April 19-24, 2015, pp. 5206–5210. IEEE, 2015. doi: 10.1109/ICASSP.2015.7178964. URL https://doi.org/10.1109/ICASSP.2015.7178964.
+
+Daniel S. Park, William Chan, Yu Zhang, Chung-Cheng Chiu, Barret Zoph, Ekin D. Cubuk, và Quoc V. Le. Specaugment: A simple data augmentation method for automatic speech recognition. Trong Gernot Kubin và Zdravko Kacic (eds.), Interspeech 2019, 20th Annual Conference of the International Speech Communication Association, Graz, Austria, 15-19 September 2019, pp. 2613–2617. ISCA, 2019. doi: 10.21437/INTERSPEECH.2019-2680. URL https://doi.org/10.21437/Interspeech.2019-2680.
+
+Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory Chanan, Trevor Killeen, Zeming Lin, Natalia Gimelshein, Luca Antiga, Alban Desmaison, Andreas Köpf, Edward Z. Yang, Zachary DeVito, Martin Raison, Alykhan Tejani, Sasank Chilamkurthy, Benoit Steiner, Lu Fang, Junjie Bai, và Soumith Chintala. Pytorch: An imperative style, high-performance deep learning library. Trong Hanna M. Wallach, Hugo Larochelle, Alina Beygelzimer, Florence d'Alché-Buc, Emily B. Fox, và Roman Garnett (eds.), Advances in Neural Information Processing Systems 32: Annual Conference on Neural Information Processing Systems 2019, NeurIPS 2019, December 8-14, 2019, Vancouver, BC, Canada, pp. 8024–8035, 2019. URL https://proceedings.neurips.cc/paper/2019/hash/bdbca288fee7f92f2bfa9f7012727740-Abstract.html.
+
+Ofir Press, Noah A. Smith, và Mike Lewis. Train short, test long: Attention with linear biases enables input length extrapolation. Trong The Tenth International Conference on Learning Representations, ICLR 2022, Virtual Event, April 25-29, 2022. OpenReview.net, 2022. URL https://openreview.net/forum?id=R8sQPpGCv0.
+
+Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan Narang, Michael Matena, Yanqi Zhou, Wei Li, và Peter J. Liu. Exploring the limits of transfer learning with a unified text-to-text transformer. J. Mach. Learn. Res., 21:140:1–140:67, 2020. URL http://jmlr.org/papers/v21/20-074.html.
+
+Noam Shazeer. Fast transformer decoding: One write-head is all you need. CoRR, abs/1911.02150, 2019. URL http://arxiv.org/abs/1911.02150.
+
+--- TRANG 16 ---
+
+Kai Shen, Junliang Guo, Xu Tan, Siliang Tang, Rui Wang, và Jiang Bian. A study on relu and softmax in transformer. CoRR, abs/2302.06461, 2023. doi: 10.48550/ARXIV.2302.06461. URL https://doi.org/10.48550/arXiv.2302.06461.
+
+Jianlin Su, Murtadha H. M. Ahmed, Yu Lu, Shengfeng Pan, Wen Bo, và Yunfeng Liu. Roformer: Enhanced transformer with rotary position embedding. Neurocomputing, 568:127063, 2024. doi: 10.1016/J.NEUCOM.2023.127063. URL https://doi.org/10.1016/j.neucom.2023.127063.
+
+Gabriel Synnaeve, Qiantong Xu, Jacob Kahn, Tatiana Likhomanenko, Edouard Grave, Vineel Pratap, Anuroop Sriram, Vitaliy Liptchinsky, và Ronan Collobert. End-to-end ASR: from supervised to semi-supervised learning with modern architectures. Trong ICML 2020 Workshop on Self-supervision in Audio and Speech, 2020. URL https://openreview.net/forum?id=OSVxDDc360z.
+
+Hugo Touvron, Matthieu Cord, Alexandre Sablayrolles, Gabriel Synnaeve, và Hervé Jégou. Going deeper with image transformers. Trong Proceedings of the IEEE/CVF international conference on computer vision, pp. 32–42, 2021.
+
+Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei, Nikolay Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, et al. Llama 2: Open foundation and fine-tuned chat models. arXiv preprint arXiv:2307.09288, 2023.
+
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez, Lukasz Kaiser, và Illia Polosukhin. Attention is all you need. Trong Isabelle Guyon, Ulrike von Luxburg, Samy Bengio, Hanna M. Wallach, Rob Fergus, S. V. N. Vishwanathan, và Roman Garnett (eds.), Advances in Neural Information Processing Systems 30: Annual Conference on Neural Information Processing Systems 2017, December 4-9, 2017, Long Beach, CA, USA, pp. 5998–6008, 2017. URL https://proceedings.neurips.cc/paper/2017/hash/3f5ee243547dee91fbd053c1c4a845aa-Abstract.html.
+
+Ross Wightman, Hugo Touvron, và Hervé Jégou. Resnet strikes back: An improved training procedure in timm. CoRR, abs/2110.00476, 2021. URL https://arxiv.org/abs/2110.00476.
+
+Mitchell Wortsman, Jaehoon Lee, Justin Gilmer, và Simon Kornblith. Replacing softmax with ReLU in vision transformers. arXiv preprint arXiv:2309.08586, 2023a.
+
+Mitchell Wortsman, Peter J. Liu, Lechao Xiao, Katie Everett, Alex Alemi, Ben Adlam, John D. Co-Reyes, Izzeddin Gur, Abhishek Kumar, Roman Novak, Jeffrey Pennington, Jascha Sohl-Dickstein, Kelvin Xu, Jaehoon Lee, Justin Gilmer, và Simon Kornblith. Small-scale proxies for large-scale transformer training instabilities. CoRR, abs/2309.14322, 2023b. doi: 10.48550/ARXIV.2309.14322. URL https://doi.org/10.48550/arXiv.2309.14322.
+
+xai-org. Grok-1. https://github.com/xai-org/grok-1, 2024. Accessed: [Insert Access Date].
+
+Ruibin Xiong, Yunchang Yang, Di He, Kai Zheng, Shuxin Zheng, Chen Xing, Huishuai Zhang, Yanyan Lan, Liwei Wang, và Tieyan Liu. On layer normalization in the transformer architecture. Trong International Conference on Machine Learning, pp. 10524–10533. PMLR, 2020.
+
+Zhilin Yang, Zihang Dai, Ruslan Salakhutdinov, và William W. Cohen. Breaking the softmax bottleneck: A high-rank RNN language model. Trong 6th International Conference on Learning Representations, ICLR 2018, Vancouver, BC, Canada, April 30 - May 3, 2018, Conference Track Proceedings. OpenReview.net, 2018. URL https://openreview.net/forum?id=HkwZSG-CZ.
+
+Chulhee Yun, Srinadh Bhojanapalli, Ankit Singh Rawat, Sashank J. Reddi, và Sanjiv Kumar. Are transformers universal approximators of sequence-to-sequence functions?, 2020.
+
+Shuangfei Zhai, Tatiana Likhomanenko, Etai Littwin, Dan Busbridge, Jason Ramapuram, Yizhe Zhang, Jiatao Gu, và Joshua M. Susskind. Stabilizing transformer training by preventing attention entropy collapse. Trong Andreas Krause, Emma Brunskill, Kyunghyun Cho, Barbara Engelhardt, Sivan Sabato, và Jonathan Scarlett (eds.), International Conference on Machine Learning, ICML 2023, 23-29 July 2023, Honolulu, Hawaii, USA, volume 202 of Proceedings of Machine Learning Research, pp. 40770–40803. PMLR, 2023a. URL https://proceedings.mlr.press/v202/zhai23a.html.
+
+--- TRANG 17 ---
+
+Xiaohua Zhai, Basil Mustafa, Alexander Kolesnikov, và Lucas Beyer. Sigmoid loss for language image pre-training. CoRR, abs/2303.15343, 2023b. doi: 10.48550/ARXIV.2303.15343. URL https://doi.org/10.48550/arXiv.2303.15343.
+
+Biao Zhang và Rico Sennrich. Root Mean Square Layer Normalization. Trong Advances in Neural Information Processing Systems 32, Vancouver, Canada, 2019. URL https://openreview.net/references/pdf?id=S1qBAf6rr.
+
+--- TRANG 18 ---
+
+Phụ lục
+
+A Hạn chế 21
+B Tác động Rộng lớn 21
+C Tính chất Xấp xỉ Vạn năng cho Sigmoid Attention 22
+C.1 Chứng minh Bước (3): Sigmoid Transformers có thể Xấp xỉ Modified Sigmoid Transformers . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 22
+C.2 Chứng minh Bước (2-b): Modified Sigmoid Transformers có thể Triển khai Ánh xạ Ngữ cảnh . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 23
+C.2.1 Khối Xây dựng Cơ bản của Ánh xạ Ngữ cảnh . . . . . . . . . . . . . . 24
+C.2.2 Kết quả của Việc Áp dụng một Chuỗi Selective Shifts . . . . . . . . . . 25
+C.2.3 Kết quả của Việc Áp dụng Một Lớp Global Shift Cuối cùng . . . . . . . 27
+C.2.4 Một Chuỗi Selective Shifts theo sau bởi Global Shift Tạo ra Ánh xạ Ngữ cảnh . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 28
+D Tính Lipschitz của Sigmoid Attention 32
+E Bias Term của Sigmoid Attention 33
+F Chi tiết về FLASH SIGMOID 35
+F.1 Chi tiết về Thuật toán FLASH SIGMOID . . . . . . . . . . . . . . . . . . . . . . . . 35
+F.2 Benchmarking của FLASH SIGMOID Kernels . . . . . . . . . . . . . . . . . . . . . 38
+F.3 Tăng tốc của FLASH SIGMOID trong Thiết lập Thực tế . . . . . . . . . . . . . . . 39
+F.4 FLASH SIGMOID với ALiBi . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 42
+F.5 Hướng cho Nghiên cứu Tương lai về FLASH SIGMOID . . . . . . . . . . . . . . . . 42
+G Thí nghiệm 43
+G.1 Ablations Thêm . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 43
+G.1.1 Hiệu ứng của Chuẩn hóa Chiều dài Chuỗi Nhân . . . . . . . . . . . . . 43
+G.1.2 Ablation Ổn định Attention Bias . . . . . . . . . . . . . . . . . . . . . . 44
+G.2 Thị giác . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 44
+G.2.1 Test ImageNet1k Top-1% . . . . . . . . . . . . . . . . . . . . . . . . . 44
+G.2.2 Sigmoid Attention Không LayerScale . . . . . . . . . . . . . . . . . . . 45
+G.2.3 Sigmoid Attention vs. Attention Relaxations . . . . . . . . . . . . . . . 45
+G.2.4 Siêu tham số . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 46
+G.3 Mô hình Ngôn ngữ . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 46
+G.3.1 Siêu tham số . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 46
+G.3.2 Gradient Norm . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 47
+G.3.3 Cấu trúc Norm . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 48
+G.4 Nhận dạng Giọng nói Tự động . . . . . . . . . . . . . . . . . . . . . . . . . . . . 48
+G.4.1 Chi tiết Huấn luyện . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 48
+
+--- TRANG 19 ---
+
+G.4.2 Kết quả và Ablations . . . . . . . . . . . . . . . . . . . . . . . . . . . . 50
+G.5 Thí nghiệm Đơn giản . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 52
+G.5.1 Định nghĩa Bài toán k–Summation . . . . . . . . . . . . . . . . . . . . 52
+G.5.2 So sánh với Softmax . . . . . . . . . . . . . . . . . . . . . . . . . . . . 53
+G.5.3 Phát triển Attention . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 53
+G.5.4 Bài toán Pair Repeat . . . . . . . . . . . . . . . . . . . . . . . . . . . . 54
+G.6 Hướng dẫn cho Người thực hành . . . . . . . . . . . . . . . . . . . . . . . . . . . . 55
+H Đóng góp 56

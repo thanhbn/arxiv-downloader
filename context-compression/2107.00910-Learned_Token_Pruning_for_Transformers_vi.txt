@@ -1,0 +1,181 @@
+# Cắt Tỉa Token Học Được cho Transformer
+
+Sehoon Kim∗
+sehoonkim@berkeley.edu
+University of California, Berkeley
+Berkeley, CA, USA
+
+Sheng Shen∗
+sheng.s@berkeley.edu
+University of California, Berkeley
+Berkeley, CA, USA
+
+David Thorsley∗
+d.thorsley@samsung.com
+Samsung Semiconductor, Inc.
+San Jose, CA, USA
+
+Amir Gholami∗
+amirgh@berkeley.edu
+University of California, Berkeley
+Berkeley, CA, USA
+
+Woosuk Kwon
+woosuk.kwon@berkeley.edu
+University of California, Berkeley
+Berkeley, CA, USA
+
+Joseph Hassoun
+j.hassoun@samsung.com
+Samsung Semiconductor, Inc.
+San Jose, CA, USA
+
+Kurt Keutzer
+keutzer@berkeley.edu
+University of California, Berkeley
+Berkeley, CA, USA
+
+TÓM TẮT
+Triển khai hiệu quả các mô hình transformer trong thực tế là thử thách do chi phí suy luận bao gồm dung lượng bộ nhớ, độ trễ và tiêu thụ năng lượng, điều này tăng theo bậc hai với độ dài chuỗi đầu vào. Để giải quyết điều này, chúng tôi trình bày một phương pháp giảm token mới được gọi là Cắt Tỉa Token Học Được (LTP) có thể loại bỏ thích ứng các token không quan trọng khi chuỗi đầu vào đi qua các lớp transformer. Cụ thể, LTP cắt tỉa các token có điểm attention dưới một ngưỡng, với giá trị được học cho mỗi lớp trong quá trình huấn luyện. Phương pháp dựa trên ngưỡng của chúng tôi cho phép độ dài của chuỗi được cắt tỉa thay đổi thích ứng dựa trên chuỗi đầu vào, và tránh các phép toán tốn kém về thuật toán như lựa chọn token top-k. Chúng tôi kiểm tra toàn diện hiệu suất của LTP trên các tác vụ GLUE và SQuAD và cho thấy phương pháp của chúng tôi vượt trội hơn các phương pháp cắt tỉa token tiên tiến trước đó lên đến ~2.5% độ chính xác cao hơn với cùng lượng FLOPs. Cụ thể, LTP đạt được giảm FLOPs lên đến 2.1× với ít hơn 1% giảm độ chính xác, dẫn đến cải thiện thông lượng lên đến 1.9× và 2.0× trên Intel Haswell CPUs và NVIDIA V100 GPUs. Hơn nữa, chúng tôi chứng minh rằng LTP mạnh mẽ hơn các phương pháp trước đó đối với các biến thiên trong độ dài chuỗi đầu vào. Mã của chúng tôi đã được phát triển trong PyTorch và mã nguồn mở.
+
+KHÁI NIỆM CCS
+•Tổ chức hệ thống máy tính →Mạng neural ;Xử lý ngôn ngữ tự nhiên .
+
+TỪ KHÓA
+Học Sâu, Cắt Tỉa Mạng, Xử Lý Ngôn Ngữ Tự Nhiên
+
+1 GIỚI THIỆU
+Các kiến trúc mạng neural sâu dựa trên Transformer như BERT và RoBERTa đạt được kết quả tiên tiến trong các tác vụ Xử lý Ngôn ngữ Tự nhiên (NLP) như phân loại câu và trả lời câu hỏi. Tuy nhiên, triển khai hiệu quả các mô hình này ngày càng thử thách do kích thước lớn, nhu cầu suy luận thời gian thực, và tài nguyên năng lượng, tính toán và bộ nhớ hạn chế có sẵn. Trung tâm của một lớp transformer là cơ chế multi-head self-attention, nơi mỗi token trong chuỗi đầu vào attention đến mọi token khác để tính toán một biểu diễn mới của chuỗi. Vì tất cả token attention lẫn nhau, độ phức tạp tính toán là bậc hai theo độ dài chuỗi đầu vào; do đó khả năng áp dụng các mô hình transformer cho chuỗi đầu vào dài trở nên hạn chế.
+
+Cắt tỉa là một kỹ thuật phổ biến để giảm kích thước của mạng neural và lượng tính toán cần thiết. Cắt tỉa không có cấu trúc cho phép các mẫu thưa thớt tùy ý cho tham số và feature map và có thể, về lý thuyết, tạo ra tiết kiệm tính toán đáng kể trong khi bảo toàn độ chính xác. Tuy nhiên, các bộ tăng tốc DNN thương mại không thể khai thác hiệu quả các mẫu thưa thớt không có cấu trúc. Do đó, các phương pháp cắt tỉa có cấu trúc thường được ưa thích trong thực tế do tính dễ triển khai tương đối trên phần cứng.
+
+Multi-head self-attention cung cấp một số khả năng cho cắt tỉa có cấu trúc; ví dụ, head pruning giảm kích thước mô hình bằng cách loại bỏ các head không cần thiết trong mỗi lớp transformer. Một cách tiếp cận trực giao khác mà chúng tôi xem xét trong bài báo này là cắt tỉa token, làm giảm tính toán bằng cách loại bỏ dần các token không quan trọng trong chuỗi trong quá trình suy luận. Đối với các tác vụ NLP như phân loại câu, cắt tỉa token là một cách tiếp cận hấp dẫn để xem xét vì nó khai thác quan sát trực quan rằng không phải tất cả token (tức là từ) trong một câu đầu vào đều cần thiết để thực hiện suy luận thành công.
+
+Có hai lớp phương pháp cắt tỉa token chính. Trong lớp đầu tiên, các phương pháp như PoWER-BERT và Length-Adaptive Transformer (LAT) tìm kiếm một cấu hình cắt tỉa token duy nhất (tức là độ dài chuỗi cho mỗi lớp) cho toàn bộ tập dữ liệu. Nói cách khác, chúng cắt tỉa tất cả chuỗi đầu vào về cùng độ dài. Tuy nhiên, độ dài chuỗi đầu vào có thể thay đổi rất nhiều trong các tác vụ và giữa tập huấn luyện và tập xác thực như trong Hình 1, và do đó áp dụng một cấu hình cắt tỉa duy nhất cho tất cả chuỗi đầu vào có thể cắt tỉa không đủ các chuỗi ngắn hơn hoặc cắt tỉa quá mức các chuỗi dài hơn.
+
+Trong lớp khác, phương pháp cắt tỉa token điều chỉnh cấu hình dựa trên chuỗi đầu vào. SpAtten sử dụng cấu hình cắt tỉa tỷ lệ với độ dài câu đầu vào; tuy nhiên, nó không điều chỉnh tỷ lệ token được cắt tỉa dựa trên nội dung của chuỗi đầu vào. TR-BERT gần đây được công bố sử dụng học tăng cường (RL) để tìm mạng chính sách động giảm số lượng token dựa trên độ dài và nội dung của chuỗi đầu vào; tuy nhiên, nó yêu cầu huấn luyện tốn kém bổ sung để hội tụ phương pháp dựa trên RL. Ngoài ra, tất cả các phương pháp trước đó này dựa một phần vào việc chọn k token quan trọng nhất trong quá trình suy luận hoặc huấn luyện. Việc lựa chọn này có thể tốn kém về mặt tính toán mà không phát triển phần cứng chuyên dụng, như động cơ top-k được giới thiệu trong SpAtten.
+
+Vì vậy, chúng tôi đề xuất một phương pháp cắt tỉa token dựa trên ngưỡng học được thích ứng với độ dài và nội dung của các ví dụ cá nhân và tránh sử dụng các phép toán top-k. Cụ thể, đóng góp của chúng tôi như sau:
+
+•Chúng tôi đề xuất Cắt Tỉa Token Học Được (LTP), một phương pháp cắt tỉa token dựa trên ngưỡng, chỉ cần một phép toán ngưỡng đơn giản để phát hiện token không quan trọng. Ngoài ra, LTP tự động hoàn toàn việc tìm kiếm cấu hình cắt tỉa tối ưu bằng cách giới thiệu một mask binarized mềm có thể vi phân cho phép huấn luyện các ngưỡng chính xác cho các lớp và tác vụ khác nhau. (Phần 3.3)
+
+•Chúng tôi áp dụng LTP vào RoBERTa và đánh giá hiệu suất của nó trên các tác vụ GLUE và SQuAD. Chúng tôi cho thấy LTP đạt được giảm FLOPs lên đến 2.10× với ít hơn 1% giảm độ chính xác, dẫn đến cải thiện thông lượng lên đến 1.93× và 1.97× trên NVIDIA V100 GPU và Intel Haswell CPU, tương ứng, so với baseline FP16 không được cắt tỉa. Chúng tôi cũng cho thấy LTP vượt trội hơn SpAtten và LAT trong hầu hết trường hợp, đạt được giảm FLOPs bổ sung cho cùng mức giảm độ chính xác. (Phần 4.2 và 4.5)
+
+•Chúng tôi cho thấy LTP có tính mạnh mẽ cao đối với các biến thiên độ dài câu. LTP thể hiện độ chính xác tốt hơn nhất quán trên các phân bố độ dài câu khác nhau, đạt được khoảng cách độ chính xác lên đến 16.4% từ LAT. (Phần 4.3)
+
+2 CÔNG TRÌNH LIÊN QUAN
+
+2.1 Transformer Hiệu Quả
+Nhiều cách tiếp cận khác nhau đã được đề xuất để cải thiện tốc độ và giảm dung lượng bộ nhớ của transformer. Những cách này có thể được phân loại rộng rãi như sau: (i) thiết kế kiến trúc hiệu quả; (ii) chưng cất kiến thức; (iii) lượng tử hóa; và (iv) cắt tỉa. Ở đây, chúng tôi chỉ tập trung vào cắt tỉa và thảo luận ngắn gọn về công trình liên quan.
+
+2.2 Cắt Tỉa Transformer
+Các phương pháp cắt tỉa có thể được phân loại thành cắt tỉa không có cấu trúc và cắt tỉa có cấu trúc. Đối với cắt tỉa không có cấu trúc, giả thuyết lottery-ticket đã được khám phá cho transformer. Gần đây, một nghiên cứu tận dụng cắt tỉa như một cách hiệu quả để fine-tune transformer trên các tác vụ downstream. Một nghiên cứu khác đề xuất movement pruning, đạt được cải thiện hiệu suất đáng kể so với các phương pháp dựa trên magnitude trước đó bằng cách xem xét việc sửa đổi trọng số trong quá trình fine-tuning. Tuy nhiên, thường khá khó khăn để triển khai hiệu quả tính thưa thớt không có cấu trúc trên các bộ tăng tốc neural thương mại để đạt được tăng tốc có ý nghĩa.
+
+Vì lý do này, một số phương pháp cắt tỉa có cấu trúc đã được giới thiệu để loại bỏ các tập tham số có cấu trúc. Một số nghiên cứu loại bỏ attention head trong các lớp multi-head attention, và các nghiên cứu khác cắt tỉa toàn bộ các lớp transformer. Một nghiên cứu cắt tỉa có cấu trúc ma trận trọng số thông qua phân tích thừa số hạng thấp, và các nghiên cứu khác cố gắng đồng thời cắt tỉa attention head và bộ lọc của ma trận trọng số. Các nghiên cứu khác xác định động tỷ lệ cắt tỉa có cấu trúc trong quá trình suy luận. Các sơ đồ block pruning gần đây chia ma trận trọng số thành nhiều khối và cắt tỉa chúng dựa trên tối ưu hóa group Lasso, regularization thích ứng, và movement pruning. Tất cả các phương pháp này tương ứng với cắt tỉa trọng số, nơi các tham số mô hình (tức là trọng số) được cắt tỉa.
+
+Gần đây, đã có công trình về cắt tỉa câu đầu vào cho transformer, thay vì tham số mô hình. Điều này được gọi là cắt tỉa token, nơi các token ít quan trọng hơn được loại bỏ dần trong quá trình suy luận. PoWER-BERT, một trong những công trình sớm nhất, đề xuất học trực tiếp các cấu hình cắt tỉa token. LAT mở rộng ý tưởng này bằng cách giới thiệu LengthDrop, một quy trình trong đó một mô hình được huấn luyện với các cấu hình cắt tỉa token khác nhau, theo sau bởi một tìm kiếm tiến hóa. Phương pháp này có lợi thế là quy trình huấn luyện trước đó không cần phải lặp lại cho các tỷ lệ cắt tỉa khác nhau của cùng một mô hình. Trong khi các phương pháp này đã cho thấy giảm tính toán lớn trên các tác vụ NLP downstream khác nhau, chúng cố định một cấu hình cắt tỉa token duy nhất cho toàn bộ tập dữ liệu. Nghĩa là, chúng cắt tỉa tất cả chuỗi đầu vào về cùng độ dài. Tuy nhiên, như được hiển thị trong Hình 1, độ dài chuỗi đầu vào thay đổi rất nhiều trong một tác vụ. Kết quả là, việc cố định một cấu hình cắt tỉa duy nhất có thể cắt tỉa không đủ các chuỗi ngắn hơn để giữ đủ token cho việc xử lý các chuỗi dài hơn hoặc, ngược lại, cắt tỉa quá mức các chuỗi dài hơn để loại bỏ đủ token để xử lý hiệu quả các chuỗi ngắn hơn. Quan trọng hơn, một cấu hình cắt tỉa duy nhất thiếu tính mạnh mẽ đối với các biến thiên độ dài chuỗi đầu vào, nơi các câu đầu vào tại thời điểm suy luận dài hơn so với những câu trong tập dữ liệu huấn luyện.
+
+Ngược lại, SpAtten vượt qua vấn đề này bằng cách gán một cấu hình cắt tỉa tỷ lệ với độ dài chuỗi đầu vào. Trong khi điều này cho phép cắt tỉa nhiều token hơn từ các chuỗi dài hơn và ít token hơn từ các chuỗi ngắn hơn, nó không thích ứng với các chuỗi đầu vào cá nhân vì nó gán cùng một cấu hình cho tất cả các chuỗi có cùng độ dài bất kể nội dung của chúng. Ngoài ra, các cấu hình cắt tỉa được xác định bằng heuristic và do đó có thể dẫn đến giải pháp không tối ưu. Gần đây, TR-BERT đề xuất học một mạng chính sách RL để áp dụng các cấu hình cắt tỉa thích ứng cho mỗi chuỗi đầu vào. Tuy nhiên, như được ghi nhận bởi các tác giả, vấn đề có không gian tìm kiếm lớn có thể khó giải quyết cho RL. Vấn đề này được giảm thiểu bằng heuristic liên quan đến imitation learning và sampling của các chuỗi hành động, điều này tăng đáng kể chi phí huấn luyện. Quan trọng là, tất cả các phương pháp cắt tỉa token nói trên phụ thuộc một phần hoặc hoàn toàn vào phép toán top-k để chọn k token quan trọng nhất trong quá trình suy luận hoặc huấn luyện. Phép toán này có thể tốn kém mà không có hỗ trợ phần cứng chuyên dụng, như được thảo luận trong SpAtten. LTP, mặt khác, dựa trên một chiến lược cắt tỉa dựa trên ngưỡng hoàn toàn có thể học được. Do đó, nó (i) thích ứng với cả độ dài và nội dung đầu vào, (ii) mạnh mẽ đối với các biến thiên độ dài câu, (iii) hiệu quả về mặt tính toán, và (iv) dễ triển khai.
+
+3 PHƯƠNG PHÁP
+
+3.1 Nền Tảng
+BERT bao gồm nhiều lớp transformer encoder được xếp chồng lên nhau. Một lớp transformer encoder cơ bản bao gồm một khối multi-head attention (MHA) theo sau bởi một khối feed-forward point-wise (FFN), với các kết nối residual xung quanh mỗi khối. Cụ thể, một MHA bao gồm Nh head được tham số hóa độc lập. Một attention head h trong lớp l được tham số hóa bởi W(h,l)k, W(h,l)q, W(h,l)v ∈ Rdh×d, W(h,l)o ∈ Rd×dh, trong đó dh thường được đặt thành d/Nh và d là chiều đặc trưng. Chúng tôi bỏ qua chỉ số trên l để đơn giản trong công thức sau. MHA đo lường tầm quan trọng theo cặp của mỗi token trên mọi token khác trong đầu vào:
+
+MHA(x) = ∑h=1^Nh AttW(h)k,q,v,o(x), (1)
+
+trong đó x ∈ Rd×n là chuỗi đầu vào với độ dài chuỗi n, và AttWk,q,v,o là:
+
+AttWk,q,v,o(x) = Wo ∑i=1^n Wvxi softmax(xTWTqWkxi/√d), (2)
+
+xMHA = LN(AttWk,q,v,o(x)) + x, (3)
+
+trong đó Eq. 3 là kết nối residual và LayerNorm (LN) tiếp theo. Đầu ra của MHA sau đó được đưa vào khối FFN áp dụng hai lớp feed-forward cho đầu vào này:
+
+FFN(xMHA) = σ(W2(W1xMHA + b1) + b2), (4)
+
+xout = LN(FFN(xMHA)) + xMHA, (5)
+
+trong đó W1, W2, b1 và b2 là các tham số FFN, và σ là hàm kích hoạt (thường là GELU cho BERT).
+
+3.2 Cắt Tỉa Token Ngưỡng
+Hãy ký hiệu xác suất attention của head h giữa token xi và xj là A(h,l):
+
+A(h,l)(xi, xj) = softmax(xTWTqWkx/√d)(i,j) ∈ R. (6)
+
+Chi phí độ phức tạp tính toán để tính toán ma trận attention là O(d²n + n²d), tỷ lệ bậc hai với độ dài chuỗi. Do đó, phép toán attention trở thành nút thắt cổ chai khi áp dụng cho các chuỗi dài. Để giải quyết điều này, chúng tôi áp dụng cắt tỉa token loại bỏ các token không quan trọng khi đầu vào đi qua các lớp transformer để giảm độ dài chuỗi n cho các khối sau. Điều này được minh họa sơ đồ trong Hình 2 (Trái).
+
+Để cắt tỉa token, chúng ta phải định nghĩa một metric để xác định các token không quan trọng. Theo sau các nghiên cứu trước, chúng tôi định nghĩa điểm quan trọng của token xi trong lớp l là:
+
+s(l)(xi) = (1/Nh)(1/n)∑h=1^Nh ∑j=1^n A(h,l)(xi, xj). (7)
+
+Trực quan, xác suất attention A(h,l)(xi, xj) được diễn giải là lượng chuẩn hóa mà tất cả các token khác xj attend đến token xi. Token xi do đó được coi là quan trọng nếu nó nhận được nhiều attention hơn từ tất cả token qua tất cả head, điều này trực tiếp dẫn chúng ta đến phương trình 7. Quy trình tính toán điểm quan trọng từ xác suất attention được minh họa trong Hình 2 (Phải).
+
+Trong các nghiên cứu trước, token được xếp hạng theo điểm quan trọng và cắt tỉa bằng chiến lược lựa chọn top-k. Cụ thể, token xi được cắt tỉa tại lớp l nếu điểm quan trọng s(l)(xi) của nó nhỏ hơn k giá trị lớn nhất của điểm quan trọng từ tất cả token. Tuy nhiên, việc tìm k giá trị lớn nhất của điểm quan trọng là không hiệu quả về mặt tính toán mà không có phần cứng chuyên dụng; chúng tôi cung cấp kết quả thực nghiệm cho thấy điều này trong Phần A.2. Thay vào đó, chúng tôi giới thiệu một cách tiếp cận cắt tỉa token dựa trên ngưỡng mới trong đó một token chỉ được cắt tỉa nếu điểm quan trọng của nó dưới một ngưỡng được ký hiệu bởi θ(l) ∈ R. Cụ thể, chúng tôi định nghĩa một chiến lược cắt tỉa bằng cách áp đặt một mask nhị phân M(l)(·): {1,...,n} → {0,1} chỉ ra liệu một token nên được giữ hay cắt tỉa:
+
+M(l)(xi) = {1 nếu s(l)(xi) > θ(l), 0 ngược lại. (8)
+
+Lưu ý rằng phép toán này chỉ yêu cầu một toán tử so sánh đơn giản mà không có bất kỳ tính toán top-k tốn kém nào. Một khi một token được cắt tỉa, nó được loại trừ khỏi các tính toán trong tất cả các lớp tiếp theo, do đó giảm dần độ phức tạp tính toán hướng tới các lớp đầu ra.
+
+3.3 Ngưỡng Có Thể Học Cho Cắt Tỉa Token
+Một mối quan tâm chính với phương pháp trên là làm thế nào để xác định các giá trị ngưỡng cho mỗi lớp. Không chỉ các giá trị ngưỡng thay đổi cho các lớp khác nhau, chúng cũng thay đổi giữa các tác vụ khác nhau. Chúng tôi giải quyết điều này bằng cách làm cho các ngưỡng (tức là θ trong Eq. 8) có thể học được. Tuy nhiên, có một số thử thách cần xem xét. Đầu tiên, do tính chất nhị phân của M không có dòng gradient cho các token được cắt tỉa. Thứ hai, toán tử M là không thể vi phân ngăn cản dòng gradient vào các ngưỡng. Để giải quyết những thử thách này, chúng tôi sử dụng một sơ đồ cắt tỉa mềm mô phỏng cắt tỉa cứng ban đầu trong khi vẫn truyền gradient đến các ngưỡng như được hiển thị trong Hình 3.
+
+Sơ Đồ Cắt Tỉa Mềm. Trong sơ đồ cắt tỉa mềm, chúng tôi thay thế mask không thể vi phân M(l) bằng một soft mask có thể vi phân sử dụng phép toán sigmoid σ:
+
+M̃(l)(xi) = σ((s(l)(xi) - θ(l))/T), (9)
+
+trong đó T là nhiệt độ, và θ(l) là giá trị ngưỡng có thể học cho lớp l. Với nhiệt độ T đủ nhỏ, M̃(l)(xi) sẽ xấp xỉ gần với hard masking M(l)(xi) trong Eq. 8. Ngoài ra, thay vì chọn token để được cắt tỉa hoặc giữ dựa trên hard mask của Eq. 8, chúng tôi nhân soft mask với activation đầu ra của lớp l. Nghĩa là,
+
+x̃(l)out = M̃(l)(x(l)) · x(l)out (10)
+= M̃(l)(x(l)) · LN(FFN(x(l)MHA) + x(l)MHA), (11)
+
+trong đó x(l)MHA là activation đầu ra của MHA trong lớp l. Nếu điểm quan trọng của token xi dưới ngưỡng một biên độ lớn, activation đầu ra lớp của nó gần bằng không và do đó có ít tác động đến lớp tiếp theo. Ngoài ra, vì token có điểm quan trọng bằng không trong lớp tiếp theo, tức là s(l+1)(xi) = 0, nó có khả năng được cắt tỉa lại. Do đó, sơ đồ cắt tỉa mềm gần như giống hệt với cắt tỉa cứng về hành vi, nhưng dạng có thể vi phân của nó cho phép backpropagation và tối ưu hóa dựa trên gradient để làm cho θ có thể học được. Sau khi (i) huấn luyện đồng thời tham số mô hình và ngưỡng trên các tác vụ downstream với sơ đồ cắt tỉa mềm, (ii) chúng tôi cố định các ngưỡng và binarize soft mask, và (iii) thực hiện fine-tuning tiếp theo của các tham số mô hình. Mã giả cho thuật toán ba bước này được đưa ra trong Algorithm 1. Trực quan, độ lớn của gradient dM̃(l)(xi)/dθ(l) được tối đa hóa khi điểm quan trọng s(l)(xi) đủ gần với ngưỡng θ(l) và trở nên gần bằng không ở nơi khác. Do đó, ngưỡng có thể được huấn luyện chỉ dựa trên các token sắp được cắt tỉa hoặc giữ lại.
+
+Regularization. Không thể học θ mà không có regularization, vì optimizer thường nhận được giá trị loss tốt hơn nếu tất cả token đều có mặt. Do đó, chúng tôi thêm một số hạng regularization để phạt mạng nếu token được để lại không cắt tỉa. Điều này được đạt được bằng cách áp đặt một loss L1 trên toán tử masking M̃:
+
+Lnew = L + λLreg trong đó Lreg = (1/L)∑l=1L ||M̃(l)(x)||1. (12)
+
+Ở đây, L là hàm loss ban đầu (ví dụ: cross-entropy loss), và λ là tham số regularization. Các giá trị λ lớn hơn dẫn đến tỷ lệ cắt tỉa cao hơn. Toán tử regularization này tạo ra một gradient bổ sung cho ngưỡng:
+
+dLreg/dθ(l) = (1/dθ(l))||M̃(l)(x)||1 = ∑i=1n dM̃(l)(xi)/dθ(l) (13)
+
+Nếu có nhiều token gần ngưỡng, thì gradient dLreg/dθ(l) lớn hơn. Kết quả là, ngưỡng được đẩy đến một giá trị lớn hơn, cắt tỉa nhiều token gần ranh giới ngưỡng.
+
+4 THỰC NGHIỆM
+
+4.1 Thiết Lập Thực Nghiệm
+Chúng tôi triển khai LTP trên RoBERTa base sử dụng repo của HuggingFace và kiểm tra trên các tác vụ GLUE (tiếng Anh) và SQuAD 2.0. Đối với các tác vụ GLUE, chúng tôi sử dụng 6 tác vụ để đánh giá bao gồm độ tương tự câu (QQP, MRPC, STS-B), phân loại cảm xúc (SST-2), suy luận văn bản (RTE) và suy luận ngôn ngữ tự nhiên (MNLI, QNLI). Để đánh giá kết quả, chúng tôi đo độ chính xác phân loại và điểm F1 cho MRPC và QQP, Pearson Correlation và Spearman Correlation cho STS-B, và độ chính xác phân loại cho các tác vụ còn lại trên tập xác thực. Đối với các tác vụ có nhiều metric (tức là MRPC, QQP, STS-B), chúng tôi báo cáo trung bình của chúng. Đối với SQuAD 2.0, là tác vụ hỏi đáp, chúng tôi đo điểm F1 để đánh giá kết quả.
+
+Như đã đề cập trong Phần 3.3, quy trình huấn luyện của LTP bao gồm hai giai đoạn: cắt tỉa mềm huấn luyện cả tham số mô hình và ngưỡng trên các tác vụ downstream, theo sau bởi cắt tỉa cứng fine-tune các tham số mô hình với ngưỡng cố định. Chúng tôi cũng so sánh LTP với các phương pháp cắt tỉa token tiên tiến hiện tại của SpAtten và LAT theo chi tiết triển khai trong các bài báo của họ. Xem A.1 cho chi tiết của quy trình huấn luyện. Chúng tôi sử dụng PyTorch 1.8 trong suốt tất cả thực nghiệm. Đối với thực nghiệm tốc độ suy luận CPU, chúng tôi sử dụng Intel Haswell CPU với bộ nhớ 3.75GB của Google Cloud Platform. Đối với thực nghiệm tốc độ suy luận GPU, chúng tôi sử dụng instance AWS p3.2xlarge có NVIDIA V100 GPU với CUDA 11.1.
+
+Một vấn đề quan trọng trong công trình trước đó là tất cả chuỗi đầu vào cho một tác vụ cụ thể được đệm đến lũy thừa của 2 gần nhất từ phần trăm thứ 99 của độ dài chuỗi, và sau đó hiệu suất được cắt tỉa được so sánh với baseline được đệm. Điều này dẫn đến tăng hiệu suất cường điệu so với baseline. Ví dụ, trong một nghiên cứu trước, đầu vào từ tập dữ liệu SST-2 được đệm đến 64, trong khi độ dài câu trung bình của nó là 26 (cf. Hình 1). Với cách tiếp cận này, người ta có thể đạt được tăng tốc khoảng 2.5× chỉ bằng cách loại bỏ padding. Do đó, chúng tôi tránh bất kỳ đệm bổ sung nào của chuỗi đầu vào và tất cả tăng tốc và thông lượng chúng tôi báo cáo được so sánh với baseline không được đệm.
+
+4.2 Đánh Giá Hiệu Suất
+Bảng 1 liệt kê độ chính xác và GFLOPs cho LTP. Chúng tôi chọn một mô hình cho mỗi tác vụ downstream đạt được GFLOPs nhỏ nhất trong khi ràng buộc giảm độ chính xác từ baseline (RoBERTa base) tối đa 1%. Sử dụng phương pháp của chúng tôi, độ dài chuỗi trong mỗi lớp có thể thay đổi qua các câu đầu vào khác nhau. Do đó, chúng tôi báo cáo GFLOPs trung bình của việc xử lý tất cả câu đầu vào trong tập phát triển. Như được hiển thị trong bảng, phương pháp của chúng tôi đạt được tăng tốc trung bình 1.96× và lên đến 2.10× trong 1% giảm độ chính xác.
+
+Hình 4 vẽ độ chính xác của LTP (đường màu xanh) cũng như các phương pháp cắt tỉa trước đó (đường màu đỏ cho SpAtten và đường màu cam cho LAT) với FLOPs khác nhau trên các tác vụ GLUE. LTP nhất quán vượt trội hơn SpAtten cho tất cả tác vụ với độ chính xác cao hơn lên đến ~2% dưới cùng lượng FLOPs. So với LAT, LTP vượt trội cho tất cả tác vụ trừ QQP với độ chính xác cao hơn lên đến ~2.5% cho cùng FLOPs mục tiêu. Riêng đối với QQP, LTP đạt được tối đa ~0.2% độ chính xác thấp hơn so với LAT.
+
+Một quan sát quan trọng là đối với SST-2 và STS-B nơi LTP (của chúng tôi) vượt trội hơn LAT với biên độ lớn, độ dài chuỗi thay đổi rất nhiều từ tập dữ liệu huấn luyện đến tập dữ liệu đánh giá như có thể thấy từ KL-divergence lớn trong Bảng 2 và Hình 1 (b, c). Mặt khác, đối với QQP, tập dữ liệu duy nhất mà LAT vượt trội nhẹ hơn LTP (của chúng tôi), phân bố độ dài chuỗi của tập dữ liệu huấn luyện gần như giống hệt với tập dữ liệu đánh giá như có thể thấy từ KL-divergence nhỏ trong Bảng 2 và Hình 2 (a). Quan sát này hỗ trợ tuyên bố của chúng tôi trong Phần 1 và 2: LTP mạnh mẽ đối với các biến thiên độ dài chuỗi vì nó không cố định cấu hình cắt tỉa không giống như các phương pháp khác sử dụng một cấu hình cắt tỉa duy nhất bất kể độ dài chuỗi đầu vào. Điều này quan trọng trong thực tế vì độ dài chuỗi trong quá trình suy luận không phải lúc nào cũng tuân theo phân bố độ dài chuỗi của tập dữ liệu huấn luyện như trong SST-2 và STS-B. Chúng tôi thảo luận thêm trong Phần 4.3.
+
+Đối với SQuAD 2.0, chúng tôi có kết quả tương tự với GLUE. Như có thể thấy trong Bảng 1 và Hình 5 (Trái), chúng tôi có được điểm F1 gần như giống hệt với baseline tại 0.58 FLOPs tương đối, và tăng tốc 1.89× với ít hơn 1% giảm điểm F1. Tập dữ liệu SQuAD 2.0 được chia thành hai tập con: tập con các ví dụ mà câu trả lời cho câu hỏi được bao gồm trong văn bản bối cảnh, và tập con không có câu trả lời. Trong Hình 5 (Phải), chúng tôi vẽ thêm kết quả trên mỗi tập con của tập dữ liệu (màu đen và đỏ cho tập có và không có câu trả lời, tương ứng). Chúng ta thấy rằng điểm F1 giảm cho tập con có câu trả lời và tăng cho tập con không có câu trả lời khi chúng ta giảm FLOPs tương đối. Điều này được mong đợi vì head hỏi đáp sẽ dự đoán không có câu trả lời nếu điểm bắt đầu và kết thúc của câu trả lời trong bối cảnh không thể được xác định do tỷ lệ cắt tỉa token cao. Do đó, việc thiết lập cẩn thận λ trong Eq. 12 là cần thiết để cân bằng độ chính xác giữa hai tập con.
+
+Cuối cùng, chúng tôi cũng nhấn mạnh rằng LTP có lợi thế bổ sung so với các cách tiếp cận dựa trên top-k trước đó bằng cách tránh các phép toán top-k không hiệu quả về mặt tính toán như được thảo luận thêm trong Phần A.2.
+
+4.3 Tính Mạnh Mẽ Đối Với Biến Thiên Độ Dài Chuỗi
+Trong Phần 4.2, chúng tôi tuyên bố rằng LTP mạnh mẽ hơn đối với các biến thiên độ dài chuỗi từ thời gian huấn luyện đến thời gian đánh giá. Ở đây, chúng tôi thực hiện phân tích có hệ thống hơn về điều này. Lý tưởng nhất, hiệu suất nên độc lập với độ dài chuỗi. Để kiểm tra định lượng tính mạnh mẽ của các phương pháp cắt tỉa đối với các biến thiên độ dài chuỗi, chúng tôi huấn luyện LTP và LAT trên QNLI và QQP, nhưng chỉ sử dụng các ví dụ huấn luyện có độ dài chuỗi dưới độ dài trung vị của tập dữ liệu đánh giá. Sau đó chúng tôi đánh giá các mô hình kết quả sử dụng các ví dụ đánh giá với độ dài chuỗi (i) dưới trung vị (~Q2), (ii) giữa trung vị và quantile thứ ba (Q2~Q3), và (iii) trên quantile thứ ba (Q3~) của tập dữ liệu đánh giá. Để so sánh công bằng, chúng tôi chọn các mô hình từ LTP và LAT yêu cầu FLOPs tương tự trên ~Q2.
+
+Kết quả được liệt kê trong Bảng 3. LTP nhất quán đạt được độ chính xác và FLOPs tốt hơn trên các độ dài chuỗi khác nhau, ngay cả với những chuỗi dài hơn đáng kể so với các chuỗi huấn luyện. Ngược lại, LAT cho thấy giảm độ chính xác đáng kể khi các chuỗi dài hơn bị cắt tỉa quá mức, có thể thấy từ việc giảm FLOPs đáng kể. Cụ thể, LTP vượt trội hơn LAT lên đến 16.44% và 9.20% trên QNLI và QQP cho tập dữ liệu đánh giá Q3~.
+
+4.4 Nghiên Cứu Ablation
+Thay vì học ngưỡng, chúng ta có thể đặt chúng thủ công. Vì việc tìm kiếm thủ công trên không gian tìm kiếm mũ là không khả thi, chúng tôi thêm một ràng buộc vào không gian tìm kiếm bằng cách gán các giá trị ngưỡng tăng tuyến tính cho mỗi lớp, tương tự như cách SpAtten gán tỷ lệ giữ token: cho ngưỡng của lớp cuối θ(L), ngưỡng cho lớp l được đặt là θ(L)l/L. Chúng tôi vẽ độ chính xác và FLOPs của cách tiếp cận ngưỡng thủ công trong Hình 4 như các đường màu đen. Trong khi cách tiếp cận này thể hiện kết quả tốt trên tất cả các tác vụ downstream, các ngưỡng học được nhất quán vượt trội hơn các ngưỡng thủ công dưới cùng FLOPs. Điều này cung cấp bằng chứng thực nghiệm cho hiệu quả của phương pháp học ngưỡng của chúng tôi.
+
+4.5 Đo Lường Thông Lượng Trực Tiếp Trên Phần Cứng
+Chúng tôi đo lường trực tiếp thông lượng trên phần cứng thực bằng cách triển khai LTP trên NVIDIA V100 GPU và Intel Haswell CPU. Để suy luận, chúng tôi hoàn toàn loại bỏ các token được cắt tỉa và sắp xếp lại các token được giữ lại thành một chuỗi không có khoảng trống để có được tăng độ trễ. Tuy nhiên, một hệ quả của cắt tỉa thích ứng là mỗi chuỗi sẽ kết thúc với một mẫu cắt tỉa và độ dài chuỗi khác nhau. Do đó, việc triển khai phần cứng ngây thơ của suy luận batch có thể yêu cầu đệm tất cả các chuỗi trong một batch để đảm bảo rằng chúng đều có cùng độ dài (tức là độ dài chuỗi tối đa trong batch), dẫn đến một phần đáng kể tính toán bị lãng phí để xử lý các token đệm. Để tránh điều này, chúng tôi sử dụng Faster Transformer của NVIDIA cho triển khai GPU yêu cầu kích thước batch lớn. Framework này động loại bỏ và chèn các token đệm trong quá trình suy luận để hầu hết các phép toán transformer hiệu quả bỏ qua xử lý các token đệm. Điều này cho phép suy luận nhanh ngay cả với độ dài cắt tỉa không đều của các chuỗi cá nhân. Đối với triển khai CPU, chúng tôi thấy batching ngây thơ (tức là đệm chuỗi đến độ dài câu tối đa) đủ cho thông lượng tốt.
+
+Kết quả thông lượng đo được được hiển thị trong Hình 6 cho các kích thước batch khác nhau. Đối với tất cả thực nghiệm, thông lượng tương đối được đánh giá 3 lần trên các tập dữ liệu được xáo trộn ngẫu nhiên. LTP đạt được cải thiện thông lượng lên đến ~1.9× và ~2.0× cho QNLI và QQP trên cả CPU và GPU, so với baseline. Điều này tương tự với tăng tốc lý thuyết suy ra từ việc giảm FLOPs được báo cáo trong Bảng 1. Quan trọng là, tăng tốc của LTP tăng với kích thước batch lớn hơn trên cả CPU và GPU, chứng minh hiệu quả của LTP trong các trường hợp batch.
+
+4.6 LTP với Lượng Tử Hóa và Chưng Cất Kiến Thức
+Ở đây, chúng tôi cho thấy rằng phương pháp cắt tỉa mức token của chúng tôi tương thích với các phương pháp nén khác. Cụ thể, chúng tôi thực hiện các thực nghiệm nén bằng cách kết hợp LTP với lượng tử hóa và chưng cất kiến thức cùng nhau. Đối với lượng tử hóa, chúng tôi sử dụng phương pháp lượng tử hóa số nguyên đối xứng đồng nhất tĩnh, dễ triển khai trong phần cứng thương mại với overhead thời gian chạy tối thiểu. Tất cả các tham số mô hình được lượng tử hóa thành số nguyên 8-bit, ngoại trừ những tham số của lớp embedding có bit-width không ảnh hưởng đến tốc độ suy luận. Sau đó, chúng tôi áp dụng chưng cất kiến thức giúp khôi phục độ chính xác cho tỷ lệ nén cao. Chúng tôi đặt mô hình RoBERTa base baseline làm teacher và mô hình LTP được lượng tử hóa làm student. Sau đó chúng tôi chưng cất kiến thức từ mô hình teacher vào mô hình student thông qua một loss chưng cất kiến thức khớp logits đầu ra của lớp phân loại và biểu diễn đầu ra của lớp embedding trong mô hình teacher với các phần tương ứng trong mô hình student. Mục tiêu huấn luyện là một kết hợp lồi của loss ban đầu và loss chưng cất kiến thức. Như được hiển thị trong Hình 7, chúng tôi đạt được giảm lên đến 10× trong bit operations (BOPs) với ít hơn 2% giảm độ chính xác so với RoBERTa base FP16 bằng cách kết hợp lượng tử hóa và chưng cất kiến thức. Kết quả cho thấy thực nghiệm hiệu quả của LTP với các phương pháp nén khác.
+
+5 KẾT LUẬN
+Trong công trình này, chúng tôi trình bày Cắt Tỉa Token Học Được (LTP), một framework cắt tỉa token hoàn toàn tự động cho transformer. LTP chỉ yêu cầu so sánh điểm quan trọng token với các giá trị ngưỡng để xác định các token không quan trọng, do đó thêm độ phức tạp tối thiểu so với suy luận transformer ban đầu. Quan trọng là, các giá trị ngưỡng được học cho mỗi lớp trong quá trình huấn luyện thông qua một mask binarized mềm có thể vi phân cho phép backpropagation gradient đến các giá trị ngưỡng. So với các phương pháp cắt tỉa token tiên tiến, LTP vượt trội lên đến ~2.5% độ chính xác với cùng lượng FLOPs. Các thực nghiệm toàn diện trên GLUE và SQuAD cho thấy hiệu quả của LTP, khi nó đạt được giảm FLOPs lên đến 2.10× so với mô hình baseline chỉ trong 1% giảm độ chính xác. Triển khai sơ bộ (và không được tối ưu hóa cao) của chúng tôi cho thấy cải thiện thông lượng lên đến 1.9× và 2.0× trên Intel Haswell CPU và NVIDIA V100 GPU. Hơn nữa, LTP thể hiện tính mạnh mẽ và nhất quán tốt hơn đáng kể trên các độ dài chuỗi đầu vào khác nhau.
