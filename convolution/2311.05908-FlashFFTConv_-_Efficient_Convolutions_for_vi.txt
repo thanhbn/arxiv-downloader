@@ -1,0 +1,752 @@
+# 2311.05908.pdf
+# Chuyển đổi từ PDF sang TXT
+# Đường dẫn nguồn: /home/admin88/arxiv-downloader/convolution/2311.05908.pdf
+# Kích thước file: 3325508 bytes
+
+===============================================
+NỘI DUNG FILE PDF
+===============================================
+
+--- TRANG 1 ---
+FlashFFTConv: Tích chập hiệu quả cho dãy dài với Tensor Cores
+Daniel Y. Fu∗,1, Hermann Kumbong∗,1, Eric Nguyen2, Christopher Ré1
+∗Đóng góp ngang nhau.1Khoa Khoa học Máy tính, Đại học Stanford.
+2Khoa Kỹ thuật Sinh học, Đại học Stanford.
+{danfu,kumboh,etnguyen,chrismre}@stanford.edu
+13 tháng 11, 2023
+Tóm tắt
+Các mô hình tích chập với bộ lọc dài đã thể hiện khả năng suy luận tiên tiến trong nhiều tác vụ dãy dài nhưng lại chậm hơn so với các Transformer được tối ưu hóa nhất về thời gian thực thi. Một nút cổ chai chính là Biến đổi Fourier Nhanh (FFT)—cho phép tích chập dài chạy trong thời gian O(NlogN) với độ dài dãy N nhưng có hiệu suất sử dụng phần cứng kém. Trong bài báo này, chúng tôi nghiên cứu cách tối ưu hóa tích chập FFT. Chúng tôi tìm ra hai nút cổ chai chính: FFT không sử dụng hiệu quả các đơn vị nhân ma trận chuyên biệt, và nó gây ra chi phí I/O đắt đỏ giữa các tầng của hệ thống bộ nhớ. Để đáp ứng, chúng tôi đề xuất FlashFFTConv. FlashFFTConv sử dụng phép phân tích ma trận để tính toán FFT bằng các đơn vị nhân ma trận và cho phép kernel fusion cho dãy dài, giảm I/O. Chúng tôi cũng trình bày hai thuật toán tích chập thưa—1) tích chập từng phần và 2) tích chập thưa tần số—có thể được triển khai đơn giản bằng cách bỏ qua các khối trong phép phân tích ma trận, tạo ra thêm cơ hội tiết kiệm bộ nhớ và tính toán. FlashFFTConv tăng tốc tích chập FFT chính xác lên tới 7.93× so với PyTorch và đạt được tăng tốc lên tới 4.4× end-to-end. Với cùng ngân sách tính toán, FlashFFTConv cho phép Hyena-GPT-s đạt được 2.3 điểm perplexity tốt hơn trên PILE và M2-BERT-base đạt được 3.3 điểm GLUE score cao hơn—bằng với các mô hình có gấp đôi số lượng tham số. FlashFFTConv cũng đạt được độ chính xác 96.1% trên Path-512, một tác vụ thị giác độ phân giải cao mà trước đây chưa có mô hình nào đạt được tốt hơn 50%. Hơn nữa, tích chập từng phần cho phép các mô hình dãy dài hơn—tạo ra mô hình DNA đầu tiên có thể xử lý các gen người dài nhất (2.3M cặp base)—và tích chập thưa tần số tăng tốc các mô hình đã được huấn luyện trước trong khi duy trì hoặc cải thiện chất lượng mô hình.
+
+1 Giới thiệu
+Một thách thức chính trong machine learning là suy luận hiệu quả trên các dãy dài. Gần đây, tích chập đã nổi lên như một nguyên thủy chính cho mô hình hóa dãy, làm nền tảng cho hiệu suất tiên tiến trong mô hình hóa ngôn ngữ [42,76,94,110], phân tích chuỗi thời gian [36,46,103,115], thị giác máy tính [74,81,109], mô hình hóa DNA [82], và nhiều hơn nữa [27,55,61,71,77,80]. Mặc dù có những kết quả chất lượng mạnh mẽ này—và những lợi ích khác từ việc mở rộng tốt hơn trong độ dài dãy [46] đến sự ổn định lớn hơn [9,106]—các mô hình dãy tích chập vẫn chậm hơn so với Transformer về thời gian thực thi.
+
+Một lý do chính là hỗ trợ phần cứng kém. Khác với tích chập cổ điển được sử dụng trong các ứng dụng thị giác, thường có bộ lọc ngắn (ví dụ, 3×3 hoặc 7×7 [53,63]), tích chập cho mô hình hóa dãy thường sử dụng bộ lọc dài bằng dãy đầu vào [71,97]. Những bộ lọc dài như vậy đòi hỏi việc sử dụng thuật toán tích chập FFT, tính toán tích chập giữa đầu vào u và kernel tích chập k thông qua chuyển đổi sang không gian tần số:
+
+(u∗k)[i] = Σⱼ u[i]k[j−i] ≈ u∗k = F⁻¹(Fu⊙Fk), (1)
+
+trong đó F là FFT, có thể được tính toán trong thời gian O(NlogN) với độ dài dãy N, và ⊙ là phép nhân từng phần tử. Mặc dù có hiệu quả tiệm cận, thuật toán tích chập FFT có thời gian thực thi kém
+
+--- TRANG 2 ---
+[Hình 1 về phân cấp bộ nhớ GPU và FlashFFTConv]
+
+trên các accelerator hiện đại. Ngược lại, những tiến bộ hệ thống đã đẩy Transformer đến giới hạn của các accelerator hiện đại—đạt được hơn 72% hiệu suất FLOP end-to-end với FlashAttention-v2 [22, 24].
+
+Trong bài báo này, chúng tôi nghiên cứu cách tối ưu hóa thuật toán tích chập FFT trên các accelerator hiện đại, để cho phép khả năng context dài hơn. Giống như các tiến bộ hệ thống như FlashAttention đã mang lại cải thiện trong chất lượng mô hình hóa [1,70] và phát triển các thuật toán attention mới [2,66,73,92], chúng tôi hy vọng rằng việc hiểu cách tối ưu hóa tích chập FFT cũng có thể truyền cảm hứng cho đổi mới thuật toán, từ đó cải thiện chất lượng của các mô hình dãy tích chập.
+
+Với dãy ngắn, tích chập FFT tương đối dễ tối ưu hóa. Bộ lọc kernel thường được chia sẻ trên nhiều batch, cho phép tính toán trước FFT của bộ lọc kf=Fk và tái sử dụng nó trong một batch: (u∗k) = F⁻¹(Fu⊙kf). Do đó tích chập FFT có thể song song hóa dễ dàng trên các batch và bộ lọc, và đầu ra trung gian của tích chập có thể được cache trong SRAM hoặc thanh ghi thông qua kernel fusion.
+
+Tuy nhiên, khi độ dài dãy tăng, chúng tôi tìm thấy hai nút cổ chai chính xuất hiện. Đầu tiên, tích chập FFT không sử dụng hiệu quả các đơn vị nhân ma trận-ma trận chuyên biệt có sẵn trên các accelerator hiện đại—ví dụ, H100 có thể sử dụng tensor core để tính toán nhân ma trận-ma trận ở 1.0 PetaFLOP/s so với 67 TeraFLOP/s cho số học tổng quát. Thứ hai, dãy trở nên quá lớn để vừa với SRAM, và kernel fusion thất bại, dẫn đến chi phí I/O đắt đỏ (Hình 1 giữa phải). Những chi phí I/O này có thể bị tăng nặng bởi các phép toán padding cho tính nhân quả, và chuyển đổi từ đầu vào/đầu ra giá trị thực sang trung gian FFT giá trị phức.
+
+Để đáp ứng, chúng tôi đề xuất FlashFFTConv, một hệ thống mới tối ưu hóa tích chập FFT cho dãy dài sử dụng phân tích Monarch của FFT. Một phân tích Monarch bậc-p viết lại FFT thành một chuỗi p phép toán nhân ma trận-ma trận (Hình 1 giữa trái), có thể được ánh xạ hiệu quả lên phần cứng [23]. Bậc p kiểm soát số lượng phép toán nhân ma trận và tạo ra sự đánh đổi: giá trị p cao hơn gây ra chi phí FLOP thấp hơn thông qua ma trận nhỏ hơn, nhưng yêu cầu nhiều I/O hơn để truyền đạt kết quả trung gian. Sử dụng một mô hình chi phí GPU đơn giản, chúng tôi cho thấy cách điều chỉnh p dựa trên độ dài dãy để cân bằng chi phí FLOP và chi phí I/O. Phép phân tích này mang lại lợi ích thứ hai: giảm lượng dãy cần được giữ trong SRAM, làm cho kernel fusion khả thi ở độ dài dãy dài hơn. Kết quả là, FlashFFTConv mở rộng qua bốn bậc độ lớn trong độ dài dãy, từ 256 đến 4 triệu. FlashFFTConv cũng khai thác thuật toán FFT giá trị thực để cắt giảm độ dài phép toán FFT đi một nửa [102], và có chọn lọc bỏ qua các phần của phép toán nhân ma trận khi đầu vào được đệm bằng số không.
+
+Cuối cùng, cái nhìn ma trận của tích chập FFT trình bày một giao diện tự nhiên để triển khai hai sửa đổi kiến trúc: tích chập từng phần, học với k ngắn hơn dãy đầu vào, và tích chập thưa tần số, làm cho các phần của kernel kf trong không gian tần số bằng không. Những cái này có thể được xem như các tương đồng tích chập với attention thưa/xấp xỉ trong Transformer [8,50,51,62,92], và ánh xạ tự nhiên lên FlashFFTConv: cả hai thuật toán có thể được triển khai đơn giản bằng cách bỏ qua các phần của phân tích ma trận, từ đó giảm footprint bộ nhớ và thời gian chạy.
+
+Đánh giá Chúng tôi cho thấy FlashFFTConv tăng tốc tích chập FFT, mang lại các mô hình chất lượng cao hơn, hiệu quả hơn và dãy dài hơn.
+
+• Chất lượng FlashFFTConv cải thiện chất lượng của các mô hình dãy tích chập thông qua hiệu quả tốt hơn: với cùng ngân sách tính toán, FlashFFTConv cho phép Hyena-GPT-s đạt được 2.3 điểm perplexity tốt hơn [94],
+
+--- TRANG 3 ---
+[Hình 2: Minh họa phân tích FFT Monarch]
+
+và cho phép M2-BERT-base [42] đạt được tới 3.3 điểm GLUE score cao hơn trung bình—một mức tăng hiệu suất tương đương với việc nhân đôi các tham số của mô hình.
+
+• Hiệu quả FlashFFTConv làm cho tích chập hiệu quả hơn qua bốn bậc độ lớn trong độ dài dãy, mang lại tăng tốc lên tới 7.93× và tiết kiệm bộ nhớ lên tới 5.60× so với PyTorch. FlashFFTConv đạt được tới 62.3% hiệu suất FLOP end-to-end—chỉ ít hơn 10% so với FlashAttention-v2—và nhanh hơn về thời gian thực thi so với FlashAttention-v2 end-to-end ở độ dài dãy 2K trở lên do chi phí FLOP thấp hơn.
+
+• Mô hình dãy dài hơn FlashFFTConv cho phép các mô hình dãy dài hơn. Trong phân loại hình ảnh độ phân giải cao, FlashFFTConv tạo ra mô hình đầu tiên có thể giải quyết tác vụ Path-512 đầy thách thức (độ dài dãy 256K) từ benchmark long range arena [104]. Trong mô hình hóa DNA, FlashFFTConv sử dụng tích chập từng phần để mở rộng HyenaDNA [82] đến độ dài dãy 4M—tạo ra mô hình đầu tiên có thể nhúng các gen người dài nhất (lên tới 2.3M cặp base) ở độ phân giải nucleotide đơn.
+
+Nhìn chung, chúng tôi hy vọng rằng FlashFFTConv cho phép áp dụng rộng rãi hơn các mô hình dãy tích chập và những hiểu biết từ công việc của chúng tôi giúp thông báo cho việc thiết kế các kiến trúc hiệu quả phần cứng tốt hơn.
+
+2 Bối cảnh
+Chúng tôi cung cấp một số bối cảnh về tích chập FFT và phân tích FFT Monarch, và thảo luận về đặc tính hiệu suất của GPU.
+
+2.1 Tích chập FFT
+Nhớ lại định nghĩa của một phép toán tích chập: (u∗k)[i] = Σⱼ uⱼki-j. Tính toán công thức này trực tiếp gây ra O(NNk) FLOP trong độ dài dãy N và độ dài kernel Nk. Với tích chập dài, trong đó Nk=N, một chiến lược phổ biến là sử dụng biến đổi Fourier để chuyển đổi tín hiệu u và kernel k sang miền tần số, và tính toán tích chập sử dụng phép nhân từng điểm trong miền tần số, sử dụng Phương trình 1. Quan trọng, một biến đổi Fourier FN trên một đầu vào có độ dài N có thể được tính toán trong thời gian O(NlogN) sử dụng FFT—đưa chi phí tổng thể của tích chập dài từ O(N²) xuống O(NlogN). Chúng tôi lưu ý rằng tích chập FFT về mặt kỹ thuật tính toán một tích chập tròn ΣN uⱼki-j, trong đó i-j<0 quay lại cuối k. Vì lý do này, u và k thường được đệm bằng số không để tính toán tích chập nhân quả.
+
+Phân tích FFT Monarch Hình 2 cho thấy một minh họa của phân tích FFT Monarch bậc-2. Với N=N₁N₂, một phân tích FFT Monarch bậc-2 viết lại FN=P(IN₂⊗FN₁)DP⁻¹(IN₁⊗FN₂)P, trong đó ⊗ biểu thị tích Kronecker, FN là ma trận Fourier rời rạc N×N, P là ma trận hoán vị reshape đầu vào thành N₁×N₂, chuyển vị nó thành N₂×N₁, và sau đó reshape nó trở lại N, và D∈CN×N là ma trận đường chéo chứa các giá trị hiệu chỉnh gọi là hệ số Twiddle [6]. Các phân tích Monarch bậc cao hơn đệ quy áp dụng phân tích bậc-2 cho FN₁ hoặc FN₂, điều này giảm chi phí FLOP nhưng tăng số lượng phép toán hoán vị, tăng chi phí I/O.
+
+2.2 Đặc tính hiệu suất GPU
+Chúng tôi cung cấp một số bối cảnh về hệ thống bộ nhớ phân cấp GPU và các đơn vị tính toán có sẵn, cũng như các phép toán bị ràng buộc tính toán so với bị ràng buộc bộ nhớ. Chúng tôi tập trung vào lập trình GPU trong bài báo này, nhưng các nguyên tắc chung
+
+--- TRANG 4 ---
+mở rộng cho hầu hết các accelerator phần cứng hiện đại [35, 57, 68, 114].
+
+Mô hình tính toán GPU và hệ thống bộ nhớ phân cấp GPU có hệ thống bộ nhớ phân cấp bao gồm bộ nhớ toàn cục (HBM), bộ nhớ chia sẻ (SRAM), và thanh ghi, như được hiển thị trong Hình 1 Trái. Các tầng thấp hơn/lớn hơn của hệ thống bộ nhớ phân cấp có nhiều không gian hơn nhưng chậm hơn nhiều, trong khi các tầng cao hơn/nhỏ hơn của hệ thống bộ nhớ phân cấp có ít không gian hơn nhưng nhanh hơn nhiều [83–85]. Hệ thống bộ nhớ phân cấp được liên kết chặt chẽ với mô hình tính toán GPU. Một GPU được tạo thành từ nhiều bộ xử lý đa luồng độc lập (SM), mỗi bộ được tạo thành từ các luồng độc lập. HBM được chia sẻ giữa tất cả SM, nhưng mỗi SM có SRAM độc lập. SRAM được chia sẻ giữa tất cả các luồng trong SM. Mỗi luồng có quyền truy cập vào thanh ghi riêng của nó, nhưng không thể truy cập thanh ghi của các luồng khác. Do đó, thực hiện các phép toán toàn cục giữa các SM yêu cầu di chuyển dữ liệu đến và từ HBM, trong khi công việc độc lập trong mỗi SM có thể giữ nguyên cục bộ trong SRAM.
+
+Đơn vị tính toán GPU GPU hiện đại (từ V100 [83]) có các đơn vị nhân ma trận chuyên biệt gọi là tensor core, có thể tính toán các phép toán nhân ma trận-ma trận với TFLOP cao hơn nhiều so với các đơn vị tính toán đa năng. Ví dụ, tensor core H100 có thể tính toán phép nhân ma trận giữa các ma trận 16×16 ở 1.0 PFLOP, trong khi các đơn vị tính toán đa năng chỉ có thể tính toán ở 67 TFLOP [85].
+
+Phép toán bị ràng buộc bộ nhớ so với bị ràng buộc tính toán Các phép toán GPU có thể bị ràng buộc bộ nhớ hoặc bị ràng buộc tính toán. Phép toán bị ràng buộc bộ nhớ bị nghẽn cổ chai bởi lượng I/O giữa HBM và thanh ghi mà chúng cần thực hiện, và bị giới hạn bởi băng thông của hệ thống bộ nhớ phân cấp. Ví dụ bao gồm các phép toán từng điểm đơn giản như cộng hoặc nhân, cũng như hầu hết các triển khai FFT truyền thống. Phép toán bị ràng buộc tính toán bị nghẽn cổ chai bởi lượng FLOP mà chúng cần thực thi, và bị giới hạn bởi tốc độ của các đơn vị tính toán. Ví dụ bao gồm các phép toán nhân ma trận lớn.
+
+Kernel Fusion Một phương pháp phổ biến để giảm chi phí I/O là kernel fusion—tải dữ liệu cho nhiều phép toán vào SRAM, tính toán chúng độc lập trong mỗi SM, và sau đó viết kết quả cuối cùng trở lại HBM. Kernel fusion phổ biến (và có thể được tự động hóa) cho các phép toán từng điểm [93], nhưng khó khăn hơn cho các phép toán phức tạp yêu cầu tham chiếu nhiều phần dữ liệu. Ví dụ, fusion các phép toán trong attention không phổ biến cho đến khi phát triển FlashAttention [24].
+
+3 FlashFFTConv
+[Hình 3: FlashFFTConv]
+
+Mục 3.1 cung cấp tổng quan rộng về FlashFFTConv và cho thấy cách thích ứng phân tích FFT Monarch với tích chập, bao gồm việc broadcast phép nhân ma trận song song qua dãy đầu vào. Chúng tôi cũng mô tả chiến lược kernel fusion và cách chúng tôi khai thác các thuộc tính cụ thể miền của tích chập trong ML để tối ưu hóa thêm. Mục 3.2 trình bày một mô hình chi phí đặc trưng cho chi phí tương đối của các phân tích FFT bậc-p khác nhau khi độ dài dãy thay đổi, cùng với một heuristic đơn giản để chọn p cho các đặc tính phần cứng. Cuối cùng, Mục 3.3 thảo luận về các mở rộng kiến trúc bằng cách trình bày các tương đồng với sparsity trong kernel tích chập.
+
+3.1 Thuật toán FlashFFTConv
+Chúng tôi mô tả thuật toán FlashFFTConv cốt lõi. Thuật toán 1 cung cấp tổng quan. Đầu tiên chúng tôi mô tả cách chúng tôi thích ứng phân tích FFT Monarch cho tích chập. Sau đó, chúng tôi thảo luận về cách phân tích Monarch cho phép kernel fusion cho
+
+--- TRANG 5 ---
+Thuật toán 1 Thuật toán cốt lõi FlashFFTConv, với phân tích Monarch bậc-2. Chúng tôi giả sử N=N₁² cho đơn giản ở đây.
+
+Input: Đầu vào u∈RB×H×N, kernel tích chập kf∈CH×N, ma trận FFT F∈CN₁×N₁, F⁻¹∈CN₁×N₁, hệ số Twiddle t∈CN, tinv∈CN, kích thước tile B Btile, kích thước tile H Htile.
+Output: Đầu ra y∈RB×H×N.
+
+for SM song song qua B/Btile×H/Htile do
+    Tải F, F⁻¹, t, tinv từ HBM.
+    for h←1 to Htile do
+        Tải Kf←kf[h] từ HBM, reshape thành N₁×N₁.
+        for b←1 to Btile do
+            Tải X←u[b, h] từ HBM, reshape thành N₁×N₁.
+            X←((F⊤X)∗t)F ▷FFT, phân tích thành hai bước
+            X←X∗Kf⊤ ▷Nhân từng phần tử với kf
+            Y←((XF⁻¹)⊤∗tinv)F⁻¹ ▷FFT nghịch đảo, phân tích thành hai bước
+            Viết Y⊤ vào HBM.
+
+dãy dài. Chúng tôi kết luận bằng cách trình bày các tối ưu hóa cụ thể miền.
+
+Thích ứng Monarch cho Fusion Phân tích FFT Monarch, cũng như các thuật toán cổ điển như thuật toán FFT của Bailey [6], truyền thống broadcast phép toán ma trận đối với chiều batch và chiều ẩn, như được hiển thị trong Hình 3 trên trái. Điều này cho phép mỗi phép toán FN₁ trong ma trận IN₂⊗FN₁ chạy độc lập. Tuy nhiên, nó cũng làm cho kernel fusion khó khăn; fusion qua các phép toán nhân ma trận và hoán vị yêu cầu tải ít nhất 16 dãy cùng lúc vào SRAM để lấp đầy đơn vị nhân ma trận—giới hạn độ dài dãy khoảng 2K trên A100 và H100.
+
+Thay vào đó, chúng tôi broadcast phép toán ma trận qua toàn bộ dãy, như được hiển thị trong Hình 3 trên phải, và chạy thuật toán song song qua các chiều batch và ẩn. Điều này giảm yêu cầu SRAM cho kernel fusion, vì chúng tôi chỉ cần tải một dãy duy nhất vào SRAM tại một thời điểm—cho phép chúng tôi fusion toàn bộ kernel cho dãy lên tới 32K trên A100 và H100. Broadcasting dọc theo dãy có lợi ích bổ sung: các hoán vị đơn giản trở thành các transpose ma trận (Hình 3 dưới), có thể được thực hiện nhanh chóng sử dụng các routine đã được thiết lập tốt on-chip [84]. Cuối cùng, chúng tôi cũng tile tính toán qua các chiều B và H để giảm chi phí tải kf, F, và các hệ số twiddle từ HBM. Thuật toán cốt lõi được hiển thị trong Thuật toán 1 cho phân tích hai chiều. Các phân tích bậc cao hơn và chi tiết hơn được đưa ra trong Phụ lục A.
+
+Kernel Fusion và Recomputation Phân tích Monarch cho phép kernel fusion cho dãy dài. Các tầng bên trong của phân tích không yêu cầu toàn bộ dãy, điều này giảm yêu cầu SRAM cho fusion. Do đó, đối với dãy dài, chúng tôi có thể fusion các phép toán ma trận bên trong nhất và phép nhân từng phần tử, và thực hiện một I/O cho mỗi phép toán ma trận bên ngoài nhất. Chúng tôi cũng sử dụng recomputation trong lượt backward để giảm footprint bộ nhớ và chi phí I/O. Thay vì lưu trữ kết quả trung gian trên HBM cho lượt backward (ví dụ, kết quả trung gian của FNu), chúng tôi đơn giản tính toán lại chúng trong lượt backward.
+
+Tối ưu hóa cụ thể miền Cuối cùng, chúng tôi sử dụng một vài tối ưu hóa cụ thể miền để thích ứng tích chập đặc biệt cho khối lượng công việc học dãy. Đầu tiên, vì các tích chập được sử dụng trong học dãy là tích chập thực-thành-thực (với trọng số kernel thực), chúng tôi có thể sử dụng một thuật toán cổ điển gọi là decimation một giai đoạn theo thời gian để tính toán FFT của một dãy có độ dài N sử dụng FFT phức có độ dài N/2 (xem Phụ lục A)—cắt giảm chi phí FFT đi một nửa. Thứ hai, đầu vào và đầu ra thường được đệm bằng số không trong tích chập để tính toán tích chập nhân quả [42,46,94]. Chúng tôi xử lý đặc biệt padding này, và sử dụng nó để loại bỏ một nửa các phép toán nhân ma trận bên ngoài nhất trong FFT và iFFT. Chúng tôi cũng fusion thêm các phép toán xung quanh tích chập, như elementwise-gating, để giảm I/O thêm nữa.
+
+--- TRANG 6 ---
+Mô hình chi phí cho phân tích Monarch bậc-p
+[Hình 4: Biểu đồ chi phí tính toán của các phân tích Monarch bậc-p khác nhau]
+
+3.2 Mô hình chi phí của phân tích Monarch bậc-p
+Chúng tôi trình bày một mô hình chi phí chính thức cho phân tích Monarch bậc-p của tích chập dựa trên độ dài dãy. Mô hình chi phí tính đến cả chi phí tính toán và I/O, tương tự như phân tích roofline [54].
+
+Cho B và H lần lượt là kích thước batch và chiều ẩn mô hình, và giả sử rằng chúng tôi tính toán tích chập ở độ chính xác nửa. Cho N là độ dài dãy, và cho N = Πᵢ₌₁ᵖ Nᵢ là tích của p thừa số. Để đơn giản, chúng tôi sẽ giả sử rằng N là lũy thừa của 2. Cho μ là kích thước của đơn vị nhân ma trận-ma trận trên GPU (ví dụ, 16 cho A100 [84] và H100 [85]). Cho τG và τM lần lượt là FLOP có thể đạt được thực nghiệm trên GPU cho số học đa năng và số học nhân ma trận-ma trận. Để thuận tiện, định nghĩa γ(Nᵢ) như một hàm helper trả về τG nếu Nᵢ < μ, và τM nếu Nᵢ ≥ μ. Cuối cùng, cho σH và σS lần lượt là băng thông có thể đạt được thực nghiệm cho HBM và SRAM. Các giá trị mẫu cho những hằng số này được đưa ra trong Phụ lục C.
+
+Bây giờ, chúng tôi có thể trình bày chi phí của tích chập FFT với phân tích Monarch bậc-p. Cho ω(i) là hàm helper trả về băng thông của bộ nhớ nơi kết quả trung gian của bước phân tích i được lưu trữ. Chi phí tổng thể của tích chập sử dụng phân tích Monarch bậc-p được đưa ra bởi:
+
+C = BH Σᵢ₌₁ᵖ (16NNᵢ/γ(Nᵢ) + 4N/ω(i))  (2)
+
+Hình 4 vẽ biểu đồ Phương trình 2 cho các phân tích bậc-p khác nhau trên các độ dài dãy khác nhau cho A100, với p∈{2,3,4}. Với trường hợp N₁=···=Nₚ, tổng chi phí FLOP của phân tích bậc-p tăng với O(N^(p+1)/p). Tuy nhiên, đối với dãy ngắn hơn, các phân tích bậc cao hơn thực sự đắt hơn, vì chúng phân tích thành ma trận nhỏ hơn đơn vị nhân ma trận-ma trận (tương ứng với các bump đầu). Cũng lưu ý bump trong chi phí cho p=3 giữa 32K và 64K, là kết quả của việc hết SRAM nhưng được điều hòa bởi phân tích bổ sung cho p=4.
+
+3.3 Mở rộng kiến trúc: Sparsity trong tích chập
+Chúng tôi trình bày 2 mở rộng kiến trúc cho FlashFFTConv: tích chập từng phần và tích chập thưa tần số. Những cái này có thể được nghĩ như các tương đồng tích chập với sparse attention và trình bày cơ hội cho tối ưu hóa thêm.
+
+Tích chập từng phần Trong tích chập từng phần, chúng tôi làm cho các phần sau của kernel tích chập bằng không, tương tự như local attention. Điều này có hai lợi ích. Đầu tiên, nó giảm footprint bộ nhớ, vì nó yêu cầu ít phần tử hơn được giữ trong bộ nhớ GPU cùng lúc. Thứ hai, nó cho phép mở rộng tự nhiên của mô hình tích chập đã được huấn luyện trước đến dãy dài hơn (tức là, thông qua phương pháp sliding window).
+
+--- TRANG 7 ---
+Bảng 1: Cải thiện chất lượng với ngân sách tính toán cố định.
+[Bảng hiển thị kết quả so sánh PyTorch vs FlashFFTConv]
+
+Bảng 2: Độ chính xác phân loại (↑) trên Path-X và Path-512 từ benchmark long range arena [104].
+[Bảng hiển thị kết quả với FlashFFTConv cho phép phân loại độ phân giải cao hơn]
+
+Tích chập thưa tần số Trong tích chập thưa tần số, chúng tôi làm cho các phần của kernel tích chập trong không gian tần số bằng không, tức là làm cho các phần của kf bằng không. Điều này có thể được nghĩ như một biến thể của tích chập từng phần trong không gian tần số. Ở đây, mẫu sparsity cụ thể có thể mang lại lợi ích tính toán. Làm cho các phần phù hợp của kernel bằng không có thể loại bỏ nhu cầu tính toán các phần của phép nhân ma trận-ma trận trong phân tích Monarch. Chúng tôi trình bày ví dụ về các mẫu sparsity như vậy trong Phụ lục A.
+
+4 Thử nghiệm
+Trong phần này, chúng tôi đánh giá FlashFFTConv về mặt chất lượng và hiệu quả. Đầu tiên (Mục 4.1), chúng tôi cho thấy FlashFFTConv cho phép các mô hình đạt được chất lượng tốt hơn với cùng ngân sách tính toán trong mô hình hóa ngôn ngữ—phù hợp với hiệu suất của các mô hình có gấp đôi tham số miễn phí. FlashFFTConv cũng cho phép chất lượng cao hơn thông qua độ phân giải cao hơn trong phân loại hình ảnh—giải quyết tác vụ Path-512 đầy thách thức lần đầu tiên chỉ đơn giản thông qua tăng độ dài dãy. Tiếp theo (Mục 4.2), chúng tôi chứng minh tăng tốc của FlashFFTConv so với các triển khai tích chập khác, đánh giá mức tăng hiệu quả khi được sử dụng trong các mô hình tích chập, và so sánh mô hình tích chập sử dụng FlashFFTConv với Transformer sử dụng FlashAttention-v2. Cuối cùng (Mục 4.3), chúng tôi đánh giá tích chập từng phần và thưa tần số. Tích chập từng phần tạo ra mô hình DNA đầu tiên có thể nhúng các gen dài nhất ở độ phân giải nucleotide đơn (2.3M cặp base), và tích chập thưa tần số mang lại tăng tốc trong khi duy trì—hoặc cải thiện—chất lượng.
+
+4.1 Tác động của hiệu quả lên chất lượng
+Chúng tôi nghiên cứu cách FlashFFTConv tác động đến chất lượng downstream. Đầu tiên, với hai triển khai có cùng ngân sách tính toán, FlashFFTConv đạt được chất lượng cao hơn do throughput huấn luyện cao hơn. Thứ hai, chúng tôi cho thấy rằng hiệu quả cải thiện có thể dẫn đến chất lượng cao hơn thông qua độ dài dãy dài hơn.
+
+Cải thiện chất lượng với ngân sách tính toán cố định Để đánh giá tác động của hiệu quả lên chất lượng downstream, chúng tôi huấn luyện hai mô hình ngôn ngữ tích chập phổ biến, M2-BERT-base [42] và Hyena-s [94], từ đầu. Những mô hình này được huấn luyện theo kiểu BERT (masked language modeling) và kiểu GPT (dự đoán token tiếp theo), tương ứng. Chúng tôi so sánh chất lượng của các mô hình được huấn luyện với cùng ngân sách tính toán nhưng các triển khai tích chập khác nhau—hoặc FlashFFTConv hoặc triển khai PyTorch của tích chập FFT. FlashFFTConv đạt được throughput pretraining cao hơn, cho phép các mô hình thấy nhiều dữ liệu hơn trong quá trình pretraining. Những mức tăng hiệu quả này cải thiện điểm GLUE trung bình lên tới 3.4 điểm cho M2-BERT-base và perplexity 2.3 điểm cho Hyena-s. Để tham khảo, những cải thiện chất lượng này tương tự về độ lớn với hiệu ứng của việc nhân đôi số lượng tham số trong mô hình (xem Phụ lục B cho kết quả tham khảo).
+
+Mô hình dãy dài hơn Tiếp theo, chúng tôi cho thấy cách hiệu quả tăng có thể dẫn đến chất lượng cao hơn thông qua độ dài dãy dài hơn. Chúng tôi đánh giá các mô hình tích chập dài trên Path-X và Path-512, các tác vụ hình ảnh độ phân giải cao
+
+--- TRANG 8 ---
+Bảng 3: Thời gian (↓) để tính toán lượt forward của tích chập với FlashFFTConv tính bằng millisecond trên một H100-SXM, cũng như các ablation loại bỏ các tối ưu hóa cụ thể. Chúng tôi cũng hiển thị tiết kiệm bộ nhớ. Tất cả kết quả được scale đến batch size 64, hidden dimension 768. p chỉ bậc của phân tích Monarch.
+
+[Bảng hiển thị kết quả thời gian và tăng tốc cho các độ dài dãy khác nhau]
+
+từ benchmark long range arena (LRA) [104]. Các tác vụ này lấy một hình ảnh (128×128 cho Path-X và 512×512 cho Path-512), làm phẳng nó, và yêu cầu mô hình dãy phân loại xem hai chấm trong hình ảnh có được kết nối bởi một đường dẫn hay không.
+
+Các triển khai PyTorch hiện có của các mô hình dãy tích chập (hoặc thậm chí các triển khai tối ưu hóa trước đó [43]) thất bại trong việc đạt được độ chính xác tốt hơn ngẫu nhiên (50%) trên Path-512 do lỗi hết bộ nhớ và thiếu hỗ trợ cho dãy dài như vậy. Tuy nhiên, Bảng 2 cho thấy rằng FlashFFTConv cho phép mô hình dãy tích chập giải quyết Path-512 lần đầu tiên chỉ đơn giản bằng cách tăng độ dài dãy có sẵn và giảm footprint bộ nhớ của mô hình thông qua fusion.
+
+4.2 Hiệu quả
+Chúng tôi đánh giá FlashFFTConv về tốc độ tính toán tích chập so với baseline PyTorch, và mức tăng tốc mà nó mang lại cho các mô hình dãy tích chập end-to-end. Chúng tôi cũng đánh giá tiết kiệm bộ nhớ so với PyTorch và so sánh hiệu quả end-to-end với Transformer được tối ưu hóa cao sử dụng FlashAttention-v2 [22].
+
+FlashFFTConv tăng tốc tích chập Chúng tôi benchmark tốc độ của tích chập so với tích chập FFT được triển khai trong PyTorch. Chúng tôi cũng benchmark các ablation đánh giá kernel fusion mà không sử dụng tensor core—phục hồi baseline mạnh của việc sử dụng thư viện kernel fusion cuFFTdx của Nvidia [87]—và FlashFFTConv mà không có các tối ưu hóa cụ thể miền của nó.
+
+Bảng 3 cho thấy FlashFFTConv vượt trội hơn tích chập FFT PyTorch trên tất cả độ dài dãy, lên tới 6.54×. Tăng tốc lớn nhất đối với dãy ngắn, nơi tích chập FFT PyTorch bị chi phối bởi chi phí I/O. Tăng tốc khiêm tốn hơn đối với dãy dài hơn, gây ra chi phí I/O bổ sung (giữa thanh ghi và SRAM cho p=3 và giữa SRAM và HBM cho p=4). Mà không sử dụng phân tích Monarch cho tensor core (chỉ fusion), FlashFFTConv trở thành nghẽn cổ chai bởi tốc độ của các phép toán số học tổng quát trên GPU, và không hỗ trợ dãy dài hơn 32K do thiếu không gian SRAM. Các benchmark thêm được đưa ra trong Phụ lục B.
+
+Tối ưu hóa cụ thể miền cung cấp tăng tốc thêm Chúng tôi cũng benchmark các tối ưu hóa cụ thể miền trong FlashFFTConv. Bảng 4 cho thấy hiệu suất của tích chập gated y=v⊙((u⊙w)∗k), trong đó v và w là các projection tuyến tính của đầu vào u. Mẫu này phổ biến trong các kiến trúc tích chập và dựa trên SSM cho mô hình hóa ngôn ngữ [43,44,78,94]. Triển khai PyTorch của tích chập gated gây ra chi phí I/O bổ sung từ các phép toán gating, trong khi FlashFFTConv fusion các phép toán gating vào tích chập. Fusion này dẫn đến tăng tốc thêm so với PyTorch, lên tới 7.93×. Các benchmark của các tối ưu hóa cụ thể miền thêm như implicit padding (tức là, padding đầu vào để đảm bảo tính nhân quả, mà không chạy phép toán padding bổ sung) được đưa ra trong Phụ lục B.
+
+--- TRANG 9 ---
+Bảng 4: Thời gian (↓) để tính toán lượt forward của tích chập gated với FlashFFTConv tính bằng millisecond trên một H100-SXM. Chúng tôi cũng hiển thị tiết kiệm bộ nhớ. Tất cả kết quả được scale đến batch size 64, hidden dimension 768. p chỉ bậc của phân tích Monarch.
+
+[Bảng hiển thị kết quả thời gian và tăng tốc cho tích chập gated]
+
+Bảng 5: Throughput end-to-end (↑) của các mô hình dãy tích chập so với PyTorch.
+
+[Bảng hiển thị kết quả throughput cho các mô hình khác nhau]
+
+FlashFFTConv cung cấp tiết kiệm bộ nhớ Bảng 3 và 4 cũng cho thấy tiết kiệm bộ nhớ từ FlashFFTConv so với PyTorch. FlashFFTConv giảm footprint bộ nhớ của tích chập và tích chập gated bằng cách sử dụng recomputation trong lượt backward và kernel fusion. Tiết kiệm bộ nhớ tuyệt đối cho tích chập gated lớn hơn, vì FlashFFTConv không cần lưu trữ các activation trung gian từ các phép toán gating (xem Phụ lục B), nhưng tiết kiệm bộ nhớ tương đối nhỏ hơn vì tích chập gated chiếm nhiều bộ nhớ hơn.
+
+FlashFFTConv tăng tốc các mô hình dãy tích chập Chúng tôi benchmark throughput end-to-end của các mô hình dãy tích chập qua nhiều modality và độ dài dãy khác nhau kéo dài bốn bậc độ lớn. Chúng tôi benchmark M2-BERT-base [42], mô hình ngôn ngữ kiểu BERT có độ dài dãy 128; Hyena-s-4K [94], mô hình ngôn ngữ kiểu GPT có độ dài dãy 4K; mô hình tích chập dài [44] được huấn luyện trên Path-X với độ dài dãy 16K [104]; SaShiMi [45], mô hình sinh âm thanh được huấn luyện trên các clip âm thanh 1 giây được sample ở 64 KHz; và HyenaDNA-1M [82], mô hình mô hình hóa DNA được huấn luyện trên độ dài dãy 1M. Chi tiết của các kiến trúc và tối ưu hóa cụ thể kiến trúc (như fusion multiplicative gating cho các mô hình M2 và Hyena) được đưa ra trong Phụ lục C.
+
+Bảng 5 cho thấy FlashFFTConv tăng tốc các mô hình này end-to-end. Tăng tốc thay đổi theo kích thước của các mô hình và lượng thời gian tương đối được dành để tính toán tích chập so với các phần khác của mô hình. Ví dụ, FlashFFTConv chỉ tăng tốc mô hình SaShiMi 1.3×, vì mô hình interleave tích chập với sinh bộ lọc dựa trên SSM, các tầng pooling, và MLP, điều này giảm lượng thời gian tương đối được dành để tính toán tích chập. Tăng tốc lớn nhất cho HyenaDNA, nơi PyTorch bị nghẽn cổ chai bởi batch size nhỏ. Triển khai PyTorch chỉ cho phép batch size 1 trên GPU 80GB, trong khi FlashFFTConv cho phép batch size 4—mang lại tăng tốc đáng kể.
+
+FlashFFTConv nhanh hơn FlashAttention-v2 Chúng tôi so sánh hiệu quả end-to-end của mô hình Hyena 2.7B tham số sử dụng FlashFFTConv với mô hình GPT 2.7B tham số sử dụng FlashAttention-v2 [22] ở ba độ dài dãy. Bảng 6 cho thấy throughput, hiệu suất FLOP end-to-end, và tăng tốc. FlashFFTConv đạt được hiệu suất FLOP end-to-end thấp hơn so với FlashAttention-v2 nhưng đạt được throughput cao hơn, vì tích chập gây ra ít FLOP tổng thể hơn.
+
+--- TRANG 10 ---
+Bảng 6: Throughput end-to-end (↑) tính bằng nghìn token mỗi giây, hiệu suất FLOP, và tăng tốc của Hyena so với GPT chạy FlashAttention-v2 [22] qua các độ dài dãy cho A100.
+
+[Bảng hiển thị kết quả so sánh throughput]
+
+Bảng 7: Chất lượng và footprint bộ nhớ của tích chập từng phần trong quá trình huấn luyện qua các độ dài dãy.
+
+[Bảng hiển thị kết quả perplexity và memory footprint]
+
+4.3 Tích chập từng phần và thưa tần số
+Chúng tôi đánh giá tác động của tích chập từng phần đối với chất lượng downstream và footprint bộ nhớ và về mức độ chúng có thể mở rộng độ dài dãy của các mô hình hiện có. Chúng tôi đánh giá tác động của tích chập thưa tần số đối với chất lượng downstream, và chúng tôi cho thấy rằng tích chập thưa tần số có thể mang lại tăng tốc lên tới 1.4× bổ sung trong tích chập mà không ảnh hưởng đến chất lượng.
+
+Tích chập từng phần giảm footprint bộ nhớ và tăng độ dài dãy Tích chập từng phần giảm footprint bộ nhớ của các mô hình, trong cả mô hình hóa ngôn ngữ và mô hình hóa DNA. Một tỷ lệ lớn các bộ lọc tích chập có thể được pruning mà không ảnh hưởng đến chất lượng downstream. Bảng 7 cho thấy rằng mô hình Hyena-s-8K có thể được pretrain với kernel tích chập ngắn hơn nhiều—ngắn đến 2K—mà không ảnh hưởng tiêu cực đến chất lượng.
+
+Tích chập từng phần mang lại lợi ích khác: chúng tôi có thể mở rộng tự nhiên độ dài dãy của các mô hình đã được huấn luyện trước hiện có. Chúng tôi mở rộng mô hình HyenaDNA-1M đã được huấn luyện trước đến độ dài dãy 4M với kết quả PPL hứa hẹn (Bảng 8)—tạo ra mô hình đầu tiên có thể nhúng các gen người dài nhất ở độ phân giải nucleotide đơn (2.3M cặp base) (Xem Phụ lục B để có trực quan hóa về embedding gen).
+
+Tích chập thưa tần số tăng throughput Tích chập thưa tần số có thể tăng tốc độ của tích chập—và cũng có thể có hiệu ứng tích cực đối với chất lượng. Bảng 9 cho thấy chúng tôi có thể đặt lên tới 79% các entry của kernel kf bằng không mà không mất chất lượng. Sparsification trong không gian tần số thậm chí có thể cải thiện chất lượng của các mô hình đã được huấn luyện trước một chút; PPL của mô hình HyenaDNA-1M đã được huấn luyện trước cải thiện 0.01 điểm sau khi kernel của nó được sparsified 75% trong không gian tần số—có thể là kết quả của việc loại bỏ nhiễu tần số cao. Sparsification cũng mang lại tăng tốc lên tới 1.4× trong tích chập thông qua việc bỏ qua toàn bộ khối của phép nhân ma trận-ma trận trong phân tích Monarch. Phụ lục C cung cấp thêm chi tiết về các mẫu sparsity được sử dụng trong Bảng 9.
+
+5 Công việc liên quan
+Tích chập dài trong mô hình hóa dãy Các mô hình tích chập dài đã nổi lên như một thay thế hứa hẹn cho Transformer trong mô hình hóa dãy [42–44,46–48,52,76,82,94,96,97,101]. Những phương pháp này khác nhau trong cách chúng tạo ra kernel tích chập; ví dụ, dòng công việc S4 sử dụng các mô hình state space đã học [46,49,76,78], trong khi các công việc khác [94,96,97] tham số hóa tích chập sử dụng MLP từ encoding vị trí. Tuy nhiên, tất cả các mô hình hoạt động bằng cách thực hiện tích chập trên dãy đầu vào với kernel dài bằng đầu vào: y=u∗k, trong đó u∈RB×H×N, k∈RH×N, và kernel k được broadcast dọc theo chiều B. Khi được sử dụng cho mô hình hóa ngôn ngữ, những mô hình này thường kết hợp elementwise
+
+--- TRANG 11 ---
+Bảng 8: PPL (↓) từ việc sử dụng tích chập từng phần để mở rộng độ dài dãy của HyenaDNA đến dãy dài hơn. Ở độ dài dãy 4M, các mô hình có thể nhúng các gen người dài nhất.
+
+[Bảng hiển thị kết quả PPL cho các độ dài base filter khác nhau]
+
+Bảng 9: Áp dụng frequency-sparsity cho các bộ lọc của mô hình HyenaDNA-1M đã được huấn luyện trước.
+
+[Bảng hiển thị kết quả sparsity fraction và convolution speedup]
+
+multiplicative gating: y=f(u)⊙((g(u)⊙h(u))∗k), trong đó f, g, và h là các ánh xạ tuyến tính dọc theo chiều H [42, 43, 78, 94, 110].
+
+Ứng dụng context dài Các mô hình tích chập dài đặc biệt hữu ích cho các ứng dụng context dài, như mô hình hóa DNA và tổng hợp giọng nói. Trong mô hình hóa DNA, hầu hết các mô hình genomic context dài hơn đã dựa vào tokenization [56,107,113] hoặc downsampling [3,38]. Tuy nhiên, công việc gần đây đã gợi ý rằng mô hình hóa DNA trực tiếp từ cặp base có thể mang lại cải thiện downstream trong chất lượng, điều này yêu cầu độ dài dãy dài [82].
+
+Giống như mô hình hóa DNA, tổng hợp giọng nói cũng đã hưởng lợi từ mô hình hóa context dài. Trong khi các pipeline tổng hợp giọng nói truyền thống sử dụng các biểu diễn trung gian như spectrogram [64,95,99], đặc trưng ngôn ngữ [10,59,89], hoặc mã âm thanh rời rạc [30,31,67,108], công việc gần đây đã cho thấy rằng mô hình hóa giọng nói trực tiếp từ waveform thô có thể mang lại cải thiện downstream trong chất lượng [45]. Một lần nữa, những mô hình như vậy yêu cầu dãy dài để mô hình hóa âm thanh ở tốc độ mà nó được sample tự nhiên, đòi hỏi mô hình hóa dãy dài.
+
+Thuật toán FFT Có một lịch sử lâu dài của các thuật toán FFT hiệu quả, từ thuật toán FFT Cooley-Tukey được xuất bản năm 1965 [19] đến các thuật toán FFT song song [4] và nhiều hơn nữa [5,6,18]. Những thuật toán này đã cho phép tiến bộ cơ bản trong một loạt các ngành, từ lý thuyết điều khiển [7,12] đến xử lý tín hiệu [90,91]. Khi FFT trở nên hữu ích hơn cho các ứng dụng deep learning hiện đại, như tích chập dài, các kỹ thuật mới được yêu cầu để chạy chúng hiệu quả trên các accelerator hiện đại. Công việc của chúng tôi tiếp tục một dòng công việc khám phá cách sử dụng tensor core cho tích chập FFT [43,44,69], và mở rộng khả năng thuật toán đến dãy dài hơn nhiều.
+
+Sparsity trong deep learning Khi các mô hình deep learning đã trở nên lớn hơn và sâu hơn [11,13,17], có sự quan tâm ngày càng tăng trong việc giảm chi phí huấn luyện và chạy mô hình. Sparsity đặc biệt đã nhận được rất nhiều chú ý, và có lịch sử lâu dài trong machine learning, bao gồm công việc trong pruning mạng neural [32,50,51,72,98] và tìm kiếm lottery ticket [39–41]. Công việc của chúng tôi trong tích chập từng phần và tích chập thưa tần số liên quan đến dòng công việc này, như một tương đồng của sparsity trong bộ lọc tích chập. Phân tích Monarch cũng liên quan chặt chẽ đến ma trận có cấu trúc. Ma trận có cấu trúc có tham số và runtime subquadratic (o(n²) cho chiều n×n), như ma trận thưa và low-rank, và các biến đổi nhanh (Fourier, Chebyshev, sine/cosine, đa thức trực giao) [23]. Ma trận có cấu trúc thường có thể được tính toán với các sơ đồ chia-để-trị đơn giản, và có thể được sử dụng để biểu diễn nhiều biến đổi nhanh [28,34,58,100].
+
+Tối ưu hóa các nguyên thủy deep learning Có lịch sử phong phú trong việc tối ưu hóa các nguyên thủy deep learning. Nhiều kỹ thuật, như kernel fusion, nhằm giảm di chuyển dữ liệu. Gần đây, các thư viện như PyTorch 2.0 [93] đã thêm kernel fusion tự động. Các kỹ thuật khác bao gồm checkpointing, trong đó một lưu trữ ít kết quả trung gian hơn và tính toán lại những cái khác khi cần thiết, đánh đổi tính toán bổ sung cho bộ nhớ [65,111]. Nhiều thuật toán cũng có tối ưu hóa thủ công có thể loại bỏ tính toán hoặc truy cập bộ nhớ không cần thiết [79].
+
+--- TRANG 12 ---
+Một dòng kỹ thuật tối ưu hóa khác nhằm giảm FLOP. MLP và attention đặc biệt là mục tiêu phổ biến của việc giảm FLOP, thông qua các phân tích thưa của trọng số [14,19,23,25,26,29,39,116], hoặc các xấp xỉ thưa/low-rank của attention [8,16,21,33,37,60,62,75,112,116] và sự kết hợp của chúng [15,105].
+
+6 Kết luận
+Chúng tôi trình bày FlashFFTConv, một hệ thống mới để tối ưu hóa tích chập FFT cho dãy dài. Chúng tôi cho thấy FlashFFTConv cải thiện chất lượng dưới ngân sách tính toán cố định, cho phép các mô hình dãy dài hơn, và cải thiện hiệu quả của tích chập dài. Chúng tôi cũng cho thấy rằng các tương đồng của sparsity trong bộ lọc tích chập ánh xạ tự nhiên lên mô hình tính toán của FlashFFTConv, và có thể giảm footprint bộ nhớ và runtime.
+
+Chúng tôi hy vọng rằng công việc của chúng tôi sẽ giúp hỗ trợ việc áp dụng rộng rãi hơn các mô hình dãy tích chập, và những hiểu biết của chúng tôi có thể giúp thông báo cho việc thiết kế các kiến trúc tương lai.
+
+Lời cảm ơn
+Chúng tôi biết ơn sự hỗ trợ của DARPA dưới số FA86501827865 (SDH) và FA86501827882 (ASED); NIH dưới số U54EB020405 (Mobilize), NSF dưới số CCF1763315 (Beyond Sparsity), CCF1563078 (Volume to Velocity), và 1937301 (RTML); ONR dưới số N000141712266 (Unifying Weak Supervision); Moore Foundation, NXP, Xilinx, LETI-CEA, Intel, IBM, Microsoft, NEC, Toshiba, TSMC, ARM, Hitachi, BASF, Accenture, Ericsson, Qualcomm, Analog Devices, Okawa Foundation, American Family Insurance, Google Cloud, Microsoft Azure, Swiss Re, Brown Institute for Media Innovation, Bộ Quốc phòng (DoD) thông qua Chương trình Nghiên cứu sinh tốt nghiệp Khoa học và Kỹ thuật Quốc phòng (NDSEG), Fannie and John Hertz Foundation, Chương trình Nghiên cứu sinh tốt nghiệp Quỹ Khoa học Quốc gia, Texas Instruments Stanford Graduate Fellowship in Science and Engineering, và các thành viên của dự án Stanford DAWN: Teradata, Facebook, Google, Ant Financial, NEC, VMWare, và Infosys. Chính phủ Hoa Kỳ được ủy quyền sao chép và phân phối bản in lại cho mục đích Chính phủ bất chấp bất kỳ ghi chú bản quyền nào trên đó. Bất kỳ ý kiến, phát hiện, và kết luận hoặc khuyến nghị nào được thể hiện trong tài liệu này là của các tác giả và không nhất thiết phản ánh quan điểm, chính sách, hoặc sự tán thành, được thể hiện hoặc ngụ ý, của DARPA, NIH, ONR, hoặc Chính phủ Hoa Kỳ.
+
+Tài liệu tham khảo
+[1] Gustaf Ahdritz, Nazim Bouatta, Sachin Kadyan, Qinghui Xia, William Gerecke, Timothy J O'Donnell, Daniel Berenberg, Ian Fisk, Niccolò Zanichelli, Bo Zhang, et al. Openfold: Retraining alphafold2 yields new insights into its learning mechanisms and capacity for generalization. bioRxiv, trang 2022–11, 2022.
+
+[2] Ben Athiwaratkun, Sujan Kumar Gonugondla, Sanjay Krishna Gouda, Haifeng Qian, Hantian Ding, Qing Sun, Jun Wang, Liangfu Chen, Jiacheng Guo, Parminder Bhatia, et al. On io-efficient attention mechanisms: Context-aware bifurcated attention and the generalized multi-group attention. Trong Workshop on Efficient Systems for Foundation Models@ ICML2023, 2023.
+
+[3] Žiga Avsec, Vikram Agarwal, Daniel Visentin, Joseph R Ledsam, Agnieszka Grabska-Barwinska, Kyle R Taylor, Yannis Assael, John Jumper, Pushmeet Kohli, và David R Kelley. Effective gene expression prediction from sequence by integrating long-range interactions. Nature methods, 18(10):1196–1203, 2021.
+
+[4] Manohar Ayinala, Michael Brown, và Keshab K Parhi. Pipelined parallel fft architectures via folding transformation. IEEE Transactions on Very Large Scale Integration (VLSI) Systems, 20(6):1068–1081, 2011.
+
+[5] Jun Ho Bahn, Jung Sook Yang, Wen-Hsiang Hu, và Nader Bagherzadeh. Parallel fft algorithms on network-on-chips. Journal of Circuits, Systems, and Computers, 18(02):255–269, 2009.
+
+--- TRANG 13 ---
+[6] David H Bailey. Ffts in external of hierarchical memory. Trong Proceedings of the 1989 ACM/IEEE conference on Supercomputing, trang 234–242, 1989.
+
+[7] AJAA Bekele. Cooley-tukey fft algorithms. Advanced algorithms, 2016.
+
+[8] Iz Beltagy, Matthew E Peters, và Arman Cohan. Longformer: The long-document transformer. arXiv preprint arXiv:2004.05150, 2020.
+
+[9] Alberto Bietti và Julien Mairal. Invariance and stability of deep convolutional representations. Advances in neural information processing systems, 30, 2017.
+
+[10] Mikołaj Bińkowski, Jeff Donahue, Sander Dieleman, Aidan Clark, Erich Elsen, Norman Casagrande, Luis C Cobo, và Karen Simonyan. High fidelity speech synthesis with adversarial networks. Trong International Conference on Learning Representations, 2019.
+
+[11] Rishi Bommasani, Drew A Hudson, Ehsan Adeli, Russ Altman, Simran Arora, Sydney von Arx, Michael S Bernstein, Jeannette Bohg, Antoine Bosselut, Emma Brunskill, et al. On the opportunities and risks of foundation models. arXiv preprint arXiv:2108.07258, 2021.
+
+[12] E Oran Brigham. The fast Fourier transform and its applications. Prentice-Hall, Inc., 1988.
+
+[13] Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, et al. Language models are few-shot learners. Advances in neural information processing systems, 33:1877–1901, 2020.
+
+[14] Beidi Chen, Tri Dao, Kaizhao Liang, Jiaming Yang, Zhao Song, Atri Rudra, và Christopher Ré. Pixelated butterfly: Simple and efficient sparse training for neural network models. 2021.
+
+[15] Beidi Chen, Tri Dao, Eric Winsor, Zhao Song, Atri Rudra, và Christopher Ré. Scatterbrain: Unifying sparse and low-rank attention. Trong Advances in Neural Information Processing Systems (NeurIPS), 2021.
+
+[16] Krzysztof Choromanski, Valerii Likhosherstov, David Dohan, Xingyou Song, Andreea Gane, Tamas Sarlos, Peter Hawkins, Jared Davis, Afroz Mohiuddin, Lukasz Kaiser, et al. Rethinking attention with performers. arXiv preprint arXiv:2009.14794, 2020.
+
+[17] Aakanksha Chowdhery, Sharan Narang, Jacob Devlin, Maarten Bosma, Gaurav Mishra, Adam Roberts, Paul Barham, Hyung Won Chung, Charles Sutton, Sebastian Gehrmann, et al. Palm: Scaling language modeling with pathways. arXiv preprint arXiv:2204.02311, 2022.
+
+[18] Eleanor Chu và Alan George. Inside the FFT black box: serial and parallel fast Fourier transform algorithms. CRC press, 1999.
+
+[19] James W Cooley và John W Tukey. An algorithm for the machine calculation of complex fourier series. Mathematics of computation, 19(90):297–301, 1965.
+
+[20] Fiona Cunningham, James E Allen, Jamie Allen, Jorge Alvarez-Jarreta, M Ridwan Amode, Irina M Armean, Olanrewaju Austine-Orimoloye, Andrey G Azov, If Barnes, Ruth Bennett, et al. Ensembl 2022. Nucleic acids research, 50(D1):D988–D995, 2022.
+
+[21] Zihang Dai, Guokun Lai, Yiming Yang, và Quoc Le. Funnel-transformer: Filtering out sequential redundancy for efficient language processing. Advances in neural information processing systems, 33:4271–4282, 2020.
+
+[22] Tri Dao. Flashattention-2: Faster attention with better parallelism and work partitioning. arXiv preprint arXiv:2307.08691, 2023.
+
+[23] Tri Dao, Beidi Chen, Nimit S Sohoni, Arjun Desai, Michael Poli, Jessica Grogan, Alexander Liu, Aniruddh Rao, Atri Rudra, và Christopher Ré. Monarch: Expressive structured matrices for efficient and accurate training. Trong International Conference on Machine Learning. PMLR, 2022.
+
+--- TRANG 14 ---
+[24] Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, và Christopher Ré. FlashAttention: Fast and memory-efficient exact attention with IO-awareness. Trong Advances in Neural Information Processing Systems, 2022.
+
+[25] Tri Dao, Albert Gu, Matthew Eichhorn, Atri Rudra, và Christopher Ré. Learning fast algorithms for linear transforms using butterfly factorizations. arXiv preprint arXiv:1903.05895, 2020.
+
+[26] Tri Dao, Nimit S. Sohoni, Albert Gu, Matthew Eichhorn, Amit Blonder, Megan Leszczynski, Atri Rudra, và Christopher Ré. Kaleidoscope: An efficient, learnable representation for all structured linear maps. arXiv preprint arXiv:2012.14966, 2021.
+
+[27] Shmuel Bar David, Itamar Zimerman, Eliya Nachmani, và Lior Wolf. Decision s4: Efficient sequence-based rl via state spaces layers. Trong The Eleventh International Conference on Learning Representations, 2022.
+
+[28] Christopher De Sa, Albert Gu, Rohan Puttagunta, Christopher Ré, và Atri Rudra. A two-pronged progress in structured dense matrix vector multiplication. Trong Proceedings of the Twenty-Ninth Annual ACM-SIAM Symposium on Discrete Algorithms, trang 1060–1079. SIAM, 2018.
+
+[29] Tim Dettmers và Luke Zettlemoyer. Sparse networks from scratch: Faster training without losing performance. arXiv preprint arXiv:1907.04840, 2019.
+
+[30] Prafulla Dhariwal, Heewoo Jun, Christine Payne, Jong Wook Kim, Alec Radford, và Ilya Sutskever. Jukebox: A generative model for music. arXiv preprint arXiv:2005.00341, 2020.
+
+[31] Sander Dieleman, Aaron van den Oord, và Karen Simonyan. The challenge of realistic music generation: modelling raw audio at scale. Advances in neural information processing systems, 31, 2018.
+
+[32] Xin Dong, Shangyu Chen, và Sinno Pan. Learning to prune deep neural networks via layer-wise optimal brain surgeon. Advances in Neural Information Processing Systems, 30, 2017.
+
+[33] Nan Du, Yanping Huang, Andrew M Dai, Simon Tong, Dmitry Lepikhin, Yuanzhong Xu, Maxim Krikun, Yanqi Zhou, Adams Wei Yu, Orhan Firat, et al. Glam: Efficient scaling of language models with mixture-of-experts. Trong International Conference on Machine Learning, trang 5547–5569. PMLR, 2022.
+
+[34] Yuli Eidelman và Israel Gohberg. On a new class of structured matrices. Integral Equations and Operator Theory, 34(3):293–324, 1999.
+
+[35] Murali Emani, Venkatram Vishwanath, Corey Adams, Michael E Papka, Rick Stevens, Laura Florescu, Sumti Jairath, William Liu, Tejas Nama, và Arvind Sujeeth. Accelerating scientific applications with sambanova reconfigurable dataflow architecture. Computing in Science & Engineering, 23(2):114–119, 2021.
+
+[36] Yassir Fathullah, Chunyang Wu, Yuan Shangguan, Junteng Jia, Wenhan Xiong, Jay Mahadeokar, Chunxi Liu, Yangyang Shi, Ozlem Kalinli, Mike Seltzer, et al. Multi-head state space model for speech recognition. arXiv preprint arXiv:2305.12498, 2023.
+
+[37] William Fedus, Barret Zoph, và Noam Shazeer. Switch transformers: Scaling to trillion parameter models with simple and efficient sparsity. The Journal of Machine Learning Research, 23(1):5232–5270, 2022.
+
+[38] Quentin Fournier, Gaétan Marceau Caron, và Daniel Aloise. A practical survey on faster and lighter transformers. ACM Computing Surveys, 2021.
+
+[39] Jonathan Frankle và Michael Carbin. The lottery ticket hypothesis: Finding sparse, trainable neural networks. arXiv preprint arXiv:1803.03635, 2018.
+
+--- TRANG 15 ---
+[40] Jonathan Frankle, Gintare Karolina Dziugaite, Daniel Roy, và Michael Carbin. Linear mode connectivity and the lottery ticket hypothesis. Trong International Conference on Machine Learning, trang 3259–3269. PMLR, 2020.
+
+[41] Jonathan Frankle, Gintare Karolina Dziugaite, Daniel M Roy, và Michael Carbin. Stabilizing the lottery ticket hypothesis. arXiv preprint arXiv:1903.01611, 2019.
+
+[42] Daniel Y. Fu, Simran Arora, Jessica Grogan, Isys Johnson, Sabri Eyuboglu, Armin W. Thomas, Benjamin F. Spector, Michael Poli, Atri Rudra, và Christopher Ré. Monarch Mixer: A simple sub-quadratic GEMM-based architecture. Trong Advances in Neural Information Processing Systems, 2023.
+
+[43] Daniel Y. Fu, Tri Dao, Khaled K. Saab, Armin W. Thomas, Atri Rudra, và Christopher Ré. Hungry Hungry Hippos: Towards language modeling with state space models. Trong International Conference on Learning Representations, 2023.
+
+[44] Daniel Y. Fu, Elliot L. Epstein, Eric Nguyen, Armin W. Thomas, Michael Zhang, Tri Dao, Atri Rudra, và Christopher Ré. Simple hardware-efficient long convolutions for sequence modeling. International Conference on Machine Learning, 2023.
+
+[45] Karan Goel, Albert Gu, Chris Donahue, và Christopher Ré. It's raw! audio generation with state-space models. arXiv preprint arXiv:2202.09729, 2022.
+
+[46] Albert Gu, Karan Goel, và Christopher Re. Efficiently modeling long sequences with structured state spaces. Trong International Conference on Learning Representations, 2021.
+
+[47] Albert Gu, Ankit Gupta, Karan Goel, và Christopher Ré. On the parameterization and initialization of diagonal state space models. Trong Advances in Neural Information Processing Systems, 2022.
+
+[48] Albert Gu, Isys Johnson, Aman Timalsina, Atri Rudra, và Christopher Ré. How to train your hippo: State space models with generalized orthogonal basis projections. arXiv preprint arXiv:2206.12037, 2022.
+
+[49] Ankit Gupta, Albert Gu, và Jonathan Berant. Diagonal state spaces are as effective as structured state spaces. Trong Advances in Neural Information Processing Systems, 2022.
+
+[50] Song Han, Huizi Mao, và William J Dally. Deep compression: Compressing deep neural networks with pruning, trained quantization and huffman coding. arXiv preprint arXiv:1510.00149, 2015.
+
+[51] Song Han, Jeff Pool, John Tran, và William Dally. Learning both weights and connections for efficient neural network. Advances in neural information processing systems, 28, 2015.
+
+[52] Ramin Hasani, Mathias Lechner, Tsun-Huang Wang, Makram Chahine, Alexander Amini, và Daniela Rus. Liquid structural state-space models. arXiv preprint arXiv:2209.12951, 2022.
+
+[53] Kaiming He, Xiangyu Zhang, Shaoqing Ren, và Jian Sun. Deep residual learning for image recognition. Trong Proceedings of the IEEE conference on computer vision and pattern recognition, trang 770–778, 2016.
+
+[54] John L Hennessy và David A Patterson. Computer architecture: a quantitative approach. Elsevier, 2011.
+
+[55] Md Mohaiminul Islam, Mahmudul Hasan, Kishan Shamsundar Athrey, Tony Braskich, và Gedas Bertasius. Efficient movie scene detection using state-space transformers. Trong Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition, trang 18749–18758, 2023.
+
+[56] Yanrong Ji, Zhihan Zhou, Han Liu, và Ramana V Davuluri. DNABERT: pre-trained bidirectional encoder representations from transformers model for DNA-language in genome. Bioinformatics, 37(15):2112–2120, 2021.
+
+--- TRANG 16 ---
+[57] Norm Jouppi, George Kurian, Sheng Li, Peter Ma, Rahul Nagarajan, Lifeng Nai, Nishant Patil, Suvinay Subramanian, Andy Swing, Brian Towles, et al. Tpu v4: An optically reconfigurable supercomputer for machine learning with hardware support for embeddings. Trong Proceedings of the 50th Annual International Symposium on Computer Architecture, trang 1–14, 2023.
+
+[58] Thomas Kailath, Sun-Yuan Kung, và Martin Morf. Displacement ranks of matrices and linear equations. Journal of Mathematical Analysis and Applications, 68(2):395–407, 1979.
+
+[59] Nal Kalchbrenner, Erich Elsen, Karen Simonyan, Seb Noury, Norman Casagrande, Edward Lockhart, Florian Stimberg, Aaron Oord, Sander Dieleman, và Koray Kavukcuoglu. Efficient neural audio synthesis. Trong International Conference on Machine Learning, trang 2410–2419. PMLR, 2018.
+
+[60] Angelos Katharopoulos, Apoorv Vyas, Nikolaos Pappas, và François Fleuret. Transformers are rnns: Fast autoregressive transformers with linear attention. Trong International Conference on Machine Learning, trang 5156–5165. PMLR, 2020.
+
+[61] Sanghyeon Kim và Eunbyung Park. Smpconv: Self-moving point representations for continuous convolution. Trong Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition, trang 10289–10299, 2023.
+
+[62] Nikita Kitaev, Łukasz Kaiser, và Anselm Levskaya. Reformer: The efficient transformer. arXiv preprint arXiv:2001.04451, 2020.
+
+[63] Alex Krizhevsky, Ilya Sutskever, và Geoffrey E Hinton. Imagenet classification with deep convolutional neural networks. Advances in neural information processing systems, 25, 2012.
+
+[64] Kundan Kumar, Rithesh Kumar, Thibault De Boissiere, Lucas Gestin, Wei Zhen Teoh, Jose Sotelo, Alexandre De Brebisson, Yoshua Bengio, và Aaron C Courville. Melgan: Generative adversarial networks for conditional waveform synthesis. Advances in neural information processing systems, 32, 2019.
+
+[65] Mitsuru Kusumoto, Takuya Inoue, Gentaro Watanabe, Takuya Akiba, và Masanori Koyama. A graph theoretic framework of recomputation algorithms for memory-efficient backpropagation. Advances in Neural Information Processing Systems, 32, 2019.
+
+[66] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph E. Gonzalez, Hao Zhang, và Ion Stoica. Efficient memory management for large language model serving with pagedattention. Trong Proceedings of the ACM SIGOPS 29th Symposium on Operating Systems Principles, 2023.
+
+[67] Kushal Lakhotia, Eugene Kharitonov, Wei-Ning Hsu, Yossi Adi, Adam Polyak, Benjamin Bolte, Tu-Anh Nguyen, Jade Copet, Alexei Baevski, Abdelrahman Mohamed, et al. On generative spoken language modeling from raw audio. Transactions of the Association for Computational Linguistics, 9:1336–1354, 2021.
+
+[68] Adam Lavely. Powering extreme-scale hpc with cerebras wafer-scale accelerators. Cerebras White Paper, 2022.
+
+[69] Binrui Li, Shenggan Cheng, và James Lin. tcfft: Accelerating half-precision fft through tensor cores. arXiv preprint arXiv:2104.11471, 2021.
+
+[70] Raymond Li, Loubna Ben Allal, Yangtian Zi, Niklas Muennighoff, Denis Kocetkov, Chenghao Mou, Marc Marone, Christopher Akiki, Jia Li, Jenny Chim, et al. Starcoder: may the source be with you! arXiv preprint arXiv:2305.06161, 2023.
+
+[71] Yuhong Li, Tianle Cai, Yi Zhang, Deming Chen, và Debadeepta Dey. What makes convolutional models great on long sequence modeling? arXiv preprint arXiv:2210.09298, 2022.
+
+[72] Ji Lin, Yongming Rao, Jiwen Lu, và Jie Zhou. Runtime neural pruning. Advances in neural information processing systems, 30, 2017.
+
+--- TRANG 17 ---
+[73] Hao Liu và Pieter Abbeel. Blockwise parallel transformer for long context large models. arXiv preprint arXiv:2305.19370, 2023.
+
+[74] Zhuang Liu, Hanzi Mao, Chao-Yuan Wu, Christoph Feichtenhofer, Trevor Darrell, và Saining Xie. A convnet for the 2020s. Trong Proceedings of the IEEE/CVF conference on computer vision and pattern recognition, trang 11976–11986, 2022.
+
+[75] Xuezhe Ma, Xiang Kong, Sinong Wang, Chunting Zhou, Jonathan May, Hao Ma, và Luke Zettlemoyer. Luna: Linear unified nested attention. Advances in Neural Information Processing Systems, 34:2441–2453, 2021.
+
+[76] Xuezhe Ma, Chunting Zhou, Xiang Kong, Junxian He, Liangke Gui, Graham Neubig, Jonathan May, và Luke Zettlemoyer. Mega: moving average equipped gated attention. arXiv preprint arXiv:2209.10655, 2022.
+
+[77] Temesgen Mehari và Nils Strodthoff. Towards quantitative precision for ecg analysis: Leveraging state space models, self-supervision and patient metadata. IEEE Journal of Biomedical and Health Informatics, 2023.
+
+[78] Harsh Mehta, Ankit Gupta, Ashok Cutkosky, và Behnam Neyshabur. Long range language modeling via gated state spaces. arXiv preprint arXiv:2206.13947, 2022.
+
+[79] Maxim Milakov và Natalia Gimelshein. Online normalizer calculation for softmax. arXiv preprint arXiv:1805.02867, 2018.
+
+[80] Koichi Miyazaki, Masato Murata, và Tomoki Koriyama. Structured state space decoder for speech recognition and synthesis. Trong ICASSP 2023-2023 IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP), trang 1–5. IEEE, 2023.
+
+[81] Eric Nguyen, Karan Goel, Albert Gu, Gordon Downs, Preey Shah, Tri Dao, Stephen Baccus, và Christopher Ré. S4nd: Modeling images and videos as multidimensional signals with state spaces. Trong Advances in neural information processing systems, 2022.
+
+[82] Eric Nguyen, Michael Poli, Marjan Faizi, Armin Thomas, Callum Birch-Sykes, Michael Wornow, Aman Patel, Clayton Rabideau, Stefano Massaroli, Yoshua Bengio, et al. Hyenadna: Long-range genomic sequence modeling at single nucleotide resolution. Trong Advances in Neural Information Processing Systems, 2023.
+
+[83] NVIDIA. Nvidia Tesla V100 GPU architecture, 2017.
+
+[84] NVIDIA. Nvidia A100 tensor core GPU architecture, 2020.
+
+[85] NVIDIA. Nvidia H100 tensor core GPU architecture, 2022.
+
+[86] NVIDIA. Cuda c++ programming guide, 2023. https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html.
+
+[87] NVIDIA. cufftdx v1.1.0 documentation, 2023. https://docs.nvidia.com/cuda/cufftdx/index.html.
+
+[88] NVIDIA. Cutlass 3.2, 2023. https://github.com/NVIDIA/cutlass.
+
+[89] Aaron van den Oord, Sander Dieleman, Heiga Zen, Karen Simonyan, Oriol Vinyals, Alex Graves, Nal Kalchbrenner, Andrew Senior, và Koray Kavukcuoglu. Wavenet: A generative model for raw audio. arXiv preprint arXiv:1609.03499, 2016.
+
+[90] Alan V Oppenheim. Applications of digital signal processing. Englewood Cliffs, 1978.
+
+[91] Alan V Oppenheim, John R Buck, và Ronald W Schafer. Discrete-time signal processing. Vol. 2. Upper Saddle River, NJ: Prentice Hall, 2001.
+
+--- TRANG 18 ---
+[92] Daniele Paliotta, Matteo Pagliardini, Martin Jaggi, và François Fleuret. Fast causal attention with dynamic sparsity. Trong Workshop on Efficient Systems for Foundation Models@ ICML2023, 2023.
+
+[93] Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory Chanan, Trevor Killeen, Zeming Lin, Natalia Gimelshein, Luca Antiga, et al. Pytorch: An imperative style, high-performance deep learning library. Advances in neural information processing systems, 32, 2019.
+
+[94] Michael Poli, Stefano Massaroli, Eric Nguyen, Daniel Y Fu, Tri Dao, Stephen Baccus, Yoshua Bengio, Stefano Ermon, và Christopher Ré. Hyena hierarchy: Towards larger convolutional language models. Proceedings of the 40th International Conference on Machine Learning (ICML 2023), 2023.
+
+[95] Ryan Prenger, Rafael Valle, và Bryan Catanzaro. Waveglow: A flow-based generative network for speech synthesis. Trong ICASSP 2019-2019 IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP), trang 3617–3621. IEEE, 2019.
+
+[96] David W Romero, Robert-Jan Bruintjes, Jakub M Tomczak, Erik J Bekkers, Mark Hoogendoorn, và Jan C van Gemert. Flexconv: Continuous kernel convolutions with differentiable kernel sizes. arXiv preprint arXiv:2110.08059, 2021.
+
+[97] David W Romero, Anna Kuzina, Erik J Bekkers, Jakub Mikolaj Tomczak, và Mark Hoogendoorn. Ckconv: Continuous kernel convolution for sequential data. Trong International Conference on Learning Representations, 2021.
+
+[98] Victor Sanh, Thomas Wolf, và Alexander Rush. Movement pruning: Adaptive sparsity by fine-tuning. Advances in Neural Information Processing Systems, 33:20378–20389, 2020.
+
+[99] Jonathan Shen, Ruoming Pang, Ron J Weiss, Mike Schuster, Navdeep Jaitly, Zongheng Yang, Zhifeng Chen, Yu Zhang, Yuxuan Wang, Rj Skerrv-Ryan, et al. Natural tts synthesis by conditioning wavenet on mel spectrogram predictions. Trong 2018 IEEE international conference on acoustics, speech and signal processing (ICASSP), trang 4779–4783. IEEE, 2018.
+
+[100] Vikas Sindhwani, Tara Sainath, và Sanjiv Kumar. Structured transforms for small-footprint deep learning. Advances in Neural Information Processing Systems, 28, 2015.
+
+[101] Jimmy TH Smith, Andrew Warrington, và Scott Linderman. Simplified state space layers for sequence modeling. Trong The Eleventh International Conference on Learning Representations, 2023.
+
+[102] H V Sorensen, D Jones, Michael Heideman, và C Burrus. Real-valued fast fourier transform algorithms. IEEE Transactions on acoustics, speech, and signal processing, 35(6):849–863, 1987.
+
+[103] Siyi Tang, Jared A Dunnmon, Liangqiong Qu, Khaled K Saab, Christopher Lee-Messer, và Daniel L Rubin. Spatiotemporal modeling of multivariate signals with graph neural networks and structured state space models. arXiv preprint arXiv:2211.11176, 2022.
+
+[104] Yi Tay, Mostafa Dehghani, Samira Abnar, Yikang Shen, Dara Bahri, Philip Pham, Jinfeng Rao, Liu Yang, Sebastian Ruder, và Donald Metzler. Long range arena: A benchmark for efficient transformers. Trong International Conference on Learning Representations, 2020.
+
+[105] Yi Tay, Mostafa Dehghani, Dara Bahri, và Donald Metzler. Efficient transformers: A survey. ACM Computing Surveys, 55(6):1–28, 2022.
+
+[106] Yi Tay, Mostafa Dehghani, Jai Prakash Gupta, Vamsi Aribandi, Dara Bahri, Zhen Qin, và Donald Metzler. Are pretrained convolutions better than pretrained transformers? Trong Proceedings of the 59th Annual Meeting of the Association for Computational Linguistics and the 11th International Joint Conference on Natural Language Processing (Volume 1: Long Papers), trang 4349–4359, 2021.
+
+[107] Yi Tay, Vinh Q Tran, Sebastian Ruder, Jai Gupta, Hyung Won Chung, Dara Bahri, Zhen Qin, Simon Baumgartner, Cong Yu, và Donald Metzler. Charformer: Fast character transformers via gradient-based subword tokenization. arXiv preprint arXiv:2106.12672, 2021.
+
+--- TRANG 19 ---
+[108] Aaron Van Den Oord, Oriol Vinyals, et al. Neural discrete representation learning. Advances in neural information processing systems, 30, 2017.
+
+[109] Jue Wang, Wentao Zhu, Pichao Wang, Xiang Yu, Linda Liu, Mohamed Omar, và Raffay Hamid. Selective structured state-spaces for long-form video understanding. Trong Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition, trang 6387–6397, 2023.
+
+[110] Junxiong Wang, Jing Nathan Yan, Albert Gu, và Alexander M Rush. Pretraining without attention. arXiv preprint arXiv:2212.10544, 2022.
+
+[111] Qipeng Wang, Mengwei Xu, Chao Jin, Xinran Dong, Jinliang Yuan, Xin Jin, Gang Huang, Yunxin Liu, và Xuanzhe Liu. Melon: Breaking the memory wall for resource-efficient on-device machine learning. Trong Proceedings of the 20th Annual International Conference on Mobile Systems, Applications and Services, trang 450–463, 2022.
+
+[112] Sinong Wang, Belinda Z Li, Madian Khabsa, Han Fang, và Hao Ma. Linformer: Self-attention with linear complexity. arXiv preprint arXiv:2006.04768, 2020.
+
+[113] Manzil Zaheer, Guru Guruganesh, Kumar Avinava Dubey, Joshua Ainslie, Chris Alberti, Santiago Ontanon, Philip Pham, Anirudh Ravula, Qifan Wang, Li Yang, et al. Big bird: Transformers for longer sequences. Advances in neural information processing systems, 33:17283–17297, 2020.
+
+[114] Dan Zhang, Safeen Huda, Ebrahim Songhori, Kartik Prabhu, Quoc Le, Anna Goldie, và Azalia Mirhoseini. A full-stack search technique for domain optimized deep learning accelerators. Trong Proceedings of the 27th ACM International Conference on Architectural Support for Programming Languages and Operating Systems, trang 27–42, 2022.
+
+[115] Michael Zhang, Khaled Kamal Saab, Michael Poli, Tri Dao, Karan Goel, và Christopher Re. Effectively modeling time series with simple discrete state spaces. Trong International Conference on Learning Representations, 2022.
+
+[116] Chen Zhu, Wei Ping, Chaowei Xiao, Mohammad Shoeybi, Tom Goldstein, Anima Anandkumar, và Bryan Catanzaro. Long-short transformer: Efficient transformers for language and vision. Advances in Neural Information Processing Systems, 34:17723–17736, 2021.
+
+--- TRANG 20 ---
+Phụ lục
+Chúng tôi trình bày chi tiết thuật toán bổ sung (Phụ lục A), kết quả thử nghiệm bổ sung (Phụ lục B), và chi tiết thử nghiệm (Phụ lục C).
+
+A Chi tiết thuật toán
+A.1 Tối ưu hóa cụ thể miền
+Chúng tôi xem xét chi tiết cách tính toán FFT thực-thành-thực kích thước N sử dụng FFT phức kích thước N/2, theo hướng dẫn của [102].
+
+Cho phần này, chúng tôi áp dụng ký hiệu phổ biến trong mô tả thuật toán FFT. Cho x(n) là dãy đầu vào có độ dài N, và cho X(k) là kết quả của biến đổi Fourier rời rạc của nó. Nhớ lại rằng:
+
+X(k) = Σ(n=0 to N-1) x(n)W_N^(nk), (3)
+
+với k= 0,1, . . . , N −1, trong đó W_N=e^(-2πi/N) là căn bậc N của đơn vị.
+
+Đầu tiên, nếu x(n) là thực, thì các đối xứng xuất hiện trong X(k). Cụ thể, chúng ta có X(k) =X∗(−k) =X∗(N−k), trong đó ∗ biểu thị liên hợp phức. Những đối xứng này cho phép chúng ta có thuật toán để tính toán X(k) sử dụng một DFT phức duy nhất kích thước N/2.
+
+Cụ thể:
+X(k) = Σ(n=0 to N-1) x(n)W_N^(nk)
+     = Σ(n=0 to N/2-1) x(2n)W_(N/2)^(nk) + W_N^k Σ(n=0 to N/2-1) x(2n+1)W_(N/2)^(nk),
+
+với k= 0,1, . . . , N −1. DFT hiện được phân tích thành hai phần: một DFT trên các phần tử chỉ số chẵn của x(n), và trên các phần tử chỉ số lẻ của x(n).
+
+Bây giờ chúng ta có thể tạo ra dãy phức thứ ba, có độ dài N/2, và đặt các phần tử chỉ số chẵn của x(n) vào phần thực, và các phần tử chỉ số lẻ của x(n) vào phần ảo. Cho:
+
+z(n) =x(2n) +ix(2n+ 1),
+
+với n= 0,1, . . . , N/ 2−1. Sau đó, chúng ta tính toán DFT kích thước N/2 Z(k), và chúng ta có thể phục hồi DFT trên các phần chẵn và lẻ của x(n) (X_e[k] và X_o[k], tương ứng):
+
+X_e[k] = (Z[k] + Z∗[N/2−k])/2
+X_o[k] = (-iZ[k] − Z∗[N/2−k])/(2i).
+
+Bây giờ chúng ta có thể phục hồi X[k], k= 0. . . , N −1 sử dụng:
+X[k] = X_e[k mod N/2] + X_o[k mod N/2]W_N^k.
+
+FFT nghịch đảo tiến hành tương tự. Mục tiêu là phục hồi x(n) cho trước đầu vào X[k], sử dụng một iDFT phức đơn giản có độ dài N/2.
+
+Đầu tiên, chúng ta phục hồi X_e[k] và X_o[k]:
+X_e[k] = (X[k] + X∗[N/2−k])/2
+X_o[k] = (X[k] − X∗[N/2−k])/(2W_N^k),
+
+với k= 0, . . . , N/ 2−1. Sau đó, chúng ta xây dựng Z[k]:
+Z[k] = X_e[k] + iX_o[k], k= 0. . . , N/ 2−1.
+
+Chúng ta sử dụng iDFT để phục hồi z(n), và sau đó phục hồi x(n) từ các phần thực và ảo của z(n):
+x(2n) = Re(z_n)
+x(2n+ 1) = Im(z_n),
+
+với n= 0, . . . , N/ 2−1.
+
+Để triển khai những cái này trong kernel của chúng tôi, chúng tôi thực hiện bookkeeping sau khi đọc đầu vào hoặc trước khi viết đầu ra, và sau đó sử dụng các triển khai FFT/iFFT như được chi tiết trong Thuật toán 1 và các thuật toán khác.
+
+A.2 Chi tiết CUDA cấp thấp
+Để đảm bảo hiệu suất cao, chúng tôi triển khai kernel CUDA cho mỗi độ dài dãy cụ thể, cho phép chúng tôi phục vụ các sắc thái hiệu suất cụ thể phát sinh từ phân tích ở độ dài dãy đó. Trong phần này, chúng tôi đi sâu vào một số chi tiết triển khai cấp thấp cho FlashFFTConv.
+
+Nhân ma trận sử dụng CUDA Tensor core CUDA Tensor core có thể thực hiện phép nhân hai ma trận m×k và k×n cho các phần tử bfloat16 hoặc float16, sử dụng khoảng cùng số chu kỳ như yêu cầu cho phép nhân hai số vô hướng. m×k×n phải là một trong các cái sau: 16×16×16, 32×8×16, 8×32×16. Điều này thông báo cho việc lựa chọn radix của chúng tôi cho phân tích khi thực hiện FFT và iFFT. Cụ thể, triển khai của chúng tôi chia nhỏ phép nhân ma trận-ma trận thành phép nhân ma trận-ma trận được khối hóa trong đó m×k×n= 16×16×16. Chúng tôi lưu ý những điều sau về phép nhân ma trận-ma trận trên tensor core [86]:
+
+• Tensor core được sử dụng ở cấp độ warp và việc truy cập lập trình của tensor core thông qua API Warp Level Matrix Multiply Accumulate (WMMA).
+• Các toán hạng tensor core được giữ trong các fragment thanh ghi (wmma::matrix_a, và wmma::matrix_b) và kết quả được viết vào một fragment thanh ghi (wmma::accumulator).
+• Các fragment toán hạng có thể giữ dữ liệu ở định dạng row-major hoặc column-major và dữ liệu trong fragment wmma::accumulator có thể được viết vào bộ nhớ ở định dạng row-major hoặc column-major.
+• Ánh xạ cụ thể của các item trong fragment sang các thread trong warp không được chỉ định, tuy nhiên, ánh xạ của các item sang threads trong fragment wmma::accumulator khớp chính xác với fragment wmma::matrix_a được đọc row-major, cho phép chúng tôi sao chép trực tiếp kết quả của phép nhân ma trận-ma trận và sử dụng làm toán hạng cho phép nhân ma trận-ma trận khác.
+
+Để thực hiện phép nhân ma trận-ma trận C=A×B sử dụng tensor core, một warp tải nội dung của A và B vào thanh ghi (fragment WMMA trong thuật ngữ CUDA), thực hiện phép nhân ma trận-ma trận, và viết kết quả được lưu trữ trong fragment accumulator trở lại bộ nhớ.
+
+Tái sử dụng thanh ghi Một phần quan trọng của việc đảm bảo hiệu suất cao là tối thiểu hóa I/O qua các cấp độ khác nhau của hệ thống bộ nhớ phân cấp: từ HBM đến SRAM và từ SRAM đến thanh ghi. Để đảm bảo điều này, chúng tôi di chuyển đầu ra từ fragment accumulator trực tiếp vào fragment matrix_a để sử dụng trong các phép nhân ma trận tiếp theo, tránh một chuyến đi bổ sung đến SRAM. Tuy nhiên, điều này chỉ có thể nếu đầu ra từ phép nhân ma trận-ma trận trước đó không cần được chuyển vị trước khi sử dụng nó làm toán hạng cho phép nhân tiếp theo. Khi điều này không xảy ra, chúng tôi cần thực hiện một chuyến đi đến SRAM và quay lại. Trong Thuật toán 2, chúng tôi chi tiết I/O từ SRAM đến thanh ghi.
+
+Locality và Tiling Thuật toán có thể song song hóa một cách tầm thường qua B và H, cho phép chúng tôi tile trong cả hai chiều ở cấp độ threadblock. Trong Thuật toán 3, tất cả các vòng lặp từ i←1 đến N₁ được warp-tiled.
+
+--- TRANG 21 ---
+Thuật toán 2 Chú thích chi tiết của thuật toán cốt lõi FlashFFTConv hiển thị I/O từ SRAM đến fragment thanh ghi, với phân tích Monarch hai chiều. Chúng tôi giả sử N=N₁² cho đơn giản ở đây.
+
+Input: Đầu vào u∈R^(B×H×N), kernel tích chập k_f∈C^(H×N), ma trận FFT F∈C^(N₁×N₁), F^(-1)∈C^(N₁×N₁), hệ số Twiddle t∈C^N, t_inv∈C^N, kích thước tile B B_tile, kích thước tile H H_tile.
+Output: Đầu ra y∈R^(B×H×N).
+
+for SM song song qua B/B_tile×H/H_tile do
+    Tải F, F^(-1), t, t_inv từ HBM.
+    for h←1 to H_tile do
+        Tải K_f←k_f[h] từ HBM, reshape thành N₁×N₁.
+        for b←1 to B_tile do
+            Tải X←u[b, h] từ HBM, reshape thành N₁×N₁.
+            X←F^⊤X ▷F^⊤(matrix_a), X(matrix_b) đầu ra đến accumulator
+            Tải X từ accumulator vào matrix_a
+            X←X∗t ▷Nhân từng phần tử trực tiếp trong matrix_a
+            X←XF ▷X(matrix_a), F(matrix_b) đầu ra đến accumulator
+            Tải X từ accumulator vào matrix_a
+            X←X∗K_f^⊤ ▷Nhân từng phần tử với k_f trực tiếp trong matrix_a
+            X←XF^(-1) ▷X(matrix_a), F^(-1)(matrix_b) đầu ra đến accumulator
+            Viết X từ fragment accumulator vào SRAM
+            Tải X^⊤ từ SRAM vào fragment matrix_a
+            X←X^⊤∗t_inv ▷Nhân từng phần tử với t_inv trực tiếp trong matrix_a
+            Y←XF^(-1) ▷X(matrix_a), F^(-1)(matrix_b) đầu ra đến accumulator
+            Viết Y^⊤ vào HBM.
+
+Tối ưu hóa tùy chỉnh khác Ngoài các tối ưu hóa trên, chúng tôi cũng thực hiện một số tối ưu hóa khác cung cấp tăng tốc krên biên. Bao gồm: sử dụng vector intrinsic/type để thực hiện đọc/viết bộ nhớ và số học cho 16-bit floating point (fp16) và brain float point (bf16), cho phép các phép toán không phải tensor core trên các kiểu này được thực hiện với tốc độ khoảng gấp đôi tốc độ bình thường. Hơn nữa, chúng tôi double buffer các chuyển động I/O qua tất cả các cấp độ của hệ thống bộ nhớ phân cấp, giảm warp stall. Chúng tôi cũng điều chỉnh tích cực các siêu tham số kernel như kích thước block và tile, và các yếu tố unroll vòng lặp để có hiệu suất tốt nhất trên phần cứng cơ bản cụ thể.
+
+A.3 Tổng quát hóa cho phân tích Monarch 3-chiều và 4-chiều
+Chúng tôi cung cấp danh sách thuật toán cho phân tích Monarch 3-chiều và 4-chiều.
+
+Phân tích 3-chiều Thuật toán 3 hiển thị thuật toán cho phân tích Monarch 3-chiều. Nó bao gồm một phép toán nhân ma trận bổ sung ở mỗi bên của FFT và iFFT, và tiến hành qua thuật toán trong Thuật toán 1 trong một vòng lặp bên trong.
+
+Phân tích 4-chiều Cho phân tích 4-chiều, chúng tôi giả sử rằng chúng tôi cần viết đầu ra trung gian vào HBM. Ở đây, chúng tôi xử lý phân tích 3-chiều như một sub-routine, và giả sử nó có kernel fusion (tức là, Thuật toán 3). Chúng tôi tính toán một phép nhân ma trận cho FFT và một cho iFFT, và sau đó gọi kernel cho phân tích 3-chiều trên các hàng của đầu ra. Thuật toán được liệt kê trong Thuật toán 4.
+
+A.4 Mẫu thưa tần số
+Chúng tôi mô tả các mẫu thưa tần số và tiết kiệm matmul chi tiết hơn ở đây. Chúng tôi sử dụng trường hợp phân tích 4-chiều đầy đủ, vì các thuật toán tổng quát hóa cho các phân tích bậc thấp hơn.
+
+Cho N=N₁⁴, và xem xét kernel k_f∈C^N. Xem xét các phép toán nhân ma trận và vòng lặp xảy ra khi tính toán các phần FFT của FlashFFTConv(u,k_f) (các phần iFFT giống nhau, theo thứ tự ngược lại):
+
+--- TRANG 22 ---
+Thuật toán 3 Thuật toán FlashFFTConv cho phân tích 3-chiều. Chúng tôi giả sử N=N₁³ cho đơn giản ở đây.
+
+Input: Đầu vào u∈R^(B×H×N), kernel tích chập k_f∈C^(H×N), ma trận FFT F∈C^(N₁×N₁), F^(-1)∈C^(N₁×N₁), hệ số Twiddle t₁∈C^(N₁²), t₁,inv∈C^(N₁²), t₂∈C^N, t₂,inv∈C^N, kích thước tile B B_tile, kích thước tile H H_tile.
+Output: Đầu ra y∈R^(B×H×N).
+
+for SM song song qua B/B_tile×H/H_tile do
+    Tải F, F^(-1), t, t_inv từ HBM.
+    for h←1 to H_tile do
+        Tải K_f←k_f[h] từ HBM, reshape thành N₁²×N₁.
+        K_f←K_f^T. ▷Chuyển vị hai chiều cuối.
+        Reshape K_f thành N₁×N₁².
+        for b←1 to B_tile do
+            Tải X←u[b, h] từ HBM, reshape thành N₁×N₁×N₁.
+            for i←1 to N₁ do
+                X'←FX[:, i∗N₁: (i+ 1)∗N₁]
+                X[:,i∗N₁: (i+1)∗N₁]←X' ▷Chuyển vị, matmul, chuyển vị.
+            X←X∗t₂
+            for i←1 to N₁ do ▷Vòng lặp trên các hàng
+                X'←FX[i]
+                Reshape X' thành N₁×N₁
+                X'←((F^⊤X')∗t)F ▷FFT, phân tích thành hai bước
+                X'←X'∗K_f[i]^⊤ ▷Nhân từng phần tử với k_f
+                Y'←((X'F^(-1))^⊤∗t_inv)F^(-1) ▷FFT nghịch đảo, phân tích thành hai bước
+                Y'←Y'^⊤
+                Y[i]←Y' ▷Kết thúc vòng lặp bên trong
+            Y←Y∗t₂,inv
+            for i←1 to N₁ do
+                Y'←FY[:, i∗N₁: (i+ 1)∗N₁]
+                Y[:,i∗N₁: (i+1)∗N₁]←Y' ▷Chuyển vị, matmul, chuyển vị.
+            Viết Y vào HBM.
+
+1. Trong Thuật toán 4, có một phép toán FFT trên các cột của u, reshape thành N₁×N/N₁, và một hiệu chỉnh Twiddle.
+2. Sau đó, Thuật toán 3 lặp qua các hàng của u với α:=N₁ bước.
+3. Cho u' là hàng trong một lần lặp cụ thể. Trong Thuật toán 3, có một FFT trên các cột của u', reshape thành N₁×N₁², và một hiệu chỉnh Twiddle.
+4. Sau đó, vòng lặp bên trong lặp qua các hàng của u' với β:=N₁ bước.
+5. Trong mỗi vòng lặp, u' có một phép toán FFT với hiệu chỉnh hệ số twiddle. Cho ma trận của phép toán FFT này được ký hiệu A.
+6. Sau đó có một phép toán FFT thứ hai. Cho ma trận của phép toán FFT này được ký hiệu B.
+
+Bây giờ, reshape k_f thành N₁×N₁×N₁×N₁. Hãy xem xét cách sparsity dọc theo mỗi chiều trong bốn chiều của k_f cho phép chúng ta bỏ qua các phép toán trong các bước trên.
+
+• Sparsity trong chiều đầu tiên cho phép chúng ta bỏ qua tính toán trong B, chính xác theo tỷ lệ với lượng chiều đầu tiên mà chúng ta loại bỏ. Điều này có thể dẫn đến tiết kiệm chi phí, miễn là B vẫn có thể được biểu diễn sử dụng tensor core on-chip sau khi bỏ qua tính toán. Ví dụ, nếu B là 32×32, thì N₁= 32, và không có ý nghĩa gì khi loại bỏ hơn một nửa chiều đầu tiên.
+• Sparsity trong chiều thứ hai hoạt động chính xác giống cách đó, ngoại trừ nó cho phép chúng ta bỏ qua tính toán trong A.
+
+--- TRANG 23 ---
+Thuật toán 4 Thuật toán FlashFFTConv cho phân tích 4-chiều. Chúng tôi giả sử N=N₁⁴ cho đơn giản ở đây.
+
+Input: Đầu vào u∈R^(B×H×N), kernel tích chập k_f∈C^(H×N), ma trận FFT F∈C^(N₁×N₁), F^(-1)∈C^(N₁×N₁), hệ số Twiddle t∈C^N, t_inv∈C^N, t₂∈C^N, t₂,inv∈C^N.
+Output: Đầu ra y∈R^(B×H×N).
+
+Reshape u thành B×H×N₁×(N/N₁).
+Reshape k_f thành H×N₁×(N/N₁).
+k_f←k_f^T. ▷Chuyển vị hai chiều cuối.
+Reshape k_f thành HN₁×N/N₁.
+u←Fu ▷Tính toán FFT trên các cột của u.
+Reshape u thành B×(HN₁)×(N/N₁). ▷Di chuyển N₁ vào chiều H.
+Reshape k_f thành (HN₁)×(N/N₁).
+Gọi FlashFFTConv(u,k_f). ▷Gọi FlashFFTConv 3-chiều.
+Reshape u thành B×H×N₁×(N/N₁).
+y←F^(-1)u ▷Tính toán iFFT trên các cột của u.
+Trả về y.
+
+• Sparsity trong chiều thứ ba cho phép chúng ta giảm β. Mỗi hàng của chiều thứ ba mà chúng ta loại bỏ cho phép chúng ta bỏ qua một lần lặp của vòng lặp bên trong trong bước 4 trên.
+• Sparsity trong chiều thứ tư cho phép chúng ta giảm α. Mỗi hàng của chiều thứ tư mà chúng ta loại bỏ cho phép chúng ta bỏ qua một lần lặp của vòng lặp bên ngoài trong bước 2 trên.
+
+Như một ví dụ, chúng tôi tiết lộ các chiều sparsity mà chúng tôi đã áp dụng trong thí nghiệm được chi tiết trong Bảng 9 trong bài báo chính. Về mặt khái niệm, chúng tôi sử dụng kernel k_f có độ dài 2 triệu đầy đủ, và reshape nó thành 32×32×32×64. Cho a, b, c, và d là các biến mô tả lượng mỗi chiều chúng ta đặt bằng không. Cụ thể, chúng ta đặt k_f[a:,:,:,:] = 0, k_f[:, b:,:,:] = 0, k_f[:,:, c:,:] = 0, và k_f[:,:,:, d:] = 0 tuần tự. Công thức phần sparsity S cho a, b, c, d trong trường hợp này được đưa ra bởi:
+
+S = 1−(32−a)(32−b)(32−c)(64−d)/32×32×32×64,
+
+hoặc tổng quát hơn, 1 trừ đi tích của phần mỗi chiều được loại bỏ. Bảng 10 liệt kê các cấu hình của các mẫu sparsity và các phần sparsity được sử dụng cho thí nghiệm trong Bảng 9.
+
+A.5 Hỗ trợ phần cứng
+FlashFFTConv được phát triển trên GPU A100, và được kiểm tra trên GPU A100 và H100. Các thế hệ GPU cũ hơn như V100 không được hỗ trợ, vì kích thước của tensor core khác nhau. Chúng tôi mong muốn tích hợp các thư viện tổng quát hơn như Cutlass [88] để hỗ trợ phạm vi GPU rộng hơn, và phát triển hỗ trợ cho các accelerator không phải GPU.
+
+--- TRANG 24 ---
+Bảng 10: Mẫu sparsity cho k_f và phần sparsity cho thí nghiệm tích chập thưa tần số trong Bảng 9.
+
+[Bảng hiển thị các mẫu sparsity với các giá trị a, b, c, d khác nhau]
+
+B Kết quả bổ sung
+B.1 Kết quả đầy đủ cho tất cả độ dài dãy
+Chúng tôi báo cáo kết quả đầy đủ cho tất cả độ dài dãy theo lũy thừa của hai từ 256 đến 4M. Chúng tôi báo cáo kết quả đầy đủ cho năm trường hợp:
+
+• Bảng 11: Lượt forward tiêu chuẩn, trong đó kích thước FFT giống với kích thước đầu vào. Điều này tương đương với tích chập tròn.
+• Bảng 12: Lượt forward gated, trong đó kích thước FFT giống với kích thước đầu vào.
+• Bảng 13: Lượt forward, trong đó kích thước đầu vào bằng một nửa kích thước FFT. Điều này tương đương với tích chập nhân quả.
+• Bảng 14: Lượt forward gated, trong đó kích thước đầu vào bằng một nửa kích thước FFT.
+• Bảng 15: Lượt backward tiêu chuẩn, trong đó kích thước FFT giống với kích thước đầu vào.
+• Bảng 16: Sử dụng bộ nhớ cho FlashFFTConv so với PyTorch cho tích chập, scale đến batch size 64, hidden dimension 768.
+• Bảng 17: Sử dụng bộ nhớ cho tích chập gated sử dụng FlashFFTConv so với PyTorch cho tích chập, scale đến batch size 64, hidden dimension 768.
+
+Tăng tốc thay đổi, nhưng nói chung theo xu hướng từ kết quả trong phần thân bài báo. FlashFFTConv đạt được tiết kiệm bộ nhớ đáng kể so với PyTorch do recomputation trong lượt backward và kernel fusion. Để đo tiết kiệm bộ nhớ, chúng tôi đo bộ nhớ bổ sung tương đối từ việc gọi các phép toán tích chập (chúng tôi không đo footprint của các đầu vào gốc).
+
+B.2 Mô hình lớn hơn tham khảo
+Bảng 18 đưa ra số liệu hiệu suất cho các mô hình lớn hơn được huấn luyện cho cùng số token và bước như các mô hình PyTorch tham khảo trong Bảng 1 trong bài báo chính.
+
+Các mô hình PyTorch kiểu GPT được huấn luyện cho 5B token, với batch size 512K token. Các mô hình PyTorch kiểu BERT được huấn luyện cho 16000 bước, với batch size 64K token. Ngược lại, các mô hình FlashFFTConv, với throughput huấn luyện cao hơn, được huấn luyện cho 15B token và 70000 bước trong cùng ngân sách tính toán, tương ứng.
+
+--- TRANG 25 ---
+[Tiếp tục với các bảng 11-17 hiển thị kết quả chi tiết cho các trường hợp khác nhau]
+
+--- TRANG 26 ---
+[Tiếp tục với các bảng]
+
+--- TRANG 27 ---
+[Tiếp tục với các bảng]
+
+--- TRANG 28 ---
+[Tiếp tục với các bảng]
+
+Bảng 18: Số liệu chất lượng tham khảo cho các mô hình khi được huấn luyện cho cùng số bước và dữ liệu huấn luyện.
+
+[Bảng hiển thị kết quả chất lượng]
+
+B.3 Embedding DNA
+Chúng tôi sử dụng mô hình HyenaDNA-4M với độ dài dãy 4M của chúng tôi để tạo ra embedding cho các đoạn DNA khác nhau theo quy trình từ [82]. Các lớp DNA bao gồm các gen người tương ứng với các chú thích chức năng sinh học khác nhau từ dataset genome Ensembl được biết đến như các biotype [20]. Gen người dài nhất, gen dystrophin, được chú thích.
+
+C Chi tiết thí nghiệm
+C.1 Tính toán
+Tất cả thí nghiệm được thực hiện trên box với 8xA100-40GB GPU hoặc box với 8xH100-SXM GPU.
+
+C.2 Thí nghiệm ngân sách tính toán cố định
+Cho thí nghiệm trong Bảng 1, chúng tôi huấn luyện mô hình M2-BERT-base từ đầu, và mô hình Hyena-s-155M từ đầu.
+
+Chúng tôi huấn luyện mô hình M2-BERT-base sử dụng masked language modeling 30% trên dataset C4, và fine-tune nó trên GLUE sử dụng giao thức từ [42]. Mô hình FlashFFTConv có throughput huấn luyện cao hơn, nên nó huấn luyện cho nhiều token hơn; chúng tôi huấn luyện mô hình FlashFFTConv cho 70,000 bước với batch size 64K token. Mô hình PyTorch, với throughput huấn luyện thấp hơn, chỉ huấn luyện cho 16,000 bước, với cùng batch size. Mô hình M2-BERT-base chúng tôi sử dụng được khớp tham số với Transformer BERT-base. Nó có 12 tầng ẩn, với model dimension 960, và hệ số mở rộng bốn. Nó cũng sử dụng MLP block-diagonal với bốn block. Bộ lọc M2 Hyena có embedding dimension 5, filter order 128, và hệ số sine activation ban đầu 10. Chúng tôi huấn luyện với learning rate 8e-4, weight decay 1e-5, và 6% warmup với cosine decay.
+
+Chúng tôi huấn luyện mô hình Hyena-s-155M sử dụng objective causal language modeling trên Pile. Chúng tôi huấn luyện mô hình FlashFFTConv cho 15M token, và mô hình PyTorch cho 5M token. Mô hình Hyena-s-155M khớp với cấu hình từ [94] và có 18 tầng, với hidden dimension 864, và hệ số mở rộng 4. Bộ lọc Hyena có embedding dimension 33, filter order 64, và hệ số sine activation ban đầu 14. Chúng tôi huấn luyện với learning rate 6e-4, với 1% warmup time và cosine decay.
+
+C.3 Thí nghiệm Path-X và Path-512
+Cho thí nghiệm trong Bảng 2, chúng tôi sử dụng các mô hình ngôn ngữ tích chập đơn giản, như trong [44].
+
+Cho Path-X, chúng tôi sử dụng cùng mô hình và siêu tham số như mô hình tích chập từ [44]. Chúng tôi sử dụng mô hình tích chập với 6 tầng, prenorm batch norm, và hidden dimension 256. Cho các tham số bộ lọc tích chập, chúng tôi sử dụng kernel dropout 0.3, kernel learning rate 0.0005, λ factor 0.001, và hai channel trên bộ lọc. Chúng tôi sử dụng learning rate tổng thể 0.0005 và weight decay 0.05. Chúng tôi huấn luyện cho 500000 bước, với 10000 bước warmup với cosine decay, và global batch size 16.
+
+Cho Path-512, chúng tôi scale up độ phân giải của Path-256. Chúng tôi huấn luyện cho 200000 bước, với 10000 bước warmup, learning rate 0.0005, và weight decay 0.05. Cho mô hình, chúng tôi huấn luyện với 4 tầng, và hidden dimension 256. Chúng tôi sử dụng kernel dropout 0.1, kernel learning rate 0.0005, λ factor 0.001, và hai channel trên bộ lọc. Chúng tôi giữ độ dài bộ lọc là 65536.
+
+C.4 Benchmark tích chập
+Cho các thí nghiệm trong Bảng 3, chúng tôi tính thời gian lượt forward của tích chập với batch size 64, hidden dimension 768, và độ dài dãy thay đổi. Nếu chúng tôi hết bộ nhớ cho một độ dài dãy, chúng tôi chia batch và hidden dimension và gọi lượt forward nhiều lần. Chúng tôi tính thời gian mỗi lần gọi 30 lần và lấy trung bình của các lần chạy. Chúng tôi sử dụng cùng giao thức cho lượt backward trong Bảng ?.
+
+C.5 Chi tiết mô hình hóa end-to-end
+Cho các thí nghiệm trong Bảng 5, chúng tôi chạy lượt forward của mỗi mô hình, và sử dụng nó để tính toán throughput. Batch size thay đổi theo mô hình, và chúng tôi kiểm tra tính toán throughput với một vài batch size để đảm bảo kết quả nhất quán. Cho mô hình M2-BERT-base, chúng tôi sử dụng mô hình 110M từ Monarch Mixer [42]. Cho mô hình Hyena-s-4K, chúng tôi sử dụng mô hình giống hệt như trong Bảng 1, nhưng với độ dài bộ lọc 4K. Cho mô hình long conv Path-X, chúng tôi sử dụng cùng mô hình như trong Bảng 2. Cho mô hình SaShiMi, chúng tôi sử dụng mô hình SaShiMi standalone từ triển khai chính thức [45], và chúng tôi sử dụng 8 tầng với hidden dimension 64, và 4 tầng up pool và down pool. Cho mô hình HyenaDNA, chúng tôi sử dụng checkpoint chính thức độ dài dãy 1M từ [82]. Cho M2-BERT-base, Hyena-s-4K, và HyenaDNA, chúng tôi cũng sử dụng kernel tích chập depthwise nhanh cho kernel ngắn. Cho M2-BERT-base, Hyena-s-4K, và HyenaDNA, chúng tôi báo cáo kết quả benchmark trên một H100-SXM. Cho các mô hình khác, chúng tôi báo cáo hiệu suất trên một A100-40GB.
+
+C.6 So sánh với Transformer
+Cho so sánh với Transformer trong Bảng 6, chúng tôi sử dụng các triển khai chính thức với phiên bản FlashAttention-v2 [22]. Chúng tôi sử dụng mô hình Hyena, và khớp số tầng, hidden dimension, và hệ số mở rộng với mô hình Transformer 2.7B. Để tính toán sử dụng FLOP, chúng tôi lấy công thức:
+
+2 * số token * số tham số
+
+cho FLOP tham số. Cho FLOP không tham số, chúng tôi thêm số FLOP thô từ mô hình chi phí của chúng tôi trong Phương trình 2 (mà không điều chỉnh tốc độ FLOP tensor core).
+
+C.7 Tích chập từng phần cho Hyena
+Cho đo footprint bộ nhớ giảm trong Bảng 7, chúng tôi sử dụng cùng mô hình Hyena-s như trong Bảng 1 và 5, ngoại trừ chúng tôi cắt ngắn bộ lọc. Điều này cho phép chúng tôi offload các phần của đầu vào, điều này giảm footprint bộ nhớ.
+
+C.8 Mở rộng HyenaDNA-1M
+Trong Bảng 8, chúng tôi sử dụng phương pháp sliding window để mở rộng các mô hình HyenaDNA-1M và HyenaDNA-450K đến dãy dài hơn. Điều này bắt chước việc huấn luyện HyenaDNA độ dài dãy 4M với bộ lọc ngắn.
+
+C.9 Tích chập thưa tần số
+Để đánh giá tích chập thưa tần số, chúng tôi lấy mô hình HyenaDNA-1M đã được huấn luyện trước, và sparsify k_f sử dụng chiến lược được mô tả trong Phụ lục A.4. Sau đó chúng tôi chạy validation tiêu chuẩn sử dụng validation set từ [82].
+
+C.10 Profiling GPU thực nghiệm
+Bảng 19 đưa ra số liệu GPU được đo thực nghiệm cho A100-40GB, mà chúng tôi đã sử dụng để tạo ra Hình 4. Các số liệu được chuyên biệt hóa cho khối lượng công việc phân tích Monarch. Để đo FLOP tensor core có thể đạt được, chúng tôi đo utilization của phép nhân ma trận fp16 thực. Để đo FLOP số học tổng quát có thể đạt được, chúng tôi đo utilization của việc áp dụng liên tục hệ số Twiddle. Để đo băng thông HBM có thể đạt được, chúng tôi đo tốc độ của torch.clone của một tensor. Để đo băng thông SRAM có thể đạt được, chúng tôi đo slow down từ việc viết kết quả trung gian vào SRAM giữa các lệnh nhân ma trận.
+
+--- TRANG 31 ---
+Bảng 19: Các hằng số đo được cho mô hình chi phí cho A100-40GB.
+
+[Bảng hiển thị các hằng số với giá trị tương ứng]
