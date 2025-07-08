@@ -801,14 +801,6 @@ class TranslationManager:
                     total, processing, pending = self.queue_manager.get_queue_status()
                     current_time = time.time()
                     
-                    # Periodically clean stale processing entries (every 5 minutes)
-                    if current_time - self.last_stale_cleanup > 300:  # 5 minutes
-                        stale_cleaned = self.queue_manager.clean_stale_processing()
-                        if stale_cleaned > 0:
-                            logger.info(f"Cleaned {stale_cleaned} stale processing entries")
-                            # Refresh queue status after cleaning
-                            total, processing, pending = self.queue_manager.get_queue_status()
-                        self.last_stale_cleanup = current_time
                     
                     # Only log status if it changed or 60 seconds have passed
                     status_changed = (total, processing, pending) != self.last_status
@@ -821,6 +813,15 @@ class TranslationManager:
                     
                     # Check if we're done (only if we have no processing items left)
                     if pending == 0 and processing == 0 and len(futures) == 0:
+                        # Clean stale processing entries at the end when pending = 0
+                        stale_cleaned = self.queue_manager.clean_stale_processing()
+                        if stale_cleaned > 0:
+                            logger.info(f"Final cleanup: cleaned {stale_cleaned} stale processing entries")
+                            # Refresh queue status after cleaning
+                            total, processing, pending = self.queue_manager.get_queue_status()
+                            # Continue the loop to recheck status after stale cleanup
+                            continue
+                        
                         if total == 0:
                             logger.info("Queue is empty. Nothing to process.")
                         else:
@@ -829,13 +830,7 @@ class TranslationManager:
                     
                     # If we have pending work but no futures, something went wrong
                     if pending > 0 and len(futures) == 0:
-                        logger.warning(f"No active workers but {pending} pending files. Checking for stale entries and attempting to start workers...")
-                        # Clean stale entries first
-                        stale_cleaned = self.queue_manager.clean_stale_processing()
-                        if stale_cleaned > 0:
-                            logger.info(f"Cleaned {stale_cleaned} additional stale processing entries")
-                            # Refresh queue status after cleaning
-                            total, processing, pending = self.queue_manager.get_queue_status()
+                        logger.warning(f"No active workers but {pending} pending files. Attempting to start workers...")
                         
                         # Try to start at least one worker before continuing
                         filename = self.queue_manager.get_next_file()
