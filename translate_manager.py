@@ -575,7 +575,7 @@ IMPORTANT: Output only the Vietnamese translation. Do not explain what you did. 
                             "Claude configuration file at",
                             "The corrupted file has been back"
                         ]
-                        is_valid = (stdout and len(stdout.strip()) > 100 and 
+                        is_valid = (stdout and len(stdout.strip()) > 50 and 
                                   not any(indicator in stdout for indicator in invalid_indicators))
                         
                         if is_valid:
@@ -593,7 +593,7 @@ IMPORTANT: Output only the Vietnamese translation. Do not explain what you did. 
                                 simple_cmd = [self.claude_path, "--print", "--dangerously-skip-permissions"]
                                 try:
                                     retry_result = subprocess.run(simple_cmd, input=full_prompt, capture_output=True, text=True, timeout=1200)
-                                    if retry_result.returncode == 0 and retry_result.stdout and len(retry_result.stdout.strip()) > 100:
+                                    if retry_result.returncode == 0 and retry_result.stdout and len(retry_result.stdout.strip()) > 50:
                                         output_path.write_text(retry_result.stdout, encoding='utf-8')
                                         worker_logger.info(f"Retry successful: Translation saved to {output_path} ({len(retry_result.stdout)} chars)")
                                         return True
