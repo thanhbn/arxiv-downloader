@@ -20,7 +20,7 @@ import multiprocessing
 import time
 import logging
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Any
 import fcntl
 import tempfile
 import shutil
@@ -29,6 +29,9 @@ import signal
 import glob
 import re
 from datetime import datetime
+import json
+import uuid
+import threading
 
 # Configure logging
 logging.basicConfig(
@@ -40,6 +43,190 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+class ChunkStateManager:
+    """Manages state and assembly of parallel chunk translations."""
+    
+    def __init__(self, file_path: str):
+        self.file_path = Path(file_path)
+        self.translation_id = str(uuid.uuid4())[:8]
+        self.state_dir = Path(f".translation_state_{self.translation_id}")
+        self.state_file = self.state_dir / "chunks.json"
+        self.lock = threading.Lock()
+        
+        # Create state directory
+        self.state_dir.mkdir(exist_ok=True)
+        
+        # Initialize state
+        self.state = {
+            "file_path": str(file_path),
+            "translation_id": self.translation_id,
+            "total_chunks": 0,
+            "completed_chunks": 0,
+            "failed_chunks": [],
+            "chunks": {},  # chunk_id -> {status, file, order, size, timestamp}
+            "created_at": datetime.now().isoformat(),
+            "last_updated": datetime.now().isoformat()
+        }
+        self._save_state()
+    
+    def register_chunks(self, chunks: List[str]) -> List[str]:
+        """Register chunks and return chunk IDs for processing."""
+        with self.lock:
+            chunk_ids = []
+            self.state["total_chunks"] = len(chunks)
+            
+            for i, chunk_content in enumerate(chunks):
+                chunk_id = f"chunk_{i+1:03d}"
+                chunk_file = self.state_dir / f"{chunk_id}.txt"
+                
+                # Save chunk content to file
+                chunk_file.write_text(chunk_content, encoding='utf-8')
+                
+                # Register in state
+                self.state["chunks"][chunk_id] = {
+                    "status": "pending",
+                    "order": i + 1,
+                    "content_file": str(chunk_file),
+                    "translation_file": str(self.state_dir / f"{chunk_id}_translation.txt"),
+                    "size": len(chunk_content),
+                    "created_at": datetime.now().isoformat()
+                }
+                chunk_ids.append(chunk_id)
+            
+            self._save_state()
+            return chunk_ids
+    
+    def start_chunk(self, chunk_id: str) -> Optional[str]:
+        """Mark chunk as processing and return content."""
+        with self.lock:
+            if chunk_id not in self.state["chunks"]:
+                return None
+            
+            chunk_info = self.state["chunks"][chunk_id]
+            if chunk_info["status"] != "pending":
+                return None
+            
+            chunk_info["status"] = "processing"
+            chunk_info["started_at"] = datetime.now().isoformat()
+            self._save_state()
+            
+            # Return chunk content
+            content_file = Path(chunk_info["content_file"])
+            if content_file.exists():
+                return content_file.read_text(encoding='utf-8')
+            return None
+    
+    def complete_chunk(self, chunk_id: str, translation: str) -> bool:
+        """Mark chunk as completed and save translation."""
+        with self.lock:
+            if chunk_id not in self.state["chunks"]:
+                return False
+            
+            chunk_info = self.state["chunks"][chunk_id]
+            if chunk_info["status"] != "processing":
+                return False
+            
+            # Save translation
+            translation_file = Path(chunk_info["translation_file"])
+            translation_file.write_text(translation, encoding='utf-8')
+            
+            # Update state
+            chunk_info["status"] = "completed"
+            chunk_info["completed_at"] = datetime.now().isoformat()
+            chunk_info["translation_size"] = len(translation)
+            
+            self.state["completed_chunks"] += 1
+            self._save_state()
+            return True
+    
+    def fail_chunk(self, chunk_id: str, error: str) -> bool:
+        """Mark chunk as failed."""
+        with self.lock:
+            if chunk_id not in self.state["chunks"]:
+                return False
+            
+            chunk_info = self.state["chunks"][chunk_id]
+            chunk_info["status"] = "failed"
+            chunk_info["failed_at"] = datetime.now().isoformat()
+            chunk_info["error"] = error
+            
+            if chunk_id not in self.state["failed_chunks"]:
+                self.state["failed_chunks"].append(chunk_id)
+            
+            self._save_state()
+            return True
+    
+    def get_assembly_order(self) -> List[Tuple[str, str]]:
+        """Get chunks in correct order for assembly. Returns [(chunk_id, status), ...]"""
+        with self.lock:
+            chunks_by_order = sorted(
+                self.state["chunks"].items(),
+                key=lambda x: x[1]["order"]
+            )
+            return [(chunk_id, info["status"]) for chunk_id, info in chunks_by_order]
+    
+    def assemble_translation(self) -> Tuple[str, List[str]]:
+        """Assemble final translation from completed chunks."""
+        with self.lock:
+            translation_parts = []
+            failed_chunks = []
+            
+            # Get chunks in order
+            chunks_by_order = sorted(
+                self.state["chunks"].items(),
+                key=lambda x: x[1]["order"]
+            )
+            
+            for chunk_id, chunk_info in chunks_by_order:
+                if chunk_info["status"] == "completed":
+                    translation_file = Path(chunk_info["translation_file"])
+                    if translation_file.exists():
+                        translation = translation_file.read_text(encoding='utf-8')
+                        translation_parts.append(translation)
+                    else:
+                        failed_chunks.append(chunk_id)
+                        translation_parts.append(f"[MISSING TRANSLATION FOR CHUNK {chunk_id}]")
+                elif chunk_info["status"] == "failed":
+                    failed_chunks.append(chunk_id)
+                    translation_parts.append(f"[TRANSLATION FAILED FOR CHUNK {chunk_id}]")
+                else:
+                    # Still pending or processing
+                    failed_chunks.append(chunk_id)
+                    translation_parts.append(f"[INCOMPLETE TRANSLATION FOR CHUNK {chunk_id}]")
+            
+            return "\n\n".join(translation_parts), failed_chunks
+    
+    def get_status(self) -> Dict[str, Any]:
+        """Get current translation status."""
+        with self.lock:
+            pending = sum(1 for info in self.state["chunks"].values() if info["status"] == "pending")
+            processing = sum(1 for info in self.state["chunks"].values() if info["status"] == "processing")
+            completed = sum(1 for info in self.state["chunks"].values() if info["status"] == "completed")
+            failed = sum(1 for info in self.state["chunks"].values() if info["status"] == "failed")
+            
+            return {
+                "total_chunks": self.state["total_chunks"],
+                "pending": pending,
+                "processing": processing,
+                "completed": completed,
+                "failed": failed,
+                "success_rate": (completed / self.state["total_chunks"] * 100) if self.state["total_chunks"] > 0 else 0
+            }
+    
+    def cleanup(self):
+        """Clean up temporary state files."""
+        try:
+            if self.state_dir.exists():
+                shutil.rmtree(self.state_dir)
+        except Exception as e:
+            logger.warning(f"Failed to cleanup state directory {self.state_dir}: {e}")
+    
+    def _save_state(self):
+        """Save current state to JSON file."""
+        self.state["last_updated"] = datetime.now().isoformat()
+        with open(self.state_file, 'w') as f:
+            json.dump(self.state, f, indent=2)
 
 class TranslationQueueManager:
     """Manages the translation queue with file locking for thread safety."""
@@ -376,6 +563,17 @@ class TranslationQueueManager:
         finally:
             self._release_lock()
             
+    def is_all_processing_state(self) -> bool:
+        """Check if queue has no pending items but has processing items (indicating potential stale entries)."""
+        if not self._acquire_lock():
+            return False
+            
+        try:
+            total, processing, pending = self.get_queue_status()
+            return pending == 0 and processing > 0
+        finally:
+            self._release_lock()
+    
     def clean_duplicate_arxiv_ids(self) -> int:
         """Remove duplicate arxiv_id.txt entries from queue, keeping only the longer filename versions."""
         if not self._acquire_lock():
@@ -481,6 +679,46 @@ class ClaudeTranslator:
     def __init__(self, claude_path: str = "claude"):
         self.claude_path = claude_path
         self.translation_prompt = self._build_translation_prompt()
+        self.chunk_translation_prompt = self._build_chunk_translation_prompt()
+        self.emergency_chunk_prompt = self._build_emergency_chunk_prompt()
+        
+        # Token-aware chunking thresholds
+        # Claude Sonnet 4: 200K tokens total (input + output combined)
+        self.claude_max_tokens = 200000
+        self.claude_max_output_tokens = 64000  # Claude Sonnet 4 output limit
+        self.chars_per_token = 0.75  # Conservative estimate for English text
+        
+        # Vietnamese translation characteristics (based on analysis)
+        self.vietnamese_expansion_ratio = 1.3  # Conservative estimate (1.3x expansion)
+        self.vietnamese_chars_per_token = 0.6  # Vietnamese text is more token-dense
+        
+        # Calculate safe input limits accounting for output tokens
+        # Total budget: 200K tokens
+        # Reserve tokens for output: estimated_input_tokens * expansion_ratio / chars_per_token
+        self.output_token_overhead_ratio = 1.5  # Conservative multiplier for output tokens
+        self.max_safe_input_tokens = int(self.claude_max_tokens * 0.6)  # Use 60% for input, 40% for output
+        self.max_input_chars = int(self.max_safe_input_tokens * self.chars_per_token)  # ~90K chars safe limit
+        
+        # Chunking configuration (accounting for input + output tokens)
+        self.max_chars_per_chunk = 25000  # Reduced from 40KB to account for output tokens
+        self.large_file_threshold = 40000  # Reduced threshold for safety
+        self.emergency_chunk_size = int(self.max_input_chars * 0.4)  # Even more conservative for emergency mode
+        
+        # Enhanced boundary handling
+        self.sentence_overlap_count = 2  # Number of sentences to overlap between chunks
+        self.context_window_sentences = 3  # Additional sentences for context
+        self.min_chunk_sentences = 5  # Minimum sentences per chunk
+        
+        # Safety margins
+        self.prompt_overhead = 500  # Estimated chars for prompt template
+        self.safety_margin = 0.9  # Use 90% of available space
+        
+        # Debug info
+        logger.info(f"Token-aware chunking initialized:")
+        logger.info(f"  Max safe input chars: {self.max_input_chars:,}")
+        logger.info(f"  Standard chunk size: {self.max_chars_per_chunk:,} chars")
+        logger.info(f"  Emergency chunk size: {self.emergency_chunk_size:,} chars")
+        logger.info(f"  Vietnamese expansion ratio: {self.vietnamese_expansion_ratio}x")
         
     def _build_translation_prompt(self) -> str:
         """Build the translation prompt template."""
@@ -489,6 +727,399 @@ class ClaudeTranslator:
 {content}
 
 IMPORTANT: Output only the Vietnamese translation. Do not explain what you did. Do not summarize. Start with the first Vietnamese sentence immediately."""
+    
+    def _build_chunk_translation_prompt(self) -> str:
+        """Build the translation prompt template for file chunks."""
+        return """Translate this chunk of text to Vietnamese. This is part {chunk_num} of {total_chunks} from a larger document.
+
+{content}
+
+IMPORTANT INSTRUCTIONS:
+- If you see [CONTEXT from previous chunk - for reference only], use this for understanding but DO NOT translate it
+- Only translate the content under [NEW CONTENT to translate] section
+- If there are no context markers, translate the entire content
+- Output only the Vietnamese translation of the NEW content
+- Maintain terminology consistency with any context provided
+- Preserve original structure and formatting
+- Start immediately with the Vietnamese translation"""
+    
+    def _build_emergency_chunk_prompt(self) -> str:
+        """Build a minimal prompt for emergency ultra-small chunks."""
+        return """Translate to Vietnamese:
+
+{content}
+
+Vietnamese:"""
+    
+    def _estimate_tokens(self, text: str) -> int:
+        """Estimate token count for text (conservative)."""
+        return int(len(text) / self.chars_per_token)
+    
+    def _is_chunk_safe_for_context(self, chunk: str, prompt_template: str) -> bool:
+        """Check if chunk + prompt + expected output will fit within Claude's context limit."""
+        # Estimate input tokens (prompt + content)
+        full_prompt = prompt_template.format(content=chunk, chunk_num=1, total_chunks=1)
+        input_tokens = self._estimate_tokens(full_prompt)
+        
+        # Estimate output tokens (Vietnamese translation)
+        vietnamese_content_chars = len(chunk) * self.vietnamese_expansion_ratio
+        output_tokens = int(vietnamese_content_chars / self.vietnamese_chars_per_token)
+        
+        # Total token usage
+        total_tokens = input_tokens + output_tokens
+        
+        # Safety check: must be under 90% of Claude's total limit
+        return total_tokens < (self.claude_max_tokens * 0.9)
+    
+    def _detect_sentences(self, text: str) -> List[str]:
+        """Detect sentence boundaries in text with academic paper awareness."""
+        import re
+        
+        # Simple but effective sentence detection for academic papers
+        # Replace problematic patterns first
+        text = re.sub(r'\bet al\.', 'et al', text)  # Handle et al.
+        text = re.sub(r'\b(Dr|Mr|Mrs|Ms|Prof|Fig|Table|Eq|Ref|vs|i\.e|e\.g|etc|cf|pp|vol|no|sec|ch|dept|univ|inst|corp|inc|ltd)\.', r'\1', text)
+        
+        # Split on sentence endings followed by whitespace and capital letter
+        sentence_pattern = r'[.!?]+\s+(?=[A-Z])'
+        
+        # Split text into sentences
+        sentences = re.split(sentence_pattern, text)
+        
+        # Clean up and reassemble sentences
+        cleaned_sentences = []
+        for i, sentence in enumerate(sentences):
+            sentence = sentence.strip()
+            if sentence:
+                # Add period if missing and not the last sentence
+                if i < len(sentences) - 1 and not sentence.endswith(('.', '!', '?')):
+                    sentence += '.'
+                cleaned_sentences.append(sentence)
+        
+        # Filter out very short "sentences" that are likely fragments
+        final_sentences = []
+        for sentence in cleaned_sentences:
+            sentence = sentence.strip()
+            if len(sentence) > 10:  # Minimum sentence length
+                # Restore abbreviations
+                sentence = re.sub(r'\bet al\b', 'et al.', sentence)
+                sentence = re.sub(r'\b(Dr|Mr|Mrs|Ms|Prof|Fig|Table|Eq|Ref|vs|i\.e|e\.g|etc|cf|pp|vol|no|sec|ch|dept|univ|inst|corp|inc|ltd)\b', r'\1.', sentence)
+                final_sentences.append(sentence)
+        
+        return final_sentences
+    
+    def _find_optimal_chunk_boundary(self, sentences: List[str], target_size: int, start_idx: int) -> int:
+        """Find the best place to end a chunk, prioritizing sentence boundaries."""
+        current_size = 0
+        best_boundary = start_idx
+        
+        for i in range(start_idx, len(sentences)):
+            sentence_size = len(sentences[i]) + 1  # +1 for space/newline
+            
+            if current_size + sentence_size > target_size:
+                # If we haven't included minimum sentences, continue
+                if i - start_idx < self.min_chunk_sentences and i < len(sentences) - 1:
+                    current_size += sentence_size
+                    continue
+                else:
+                    break
+            
+            current_size += sentence_size
+            best_boundary = i + 1  # +1 because we want to include this sentence
+        
+        return min(best_boundary, len(sentences))
+    
+    def _split_content_into_chunks(self, content: str, emergency_mode: bool = False) -> List[str]:
+        """Split content into manageable chunks with sentence-aware boundaries and context preservation."""
+        # First try sentence-aware chunking
+        try:
+            return self._split_by_sentences(content, emergency_mode)
+        except Exception as e:
+            # Fallback to line-based chunking if sentence detection fails
+            logger.warning(f"Sentence-aware chunking failed, falling back to line-based: {e}")
+            return self._split_by_lines_fallback(content, emergency_mode)
+    
+    def _split_by_sentences(self, content: str, emergency_mode: bool = False) -> List[str]:
+        """Split content by sentences with proper context preservation."""
+        sentences = self._detect_sentences(content)
+        
+        if len(sentences) < self.min_chunk_sentences:
+            # Content too short for sentence-based chunking
+            return [content]
+        
+        chunks = []
+        target_chunk_size = self.emergency_chunk_size if emergency_mode else self.max_chars_per_chunk
+        
+        i = 0
+        while i < len(sentences):
+            # Find optimal boundary for this chunk
+            end_idx = self._find_optimal_chunk_boundary(sentences, target_chunk_size, i)
+            
+            # Add context from previous chunk (except for first chunk)
+            if i > 0 and not emergency_mode:
+                # Include some sentences from previous chunk for context
+                context_start = max(0, i - self.context_window_sentences)
+                chunk_sentences = sentences[context_start:end_idx]
+                
+                # Mark context vs new content for translation
+                context_marker = f"[CONTEXT from previous chunk - for reference only]\n"
+                context_part = " ".join(sentences[context_start:i])
+                new_content_marker = f"\n[NEW CONTENT to translate]\n"
+                new_part = " ".join(sentences[i:end_idx])
+                
+                chunk_text = context_marker + context_part + new_content_marker + new_part
+            else:
+                # First chunk or emergency mode - no context needed
+                chunk_text = " ".join(sentences[i:end_idx])
+            
+            # Verify chunk safety
+            prompt_template = self.emergency_chunk_prompt if emergency_mode else self.chunk_translation_prompt
+            if not self._is_chunk_safe_for_context(chunk_text, prompt_template):
+                if emergency_mode:
+                    # Ultra-emergency: force smaller chunks
+                    mini_chunk_size = max(1, (end_idx - i) // 2)
+                    end_idx = i + mini_chunk_size
+                    chunk_text = " ".join(sentences[i:end_idx])
+                else:
+                    # Fall back to emergency mode
+                    emergency_chunks = self._split_by_sentences(chunk_text, emergency_mode=True)
+                    chunks.extend(emergency_chunks)
+                    i = end_idx
+                    continue
+            
+            chunks.append(chunk_text)
+            
+            # Move to next chunk with overlap
+            if not emergency_mode:
+                # Overlap by moving back slightly
+                i = max(i + 1, end_idx - self.sentence_overlap_count)
+            else:
+                i = end_idx
+        
+        return chunks
+    
+    def _split_by_lines_fallback(self, content: str, emergency_mode: bool = False) -> List[str]:
+        """Fallback line-based chunking when sentence detection fails."""
+        lines = content.split('\n')
+        chunks = []
+        current_chunk = []
+        current_size = 0
+        
+        target_chunk_size = self.emergency_chunk_size if emergency_mode else self.max_chars_per_chunk
+        
+        for line in lines:
+            line_size = len(line) + 1
+            
+            if current_size + line_size > target_chunk_size and current_chunk:
+                chunk_text = '\n'.join(current_chunk)
+                chunks.append(chunk_text)
+                
+                # Simple overlap for fallback mode
+                if not emergency_mode and len(current_chunk) > 3:
+                    current_chunk = current_chunk[-2:]  # Keep last 2 lines
+                    current_size = sum(len(l) + 1 for l in current_chunk)
+                else:
+                    current_chunk = []
+                    current_size = 0
+            
+            current_chunk.append(line)
+            current_size += line_size
+        
+        if current_chunk:
+            chunks.append('\n'.join(current_chunk))
+        
+        return chunks
+    
+    def _split_oversized_chunk(self, chunk: str) -> List[str]:
+        """Ultra-aggressive splitting for chunks that exceed even emergency limits."""
+        # Split by sentences first
+        sentences = chunk.replace('.', '.\n').replace('!', '!\n').replace('?', '?\n').split('\n')
+        sentences = [s.strip() for s in sentences if s.strip()]
+        
+        mini_chunks = []
+        current_mini = []
+        current_size = 0
+        max_mini_size = int(self.emergency_chunk_size * 0.5)  # Even smaller chunks
+        
+        for sentence in sentences:
+            sentence_size = len(sentence) + 1
+            
+            if current_size + sentence_size > max_mini_size and current_mini:
+                mini_chunks.append('\n'.join(current_mini))
+                current_mini = []
+                current_size = 0
+            
+            current_mini.append(sentence)
+            current_size += sentence_size
+        
+        if current_mini:
+            mini_chunks.append('\n'.join(current_mini))
+        
+        return mini_chunks
+    
+    def _is_large_file(self, content: str) -> bool:
+        """Check if file is too large for single translation."""
+        return len(content) > self.large_file_threshold
+    
+    def _translate_chunk(self, chunk: str, chunk_num: int, total_chunks: int, worker_logger, emergency_mode: bool = False) -> str:
+        """Translate a single chunk of content."""
+        # Choose appropriate prompt based on mode
+        if emergency_mode:
+            prompt = self.emergency_chunk_prompt.format(content=chunk)
+            worker_logger.warning(f"Using emergency mode for chunk {chunk_num}/{total_chunks}")
+        else:
+            prompt = self.chunk_translation_prompt.format(
+                content=chunk,
+                chunk_num=chunk_num,
+                total_chunks=total_chunks
+            )
+        
+        # Final safety check (input + expected output)
+        input_tokens = self._estimate_tokens(prompt)
+        vietnamese_chars = len(chunk) * self.vietnamese_expansion_ratio
+        output_tokens = int(vietnamese_chars / self.vietnamese_chars_per_token)
+        total_tokens = input_tokens + output_tokens
+        
+        if total_tokens > self.claude_max_tokens * 0.95:
+            worker_logger.error(f"Chunk {chunk_num}/{total_chunks} still too large: {input_tokens} input + {output_tokens} output = {total_tokens} total tokens")
+            return None
+        
+        worker_logger.debug(f"Chunk {chunk_num}/{total_chunks} token usage: {input_tokens} input + {output_tokens} output = {total_tokens} total")
+        
+        cmd = [
+            self.claude_path,
+            "--print", 
+            "--dangerously-skip-permissions",
+            "--model", "sonnet"
+        ]
+        
+        worker_logger.info(f"Translating chunk {chunk_num}/{total_chunks} ({len(chunk)} chars)")
+        
+        try:
+            result = subprocess.run(
+                cmd,
+                input=prompt,
+                capture_output=True,
+                text=True,
+                timeout=900  # 15 minutes per chunk
+            )
+            
+            if result.returncode == 0 and result.stdout:
+                # Validate chunk translation
+                stdout = result.stdout.strip()
+                invalid_indicators = [
+                    "Execution error", "configuration file", "corrupted",
+                    "Unexpected end of JSON input", "Claude configuration file"
+                ]
+                
+                if stdout and len(stdout) > 20 and not any(indicator in stdout for indicator in invalid_indicators):
+                    worker_logger.info(f"Chunk {chunk_num}/{total_chunks} translated successfully ({len(stdout)} chars)")
+                    return stdout
+                else:
+                    worker_logger.error(f"Invalid chunk translation: {stdout[:100]}...")
+                    return None
+            else:
+                worker_logger.error(f"Chunk translation failed: {result.stderr}")
+                return None
+                
+        except subprocess.TimeoutExpired:
+            worker_logger.error(f"Chunk {chunk_num}/{total_chunks} translation timeout")
+            return None
+        except Exception as e:
+            worker_logger.error(f"Error translating chunk {chunk_num}/{total_chunks}: {e}")
+            return None
+    
+    def _translate_large_file(self, input_path: Path, output_path: Path, content: str, worker_logger) -> bool:
+        """Translate a large file using parallel chunk processing with state management."""
+        estimated_tokens = self._estimate_tokens(content)
+        worker_logger.info(f"File size: {len(content)} chars, estimated {estimated_tokens} tokens")
+        
+        # Choose chunking strategy based on file size
+        if estimated_tokens > self.claude_max_tokens * 5:
+            worker_logger.warning("Extremely large file detected. Using emergency chunking mode.")
+            chunks = self._split_content_into_chunks(content, emergency_mode=True)
+            emergency_mode = True
+        else:
+            chunks = self._split_content_into_chunks(content, emergency_mode=False)
+            emergency_mode = False
+        
+        total_chunks = len(chunks)
+        worker_logger.info(f"Split large file into {total_chunks} chunks (emergency_mode={emergency_mode})")
+        
+        # Initialize chunk state manager
+        chunk_manager = ChunkStateManager(str(input_path))
+        
+        try:
+            # Register all chunks
+            chunk_ids = chunk_manager.register_chunks(chunks)
+            worker_logger.info(f"Registered {len(chunk_ids)} chunks for parallel processing")
+            
+            # Process chunks in parallel using ProcessPoolExecutor
+            max_chunk_workers = min(4, total_chunks)  # Limit concurrent chunks to avoid overwhelming Claude
+            worker_logger.info(f"Using {max_chunk_workers} parallel chunk workers")
+            
+            with ProcessPoolExecutor(max_workers=max_chunk_workers) as executor:
+                # Submit all chunks for processing
+                chunk_futures = {}
+                for chunk_id in chunk_ids:
+                    future = executor.submit(
+                        chunk_worker, 
+                        (chunk_id, str(chunk_manager.state_dir), self.claude_path, 
+                         self.max_chars_per_chunk, self.large_file_threshold)
+                    )
+                    chunk_futures[future] = chunk_id
+                
+                # Process completed chunks as they finish
+                completed_count = 0
+                for future in as_completed(chunk_futures):
+                    chunk_id = chunk_futures[future]
+                    try:
+                        chunk_id_result, success, result_or_error = future.result()
+                        
+                        if success:
+                            chunk_manager.complete_chunk(chunk_id_result, result_or_error)
+                            completed_count += 1
+                            worker_logger.info(f"Chunk {chunk_id_result} completed ({completed_count}/{total_chunks})")
+                        else:
+                            chunk_manager.fail_chunk(chunk_id_result, result_or_error)
+                            worker_logger.error(f"Chunk {chunk_id_result} failed: {result_or_error}")
+                            
+                    except Exception as e:
+                        chunk_manager.fail_chunk(chunk_id, f"Future exception: {e}")
+                        worker_logger.error(f"Exception processing chunk {chunk_id}: {e}")
+                    
+                    # Report progress
+                    status = chunk_manager.get_status()
+                    if status["completed"] % 5 == 0 or status["completed"] == total_chunks:
+                        worker_logger.info(f"Progress: {status['completed']}/{total_chunks} completed, "
+                                         f"{status['failed']} failed ({status['success_rate']:.1f}% success)")
+            
+            # Assemble final translation
+            worker_logger.info("Assembling final translation from completed chunks...")
+            full_translation, failed_chunk_ids = chunk_manager.assemble_translation()
+            
+            # Save the complete translation
+            output_path.write_text(full_translation, encoding='utf-8')
+            
+            # Report final status
+            final_status = chunk_manager.get_status()
+            worker_logger.info(f"Parallel chunk translation completed: {len(full_translation)} chars "
+                             f"across {total_chunks} chunks ({final_status['success_rate']:.1f}% success)")
+            
+            if failed_chunk_ids:
+                worker_logger.warning(f"Translation completed with {len(failed_chunk_ids)} failed chunks: {failed_chunk_ids}")
+                worker_logger.warning("Check output for [TRANSLATION FAILED] markers")
+            else:
+                worker_logger.info(f"Successfully completed parallel translation of {input_path}")
+            
+            return len(failed_chunk_ids) == 0
+            
+        except Exception as e:
+            worker_logger.error(f"Error in parallel chunk processing: {e}")
+            return False
+        finally:
+            # Clean up state files
+            chunk_manager.cleanup()
     
     def translate_file(self, input_file: str) -> bool:
         """Translate a single file using Claude executable."""
@@ -517,6 +1148,12 @@ IMPORTANT: Output only the Vietnamese translation. Do not explain what you did. 
             # Remove null bytes and other problematic characters
             content = content.replace('\x00', '').replace('\r', '\n')
             
+            # Check if file is too large for single translation
+            if self._is_large_file(content):
+                worker_logger.info(f"Large file detected ({len(content)} chars). Using chunked translation.")
+                return self._translate_large_file(input_path, output_path, content, worker_logger)
+            
+            # Standard single-file translation for smaller files
             # Build full prompt
             full_prompt = self.translation_prompt.format(content=content)
             
@@ -624,9 +1261,86 @@ IMPORTANT: Output only the Vietnamese translation. Do not explain what you did. 
             worker_logger.error(f"Exception traceback: {traceback.format_exc()}")
             return False
 
-def translate_worker(args: Tuple[str, str]) -> Tuple[str, bool]:
+def chunk_worker(args: Tuple[str, str, str, int, int]) -> Tuple[str, bool, str]:
+    """Worker function for processing individual chunks with state management."""
+    chunk_id, state_dir, claude_path, chunk_size, large_file_threshold = args
+    worker_pid = os.getpid()
+    
+    # Set up worker-specific logger
+    worker_logger = logging.getLogger(f"chunk_worker_{worker_pid}")
+    worker_logger.setLevel(logging.INFO)
+    
+    if not worker_logger.handlers:
+        worker_handler = logging.StreamHandler()
+        worker_formatter = logging.Formatter(
+            f'%(asctime)s - CHUNK-WORKER-{worker_pid} - %(levelname)s - %(message)s'
+        )
+        worker_handler.setFormatter(worker_formatter)
+        worker_logger.addHandler(worker_handler)
+        worker_logger.propagate = False
+    
+    worker_logger.info(f"Starting chunk worker for {chunk_id}")
+    
+    try:
+        # Load state and get chunk content
+        state_file = Path(state_dir) / "chunks.json"
+        if not state_file.exists():
+            return (chunk_id, False, "State file not found")
+        
+        with open(state_file, 'r') as f:
+            state = json.load(f)
+        
+        if chunk_id not in state["chunks"]:
+            return (chunk_id, False, "Chunk not found in state")
+        
+        chunk_info = state["chunks"][chunk_id]
+        content_file = Path(chunk_info["content_file"])
+        
+        if not content_file.exists():
+            return (chunk_id, False, "Chunk content file not found")
+        
+        # Read chunk content
+        chunk_content = content_file.read_text(encoding='utf-8')
+        worker_logger.info(f"Processing chunk {chunk_id}: {len(chunk_content)} chars")
+        
+        # Set up translator
+        translator = ClaudeTranslator(claude_path)
+        translator.max_chars_per_chunk = chunk_size
+        translator.large_file_threshold = large_file_threshold
+        
+        # Translate the chunk
+        # Extract chunk number from chunk_id for display
+        chunk_num = int(chunk_id.split('_')[-1])
+        total_chunks = state["total_chunks"]
+        
+        translation = translator._translate_chunk(
+            chunk_content, 
+            chunk_num, 
+            total_chunks, 
+            worker_logger, 
+            emergency_mode=False
+        )
+        
+        if translation:
+            # Save translation directly to state managed file
+            translation_file = Path(chunk_info["translation_file"])
+            translation_file.write_text(translation, encoding='utf-8')
+            
+            worker_logger.info(f"Successfully translated chunk {chunk_id} ({len(translation)} chars)")
+            return (chunk_id, True, translation)
+        else:
+            worker_logger.error(f"Failed to translate chunk {chunk_id}")
+            return (chunk_id, False, "Translation failed")
+            
+    except Exception as e:
+        worker_logger.error(f"Chunk worker error for {chunk_id}: {e}")
+        import traceback
+        worker_logger.error(f"Traceback: {traceback.format_exc()}")
+        return (chunk_id, False, str(e))
+
+def translate_worker(args: Tuple[str, str, int, int]) -> Tuple[str, bool]:
     """Worker function for multiprocessing translation."""
-    filename, claude_path = args
+    filename, claude_path, chunk_size, large_file_threshold = args
     worker_pid = os.getpid()
     
     # Set up worker-specific logger
@@ -655,7 +1369,10 @@ def translate_worker(args: Tuple[str, str]) -> Tuple[str, bool]:
     
     try:
         translator = ClaudeTranslator(claude_path)
-        worker_logger.info(f"Translator initialized for {filename}")
+        # Configure chunking parameters
+        translator.max_chars_per_chunk = chunk_size
+        translator.large_file_threshold = large_file_threshold
+        worker_logger.info(f"Translator initialized for {filename} (chunk_size={chunk_size}, threshold={large_file_threshold})")
         
         result = translator.translate_file(filename)
         
@@ -671,9 +1388,9 @@ def translate_worker(args: Tuple[str, str]) -> Tuple[str, bool]:
         worker_logger.error(f"Traceback: {traceback.format_exc()}")
         return (filename, False)
 
-def idle_worker(args: Tuple[str, str]) -> Tuple[Optional[str], bool]:
+def idle_worker(args: Tuple[str, str, int, int]) -> Tuple[Optional[str], bool]:
     """Idle worker function that polls for new files and processes them."""
-    queue_file, claude_path = args
+    queue_file, claude_path, chunk_size, large_file_threshold = args
     worker_pid = os.getpid()
     
     # Set up worker-specific logger
@@ -703,6 +1420,9 @@ def idle_worker(args: Tuple[str, str]) -> Tuple[Optional[str], bool]:
     try:
         queue_manager = TranslationQueueManager(queue_file)
         translator = ClaudeTranslator(claude_path)
+        # Configure chunking parameters
+        translator.max_chars_per_chunk = chunk_size
+        translator.large_file_threshold = large_file_threshold
         
         # Poll for files every 5 seconds
         poll_interval = 5
@@ -748,10 +1468,13 @@ class TranslationManager:
     """Main translation manager orchestrating the entire process."""
     
     def __init__(self, queue_file: str = "translation_queue.txt", 
-                 claude_path: str = "claude", max_workers: int = 6):
+                 claude_path: str = "claude", max_workers: int = 6,
+                 chunk_size: int = 40000, large_file_threshold: int = 60000):
         self.queue_manager = TranslationQueueManager(queue_file)
         self.claude_path = claude_path
         self.max_workers = max_workers
+        self.chunk_size = chunk_size
+        self.large_file_threshold = large_file_threshold
         self.active_workers = 0
         self.worker_start_times = {}  # Track when each worker started
         self.warmup_threshold = 300  # 5 minutes in seconds
@@ -827,6 +1550,20 @@ class TranslationManager:
                             logger.info("All files completed successfully.")
                         break
                     
+                    # Check for stale processing state (pending=0, processing>0, no active workers)
+                    if pending == 0 and processing > 0 and len(futures) == 0:
+                        logger.warning(f"Detected all-processing state: 0 pending, {processing} processing, 0 active workers")
+                        logger.info("Cleaning stale processing entries...")
+                        stale_cleaned = self.queue_manager.clean_stale_processing()
+                        if stale_cleaned > 0:
+                            logger.info(f"Cleaned {stale_cleaned} stale processing entries")
+                            # Refresh queue status after cleaning
+                            total, processing, pending = self.queue_manager.get_queue_status()
+                            logger.info(f"Updated queue status - Total: {total}, Processing: {processing}, Pending: {pending}")
+                        else:
+                            logger.warning("No stale entries found, but all items are still processing - may indicate a system issue")
+                        continue
+                    
                     # If we have pending work but no futures, something went wrong
                     if pending > 0 and len(futures) == 0:
                         logger.warning(f"No active workers but {pending} pending files. Checking for stale entries and attempting to start workers...")
@@ -840,7 +1577,7 @@ class TranslationManager:
                         # Try to start at least one worker before continuing
                         filename = self.queue_manager.get_next_file()
                         if filename:
-                            future = executor.submit(translate_worker, (filename, self.claude_path))
+                            future = executor.submit(translate_worker, (filename, self.claude_path, self.chunk_size, self.large_file_threshold))
                             futures[future] = ('file', filename)
                             self.worker_start_times[future] = time.time()
                             logger.info(f"Emergency restart: submitted {filename} for translation")
@@ -865,14 +1602,14 @@ class TranslationManager:
                             # Try to get a file for immediate processing
                             filename = self.queue_manager.get_next_file()
                             if filename:
-                                future = executor.submit(translate_worker, (filename, self.claude_path))
+                                future = executor.submit(translate_worker, (filename, self.claude_path, self.chunk_size, self.large_file_threshold))
                                 futures[future] = ('file', filename)  # Mark as file worker
                                 self.worker_start_times[future] = time.time()
                                 logger.info(f"Submitted {filename} for translation")
                                 continue
                         
                         # No pending files, but we have worker capacity - start idle worker
-                        future = executor.submit(idle_worker, (str(self.queue_manager.queue_file), self.claude_path))
+                        future = executor.submit(idle_worker, (str(self.queue_manager.queue_file), self.claude_path, self.chunk_size, self.large_file_threshold))
                         futures[future] = ('idle', f'idle_worker_{len(futures)}')  # Mark as idle worker
                         self.worker_start_times[future] = time.time()
                         logger.info(f"Started idle worker {len(futures)} (total workers: {len(futures)})")
@@ -979,6 +1716,10 @@ def main():
                        help="Only clean duplicates and already-translated files from queue, don't start translation")
     parser.add_argument("--clean-stale", action="store_true",
                        help="Only clean stale processing entries (>30 minutes) from queue, don't start translation")
+    parser.add_argument("--chunk-size", type=int, default=40000,
+                       help="Maximum characters per chunk for large files (default: 40000)")
+    parser.add_argument("--large-file-threshold", type=int, default=60000,
+                       help="File size threshold in characters for chunking (default: 60000)")
     
     args = parser.parse_args()
     
@@ -990,11 +1731,13 @@ def main():
         logger.error("Number of workers must be between 1 and 16")
         sys.exit(1)
     
-    # Create translation manager
+    # Create translation manager with chunking configuration
     manager = TranslationManager(
         queue_file=args.queue_file,
         claude_path=args.claude_path,
-        max_workers=args.workers
+        max_workers=args.workers,
+        chunk_size=args.chunk_size,
+        large_file_threshold=args.large_file_threshold
     )
     
     # If clean-only mode, just clean and exit
