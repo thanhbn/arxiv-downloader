@@ -1,0 +1,202 @@
+# CharBERT: Mô hình Ngôn ngữ Tiền huấn luyện Nhận thức Ký tự
+
+Wentao May, Yiming Cuizy, Chenglei Si{y, Ting Liuz, Shijin Wangyx, Guoping Huy
+yPhòng thí nghiệm Trọng điểm Nhà nước về Trí tuệ Nhận thức, Nghiên cứu iFLYTEK, Trung Quốc
+zTrung tâm Nghiên cứu Tính toán Xã hội và Truy xuất Thông tin (SCIR),
+Viện Công nghệ Harbin, Harbin, Trung Quốc
+xNghiên cứu AI iFLYTEK (Hebei), Langfang, Trung Quốc
+{Đại học Maryland, College Park, MD, Hoa Kỳ
+yxfwtma,ymcui,clsi,sjwang3,gphu g@iflytek.com
+zfymcui,tliug@ir.hit.edu.cn
+
+## Tóm tắt
+
+Hầu hết các mô hình ngôn ngữ tiền huấn luyện (PLM) xây dựng biểu diễn từ ở mức từ phụ với Mã hóa Cặp Byte (BPE) hoặc các biến thể của nó, qua đó các từ OOV (ngoài từ vựng) hầu như có thể tránh được. Tuy nhiên, những phương pháp đó chia một từ thành các đơn vị từ phụ và làm cho biểu diễn không hoàn chỉnh và dễ vỡ. Trong bài báo này, chúng tôi đề xuất một mô hình ngôn ngữ tiền huấn luyện nhận thức ký tự có tên CharBERT cải tiến so với các phương pháp trước đây (như BERT, RoBERTa) để giải quyết những vấn đề này. Đầu tiên, chúng tôi xây dựng embedding từ ngữ cảnh cho mỗi token từ các biểu diễn ký tự tuần tự, sau đó kết hợp các biểu diễn của ký tự và biểu diễn từ phụ bằng một mô-đun tương tác không đồng nhất mới. Chúng tôi cũng đề xuất một nhiệm vụ tiền huấn luyện mới có tên NLM (Noisy LM) cho việc học biểu diễn ký tự không giám sát. Chúng tôi đánh giá phương pháp của mình trên các nhiệm vụ trả lời câu hỏi, gán nhãn chuỗi và phân loại văn bản, cả trên các tập dữ liệu gốc và các tập thử nghiệm lỗi chính tả đối kháng. Kết quả thực nghiệm cho thấy phương pháp của chúng tôi có thể cải thiện đáng kể cả hiệu suất và tính bền vững của PLM đồng thời.
+
+## 1 Giới thiệu
+
+Các mô hình ngôn ngữ tiền huấn luyện không giám sát như BERT (Devlin et al., 2019) và RoBERTa (Liu et al., 2019) đã đạt được kết quả đáng ngạc nhiên trên nhiều benchmark NLP. Các mô hình này được tiền huấn luyện trên các corpus quy mô lớn trong miền mở để có được biểu diễn ngôn ngữ tổng quát và sau đó được tinh chỉnh cho các nhiệm vụ downstream cụ thể. Để xử lý từ vựng lớn, các mô hình này sử dụng Mã hóa Cặp Byte (BPE) (Sennrich et al., 2016) hoặc các biến thể của nó như phương pháp mã hóa. Thay vì từ hoàn chỉnh, BPE thực hiện phân tích thống kê corpus huấn luyện và chia các từ thành các đơn vị từ phụ, một kết hợp giữa biểu diễn ở mức ký tự và mức từ.
+
+Mặc dù BPE có thể mã hóa hầu hết tất cả các từ trong từ vựng thành các token WordPiece mà không có từ OOV, nó có hai vấn đề: 1) mô hình hóa không hoàn chỉnh: các biểu diễn từ phụ có thể không kết hợp thông tin ký tự chi tiết và biểu diễn của toàn bộ từ; 2) biểu diễn dễ vỡ: các lỗi đánh máy nhỏ có thể thay đổi drastically các token BPE, dẫn đến biểu diễn không chính xác hoặc không hoàn chỉnh. Sự thiếu tính bền vững này cản trở nghiêm trọng khả năng ứng dụng của nó trong các ứng dụng thực tế. Chúng tôi minh họa hai vấn đề này bằng ví dụ trong Hình 1. Đối với một từ như "backhand", chúng ta có thể phân tách biểu diễn của nó ở các mức độ khác nhau bằng một cây có độ sâu 3: từ hoàn chỉnh ở lớp đầu tiên, các từ phụ ở lớp thứ hai và các ký tự cuối cùng. BPE chỉ xem xét biểu diễn của các từ phụ ở lớp thứ hai và bỏ lỡ thông tin có thể hữu ích ở lớp đầu tiên và lớp cuối cùng. Hơn nữa, nếu có nhiễu hoặc lỗi đánh máy trong các ký tự (ví dụ: thiếu chữ cái 'k'), các từ phụ và số lượng của chúng ở lớp thứ hai sẽ bị thay đổi cùng lúc. Các mô hình chỉ dựa vào các biểu diễn từ phụ này do đó gặp phải sự thiếu tính bền vững này.
+
+Chúng tôi lấy tập phát triển CoNLL-2003 NER làm ví dụ. Gần 28% các từ danh từ sẽ được chia thành nhiều hơn một từ phụ với tokenizer BERT. Khi chúng tôi ngẫu nhiên loại bỏ một ký tự từ các từ danh từ trong tập dữ liệu như ví dụ trong Hình 1, khoảng 78% các từ sẽ được tokenize thành các từ phụ hoàn toàn khác biệt, và 77% các từ có số lượng từ phụ khác nhau.
+
+[Hình 1: Cây cấu trúc nội bộ của "backhand", có hai từ phụ: "back", "hand". Nếu chữ cái "k" bị loại bỏ, các từ phụ sẽ thay đổi thành "b", "ach", và "and".]
+
+Nếu chúng ta tập trung vào các nút lá trong ví dụ, chúng ta có thể thấy rằng sự khác biệt của hai cây chỉ là một lá. Vì vậy, chúng tôi mở rộng các mô hình ngôn ngữ tiền huấn luyện bằng cách tích hợp thông tin ký tự của các từ. Có hai thách thức đối với việc tích hợp ký tự: 1) cách mô hình hóa thông tin ký tự cho toàn bộ từ thay vì từ phụ; 2) cách kết hợp các biểu diễn ký tự với thông tin từ phụ trong các mô hình tiền huấn luyện gốc.
+
+Chúng tôi đề xuất một phương pháp tiền huấn luyện mới CharBERT (BERT cũng có thể được thay thế bằng các mô hình tiền huấn luyện khác như RoBERTa) để giải quyết những vấn đề này. Thay vì lớp CNN truyền thống để mô hình hóa thông tin ký tự, chúng tôi sử dụng embedding chuỗi ngữ cảnh (Akbik et al., 2018) để mô hình hóa biểu diễn chi tiết của từ. Chúng tôi sử dụng kiến trúc hai kênh cho ký tự và từ phụ gốc và kết hợp chúng sau mỗi khối transformer. Hơn nữa, chúng tôi đề xuất một nhiệm vụ học ký tự không giám sát, tạo ra nhiễu vào ký tự và huấn luyện mô hình để khử nhiễu và khôi phục từ gốc.
+
+Những lợi thế chính của phương pháp chúng tôi là: 1) nhận thức ký tự: chúng tôi xây dựng biểu diễn từ từ ký tự dựa trên từ phụ gốc, điều này bổ sung rất tốt cho mô hình hóa dựa trên từ phụ. 2) tính bền vững: chúng tôi cải thiện không chỉ hiệu suất mà còn cả tính bền vững của mô hình tiền huấn luyện; 3) không phụ thuộc mô hình: phương pháp của chúng tôi không phụ thuộc vào PLM nền như BERT và RoBERTa, để chúng tôi có thể thích ứng nó với bất kỳ PLM dựa trên transformer nào. Tóm lại, những đóng góp của chúng tôi trong bài báo này là:
+
+• Chúng tôi đề xuất một phương pháp tiền huấn luyện nhận thức ký tự CharBERT, có thể làm phong phú biểu diễn từ trong PLM bằng cách kết hợp các đặc trưng ở các mức độ khác nhau của một từ;
+
+• Chúng tôi đánh giá phương pháp của mình trên 8 benchmark, và kết quả cho thấy phương pháp của chúng tôi có thể cải thiện đáng kể hiệu suất so với các baseline mạnh BERT và RoBERTa;
+
+• Chúng tôi xây dựng ba tập thử nghiệm tấn công ký tự trên ba loại nhiệm vụ. Kết quả thực nghiệm cho thấy phương pháp của chúng tôi có thể cải thiện tính bền vững với một biên độ lớn.
+
+## 2 Công trình Liên quan
+
+**Mô hình Ngôn ngữ Tiền huấn luyện.** Các mô hình ngôn ngữ tiền huấn luyện (PLM) ban đầu như CoVe (McCann et al., 2017) và ELMo (Peters et al., 2018) được tiền huấn luyện với các mô hình dựa trên RNN, thường được sử dụng như một phần của lớp embedding trong các mô hình cụ thể cho nhiệm vụ. GPT (Radford et al., 2019a) sử dụng bộ giải mã transformer cho mô hình hóa ngôn ngữ bằng tiền huấn luyện sinh và tinh chỉnh cho các nhiệm vụ downstream khác nhau. BERT (Devlin et al., 2019) tiền huấn luyện bộ mã hóa transformer và sử dụng tiền huấn luyện tự giám sát trên corpus lớn hơn, đạt được kết quả đáng ngạc nhiên trong nhiều benchmark hiểu ngôn ngữ tự nhiên (NLU). Các PLM khác như RoBERTa (Liu et al., 2019), XLNet (Yang et al., 2019), ALBERT (Lan et al., 2019) và ELECTRA (Clark et al., 2019), cải tiến trên các mô hình trước đó với nhiều cải tiến khác nhau về kiến trúc mô hình, phương pháp huấn luyện hoặc corpus tiền huấn luyện.
+
+Để xử lý từ vựng lớn trong corpus ngôn ngữ tự nhiên, hầu hết các PLM xử lý chuỗi đầu vào theo các đơn vị từ phụ bằng BPE (Sennrich et al., 2016) thay vì từ hoàn chỉnh, chia một từ thành các từ phụ bằng thuật toán nén mã hóa cặp byte. Kích thước từ vựng BPE thường dao động từ 10K-100K đơn vị từ phụ, hầu hết trong số đó là các ký tự Unicode. Radford et al. (2019b) giới thiệu một implementation khác sử dụng byte thay vì ký tự Unicode như các đơn vị từ phụ cơ sở, cho phép BPE mã hóa bất kỳ chuỗi đầu vào nào mà không có từ OOV với kích thước từ vựng khiêm tốn (50K).
+
+**Biểu diễn Ký tự.** Các mô hình ngôn ngữ truyền thống sử dụng từ vựng từ được định nghĩa trước, nhưng chúng không thể xử lý tốt các từ ngoài từ vựng. Các mô hình ngôn ngữ ký tự (CLM) có thể giảm thiểu vấn đề này bằng cách sử dụng từ vựng ký tự và mô hình hóa phân phối ký tự cho mô hình hóa ngôn ngữ (Sutskever et al., 2011). CLM đã được chứng minh là có hiệu suất cạnh tranh trên nhiều nhiệm vụ NLP khác nhau, như dịch máy neural (Lee et al., 2017) và gán nhãn chuỗi (Şahin and Steedman, 2018; Akbik et al., 2018). Hơn nữa, biểu diễn ký tự cũng đã được sử dụng để xây dựng biểu diễn từ; ví dụ, Peters et al. (2018) xây dựng biểu diễn từ ngữ cảnh với embedding ký tự và đạt được cải thiện đáng kể.
+
+**Tấn công Đối kháng.** Các PLM dễ bị tấn công đối kháng, trong đó các nhiễu loạn không thể nhận biết bằng mắt thường được thêm vào các ví dụ gốc để đánh lừa mô hình đưa ra dự đoán sai. Jia và Liang (2017) và Si et al. (2020) cho thấy rằng các mô hình đọc hiểu tiên tiến có thể bị đánh lừa ngay cả với các cuộc tấn công hộp đen mà không truy cập vào các tham số mô hình. Các cuộc tấn công hộp trắng khác (Alzantot et al., 2018; Ren et al., 2019; Jin et al., 2020; Zang et al., 2020) sử dụng gradient hoặc điểm dự đoán mô hình để tìm các từ thay thế đối kháng như các cuộc tấn công hiệu quả. Đối với các cuộc tấn công ở mức ký tự, Belinkov và Bisk (2017) nghiên cứu cách nhiễu tổng hợp và nhiễu từ các nguồn tự nhiên ảnh hưởng đến dịch máy ở mức ký tự. Ebrahimi et al. (2018) điều tra các ví dụ đối kháng cho dịch máy neural ở mức ký tự với một đối thủ hộp trắng. Để bảo vệ chống lại các cuộc tấn công ở mức ký tự, Pruthi et al. (2019) đề xuất đặt một mô hình nhận dạng từ trước bộ phân loại downstream để thực hiện sửa lỗi chính tả từ để chống lại các lỗi chính tả.
+
+**Kết hợp Biểu diễn Không đồng nhất.** Trong công trình của chúng tôi, chúng tôi cần kết hợp các biểu diễn không đồng nhất từ hai nguồn khác nhau. Các mô-đun tương tự đã được áp dụng trước đó trong các cài đặt khác nhau như đọc hiểu máy (Seo et al., 2017; Yang et al., 2017) và các mô hình ngôn ngữ tiền huấn luyện (Zhang et al., 2019; Zhang et al., 2020). Khác với các công trình này, chúng tôi thiết kế một mô-đun kết hợp hai bước để kết hợp các biểu diễn ký tự và từ phụ bằng cách tương tác, có thể được mở rộng để tích hợp thông tin khác vào mô hình ngôn ngữ (ví dụ: dấu phụ hoặc kiến thức bên ngoài).
+
+## 3 Phương pháp
+
+Trong phần này, chúng tôi trình bày khung tổng thể của CharBERT và các mô-đun phụ của nó, bao gồm kiến trúc mô hình trong Phần 3.2, bộ mã hóa ký tự trong Phần 3.3, mô-đun tương tác không đồng nhất trong Phần 3.4, nhiệm vụ tiền huấn luyện mới trong Phần 3.5, và phương pháp tinh chỉnh trong Phần 3.6.
+
+### 3.1 Ký hiệu
+
+Chúng tôi ký hiệu một chuỗi đầu vào là {w1;...;wi;...;wm}, trong đó wi là một từ phụ được tokenize bởi BPE và m là độ dài của chuỗi ở mức từ phụ. Mỗi token wi bao gồm các ký tự {ci1;...;cini} và ni là độ dài của từ phụ. Chúng tôi ký hiệu độ dài đầu vào ở mức ký tự là N, trong đó N=∑m i=1 ni.
+
+### 3.2 Kiến trúc Mô hình
+
+Như được hiển thị trong Hình 2, chúng tôi sử dụng kiến trúc hai kênh để mô hình hóa thông tin từ các từ phụ và ký tự tương ứng. Bên cạnh các lớp transformer từ mô hình tiền huấn luyện gốc như BERT, các mô-đun cốt lõi của CharBERT là: 1) bộ mã hóa ký tự, chịu trách nhiệm mã hóa chuỗi ký tự từ các token đầu vào; 2) tương tác không đồng nhất, kết hợp thông tin từ hai nguồn và xây dựng các biểu diễn độc lập mới cho chúng.
+
+Chúng tôi mô hình hóa các từ đầu vào như các chuỗi ký tự để nắm bắt thông tin ký tự trong và giữa các từ phụ, một bổ sung cho embedding WordPiece. Biểu diễn ở mức ký tự là không đồng nhất với biểu diễn ở mức từ phụ từ lớp embedding của các mô hình tiền huấn luyện vì chúng đến từ các nguồn khác nhau. Tuy nhiên, chúng nắm bắt thông tin ở độ chi tiết khác nhau và bổ sung cho nhau. Để cho phép chúng làm phong phú nhau một cách hiệu quả, chúng tôi thiết kế một mô-đun tương tác không đồng nhất với hai bước: 1) kết hợp: kết hợp thông tin từ hai kênh dựa trên lớp CNN (Kim, 2014); 2) chia: xây dựng biểu diễn mới cho mỗi kênh dựa trên kết nối dư.
+
+### 3.3 Bộ mã hóa Ký tự
+
+Trong mô-đun này, chúng tôi cần tạo ra các embedding ở mức token với các câu đầu vào như các chuỗi ký tự. Đầu tiên, chúng tôi chuyển đổi các chuỗi token thành ký tự và nhúng chúng vào các vector có kích thước cố định. Sau đó, chúng tôi áp dụng một lớp GRU hai chiều (Cho et al., 2014) để xây dựng các embedding ký tự ngữ cảnh, có thể được công thức hóa bởi
+
+eij = Wc cij ; hij(x) = Bi-GRU(eij); (1)
+
+trong đó Wc là ma trận embedding ký tự, hij là biểu diễn cho ký tự thứ j trong token thứ i.
+
+Chúng tôi áp dụng bi-GRU trên các ký tự với độ dài N cho toàn bộ chuỗi đầu vào thay vì một token đơn, xây dựng các biểu diễn từ các ký tự trong và giữa các từ phụ. Để xây dựng embedding ở mức token, chúng tôi nối các hidden của ký tự đầu tiên và cuối cùng của token.
+
+hi(x) = [hi1(x); hini(x)] (2)
+
+trong đó ni là độ dài của token thứ i và hi(x) là embedding ở mức token từ ký tự. Các embedding ký tự ngữ cảnh được tạo ra bởi các ký tự và cũng có thể nắm bắt thông tin từ hoàn chỉnh bằng các lớp bi-GRU.
+
+### 3.4 Tương tác Không đồng nhất
+
+Các embedding từ ký tự và kênh token gốc được đưa vào cùng các lớp transformer trong các mô hình tiền huấn luyện. Các biểu diễn token và char được kết hợp và chia bởi mô-đun tương tác không đồng nhất sau mỗi lớp transformer.
+
+Trong bước kết hợp, hai biểu diễn được biến đổi bởi các lớp fully-connected khác nhau. Sau đó chúng được nối và kết hợp bởi một lớp CNN, có thể được công thức hóa bởi
+
+t'i(x) = W1ti(x) + b1; h'i(x) = W2hi(x) + b2 (3)
+
+wi(x) = [t'i(x); h'i(x)]; mj,t = tanh(Wj3 wt:t+sj-1 + bj3) (4)
+
+trong đó ti(x) là biểu diễn token, W,b là các tham số, wt:t+sj-1 tham chiếu đến việc nối embedding của (wt,...,wt+sj-1), sj là kích thước cửa sổ của bộ lọc thứ j, và m là biểu diễn kết hợp có chiều giống với số lượng bộ lọc.
+
+Trong bước chia, chúng tôi biến đổi các biểu diễn kết hợp bởi một lớp fully connected khác với lớp kích hoạt GELU (Hendrycks và Gimpel, 2016). Sau đó chúng tôi sử dụng kết nối dư để giữ lại
+
+mti(x) = σ(W4mi(x) + b4); mhi(x) = σ(W5mi(x) + b5) (5)
+
+Ti(x) = ti(x) + mti(x); Hi(x) = hi(x) + mhi(x) (6)
+
+Trong đó σ là hàm kích hoạt GELU, T và H là các biểu diễn mới của hai kênh. Để ngăn chặn việc biến mất hoặc bùng nổ của gradient, một phép toán chuẩn hóa lớp (Ba et al., 2016) được áp dụng sau kết nối dư.
+
+Bằng bước kết hợp, các biểu diễn từ hai kênh có thể làm phong phú lẫn nhau. Bằng bước chia, chúng có thể giữ các đặc trưng độc đáo từ token và ký tự, và học các biểu diễn khác nhau trong hai kênh bằng các nhiệm vụ tiền huấn luyện riêng của chúng.
+
+### 3.5 Tiền huấn luyện Ký tự Không giám sát
+
+Để học biểu diễn từ đặc trưng hình thái nội bộ trong các từ, chúng tôi đề xuất một nhiệm vụ tiền huấn luyện ký tự không giám sát có tên mô hình hóa ngôn ngữ nhiễu (NLM) cho CharBERT. Chúng tôi đưa một số nhiễu ký tự vào các từ, và dự đoán các từ gốc bằng các biểu diễn từ kênh ký tự như được hiển thị trong Hình 3.
+
+Theo công trình trước đây (Pruthi et al., 2019), chúng tôi thay đổi chuỗi ký tự gốc bằng cách loại bỏ, thêm và hoán đổi các ký tự nội bộ trong toàn bộ từ. Vì số lượng từ phụ có thể thay đổi sau khi đưa vào nhiễu, mục tiêu của các nhiệm vụ tiền huấn luyện là dự đoán toàn bộ từ gốc thay vì từ phụ. Chúng tôi xây dựng một từ vựng ở mức từ mới như không gian dự đoán
+
+H'i = (W6Hi + b5); p(Wj|Hi) = exp(linear(H'i)Wj) / ∑Sk=1 exp(linear(H'i)Wk) (7)
+
+trong đó linear() là một lớp tuyến tính, Hi là biểu diễn token từ kênh ký tự, S là kích thước của từ vựng ở mức từ.
+
+Tương tự như BERT, CharBERT cũng áp dụng mô hình hóa ngôn ngữ có mặt nạ (MLM) như nhiệm vụ tiền huấn luyện cho kênh token. Khác với NLM, MLM cho phép CharBERT nắm bắt thông tin từ vựng và cú pháp ở mức token. Lưu ý rằng, chúng tôi chỉ che hoặc thay thế các token mà không có bất kỳ nhiễu ký tự nào cho MLM. Thêm chi tiết về các nhiệm vụ tiền huấn luyện có thể được tìm thấy trong Devlin et al. (2019).
+
+### 3.6 Tinh chỉnh cho Các Nhiệm vụ Cụ thể
+
+Hầu hết các nhiệm vụ hiểu ngôn ngữ tự nhiên có thể được chia đơn giản thành hai nhóm: các nhiệm vụ ở mức token như gán nhãn chuỗi và các nhiệm vụ ở mức chuỗi, như các nhiệm vụ phân loại văn bản. Đối với các nhiệm vụ ở mức token, chúng tôi nối các embedding đầu ra cuối cùng từ hai kênh trong CharBERT làm đầu vào
+
+cho tinh chỉnh. Đối với các nhiệm vụ ở mức chuỗi, hầu hết các mô hình tiền huấn luyện sử dụng biểu diễn của một token đặc biệt như [CLS] để dự đoán. Trong bài báo này, để tận dụng đầy đủ thông tin ở mức ký tự và token trong chuỗi, chúng tôi thực hiện trung bình trên tất cả các embedding sau khi nối các biểu diễn từ hai kênh trong lớp cuối cùng của CharBERT để phân loại ở mức chuỗi.
+
+## 4 Thí nghiệm
+
+Trong phần này, chúng tôi trình bày chi tiết tiền huấn luyện của CharBERT và kết quả tinh chỉnh trên ba loại nhiệm vụ: trả lời câu hỏi, gán nhãn chuỗi và phân loại văn bản. Hơn nữa, chúng tôi xây dựng ba tập thử nghiệm tấn công ký tự từ những nhiệm vụ đó và đánh giá tính bền vững của CharBERT.
+
+### 4.1 Thiết lập Thí nghiệm
+
+Chúng tôi sử dụng BERT (Devlin et al., 2019) và RoBERTa (Liu et al., 2019) base làm baseline chính, trong đó các mô hình bao gồm 12 lớp transformer, với kích thước hidden 768 và 12 attention head. Từ vựng của BERT và RoBERTa chứa 30K và 50K đơn vị từ phụ tương ứng, và tổng tham số của chúng là 110M và 125M. Kích thước tham số bổ sung cho BERT và RoBERTa là 5M, có nghĩa là kênh ký tự nhỏ hơn nhiều so với kênh token trong các mô hình tiền huấn luyện gốc. Chúng tôi thay đổi 15% các từ đầu vào cho NLM và giảm xác suất mask từ 15% xuống 10% trong nhiệm vụ MLM để tránh mất quá nhiều thông tin trong chuỗi.
+
+Chúng tôi sử dụng Wikipedia tiếng Anh (12G, 2,500M từ) làm corpus tiền huấn luyện và áp dụng các tham số của các mô hình tiền huấn luyện để khởi tạo kênh token của CharBERT. Trong bước tiền huấn luyện, chúng tôi đặt tỷ lệ học là 5e-5, kích thước batch là 32, và tiền huấn luyện CharBERT 320K bước. Từ vựng ở mức từ chứa 30K từ cho NLM, và kích thước từ vựng ký tự là 1000. Chúng tôi sử dụng 2 GPU NVIDIA Tesla V100, với bộ nhớ 32GB và FP16 để tiền huấn luyện, dự kiến mất 5 ngày. Để tinh chỉnh, chúng tôi thấy các khoảng giá trị khả thi sau đây hoạt động tốt trên các nhiệm vụ downstream, tức là kích thước batch 16, tỷ lệ học: 3e-5, 2e-5, số epoch từ 2 đến 6.
+
+Đối với optimizer, chúng tôi sử dụng cùng cài đặt với mô hình tiền huấn luyện trong kênh token như BERT và RoBERTa, cả trong bước tiền huấn luyện và tinh chỉnh. Để so sánh thí nghiệm, chúng tôi chủ yếu so sánh CharBERT với các mô hình tiền huấn luyện tiên tiến trước đây trong cài đặt BERT base. Chúng tôi cũng sẽ tiền huấn luyện CharBERT với các mô hình tiền huấn luyện trong cài đặt BERT large trong tương lai.
+
+### 4.2 Kết quả về Trả lời Câu hỏi (SQuAD)
+
+Nhiệm vụ Stanford Question Answering Dataset (SQuAD) yêu cầu trích xuất khoảng trả lời từ một đoạn văn được cung cấp dựa trên các câu hỏi được chỉ định. Chúng tôi đánh giá trên hai phiên bản của tập dữ liệu: SQuAD 1.1 (Rajpurkar et al., 2016) và SQuAD 2.0 (Rajpurkar et al., 2018). Đối với bất kỳ câu hỏi nào trong SQuAD 1.1, luôn có một hoặc nhiều câu trả lời trong đoạn văn tương ứng. Trong khi đối với một số câu hỏi trong SQuAD 2.0, không có câu trả lời trong đoạn văn. Trong bước tinh chỉnh cho SQuAD, chúng tôi nối các đầu ra từ kênh ký tự và token từ CharBERT và sử dụng một lớp phân loại để dự đoán token có phải là vị trí bắt đầu hay kết thúc của câu trả lời. Đối với SQuAD 2.0, chúng tôi sử dụng xác suất trên token [CLS] làm kết quả không có câu trả lời và tìm kiếm ngưỡng tốt nhất cho nó.
+
+Kết quả được báo cáo trong Bảng 1. Để có các thí nghiệm so sánh, tất cả kết quả được báo cáo bởi một mô hình đơn mà không có các thủ thuật khác như tăng cường dữ liệu. Chúng tôi có thể thấy rằng các mô hình nhận thức ký tự của chúng tôi (CharBERT, CharBERT RoBERTa) vượt trội hơn các mô hình tiền huấn luyện baseline trừ RoBERTa trong SQuAD 1.1, điều này cho thấy thông tin ký tự có thể không giúp ích cho các câu hỏi còn lại.
+
+### 4.3 Kết quả về Phân loại Văn bản
+
+Chúng tôi chọn bốn nhiệm vụ phân loại văn bản để đánh giá: CoLA (Warstadt et al., 2019), MRPC (Dolan và Brockett, 2005), QQP, và QNLI (Wang et al., 2018). CoLA là một nhiệm vụ câu đơn được chú thích về việc đó có phải là một câu tiếng Anh ngữ pháp hay không. MRPC là một nhiệm vụ tương đồng bao gồm các cặp câu được trích xuất tự động từ các nguồn tin tức trực tuyến, với chú thích của con người về việc các câu trong cặp có tương đương về mặt ngữ nghĩa hay không. QQP là một nhiệm vụ paraphrase với một tập hợp các cặp câu hỏi từ trang web hỏi đáp cộng đồng Quora, được chú thích về việc một cặp câu hỏi có tương đương về mặt ngữ nghĩa hay không. QNLI là một nhiệm vụ suy luận bao gồm các cặp câu hỏi-đoạn văn, với chú thích của con người về việc câu đoạn văn có chứa câu trả lời hay không.
+
+Kết quả được báo cáo trong Bảng 1. Đối với các thí nghiệm dựa trên BERT, CharBERT vượt trội đáng kể so với BERT trong bốn nhiệm vụ. Trong phần dựa trên RoBERTa, cải thiện trở nên yếu hơn nhiều đối với baseline mạnh hơn. Chúng tôi thấy rằng cải thiện trong phân loại văn bản yếu hơn so với hai loại nhiệm vụ khác, điều này có thể là do thông tin ký tự đóng góp nhiều hơn cho các nhiệm vụ phân loại ở mức token như SQuAD và gán nhãn chuỗi.
+
+### 4.4 Kết quả về Gán nhãn Chuỗi
+
+Để đánh giá hiệu suất trên các nhiệm vụ gán thẻ token, chúng tôi tinh chỉnh CharBERT trên CoNLL-2003 Named Entity Recognition (NER) (Sang và De Meulder, 2003) và các tập dữ liệu POS tagging Penn Treebank. Tập dữ liệu CoNLL-2003 NER bao gồm 300k từ, đã được chú thích là Person, Organization, Miscellaneous, Location, hoặc Other. Tập dữ liệu POS tagging đến từ phần Wall Street Journal (WSJ) của Penn Treebank, chứa 45 thẻ POS khác nhau và hơn 1 triệu từ. Để tinh chỉnh, chúng tôi đưa các biểu diễn từ hai kênh của CharBERT vào một lớp phân loại trên tập nhãn. Theo cài đặt trong BERT (Devlin et al., 2019), chúng tôi sử dụng trạng thái ẩn tương ứng với sub-token đầu tiên làm đầu vào cho bộ phân loại.
+
+Kết quả được báo cáo trong Bảng 3. Chúng tôi giới thiệu hai baseline mạnh Meta-BiLSTM (Bohnet et al., 2018) và Flair Embeddings (Akbik et al., 2018) trong hai nhiệm vụ để so sánh. Mô hình của chúng tôi (CharBERT, CharBERT RoBERTa) vượt trội hơn các mô hình tiền huấn luyện baseline BERT và RoBERTa một cách đáng kể (p-value < 0.05), và chúng tôi đặt kết quả tiên tiến mới trên tập dữ liệu POS tagging.
+
+### 4.5 Đánh giá Tính bền vững
+
+Chúng tôi tiến hành đánh giá tính bền vững trên lỗi chính tả đối kháng với các mô hình dựa trên BERT. Theo công trình trước đây (Pruthi et al., 2019), chúng tôi sử dụng bốn loại tấn công ở mức ký tự: 1) loại bỏ: loại bỏ một ký tự ngẫu nhiên trong từ; 2) thêm: thêm một ký tự ngẫu nhiên vào từ; 3) hoán đổi: hoán đổi hai ký tự liền kề trong từ; 4) bàn phím: thay thế một ký tự nội bộ ngẫu nhiên bằng một ký tự gần đó trên bàn phím. Chúng tôi chỉ áp dụng nhiễu loạn tấn công trên các từ có độ dài không nhỏ hơn 4 và chúng tôi ngẫu nhiên chọn một trong bốn cuộc tấn công để áp dụng trên mỗi từ.
+
+Đối với các nhiệm vụ đánh giá, chúng tôi xem xét tất cả ba loại nhiệm vụ: trả lời câu hỏi, gán nhãn chuỗi và phân loại văn bản. Điều này khác với các công trình trước đây về tấn công đối kháng và phòng thủ (Ebrahimi et al., 2018; Pruthi et al., 2019), thường chỉ tập trung vào một nhiệm vụ cụ thể như dịch máy hoặc phân loại văn bản. Chúng tôi chọn các tập dữ liệu SQuAD 2.0, CoNLL-2003 NER, và QNLI để đánh giá.
+
+Đối với tập dev trong SQuAD 2.0, chúng tôi chỉ tấn công các từ trong câu hỏi. Đối với CoNLL-2003 NER và QNLI, chúng tôi tấn công tất cả các từ dưới ràng buộc độ dài. Trong thiết lập này, chúng tôi sửa đổi 51.86% các từ trong QNLI, 49.38% trong CoNLL-2003 NER, và 22.97% từ trong SQuAD 2.0. Chúng tôi so sánh mô hình CharBERT của chúng tôi với ba baseline: 1) mô hình BERT gốc; 2) mô hình BERT với huấn luyện đối kháng (AdvBERT), được tiền huấn luyện bằng cùng dữ liệu và siêu tham số với CharBERT; 3) BERT với nhận dạng từ và back-off truyền qua (BERT+WordRec), chúng tôi sử dụng bộ sửa lỗi đánh máy scRNN tiền huấn luyện từ (Pruthi et al., 2019). Tất cả các đầu vào được 'sửa' bởi bộ sửa lỗi đánh máy và đưa vào mô hình downstream. Chúng tôi thay thế bất kỳ từ OOV nào được dự đoán bởi bộ sửa lỗi đánh máy bằng từ gốc để có hiệu suất tốt hơn.
+
+Kết quả được báo cáo trong Bảng 2. Hiệu suất của BERT giảm hơn 30% trên các tập thử nghiệm lỗi chính tả, cho thấy BERT dễ vỡ đối với các cuộc tấn công lỗi chính tả ký tự. AdvBERT và BERT+WordRec có cải thiện vừa phải trên các tập tấn công lỗi chính tả, so với baseline BERT. Chúng tôi thấy rằng hiệu suất của BERT+WordRec đã giảm đáng kể trong tập gốc do lỗi recall cho các từ bình thường. Để so sánh, CharBERT có sự sụt giảm hiệu suất ít nhất so với các baseline khác dưới các cuộc tấn công ký tự, điều này cho thấy mô hình của chúng tôi là bền vững nhất đối với cuộc tấn công lỗi chính tả trong nhiều nhiệm vụ, trong khi vẫn đạt được cải thiện trên các tập thử nghiệm gốc cùng lúc. Lưu ý rằng AdvBERT được tiền huấn luyện trên cùng dữ liệu với cùng số bước huấn luyện như mô hình CharBERT của chúng tôi, ngoại trừ AdvBERT không có các phương pháp mới được đề xuất của chúng tôi. Do đó, việc so sánh giữa AdvBERT và CharBERT có thể làm nổi bật những lợi thế của phương pháp chúng tôi.
+
+### 4.6 Nghiên cứu Loại bỏ
+
+Chúng tôi xem xét ba mô-đun trong CharBERT: bộ mã hóa ký tự, tương tác không đồng nhất, và nhiệm vụ tiền huấn luyện NLM trong các thí nghiệm loại bỏ. Đối với bộ mã hóa ký tự, chúng tôi loại bỏ lớp GRU và sử dụng embedding ký tự làm biểu diễn ký tự (w/o GRU). Đối với mô-đun tương tác không đồng nhất, chúng tôi loại bỏ toàn bộ mô-đun và hai kênh không có tương tác với nhau trong mô hình (w/o HI). Đối với các nhiệm vụ tiền huấn luyện, chúng tôi loại bỏ NLM và nối các biểu diễn từ hai kênh trong CharBERT cho MLM trong bước tiền huấn luyện (w/o NLM). Cuối cùng, chúng tôi cũng so sánh với hai mô hình baseline AdvBERT và BERT. Chúng tôi có thể xem AdvBERT như một mô hình baseline công bằng với cùng khởi tạo trọng số, dữ liệu huấn luyện và bước huấn luyện như CharBERT, mà không có ba mô-đun được đề xuất của chúng tôi. Chúng tôi chọn bốn nhiệm vụ: SQuAD 2.0, CoNLL-2003 NER, QNLI, và QNLI với tấn công ký tự (QNLI-Att) từ bốn phần thí nghiệm ở trên để đánh giá.
+
+Chúng tôi có thể thấy kết quả loại bỏ từ Bảng 4. Khi chúng tôi loại bỏ lớp GRU hoặc mô-đun tương tác không đồng nhất, hiệu suất giảm đáng kể trong tất cả các nhiệm vụ. Trong khi chúng tôi loại bỏ NLM trong bước tiền huấn luyện, mô hình có hiệu suất tương tự trong các nhiệm vụ SQuAD 2.0, NER, và QNLI, nhưng có hiệu suất tệ hơn nhiều trong tập QNLI-Att, điều này cho thấy nhiệm vụ tiền huấn luyện cải thiện đáng kể tính bền vững của CharBERT. Hơn nữa, CharBERT (w/o NLM) vẫn có hiệu suất tốt hơn nhiều so với BERT, có nghĩa là CharBERT có tính bền vững tốt hơn ngay cả khi không có nhiệm vụ tiền huấn luyện.
+
+## 5 Phân tích
+
+Trong phần này, chúng tôi tiến hành một số thí nghiệm trên nhiệm vụ CoNLL-2003 NER với tập thử nghiệm để phân tích thêm các vấn đề 'mô hình hóa không hoàn chỉnh' và 'biểu diễn dễ vỡ'. Cuối cùng, chúng tôi so sánh các embedding từ ngữ cảnh được tạo ra bởi BERT và CharBERT với một phương pháp dựa trên đặc trưng.
+
+### 5.1 Từ vs Từ phụ
+
+Để tìm hiểu ảnh hưởng của vấn đề 'mô hình hóa không hoàn chỉnh' đối với biểu diễn từ, chúng tôi chia tất cả các từ trong tập dữ liệu thành nhóm 'Word' và 'Subword' theo việc từ có được chia thành nhiều từ phụ hay không. Trên thực tế, nhóm 'Subword' chỉ có 17.8% từ nhưng có 45.3% thực thể có tên.
+
+Kết quả của BERT và CharBERT trong Hình 4. Đối với kết quả của cùng mô hình trong các nhóm khác nhau, chúng tôi thấy rằng hiệu suất trong nhóm 'Subword' thấp hơn đáng kể so với nhóm 'Word', điều này cho thấy các biểu diễn dựa trên từ phụ có thể không đủ cho các từ. Đối với kết quả của các mô hình khác nhau trong cùng nhóm, cải thiện của CharBERT trong nhóm 'Subword' là 0.68%, cao hơn nhiều so với nhóm 'Word' (0.29%). Điều đó có nghĩa là cải thiện chính đến từ phần 'Subword', và CharBERT có thể tạo ra biểu diễn tốt hơn cho các từ có nhiều từ phụ. Nói cách khác, CharBERT có thể giảm thiểu vấn đề 'mô hình hóa không hoàn chỉnh' bằng cách nắm bắt thông tin giữa các từ phụ khác nhau với lớp GRU.
+
+### 5.2 Phân tích Tính bền vững
+
+Trong phần này, chúng tôi khám phá thêm cách các embedding từ ngữ cảnh thay đổi theo nhiễu ký tự. Cụ thể, chúng tôi cần tìm hiểu xem các biểu diễn từ CharBERT có nhạy cảm hơn hay ít nhạy cảm hơn với các thay đổi ở mức ký tự. Chúng tôi định nghĩa một metric để đo độ nhạy cảm của các mô hình ngôn ngữ tiền huấn luyện trên một tập dữ liệu cụ thể
+
+S = (1/m) ∑m i=1 (1 - cos(h(ti), hi(t'i))/2 + 0.5) (8)
+
+trong đó cos là độ tương đồng cosine, m là số từ trong tập dữ liệu, h là hidden cuối cùng trong mô hình, ti là từ thứ i trong tập và t'i là cùng từ với nhiễu ký tự. Trong các trường hợp cực đoan, nếu một mô hình hoàn toàn không nhạy cảm với tấn công ký tự, hai vector sẽ giống nhau, cho S=0.
+
+Chúng tôi tiến hành thí nghiệm với tập gốc và tập có tấn công ký tự. Đối với các từ có nhiều từ phụ, chúng tôi sử dụng hidden của từ phụ đầu tiên làm embedding từ, phù hợp với cài đặt tinh chỉnh. Ví dụ, chúng tôi tính toán độ nhạy cảm cho mỗi từ trong câu trong mẫu trong Hình 5, và trung bình của kết quả là S.
+
+Thật ngạc nhiên, kết quả độ nhạy cảm của ba mô hình là: SBERT = 0.0612, SAdvBERT = 0.0407, SCharBERT = 0.0986, nhưng tính bền vững của ba mô hình là: BERT < AdvBERT < CharBERT (Phần 4.5), có nghĩa là không có mối tương quan đáng kể giữa tính bền vững và độ nhạy cảm. Điều này khác với công trình trước đây Pruthi et al. (2019), cho thấy các mô hình nhận dạng từ có độ nhạy cảm thấp bền vững hơn. Sau khi quan sát kết quả của nhiều mẫu, chúng tôi thấy rằng đối với các từ không có nhiễu ký tự, độ nhạy cảm của BERT và CharBERT không có sự khác biệt rõ rệt. Trong khi đối với các từ có nhiễu như 'think-thnik,' 'fair-far' trong ví dụ, độ nhạy cảm của CharBERT cao hơn nhiều so với BERT. Mặt khác, độ nhạy cảm của AdvBERT thấp hơn BERT trong hầu hết các từ.
+
+Điều đó cho thấy CharBERT cải thiện tính bền vững bằng cách khác với huấn luyện đối kháng (AdvBERT). Có thể là do chúng tôi sử dụng biểu diễn của các từ có nhiễu để dự đoán từ gốc trong NLM, nhưng AdvBERT xử lý tất cả các từ theo cùng một cách trong bước tiền huấn luyện, điều này dẫn đến CharBERT xây dựng các biểu diễn cho các từ có nhiễu theo cách khác. Kết quả này truyền cảm hứng cho chúng tôi rằng, chúng tôi có thể cải thiện tính bền vững của mô hình trực tiếp bằng biểu diễn tốt hơn cho nhiễu, điều này khác với cải thiện tính bền vững bằng các mô-đun nhận dạng từ bổ sung hoặc huấn luyện đối kháng.
+
+### 5.3 So sánh Dựa trên Đặc trưng
+
+Các embedding từ ngữ cảnh từ các mô hình tiền huấn luyện thường được sử dụng như các đặc trưng đầu vào trong các mô hình cụ thể cho nhiệm vụ. Để khám phá xem thông tin ký tự có thể làm phong phú biểu diễn từ hay không, chúng tôi đánh giá embedding ngữ cảnh được tạo ra bởi BERT và CharBERT. Theo Devlin et al. (2019), chúng tôi sử dụng cùng biểu diễn đầu vào như Phần 4.4 mà không tinh chỉnh bất kỳ tham số nào của BERT hoặc CharBERT. Các embedding ngữ cảnh đó được sử dụng như các đặc trưng embedding cho một Bi-LSTM hai lớp 768 chiều được khởi tạo ngẫu nhiên trước lớp phân loại. Đối với CharBERT, chúng tôi xem xét embedding từ ba nguồn: kênh token, kênh ký tự, tổng và nối của hai kênh.
+
+Kết quả được báo cáo trong Hình 6. Chúng tôi thấy rằng embedding từ kênh token của CharBERT và BERT có hiệu suất tương tự, điều này cho thấy kênh token giữ lại thông tin trong BERT. Embedding từ kênh ký tự có hiệu suất tệ hơn, có thể là do ít dữ liệu và bước huấn luyện hơn cho phần tham số này. Khi chúng tôi nối các embedding từ kênh token và ký tự, mô hình đạt được điểm tốt nhất. Điều đó cho thấy thông tin ký tự có thể làm phong phú các embedding từ, ngay cả với ít dữ liệu và bước huấn luyện hơn nhiều.
+
+## 6 Kết luận
+
+Trong bài báo này, chúng tôi giải quyết các hạn chế quan trọng của các PLM hiện tại: mô hình hóa không hoàn chỉnh và thiếu tính bền vững. Để giải quyết những vấn đề này, chúng tôi đã đề xuất một mô hình tiền huấn luyện mới CharBERT bằng cách tiêm thông tin ở mức ký tự vào các PLM. Chúng tôi xây dựng các biểu diễn từ ký tự bằng các lớp GRU tuần tự và sử dụng kiến trúc hai kênh cho từ phụ và ký tự. Hơn nữa, chúng tôi đề xuất một nhiệm vụ tiền huấn luyện mới NLM để học biểu diễn ký tự không giám sát. Kết quả thí nghiệm cho thấy CharBERT có thể cải thiện cả hiệu suất và tính bền vững của các mô hình tiền huấn luyện.
+
+Trong tương lai, chúng tôi sẽ mở rộng CharBERT sang các ngôn ngữ khác để học biểu diễn đa ngôn ngữ từ thông tin ký tự. Chúng tôi tin rằng CharBERT có thể mang lại nhiều cải thiện hơn cho các ngôn ngữ giàu hình thái như tiếng Ả Rập, nơi các từ phụ không thể nắm bắt đầy đủ thông tin hình thái. Mặt khác, chúng tôi sẽ mở rộng CharBERT để phòng thủ các loại nhiễu khác, ví dụ: nhiễu ở mức từ, mức câu, để cải thiện tính bền vững của các PLM một cách toàn diện.
+
+## Lời cảm ơn
+
+Chúng tôi xin cảm ơn tất cả các reviewer ẩn danh đã làm việc chăm chỉ trong việc review và cung cấp các nhận xét có giá trị về bài báo của chúng tôi. Công trình này được hỗ trợ bởi Quỹ Khoa học Tự nhiên Quốc gia Trung Quốc (NSFC) thông qua các khoản tài trợ 61976072, 61632011, và 61772153.
