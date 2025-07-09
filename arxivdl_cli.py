@@ -72,7 +72,8 @@ class ArXivCLI:
                     'openai': 'translate_papers.py',
                     'claude': 'translate_manager.py',
                     'check': 'check_translation_completeness.py',
-                    'add-queue': 'add_to_translation_queue.py'
+                    'add-queue': 'add_to_translation_queue.py',
+                    'cleanup': 'cleanup_translations.py'
                 },
                 'default': 'translate_manager.py',
                 'help': 'Translate papers using OpenAI or Claude with quality checking'
@@ -213,6 +214,11 @@ class ArXivCLI:
                 
                 # Manual queue management
                 'python3 add_to_translation_queue.py',
+                
+                # Cleanup low-quality translations
+                'python3 cleanup_translations.py --threshold 0.1',
+                'python3 cleanup_translations.py --threshold 0.2 --backup',
+                'python3 cleanup_translations.py --threshold 0.1 --requeue',
                 
                 # Test translation setup
                 'python3 test_translation.py'
