@@ -1,0 +1,268 @@
+# CrossTune: Phân loại Few-Shot Hộp đen với Cải tiến Nhãn
+Danqing Luo1⋆, Chen Zhang1⋆, Yan Zhang1, Haizhou Li1,2†
+1Đại học Quốc gia Singapore
+2Đại học Trung văn Hồng Kông (Thâm Quyến), Trung Quốc
+chen_zhang@u.nus.edu, {danqing, eleyanz, haizhou.li}@nus.edu.sg
+
+## Tóm tắt
+Huấn luyện hoặc tinh chỉnh các mô hình ngôn ngữ quy mô lớn (LLMs) đòi hỏi tài nguyên tính toán đáng kể, tạo động lực cho các nỗ lực gần đây nhằm khám phá việc thích ứng hiệu quả tham số với các nhiệm vụ downstream. Một phương pháp là coi các mô hình này như hộp đen và sử dụng các lần chạy thuận (Inference APIs) để tương tác với chúng. Nghiên cứu hiện tại tập trung vào việc thích ứng các mô hình hộp đen này với các nhiệm vụ downstream bằng cách sử dụng tối ưu hóa prompt không gradient, nhưng điều này thường bao gồm một quá trình tốn kém để tìm kiếm các prompt cụ thể cho từng nhiệm vụ. Do đó, chúng tôi có động lực nghiên cứu việc thích ứng mô hình ngôn ngữ hộp đen mà không cần tìm kiếm prompt. Cụ thể, chúng tôi giới thiệu một mạng cross-attention tăng cường nhãn được gọi là CrossTune, mô hình hóa mối quan hệ ngữ nghĩa giữa chuỗi văn bản đầu vào và các mô tả nhãn cụ thể của nhiệm vụ. Hiệu quả của nó được kiểm tra trong bối cảnh phân loại văn bản few-shot. Để cải thiện khả năng tổng quát hóa của CrossTune, chúng tôi sử dụng ChatGPT để tạo dữ liệu huấn luyện bổ sung thông qua in-context learning. Một cơ chế chuyển đổi được triển khai để loại bỏ dữ liệu chất lượng thấp do ChatGPT tạo ra. Thông qua các thí nghiệm rộng rãi trên bảy bộ dữ liệu phân loại văn bản benchmark, chúng tôi chứng minh rằng phương pháp được đề xuất của chúng tôi vượt trội hơn phương pháp tuning hộp đen không gradient tiên tiến nhất trước đó trung bình 5.7%. Ngay cả khi không sử dụng dữ liệu tăng cường từ ChatGPT, CrossTune cũng hoạt động tốt hơn hoặc tương đương với các phương pháp tuning hộp đen trước đó, cho thấy hiệu quả của phương pháp chúng tôi.
+
+**Từ khóa:** Black-Box Tuning, Phân loại Văn bản Few-shot, Mô hình Ngôn ngữ Lớn
+
+## 1. Giới thiệu
+Trong vài năm qua, đã có tiến bộ đáng kể trong nghiên cứu về các mô hình ngôn ngữ quy mô lớn (LLMs) (Devlin et al., 2019; Liu et al., 2019; Ouyang and et al., 2022; Chowdhery et al., 2022). Việc mở rộng quy mô các mô hình ngôn ngữ đã được chứng minh là tăng cường hiệu suất và hiệu quả mẫu trên một loạt các nhiệm vụ downstream (Raffel et al., 2020; Brown et al., 2020b, inter alia). Tuy nhiên, việc huấn luyện các LLMs như vậy không thực tế với phần cứng nghiên cứu điển hình. Ngay cả việc tinh chỉnh chúng trên dữ liệu cụ thể của nhiệm vụ cũng cực kỳ thử thách. Nhiều nỗ lực nghiên cứu đã được dành cho các phương pháp thích ứng hiệu quả tham số hơn, bao gồm (1) tinh chỉnh hiệu quả tham số (PEFT) (Lester et al., 2021; Li and Liang, 2021; Houlsby et al., 2019; Hu et al., 2022), tối ưu hóa một phần nhỏ các tham số cụ thể của nhiệm vụ, trong khi giữ nguyên mô hình ngôn ngữ; (2) học dựa trên prompt, trong đó một chuỗi cụ thể nhiệm vụ được thiết kế cẩn thận, được gọi là prompt, được thêm vào chuỗi văn bản đầu vào của mô hình ngôn ngữ đã được huấn luyện trước (LM). LM được tái sử dụng để thích ứng với các nhiệm vụ downstream mà không cần huấn luyện bổ sung.
+
+Do lý do thương mại, các LLMs mạnh mẽ được cung cấp như một dịch vụ trên đám mây, và người dùng cuối chỉ có thể tương tác với chúng thông qua inference APIs. Thiết lập này được gọi là Language-Model-as-a-Service (LMaaS) Sun et al. (2022b). Các phương pháp PEFT phổ biến không thực tế trong bối cảnh này vì chúng yêu cầu truy cập vào gradient của mô hình. Để giải quyết thách thức này, một hướng nghiên cứu học dựa trên prompt mới nổi tập trung vào các kỹ thuật tối ưu hóa prompt không gradient (Brown et al., 2020b; Sun et al., 2022b,a; Deng et al., 2022; Prasad et al., 2023; Hou et al., 2023). Tuy nhiên, các phương pháp này cũng có vấn đề vì (1) tối ưu hóa prompt rất nhạy cảm với thiết kế template và lựa chọn demonstration (Gao et al., 2021a; Zhao et al., 2021) dẫn đến hiệu suất không ổn định và khả năng tổng quát hóa kém. (2) Quá trình tìm kiếm prompt, dù thủ công hay tự động, cũng tốn thời gian. Ví dụ, chiến lược tiến hóa thích ứng ma trận hiệp phương sai (CMA-ES) được áp dụng bởi Sun et al. (2022b) đòi hỏi hàng chục nghìn lần chạy thuận qua LLMs để đạt được hiệu suất thỏa mãn ngay cả trong các kịch bản phân loại văn bản few-shot.
+
+Vì vậy, chúng tôi đề xuất CrossTune, một học viên few-shot hộp đen tăng cường nhãn để thích ứng các LMs hộp đen mà không cần tìm kiếm prompt. Theo các nghiên cứu hiện có, chúng tôi giả định rằng inference APIs cung cấp đầu ra LM forward-pass và nghiên cứu phương pháp của chúng tôi trong bối cảnh phân loại văn bản few-shot. Trong CrossTune, mô hình hộp đen được coi như một bộ trích xuất đặc trưng nơi các trạng thái ẩn của chuỗi văn bản đầu vào được tạo ra. Bên cạnh đó, các từ nhãn gốc được mở rộng thành các mô tả văn bản dài. Một mạng cross-attention được huấn luyện để căn chỉnh chuỗi văn bản đầu vào với nhãn liên quan của nó. Theo cách này, chúng tôi có thể điều khiển mô hình tập trung vào các khía cạnh cụ thể của dữ liệu văn bản đầu vào có liên quan ngữ nghĩa đến các mô tả nhãn, hoạt động như một dạng đầu vào ngữ cảnh và cung cấp hướng dẫn ngữ nghĩa bổ sung cho mô hình về ý nghĩa của từng nhãn.
+
+Trong các kịch bản few-shot, mô hình có thể dễ dàng overfit dữ liệu huấn luyện dẫn đến khả năng tổng quát hóa kém với dữ liệu test chưa thấy. Các nghiên cứu hiện có chủ yếu dựa vào các phương pháp bán giám sát và giám sát yếu để tăng cường khả năng tổng quát hóa của các bộ phân loại văn bản. Cả hai đều giả định sự hiện diện của dữ liệu không nhãn trong phân phối dồi dào (Schick and Schütze, 2021; Chen et al., 2021; Fei et al., 2022; Du et al., 2021; Cho et al., 2023)¹. Trái ngược với các nghiên cứu trước, chúng tôi không đưa ra giả định như vậy. Thay vào đó, chúng tôi khai thác khả năng theo dõi hướng dẫn mạnh mẽ của ChatGPT² để tạo dữ liệu có điều kiện trên các nhãn thông qua in-context learning (Brown et al., 2020b). Để lọc ra các thế hệ chất lượng thấp, chúng tôi triển khai một cơ chế chuyển đổi bổ sung như được mô tả trong §3.4.
+
+Tóm lại, những đóng góp của chúng tôi như sau:
+• Chúng tôi giới thiệu CrossTune, một phương pháp mới để thích ứng few-shot các mô hình ngôn ngữ hộp đen. Khác với các phương pháp hiện có, CrossTune không dựa vào quá trình tìm kiếm prompt tốn kém. Ngoài ra, CrossTune tận dụng thông tin ngữ nghĩa phong phú trong các mô tả nhãn để thực hiện nhiệm vụ phân loại.
+• Thay vì dựa vào dữ liệu huấn luyện không nhãn trong phân phối, hiếm khi có sẵn trong các kịch bản thực tế, chúng tôi khai thác sức mạnh của một bộ tạo văn bản theo hướng dẫn mạnh mẽ, ChatGPT, để tạo dữ liệu có điều kiện trên các nhãn thông qua in-context learning. Một pipeline được thiết kế để tạo và làm sạch dữ liệu. Các thí nghiệm của chúng tôi chứng minh rằng chất lượng dữ liệu được tạo bởi ChatGPT ngang bằng với dữ liệu huấn luyện gốc.
+• Các thí nghiệm rộng rãi được thực hiện trên 7 bộ dữ liệu phân loại văn bản few-shot và CrossTune vượt trội đáng kể so với phương pháp tối ưu hóa prompt không gradient tiên tiến nhất trước đó với cải thiện tuyệt đối 5.7% trung bình.
+
+¹ Dữ liệu không nhãn là tập huấn luyện gốc với các nhãn ground-truth bị loại bỏ hoặc các câu được truy xuất từ ngân hàng câu dựa trên sự tương tự của chúng với các ví dụ huấn luyện few-shot.
+² https://openai.com/chatgpt
+
+## 2. Nghiên cứu liên quan
+**Gradient-Free Black-Box Tuning** Thành công của học dựa trên prompt với GPT-3 (Brown et al., 2020b) đã truyền cảm hứng cho nghiên cứu phong phú trong cộng đồng NLP. Một hướng điển hình là tối ưu hóa các prompt cho các nhiệm vụ downstream dựa trên gradient của các mô hình ngôn ngữ đã được huấn luyện trước sao cho đầu ra có thể căn chỉnh gần với kết quả mong muốn (Gao et al., 2021a; Chen et al., 2021; Li and Liang, 2021; Liu et al., 2021). Tuy nhiên, nhiều ứng dụng thực tế liên quan đến các mô hình mà các tham số hoặc gradient nội bộ bị che khuất hoặc không thể truy cập, dẫn đến một cài đặt tuning "hộp đen" (Sun et al., 2022b; Diao et al., 2023).
+
+Một số nghiên cứu đã đi sâu vào các thách thức tuning hộp đen. BBT (Sun et al., 2022b) và BBTv2 (Sun et al., 2022a) sử dụng chiến lược tiến hóa CMA để tối ưu hóa prompt nhưng gặp thách thức về hiệu quả và tính linh hoạt. RLPrompt (Deng et al., 2022) và Black-box Discrete Prompt Learning (BDPL) (Diao et al., 2023) đều sử dụng học tăng cường để tinh chỉnh prompt rời rạc, với BDPL có phương pháp tìm kiếm được tinh giản. TEMPERA (Zhang et al., 2023) mở rộng các thành phần tối ưu hóa, trong khi GrIPS (Prasad et al., 2023) tập trung vào chỉnh sửa ở cấp độ cụm từ. Tuy nhiên, nhiều phương pháp tuning hộp đen này gặp vấn đề về hiệu quả và có thể không luôn mang lại kết quả tối ưu. Gần đây, PromptBoosting (Hou et al., 2023) thích ứng ý tưởng ensembling của AdaBoost với tuning hộp đen và đạt hiệu suất tiên tiến trong nhiều nhiệm vụ phân loại few-shot hộp đen. Khác với các phương pháp hiện có, CrossTune không yêu cầu tìm kiếm prompt tốn kém và cung cấp thích ứng đơn giản và hiệu quả hơn nhiều cho các mô hình ngôn ngữ hộp đen.
+
+**Phân loại Văn bản Few-shot với Dữ liệu Tăng cường** Các hướng nghiên cứu phổ biến để tăng cường khả năng tổng quát hóa của bộ phân loại văn bản few-shot bao gồm học bán giám sát (Xie et al., 2020; Sohn et al., 2020; Zoph et al., 2020) và học giám sát yếu (Meng et al., 2020; Zhang et al., 2021; Fei et al., 2022; Cho et al., 2023). Cả hai hướng nghiên cứu đều giả định sự hiện diện của lượng lớn dữ liệu không nhãn. Các kỹ thuật phổ biến để thu được dữ liệu văn bản không nhãn bao gồm (1) loại bỏ nhãn vàng của dữ liệu huấn luyện đầy đủ gốc cho một nhiệm vụ cụ thể (Chen et al., 2021; Schick and Schütze, 2021), (2) áp dụng bộ truy xuất để truy xuất câu từ ngân hàng câu quy mô lớn có tương tự ngữ nghĩa với dữ liệu huấn luyện few-shot (Du et al., 2021), và (3) tăng cường dữ liệu văn bản, như paraphrasing và back-translation (Bayer et al., 2022). Tuy nhiên, các kỹ thuật này có một số hạn chế: Sử dụng dữ liệu huấn luyện đầy đủ như một nguồn không nhãn thường không thực tế vì dữ liệu không nhãn trong phân phối đáng kể không phải lúc nào cũng có sẵn trong các kịch bản thực tế. Hơn nữa, truy xuất và tăng cường văn bản có xu hướng tạo ra dữ liệu không nhãn tương tự với tập huấn luyện few-shot, hạn chế tính đa dạng của dữ liệu tăng cường. Hơn nữa, cả học bán giám sát và giám sát yếu đều dựa vào việc pseudo-labeling có thể không chính xác của dữ liệu không nhãn.
+
+Được động viên bởi nghiên cứu học bắt chước gần đây về việc chưng cất dữ liệu huấn luyện chất lượng cao từ các LLMs mạnh mẽ, như ChatGPT và GPT-4 (Wang et al., 2023; Xu et al., 2023; Mukherjee et al., 2023), chúng tôi giải quyết các hạn chế trên bằng cách nhắc ChatGPT tạo dữ liệu huấn luyện chất lượng cao thông qua in-context learning. Với khả năng theo dõi hướng dẫn và tạo văn bản mạnh mẽ, ChatGPT phục vụ như một công cụ mạnh mẽ để tăng cường dữ liệu văn bản.
+
+## 3. Phương pháp luận
+### 3.1. Công thức hóa Vấn đề
+Trong một nhiệm vụ phân loại văn bản few-shot T với không gian nhãn Y, chúng tôi giả định có K ví dụ huấn luyện được gán nhãn mỗi lớp trong tập huấn luyện, D^T_train. Kích thước dữ liệu huấn luyện, |D^T_train| = K × |Y|. Chúng tôi cũng giả định một tập phát triển, D^T_dev, có kích thước dữ liệu bằng với D^T_train. Cả D^T_train và D^T_dev đều bao gồm các thể hiện dữ liệu (X_i, y_i) với y_i ∈ Y và X_i biểu thị chuỗi văn bản đầu vào, chứa n token, tức là, X_i = {x^1_i, x^2_i, ..., x^n_i}. Giả định rằng chúng ta có hàm ánh xạ template cụ thể nhiệm vụ F_T, ánh xạ X_i thành một định dạng đầu vào cụ thể F_T(X_i). Hình 1 hiển thị hai ví dụ về F_T(X_i). Các văn bản được gạch dưới trong các hộp là các văn bản đầu vào gốc, X_i. Lưu ý rằng không có token prompt bổ sung nào được thêm vào đầu vào được biến đổi. Hơn nữa, giả định một mô hình ngôn ngữ hộp đen được ký hiệu là M, chỉ dành cho suy luận. Thông qua API của nó, chúng ta có thể thu được logits của token "[MASK]" và các trạng thái ẩn của chuỗi văn bản đầu vào. Mục tiêu của chúng tôi là phát triển một mô hình tổng quát hóa tốt với tập test chưa thấy D^T_test.
+
+### 3.2. Kiến trúc CrossTune
+Hình 2 trình bày kiến trúc mô hình của CrossTune. Sử dụng mô hình ngôn ngữ hộp đen đóng băng M, chúng tôi tạo ra một chuỗi các trạng thái ẩn sau mỗi lớp l liên quan đến đầu vào văn bản được định dạng lại F_T(X_i). Vì chúng tôi quan tâm đến các vector ẩn của token "[MASK]" là {h^mask_i,l ∈ R^d}^L_l=1, chúng tôi thực hiện max pooling trên {h^mask_i,l}^L_l=L-3 để tạo ra một biểu diễn vector đơn, h^mask_i ∈ R^d. Thao tác này được động viên bởi các nghiên cứu trước về học biểu diễn câu (Ethayarajh, 2019; Li et al., 2020; Hosseini et al., 2023) nêu rõ rằng việc kết hợp embedding từ nhiều lớp dẫn đến biểu diễn ngữ nghĩa tốt hơn so với chỉ sử dụng embedding lớp cuối.
+
+Hơn nữa, mỗi nhãn trong không gian Y được chuyển đổi thành mô tả văn bản nhãn tương ứng, là các định nghĩa được chỉ định trong các bộ dữ liệu gốc hoặc từ Wikipedia. Sử dụng cùng mô hình M, chúng tôi thu được embedding nhãn vector đơn h_yi cho mỗi y_i trong Y. Các embedding h_yi được thu được bằng cách áp dụng cùng quy trình max pooling được mô tả ở trên trên các trạng thái ẩn của mô tả nhãn và sau đó theo sau bởi một thao tác mean pooling cấp token.
+
+Một mô-đun multi-head cross-attention được triển khai sao cho h^mask_Xi có thể attend đến mỗi h_yi trong Y. Cụ thể hơn, h^mask_Xi và tất cả embedding nhãn, H_Y, đầu tiên được biến đổi tuyến tính thành vector truy vấn và ma trận khóa cho mỗi head:
+
+q_k = W^k_Q h^mask_Xi
+K_k = W^k_K H_Y
+
+trong đó k biểu thị head thứ k. W^k_Q ∈ R^{d×d}, W^k_K ∈ R^{d×d} là các ma trận trọng số head thứ k cho truy vấn và khóa tương ứng. Cross attention sau đó được tính như:
+
+CrossAttn_k(q_k, K_k) = softmax(q_k(K_k)^T/√d)
+
+trong đó d là chiều của các ma trận trọng số. Để thu được điểm attention cuối cùng, chúng tôi tính trung bình điểm từ mỗi head. Các điểm attention kết quả này chỉ ra tầm quan trọng của mỗi mô tả nhãn liên quan đến chuỗi văn bản đầu vào. Cuối cùng, cross entropy loss được chọn làm mục tiêu huấn luyện:
+
+L = Σ_(X_i,y_i)∈D^T_train -y_i log ŷ_i
+
+trong đó y_i được chuyển đổi thành vector one-hot trong khi ŷ_i là vector điểm attention cuối cùng, tức là, phân phối xác suất trên các nhãn trong không gian nhãn Y.
+
+### 3.3. ChatGPT cho Tạo Dữ liệu
+Chúng tôi đề xuất tạo dữ liệu cụ thể nhiệm vụ với ChatGPT (gpt-3.5-turbo). Các template hướng dẫn cụ thể nhiệm vụ được thiết kế để nhắc ChatGPT tạo dữ liệu văn bản liên quan thuộc về một lớp cụ thể. ChatGPT cung cấp các biến thể dữ liệu phong phú hơn, và thông qua in-context learning, nó có thể được nhắc để tạo văn bản cụ thể nhiệm vụ và ngữ cảnh, đảm bảo đầu ra chính xác và tự nhiên hơn. Bảng 1 trình bày hai ví dụ về cách chúng tôi nhắc ChatGPT tạo dữ liệu huấn luyện. Các exemplar in-context là dữ liệu huấn luyện few-shot cụ thể nhiệm vụ và seed liên quan đến một lớp cụ thể mà chúng tôi muốn thực hiện tăng cường dữ liệu với ChatGPT. Để chọn các exemplar in-context, chúng tôi theo thiết lập phổ biến nhất, là lấy mẫu ngẫu nhiên, tức là, để tạo mẫu của một lớp cụ thể, chúng tôi lấy mẫu ngẫu nhiên 8 mẫu huấn luyện của lớp đó. Khi gọi inference API của ChatGPT, chúng tôi đặt temperature, top_p, frequency_penalty, và presence_penalty lần lượt là 0.8, 0.95, 0.8, và 1.4. Đối với mỗi lớp, chúng tôi gọi API suy luận lặp lại cho đến khi thu được đủ lượng dữ liệu huấn luyện.
+
+### 3.4. Cơ chế Chuyển đổi
+Mặc dù ChatGPT là một bộ tạo văn bản theo hướng dẫn mạnh mẽ, nó không phải lúc nào cũng đảm bảo sản xuất dữ liệu được gán nhãn chất lượng cao. Do đó, chúng tôi sử dụng khả năng hiểu văn bản của một mô hình giáo viên khác. Chúng tôi chọn DeBERTa-base làm mô hình giáo viên do kích thước có thể quản lý (phù hợp cho GPU nghiên cứu tiêu chuẩn) và hiệu suất vượt trội trên các benchmark phân loại văn bản phổ biến (Wang et al., 2019) so với các mô hình kích thước tương tự, như BERT (Devlin et al., 2019), RoBERTa (Liu et al., 2019), và ELECTRA (Clark et al., 2020). Một cơ chế chuyển đổi được giới thiệu sao cho cả hai giáo viên ChatGPT và DeBERTa có thể bổ sung cho nhau và hợp tác xác định nhãn của dữ liệu tăng cường. Gọi A_chatgpt và A_deberta biểu thị các giáo viên ChatGPT và DeBERTa tương ứng. Được động viên bởi các phát hiện trong các nghiên cứu trước (Gao et al., 2021a; Chen et al., 2021) rằng tinh chỉnh dựa prompt của mô hình ngôn ngữ với demonstration có thể vượt trội đáng kể so với các quy trình tinh chỉnh tiêu chuẩn trong thiết lập tài nguyên thấp, chúng tôi áp dụng tinh chỉnh dựa prompt để thích ứng A_deberta với nhiệm vụ T. Kích thước tham số của A_deberta nhỏ hơn đáng kể so với black-box LM, do đó nó có thể được xem như một mô hình phụ trợ dễ tiếp cận được thiết kế để nâng cao chất lượng dữ liệu tăng cường. Kết quả thí nghiệm của chúng tôi tiết lộ rằng việc kết hợp cơ chế chuyển đổi với A_deberta nâng cao hiệu suất của CrossTune.
+
+**Tinh chỉnh dựa Prompt của A_deberta** Hình 3 minh họa cách chúng tôi tinh chỉnh A_deberta. Cho (X_i, y_i) ∈ D^T_train, X_i đầu tiên được chuyển đổi thành F_T(X_i) theo các template cụ thể nhiệm vụ³. Verbalizer chuyển đổi y_i thành từ tương ứng trong từ vựng của A_deberta. Để điền vào vị trí "[MASK]" trong F_T(X_i), A_deberta học gán xác suất cao hơn cho từ được ánh xạ tới y_i so với các từ nhãn khác. Ví dụ, A_deberta nên dự đoán xác suất "great" cao hơn "terrible" cho ví dụ đầu vào trong Hình 3. Để tăng cường thêm quá trình tinh chỉnh dựa prompt, chúng tôi thêm demonstration sau F_T(X_i). Một demonstration là một ví dụ văn bản đầu vào. Đối với mỗi danh mục, một demonstration được thêm vào. A_deberta được tinh chỉnh với MLM loss tiêu chuẩn trên D^T_train. Ngoài ra, để lựa chọn mô hình, chúng tôi thực hiện quy trình grid search trên các hyperparameter huấn luyện khác nhau. Checkpoint với hiệu suất tốt nhất trên D^T_dev được sử dụng làm mô hình giáo viên.
+
+**Quy tắc Chuyển đổi** Dữ liệu được tạo bởi A_chatgpt được trang bị pseudo label mà nó cho là đúng. Để xác thực các nhãn này, chúng tôi triển khai một quy tắc để quyết định xem A_deberta có nên chú thích dữ liệu hay không. Quyết định dựa trên hiệu suất phân loại của cả A_chatgpt và A_deberta trên D^T_dev. Nếu A_chatgpt vượt trội hơn A_deberta, chúng tôi giữ lại các pseudo label. Ngược lại, chúng tôi sử dụng A_deberta để chú thích thêm, loại bỏ bất kỳ dữ liệu nào mà A_deberta và A_chatgpt không đồng ý và giữ lại những dữ liệu mà A_deberta tin tưởng.
+
+³ Trong các thí nghiệm của chúng tôi, chúng tôi sử dụng cùng một tập template thủ công cụ thể nhiệm vụ cho cả tinh chỉnh dựa prompt của A_deberta và huấn luyện CrossTune.
+
+## 4. Thiết lập Thí nghiệm
+**Bộ dữ liệu** CrossTune được đánh giá trên 7 bộ dữ liệu phân loại văn bản, bao gồm 3 bộ dữ liệu phân loại câu đơn và 4 bộ dữ liệu phân loại cặp câu. Trong số đó, AGNews (Zhang et al., 2015) dành cho phân loại chủ đề. SST-2 (Wang et al., 2019) dành cho phân tích cảm xúc. TREC (Hovy et al., 2001) dành cho phân loại câu hỏi. MRPC (Wang et al., 2019) và QQP (Wang et al., 2019) là các nhiệm vụ paraphrasing. QNLI (Wang et al., 2019) và MNLI (Bowman et al., 2015) dành cho suy luận ngôn ngữ tự nhiên. Theo Sun et al. (2022a), K mẫu được rút ngẫu nhiên từ tập huấn luyện gốc cho mỗi lớp để xây dựng tập huấn luyện và K mẫu khác từ tập huấn luyện gốc cho tập phát triển. Đối với các tập test, chúng tôi sử dụng tập phát triển gốc nếu tồn tại, ngược lại, tập test gốc được sử dụng. K được đặt là 16 trên tất cả các bộ dữ liệu.
+
+**Baselines** Chúng tôi so sánh phương pháp của mình với các phương pháp tinh chỉnh mô hình đầy đủ và các phương pháp tuning hộp đen tiên tiến được mô tả như sau: (1) Finetuning, cách tiêu chuẩn để tinh chỉnh mô hình ngôn ngữ cho phân loại văn bản few-shot. (2) tinh chỉnh dựa prompt như được triển khai bởi Gao et al. (2021). Phương pháp này được gọi là LM-BFF. Cả (1) và (2) đều yêu cầu cập nhật trọng số của LLM. Do đó, chúng có thể được coi là các phương pháp white-box. (3) ICL-RoBERTa, áp dụng phương pháp in-context learning được đề xuất trong Brown et al. (2020) (Brown et al., 2020b) với RoBERTa-large. (4) Black-Box Tuning (BBT) (Sun et al., 2022b). (5) BBTv2 (Sun et al., 2022a). (4) và (5) là các phương pháp tối ưu hóa không có đạo hàm dựa trên chiến lược tiến hóa thích ứng ma trận hiệp phương sai để tối ưu hóa prompt liên tục (Hansen and Ostermeier, 2001). (6) RLPrompt (Deng et al., 2022), tối ưu hóa prompt rời rạc với học tăng cường và áp dụng Q-learning để tìm prompt tốt nhất. (7) Promptboosting (Hou et al., 2023), tìm kiếm verbalizer và ensemble hàng trăm verbalizer qua AdaBoost để cân bằng các mẫu huấn luyện khác nhau. (8) Để xác thực hiệu quả của CrossTune, chúng tôi xem xét một biến thể dựa trên đặc trưng khác, được triển khai như một bộ phân loại MLP. Cụ thể, embedding token MASK được trích xuất từ mô hình hộp đen đóng băng và đưa vào MLP 2 lớp để phân loại. Chúng tôi đặt tên baseline này là MLP-Classifier.
+
+**Chi tiết Triển khai** Để phù hợp với các nghiên cứu trước về tuning hộp đen, chúng tôi sử dụng RoBERTa-Large (Liu et al., 2019) (với 354 triệu tham số) làm mô hình ngôn ngữ hộp đen quy mô lớn. Điều quan trọng cần lưu ý là phương pháp luận của chúng tôi là agnostic mô hình. Điều này có nghĩa là các LLMs hộp đen có thể là bất kỳ mô hình encoder-only hoặc encoder-decoder nào, thậm chí những mô hình có hàng tỷ tham số.
+
+Để huấn luyện mô hình giáo viên A_deberta, chúng tôi đặt kích thước batch huấn luyện, độ dài chuỗi tối đa và số bước huấn luyện tối đa lần lượt là 2, 128 và 2000. Chúng tôi thực hiện grid search trên learning rate (1e-5, 2e-5) và gradient accumulation steps (1, 2) tương ứng. Việc tinh chỉnh DeBERTa được thực hiện trên card Nvidia 1080, sử dụng 5GB bộ nhớ GPU. Chi phí thời gian khá nhẹ. Thời gian tìm kiếm hyperparameter trung bình cho một seed là khoảng 30 phút. Khi lọc dữ liệu tăng cường ChatGPT với giáo viên DeBERTa, chúng tôi đặt ngưỡng tin cậy của xác suất đầu ra là 0.9 theo phân phối của nó, giữ lại tối đa M mẫu cho mỗi lớp. Theo kinh nghiệm, 1000 <= M <= 1500. Bảng 3 trình bày thống kê dữ liệu được sử dụng trong thí nghiệm của chúng tôi. Để đảm bảo so sánh công bằng, mô hình baseline MLP-Classifier được huấn luyện trên cùng dữ liệu với CrossTune.
+
+Để huấn luyện CrossTune, chúng tôi đặt kích thước batch huấn luyện, learning rate, tổng số epoch huấn luyện và độ dài chuỗi tối đa lần lượt là 32, 4e-5, 100 và 512. Grid search được thực hiện trên số lượng attention heads (1, 2, 4, 8). Mô hình được đánh giá với tập phát triển ở cuối mỗi epoch và nếu hiệu suất validation không cải thiện trong 5 epoch liên tiếp, chúng tôi dừng huấn luyện sớm. Bảng 2 mô tả các template chúng tôi sử dụng để huấn luyện CrossTune. Đáng chú ý là chúng tôi không cần verbalizer trong phương pháp của mình và không có prompt bổ sung nào được thêm vào đầu template. Trong Hình 2, chúng tôi trình bày các mô tả nhãn của TREC và những mô tả của các bộ dữ liệu còn lại sẽ được bao gồm trong Phụ lục của phiên bản cuối cùng.
+
+## 5. Kết quả & Phân tích
+### 5.1. Kết quả Chính
+Bảng 4 tóm tắt các kết quả chính. Chúng ta có thể quan sát thấy rằng trung bình, CrossTune vượt trội hơn BBTv2 9.4% trung bình. Nó cũng phù hợp với hiệu suất của LM-BFF, một phương pháp thích ứng white-box mạnh mẽ sử dụng tuning dựa prompt. So với phương pháp tuning hộp đen SoTA hiện tại, PromptBoosting, CrossTune đạt kết quả tốt hơn đáng kể trên MRPC, QNLI và MNLI. Nó vượt trội hơn PromptBoosting với biên độ tuyệt đối 5.7% trung bình.
+
+So với MLP-Classifier, cũng không dựa vào quá trình tìm kiếm prompt tốn kém và được huấn luyện trên cùng dữ liệu tăng cường, CrossTune đạt được cải thiện 1.8% trung bình trên bảy bộ dữ liệu, nhấn mạnh rằng mạng label cross-attention được đề xuất của chúng tôi hiệu quả hơn việc sử dụng bộ phân loại MLP. Hơn nữa, CrossTune nhẹ hơn và hiệu quả hơn MLP-Classifier vì số lượng tham số có thể huấn luyện của chúng lần lượt là 2.10M và 3.15M.
+
+Ngoài ra, chúng ta có thể thấy rằng hiệu suất của CrossTune nhất quán hơn với độ lệch chuẩn nhỏ hơn trên các data split khác nhau so với các phương pháp hộp đen dựa prompt, như BBTv2 và RLPrompt, cho thấy CrossTune ít có khả năng overfit với các data split cụ thể và thể hiện khả năng tổng quát hóa tốt hơn.
+
+**Tác động của Lượng Dữ liệu Tăng cường** Chúng tôi nghiên cứu cách hiệu suất của CrossTune thay đổi w.r.t. lượng dữ liệu tăng cường. Kết quả của MLP-Classifier cũng được bao gồm trong Bảng 5 để so sánh. Cụ thể, chúng tôi so sánh các trường hợp khi lượng dữ liệu tăng cường cho mỗi lớp là 0, 300 và đầy đủ tương ứng. Lượng đầy đủ đề cập đến cùng thiết lập được hiển thị trong Bảng 3.
+
+Khi lượng dữ liệu tăng cường là 0, tức là chỉ sử dụng dữ liệu K-shot gốc, hiệu suất của cả CrossTune và MLP-Classifier giảm đáng kể khoảng 10% trung bình. Sự sụt giảm hiệu suất rõ ràng nhất là trên TREC và QNLI, chứa các trường hợp test với các biến thể ngữ nghĩa và cú pháp đa dạng. Quan sát này nêu bật tầm quan trọng của việc tăng cường khả năng tổng quát hóa của các phương pháp tuning hộp đen dựa trên đặc trưng với tăng cường dữ liệu. Đáng chú ý, ngay cả khi không có tăng cường dữ liệu, CrossTune vẫn hoạt động tương đương hoặc tốt hơn các phương pháp tuning hộp đen dựa prompt trên hầu hết các bộ dữ liệu (Bảng 4) trong khi không yêu cầu quá trình tìm kiếm prompt hoặc verbalizer tốn kém.
+
+Sau khi tăng số lượng dữ liệu tăng cường lên 300 mỗi lớp, hiệu suất trên TREC và QNLI cải thiện đáng kể. Hiệu suất trung bình của cả MLP-Classifier và CrossTune trở nên gần như ngang bằng với các biến thể tương ứng được huấn luyện trên dữ liệu đầy đủ, vượt trội tất cả các phương pháp hộp đen dựa prompt như BBTv2 và RLPrompt. Điều này cho thấy các phương pháp tuning hộp đen dựa trên đặc trưng thể hiện hiệu quả dữ liệu cao.
+
+Cuối cùng, bất kể lượng dữ liệu tăng cường được sử dụng, CrossTune luôn vượt trội hơn MLP-Classifier. Điều này nhấn mạnh thêm hiệu quả của việc sử dụng ngữ nghĩa phong phú của các mô tả nhãn với mạng cross-attention.
+
+### 5.2. Phân tích Ablation
+**Dữ liệu In-Distribution vs Dữ liệu Tăng cường ChatGPT** Để kiểm tra xem ChatGPT có hiệu quả trong việc cung cấp dữ liệu tăng cường để tăng cường các học viên few-shot hay không, chúng tôi so sánh hiệu suất của việc học với dữ liệu tăng cường in-distribution với việc học với dữ liệu tăng cường của chúng tôi sử dụng ChatGPT. Dữ liệu tăng cường in-distribution là dữ liệu huấn luyện cụ thể nhiệm vụ gốc với nhãn ground-truth bị loại bỏ và sau đó được pseudo-labeled với mô hình giáo viên DeBERTa. Trong trường hợp sử dụng dữ liệu tăng cường ChatGPT, chúng tôi cũng áp dụng cùng giáo viên DeBERTa để pseudo-label và lọc dữ liệu tăng cường. Lưu ý rằng chúng tôi giữ lượng tối đa dữ liệu được lọc giống nhau cho cả hai nguồn dữ liệu để đảm bảo so sánh công bằng. Bảng 6 trình bày kết quả của MLP-Classifier được huấn luyện trên hai nguồn dữ liệu trên sáu bộ dữ liệu khác nhau. Ngoại trừ QQP, huấn luyện trên dữ liệu tăng cường ChatGPT cho kết quả tốt hơn hoặc tương đương so với khi được huấn luyện trên dữ liệu tăng cường in-distribution. Quan sát này ngụ ý rằng ChatGPT có khả năng sản xuất dữ liệu cụ thể nhiệm vụ chất lượng cao. Trong các kịch bản thực tế, chúng ta thường có quyền truy cập vào dữ liệu được gán nhãn hạn chế và thiếu dữ liệu huấn luyện in-distribution. Trong những tình huống này, sử dụng ChatGPT để tăng cường dữ liệu là một lựa chọn khả thi để cải thiện hiệu suất của các học viên few-shot.
+
+Chúng tôi tiếp tục phân tích phân phối dữ liệu của dữ liệu tăng cường ChatGPT, dữ liệu huấn luyện gốc và dữ liệu test. Chúng tôi đầu tiên mã hóa văn bản thành embedding chiều cao với bộ mã hóa câu SimCSE⁴ (Gao et al., 2021b) và sau đó áp dụng biến đổi T-SNE. Hình 4 hiển thị các biểu đồ của TREC, QQP và AGNews. Chúng ta có thể quan sát thấy rằng đối với TREC và AGnews, dữ liệu tăng cường ChatGPT được phân phối tương đối đều trên không gian của dữ liệu huấn luyện in-distribution và giống với một phần lớn dữ liệu test. Tuy nhiên, đối với QQP, phân phối dữ liệu tăng cường ChatGPT không chồng chéo tốt với dữ liệu huấn luyện gốc. Bên cạnh đó, vì lượng dữ liệu test trong QQP lớn hơn nhiều so với dữ liệu tăng cường (40400 ≫ 1900), hầu hết dữ liệu test không được bao phủ. Các quan sát này phù hợp với kết quả trong Bảng 6 rằng MLP-Classifier được huấn luyện trên dữ liệu tăng cường ChatGPT hoạt động ngang bằng với dữ liệu được huấn luyện trên dữ liệu huấn luyện gốc trong TREC và AGNews, nhưng tệ hơn trong trường hợp QQP. Một giải pháp có thể là tối ưu hóa các prompt đầu vào cho ChatGPT sao cho có thể tạo ra dữ liệu đa dạng hơn. Chúng tôi để lại những nỗ lực kỹ thuật prompt như vậy cho nghiên cứu tương lai.
+
+⁴ https://huggingface.co/princeton-nlp/
+
+**Hiệu quả của Switch** Như được giới thiệu trong §3.4, một cơ chế chuyển đổi được triển khai để xác định có nên lọc dữ liệu tăng cường ChatGPT với giáo viên DeBERTa bổ sung hay không. Như được mô tả trong Hình 5, có một tương quan dương nhất quán giữa hiệu suất của các giáo viên trên tập phát triển few-shot và hiệu suất test cuối cùng của CrossTune trên tất cả các nhiệm vụ ngoại trừ SST-2. Tức là, khi switch được kích hoạt (chỉ ra giáo viên DeBERTa vượt trội hơn ChatGPT), CrossTune, được huấn luyện trên dữ liệu được lọc bởi giáo viên DeBERTa, vượt trội hơn biến thể được huấn luyện trên dữ liệu tăng cường chưa được lọc, và ngược lại. Ví dụ, trên TREC, AGNews, MRPC, QQP và MNLI, hiệu suất test của CrossTune cải thiện với bộ lọc DeBERTa (vì giáo viên DeBERTa thể hiện hiệu suất vượt trội so với ChatGPT trên tập phát triển few-shot) trong khi trên QNLI, hiệu suất của CrossTune tốt hơn mà không có bộ lọc DeBERTa, cho rằng giáo viên DeBERTa kém hiệu suất so với ChatGPT. Những quan sát này xác nhận rằng cơ chế chuyển đổi được đề xuất của chúng tôi là hợp lý.
+
+**Tác động của mô tả nhãn** Chúng tôi tiếp tục nghiên cứu tác động của việc sử dụng các mô tả nhãn khác nhau. Trong Bảng 7, chúng tôi so sánh hiệu suất của việc sử dụng mô tả dài và thông tin với mô tả ngắn và không thông tin. Khi các mô tả không thông tin được sử dụng, CrossTune vẫn hoạt động nhưng hiệu suất hơi tệ hơn so với khi sử dụng mô tả nhãn dài và thông tin. Do đó, chúng ta có thể kết luận rằng các mô tả nhãn thông tin giúp cải thiện khả năng phân loại văn bản của CrossTune. Chi tiết của các mô tả nhãn khác nhau sẽ được trình bày trong phụ lục trong phiên bản cuối cùng.
+
+Ngoài ra, chúng tôi kiểm tra xem các mô tả nhãn có giúp cải thiện các phương pháp khác hay không. Các thí nghiệm được thực hiện trên MRPC và SST-2 với baseline MLP-Classifier. Cụ thể, đầu vào cho mô hình là sự nối của {desc_1, desc_2, ..., desc_c, x_i} trong đó desc_j là mô tả nhãn của lớp thứ j và x_i là chuỗi văn bản để phân loại. Chúng tôi nhận thấy rằng hiệu suất của MLP-classifier giảm từ 89.1% xuống 74.65% trên SST-2 và 80.4% xuống 75.92% trên MRPC, cho thấy tác động tiêu cực của các mô tả nhãn đối với MLP-classifier.
+
+**Tác động của Dữ liệu Tăng cường trên Các Baseline Khác** Chúng tôi tiếp tục thực hiện thí nghiệm với các baseline, BBTv2 và RLprompt trên SST2, với cùng dữ liệu tăng cường ChatGPT như được sử dụng trên CrossTune. Không có cải thiện đáng kể nào được quan sát so với huấn luyện với dữ liệu 16-shot gốc. BBTv2 đạt 83.8% vs 82.8% độ chính xác trong khi RLPrompt đạt 90.5% vs 91.0% độ chính xác trước và sau tăng cường dữ liệu tương ứng. Nó cho thấy các phương pháp dựa trên tối ưu hóa prompt này không sử dụng dữ liệu tăng cường hiệu quả như CrossTune.
+
+**Tác động của Các Kỹ thuật Tăng cường Khác** Bên cạnh tăng cường ChatGPT, chúng tôi khám phá xem các kỹ thuật tăng cường dữ liệu truyền thống có cũng tăng cường CrossTune hay không. Các thí nghiệm được thực hiện với CrossTune trên MRPC và SST2, sử dụng dữ liệu được tăng cường từ các kỹ thuật EDA (Wei and Zou, 2019), bao gồm hoán đổi, xóa và chèn ngẫu nhiên của văn bản đầu vào. Phát hiện của chúng tôi chỉ ra rằng với 300 điểm dữ liệu tăng cường EDA, hiệu suất của CrossTune phù hợp với các mô hình được huấn luyện với dữ liệu tăng cường ChatGPT. Tuy nhiên, khi chúng tôi tăng tăng cường dữ liệu lên 2000, hiệu suất sử dụng tăng cường EDA giảm so với việc không sử dụng tăng cường nào cả. Sự suy giảm này có thể là do một lượng lớn dữ liệu tăng cường EDA gây ra nhiễu quá mức vào mô hình ngôn ngữ. Các thao tác xóa, chèn và hoán đổi có nguy cơ thay đổi ý nghĩa ngữ nghĩa của câu gốc. So với EDA, tăng cường dựa trên ChatGPT nổi lên như một phương pháp đáng tin cậy hơn.
+
+## 6. Kết luận
+Tóm lại, chúng tôi đề xuất CrossTune cho phân loại văn bản few-shot trong thiết lập hộp đen. CrossTune coi LM hộp đen như một bộ trích xuất đặc trưng và tận dụng các mô tả nhãn như ngữ cảnh ngữ nghĩa đầu vào bổ sung. Để tăng cường khả năng tổng quát hóa của CrossTune, chúng tôi tránh dựa vào dữ liệu không nhãn in-distribution, thay vào đó sử dụng ChatGPT để tạo các mẫu huấn luyện pseudo-labeled. Một cơ chế chuyển đổi được triển khai để đảm bảo chất lượng dữ liệu được tạo. Các đánh giá thực nghiệm rộng rãi của chúng tôi trên bảy bộ dữ liệu benchmark tiết lộ hiệu quả của CrossTune trong tuning hộp đen, vượt trội hơn state-of-the-art hiện có với điểm số ấn tượng 5.7% trung bình. Ngay cả khi không có tăng cường dữ liệu, CrossTune vẫn hoạt động tốt hơn hoặc tương đương với các phương pháp trước đó trên hầu hết các bộ dữ liệu.
+
+**Lời cảm ơn** Chúng tôi cảm ơn các nhà đánh giá ẩn danh vì những bình luận sâu sắc của họ. Công trình này được hỗ trợ bởi Quỹ Khoa học Tự nhiên Quốc gia Trung Quốc (Grant No. 62271432), Quỹ Nghiên cứu Khoa học và Công nghệ Thâm Quyến (Dự án Chính Nghiên cứu Cơ bản Grant No. JCYJ20220818103001002), và Quỹ Dự án Nội bộ từ Viện Nghiên cứu Dữ liệu Lớn Thâm Quyến dưới Grant No. T00120220002.
+
+**Tài liệu tham khảo**
+
+Markus Bayer, Marc-André Kaufhold, và Christian Reuter. 2022. Một khảo sát về tăng cường dữ liệu cho phân loại văn bản. ACM Comput. Surv., 55(7).
+
+Samuel R. Bowman, Gabor Angeli, Christopher Potts, và Christopher D. Manning. 2015. Một corpus được chú thích lớn để học suy luận ngôn ngữ tự nhiên. Trong Proceedings of the 2015 Conference on Empirical Methods in Natural Language Processing, trang 632–642, Lisbon, Portugal. Association for Computational Linguistics.
+
+Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal, và cộng sự. 2020a. Mô hình ngôn ngữ là học viên few-shot. Trong Advances in Neural Information Processing Systems, tập 33, trang 1877–1901. Curran Associates, Inc.
+
+Tom Brown và cộng sự. 2020b. Mô hình ngôn ngữ là học viên few-shot. Trong Advances in Neural Information Processing Systems, tập 33, trang 1877–1901. Curran Associates, Inc.
+
+Yiming Chen, Yan Zhang, Chen Zhang, Grandee Lee, Ran Cheng, và Haizhou Li. 2021. Revisiting self-training for few-shot learning of language model. Trong Proceedings of the 2021 Conference on Empirical Methods in Natural Language Processing, trang 9125–9135, Online and Punta Cana, Dominican Republic. Association for Computational Linguistics.
+
+Hyunsoo Cho, Youna Kim, và Sang-goo Lee. 2023. CELDA: Leveraging black-box language model as enhanced classifier without labels. Trong Proceedings of the 61st Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), trang 4364–4379, Toronto, Canada. Association for Computational Linguistics.
+
+Aakanksha Chowdhery, Sharan Narang, Jacob Devlin, Maarten Bosma, Gaurav Mishra, Adam Roberts, và cộng sự. 2022. PaLM: Scaling language modeling with pathways.
+
+Kevin Clark, Minh-Thang Luong, Quoc V. Le, và Christopher D. Manning. 2020. ELECTRA: Pre-training text encoders as discriminators rather than generators. Trong International Conference on Learning Representations.
+
+Mingkai Deng, Jianyu Wang, Cheng-Ping Hsieh, Yihan Wang, Han Guo, Tianmin Shu, Meng Song, Eric Xing, và Zhiting Hu. 2022. RLPrompt: Optimizing discrete text prompts with reinforcement learning. Trong Proceedings of the 2022 Conference on Empirical Methods in Natural Language Processing, trang 3369–3391, Abu Dhabi, United Arab Emirates. Association for Computational Linguistics.
+
+Jacob Devlin, Ming-Wei Chang, Kenton Lee, và Kristina Toutanova. 2019. BERT: Pre-training of deep bidirectional transformers for language understanding. Trong Proceedings of the 2019 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies, Volume 1 (Long and Short Papers), trang 4171–4186, Minneapolis, Minnesota. Association for Computational Linguistics.
+
+Shizhe Diao, Zhichao Huang, Ruijia Xu, Xuechun Li, LIN Yong, Xiao Zhou, và Tong Zhang. 2023. Black-box prompt learning for pre-trained language models. Transactions on Machine Learning Research.
+
+Jingfei Du, Edouard Grave, Beliz Gunel, Vishrav Chaudhary, Onur Celebi, Michael Auli, Veselin Stoyanov, và Alexis Conneau. 2021. Self-training improves pre-training for natural language understanding. Trong Proceedings of the 2021 Conference of the North American Chapter of the Association for Computational Linguistics: Human Language Technologies, trang 5408–5418, Online. Association for Computational Linguistics.
+
+Kawin Ethayarajh. 2019. How contextual are contextualized word representations? Comparing the geometry of BERT, ELMo, and GPT-2 embeddings. Trong Proceedings of the 2019 Conference on Empirical Methods in Natural Language Processing and the 9th International Joint Conference on Natural Language Processing (EMNLP-IJCNLP), trang 55–65, Hong Kong, China. Association for Computational Linguistics.
+
+Yu Fei, Zhao Meng, Ping Nie, Roger Wattenhofer, và Mrinmaya Sachan. 2022. Beyond prompting: Making pre-trained language models better zero-shot learners by clustering representations. Trong Proceedings of the 2022 Conference on Empirical Methods in Natural Language Processing, trang 8560–8579, Abu Dhabi, United Arab Emirates. Association for Computational Linguistics.
+
+Tianyu Gao, Adam Fisch, và Danqi Chen. 2021a. Making pre-trained language models better few-shot learners. Trong Proceedings of the 59th Annual Meeting of the Association for Computational Linguistics and the 11th International Joint Conference on Natural Language Processing (Volume 1: Long Papers), trang 3816–3830, Online. Association for Computational Linguistics.
+
+Tianyu Gao, Xingcheng Yao, và Danqi Chen. 2021b. SimCSE: Simple contrastive learning of sentence embeddings. Trong Proceedings of the 2021 Conference on Empirical Methods in Natural Language Processing, trang 6894–6910, Online and Punta Cana, Dominican Republic. Association for Computational Linguistics.
+
+Nikolaus Hansen và Andreas Ostermeier. 2001. Completely Derandomized Self-Adaptation in Evolution Strategies. Evolutionary Computation, 9(2):159–195.
+
+Pengcheng He, Xiaodong Liu, Jianfeng Gao, và Weizhu Chen. 2021. DEBERTA: Decoding-enhanced BERT with disentangled attention. Trong International Conference on Learning Representations.
+
+Mohammad Saleh Hosseini, Munawara Munia, và Latifur Khan. 2023. BERT has more to offer: BERT layers combination yields better sentence embeddings. Trong Findings of the Association for Computational Linguistics: EMNLP 2023, trang 15419–15431, Singapore. Association for Computational Linguistics.
+
+Bairu Hou, Joe O'Connor, Jacob Andreas, Shiyu Chang, và Yang Zhang. 2023. PromptBoosting: Black-box text classification with ten forward passes. Trong Proceedings of the 40th International Conference on Machine Learning, tập 202 của Proceedings of Machine Learning Research, trang 13309–13324. PMLR.
+
+Neil Houlsby, Andrei Giurgiu, Stanislaw Jastrzebski, Bruna Morrone, Quentin De Laroussilhe, Andrea Gesmundo, Mona Attariyan, và Sylvain Gelly. 2019. Parameter-efficient transfer learning for NLP. Trong Proceedings of the 36th International Conference on Machine Learning, tập 97 của Proceedings of Machine Learning Research, trang 2790–2799. PMLR.
+
+Eduard Hovy, Laurie Gerber, Ulf Hermjakob, Chin-Yew Lin, và Deepak Ravichandran. 2001. Toward semantics-based answer pinpointing. Trong Proceedings of the First International Conference on Human Language Technology Research.
+
+Edward J Hu, yelong shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang, và Weizhu Chen. 2022. LoRA: Low-rank adaptation of large language models. Trong International Conference on Learning Representations.
+
+Jacob Kahn, Ann Lee, và Awni Hannun. 2020. Self-training for end-to-end speech recognition. Trong ICASSP 2020 - 2020 IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP), trang 7084–7088.
+
+Brian Lester, Rami Al-Rfou, và Noah Constant. 2021. The power of scale for parameter-efficient prompt tuning. Trong Proceedings of the 2021 Conference on Empirical Methods in Natural Language Processing, trang 3045–3059, Online and Punta Cana, Dominican Republic. Association for Computational Linguistics.
+
+Bohan Li, Hao Zhou, Junxian He, Mingxuan Wang, Yiming Yang, và Lei Li. 2020. On the sentence embeddings from pre-trained language models. Trong Proceedings of the 2020 Conference on Empirical Methods in Natural Language Processing (EMNLP), trang 9119–9130, Online. Association for Computational Linguistics.
+
+Xiang Lisa Li và Percy Liang. 2021. Prefix-tuning: Optimizing continuous prompts for generation. Trong Proceedings of the 59th Annual Meeting of the Association for Computational Linguistics and the 11th International Joint Conference on Natural Language Processing (Volume 1: Long Papers), trang 4582–4597, Online. Association for Computational Linguistics.
+
+Xiao Liu, Yanan Zheng, Zhengxiao Du, Ming Ding, Yujie Qian, Zhilin Yang, và Jie Tang. 2021. GPT understands, too.
+
+Yinhan Liu và cộng sự. 2019. RoBERTa: A robustly optimized BERT pretraining approach. arXiv preprint arXiv: Arxiv-1907.11692.
+
+Yu Meng, Yunyi Zhang, Jiaxin Huang, Chenyan Xiong, Heng Ji, Chao Zhang, và Jiawei Han. 2020. Text classification using label names only: A language model self-training approach. Trong Proceedings of the 2020 Conference on Empirical Methods in Natural Language Processing (EMNLP), trang 9006–9017, Online. Association for Computational Linguistics.
+
+Subhabrata Mukherjee, Arindam Mitra, Ganesh Jawahar, Sahaj Agarwal, Hamid Palangi, và Ahmed Awadallah. 2023. Orca: Progressive learning from complex explanation traces of GPT-4. arXiv preprint arXiv: 2306.02707.
+
+OpenAI. 2023. GPT-4 technical report.
+
+Long Ouyang và cộng sự. 2022. Training language models to follow instructions with human feedback. Trong Advances in neural information processing systems.
+
+Archiki Prasad, Peter Hase, Xiang Zhou, và Mohit Bansal. 2023. GrIPS: Gradient-free, edit-based instruction search for prompting large language models. Trong Proceedings of the 17th Conference of the European Chapter of the Association for Computational Linguistics, trang 3845–3864, Dubrovnik, Croatia. Association for Computational Linguistics.
+
+Colin Raffel và cộng sự. 2020. Exploring the limits of transfer learning with a unified text-to-text transformer. Journal of Machine Learning Research, 21(140):1–67.
+
+Timo Schick và Hinrich Schütze. 2021. Exploiting cloze-questions for few-shot text classification and natural language inference. Trong Proceedings of the 16th Conference of the European Chapter of the Association for Computational Linguistics: Main Volume, trang 255–269, Online. Association for Computational Linguistics.
+
+Kihyuk Sohn, David Berthelot, Nicholas Carlini, Zizhao Zhang, Han Zhang, Colin A Raffel, Ekin Dogus Cubuk, Alexey Kurakin, và Chun-Liang Li. 2020. Fixmatch: Simplifying semi-supervised learning with consistency and confidence. Advances in neural information processing systems, 33:596–608.
+
+Tianxiang Sun, Zhengfu He, Hong Qian, Yunhua Zhou, Xuanjing Huang, và Xipeng Qiu. 2022a. BBTv2: Towards a gradient-free future with large language models. Trong Proceedings of the 2022 Conference on Empirical Methods in Natural Language Processing, trang 3916–3930, Abu Dhabi, United Arab Emirates. Association for Computational Linguistics.
+
+Tianxiang Sun, Yunfan Shao, Hong Qian, Xuanjing Huang, và Xipeng Qiu. 2022b. Black-box tuning for language-model-as-a-service. Trong Proceedings of the 39th International Conference on Machine Learning, tập 162 của Proceedings of Machine Learning Research, trang 20841–20855. PMLR.
+
+Alex Wang, Amanpreet Singh, Julian Michael, Felix Hill, Omer Levy, và Samuel R. Bowman. 2019. GLUE: A multi-task benchmark and analysis platform for natural language understanding. Trong International Conference on Learning Representations.
+
+Yizhong Wang, Yeganeh Kordi, Swaroop Mishra, Alisa Liu, Noah A. Smith, Daniel Khashabi, và Hannaneh Hajishirzi. 2023. Self-instruct: Aligning language models with self-generated instructions. Trong Proceedings of the 61st Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers), trang 13484–13508, Toronto, Canada. Association for Computational Linguistics.
+
+Jason Wei và Kai Zou. 2019. EDA: Easy data augmentation techniques for boosting performance on text classification tasks. Trong Proceedings of the 2019 Conference on Empirical Methods in Natural Language Processing and the 9th International Joint Conference on Natural Language Processing (EMNLP-IJCNLP), trang 6382–6388, Hong Kong, China. Association for Computational Linguistics.
+
+Qizhe Xie, Zihang Dai, Eduard Hovy, Thang Luong, và Quoc Le. 2020. Unsupervised data augmentation for consistency training. Trong Advances in Neural Information Processing Systems, tập 33, trang 6256–6268. Curran Associates, Inc.
+
+Can Xu, Qingfeng Sun, Kai Zheng, Xiubo Geng, Pu Zhao, Jiazhan Feng, Chongyang Tao, và Daxin Jiang. 2023. WizardLM: Empowering large language models to follow complex instructions. arXiv preprint arXiv: 2304.12244.
+
+Lu Zhang, Jiandong Ding, Yi Xu, Yingyao Liu, và Shuigeng Zhou. 2021. Weakly-supervised text classification based on keyword graph. Trong Proceedings of the 2021 Conference on Empirical Methods in Natural Language Processing, trang 2803–2813, Online and Punta Cana, Dominican Republic. Association for Computational Linguistics.
+
+Tianjun Zhang, Xuezhi Wang, Denny Zhou, Dale Schuurmans, và Joseph E. Gonzalez. 2023. TEMPERA: Test-time prompt editing via reinforcement learning. Trong The Eleventh International Conference on Learning Representations.
+
+Xiang Zhang, Junbo Zhao, và Yann LeCun. 2015. Character-level convolutional networks for text classification. Trong Advances in Neural Information Processing Systems, tập 28. Curran Associates, Inc.
+
+Zihao Zhao, Eric Wallace, Shi Feng, Dan Klein, và Sameer Singh. 2021. Calibrate before use: Improving few-shot performance of language models. Trong Proceedings of the 38th International Conference on Machine Learning, tập 139 của Proceedings of Machine Learning Research, trang 12697–12706. PMLR.
+
+Barret Zoph, Golnaz Ghiasi, Tsung-Yi Lin, Yin Cui, Hanxiao Liu, Ekin Dogus Cubuk, và Quoc Le. 2020. Rethinking pre-training and self-training. Advances in neural information processing systems, 33:3833–3845.
+
+## A. Chi tiết Bộ dữ liệu Bổ sung
+
+**Bảng 8: Mô tả Nhãn Ngắn và Không Thông tin**
+
+| Bộ dữ liệu | Nhãn | Mô tả |
+|---------|------|-------|
+| TREC | description | Câu trả lời cho câu hỏi là một mô tả. |
+| | entity | Câu trả lời cho câu hỏi là một thực thể. |
+| | abbreviation | Câu trả lời cho câu hỏi là một từ viết tắt. |
+| | number | Câu trả lời cho câu hỏi là một số. |
+| | human | Câu trả lời cho câu hỏi là một con người. |
+| | location | Câu trả lời cho câu hỏi là một vị trí. |
+| AGNews | tech | Đó là một tin tức công nghệ. |
+| | world | Đó là một tin tức thế giới. |
+| | sports | Đó là một tin tức thể thao. |
+| | business | Đó là một tin tức kinh doanh. |
+| QNLI | entailment | Câu văn chứa câu trả lời cho câu hỏi. |
+| | non_entailment | Câu văn không chứa câu trả lời cho câu hỏi. |
+
+Bảng 8 mô tả các mô tả nhãn ngắn và không thông tin được sử dụng trong nghiên cứu ablation của chúng tôi (§5.2) nơi chúng tôi so sánh tác động của việc sử dụng mô tả nhãn thông tin với việc sử dụng mô tả không thông tin. Bảng 9 hiển thị các mô tả nhãn chúng tôi sử dụng trong các thí nghiệm chính của mình.
+
+**Bảng 9: Mô tả Nhãn được sử dụng trong các thí nghiệm chính**
+
+| Bộ dữ liệu | Nhãn | Mô tả |
+|---------|------|-------|
+| TREC | description | Định nghĩa của cái gì đó, mô tả của cái gì đó, cách thức của một hành động, lý do. |
+| | entity | Động vật, cơ quan của cơ thể, màu sắc, phát minh, sách và tác phẩm sáng tạo khác, tên tiền tệ, bệnh tật và y học, sự kiện, thực phẩm, nhạc cụ, ngôn ngữ, chữ cái như a-z, thực thể khác, thực vật, sản phẩm, tôn giáo, thể thao, nguyên tố và chất, ký hiệu và dấu hiệu, kỹ thuật và phương pháp, thuật ngữ tương đương, phương tiện, từ có tính chất đặc biệt. |
+| | abbreviation | Một dạng rút gọn của một từ hoặc cụm từ được sử dụng để đại diện cho ý nghĩa đầy đủ. |
+| | number | Số lượng của cái gì đó, ngày tháng, khoảng cách, giá cả, thứ tự, xếp hạng, thời gian kéo dài, phần trăm, phân số, tốc độ, nhiệt độ, kích thước, diện tích và thể tích, trọng lượng, mã bưu điện hoặc mã khác. |
+| | human | Cá nhân, chức danh của một người, mô tả về một người, nhóm hoặc tổ chức của con người. |
+| | location | Thành phố, quốc gia, núi, bang, vị trí khác. |
+| AGNews | tech | Danh mục Khoa học/Công nghệ được thiết kế để bao gồm các bài báo liên quan đến khoa học và công nghệ. Nó có thể bao gồm tin tức về khám phá khoa học hoặc đột phá nghiên cứu, ra mắt sản phẩm công nghệ, cập nhật công ty công nghệ, bao gồm hội nghị khoa học và công nghệ, phỏng vấn các nhà khoa học hoặc lãnh đạo công nghệ, bài báo về lý thuyết hoặc mô hình mới trong các ngành khoa học khác nhau, tiến bộ trong công nghệ y tế, và nhiều hơn nữa. |
+| | world | Đó là một bài báo tin tức về các vấn đề quốc tế, địa chính trị, sự kiện toàn cầu, hoặc bất kỳ chủ đề nào có phạm vi toàn thế giới hoặc quốc tế. Các ví dụ có thể bao gồm tin tức về ngoại giao quốc tế, các sự kiện toàn cầu lớn như Đại hội đồng Liên hợp quốc, xung đột hoặc chiến tranh quốc tế, bầu cử quan trọng hoặc sự kiện chính trị ở các quốc gia khác nhau, các vấn đề môi trường toàn cầu, và nhiều hơn nữa. |
+| | sports | Bài báo liên quan đến các sự kiện thể thao khác nhau, tin tức và cập nhật. danh mục Thể thao có thể bao gồm nhiều chủ đề như kết quả trận đấu, chuyển nhượng cầu thủ, chấn thương, phỏng vấn với các vận động viên, bao gồm các sự kiện thể thao quốc tế như Olympic, World Cup bóng đá, giải quần vợt grand slam, và nhiều hơn nữa. |
+| | business | Danh mục Kinh doanh thường bao gồm các chủ đề liên quan đến thương mại, kinh tế và tài chính ở quy mô địa phương, quốc gia hoặc quốc tế. Nó có thể bao gồm tin tức về sáp nhập công ty, báo cáo tài chính, cập nhật thị trường chứng khoán, thay đổi trong chính sách kinh tế, phỏng vấn với các nhà lãnh đạo kinh doanh, đổi mới trong mô hình kinh doanh, xu hướng trong các ngành công nghiệp khác nhau, và nhiều hơn nữa. |
+| QNLI | entailment | Câu văn đã cho một cách logic chứa câu trả lời cho câu hỏi liên quan. Nếu sự thật của câu văn cung cấp câu trả lời cho câu hỏi, nó được coi là một entailment. |
+| | non_entailment | Câu văn đã cho không chứa một cách logic câu trả lời cho câu hỏi liên quan. Ngay cả khi câu văn là đúng, nó không cung cấp câu trả lời hợp lệ cho câu hỏi. |
+| MNLI | entailment | Giả thuyết có thể được suy luận hoặc ngụ ý một cách logic từ tiền đề. |
+| | neutral | Tiền đề và giả thuyết không có mối quan hệ logic rõ ràng. |
+| | contradiction | Giả thuyết mâu thuẫn hoặc xung đột với thông tin được trình bày trong tiền đề. |
+| MRPC | equivalent | Hai câu trong cặp có tương đương ngữ nghĩa - chúng diễn đạt cùng một ý nghĩa hoặc ý nghĩa rất tương tự. |
+| | non_equivalent | Hai câu trong cặp không có tương đương ngữ nghĩa - chúng không truyền tải cùng một ý nghĩa. |
+| QQP | equivalent | Tức là, |
+| | non_equivalent | Một câu hỏi khác khác là, |
+| SST-2 | positive | câu từ các đánh giá phim thể hiện quan điểm tích cực, khen ngợi hoặc ca ngợi về một bộ phim. Khái niệm về cảm xúc tích cực trong bối cảnh này thường bao gồm cảm giác thích thú, ngưỡng mộ, đánh giá cao hoặc hài lòng với các yếu tố của bộ phim như cfabula, diễn xuất, đạo diễn, quay phim hoặc các khía cạnh khác trong sản xuất của nó. |
+| | negative | Câu thể hiện quan điểm không thuận lợi, phê phán hoặc chê bai về một bộ phim. Khái niệm về cảm xúc tiêu cực ở đây thường bao gồm cảm giác thất vọng, không hài lòng, thất vọng hoặc khó chịu với các yếu tố của bộ phim như cốt truyện, diễn xuất, đạo diễn, quay phim hoặc các khía cạnh khác trong sản xuất của nó. |

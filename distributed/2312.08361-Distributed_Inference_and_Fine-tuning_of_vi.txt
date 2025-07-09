@@ -1,0 +1,467 @@
+# Suy luận phân tán và tinh chỉnh các mô hình ngôn ngữ lớn qua Internet
+
+Alexander Borzunov∗
+Đại học HSE, YandexMax Ryabinin
+Đại học HSE, YandexArtem Chumachenko
+Neiro.ai
+Dmitry Baranchuk
+YandexTim Dettmers
+Đại học WashingtonYounes Belkada
+Hugging Face
+Pavel Samygin
+Trường phân tích dữ liệu YandexColin Raffel
+Hugging Face
+
+## Tóm tắt
+
+Các mô hình ngôn ngữ lớn (LLMs) rất hữu ích trong nhiều tác vụ NLP và trở nên có khả năng hơn với kích thước lớn hơn, với những mô hình nguồn mở tốt nhất có hơn 50 tỷ tham số. Tuy nhiên, việc sử dụng các mô hình 50B+ này đòi hỏi phần cứng cao cấp, khiến chúng không thể tiếp cận được với hầu hết các nhà nghiên cứu. Trong công trình này, chúng tôi nghiên cứu các phương pháp suy luận và tinh chỉnh hiệu quả về chi phí cho LLMs, so sánh các chiến lược cục bộ và phân tán. Chúng tôi quan sát thấy rằng một mô hình đủ lớn (50B+) có thể chạy hiệu quả ngay cả trên các thiết bị phân tán địa lý trong mạng tiêu dùng. Điều này có thể cho phép chạy LLM hiệu quả bằng cách gộp chung các nguồn tài nguyên tính toán nhàn rỗi của nhiều nhóm nghiên cứu và tình nguyện viên. Chúng tôi giải quyết hai vấn đề mở: (1) làm thế nào để thực hiện suy luận và tinh chỉnh một cách đáng tin cậy nếu bất kỳ thiết bị nào có thể ngắt kết nối đột ngột và (2) làm thế nào để phân vùng LLMs giữa các thiết bị với phần cứng không đồng đều, tham gia và rời khỏi tùy ý. Để làm điều đó, chúng tôi phát triển các thuật toán suy luận chịu lỗi đặc biệt và các giao thức cân bằng tải tự động gán các thiết bị để tối đa hóa thông lượng tổng thể của hệ thống. Chúng tôi trình bày các thuật toán này trong PETALS¹ - một hệ thống phi tập trung chạy Llama 2 (70B) và BLOOM (176B) qua Internet nhanh hơn tới 10× so với việc offload cho việc tạo sinh tương tác. Chúng tôi đánh giá hiệu suất của hệ thống trong điều kiện mô phỏng và thiết lập thế giới thực trải dài hai châu lục.
+
+## 1 Giới thiệu
+
+Trong những năm gần đây, cộng đồng NLP đã phát hiện ra rằng các mô hình ngôn ngữ được huấn luyện trước đã tăng tốc đáng kể tiến trình trên nhiều vấn đề nghiên cứu thông qua việc tinh chỉnh (Radford et al., 2018) hoặc prompting đơn giản (Brown et al., 2020). Chất lượng của chúng có xu hướng cải thiện khi chúng ta tăng quy mô mô hình (Radford et al., 2019; Kaplan et al., 2020). Theo xu hướng này, các mô hình ngôn ngữ hiện đại thường có hàng trăm tỷ tham số (Brown et al., 2020; Rae et al., 2021; Zeng et al., 2021; Kim et al., 2021).
+
+Gần đây nhất, một số nhóm nghiên cứu đã mở nguồn các LLM được huấn luyện trước của họ với hơn 50B tham số (Zhang et al., 2022; BigScience, 2022a; Touvron et al., 2023a,b). Tuy nhiên, chúng vẫn khó sử dụng do kích thước tuyệt đối về mặt tham số. Ví dụ, OPT-175B và BLOOM-176B cần hơn 350 GB bộ nhớ accelerator để suy luận và thậm chí nhiều hơn để tinh chỉnh. Kết quả là, ngay cả việc suy luận cơ bản cho các LLM này cần nhiều GPU cao cấp hoặc các cluster đa node. Các nghiên cứu gần đây đề xuất các thuật toán để chạy các mô hình lớn với phần cứng có giá cả phải chăng hơn (Pudipeddi et al., 2020; Ren et al., 2021), ví dụ bằng cách offload các tham số sang RAM. Tuy nhiên, như chúng tôi chỉ ra trong Mục 3.1, các kỹ thuật này không hiệu quả trong nhiều trường hợp sử dụng, chẳng hạn như các chatbot dựa trên LLM và công cụ tìm kiếm.
+
+Trong công trình này, chúng tôi tìm kiếm một cách hiệu quả về chi phí hơn để chạy các LLM được huấn luyện trước trong các trường hợp sử dụng chính của chúng: suy luận, học theo ngữ cảnh, và tinh chỉnh. Chúng tôi phân tích độ trễ và thông lượng cho các trường hợp sử dụng này và xác định những yếu tố nào trở thành thống trị đối với các mô hình rất lớn. Đáng chú ý, đối với các mô hình có hơn 50B tham số, việc truyền thông các activation qua mạng chậm có thể nhanh hơn việc swap các lớp từ RAM hoặc SSD cục bộ. Dựa trên những quan sát này, có thể chạy LLM hiệu quả về chi phí bằng cách gộp chung phần cứng commodity qua Internet.
+
+Tuy nhiên, các thuật toán LM hiện có không được thiết kế để chạy suy luận với các thiết bị không đáng tin cậy hoặc mạng có độ trễ cao. Để khắc phục khoảng cách này, chúng tôi công thức hóa một thuật toán mới cho suy luận tự hồi quy chịu lỗi phân tán của các mô hình rất lớn. Sử dụng cache attention kép, thuật toán này có thể nhanh chóng phục hồi từ server bị lỗi và gán lại tải cho một hoặc nhiều server thay thế. Cuối cùng, để đảm bảo có đủ server cho mọi phần của mô hình, chúng tôi phát triển một thuật toán cân bằng tải phi tập trung gán các transformer block cho mọi server để tối đa hóa thông lượng tổng thể của hệ thống. Bản chất hoàn toàn phi tập trung của các giao thức này cho phép những người tham gia thêm hoặc gỡ bỏ thiết bị của họ tại bất kỳ thời điểm nào, tận dụng tối ưu thời gian GPU nhàn rỗi.
+
+Chúng tôi tóm tắt những đóng góp chính của công trình này như sau:
+• Chúng tôi phân tích vấn đề suy luận LLM hiệu quả về chi phí và đề xuất một thuật toán mới có thể suy luận các mô hình ngôn ngữ lớn (50B+) trên các thiết bị phân tán không đáng tin cậy. Theo hiểu biết tốt nhất của chúng tôi, đây là thuật toán đầu tiên có thể suy luận LLM với 50B+ tham số trong thiết lập này.
+• Sử dụng thuật toán này, chúng tôi phát triển PETALS - một hệ thống phi tập trung để suy luận và tinh chỉnh LLM qua Internet. Hệ thống cho phép người dùng chạy suy luận và tinh chỉnh trên một đàn các thiết bị không đáng tin cậy với các đảm bảo tính đúng đắn giống như khi chạy cục bộ. Hệ thống chạy liên tục với sự giúp đỡ của các tình nguyện viên.
+• Chúng tôi đánh giá hiệu suất của các thuật toán được đề xuất trên Llama 2 (70B) (Touvron et al., 2023b) và BLOOM (176B) (BigScience, 2022a). Chúng tôi chạy thí nghiệm trong điều kiện được kiểm soát, với độ trễ mạng mô phỏng và lỗi server, và trong hệ thống phân tán địa lý thực tế trải dài hai châu lục. Với tốc độ mạng thực tế, các thuật toán phân tán của chúng tôi thực hiện tạo sinh tự hồi quy ≥10× nhanh hơn so với offload cục bộ.
+
+## 2 Nền tảng: huấn luyện và suy luận hiệu quả
+
+Có rất nhiều phương pháp tối ưu hóa huấn luyện và suy luận cho hầu hết các workload deep learning. Ở đây, chúng tôi tập trung vào hai lĩnh vực liên quan đến phân tích của chúng tôi: song song mô hình và offload tham số.
+
+### 2.1 Song song mô hình
+
+Song song mô hình là một họ các thuật toán huấn luyện phân tán gán mỗi thiết bị để giữ một tập con các tham số mô hình, chạy một tập con các phép tính và truyền thông các activation đầu ra. Song song tensor gán mỗi thiết bị để tính toán một tập con của mỗi lớp mô hình (ví dụ, một tập con các neuron), sau đó truyền thông kết quả giữa nhau và tiến hành lớp tiếp theo (Krizhevsky et al., 2012; Ben-Nun & Hoefler, 2019; Tang et al., 2020). Mỗi thiết bị thực hiện một phép tính đối xứng, áp dụng cho một phần khác nhau của trọng số mô hình, điều này làm cho song song tensor tương thích với truyền thông dựa trên MPI. Đổi lại, overhead hiệu suất chính của chiến lược này đến từ truyền thông all-to-all (và đồng bộ hóa) sau mỗi lớp (Krizhevsky, 2014).
+
+Song song pipeline giảm overhead truyền thông bằng cách gán mỗi thiết bị với một hoặc nhiều lớp đầy đủ (Huang et al., 2019; Narayanan et al., 2019; Yang et al., 2019). Trong quá trình forward pass, mỗi giai đoạn áp dụng tập con lớp của nó cho các đầu vào được cung cấp bởi giai đoạn trước, sau đó gửi các đầu ra của lớp cuối cùng đến giai đoạn tiếp theo. Đối với backward pass, quá trình này được đảo ngược, với mỗi giai đoạn pipeline truyền gradient đến cùng thiết bị đã cung cấp cho nó các activation đầu vào trước đó. Để sử dụng tốt hơn các thiết bị có sẵn, pipeline phải xử lý nhiều microbatch mỗi bước, cho phép mỗi giai đoạn chạy song song trên một batch đầu vào khác nhau. Ngay cả với việc thực thi tối ưu, một số giai đoạn pipeline sẽ vẫn nhàn rỗi một thời gian (Huang et al., 2019).
+
+Cả hai chiến lược này đều được sử dụng tích cực để huấn luyện LLM. Các hệ thống huấn luyện phân tán thế giới thực thường kết hợp nhiều hình thức song song tùy thuộc vào phần cứng và loại mạng (Narayanan et al., 2021; Rajbhandari et al., 2020; Jia et al., 2019). Song song tensor thường được sử dụng trong một server đa GPU duy nhất hoặc các TPU core được kết nối chặt chẽ (Narayanan et al., 2021; Shazeer et al., 2018). Đổi lại, song song pipeline được sử dụng để kết nối nhiều server (Narayanan et al., 2021). Các công trình gần đây chứng minh rằng song song mô hình có thể được sử dụng để pre-training LLM hiệu quả về chi phí bằng cách gộp chung các thiết bị GPU nhàn rỗi (Athlur et al., 2022; Wang et al., 2022; Kuszmaul, 2022; Yuan et al., 2022; Ryabinin et al., 2023).
+
+### 2.2 Offloading
+
+Offload tham số chuyển giao các tham số mô hình từ bộ nhớ accelerator sang bộ lưu trữ chậm hơn nhưng rẻ hơn: thường là RAM hoặc SSD (Pudipeddi et al., 2020; Ren et al., 2021; Rajbhandari et al., 2021). Khi sử dụng mô hình, các tham số được tải lên accelerator đúng lúc để tính toán, một hoặc vài lớp một lần. Về nguyên tắc, phương pháp này cho phép chạy các mô hình lớn với một accelerator cấp thấp duy nhất miễn là có đủ RAM (hoặc SSD) để lưu trữ mô hình.
+
+Nhược điểm chính của chiến lược này là phải tải và dỡ qua tất cả các tham số mô hình cho mỗi forward và backward pass, điều này có thể tốn thời gian. Thời gian bổ sung này có thể được phân bổ trong các workload mà mô hình có thể thực hiện nhiều phép tính hữu ích cho mỗi lần tải tham số. Trong thực tế, việc sử dụng offload để chạy một token duy nhất qua OPT-175B trên một GPU trong kịch bản tốt nhất về phần cứng và băng thông² sẽ cần 11 giây mỗi forward pass, hoặc gấp đôi cho huấn luyện. Như chúng tôi chỉ ra trong Mục 4, hiệu suất thế giới thực chậm hơn đáng kể.
+
+Pudipeddi et al. (2020) khắc phục điều này bằng cách huấn luyện với các batch rất lớn, và do đó, tăng phép tính. Đổi lại, Ren et al. (2021); Rajbhandari et al. (2021) giảm overhead bằng cách chồng chéo truyền thông và tính toán, tức là thực hiện phép tính hữu ích cho lớp hiện tại trong khi chờ việc chuyển lớp tiếp theo hoàn thành. Một số hệ thống này Ren et al. (2021) cũng phân vùng các tham số được offload giữa các thiết bị. Tuy nhiên, không giống như huấn luyện song song mô hình, offload phân tán vẫn yêu cầu mỗi thiết bị tính toán toàn bộ mô hình.
+
+## 3 Phương pháp
+
+Việc sử dụng các mô hình ngôn ngữ lớn được huấn luyện trước cho các tác vụ NLP bao gồm hai workload chính: suy luận và tinh chỉnh. Workload suy luận thường bao gồm mã hóa một văn bản đầu vào, sau đó tạo sinh token tự hồi quy. Đổi lại, tinh chỉnh yêu cầu cập nhật tất cả các tham số của mô hình hoặc (phổ biến hơn đối với các mô hình lớn) một tập nhỏ các trọng số có thể huấn luyện (ví dụ, adapter hoặc soft prompt) bằng backpropagation. Hai workload này cũng bao gồm các trường hợp sử dụng nâng cao hơn:
+
+• Tạo prompt thủ công cho một tác vụ nhất định, sau đó triển khai mô hình với các prompt này.
+• Tinh chỉnh với adapter (Hu et al., 2021; Houlsby et al., 2019; Liu et al., 2022b) hoặc prompt "mềm" (Liu et al., 2021b; Lester et al., 2021; Liu et al., 2021a) và suy luận các mô hình được tinh chỉnh.
+• Chưng cất thành một mô hình nhỏ hơn dành riêng cho tác vụ để suy luận nhanh hơn (Schick & Schütze, 2021).
+
+Ngược lại với trực giác, chúng tôi phát hiện rằng suy luận thách thức hơn tinh chỉnh đối với các thiết lập hiệu quả về chi phí. Vì vậy, chúng tôi dành phần lớn mục này cho các vấn đề dành riêng cho suy luận. Đối với tinh chỉnh, chúng tôi mô tả một cách để hỗ trợ tinh chỉnh hiệu quả tham số tùy ý trong Mục 3.4.
+
+### 3.1 Nút thắt cổ chai hiệu suất của suy luận LLM
+
+Không giống như huấn luyện, suy luận LLM tự hồi quy không thể được thực hiện với một pass duy nhất qua mô hình. Thay vào đó, mô hình cần xử lý một token tại một thời điểm, truyền nó qua toàn bộ mô hình, sau đó tạo sinh token tiếp theo và lặp lại quá trình. Trong trường hợp song song mô hình, huấn luyện một mô hình n-lớp³ trên một chuỗi t token cần O(n) vòng truyền thông, trong khi tạo sinh cùng một chuỗi cần O(n·t) vòng, khiến nó nhạy cảm hơn với độ trễ mạng. Tương tự với offload tham số, tạo sinh một chuỗi t token cần tải mọi lớp t lần, điều này cũng mất O(n·t) thời gian.
+
+Vấn đề khác của tạo sinh tự hồi quy là xử lý attention cho các token trước (Vaswani et al., 2017). Trong bước suy luận t, mỗi lớp cần attend vào t−1 key và value attention trước đó. Các thuật toán suy luận hiện có lưu trữ các entry trước trong bộ nhớ accelerator. Việc cache các activation half-precision của một chuỗi 2048-token cho các mô hình lớn như GPT-3 (Brown et al., 2020) hoặc OPT-175B (Zhang et al., 2022) (với 96 lớp của 12288 đơn vị mỗi lớp) chiếm 9.6 GB bộ nhớ GPU cho mỗi chuỗi. Offload các giá trị được cache này gặp phải những vấn đề tương tự như offload nói chung.
+
+Một giải pháp thay thế là tính toán lại tất cả các token trước đó tại mỗi bước suy luận, chỉ lưu trữ một tập key & value tại một thời điểm. Tự nhiên, cách tiếp cận này cần ngày càng nhiều phép tính hơn với độ dài chuỗi t, tổng cộng O(t³) thời gian cho các mô hình dựa trên transformer⁴. Đáng ngạc nhiên, cách tiếp cận này thường hiệu quả hơn cache offload, đặc biệt là đối với các chuỗi ngắn hơn do overhead từ việc tải và lưu trữ cache từ RAM hoặc SSD.
+
+Offload tham số vẫn có thể hiệu quả khi tạo sinh số lượng lớn các chuỗi ngắn hàng loạt. Mỗi chuỗi riêng lẻ vẫn mất nhiều thời gian để tạo sinh, nhưng hệ thống duy trì thông lượng cao bằng cách chạy nhiều mẫu song song. Thật không may, kịch bản này không bao gồm nhiều trường hợp sử dụng LLM quan trọng. Ví dụ, nó không tương thích với học theo ngữ cảnh hoặc kỹ thuật prompt, nơi mô hình cần xử lý các chuỗi dài gồm các ví dụ huấn luyện (Brown et al., 2020). Quan trọng hơn, nó không hỗ trợ các ứng dụng "tương tác" nơi LLM cần phản hồi nhanh chóng với đầu vào của người dùng. Điều này loại bỏ nhiều ứng dụng LLM như hệ thống hội thoại hoặc hoàn thành đầu vào (ví dụ ChatGPT hoặc Smart Compose).
+
+Do đó, chúng tôi khám phá một giải pháp mới dựa trên pipeline-parallelism. Một dòng công việc liên quan (Aminabadi et al., 2022) nghiên cứu song song mô hình để suy luận LLM trong các GPU cluster. Tuy nhiên, cách tiếp cận của họ không áp dụng cho các thiết lập có giá cả phải chăng hơn của chúng tôi: các instance "preemptible" rẻ hoặc kết nối các tài nguyên hiện có qua Internet. Để hoạt động trong những điều kiện này, một thuật toán suy luận cần xử lý preemption node, lỗi mạng, và độ trễ cao.
+
+### 3.2 Tạo sinh phân tán với khả năng chịu lỗi
+
+Trong mục này, chúng tôi công thức hóa một thuật toán để suy luận LLM trong một đội tàu các thiết bị phân tán địa lý không đáng tin cậy được kết nối qua Internet. Mỗi thiết bị có thể hoạt động như một server, một client, hoặc cả hai.
+
+Một client là một node được vận hành bởi người dùng, chạy các công việc suy luận hoặc tinh chỉnh thông qua đàn server. Một client chỉ giữ các embedding đầu vào và đầu ra (<3% trọng số mô hình cho BLOOM-176B) và ủy thác việc chạy các transformer block (các phép tính đắt đỏ nhất) cho các server từ xa.
+
+Một server là một node có GPU giữ một tập các transformer block liên tiếp và xử lý các yêu cầu từ các client node.
+
+Để đơn giản, chúng tôi giả định rằng mỗi block được lưu trữ trên nhiều server và kiểm tra giả định này trong mục tiếp theo. Theo ký hiệu này, một thuật toán chịu lỗi nên cho phép mỗi client hoàn thành một công việc suy luận với kết quả có thể tái tạo ngay cả khi một số server từ xa bị lỗi trong quá trình suy luận.
+
+Như chúng tôi thảo luận trong Mục 3.1, tạo sinh tự hồi quy yêu cầu nhiều vòng truyền thông tuần tự, khiến nó nhạy cảm với độ trễ mạng. Tuy nhiên, nếu mỗi thiết bị lưu trữ cache attention trong quá khứ của nó, mỗi vòng chỉ chuyển các activation cho một token duy nhất, tức là vài kilobyte dữ liệu⁵. Chúng tôi sử dụng mô hình này để trực tiếp tối thiểu hóa thời gian suy luận trên các cấu hình pipeline có thể. Như chúng tôi chỉ ra sau trong Mục 4.2, điều này cho phép suy luận hiệu quả qua kết nối Internet băng thông thấp.
+
+Một vấn đề thách thức hơn là cách phục hồi từ lỗi node và mạng. Nếu một server từ xa tắt, bất kỳ key attention được cache nào được lưu trữ trên server đó sẽ bị mất cùng với nó. Có hai giải pháp ngây thơ cho vấn đề này: khởi động lại suy luận từ đầu hoặc tính toán lại các embedding trong quá khứ tại mỗi bước. Khởi động lại có thể đủ ở quy mô nhỏ. Tuy nhiên, chạy các mô hình 50B+ có thể liên quan đến nhiều thiết bị không đáng tin cậy, khiến việc tạo sinh chuỗi dài mà không có ít nhất một lỗi trở nên khó xảy ra. Đổi lại, tính toán lại cache attention trong quá khứ yêu cầu truyền thông các token trong quá khứ tại mỗi vòng truyền thông, dẫn đến tổng cộng O(n·t²) dữ liệu được chuyển, trong đó n là số lượng lớp pipeline và t là độ dài chuỗi. Nói cách khác, cả hai giải pháp này đều gặp khó khăn trong việc tạo sinh các chuỗi dài.
+
+Chúng tôi giải quyết vấn đề này bằng cách duy trì hai loại cache: cache phía server giữ các key và value attention trong quá khứ cho các lớp của chúng, như trong các thuật toán suy luận hiện có, trong khi cache phía client giữ các đầu vào trong quá khứ được gửi đến một giai đoạn pipeline nhất định⁶. Nếu một server ngắt kết nối, một client có thể tìm server khác với giai đoạn pipeline đó và sử dụng cache phía client để khôi phục trạng thái server.
+
+Thủ tục kết quả được mô tả trong Thuật toán 1. Đối với mỗi giai đoạn pipeline, client duy trì một heap (hàng đợi ưu tiên) của các server giữ giai đoạn này (và có thể giữ các giai đoạn bổ sung). Các server trong hàng đợi được sắp xếp theo độ trễ mạng, được đo từ truyền thông trong quá khứ. Các hàng đợi này được duy trì qua lifetime của một client. Để bắt đầu tạo sinh, client chạy một thủ tục giống beam-search để tìm một chuỗi server dẫn đến ít thời gian suy luận tổng thể nhất dưới mô hình hiệu suất của chúng tôi. Khi chạy các bước suy luận, một client theo dõi các activation trung gian được gửi giữa các giai đoạn pipeline. Nếu một server từ xa bị lỗi hoặc rời khỏi, client lấy server tốt nhất tiếp theo (hoặc nhiều server) và yêu cầu nó khôi phục trạng thái attention từ các activation được cache của client.
+
+Khi server bị lỗi, thuật toán cần gửi O(t) dữ liệu (trong một vòng) cho mỗi server bị lỗi và tính toán chỉ các giai đoạn được giữ bởi các server bị lỗi. Điều này có thể được xem như một phép nội suy giữa suy luận ngây thơ và có cache, tùy thuộc vào tỷ lệ lỗi server. Nếu không có server nào bị lỗi, chúng tôi phục hồi truyền thông O(n·t), tương tự như Aminabadi et al. (2022). Đổi lại, nếu tất cả server bị lỗi sau một bước, thuật toán thực sự thực hiện tạo sinh không cache, đây là tùy chọn tốt nhất trong kịch bản đó.
+
+Trong công thức cơ bản, tất cả truyền thông giữa các giai đoạn pipeline được định tuyến qua client, tức là client nhận đầu ra của mỗi giai đoạn pipeline, cache nó và gửi nó đến giai đoạn tiếp theo. Trong thực tế, việc để các giai đoạn pipeline truyền thông trực tiếp hiệu quả hơn: một khi server có được các activation đầu ra, nó gửi chúng đến cả client và giai đoạn tiếp theo. Điều này giảm tổng thời gian bước vì cả hai thông điệp đều có kích thước vài kilobyte và có thể được gửi song song. Để xác minh rằng cả client và giai đoạn pipeline tiếp theo đều nhận được cùng một tập activation, chúng có thể xác minh checksum (tức là giá trị hash) của các activation nhận được một cách bất đồng bộ, không chặn phép tính.
+
+Thuật toán 1 có thể hỗ trợ suy luận greedy hoặc bất kỳ biến thể sampling nào (bao gồm Holtzman et al. (2020)). Tuy nhiên, nó yêu cầu thêm một bước để hỗ trợ các thuật toán dựa trên tìm kiếm như beam search: sắp xếp lại cache. Điều này cho phép client tạo sinh nhiều tiếp tục của cùng một tiền tố đầu vào bằng cách nhân bản cache attention của nó và bỏ các giả thuyết ít khả năng hơn. Chúng tôi mô tả beam search trong Phụ lục C.
+
+**Định tuyến đường đi ngắn nhất.** Trong Thuật toán 1, hàm find_best_chain (dòng 4) chọn một chuỗi server có thể chạy các lớp yêu cầu trong ít thời gian nhất. Để ước lượng thời gian này, chúng tôi cộng hai yếu tố: thời gian tính toán, được xác định bởi thông lượng tính toán của server ("tốc độ GPU") và độ trễ mạng giữa client và server đó. Các server đo thông lượng tính toán của riêng chúng và chia sẻ thông tin này với các client. Đổi lại, các client đo độ trễ mạng giữa chúng và một server nhất định bằng cách "ping" các server ứng viên trong quá trình định tuyến. Nếu một server chạy nhiều block liên tiếp, chúng tôi nhân thời gian tính toán với số lượng block.
+
+Để tìm chuỗi server tốt nhất, các client tìm đường đi ngắn nhất giữa block đầu tiên và cuối cùng, sử dụng một đồ thị nơi trọng số cạnh tương ứng với thời gian suy luận server, như được mô tả trong đoạn trước. Để tối thiểu hóa overhead, chúng tôi không chạy pathfinding từ đầu tại mỗi lần gọi find_best_chain. Thay vào đó, các client chạy pathfinding suốt đời trong nền và tái sử dụng nó giữa các lần gọi suy luận. Cụ thể hơn, chúng tôi sử dụng thuật toán D*Lite (Koenig & Likhachev, 2005) vì nó cho phép các client nhanh chóng điều chỉnh đường đi sau khi một server bị cấm hoặc rời khỏi mạng.
+
+**Thuật toán 1** Tạo sinh chuỗi, mã phía client
+```
+Đầu vào: prefix_tokens, embeddings, known_servers
+1: generated_sequence = list()
+2: cache = dictionary()
+3: streams = dictionary()
+4: chain = find_best_chain(known_servers)
+5: for server ∈ chain do
+6:     streams[server] = rpc_inference(server)
+7:     cache[server] = list()
+8: end for
+9:
+10: inputs = embeddings(prefix_tokens)
+11: while should_continue(generated_sequence) do
+12:     tail_servers = copy(chain)
+13:     while not empty(tail_servers) do
+14:         server = tail_servers.pop_left()
+15:         try:
+16:             ▷ Thử suy luận bình thường
+17:             outputs = streams[server].send(inputs)
+18:             cache[server].append(inputs)
+19:             inputs = outputs
+20:         catch ServerFailed:
+21:             ▷ Thay thế server bị lỗi
+22:             streams.pop(server).close()
+23:             past_inputs = cache.pop(server)
+24:             new_servers = replace_failed_server(
+25:                 server, past_inputs, cache,
+26:                 streams, known_servers)
+27:             chain.replace(server, new_servers)
+28:             tail_servers.push_left(new_servers)
+29:     end while
+30:
+31:     logits = compute_logits(outputs, embeddings)
+32:     next_token = choose_next(logits) {ví dụ greedy}
+33:     generated_sequence.append(next_token)
+34:     inputs = embeddings(next_token)
+35: end while
+36:
+37: for server ∈ chain do
+38:     streams[server].close()
+39: end for
+40: return generated_sequence
+```
+
+**Thuật toán 2** rpc_inference(server)
+```
+Đầu vào: local_layers, stream
+1: cache = dictionary()
+2: for layer ∈ local_layers do
+3:     cache[layer] = make_empty()
+4: end for
+5: while not stream.closed() do
+6:     inputs = stream.receive()
+7:     for layer ∈ local_layers do
+8:         past_kv = cache[layer]
+9:         inputs, new_kv = forward(
+10:             layer, inputs, past_kv)
+11:         cache[layer].append(new_kv)
+12:     end for
+13:     stream.send(inputs)
+14: end while
+```
+
+**Thuật toán 3** replace_failed_server(...)
+```
+Đầu vào: server, inputs, cache, streams, known_servers
+1: known_servers.ban(server)
+2: missing_layers = get_layers(server)
+3: chains = select_by_layer(
+4:     known_servers, missing_layers)
+5: chain = find_best_chain(chains)
+6: replacements = list()
+7: while not empty(chain) do
+8:     s = chain.pop_left()
+9:     try:
+10:         streams[s] = rpc_inference(s)
+11:         outputs = streams[s].send(inputs)
+12:         replacements.append(s)
+13:         cache[s] = inputs
+14:         missing_layers.pop(get_layers(s))
+15:         inputs = outputs
+16:     catch FailedRPC:
+17:         known_servers.ban(s)
+18:         chains = select_by_layer(
+19:             chains, missing_layers)
+20:         chain = find_best_chain(chains)
+21: end while
+22: return chain
+```
+
+### 3.3 Cân bằng tải tự động
+
+Để chạy suy luận hoặc tinh chỉnh, mỗi server cần được gán cho một giai đoạn pipeline, sau đó được gán lại nếu các server khác tham gia hoặc rời khỏi mạng. Ví dụ, nếu chúng tôi triển khai một LLM trên các tài nguyên tính toán nhàn rỗi từ nhiều trung tâm dữ liệu hoặc phòng thí nghiệm, số lượng người tham gia có thể thay đổi theo thời gian dựa trên nhu cầu. Hơn nữa, các server có thể có thông lượng tính toán, băng thông mạng và vị trí địa lý khác nhau. Để hoạt động hiệu quả trong những điều kiện này, các server nên tự động chọn lớp mô hình nào chúng nên phục vụ trong một tình huống nhất định.
+
+Vì vậy, các server định kỳ chạy một thủ tục cân bằng tải và chuyển sang các block mới nếu cần thiết. Chính thức, các server chọn block để tối đa hóa thông lượng tổng thể của hệ thống (token mỗi giây). Mỗi server định kỳ thông báo các block của nó và thông lượng được đo thực nghiệm đến một bảng băm phân tán (Maymounkov & Mazieres, 2002). Khi một server mới tham gia, nó sử dụng thông tin này để xác định một khoảng liên tiếp⁷ của các block sẽ tăng thông lượng tổng thể của hệ thống nhiều nhất.
+
+Vì các peer có thể rời khỏi hoặc bị lỗi bất cứ lúc nào, tất cả các node định kỳ kiểm tra xem việc khởi chạy một thủ tục cân bằng lại có cải thiện đáng kể thông lượng tổng thể hay không. Nếu đúng như vậy, chúng chuyển đổi lớp cho đến khi thông lượng gần tối ưu. Đặc biệt, nếu tất cả các peer phục vụ các block nhất định đột nhiên rời khỏi hệ thống, thủ tục này nhanh chóng phân phối lại các tài nguyên còn lại để đóng các khoảng trống xuất hiện.
+
+Chúng tôi cung cấp mô tả chi tiết về các thuật toán cân bằng tải trong Phụ lục D và xác thực các thuộc tính của chúng trong các thí nghiệm được báo cáo trong Phụ lục E.
+
+### 3.4 Tinh chỉnh hiệu quả tham số
+
+Trong khi LLM đạt được chất lượng cao trên nhiều vấn đề với kỹ thuật prompt engineering đơn giản (Brown et al., 2020), chúng thường cần huấn luyện để đạt được kết quả tốt nhất. Truyền thống, điều này được thực hiện bằng cách tinh chỉnh tất cả các tham số mô hình trên tác vụ downstream. Tuy nhiên, đối với các mô hình cực lớn, chiến lược này trở nên không thực tế do yêu cầu phần cứng. Ví dụ, tinh chỉnh BLOOM-176B với Adam sẽ cần gần 3 TB bộ nhớ GPU để lưu trữ mô hình, gradient và trạng thái optimizer.
+
+May mắn thay, các phương pháp tinh chỉnh hiệu quả tham số đã được phát triển để giữ hầu hết mô hình được huấn luyện trước nguyên vẹn. Một số trong số chúng chọn một tập con các tham số hiện có để cập nhật (Sung et al., 2021; Guo et al., 2021) trong khi những phương pháp khác tăng cường mô hình với các trọng số có thể huấn luyện bổ sung (Hu et al., 2021; Houlsby et al., 2019; Liu et al., 2021b; Lester et al., 2021; Liu et al., 2021a, 2022b). Mặc dù có yêu cầu bộ nhớ thấp hơn, các cách tiếp cận hiệu quả tham số thường cạnh tranh với việc tinh chỉnh mô hình đầy đủ (Hu et al., 2021; Liu et al., 2021a; Yong & Nikoulina, 2022) và thậm chí vượt trội hơn trong các chế độ dữ liệu thấp (Liu et al., 2022a). Một thuộc tính hấp dẫn khác của các cách tiếp cận này cho trường hợp sử dụng của chúng tôi là chúng cho phép nhanh chóng chuyển đổi LLM được huấn luyện trước giữa các adapter.
+
+Bằng cách tập trung vào tinh chỉnh hiệu quả tham số, chúng tôi có thể đơn giản hóa thiết kế hệ thống bằng cách làm cho các client chịu trách nhiệm lưu trữ các tham số có thể huấn luyện của chúng (xem Hình 1). Các server có thể chạy backpropagation qua các lớp của chúng và trả về gradient đối với các activation, nhưng chúng không cập nhật các tham số phía server. Ngay cả khi client truyền thông các giá trị đã học (ví dụ soft prompt) đến một server, server xử lý các giá trị này giống như các activation đầu vào. Do đó, một server có thể đồng thời chạy các tác vụ tinh chỉnh khác nhau mà không can thiệp lẫn nhau. Lựa chọn thiết kế này cũng cho phép người dùng định nghĩa các adapter tùy chỉnh trong PyTorch đơn giản mà không cần chuyên môn kỹ thuật mạng.
+
+Không giống như suy luận, các forward và backward pass tinh chỉnh xử lý toàn bộ batch cùng một lúc và không cần lưu trữ cache attention trong quá khứ giữa các yêu cầu client liên tiếp. Do đó, trong trường hợp lỗi, chúng tôi có thể loại bỏ forward/backward pass không hoàn chỉnh và chỉ lặp lại yêu cầu forward/backward pass trước đó. Thuật toán này hoạt động tương tự như baseline không cache từ Mục 4.1.
+
+### 3.5 Chi tiết triển khai
+
+Vì trường hợp sử dụng chính dự định của chúng tôi là chạy trên các thiết bị cấp thấp không đắt, chúng tôi cần làm việc xung quanh khả năng của chúng. Về mặt FLOP thô, ngay cả GPU tiêu dùng như GeForce RTX 3070 có thể chạy một bước suy luận hoàn chỉnh của BLOOM-176B trong chưa đến một giây (NVIDIA, 2020). Tuy nhiên, bộ nhớ GPU chỉ có thể giữ một phần nhỏ các lớp mô hình: chạy một cách ngây thơ sẽ cần 44 GPU RTX 3070 và 44 vòng truyền thông. Để làm điều này hiệu quả hơn, chúng tôi sử dụng quantization để lưu trữ nhiều tham số hơn mỗi GPU, giảm số lượng thiết bị liên tiếp và vòng truyền thông.
+
+Một tùy chọn cho quantization là sử dụng phân tích ma trận hỗn hợp 8-bit cho phép nhân ma trận để quantize trọng số thành độ chính xác 8-bit và giảm dung lượng bộ nhớ so với trọng số 16-bit, như được đề xuất trong Dettmers et al. (2022a). Phép phân tích này tách các hidden state và trọng số thành hai phần: khoảng 0.1% giá trị outlier 16-bit và 99.9% giá trị thông thường 8-bit, điều này roughly giảm một nửa dung lượng bộ nhớ với tác động không đáng kể đến chất lượng mô hình (xem đánh giá trong Phụ lục A). Một tùy chọn khác là sử dụng định dạng NormalFloat 4-bit (Dettmers et al., 2023).
+
+Để gửi ít dữ liệu hơn giữa các giai đoạn pipeline liên tiếp, chúng tôi áp dụng quantization blockwise động (Dettmers et al., 2022b) cho các hidden state trước khi truyền thông pipeline-parallel, điều này giảm một nửa yêu cầu băng thông mà không có tác động đáng chú ý nào đến chất lượng tạo sinh (Ryabinin et al., 2023).
+
+Trong quá trình tinh chỉnh, chúng tôi cũng tận dụng gradient checkpointing (Griewank & Walther, 2000; Chen et al., 2016) và half precision để giảm sử dụng VRAM - cả hai đều là thực hành tiêu chuẩn cho các mô hình ngôn ngữ lớn (Narayanan et al., 2021; Brown et al., 2020; Athlur et al., 2022). Trong các thí nghiệm, chúng tôi áp dụng các tối ưu hóa tương tự cho các hệ thống baseline để so sánh công bằng.
+
+## 4 Thí nghiệm
+
+### 4.1 Suy luận với server không đáng tin cậy
+
+Đầu tiên, chúng tôi tiến hành các thí nghiệm sơ bộ quy mô nhỏ để kiểm tra thuật toán tạo sinh chịu lỗi được mô tả trong Mục 3.2. Đối với các thí nghiệm này, chúng tôi sử dụng một mô hình BLOOM nhỏ hơn với 7.1 tỷ tham số (BigScience, 2022b). Mô hình này chứa 30 transformer block với hidden size 4096. Chúng tôi so sánh thuật toán của chúng tôi với các baseline khi tạo sinh một chuỗi duy nhất có độ dài 512. Để đơn giản, chúng tôi chạy tất cả các phép tính và truyền thông ở độ chính xác đơn và bỏ qua word embedding và logit cho tập thí nghiệm này. Chúng tôi đo thời gian để chạy một số lượng nhất định token qua tất cả các block và mô phỏng lỗi bằng cách reset các giai đoạn pipeline với tỷ lệ nhất định.
+
+Chúng tôi so sánh ba chiến lược suy luận:
+
+1. **Caching với khởi động lại**, đề cập đến suy luận tiêu chuẩn với các server lưu trữ cache attention. Khi lỗi, nó khởi động lại toàn bộ tạo sinh từ đầu vì cache của server bị lỗi bị mất.
+
+2. **Suy luận không cache**, chạy lại các token trong quá khứ tại mỗi bước. Khi lỗi, nó chỉ khởi động lại bước tạo sinh cuối cùng.
+
+3. **Thuật toán 1**, được thiết kế đặc biệt cho suy luận chịu lỗi.
+
+Tất cả các lần chạy sử dụng bốn giai đoạn pipeline với (8, 7, 8, 7) lớp mô hình mỗi giai đoạn pipeline. Mỗi giai đoạn pipeline được phục vụ bởi một GPU GeForce 1080 Ti duy nhất; bốn GPU chạy trong một hệ thống duy nhất với CPU Xeon Gold 6148 kép, 12 thanh DDR4 LRDIMM với 64 GB mỗi thanh. Hệ thống có 16 lane PCIe Gen. 3 chuyên dụng mỗi GPU trong cấu hình dual root, không sử dụng switch PCIe. Mỗi giai đoạn chạy trong các container Docker riêng biệt với giao diện mạng ảo, nhưng không có giới hạn băng thông truyền thông cho thí nghiệm này. Chúng tôi lặp lại tất cả các thí nghiệm 50 lần và báo cáo thời gian trung bình. Độ lệch chuẩn điều chỉnh không bao giờ vượt quá 0.2%. Chúng tôi sử dụng triển khai pipeline parallelism từ Megatron-DeepSpeed (BigScience et al., 2022) cho baseline không cache.
+
+Chúng tôi báo cáo các đo lường hiệu suất trong Bảng 1. Không giống như các baseline, thuật toán của chúng tôi cung cấp hiệu suất hợp lý trong tất cả các điều kiện được thử nghiệm, đặc biệt là đối với tỷ lệ lỗi cao hơn (phổ biến cho việc truyền thông qua Internet, sử dụng các instance spot/preemptible hoặc phần cứng không đáng tin cậy). Caching với khởi động lại hiệu quả nhất cho suy luận không có lỗi, với thuật toán của chúng tôi hơi chậm hơn do triển khai kém trưởng thành hơn. Cuối cùng, suy luận không cache có thể cạnh tranh cho các chuỗi ngắn (128 token), nhưng chậm lại đáng kể trên 1024 token, điều này phù hợp với trực giác của chúng tôi từ 3.1.
+
+Chúng tôi cung cấp các biểu đồ hiển thị các đánh giá bổ sung cho một phạm vi rộng hơn của tỷ lệ lỗi (lên đến 5%) và độ dài chuỗi (lên đến 2048 token) trong Phụ lục F (Hình 3).
+
+**Bảng 1:** Tốc độ suy luận tuần tự (bước/giây) của BLOOM (7.1B) với tỷ lệ lỗi khác nhau. Tỷ lệ lỗi p có nghĩa là việc gửi bất kỳ tập activation nào đến giai đoạn tiếp theo của pipeline bị lỗi với xác suất p. Giá trị thiếu có nghĩa là thuật toán không hoàn thành trong vòng 1 giờ.
+
+| Thuật toán suy luận | 128 token, tỷ lệ lỗi: | | | | 1024 token, tỷ lệ lỗi: | | | |
+|---------------------|------|------|------|------|------|------|------|------|
+| | 0 | 1e-4 | 1e-3 | 1e-2 | 0 | 1e-4 | 1e-3 | 1e-2 |
+| Caching với khởi động lại | 17.1 | 16.7 | 12 | 0.18 | 15.5 | 11.8 | 0.48 | – |
+| Suy luận không cache | 3.44 | 3.44 | 3.44 | 3.44 | 0.89 | 0.89 | 0.89 | 0.89 |
+| Thuật toán 1 (của chúng tôi) | 11.4 | 11.4 | 10.6 | 3.38 | 10.7 | 10.7 | 7.76 | 2.17 |
+
+### 4.2 Thí nghiệm cho Llama 2 (70B) và BLOOM (176B)
+
+Trong mục này, chúng tôi đánh giá hệ thống của chúng tôi trên các tác vụ thực tế hơn là chạy Llama 2 (70B) (Touvron et al., 2023b) và BLOOM (176B) (BigScience, 2022a). Đầu tiên, chúng tôi xem xét các server chạy trong mạng với băng thông và độ trễ được kiểm soát⁸. Chúng tôi đo hiệu suất cho (a) Llama 2 phân tán trên 3 server với GPU T4 mỗi server, (b) BLOOM phân tán trên 3 server với GPU A100 (80 GB) mỗi server, và (c) BLOOM phân tán trên 10 server với GPU RTX 3090 mỗi server. Chúng tôi sử dụng quantization NormalFloat 4-bit (Dettmers et al., 2023) cho Llama 2 và phân tích ma trận 8-bit (Dettmers et al., 2022a) cho BLOOM trong tất cả các đánh giá bao gồm cả các baseline dưới đây.
+
+Chúng tôi báo cáo hiệu suất của:
+• **Suy luận tuần tự (tự hồi quy)** cho batch size 1 (tức là mỗi bước tạo sinh 1 token). Nó được đo bằng bước tạo sinh mỗi giây mà một client có thể thực hiện và cho thấy độ trễ tạo sinh.
+• **Forward pass song song** cho batch gồm 128 chuỗi token⁹. Nó được đo bằng token mỗi giây mà một client có thể xử lý. Điều này cho thấy thông lượng của hệ thống trong quá trình xử lý batch và tinh chỉnh.
+
+Vì hiệu suất backward pass phụ thuộc vào một tập trọng số có thể huấn luyện, batch size, và các siêu tham số khác, chúng tôi báo cáo hiệu suất của nó trong các thiết lập khác nhau riêng biệt trong Phụ lục G.
+
+**Client đồng thời.** Chúng tôi cũng điều tra tác động của việc có các client đồng thời. Chúng tôi giả định rằng mỗi server thuộc về một người khác nhau, và nhiều người (có thể, tất cả họ) quan tâm đến việc chạy suy luận hoặc tinh chỉnh cùng một lúc. Để làm điều đó, họ chạy client tương tác với hệ thống phân tán của chúng tôi. Client chạy trên cùng một máy, sử dụng 8 lõi CPU và không có GPU. Chúng tôi báo cáo tốc độ suy luận tuần tự và forward pass song song mà mỗi client nhận được trung bình.
+
+**Baseline offloading.** Chúng tôi cũng đánh giá offload tham số, nơi mỗi người dùng chạy độc lập trên một GPU duy nhất, swap tham số từ bộ nhớ CPU. Đầu tiên, chúng tôi báo cáo thông lượng thực tế của RAM offloading trong trường hợp DeepSpeed với các tham số được khuyến nghị mặc định và bật pin_memory (cho tăng tốc 1.2−2×). Tiếp theo, chúng tôi báo cáo thông lượng tốt nhất về mặt lý thuyết mà baseline offloading có thể đạt được cho BLOOM. Nó được tính như một thông lượng tối đa trong thiết lập phần cứng tốt nhất có thể (CPU RAM offloading qua PCIe 4.0 với 16 lane PCIe), giả định hiệu suất GPU vô hạn. Các tính toán được chi tiết trong Phụ lục B.
+
+**Pipeline parallelism cục bộ (NVLink).** Tiếp theo, chúng tôi báo cáo hiệu suất cho BLOOM chạy trên một server với 3 × A100 (80 GB) GPU. Trong thiết lập này, một server duy nhất có đủ bộ nhớ GPU để tải toàn bộ mô hình, điều này cung cấp một giới hạn trên cho hiệu suất có thể đạt được với những GPU này. Thiết lập này chạy pipeline-parallelism từ DeepSpeed v0.7.7.
+
+**Server không đồng nhất.** Để xác thực rằng hệ thống của chúng tôi hoạt động trên phần cứng không đồng nhất, chúng tôi mô phỏng 12 thiết bị không đồng nhất bằng cách phân vùng mỗi A100 (80 GB) thành một số server ảo (3 lớn và 1 nhỏ). Chúng tôi có 9 server lưu trữ 7 block mỗi server, một server với 3 block và hai server khác với 2 block (tổng cộng 70 block, như yêu cầu cho BLOOM). Ngoài ra, chúng tôi đánh giá hệ thống trên GPU không đồng nhất thực với khả năng tính toán đa dạng trong "Thiết lập thế giới thực" bên dưới.
+
+**Thiết lập thế giới thực.** Cuối cùng, chúng tôi đánh giá BLOOM trong thiết lập thế giới thực với 14 server nhỏ hơn giữ 2 × RTX 3060, 4 × 2080Ti, 2 × 3090, 2 × A4000, và 4 × A5000 GPU. Đây là các server cá nhân và server từ các phòng thí nghiệm đại học, trải rộng khắp châu Âu và Bắc Mỹ và được kết nối với Internet với tốc độ 100–1000 Mbit/s. Bốn trong số các server hoạt động từ đằng sau tường lửa¹⁰.
+
+**Phân tích.** Chúng tôi báo cáo kết quả cho Llama 2 trong Bảng 2 và cho BLOOM trong Bảng 3. Đối với suy luận, hiệu suất không phụ thuộc nhiều vào băng thông hoặc độ dài chuỗi nhưng giảm với độ trễ cao hơn. Đổi lại, forward pass tinh chỉnh cho batch lớn bị ảnh hưởng bởi cả băng thông và độ trễ.
+
+Chúng tôi có thể thấy rằng baseline offloading chậm hơn khoảng một bậc độ lớn so với hệ thống của chúng tôi cho suy luận, cả trong thực tế và trong thiết lập tốt nhất về mặt lý thuyết giả định hiệu suất GPU vô hạn. Đối với forward pass song song, offloading có thể cạnh tranh nếu mạng bị giới hạn ở 100 Mbit/s hoặc có độ trễ cao. Trong các trường hợp khác, thuật toán của chúng tôi cung cấp thông lượng cao hơn offloading cho huấn luyện.
+
+Quan trọng, hệ thống của chúng tôi vượt trội đáng kể so với offloading ngay cả khi mỗi node GPU chạy client riêng của nó thực hiện suy luận single-batch cùng lúc. Do đó, với cùng một phần cứng, một nhóm nghiên cứu viên sẽ có tốc độ suy luận tốt hơn nhiều bằng cách hợp tác qua Internet sử dụng hệ thống của chúng tôi so với mỗi người trong số họ chạy offloading độc lập.
+
+Cuối cùng, thiết lập thế giới thực hóa ra chậm hơn so với các benchmark A100 do phần cứng chậm hơn. Tuy nhiên, thuật toán của chúng tôi vẫn vượt trội hơn offloading ngay cả khi truyền thông giữa các châu lục khác nhau.
+
+**Thí nghiệm bổ sung.** Chúng tôi tiến hành hai thí nghiệm bổ sung để kiểm tra các thành phần riêng lẻ của hệ thống. Chúng tôi đánh giá cân bằng tải từ 3.3 một cách riêng biệt trong Phụ lục E. Chúng tôi cũng đánh giá hiệu suất nén mô hình từ Mục 3.5 trong Phụ lục A. Để nhắc lại, đối với mỗi mô hình, chúng tôi sử dụng cùng một chiến lược nén trong hệ thống của chúng tôi và tất cả các baseline. Cuối cùng, chúng tôi thực hiện đánh giá định tính về khả năng chịu lỗi bằng cách tắt các server ngẫu nhiên trong quá trình suy luận và tinh chỉnh để xác minh rằng thuật toán tạo ra các đầu ra và gradient chính xác.
+
+**Bảng 2:** Hiệu suất của các bước suy luận tuần tự và forward pass song song Llama 2 (70B). Các tham số mạng đề cập đến băng thông hai chiều và độ trễ khứ hồi (RTT).
+
+| GPU | Client | Băng thông | RTT | Suy luận tuần tự (bước/s, mỗi client) | Forward pass song song (token/s, mỗi client) |
+|-----|--------|------------|-----|---------------------------------------|---------------------------------------------|
+| | | | | Độ dài chuỗi | Kích thước batch |
+| | | | | 128 | 2048 | 1 ×128 | 64 ×128 |
+| 3×T4 (16 GB) | 1 | 1 Gbit/s | < 5 ms | 2.29 | 2.02 | 45.4 | 155.1 |
+| | 1 | 100 Mbit/s | < 5 ms | 2.29 | 2.01 | 37.5 | 140.2 |
+| | 1 | 100 Mbit/s | 100 ms | 1.57 | 1.44 | 23.7 | 128.7 |
+| | 3 | 1 Gbit/s | < 5 ms | 2.02 | 1.74 | 21.2 | 124.2 |
+| | – | Offloading | | 0.139 | 0.139 | 18.0 | 139.9 |
+
+**Bảng 3:** Hiệu suất của các bước suy luận tuần tự và forward pass song song BLOOM (176B).
+
+| GPU | Client | Băng thông | RTT | Suy luận tuần tự (bước/s, mỗi client) | Forward pass song song (token/s, mỗi client) |
+|-----|--------|------------|-----|---------------------------------------|---------------------------------------------|
+| | | | | Độ dài chuỗi | Kích thước batch |
+| | | | | 128 | 2048 | 1 ×128 | 64 ×128 |
+| 3×A100 (80 GB) | 1 | 1 Gbit/s | < 5 ms | 1.71 | 1.54 | 70.0 | 253.6 |
+| | 1 | 100 Mbit/s | < 5 ms | 1.66 | 1.49 | 56.4 | 182.0 |
+| | 1 | 100 Mbit/s | 100 ms | 1.23 | 1.11 | 19.7 | 112.2 |
+| | 3 | 1 Gbit/s | < 5 ms | 1.65 | 1.49 | – | – |
+| | – | Offloading | | 0.0495 | 0.0495 | 2.5 | 152.4 |
+| | – | Local PP (NVLink) | | 2.46 | 2.28 | 98.4 | 279.5 |
+| | 1 | 1 Gbit/s | < 5 ms | 1.65 | 1.54 | 59.1 | 230.1 |
+| | 3 | 1 Gbit/s | < 5 ms | 1.65 | 1.54 | 54.7 | 221.4 |
+| 10×RTX 3090 (24 GB) | 10 | 1 Gbit/s | < 5 ms | 1.17 | 1.01 | 31.0 | 131.0 |
+| | 10 | 100 Mbit/s | < 5 ms | 1.05 | 0.99 | 20.1 | 28.1 |
+| | 10 | 100 Mbit/s | 100 ms | 0.34 | 0.33 | 6.5 | 16.8 |
+| | – | Offloading | | 0.0427 | 0.0427 | 2.2 | 109.3 |
+| | 1 | 1 Gbit/s | < 5 ms | 1.24 | 1.06 | 37.9 | 180.0 |
+| 12×không đồng nhất (server ảo) | 1 | 100 Mbit/s | < 5 ms | 1.24 | 1.05 | 25.6 | 66.0 |
+| | 1 | 100 Mbit/s | 100 ms | 0.57 | 0.53 | 5.8 | 44.3 |
+| | 12 | 1 Gbit/s | < 5 ms | 0.90 | 0.86 | – | – |
+| 14×không đồng nhất | 1 | Thiết lập thế giới thực | | 0.83 | 0.79 | 32.6 | 179.4 |
+| Tốt nhất về lý thuyết | – | Offloading | | 0.18 | 0.18 | 2.7 | 170.3 |
+
+## 5 Kết luận
+
+Trong bài báo này, chúng tôi đã giới thiệu một thuật toán chịu lỗi mới để suy luận các mô hình ngôn ngữ lớn. Dựa trên đó, chúng tôi giới thiệu một hệ thống phi tập trung để chạy LLM trên các thiết bị phân tán không đáng tin cậy được kết nối qua Internet, vượt trội đáng kể so với các cách tiếp cận khác để chạy suy luận trên phần cứng tiêu dùng. Chúng tôi đã chứng minh rằng hệ thống được đề xuất có thể mở rộng đến mô hình ngôn ngữ lớn nhất có sẵn công khai với hàng trăm tỷ tham số có thể huấn luyện.
+
+Trong khi công việc của chúng tôi tập trung vào các khía cạnh kỹ thuật, điều quan trọng là phải xem xét các hạn chế của cách tiếp cận của chúng tôi, chẳng hạn như quyền riêng tư của dữ liệu được xử lý bởi các peer bên ngoài, cũng như tác động rộng lớn hơn của việc làm cho LLM dễ tiếp cận hơn. Chúng tôi thảo luận về những vấn đề này và phác thảo các hướng cho công việc tương lai trong Phụ lục H.
+
+## Tài liệu tham khảo
+
+[Các tài liệu tham khảo được liệt kê theo định dạng gốc, bao gồm các tác giả, tiêu đề, năm xuất bản và thông tin xuất bản khác]
+
+## Phụ lục
+
+### A Chất lượng và hiệu quả của BLOOM với quantization 8-bit
+
+Như được hiển thị trong Bảng 4, phương pháp này có ít tác động đến chất lượng LLM đối với các benchmark chính. Về mặt thời gian suy luận, Bảng 5 chứng minh rằng quantization có khoảng 5% overhead với batch size 1 (20 token), nhưng trở nên không đáng kể đối với batch lớn hơn.
+
+### B Ước tính thông lượng tốt nhất về lý thuyết với RAM offloading
+
+Trong ước tính này, chúng tôi sử dụng thiết lập phần cứng tốt nhất có thể cho offloading: CPU RAM offloading qua PCIe 4.0 với 16 lane PCIe mỗi GPU. Ở 8-bit, mô hình sử dụng 1 GB bộ nhớ mỗi tỷ tham số, và PCIe 4.0 với 16 lane có thông lượng 256 Gbit/s. Chúng tôi giả định độ trễ offloading bằng không trong ước tính giới hạn trên. Như vậy, offloading 176B tham số mất ít nhất:
+
+176GB·8 / 256Gbit/s = 5.5 giây
+
+Điều này cho giới hạn trên là 1/5.5 ≈ 0.18 token/s cho tốc độ suy luận.
+
+### C Mở rộng cho các thuật toán beam search
+
+Có một số biến thể của thuật toán beam-search được sử dụng cho suy luận mô hình ngôn ngữ, bao gồm beam search tiêu chuẩn, diverse beam search, constrained beam search, và nhiều hơn nữa. Một chủ đề chung giữa các thuật toán đó là chúng duy trì một số k cố định các chuỗi ứng viên giữa các bước. Các chuỗi này được gọi không chính thức là "beam". Tại mỗi bước, các thuật toán này tạo sinh các tiếp tục có thể của các chuỗi trong beam trước đó, sau đó sử dụng một số tiêu chí fitness để chọn k trong số các tiếp tục này cho beam tiếp theo.
+
+Từ góc độ tính toán, thủ tục này tương tự như suy luận "greedy" đơn giản với một batch k chuỗi. Tuy nhiên, có một sự khác biệt quan trọng: không giống như suy luận batch, các thuật toán beam search có thể "xáo trộn" các chuỗi ứng viên giữa các bước. Nói cách khác, chuỗi tốt thứ 3 từ bước thời gian t có thể tạo ra chuỗi thứ 1 hoặc thứ 2 (hoặc bất kỳ chuỗi nào khác) ở bước tiếp theo. Hơn nữa, một chuỗi duy nhất tại bước thời gian t có thể tạo ra nhiều chuỗi được chọn cho bước t + 1.
+
+Vì các biến thể beam search khác nhau sử dụng các tiêu chí khác nhau để chọn các chuỗi hàng đầu, chúng tôi cần một thuật toán chung có thể phù hợp với bất kỳ tiêu chí nào. Trong hệ thống của chúng tôi, chúng tôi triển khai điều này bằng cách cho phép các client sắp xếp lại cache attention phía server sau mỗi bước. Chính thức, một client có thể gửi một danh sách tối đa k số nguyên trong phạm vi [1, k], trong đó chỉ số thứ i chỉ định cache attention trước đó nào nên được sử dụng khi tạo sinh chuỗi thứ i của beam tiếp theo.
+
+Ví dụ, khi được cho các chỉ số [2,2,1,3,2], một server sẽ sử dụng chuỗi tốt thứ 2 từ bước t để tạo ra chuỗi tốt mới thứ 1, thứ 3 và thứ 5. Chuỗi tốt thứ 1 và thứ 3 trước đó chuyển đến vị trí thứ 3 và thứ 4, tương ứng. Cuối cùng, chuỗi thứ 4 và thứ 5 trước đó bị loại bỏ. Từ góc độ kỹ thuật, các server triển khai việc sắp xếp lại này bằng cách sắp xếp lại cache attention với các chỉ số được chỉ định (thao tác torch.gather) ngay trước khi thực hiện một bước suy luận.
+
+**Bảng 4:** Độ chính xác zero-shot cho BLOOM-176B và OPT-175B với trọng số 8-bit và 16-bit.
+
+| Mô hình | Bit | HellaSwag | LAMBADA | WinoGrande | Trung bình |
+|---------|-----|-----------|---------|------------|------------|
+| BLOOM   | 16  | 73.0      | 67.2    | 70.1       | 70.1       |
+|         | 8   | 72.8      | 68.1    | 70.1       | 70.3       |
+| OPT     | 16  | 78.5      | 74.7    | 72.6       | 75.3       |
+|         | 8   | 78.5      | 74.6    | 71.7       | 74.9       |
+
+**Bảng 5:** Thông lượng tạo sinh (token/s) cho BLOOM-176B với trọng số 8-bit và 16-bit trên 8 × A100 GPU.
+
+| Trọng số | Kích thước batch |
+|----------|------------------|
+|          | 1    | 8    | 32   |
+| 16-bit   | 4.18 | 31.3 | 100.6|
+| 8-bit    | 3.95 | 29.4 | 95.8 |
+
+### D Chi tiết của các thuật toán cân bằng tải server
+
+**Đo thông lượng.** Trước khi tham gia lần đầu tiên, mỗi server đo thông lượng kết nối Internet của nó (bằng token/giây, sử dụng một trong các API web công cộng để làm điều đó) và thông lượng GPU (bằng token/giây, sử dụng một benchmark nhỏ chạy một số forward pass). Giá trị tối thiểu của các giá trị này trở thành thông lượng tổng thể của server, sau đó được cache cho các lần chạy tương lai.
+
+**Gán block ban đầu.** Chúng tôi giả định rằng mỗi server giữ một đoạn các transformer block liên tiếp để tối thiểu hóa độ trễ suy luận. Các client có thể yêu cầu thực hiện forward hoặc backward pass cho toàn bộ đoạn block hoặc đoạn con của nó, nếu cần thiết. Thông thường, mỗi server tải càng nhiều block càng tốt để vừa với bộ nhớ GPU của nó, trừ khi người dùng giới hạn số lượng block để sử dụng phần còn lại của bộ nhớ cho thứ khác.
+
+Trước khi bắt đầu, mỗi server tính toán các giá trị ti - tổng thông lượng của các server hiện đang giữ block thứ i hoặc đang tải nó (để bắt đầu giữ nó trong vài phút). Sau đó, để tìm đoạn block tốt nhất để phục vụ, server tìm kiếm nút thắt cổ chai hẹp nhất trong mạng. Chính thức, nếu mô hình có L block và server có thể giữ K trong số chúng trong bộ nhớ GPU của nó, chúng tôi tính toán:
+
+start = arg min(i=1 to L-K+1) sorted([ti, ti+1, ..., ti+K-1])
+
+Ở đây, arg min so sánh các mảng được sắp xếp theo thứ tự từ điển và chọn start ngoài cùng bên trái trong trường hợp có nhiều minimum.
+
+Bằng cách này, server tham gia tiếp theo sẽ luôn bao gồm một block với ti nhỏ nhất. Nếu có nhiều nút thắt cổ chai như vậy, server sẽ cố gắng bao gồm càng nhiều trong số chúng càng tốt (chúng tôi chọn bao gồm các minimum trước vì thông lượng tổng thể là minimum của thông lượng giữa các block mô hình). Trong số các tùy chọn còn lại, chúng tôi chọn một đoạn bao gồm càng nhiều minimum thứ hai càng tốt, và cứ thế.
+
+**Chất lượng của gán block.** Mặc dù chúng tôi không biết giải pháp thời gian đa thức chính xác cho vấn đề gán các đoạn một cách tối ưu, chúng tôi đã tiến hành các thí nghiệm tính toán và phát hiện ra rằng thuật toán greedy này (chạy trong thời gian đa thức) thường tìm thấy một gán với tổng thông lượng 90-100% so với tối ưu (được tìm thấy bằng cách thử tất cả các gán có thể trong thời gian mũ), với điều kiện các giá trị thông lượng thực tế đối với thiết lập của chúng tôi.
+
+**Cân bằng lại.** Vì các server có thể rời khỏi bất cứ lúc nào, mỗi server cũng định kỳ kiểm tra xem gán hiện tại có "đủ tốt" so với thông lượng được ước tính bằng cách chạy giải pháp greedy cho các server hiện có trong mạng hay không.
+
+Chính thức, mỗi server định kỳ tìm kiếm một đoạn block phù hợp hơn so với các block hiện được tải đối với quy tắc arg min (1). Nếu nó tìm thấy một, nó mô phỏng cách phần còn lại của các server sẽ hoạt động nếu chúng tôi thay thế các block hiện tại bằng các block mới (cách các server khác sẽ thay đổi block của chúng sau đó). Nếu thông lượng cuối cùng tốt hơn ít nhất p%, server cam kết thay đổi và thông báo rằng nó thay đổi các block, sau đó các server khác thực hiện phần còn lại của các thay đổi (cuối cùng tăng tổng thông lượng).
+
+Chúng tôi sử dụng p = 20% vì nó cung cấp một sự cân bằng hợp lý giữa thông lượng swarm và tần suất thay thế block trong các thí nghiệm của chúng tôi (xem Phụ lục E). Cụ thể, một giá trị p thấp hơn dẫn đến việc thay thế block xảy ra quá thường xuyên, điều này ảnh hưởng tiêu cực đến độ trễ suy luận vì mỗi việc thay thế block đặt lại cache attention cho block này.
+
+**Tính ổn định của thuật toán greedy.** Thuật toán cân bằng lại không gây ra dao động vì một loạt các thay thế block được thực thi chỉ khi nó dẫn đến việc cuối cùng tăng thông lượng ít nhất p%. Một khi thông lượng "đủ tốt" được đạt được, các server không thay đổi block của chúng nữa (trừ khi một số lượng thiết yếu server tham gia hoặc rời khỏi). Chúng tôi đã xác minh hành vi này bằng tính toán, mô phỏng một mạng với hàng nghìn server với thông lượng khác nhau.
+
+Để kết luận, heuristic greedy này cho phép các server nhanh chóng đóng các khoảng trống nếu một phần đáng kể (lên đến 100%) các server giữ các block nhất định rời khỏi, nhưng tránh các thay thế block dư thừa.
+
+### E Đánh giá của các thuật toán cân bằng tải server
+
+Trong mục này, chúng tôi đo hiệu quả của thuật toán cân bằng tải được sử dụng trong hệ thống của chúng tôi. Chúng tôi chạy tất cả các thí nghiệm sử dụng một đội tàu 206 instance ảo mô phỏng các người tham gia. Để giữ chi phí thí nghiệm có thể quản lý, chúng tôi không sử dụng GPU cho đánh giá này, thay vào đó mô phỏng thông lượng server không đồng đều bằng chương trình. Đối với mỗi server, chúng tôi lấy mẫu thông lượng của nó từ phân phối đồng đều t ~ U[0,100] token/giây, sau đó lấy mẫu kích thước bộ nhớ của nó để nó có thể giữ b ~ U[1,10] block (trong tổng số 70 block, như trong BLOOM-176B).
+
+Mỗi server tuân theo một lịch trình khả dụng nhất định, tức là bật và tắt vào cùng một thời gian được định nghĩa trước trên tất cả các thí nghiệm. Chúng tôi gán các lịch trình này sao cho số lượng server hoạt động tuân theo một sóng sine, mô phỏng các chu kỳ hoạt động hàng ngày. Lịch trình có khoảng 100–110 server hoạt động trong thời gian hoạt động cao nhất và 15–25 server ở điểm thấp nhất. Lưu ý rằng mỗi đỉnh chứa một tập con khác nhau của 100–110 server hoạt động trong tổng số 206 instance.
+
+Chúng tôi đánh giá các cách tiếp cận sau đây cho cân bằng tải:
+
+1. **Không cân bằng tải** – một hệ thống baseline nơi các server tải một khoảng liên tiếp ngẫu nhiên của các block mô hình.
+
+2. **Cân bằng chỉ server mới** – một cân bằng tải đơn giản hóa nơi các server chọn các block tối ưu khi tham gia swarm (sử dụng quy tắc (1) từ Phụ lục D) nhưng không bao giờ thay đổi chúng.
+
+3. **Cân bằng tải đầy đủ** – thuật toán đầy đủ, nơi mỗi phút mỗi server kiểm tra xem chúng có cần thay thế block của mình không. Chúng tôi sử dụng ngưỡng hiệu quả p (như được mô tả trong Phụ lục D) để tránh các thay thế block dư thừa.
+
+4. **Giới hạn trên** — ước tính thông lượng tốt nhất gán các đoạn block liên tiếp cho các server một cách tối ưu mỗi phút.
+
+Chúng tôi báo cáo hành vi của chúng trong Hình 2. Cân bằng tải đầy đủ duy trì kết nối trong suốt thí nghiệm và đạt được thông lượng gần với giới hạn trên (duy trì trong phạm vi 10–15% hầu hết thời gian). Ngưỡng p cao hơn hoạt động hơi kém hơn trong thời gian cao điểm nhưng chỉ yêu cầu các thay thế block tương đối không thường xuyên, không giống như trường hợp với p = 1%. Lưu ý rằng việc sử dụng gán dẫn đến giới hạn trên không thể thực hiện được trong thực tế vì nó yêu cầu mỗi server tải một tập lớp khác nhau mỗi phút, ngoài việc giải quyết bài toán tối ưu hóa đắt đỏ về mặt tính toán.
+
+Thật thú vị, baseline chạy cân bằng tải chỉ cho server mới đạt được thông lượng hợp lý trong các giai đoạn mà server tích cực tham gia. Tuy nhiên, nó nhanh chóng mất thông lượng khi các server ngẫu nhiên rời khỏi, vì điều này tạo ra "nút thắt cổ chai" trong pipeline yêu cầu cân bằng lại các peer hiện có. Cuối cùng, baseline ngây thơ với gán lớp ngẫu nhiên có thông lượng bằng không hầu hết thời gian vì nó không thể tạo thành một pipeline hoàn chỉnh.
+
+**Hình 2:** Hành vi của các thuật toán cân bằng tải được đánh giá trong Phụ lục E.
+
+### F Thí nghiệm với phạm vi rộng hơn của tỷ lệ lỗi
+
+Trong mục này, chúng tôi tuân theo thiết lập từ Mục 4.1 và cung cấp các đánh giá bổ sung cho một phạm vi rộng hơn của tỷ lệ lỗi (lên đến 5%) và độ dài chuỗi (lên đến 2048 token). Kết quả được hiển thị trong Hình 3. Không giống như các baseline, thuật toán của chúng tôi cung cấp hiệu suất hợp lý trong tất cả các điều kiện được thử nghiệm, đặc biệt là đối với tỷ lệ lỗi cao hơn phổ biến cho việc truyền thông qua Internet, sử dụng các instance spot/preemptible hoặc phần cứng không đáng tin cậy.
+
+**Hình 3:** Tốc độ suy luận tuần tự (bước/s) cho BLOOM (7.1B) với tỷ lệ lỗi khác nhau. Thiết lập giống như trong Mục 4.1. Tỷ lệ lỗi p có nghĩa là việc gửi một tập activation đến giai đoạn pipeline tiếp theo bị lỗi với xác suất p. Tốc độ bằng không có nghĩa là baseline không hoàn thành trong vòng 1 giờ.
+
+### G Hiệu suất của forward và backward pass thời gian huấn luyện
+
+Trong mục này, chúng tôi đánh giá thông lượng của forward và backward pass thời gian huấn luyện và nghiên cứu các yếu tố ảnh hưởng đến hiệu suất của chúng. Chúng tôi sẽ chỉ xem xét BLOOM-176B và thiết lập "3 × A100, 1 Gbit/s" từ Mục 4.2 và tập trung vào các siêu tham số dành riêng cho tinh chỉnh, vì ảnh hưởng của băng thông và độ trễ mạng đã được thảo luận trong bài báo chính.
+
+**Phân loại chuỗi.** Đầu tiên, chúng tôi xem xét việc tinh chỉnh mô hình trên một tác vụ phân loại nhị phân. Chúng tôi lấy BLOOM-176B, thay thế lớp logit bằng một classification head có thể huấn luyện (tương tự như transformers.BloomForSequenceClassification), và thêm các prompt có thể huấn luyện trước chuỗi đầu vào, sau đó huấn luyện mô hình trên các batch gồm 128 chuỗi token. Chúng tôi thử (a) cả prompt tuning và prefix tuning (liên quan đến prompt "sâu"), (b) hai kích thước batch (8 và 32), và (c) hai độ dài prompt (16 và 4). Client chia sẻ 8 lõi CPU với một trong các server và không sử dụng GPU.
+
+Kết quả được cung cấp trong Bảng 6. Prefix tuning hóa ra chậm hơn, vì nó thêm nhiều tham số có thể huấn luyện hơn vài lần. Tăng độ dài prompt và giảm kích thước batch cũng làm cho huấn luyện chậm hơn. Đáng chú ý, chúng tôi quan sát thấy rằng việc di chuyển các phép tính phía client sang GPU không cải thiện hiệu suất một cách rõ ràng, vì client không thực hiện bất kỳ thao tác nặng nào trong thiết lập này¹¹.
+
+**Mô hình hóa ngôn ngữ.** Tiếp theo, chúng tôi xem xét việc tinh chỉnh mô hình trên một tác vụ mô hình hóa ngôn ngữ nhân quả. Chúng tôi lấy BLOOM-176B, giữ lớp logit, và thêm các prompt có thể huấn luyện trước chuỗi đầu vào. Chúng tôi khám phá các siêu tham số tương tự như với phân loại chuỗi.
+
+Chúng tôi quan sát thấy rằng thông lượng của client có GPU tương tự (trong sự khác biệt 10%) so với thông lượng trong trường hợp phân loại chuỗi, được báo cáo trong Bảng 6. Thật vậy, client chỉ thực hiện một phần nhỏ các phép tính GPU trong forward và backward pass, và một model head cụ thể và một hàm loss không có ảnh hưởng quyết định đến hiệu suất. Tuy nhiên, hiệu suất của client chỉ có CPU hóa ra kém hơn 5-10 lần trong thiết lập này, vì client phải nhân ma trận embedding đầu ra với hidden state của tất cả token trong batch. Thao tác này quá lớn để được tính toán hiệu quả trên CPU¹².
+
+**Bảng 6:** Thông lượng (token/giây) của forward và backward pass cho các tác vụ khác nhau, kích thước batch, độ dài tiền tố.
+
+| Chế độ | Kích thước batch | Độ dài prompt | Thông lượng forward pass | Thông lượng backward pass |
+|--------|------------------|---------------|-------------------------|---------------------------|
+| Prompt tuning | 8 | 16 | 195.6 | 57.4 |
+| | 8 | 4 | 213.2 | 60.8 |
+| | 32 | 16 | 272.6 | 82.8 |
+| | 32 | 4 | 293.1 | 84.7 |
+| Prefix tuning | 8 | 16 | 111.0 | 42.0 |
+| (tức là "deep" prompt tuning) | 8 | 4 | 178.7 | 57.8 |
+| | 32 | 16 | 164.1 | 64.4 |
+| | 32 | 4 | 255.8 | 84.8 |
+
+### H Hạn chế và tác động rộng lớn
+
+**Quyền riêng tư.** Một hạn chế chính của cách tiếp cận của chúng tôi là các server lưu trữ các block mô hình đầu tiên có thể sử dụng đầu vào của chúng để khôi phục dữ liệu client. Do đó, người dùng làm việc với dữ liệu nhạy cảm nên giới hạn client của họ chỉ sử dụng các server đáng tin cậy hoặc, thay vào đó, thiết lập mạng riêng biệt của riêng họ sử dụng phần mềm của chúng tôi. Ví dụ, nếu nhiều phòng thí nghiệm nghiên cứu hoặc các công ty nhỏ có quyền truy cập vào một bộ dữ liệu riêng cụ thể và muốn xử lý nó với một mô hình ngôn ngữ lớn, họ có thể thiết lập một mạng phân tán riêng biệt lưu trữ mô hình này để có tốc độ suy luận tốt hơn, so với việc chạy mô hình độc lập.
+
+Trong tương lai, hạn chế này có thể được giải quyết trong công việc tương lai sử dụng tính toán đa bên bảo mật (Evans et al., 2018) hoặc phần cứng bảo vệ quyền riêng tư (NVIDIA, 2022).
+
+**Tạo động lực cho những người đóng góp.** Vì những người sử dụng client không bắt buộc phải chạy server, hệ thống của chúng tôi có thể gặp phải sự mất cân bằng giữa cung (các peer dành GPU để phục vụ các lớp mô hình) và cầu (các peer sử dụng server để thực hiện suy luận hoặc tinh chỉnh cho nhu cầu riêng của họ).
+
+Một cách để khuyến khích người dùng phục vụ các block mô hình là giới thiệu một hệ thống khuyến khích: các peer chạy server sẽ kiếm được điểm thưởng, có thể được chi tiêu cho suy luận và tinh chỉnh ưu tiên cao hoặc đổi lấy các phần thưởng khác. Để triển khai điều này, chúng tôi có thể chạy một số peer validator định kỳ duyệt tất cả các server có sẵn và cấp điểm thưởng cho chủ sở hữu của chúng.
+
+**Bảo mật.** Chúng tôi giả định rằng các server trong hệ thống của chúng tôi được chạy bởi nhiều bên độc lập. Trong thực tế, một số trong số chúng có thể hóa ra bị lỗi và trả về các đầu ra không chính xác thay vì kết quả thực tế của forward và backward pass. Điều này có thể xảy ra do ý định độc hại để ảnh hưởng đến đầu ra của người khác hoặc, khi phần thưởng được giới thiệu (như được mô tả ở trên), để kiếm phần thưởng cho việc phục vụ các lớp mà không thực sự thực hiện các phép tính.
+
+Để giải quyết vấn đề này, chúng tôi có thể mở rộng các peer validator, để chúng định kỳ kiểm tra các server với các yêu cầu ngẫu nhiên thuộc các loại khác nhau và cấm chúng nếu chúng phản hồi với các đầu ra không chính xác (có thể, thu hồi phần thưởng của chúng). Các yêu cầu validator nên khó phân biệt với các yêu cầu của người dùng điển hình, để các server độc hại không thể giả vờ trung thực với validator nhưng gửi đầu ra sai cho các peer khác. Mặc dù cách tiếp cận này vẫn để lại khả năng nhận được đầu ra sai, nó cho phép cuối cùng phơi bày và trừng phạt các server bị lỗi.
+
+Cuối cùng, các client có thể giảm xác suất nhận được đầu ra bị lỗi bằng cách chạy dữ liệu của họ thông qua nhiều chuỗi server rời rạc đồng thời và so sánh đầu ra với nhau.
+
+**Tác động rộng lớn.** Công việc này giới thiệu một thuật toán đa mục đích cho suy luận và tinh chỉnh phi tập trung của các mô hình lớn, nhằm đơn giản hóa quyền truy cập vào nghiên cứu mới nhất trong deep learning và cung cấp một cách thay thế để chạy LLM hiệu quả mà không cần phần cứng cao cấp. Chúng tôi không dự đoán bất kỳ tác động tiêu cực trực tiếp nào từ nghiên cứu của chúng tôi, vì các mô hình có thể được lưu trữ với hệ thống của chúng tôi đã được sử dụng rộng rãi và có thể được sử dụng qua API, offloading, hoặc các phương tiện khác.

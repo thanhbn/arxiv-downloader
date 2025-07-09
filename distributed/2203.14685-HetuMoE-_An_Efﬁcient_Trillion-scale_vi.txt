@@ -1,0 +1,295 @@
+# 2203.14685.pdf
+# Chuyển đổi từ PDF sang TXT
+# Đường dẫn nguồn: /home/admin88/arxiv-downloader/distributed/2203.14685.pdf
+# Kích thước tập tin: 1083028 bytes
+
+===============================================
+NỘI DUNG TẬP TIN PDF
+===============================================
+
+
+--- TRANG 1 ---
+HetuMoE: Hệ thống Huấn luyện Phân tán
+Mixture-of-Expert quy mô Nghìn tỷ tham số Hiệu quả
+Xiaonan Nie, Pinxue Zhao, Xupeng Miao, Tong Zhao, Bin Cui
+Trường Khoa học Máy tính,
+Đại học Bắc Kinh, Bắc Kinh, Trung Quốc
+{xiaonan.nie, 1800017766, xupeng.miao, zhaotong, bin.cui}@pku.edu.cn
+Tóm tắt
+Khi các mô hình dày đặc khổng lồ cải thiện chất lượng nhưng đòi hỏi ngân sách GPU lớn
+để huấn luyện, kiến trúc tính toán có điều kiện Mixture-of-Experts (MoE) với cổng thưa thớt
+được đề xuất để mở rộng quy mô mô hình trong khi giữ nguyên tính toán của chúng. Cụ thể,
+các token đầu vào được định tuyến bởi mạng cổng và chỉ kích hoạt một phần mạng chuyên gia.
+Các hệ thống huấn luyện MoE hiện tại chỉ hỗ trợ một phần các mô hình MoE chính thống
+(ví dụ Top k) huấn luyện trên các cụm GPU băng thông cao đắt tiền. Trong bài báo này, chúng tôi
+trình bày HetuMoE, một hệ thống huấn luyện MoE thưa thớt quy mô lớn hiệu suất cao được xây dựng
+trên Hetu. HetuMoE cung cấp nhiều chiến lược cổng và triển khai kernel GPU hiệu quả. Để cải thiện
+hơn nữa hiệu quả huấn luyện trên các cụm GPU thông thường (ví dụ, chỉ với 1 NIC), chúng tôi
+giới thiệu giao tiếp AllToAll phân cấp kết hợp mạng phân cấp và tổng hợp thông điệp. So với
+các hệ thống MoE tiên tiến hiện tại, HetuMoE đạt được ít nhất 15% tăng tốc. Cụ thể, HetuMoE
+vượt trội hơn DeepSpeed-MoE lên tới 8:1 dưới cổng switch với kích thước batch là 32.
+Mã nguồn của chúng tôi có sẵn tại: https://github.com/PKU-DAIR/Hetu .
+1 Giới thiệu
+Các mô hình có xu hướng hoạt động tốt hơn khi tăng kích thước dữ liệu, kích thước tham số trong nhiều
+lĩnh vực, như xử lý ngôn ngữ tự nhiên (NLP) và thị giác máy tính (CV) [2, 3, 9, 14, 15]. Tuy nhiên, những
+mô hình lớn này luôn đòi hỏi lượng tài nguyên GPU khổng lồ và mất hàng tuần hoặc thậm chí hàng tháng
+để huấn luyện. Ví dụ, cần khoảng 288 năm với một GPU NVIDIA V100 đơn lẻ để huấn luyện mô hình
+GPT-3 với 175 tỷ tham số [1, 12]. Mixture of Experts (MoE) với cổng thưa thớt, như một loại kiến trúc
+tính toán có điều kiện, đã được chứng minh là cách hiệu quả để mở rộng kích thước mô hình mà không
+tăng đáng kể tính toán [4, 5, 10, 17, 19]. Cụ thể, một mô hình MoE chứa một mạng cổng và một nhóm
+chuyên gia. Trong quá trình huấn luyện, một token sẽ được gán cho một số lượng nhỏ chuyên gia để tính toán.
+Tính chất kích hoạt thưa thớt này cho phép MoE mở rộng đáng kể kích thước mô hình trong khi giữ lượng
+tính toán gần như không đổi. Mô hình huấn luyện kích hoạt thưa thớt đòi hỏi hỗ trợ hệ thống mới. Tuy nhiên,
+các hệ thống huấn luyện MoE hiện tại, bao gồm DeepSpeed-MoE [16], Tutel [7], và FastMoE [6], vẫn
+đang đối mặt với một số hạn chế về cả tính khả dụng và hiệu quả. Thứ nhất, chúng chỉ hỗ trợ các phần
+của các mô hình MoE chính thống và mạng cổng (ví dụ Top k). Thứ hai, hầu hết chúng giả định "hyperclusters"
+có các kết nối tốc độ cao đắt tiền như NVLink hoặc Infiniband. Chúng đang gặp khó khăn từ nút thắt
+giao tiếp nghiêm trọng cho các cụm thông thường. Những thiếu sót trên đã hạn chế việc sử dụng và giới hạn
+khám phá các mô hình MoE trong các ứng dụng thực tế.
+Trong bài báo này, chúng tôi trước tiên giới thiệu ngắn gọn quy trình huấn luyện chung của các mô hình MoE
+và sau đó đề xuất HetuMoE, một hệ thống huấn luyện MoE phân tán hiệu suất cao được xây dựng trên Hetu,
+hỗ trợ nhiều chiến lược cổng chính thống và đạt được tốc độ huấn luyện tiên tiến so với
+Preprint.arXiv:2203.14685v3  [cs.DC]  17 Nov 2022
+
+--- TRANG 2 ---
+Thuật toán 1: Quy trình Huấn luyện MoE Tổng quát
+Dữ liệu: xS: một nhóm token có kích thước S,
+Gate: mạng cổng
+E: mạng chuyên gia
+Kết quả: yS: token sau khi xử lý
+1//Bước 1: Lấy các chuyên gia đích và trọng số tương ứng. ;
+2W(S; E ); idS=Gate (xS);
+3//Bước 2: Biến đổi Bố cục trên Dữ liệu Đầu vào ;
+4x0
+S=Layout _Transform (xS; idS);
+5//Bước 3: Giao tiếp AllToAll ;
+6x0
+S=AllToAll (x0
+S);
+7//Bước 4: Xử lý Chuyên gia ;
+8fori 1to S do
+9ys= 0;
+10 foridx2idido
+11 ys=ys+w(i; idx )eidx(xi);
+12//Bước 5: Giao tiếp AllToAll ;
+13yS=AllToAll (yS);
+14//Bước 6: Biến đổi Bố cục Ngược trên Dữ liệu Đầu ra ;
+15yS=Reverse _Layout _Transform (yS; idS);
+các hệ thống cơ sở hiện tại. HetuMoE áp dụng một số triển khai kernel cổng tùy chỉnh và
+sử dụng tối ưu hóa giao tiếp All-To-All phân cấp. Thí nghiệm cho thấy HetuMoE
+vượt trội hơn các hệ thống MoE hiện tại ít nhất 15% tăng tốc dưới các cài đặt khác nhau. Trong khi đó,
+HetuMoE vượt trội hơn DeepSpeed-MoE lên tới 8:1 dưới cổng switch với kích thước batch là 32.
+2 Quy trình Huấn luyện MoE
+Một mô hình MoE bao gồm một mạng cổng và một nhóm mạng con (ví dụ Mạng Feed-Forward
+trong Transformer), được gọi là chuyên gia. Chúng tôi công thức hóa quy trình huấn luyện chung của các mô hình MoE
+trong Thuật toán 1.
+(1) Các token đầu vào đầu tiên được xử lý bởi mạng cổng để biết các chuyên gia đích.
+(2) Thao tác biến đổi bố cục được thực hiện trên mỗi thiết bị để đặt các token có cùng
+chuyên gia đích trong bộ đệm bộ nhớ liên tục cho giao tiếp sắp tới. (Dòng 4)
+(3) Một thao tác giao tiếp AllToAll được thực hiện để gửi token đến các chuyên gia
+tương ứng. (Dòng 6)
+(4) Sau đó mỗi chuyên gia xử lý token của mình tương ứng. (Dòng 8-11)
+(5) Các token đã xử lý được gửi trở lại GPU của chúng. (Dòng 13)
+(6) Thao tác biến đổi bố cục ngược được thực hiện để đặt token trở lại vị trí ban đầu
+trong batch huấn luyện cho tính toán tương lai. (Dòng 15)
+Hình 1: Thời gian tiêu thụ của lớp MoE của DeepSpeed-MoE dưới 8 GPU A100 trong một nút đơn
+2
+
+--- TRANG 3 ---
+Hình 2: HetuMoE so sánh với các hệ thống MoE khác
+Sau đó chúng tôi đánh giá DeepSpeed-MoE và phân tích chi phí thời gian của lớp MoE dưới 8 GPU A100 trong
+một nút đơn và kết quả được hiển thị trong Hình 1. Như chúng ta có thể thấy, việc tính toán mạng cổng,
+bao gồm biến đổi bố cục và thao tác ngược của nó, và giao tiếp AllToAll chiếm hơn 50% thời gian huấn luyện
+tổng cộng. Khi mở rộng quy mô huấn luyện vào các tình huống phân tán qua nhiều nút, chi phí giao tiếp AllToAll
+sẽ làm xấu đi toàn bộ quá trình huấn luyện, chiếm khoảng 99% thời gian huấn luyện dưới mạng 100 Gbps.
+3 HetuMoE
+Để giải quyết các vấn đề trên, chúng tôi phát triển HetuMoE dựa trên Hetu1, một hệ thống
+học sâu phân tán hiệu suất cao. HetuMoE hỗ trợ các chiến lược cổng khác nhau được đề xuất bởi các
+phương pháp MoE gần đây, như Switch [5], GShard [10], M6 [21], BASE Layer [11], Hash Layer [18],
+SAM [8], và Dense-to-Sparse [13]. Ngoài ra, chúng tôi triển khai AllToAll phân cấp [20], 
+cải thiện đáng kể việc sử dụng băng thông mạng trong trường hợp huấn luyện phân tán đa nút dưới
+điều kiện mạng thông thường, so với AllToAll thông thường. Tính năng được hỗ trợ trong HetuMoE
+được so sánh với các hệ thống MoE khác trong Hình 2.
+3.1 Chiến lược Cổng trong HetuMoE
+Top1/Top2/Topk Shazeer et al., 2017 [19] đề xuất sử dụng lớp MoE kích hoạt Topk trong LSTM
+tăng dung lượng mô hình lên tới 1000× với chỉ những tổn thất nhỏ về hiệu quả. Cổng Topk
+được công thức hóa trong Phương trình 1, trong đó x là N token đầu vào, W là trọng số của cổng, E chuyên gia
+ei(i∈1::E) và y là token đầu ra. GShard [10] và Switch [5] đề xuất đơn giản hóa cổng thành
+Top2 và Top1, và sử dụng hệ số dung lượng C để buộc số token tối đa nhận được bởi mỗi chuyên gia. Khi
+K tăng, lớp MoE có xu hướng hoạt động tốt hơn trong khi dẫn đến nhiều tính toán hơn. Đó là một
+sự đánh đổi về K xem xét hiệu quả tính toán và hiệu suất mô hình.
+g=softmax (TopK (xW; K ))
+y=∑E
+i=1g(x)ei(x)(1)
+kTop1 Được truyền cảm hứng từ quan sát rằng K và dung lượng chuyên gia C trong định tuyến Topk có thể
+tạo ra sự khác biệt đáng kể trong hiệu suất mô hình, M6-T [21] đề xuất chiến lược cổng KTop1, trong đó
+các chuyên gia được chia thành k nguyên mẫu và mỗi token được gán cho chuyên gia có điểm cao nhất trong mỗi
+nguyên mẫu. Cuối cùng, đầu ra của các nguyên mẫu khác nhau được tổng hợp lại như cho cùng một token đầu vào.
+Phân cấp Topk(H Topk) Khi tăng số lượng chuyên gia được kích hoạt có thể thúc đẩy hiệu suất mô hình
+với tỷ lệ thưa thớt cao hơn, SAM [8] (Switch and Mixture) đề xuất một cơ chế định tuyến phân cấp
+hiệu quả chia các chuyên gia thành các nhóm khác nhau theo thiết bị của chúng
+và kích hoạt nhiều chuyên gia trong cùng một nhóm để tránh chi phí giao tiếp từ xa giữa
+1https://github.com/PKU-DAIR/Hetu
+3
+
+--- TRANG 4 ---
+(a) Số lượng Chuyên gia Khác nhau
+ (b) Số lượng Token Khác nhau
+Hình 3: So sánh hiệu suất kernel Topk với PyTorch
+các thiết bị. Cụ thể, Switch Router đầu tiên chọn một nhóm và sau đó Mixture Router chọn
+nhiều chuyên gia trong cùng một nhóm cho mỗi token.
+BASE Layer BASELayer [11] công thức hóa phân bổ token-to-expert như một bài toán gán tuyến tính
+để cải thiện hiệu quả, trong đó tải cân bằng được đảm bảo giữa mỗi chuyên gia. Bởi vì không có tham số mới
+hoặc các tổn thất cân bằng chuyên gia phụ trợ được giới thiệu, quy trình huấn luyện được đơn giản hóa. Bài toán
+được công thức hóa trong Phương trình 2, trong đó N token với biểu diễn xi và E chuyên gia với
+embeddings we, chúng tôi gán mỗi token cho một chuyên gia thông qua chỉ số gán ai∈{0::E}:
+max∑N
+i=1xiwai
+s.t.∀e∑N
+i=11ai=e=N
+E(2)
+Hash Layer Hash Layer [18] sử dụng các hàm hash khác nhau để ánh xạ token đến chuyên gia, như
+Random Hashes, Balanced assignment, và Clustered Hashes. Cụ thể, trong Hash Layer, các token được
+đặt trong các bucket tương ứng theo hàm hash được sử dụng và mỗi bucket tham chiếu đến một
+chuyên gia.
+(a) Biến đổi
+ (b) Biến đổi ngược
+(c) So sánh hiệu suất với Tutel
+Hình 4: Minh họa biến đổi bố cục dữ liệu và so sánh hiệu suất
+Dense-To-Sparse Dense-To-Sparse Gate [13] xem xét rằng các phương pháp hiện tại của huấn luyện kết hợp
+các chuyên gia và cổng thưa thớt tạo ra tác động tiêu cực đến độ chính xác của mô hình, làm giảm hiệu quả
+của việc huấn luyện mô hình quy mô lớn đắt tiền [5]. Nó đề xuất bắt đầu như một cổng dày đặc định tuyến token đến
+tất cả chuyên gia, sau đó dần dần và thích ứng trở nên thưa thớt hơn trong khi định tuyến đến ít chuyên gia hơn. Cụ thể,
+nó sử dụng Gumbel Softmax và giảm nhiệt độ trong quá trình huấn luyện.
+4
+
+--- TRANG 5 ---
+Hình 5: Minh họa NCCL AllToAll.
+Hình 6: Minh họa AllToAll phân cấp
+3.2 Tối ưu hóa HetuMoE
+Như được hiển thị trong Thuật toán 1, Gate, Layout Transform và AllToAll là ba thành phần chính
+liên quan đến huấn luyện mô hình MoE, trong đó module mạng chuyên gia cũng tồn tại trong các mô hình thông thường
+và do đó không phải là mục tiêu của chúng tôi trong tối ưu hóa đặc thù MoE. Các tối ưu hóa trong HetuMoE về ba
+module này được chi tiết như sau.
+Tối ưu hóa Gate Các chiến lược cổng khác nhau được hỗ trợ trong HetuMoE và chúng tôi chủ yếu tối ưu hóa
+toán tử topk vì nó được áp dụng rộng rãi trong các mô hình chính thống [5, 10, 17]. Đầu vào của toán tử là một
+tensor 2-D có hình dạng (num_tokens; num_experts) và thực hiện như tìm các giá trị top-k
+và chỉ số tương ứng cho mỗi hàng. Toán tử Topk được triển khai trong PyTorch hoặc TensorFlow
+cho K tùy ý. Chúng tôi thực hiện tối ưu hóa thuật toán cho k hữu ích trong MoE, như 1 và 2. Chúng tôi thay đổi
+num_experts và num_tokens để thực hiện so sánh với PyTorch và kết quả thí nghiệm
+được hiển thị trong Hình 3. Chúng tôi vượt trội hơn PyTorch Topk với cải thiện tốc độ 25% trung bình.
+Tối ưu hóa Layout Transform Biến đổi bố cục dữ liệu là một bước quan trọng khác trong quy trình
+huấn luyện MoE. Sau khi mạng cổng quyết định ánh xạ token-to-expert, các token được gán cho
+cùng một chuyên gia cần được đặt trong các vị trí bộ nhớ liên tục về mặt vật lý. Chúng tôi thực hiện tối ưu hóa
+cấp kernel để tăng tốc quá trình này, và chúng tôi đạt được cải thiện hơn 26% so với
+triển khai tiên tiến.
+Tối ưu hóa All-To-All Trong thao tác AllToAll, mỗi GPU gửi dữ liệu của mình đến tất cả GPU (one-for-all)
+và nhận dữ liệu được gửi bởi tất cả GPU (all-for-one), trong đó mỗi dữ liệu sẽ được chia đều thành n phần,
+được minh họa trong Hình 3.2. Các thao tác AllToAll hiện tại được triển khai trong NCCL và MPI có thể gặp
+khó khăn từ việc sử dụng băng thông mạng thấp vì kích thước thông điệp nhỏ. Cụ thể, nếu chúng ta
+có N nút, mỗi nút có G GPU, và mỗi GPU có dữ liệu kích thước B, thì kích thước dữ liệu được truyền
+giữa 2 GPU là B
+GN. Một cài đặt thông thường là N= 8, G= 8, và B= 16 MB.
+Trong HetuMoE, chúng tôi sử dụng Hierarchical AllToAll, kết hợp mạng phân cấp (intra-
+node và inter-node) và tổng hợp thông điệp, để tối ưu hóa giao tiếp giữa các nút đa
+được trang bị một NIC. Jesper et al., 2014 [20] cũng sử dụng phân cấp để tối ưu hóa giao tiếp alltoall
+cho MPI. Được minh họa như Hình 6, trước tiên nó thu thập dữ liệu của tất cả GPU bên trong một
+5
+
+--- TRANG 6 ---
+(a) 4 nút
+ (b) 8 nút
+Hình 7: Hiệu suất AllToAll phân cấp
+(a) Cổng Switch
+ (b) Cổng GShard
+Hình 8: So sánh hiệu suất tổng thể với DeepSpeed-MoE, FastMoE, và Tutel.
+nút vào một GPU. Sau đó, một biến đổi bố cục dữ liệu được thực hiện để đặt token được gán cho
+cùng một nút trong bộ nhớ liên tục về mặt vật lý. Sau đó, nó khởi chạy giao tiếp All2All
+giữa các nút. Sau khi AllToAll hoàn tất, nó thực hiện biến đổi bố cục dữ liệu tương ứng
+và thao tác scatter để đặt mỗi token đến chuyên gia tương ứng. Theo cách này, kích thước dữ liệu
+được truyền giữa các nút trở thành BG
+N, lớn hơn G² lần so với trước đây. Trong khi đó, AllToAll
+hai cấp tách biệt này cũng sử dụng đầy đủ băng thông intra-node (NvLink hoặc PCIe) và inter-node
+(Infiniband hoặc Ethernet). Thí nghiệm cho thấy Hierarchical AllToAll đạt được
+tăng tốc 1.66× trong cài đặt 4×8 GPU và tăng tốc 2× trong cài đặt 8×8 GPU.
+Thí nghiệm Hiệu suất Tổng thể được thực hiện trên Cụm GPU, trong đó mỗi nút được trang bị
+8 GPU TITAN RTX và tám GPU này được kết nối thông qua PCIe. Chúng tôi so sánh HetuMoE
+với các hệ thống MoE hiện tại, bao gồm Tutel, FastMoE và DeepSpeed-MoE. Mô hình thử nghiệm của chúng tôi là
+lớp MoE 16-chuyên gia, trong đó mỗi chuyên gia đại diện cho một Mạng FeedForward và kích thước ẩn là
+2048. Độ dài chuỗi và chiều nhúng của dữ liệu đầu vào lần lượt là 1024 và 2048.
+Chúng tôi thay đổi kích thước batch để so sánh hiệu suất của mỗi hệ thống.
+Như được hiển thị trong Hình 8, HetuMoE đạt được hiệu suất huấn luyện tiên tiến trong cả cổng Switch
+và cổng GShard. Cụ thể, so với FastMoE, chúng tôi đạt được tăng tốc 18% trong Switch Gate
+và tăng tốc 15% trong GShard gate. Trong khi đó, HetuMoE vượt trội hơn DeepSpeed-MoE lên tới 8:1
+dưới cổng switch với kích thước batch là 32.
+4 Kết luận
+Các hệ thống huấn luyện MoE hiện tại thiếu hỗ trợ chiến lược cổng đa dạng và hoạt động kém trong
+huấn luyện phân tán. Trong bài báo này, chúng tôi đề xuất HetuMoE, một hệ thống huấn luyện MoE phân tán
+hiệu suất cao được xây dựng trên Hetu, hỗ trợ nhiều chiến lược cổng chính thống và đạt được
+tốc độ huấn luyện tiên tiến so với các hệ thống cơ sở hiện tại. HetuMoE áp dụng một số triển khai
+kernel cổng tùy chỉnh và sử dụng All-To-All phân cấp để tối ưu hóa giao tiếp phân tán bằng cách
+kết hợp mạng phân cấp (intra-node và inter-node) và tổng hợp các thông điệp nhỏ.
+6
+
+--- TRANG 7 ---
+Tài liệu tham khảo
+[1]T. Brown, B. Mann, N. Ryder, M. Subbiah, J. D. Kaplan, P. Dhariwal, A. Neelakantan, P. Shyam,
+G. Sastry, A. Askell, et al. Language models are few-shot learners. Advances in neural
+information processing systems, 33:1877–1901, 2020.
+[2]J. Devlin, M. Chang, K. Lee, and K. Toutanova. BERT: pre-training of deep bidirectional
+transformers for language understanding. CoRR, abs/1810.04805, 2018.
+[3]A. Dosovitskiy, L. Beyer, A. Kolesnikov, D. Weissenborn, X. Zhai, T. Unterthiner, M. Dehghani,
+M. Minderer, G. Heigold, S. Gelly, et al. An image is worth 16x16 words: Transformers for
+image recognition at scale. arXiv preprint arXiv:2010.11929, 2020.
+[4]N. Du, Y. Huang, A. M. Dai, S. Tong, D. Lepikhin, Y. Xu, M. Krikun, Y. Zhou, A. W. Yu,
+O. Firat, et al. Glam: Efficient scaling of language models with mixture-of-experts. arXiv
+preprint arXiv:2112.06905, 2021.
+[5]W. Fedus, B. Zoph, and N. Shazeer. Switch transformers: Scaling to trillion parameter models
+with simple and efficient sparsity. arXiv preprint arXiv:2101.03961, 2021.
+[6]J. He, J. Qiu, A. Zeng, Z. Yang, J. Zhai, and J. Tang. Fastmoe: A fast mixture-of-expert training
+system. arXiv preprint arXiv:2103.13262, 2021.
+[7]C. Hwang, W. Cui, Y. Xiong, Z. Yang, Z. Liu, H. Hu, Z. Wang, R. Salas, J. Jose, P. Ram, et al.
+Tutel: Adaptive mixture-of-experts at scale. arXiv preprint arXiv:2206.03382, 2022.
+[8]H. Jiang, K. Zhan, J. Qu, Y. Wu, Z. Fei, X. Zhang, L. Chen, Z. Dou, X. Qiu, Z. Guo, R. Lai,
+J. Wu, E. Hu, Y. Zhang, Y. Jia, F. Yu, and Z. Cao. Towards more effective and economic
+sparsely-activated model. CoRR, abs/2110.07431, 2021.
+[9]J. Kaplan, S. McCandlish, T. Henighan, T. B. Brown, B. Chess, R. Child, S. Gray, A. Rad-
+ford, J. Wu, and D. Amodei. Scaling laws for neural language models. arXiv preprint
+arXiv:2001.08361, 2020.
+[10] D. Lepikhin, H. Lee, Y. Xu, D. Chen, O. Firat, Y. Huang, M. Krikun, N. Shazeer, and Z. Chen.
+Gshard: Scaling giant models with conditional computation and automatic sharding. CoRR,
+abs/2006.16668, 2020.
+[11] M. Lewis, S. Bhosale, T. Dettmers, N. Goyal, and L. Zettlemoyer. BASE layers: Simplifying
+training of large, sparse models. CoRR, abs/2103.16716, 2021.
+[12] D. Narayanan, M. Shoeybi, J. Casper, P. LeGresley, M. Patwary, V. Korthikanti, D. Vainbrand,
+P. Kashinkunti, J. Bernauer, B. Catanzaro, et al. Efficient large-scale language model training
+on gpu clusters using megatron-lm. In Proceedings of the International Conference for High
+Performance Computing, Networking, Storage and Analysis, pages 1–15, 2021.
+[13] X. Nie, S. Cao, X. Miao, L. Ma, J. Xue, Y. Miao, Z. Yang, Z. Yang, and B. Cui. Dense-to-sparse
+gate for mixture-of-experts. CoRR, abs/2112.14397, 2021.
+[14] A. Radford, J. Wu, R. Child, D. Luan, D. Amodei, I. Sutskever, et al. Language models are
+unsupervised multitask learners. OpenAI blog, 1(8):9, 2019.
+[15] C. Raffel, N. Shazeer, A. Roberts, K. Lee, S. Narang, M. Matena, Y. Zhou, W. Li, and P. J. Liu.
+Exploring the limits of transfer learning with a unified text-to-text transformer. arXiv preprint
+arXiv:1910.10683, 2019.
+[16] S. Rajbhandari, C. Li, Z. Yao, M. Zhang, R. Y. Aminabadi, A. A. Awan, J. Rasley, and Y. He.
+Deepspeed-moe: Advancing mixture-of-experts inference and training to power next-generation
+ai scale. arXiv preprint arXiv:2201.05596, 2022.
+[17] C. Riquelme, J. Puigcerver, B. Mustafa, M. Neumann, R. Jenatton, A. Susano Pinto, D. Keysers,
+and N. Houlsby. Scaling vision with sparse mixture of experts. Advances in Neural Information
+Processing Systems, 34:8583–8595, 2021.
+[18] S. Roller, S. Sukhbaatar, A. Szlam, and J. Weston. Hash layers for large sparse models. CoRR,
+abs/2106.04426, 2021.
+[19] N. Shazeer, A. Mirhoseini, K. Maziarz, A. Davis, Q. Le, G. Hinton, and J. Dean. Outra-
+geously large neural networks: The sparsely-gated mixture-of-experts layer. arXiv preprint
+arXiv:1701.06538, 2017.
+7
+
+--- TRANG 8 ---
+[20] J. L. Träff and A. Rougier. Mpi collectives and datatypes for hierarchical all-to-all commu-
+nication. In Proceedings of the 21st European MPI Users' Group Meeting, pages 27–32,
+2014.
+[21] A. Yang, J. Lin, R. Men, C. Zhou, L. Jiang, X. Jia, A. Wang, J. Zhang, J. Wang, Y. Li, D. Zhang,
+W. Lin, L. Qu, J. Zhou, and H. Yang. Exploring sparse expert models and beyond. CoRR,
+abs/2105.15082, 2021.
+8

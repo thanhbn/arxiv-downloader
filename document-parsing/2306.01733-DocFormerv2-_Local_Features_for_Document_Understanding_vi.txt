@@ -1,0 +1,482 @@
+# DocFormerv2: Các Tính Năng Cục Bộ cho Hiểu Tài Liệu
+
+Srikar Appalaraju1*, Peng Tang1, Qi Dong1, Nishant Sankaran1, Yichu Zhou2†, R. Manmatha1
+1AWS AI Labs 2Trường Tin học tại Đại học Utah
+{srikara, tangpen, qdon, nishsank, manmatha}@amazon.com, flyaway@cs.utah.edu
+
+Tóm tắt
+Chúng tôi đề xuất DocFormerv2, một transformer đa phương thức cho Hiểu Tài Liệu Trực Quan (VDU). Lĩnh vực VDU đòi hỏi hiểu tài liệu (vượt ra ngoài các dự đoán OCR đơn thuần) ví dụ: trích xuất thông tin từ biểu mẫu, VQA cho tài liệu và các nhiệm vụ khác. VDU là thách thức vì nó cần một mô hình để hiểu được nhiều phương thức (thị giác, ngôn ngữ và không gian) để đưa ra dự đoán. Phương pháp của chúng tôi, được gọi là DocFormerv2, là một transformer mã hóa-giải mã nhận đầu vào là các tính năng thị giác, ngôn ngữ và không gian. DocFormerv2 được tiền huấn luyện với các nhiệm vụ không giám sát được sử dụng bất đối xứng tức là hai nhiệm vụ tài liệu mới trên bộ mã hóa và một nhiệm vụ trên bộ giải mã tự hồi quy. Các nhiệm vụ không giám sát đã được thiết kế cẩn thận để đảm bảo rằng việc tiền huấn luyện khuyến khích việc căn chỉnh tính năng cục bộ giữa nhiều phương thức. DocFormerv2 khi được đánh giá trên chín bộ dữ liệu cho thấy hiệu suất tốt nhất so với các đường cơ sở mạnh ví dụ TabFact (4.3%), InfoVQA (1.4%), FUNSD (1%). Hơn nữa, để thể hiện khả năng tổng quát hóa, trên ba nhiệm vụ VQA liên quan đến văn bản cảnh, DocFormerv2 vượt trội hơn các mô hình có kích thước tương đương trước đó và thậm chí làm tốt hơn các mô hình lớn hơn nhiều (như GIT2, PaLi và Flamingo) trên một số nhiệm vụ. Các nghiên cứu loại bỏ toàn diện cho thấy rằng do việc tiền huấn luyện, DocFormerv2 hiểu nhiều phương thức tốt hơn so với các nghệ thuật trước đây trong VDU.
+
+1. Giới thiệu
+Tài liệu đã trở thành phương tiện mang thông tin phổ biến, bao gồm biểu mẫu, bảng biểu, hóa đơn và các tài liệu có cấu trúc khác. Nhiều tài liệu như vậy đòi hỏi hiểu biết về hình ảnh và bố cục để có ý nghĩa (chỉ chuỗi văn bản là không đủ). Hiểu Tài Liệu Trực Quan (VDU) là nhiệm vụ tận dụng các kỹ thuật học máy để hiểu các tài liệu được quét như vậy, chẳng hạn như PDF hoặc hình ảnh. Các nhiệm vụ VDU phổ biến bao gồm VQA Tài liệu và Bảng [9, 49], gắn nhãn chuỗi để xác định khóa-giá trị trong biểu mẫu [27], trích xuất thực thể [58], và phân loại tài liệu [19].
+
+*Tác giả liên hệ.
+†Công việc được thực hiện trong thời gian thực tập tại Amazon.
+
+Hình 1: Hiểu Tài Liệu Trực Quan. Đoạn trích của biên lai tài liệu từ DocVQA [48]. Các nhiệm vụ VDU có thể bao gồm một mô hình được yêu cầu dự đoán địa chỉ "SOLD TO" (VQA) hoặc dự đoán tất cả các mối quan hệ ("SOLD TO" →<địa chỉ>, "SHIP TO" →<địa chỉ>) hoặc được yêu cầu suy ra thông tin từ bảng (ở trên cùng).
+
+Trong khi các mô hình OCR dựa trên deep learning hiện đại [41] đã được chứng minh là hiệu quả trong việc trích xuất văn bản từ tài liệu, phương pháp ngây thơ là tuyến tính hóa văn bản OCR và đưa nó vào mô hình ngôn ngữ là không tối ưu. Điều này là do nội dung của tài liệu được trình bày theo bố cục và cấu trúc hình ảnh phải được tính đến để hiểu chính xác. Tuyến tính hóa ngây thơ văn bản từ trái sang phải sẽ dẫn đến hiệu suất không tối ưu vì ý nghĩa ngữ nghĩa thay đổi dựa trên bố cục, như được hiển thị trong Hình 1 - Bảng 6,5 có các thí nghiệm chứng minh điều này. Thay vào đó, VDU đòi hỏi một phương pháp đa phương thức có thể hiểu được văn bản và các tính năng hình ảnh trong bối cảnh bố cục 2D của tài liệu.
+
+Huấn luyện đa phương thức nói chung đòi hỏi việc căn chỉnh tính năng. Cụ thể đối với học thị giác-ngôn ngữ, điều này có nghĩa là căn chỉnh một đoạn văn bản với một khoảng pixel tùy ý trong không gian hình ảnh [1–3, 5, 10, 18, 21, 31, 37, 54, 64]. Cách các tính năng đó được căn chỉnh tạo ra sự khác biệt lớn. Trong VDU, phần lớn các nhiệm vụ đòi hỏi hiểu biết cục bộ và tương đối theo bố cục của tài liệu. Ví dụ, trong VQA tài liệu, gắn nhãn ngữ nghĩa hoặc trích xuất thực thể, một mô hình cần hiểu văn bản liên quan đến vị trí đặt văn bản trong tài liệu. Ví dụ: "1" khi được đặt ở góc phải trên/góc trái dưới của tài liệu sẽ được hiểu là số trang so với như một số khi được đặt ở bất kỳ nơi nào khác.
+
+Dựa trên hiểu biết về lĩnh vực VDU này và các thách thức của nó, chúng tôi trình bày DocFormerv2 (DFv2) là một transformer đa phương thức mã hóa-giải mã. Trong công trình này, chúng tôi tỉ mỉ thiết kế hai nhiệm vụ tiền huấn luyện không giám sát mới
+
+Model Năm Hội nghị Kiến trúc Đầu vào Mod. Nhánh Thị giác
+LayoutLMv1 [66] 2020 KDD E T + S -
+DocFormerv1 [2] 2021 ICCV E T + V + S Resnet50
+LayoutLMv2 [67] 2021 ACL E T + V + S ResNeXt 101
+SelfDoc [39] 2021 CVPR E - -
+LayoutLMv3 [25] 2022 ACM E T + V + S Linear
+BROS [22] 2022 AAAI E T + S -
+XYLayoutLM [16] 2022 CVPR E T + V + S ResNeXt 101
+FormNet [33] 2022 ACL E - -
+ERNIE-Layout [52] 2022 EMNLP E T + V + S F-RCNN
+LiLT [63] 2022 ACL E T + S -
+XDoc [8] 2022 EMNLP E T -
+TILT [53] 2021 ICDAR E + D T + V + S U-Net
+DocFormerv2 (của chúng tôi) 2023 - E + D T + V + S Linear
+
+Bảng 1: Nghiên cứu Liên quan VDU: Trong bảng này, một tóm tắt về các nghệ thuật VDU trước đây được trình bày với kiến trúc của chúng (E: Mã hóa, D: Giải mã), đầu vào (T: văn bản, V: thị giác, S: tính năng không gian), nhánh tính năng thị giác và ý tưởng cốt lõi đằng sau công trình.
+
+Hình 2: Các Mô hình VDU: Các phương pháp Hiểu Tài Liệu Trực Quan (VDU) rộng lớn. Trong a) E-only LayoutLM [66] và các biến thể. b) E+D nhưng chỉ nhiệm vụ ngôn ngữ TILT [53]. c) Của chúng tôi
+
+các nhiệm vụ với mục tiêu kết hợp thông tin ngữ nghĩa cục bộ của tài liệu vào mô hình. Các nhiệm vụ tiền huấn luyện này truyền đạt khả năng cho mô hình để định vị chính xác thông tin liên quan trong tài liệu. Chúng tôi cũng tách khỏi các nghệ thuật VDU trước đây [53, 60] khi giới thiệu một phương pháp tiền huấn luyện bất đối xứng mới. tức là tiền huấn luyện đa nhiệm vụ trên bộ mã hóa (hai nhiệm vụ) và bộ giải mã (một nhiệm vụ). Chúng tôi đề xuất hai nhiệm vụ tiền huấn luyện mới trên bộ mã hóa với ý định làm phong phú bộ mã hóa với thông tin ngữ nghĩa cục bộ. Các nhiệm vụ hỗ trợ bằng cách hợp nhất và căn chỉnh đầu vào đa phương thức và tạo ra các biểu diễn hiệu quả cho bộ giải mã. Chúng tôi cho thấy rằng các nhiệm vụ tiền huấn luyện này là cần thiết cho VDU hiệu quả (xem §5). Hơn nữa, chúng tôi chứng minh rằng một lớp hình ảnh tuyến tính đơn giản là đủ để gói gọn các tính năng hình ảnh, đơn giản hóa kiến trúc từ nghiên cứu VDU trước đây [39, 53, 67] đòi hỏi các bộ mã hóa hình ảnh cụ thể [13, 20, 44].
+
+Về mặt thí nghiệm, chúng tôi chứng minh rằng DocFormerv2 đạt được hiệu suất tốt nhất trên năm nhiệm vụ VDU. Ngoài ra, chúng tôi chứng minh tính linh hoạt của DocFormerv2 bằng cách sử dụng mô hình được tiền huấn luyện và tinh chỉnh nó trên các nhiệm vụ text-VQA từ một lĩnh vực hoàn toàn khác. Phương pháp của chúng tôi mang lại hiệu suất vượt trội trên ba bộ dữ liệu text-VQA khác nhau, vượt qua các mô hình có thể so sánh và trong một số bộ dữ liệu còn tốt hơn các mô hình lớn hơn nhiều như GIT2 [64], PaLi [10] và Flamingo [1]. Do đó, các đóng góp chính của bài báo này như sau:
+
+• Phương pháp tiền huấn luyện bất đối xứng cho VDU: Hai nhiệm vụ mới trên bộ mã hóa khuyến khích hợp tác tính năng đa phương thức cục bộ (nhiệm vụ Token-to-Line và nhiệm vụ Token-to-Grid) và một nhiệm vụ trên bộ giải mã §3.2.
+
+• Nhánh Hình ảnh đơn giản: DocFormerv2 có thể huấn luyện end-to-end và không dựa vào mạng phát hiện đối tượng được tiền huấn luyện cho các tính năng hình ảnh, đơn giản hóa kiến trúc của nó. Trên năm nhiệm vụ VDU downstream khác nhau, DocFormerv2 đạt được kết quả tốt nhất §4.
+
+• Chúng tôi cũng cho thấy tính linh hoạt của DocFormerv2 bằng cách tinh chỉnh nó trên một lĩnh vực hoàn toàn khác - các bộ dữ liệu text-VQA mà không thay đổi việc tiền huấn luyện. DocFormerv2 đánh bại các đường cơ sở mạnh và đạt được số liệu tốt nhất trên ba bộ dữ liệu text-VQA trong số các kích thước mô hình tương tự. Cụ thể, trên Text-VQA, nó vượt trội hơn các mô hình lớn hơn nhiều như PaLi-3B +6.8%, PaLi-15B +1.5% và Flamingo [1] (+9.9%) (106x kích thước DocFormerv2 về số lượng tham số) theo độ chính xác tuyệt đối §4.5.
+
+Hơn nữa, chúng tôi đã tiến hành các thí nghiệm loại bỏ toàn diện để chứng minh lợi ích của các nhiệm vụ tiền huấn luyện của chúng tôi, khả năng phục hồi của mô hình đối với nhiễu đầu vào, và hiệu quả của nhánh hình ảnh đơn giản.
+
+2. Nghiên cứu Liên quan
+Nghiên cứu VDU đã thu hút sự chú ý đáng kể trong vài năm qua [2,8,15,16,23,25,33,36,38,39,52,53,60,63,65–67,70]. Các bài báo nghiên cứu được xuất bản nổi bật trong lĩnh vực này được liệt kê trong Bảng 1. Như có thể quan sát, trọng tâm nghiên cứu đã thiên lệch về các mô hình chỉ có bộ mã hóa. Trong khi TILT [53] đề xuất một transformer mã hóa-giải mã cho VDU, họ chỉ huấn luyện nó trên một nhiệm vụ tiền huấn luyện (mô hình hóa ngôn ngữ có mặt nạ) và cũng sử dụng CNN hình ảnh cồng kềnh. Phương pháp của chúng tôi DocFormerv2, không chỉ đơn giản hóa kiến trúc bằng cách không sử dụng một mô-đun hình ảnh riêng (dựa trên CNN hoặc Transformer) mà còn có nhiều nhiệm vụ tiền huấn luyện không giám sát.
+
+3. Phương pháp
+3.1. Kiến trúc
+DocFormerv2 (DFv2) là một kiến trúc transformer mã hóa-giải mã đa phương thức (xem hình 3). Ba biến thể của DFv2 được thiết kế - các biến thể nhỏ, cơ bản và lớn (xem bảng 2). DFv2 nhận đầu vào đa phương thức, hình ảnh của tài liệu I, văn bản Text được trích xuất bởi mô hình OCR cùng với tọa độ hộp giới hạn OCR như tính năng không gian S. DFv2 có
+
+Hình 3: Kiến trúc Tiền huấn luyện DocFormerv2. Sau khi tiền huấn luyện, hai đầu dự đoán (token-to-line và grid) trên bộ mã hóa được loại bỏ, phần còn lại của kiến trúc vẫn giữ nguyên cho các nhiệm vụ downstream. Đọc phần 3.1 để biết thêm chi tiết về Ts và Vs. Tất cả các thành phần đều có thể huấn luyện end-to-end. Xem tốt nhất ở màu.
+
+một bộ mã hóa đa phương thức thống nhất nơi các tính năng đa phương thức hợp nhất và căn chỉnh với sự trợ giúp của các nhiệm vụ tiền huấn luyện mới (xem §3.2).
+
+Tính năng hình ảnh: DFv2 có một nhánh hình ảnh đơn giản trái ngược với hầu hết các nghệ thuật VDU trước đây (hình 2). DFv2 tiêu thụ một chuỗi hình ảnh được làm phẳng như đầu vào hình ảnh. Cụ thể, cho v∈R3×h×w là hình ảnh của một tài liệu. Một V=linear(conv 2×2(v)) đơn giản được sử dụng để tạo ra một embedding hình ảnh. Các trọng số được khởi tạo ngẫu nhiên cho việc tiền huấn luyện. Vì tài liệu có xu hướng có nhiều khoảng trắng, lớp down-sampling tuyến tính tạo cơ hội cho mô hình chỉ giữ lại các tính năng hình ảnh liên quan. Dựa trên các thí nghiệm loại bỏ của chúng tôi (xem §12), phương pháp đơn giản này cho kết quả tốt hơn so với việc sử dụng các bộ mã hóa hình ảnh đắt tiền như Swin, ViT [13,44,57] hoặc các mạng phát hiện đối tượng cồng kềnh như các biến thể FRCNN [56] như đã được sử dụng trong các nghệ thuật VDU trước đây [2, 53, 68]. Vì các lớp transformer là bất biến hoán vị, một mã hóa vị trí 2D có thể học được Ps cũng được tính toán. Cuối cùng, Vs=V+Ps
+
+Tính năng ngôn ngữ: Cho t là văn bản dự đoán được trích xuất qua mô hình OCR cho một hình ảnh tài liệu. DFv2 sử dụng một tokenizer từ con sentence-piece [32] để có được các token ttok. Một giới hạn chuỗi tối đa s được áp dụng trong quá trình huấn luyện và kiểm tra, vì vậy nếu số lượng token OCR lớn hơn s, phần còn lại sẽ bị bỏ qua. Nếu độ dài chuỗi nhỏ hơn s, chuỗi được đệm. Các token OCR ttok được gửi đến một lớp embedding có thể học được Wt để tạo ra một embedding văn bản T=Wt(ttok).
+
+Tính năng không gian: Cho mỗi từ OCR ti, mô hình OCR
+
+model dim ff # attn. H # lớp (E,D) # params
+small 512 2048 8 6,6 66M
+base 768 3072 12 12,12 232M
+large 1024 4096 16 24,24 750M
+
+Bảng 2: Các biến thể DocFormerv2: dim là chiều embedding. ff là chiều đầu ra của lớp feed-forward. E là bộ mã hóa và D là bộ giải mã. attn. H là đầu attention.
+
+dự đoán vị trí hộp giới hạn của nó trong dạng chuẩn hóa bi = (x1, y1, x3, y3). Thông tin này được mã hóa sử dụng bốn lớp embedding không gian có thể học được - Wx để mã hóa thông tin không gian ngang của từ xi, Wy cho tọa độ dọc yi, Wh cho chiều cao từ hi và Ww cho chiều rộng wi. Các tính năng không gian không chỉ mã hóa vị trí của một từ trong tài liệu mà còn cung cấp gợi ý về kích thước phông chữ của từ và do đó tầm quan trọng của nó trong tài liệu (thông qua hi và wi). Cụ thể, các tính năng không gian S=Wx(x1, x3) + Wy(y1, y3) + Wh(y3−y1) + Ww(x3−x1). Cuối cùng, Ts= T+S.
+
+Các tính năng khác: Các tính năng Ts và Vs là các phương thức khác nhau (hình 3). Vì mô hình không biết nó đang được cung cấp đầu vào đa phương thức, một embedding có thể học được khác Wm được sử dụng để cung cấp gợi ý cho mô hình về đầu vào đa phương thức. Một embedding-phương thức Wm học các sắc thái của các phương thức khác nhau, tạo ra embedding Mv cho phương thức hình ảnh và Mt cho văn bản. Cuối cùng, T=Ts+Mt và V=Vs+Mv. T và V được nối theo chiều chuỗi để tạo thành chuỗi đầu vào cho bộ mã hóa DFv2.
+
+Hình 4: Token-to-Line
+Hình 5: Token-to-Grid 4x4
+
+3.2. Tiền huấn luyện Tài liệu Không giám sát
+Trong DocFormerv2, chúng tôi tuân theo thực hành đã được thiết lập tốt của tiền huấn luyện không giám sát sau đó là tinh chỉnh nhiệm vụ downstream. Hơn nữa, với ý định thu được lợi ích tối đa từ tiền huấn luyện không giám sát, chúng tôi thiết kế các nhiệm vụ tiền huấn luyện như một proxy gần với các nhiệm vụ downstream. Chúng tôi bây giờ mô tả hai nhiệm vụ tiền huấn luyện mới được sử dụng trên bộ mã hóa và nhiệm vụ mô hình hóa ngôn ngữ trên bộ giải mã. Cả ba nhiệm vụ đều được thực hiện cùng lúc và tổn thất cuối cùng là một kết hợp tuyến tính của cả ba tổn thất cho mỗi lần lặp.
+
+Nhiệm vụ Token-to-Line trên Bộ mã hóa: Chúng tôi chia sẻ trực giác rằng đối với các nhiệm vụ VDU, việc căn chỉnh tính năng ngữ nghĩa cục bộ là quan trọng. Hầu hết thông tin liên quan cho dự đoán khóa-giá trị trong biểu mẫu hoặc VQA đều nằm trên cùng một dòng hoặc các dòng liền kề của tài liệu ví dụ: xem hình 4, để dự đoán giá trị cho "TOTAL" (hộp a), mô hình phải nhìn vào cùng dòng (bên phải - "$4.32" hộp d). Chúng tôi dạy mô hình thông tin vị trí tương đối giữa các token. Để triển khai, chúng tôi chọn ngẫu nhiên hai token ngôn ngữ và yêu cầu mô hình dự đoán số dòng giữa chúng. Hơn nữa, vì một tài liệu có thể có số dòng văn bản tùy ý, nhiệm vụ được lượng tử hóa. tức là chỉ có ba nhãn: {0, 1, 2}. Tất cả các cặp token cách nhau hơn 2 dòng được gắn nhãn là 2 vì các token xa không có khả năng liên quan và mô hình nên học cách bỏ qua chúng. Giả sử rằng a, b, c, d (hình 4) là các dòng. Cho F là hàm đầu bộ mã hóa DFv2 cố gắng dự đoán nhãn cho nhiệm vụ này. thì:
+F(a, d) = 0; F(a, b) = 1; F(b, c) = 2 (1)
+
+Dựa trên việc loại bỏ (bảng 10), nhiệm vụ này mang lại lợi ích +2.2% trên nhiệm vụ DocVQA. Tổn thất cho nhiệm vụ này được theo dõi như Ltol.
+
+Nhiệm vụ Token-to-Grid trên Bộ mã hóa: Thông tin ngữ nghĩa khác nhau được tập trung trong các vùng khác nhau của tài liệu. Ví dụ, a) Trong một tài liệu tài chính, khối trên cùng chứa tiêu đề, khối giữa chứa thông tin cần điền và khối dưới cùng thường chứa các yếu tố chân trang/hướng dẫn. b) Số trang thường ở trên cùng hoặc dưới cùng. c) Trong biên lai/hóa đơn, tên công ty thường ở trên cùng. Nội dung của tài liệu được trình bày theo bố cục và cấu trúc hình ảnh phải được tính đến để hiểu chính xác. Dựa trên trực giác này, nhiệm vụ này ghép ngữ nghĩa ngôn ngữ với vị trí (hình ảnh, không gian hoặc cả hai) trong tài liệu. Cụ thể, tài liệu được chia ảo thành lưới m x n. Mỗi token OCR được gán một số lưới và DFv2 được giao nhiệm vụ dự đoán số lưới cho mỗi token. Cho mỗi token OCR ti, vị trí góc trên-trái (x1, y1) của nó được sử dụng để xác định số lưới gi của nó. Các lưới theo thứ tự quét raster, vì vậy nếu một token cụ thể nằm trên ranh giới của nhiều lưới, thứ tự quét được sử dụng để phân biệt. Nếu một token nằm trên ranh giới của tọa độ hình ảnh chuẩn hóa, chúng bị bỏ qua để dự đoán. Xem hình 5 để visualize. Cụ thể, chúng ta có:
+gi=⌊x1/∆x⌋+⌊y1/∆y⌋ · m,
+
+trong đó ∆x và ∆y là chiều rộng và chiều cao của mỗi lưới, tương ứng, và m là số lưới trong một hàng. Tổn thất Ltog.
+
+Mô hình hóa Ngôn ngữ trên Bộ giải mã: Vì các dự đoán VDU nằm trong lĩnh vực ngôn ngữ, hiểu biết ngôn ngữ tạo thành một thành phần quan trọng của việc tiền huấn luyện DFv2. Chúng tôi thực hiện mô hình hóa ngôn ngữ có mặt nạ khử nhiễu được phổ biến bởi T5 [55]. Trong quá trình tiền huấn luyện, không chỉ các token đầu vào được MASKED ngẫu nhiên mà các tính năng không gian (được đề cập trong §3.1) của nó cũng được mặt nạ. Việc mặt nạ các tính năng không gian S cho các token bị mặt nạ làm cho việc dự đoán lưới và dự đoán dòng khó khăn vì mô hình không có thông tin vị trí 2D của các token bị mặt nạ. Nó phải suy ra từ ngữ cảnh khả dụng khác. Tổn thất cho thao tác này được ký hiệu là Ldlm.
+
+Tổn thất tiền huấn luyện cuối cùng: Tổn thất cuối cùng là một kết hợp tuyến tính của cả ba tổn thất tiền huấn luyện tức là Lfinal =k∗Ltol+ l∗Ltog+m∗Ldlm, trong đó k, l, m được xác định theo kinh nghiệm.
+
+Nhiệm vụ Downstream: Khi việc tiền huấn luyện hoàn thành, chúng tôi loại bỏ các đầu dự đoán tuyến tính token-to-line và token-to-grid. Phần còn lại của mô hình được tiền huấn luyện được tinh chỉnh trên dữ liệu huấn luyện downstream tương ứng.
+
+4. Thí nghiệm
+Chi tiết triển khai: Theo các nghệ thuật trước đây [2, 5, 25, 53, 66, 68], chúng tôi sử dụng bộ dữ liệu Industrial Document Library (IDL)1 để tiền huấn luyện. IDL là một bộ sưu tập tài liệu công nghiệp được lưu trữ bởi UCSF. Nó lưu trữ hàng triệu tài liệu được tiết lộ công khai từ các ngành công nghiệp khác nhau như thuốc lá, ma túy, thực phẩm, v.v. Dữ liệu từ trang web bao gồm khoảng 13M tài liệu, chuyển đổi thành khoảng 70M trang của các hình ảnh tài liệu khác nhau. Chúng tôi tiếp tục trích xuất OCR cho mỗi tài liệu. Dữ liệu được làm sạch và khoảng 6M tài liệu bị cắt bỏ, 64M hình ảnh tài liệu và văn bản OCR kết quả (với tọa độ không gian) được sử dụng để tiền huấn luyện không giám sát. Phân phối dữ liệu cho IDL 64M được trình bày trong phần bổ sung.
+
+Thí nghiệm downstream: Mô hình được tinh chỉnh trên tập huấn luyện được cung cấp và các số liệu được báo cáo trên tập validation/test tương ứng. Không có việc tinh chỉnh siêu tham số cụ thể cho bộ dữ liệu nào được thực hiện. Đây là một lợi thế của phương pháp của chúng tôi và chúng tôi tin rằng các số liệu có thể cao hơn nếu việc tinh chỉnh cụ thể cho bộ dữ liệu được thực hiện. Chi tiết về các bộ dữ liệu tinh chỉnh có trong phần bổ sung. Chúng tôi đã sử dụng Pytorch [51] và thư viện Huggingface [61].
+
+Metrics Đánh giá: Một metric đánh giá cụ thể cho bộ dữ liệu được áp dụng. Đối với DocVQA [49], InfoVQA [47], ST-VQA [7], Average Normalized Levenshtein Similarity (ANLS) [6] được sử dụng. ANLS đo lường sự tương đồng giữa kết quả dự đoán và ground truth và có phạm vi từ (0,100). Đối với FUNSD [27], CORD [58], điểm F1 được sử dụng. Đối với TextVQA [59] và OCR-VQA [50], độ chính xác được sử dụng. Trong tất cả các metric, cao hơn thì tốt hơn.
+
+4.1. Table VQA
+TabFact [9, 70]: Bộ dữ liệu này nghiên cứu hiểu biết bảng và xác minh sự thật với bằng chứng bán cấu trúc trên các bảng được thu thập từ Wikipedia. Các câu lệnh kéo theo và bác bỏ tương ứng với một hàng hoặc ô duy nhất được chuẩn bị bởi các tác giả của TabFact [9]. Nhiệm vụ này đặt ra thách thức do sự phức tạp của lý luận ngôn ngữ và không gian liên quan. Trong Bảng 3, chúng ta có thể thấy rằng DocFormerv2 vượt trội hơn các nghệ thuật trước đây với một biên độ lớn (+4.3%).
+
+Model dữ liệu tiền huấn luyện #param TabFact Acc. (%)
+phương pháp dựa trên chỉ văn bản / (văn bản + tính năng không gian):
+T5large[55] - 750M 58.9
+T5large+U [70] - 750M 76.0
+T5large+2D [70] - 750M 58.0
+T5large+2D+U [70] - 750M 78.6
+phương pháp dựa trên hình ảnh + văn bản + tính năng không gian:
+LayoutLMv3 large[25] 11M 368M 78.1
+UDOP [60] 11M 794M 78.9
+DocFormerv2 large 64M 750M 83.2 (+4.3%)
+
+Bảng 3: So sánh trên Bộ dữ liệu Table VQA [70]: Công trình của chúng tôi, DocFormerv2 vượt trội hơn nghệ thuật tốt nhất trước đây.
+
+4.2. Document VQA
+DocVQA [49] và InfographicsVQA [47] là các bộ dữ liệu cho nhiệm vụ VQA tài liệu. DocVQA [49] tập trung vào VQA cho các tài liệu công nghiệp thực tế và đòi hỏi mô hình hiểu hình ảnh, văn bản, bảng, biểu mẫu, v.v. InfographicsVQA [47] tập trung vào VQA cho infographics và đòi hỏi mô hình hiểu biểu đồ/đồ thị, văn bản, bố cục, hình ảnh. Một mô hình cần lý luận đa phương thức để tạo ra câu trả lời cho dữ liệu này. Vui lòng xem phần bổ sung để biết thống kê dữ liệu và mẫu.
+
+Model dữ liệu tiền huấn luyện #param DocVQA test ANLS (%) InfoVQA test ANLS (%)
+phương pháp dựa trên chỉ hình ảnh:
+Donut base[30] 13M 143M 67.5 11.5
+Pix2Struct large[34] 80M 1.3B 76.6 40.0
+phương pháp dựa trên chỉ văn bản / (văn bản + tính năng không gian):
+T5large[55] - 750M 70.4 36.7
+T5large+U [70] - 750M 76.3 37.1
+T5large+2D [70] - 750M 69.8 39.2
+T5large+2D+U [70] - 750M 81.0 46.1
+phương pháp dựa trên hình ảnh + văn bản + tính năng không gian:
+LayoutLMv3 large[25] 11M 368M 83.4 45.1
+UDOP [60] 11M 794M 84.7 47.4
+LayoutLMv2†large[67] 11M 426M 86.7 -
+TILT†large[53] 1.1M 780M 87.05 -
+DocFormerv2 large 64M 750M 87.2 -
+DocFormerv2†large 64M 750M 87.84 (+0.79%) 48.8 (+1.4%)
+
+Bảng 4: So sánh trên Bộ dữ liệu Document VQA [47,49]: Công trình của chúng tôi, DocFormerv2 vượt trội hơn nghệ thuật tốt nhất trước đây. † chỉ việc huấn luyện với dữ liệu VQA tài liệu bổ sung.
+
+Theo thực hành thông thường [53, 67, 70], chúng tôi huấn luyện DocFormerv2 trên sự kết hợp của tập huấn luyện và validation và thực hiện đánh giá trên tập test cho mỗi bộ dữ liệu. Ngoài ra, chúng tôi cũng tuân theo [53, 67] để huấn luyện DocFormerv2 trên một bộ dữ liệu VQA tài liệu bổ sung với 850k cặp câu hỏi-trả lời và sau đó tinh chỉnh trên DocVQA/InfographicsVQA để có độ chính xác cao hơn.
+
+DocFormerv2 vượt trội (Bảng 4) so với nghệ thuật tốt nhất trước đây cho VQA tài liệu ngay cả khi không sử dụng bất kỳ dữ liệu tiền huấn luyện VQA tài liệu bổ sung nào. Sau khi tiền huấn luyện trên dữ liệu bổ sung, DocFormerv2 vượt qua nghệ thuật tốt nhất trước đây 0.79% trên DocVQA và 1.4% trên InfographicsVQA, điều này xác nhận hiệu quả của phương pháp của chúng tôi.
+
+4.3. Nhiệm vụ Gắn nhãn Chuỗi
+Chúng tôi nghiên cứu hiệu suất của DocFormerv2 trên nhiệm vụ gắn nhãn thực thể ngữ nghĩa (tức là nhóm các token thuộc cùng một lớp). Chúng tôi kiểm tra mô hình trên bộ dữ liệu FUNSD [27], là một bộ dữ liệu biểu mẫu chứa 199 tài liệu có nhiễu (149 hình ảnh để huấn luyện, 50 hình ảnh để kiểm tra). Có bốn lớp: question, answer, header, và other. Chúng tôi đo hiệu suất cấp thực thể bằng điểm F1 (Bảng 5). Chuỗi đầu vào cho Docformerv2 bao gồm các văn bản riêng lẻ như prompts và tất cả văn bản tài liệu như ngữ cảnh, và chuỗi bộ giải mã chứa các văn bản thực thể và nhãn dự đoán. Docformerv2 đạt được 88.89% điểm F1 (Bảng 5), và vượt trội hơn các phương pháp hiện có mà không sử dụng các prior hộp thực thể trong tiền huấn luyện và tinh chỉnh (các mô hình màu xám trong bảng).
+
+Model #param Precision Recall F1
+phương pháp dựa trên chỉ hình ảnh:
+Dessurt base[11] 127M - - 65.0
+phương pháp dựa trên chỉ văn bản / (văn bản + tính năng không gian):
+BERT base[12] 109M 54.69 61.71 60.26
+RoBERTa base[42] 125M 63.49 69.75 66.48
+UniLMv2 base[4] 125M 63.49 69.75 66.48
+LayoutLMv1 base[66] 113M 76.12 81.55 78.66
+BROS base[22] 139M 80.56 81.88 81.21
+BERT large[12] 340M 61.13 70.85 65.63
+RoBERTa large[42] 355M 67.80 73.91 70.72
+UniLMv2 large[4] 355M 67.80 73.91 70.72
+LayoutLMv1 large[66] 343M 75.36 80.61 77.89
+StructuralLM large[36] 355M 83.52 86.81 85.14
+FormNet [33] 217M 85.21 84.18 84.69
+phương pháp dựa trên hình ảnh + văn bản + tính năng không gian:
+LayoutLMv1 base[66] 160M 76.77 81.95 79.27
+LayoutLMv2 base[67] 200M 80.29 85.39 82.76
+LayoutLMv2 large[67] 426M 83.24 85.19 84.20
+DocFormer base[2] 183M 80.76 86.09 83.34
+DocFormer large[2] 536M 82.29 86.94 84.55
+SelfDoc [39] - - - 83.36
+UDoc [15] 272M - - 87.93
+StrucTexT [40] ✢ 107M 85.68 80.97 83.09
+LayoutLMv3 base[25]❅ 133M 77.39 81.65 79.46
+LayoutLMv3 large[25]❅ 368M 81.35 83.75 82.53
+LayoutLMv3 base[25]❍ 133M 89.55 91.65 90.29
+LayoutLMv3 large[25]❍ 368M 92.19 92.10 92.08
+UDOP [60] ❍ 794M - - 91.62
+DocFormerv2 base 232M 89.15 87.6 88.37
+DocFormerv2 large 750M 89.88 87.92 88.89
+
+Bảng 5: So sánh FUNSD: DocFormerv2 làm tốt hơn các mô hình cùng kích thước và so sánh tốt với cả các mô hình lớn hơn. ✢ không sử dụng phân chia train/test chuẩn, và kết quả không được so sánh trực tiếp với các mô hình khác. ❍ sử dụng dòng OCR (không phải hộp từ) như vị trí 2D cho các từ, và sử dụng hộp thực thể như vị trí 2D cho mỗi từ trong quá trình tinh chỉnh và kiểm tra, và do đó kết quả không thể so sánh trực tiếp. ❅ là kết quả bằng cách sử dụng hộp từ như vị trí 2D cho mỗi từ như các đối thủ cạnh tranh khác làm.
+
+4.4. Nhiệm vụ Trích xuất Thực thể
+Chúng tôi đánh giá DocFormerv2 cho nhiệm vụ trích xuất thực thể trên bộ dữ liệu CORD. CORD [58] bao gồm 1000 biên lai (800/100/100 hình ảnh cho train/val/test). Nó định nghĩa 30 trường chi tiết dưới 4 danh mục thô. Để trích xuất tất cả thực thể, trong chuỗi đầu vào, chúng tôi thêm câu hỏi "What are entities of <CLASS>?" trước tất cả các token ngữ cảnh văn bản. Đầu ra của bộ giải mã bao gồm tất cả thực thể được tách bằng token phân tách. Theo metric đánh giá chuẩn cho trích xuất thực thể, chúng tôi đo hiệu suất cấp thực thể bằng điểm F1. Docformerv2 (Bảng 6) đạt được 97.7% điểm F1, và vượt trội hơn các phương pháp hiện có. Docformerv2 cho phép giải mã nhiều thực thể theo cách tự hồi quy cho thấy mô hình có thể học cả cấu trúc nội-thực thể và liên-thực thể.
+
+Model #param Precision Recall F1
+phương pháp dựa trên chỉ văn bản / (văn bản + tính năng không gian):
+BERT base[12] 109M 88.33 91.07 89.68
+UniLMv2 base[4] 125M 89.87 91.98 90.92
+SPADE [26] - - - 91.50
+LayoutLMv1 base[66] 113M 94.37 95.08 94.72
+BROS base[22] 139M 95.58 95.14 95.36
+BERT large[12] 340M 88.86 91.68 90.25
+RoBERTa large[42] 355M - - 93.80
+UniLMv2 large[4] 355M 91.23 92.89 92.05
+LayoutLMv1 large[66] 343M 94.32 95.54 94.93
+FormNet [33] 345M 98.02 96.55 97.28
+phương pháp dựa trên hình ảnh + văn bản + tính năng không gian:
+LayoutLMv2 base[67] 200M 94.53 95.39 94.95
+LayoutLMv2 large[67] 426M 95.65 96.37 96.01
+TILT base[53]❍ 230M - - 95.11
+TILT large[53]❍ 780M - - 96.33
+DocFormer base[2] 183M 96.52 96.14 96.33
+DocFormer large[2] 536M 97.25 96.74 96.99
+UDoc [15] 272M - - 96.86
+LayoutLMv3 base[25]❅ 133M 92.92 94.31 93.61
+LayoutLMv3 large[25]❅ 368M 96.78 96.78 96.78
+LayoutLMv3 base[25]❍ 133M - - 96.56
+LayoutLMv3 large[25]❍ 368M - - 97.46
+UDOP [60] ❍ 794M - - 97.58
+DocFormerv2 base 232M 97.51 96.10 96.80
+DocFormerv2 large 750M 97.71 97.70 97.70
+
+Bảng 6: So sánh bộ dữ liệu CORD [58]. Chúng tôi trình bày Precision, Recall, F1 cấp thực thể trên tập test. ❍ sử dụng dòng OCR (không phải hộp từ) như vị trí 2D cho các từ, và sử dụng hộp thực thể như vị trí 2D cho mỗi từ trong tinh chỉnh và kiểm tra, và do đó kết quả không thể so sánh trực tiếp. ❅ là kết quả bằng cách sử dụng hộp từ như vị trí 2D cho mỗi từ như các đối thủ cạnh tranh khác làm.
+
+4.5. Thí nghiệm Tổng quát hóa - Scene-Text VQA
+Trong phần này, chúng tôi cho thấy sức mạnh của DocFormerv2 trên một nhiệm vụ khác - Text-VQA. Không giống như hiểu tài liệu tập trung vào hình ảnh tài liệu, nhiệm vụ Text-VQA trả lời câu hỏi cho hình ảnh tự nhiên với văn bản cảnh. Chúng tôi tinh chỉnh các mô hình được tiền huấn luyện tài liệu của chúng tôi trên ba bộ dữ liệu Text-VQA. Chúng tôi nhấn mạnh rằng không có việc tiền huấn luyện hình ảnh-văn bản nào được thực hiện trên DocFormerv2, nó chỉ đơn giản được tinh chỉnh trên bộ dữ liệu huấn luyện Text-VQA tương ứng. Ba bộ dữ liệu Text-VQA phổ biến được sử dụng - OCR-VQA
+
+Model dữ liệu tiền huấn luyện #param Val Acc. (%) Test Acc. (%)
+Blk+CNN+W2V - - - 48.3
+M4C [24] - 200M 63.5 63.9
+LaAP [17] - - 63.8 64.1
+LaTr base[5] 64M 311 67.5 67.9
+GIT base 10M 129M 57.3 57.5
+GIT large 20M 347M 62.4 62.9
+GIT 800M 681M 67.8 68.1
+GIT2✢[64] 12.9B 5.1B - 70.3
+DocFormerv2 base 64M 232M 69.7 70.3
+DocFormerv2 large 64M 750M 71.1 71.5 (+3.4%)
+
+Bảng 7: So sánh trên OCR-VQA [50]: DocFormerv2 tốt hơn SOTA trước đây (+3.4%). In đậm chỉ tốt nhất và gạch chân chỉ nghệ thuật tốt nhất trước đây. GIT2 ✢: sử dụng dữ liệu VQA bổ sung (tổng hợp của 8 bộ dữ liệu VQA).
+
+[50], TextVQA [59] và ST-VQA [7], mỗi bộ có các đường cơ sở mạnh từ cộng đồng thị giác-ngôn ngữ (như là thực hành chuẩn bởi Text-VQA chúng tôi có nghĩa là bất kỳ bộ dữ liệu VQA văn bản cảnh nào trong khi TextVQA đề cập đến một bộ dữ liệu cụ thể). Vui lòng xem phần bổ sung để biết phân tích bộ dữ liệu. Đối với OCR-VQA, chúng tôi tinh chỉnh các mô hình của chúng tôi trên tập huấn luyện và thực hiện đánh giá trên tập validation và test. Đối với TextVQA và ST-VQA, theo các phương pháp tốt nhất trước đây [5, 69], chúng tôi tinh chỉnh các mô hình của chúng tôi trên sự kết hợp của các tập huấn luyện TextVQA và ST-VQA và thực hiện đánh giá trên tập validation và test của mỗi bộ dữ liệu. Bảng 7, 8, 9 cho thấy rằng mô hình kích thước lớn của chúng tôi vượt trội hơn phương pháp tốt nhất trước đây có kích thước so sánh được LaTr [5] +3.4%, +2.4% và +2.2% trên tập test OCR-VQA, TextVQA, và ST-VQA tương ứng. Những kết quả này cho thấy phương pháp của chúng tôi tổng quát hóa vượt ra ngoài các nhiệm vụ hiểu tài liệu.
+
+Phân tích: Đáng ngạc nhiên, trên OCR-VQA, DocFormerv2 large thậm chí còn hoạt động tốt hơn GIT2 [64] là một mô hình kích thước 5.1B (so với 750M cho DocFormerv2 large) và sử dụng dữ liệu 12.9B để tiền huấn luyện (so với 64M cho DocFormerv2 large). Trên TextVQA, DocFormerv2 làm tốt hơn một số mô hình thị giác-ngôn ngữ lớn hơn nhiều và đã được tiền huấn luyện trên nhiều dữ liệu hơn. Trên tập test, nó tốt hơn (+9.9%) so với Flamingo (có 80B có 106x số lượng tham số). Trên tập validation, nó tốt hơn PaLi-3B và 15B (+2.2%, +6.8%) tương ứng. GIT2 và PaLi-17B thực sự hoạt động tốt hơn nó. (GIT2 cũng sử dụng 8 bộ dữ liệu VQA để huấn luyện). DocFormerv2 có được hiệu suất này mà không có bất kỳ tiền huấn luyện hình ảnh-văn bản tự nhiên nào. Chúng tôi trình bày điều này như bằng chứng rằng DocFormerv2 là một phương pháp tốt để giải quyết vấn đề này với mô hình nhỏ hơn nhiều và ít dữ liệu hơn nhiều.
+
+Model dữ liệu tiền huấn luyện #param Val Acc. (%) Test Acc. (%)
+M4C [24] - 200M 47.8 -
+LaAP [17] - - 41.0 41.4
+SA-M4C [28] - 200M 45.4 44.6
+SMA - - 44.6 45.5
+SceneGate [46] - - 42.4 44.0
+SC-Net [14] - - 44.8 45.7
+LOGOS [45] - - 51.5 51.1
+TAP + TAG [62] - - 53.6 53.7
+TAP [69] - 200M 54.7 54.0
+TAP Two-Stage [35] - 200M 55.9 55.3
+Flamingo [1] 2.3B★ 80B 57.1 54.1
+PreSTU [29] 13M 237M - 56.3
+LaTr base[5] 64M 311M 58.0 58.9
+LaTr†base[5] 64M 311 59.5 59.6
+LaTr†large[5] 64M 856M 61.0 61.6
+GIT base 10M❍ 129M 18.8 -
+GIT large 20M❍ 347M 37.5 -
+GIT 800M❍ 681M 59.9 59.8
+GIT2✢[64] 12.9B❍ 5.1B 68.4 67.3
+PaLi-3B [10] 1.6B❍ 3B 58.8 -
+PaLi-15B [10] 1.6B❍ 15B 64.1 -
+PaLi-17B [10] 1.6B❍ 17B 70.5 73.1
+DocFormerv2†base 64M 232M 61.6 60.0
+DocFormerv2†large 64M 750M 65.6 64.0 (+2.4%)
+
+Bảng 8: So sánh trên TextVQA [59]: † chỉ mô hình sử dụng sự kết hợp của tập huấn luyện ST-VQA và TextVQA để huấn luyện mô hình. GIT2 ✢: dữ liệu bổ sung được sử dụng (tổng hợp của 8 bộ dữ liệu VQA) ★: dữ liệu video-văn bản. ❍: dữ liệu hình ảnh-văn bản độc quyền. Các hàng màu xám hiển thị các mô hình lớn hơn nhiều (# tham số ≥3x tham số DFv2 large) và sử dụng lượng lớn dữ liệu bên ngoài. DFv2 large vẫn vượt trội hơn Flamingo (+9.9%), Pali-3B (+6.8%) và Pali-15B (+1.5%) models.
+
+Model dữ liệu tiền huấn luyện #param Val ANLS (%) Test ANLS (%)
+M4C [24] - 200M 47.2 46.2
+LaAP [17] - - 49.7 48.5
+SA-M4C [28] - 200M 51.2 50.4
+SceneGate [46] - - 52.5 51.6
+LOGOS [45] - - 58.1 57.9
+TAP [69] 200M 59.8 59.7
+TAP + TAG [62] - - 62.0 60.2
+PreSTU [29] 13M 237M - 65.5
+LaTr base[5] 64M 311M 67.5 66.8
+LaTr†base[5] 64M 311M 68.3 68.4
+LaTr†large[5] 64M 856M 70.2 69.6
+GIT base 10M❍ 129M 20.7 -
+GIT large 20M❍ 347M 44.6 -
+GIT 800M❍ 681M 69.1 69.6
+DocFormerv2†base 64M 232M 70.1 68.4
+DocFormerv2†large 64M 750M 72.9 71.8 (+2.2%)
+
+Bảng 9: So sánh trên ST-VQA [7]: † chỉ sự kết hợp của tập huấn luyện ST-VQA và TextVQA được sử dụng.
+
+5. Thí nghiệm Loại bỏ
+Loại bỏ các nhiệm vụ tiền huấn luyện mới của DFv2: Bảng 10 cho thấy việc loại bỏ DFv2 trên các nhiệm vụ tiền huấn luyện mới được đề xuất và huấn luyện đa phương thức. Nhiệm vụ mô hình hóa ngôn ngữ khử nhiễu và các tính năng không gian được đề cập trong §3.1 được áp dụng cho tất cả kiến trúc. Lưu ý, việc loại bỏ này được thực hiện trên DFv2-small với tiền huấn luyện 1M doc.
+
+Model Loại bỏ Bộ dữ liệu DocVQA (ANLS)
+baseline B 69
+B + V 70.5 (+1.5)
+B + V + L 71.2 (+2.2)
+B + V + G 71.7 (+2.7)
+B + V + L + G 73.0 (+4.0)
+
+Bảng 10: Loại bỏ Nhiệm vụ Tiền huấn luyện DocFormerv2: Tác động của ba nhiệm vụ tiền huấn luyện trên bốn nhiệm vụ downstream so với baseline. B: baseline, V: chỉ với các tính năng Hình ảnh §3.1, L: với tiền huấn luyện dự đoán Token-to-Line §3.2, G: với tiền huấn luyện dự đoán Token-to-Grid §3.2.
+
+Tác động Tiền huấn luyện hay Phương pháp Tốt hơn? DFv2 được tiền huấn luyện với 64M tài liệu trong khi các nghệ thuật trước đây như LayoutLMv2 [67] được tiền huấn luyện chỉ với 11M tài liệu.
+
+Model # dữ liệu tiền huấn luyện Bộ dữ liệu FUNSD CORD
+LayoutLMv2 base[67] 11M 82.7 94.9
+DocFormerv2 base 11M 86.1 (+3.4%) 96.2 (+1.3%)
+DocFormerv2 base 64M 87.9 (+5.2%) 96.8 (+1.9%)
+DocFormerv2†base 64M 88.3 (+5.6%) 96.8 (+1.9%)
+
+Bảng 11: Loại bỏ Dữ liệu Tiền huấn luyện DocFormerv2: Tác động của việc huấn luyện với số lượng dữ liệu tiền huấn luyện khác nhau trên các nhiệm vụ downstream khác nhau. Điểm F1 được báo cáo. † chỉ sự kết hợp của tập huấn luyện ST-VQA và TextVQA được sử dụng.
+
+Để xem liệu lợi ích của DFv2 đến từ dữ liệu tiền huấn luyện nhiều hơn hay phương pháp tốt hơn, chúng tôi loại bỏ. Bảng 11 cho thấy rằng DFv2 base vượt trội hơn LayoutLMv2 base khi được tiền huấn luyện trên cùng một lượng dữ liệu. Chúng tôi cũng thấy DFv2 cải thiện hiệu suất khi được cung cấp nhiều dữ liệu tiền huấn luyện hơn (64M). Bảng cho thấy rằng phương pháp tiền huấn luyện bất đối xứng DFv2 mới là một phương pháp VDU vượt trội.
+
+Độ Bền với Lỗi OCR. DFv2 tiêu thụ văn bản OCR có thể có lỗi. Vì nó cũng có bộ giải mã tạo sinh, về mặt lý thuyết nó có khả năng bền vững với các biến dạng và nhiễu nhất định từ văn bản OCR. Để định lượng mức độ bền vững, chúng tôi tiến hành một nghiên cứu sử dụng bộ dữ liệu FUNSD và giới thiệu một cách nhân tạo nhiễu/lỗi đánh máy vào các từ đầu vào, mô phỏng lỗi OCR. Cụ thể, đối với mỗi ký tự trong văn bản, chúng tôi thay thế ngẫu nhiên nó bằng một ký tự lỗi với xác suất p, giới hạn tối đa 1 lỗi ký tự mỗi từ. Sau đó chúng tôi đánh giá hiệu suất của các mô hình DocFormerv2 base và LayoutLMv2 base trên văn bản có lỗi được chèn để quan sát khả năng phục hồi của chúng đối với nhiễu như vậy. Từ Hình 6, chúng ta thấy rằng đối với lượng lỗi OCR được chèn tăng lên. Cụ thể, 20% lỗi OCR chỉ giảm hiệu suất -1.68% trong khi mô hình chỉ có bộ mã hóa giảm với biên độ rộng -9.84%. Điều này cho thấy lợi ích của phương pháp của chúng tôi (trong việc có bộ giải mã tạo sinh).
+
+Hình 6: Loại bỏ Lỗi OCR Được Chèn. Hiệu suất điểm F1 được đánh giá trên FUNSD cho các mức độ lỗi OCR được chèn khác nhau.
+
+Thay đổi Token Hình ảnh. Việc nối các token hình ảnh cùng với các token văn bản là một phương pháp đơn giản và trực quan để mô hình học cách nắm bắt chung thông tin đa phương thức. Tuy nhiên, vì chúng ta bị hạn chế về tổng số token có thể sử dụng, điều này đặt ra câu hỏi - tỷ lệ phù hợp của token hình ảnh-văn bản để sử dụng cho thiết kế này là gì? Chúng tôi thực hiện các loại bỏ trong vấn đề này để đo hiệu suất thu được bằng cách tinh chỉnh mô hình trên FUNSD
+
+Hình 7: Loại bỏ độ dài token hình ảnh. Ảnh hưởng đến hiệu suất mô hình đối với sự thay đổi của tỷ lệ token thị giác với token văn bản được cung cấp làm đầu vào cho mô hình. 128 hoạt động tốt nhất và được sử dụng như thiết kế mô hình cuối cùng.
+
+Hình 8: Loại bỏ Token-to-Grid. Cách các kích thước lưới khác nhau được sử dụng cho nhiệm vụ tiền huấn luyện Token-to-Grid ảnh hưởng đến hiệu suất mô hình trên DocVQA. 4x4 có vẻ tốt nhất và được sử dụng cho tất cả tiền huấn luyện cuối cùng.
+
+bộ dữ liệu với các tỷ lệ khác nhau của token thị giác với token văn bản. Hình 7 cho thấy rằng 128 token hình ảnh dường như cung cấp hiệu suất tốt nhất so với các cài đặt khác.
+
+Chúng ta có cần bộ mã hóa Hình ảnh riêng không? Chúng tôi điều tra xem cách DFv2 tiêu thụ các tính năng hình ảnh có tối ưu cho VDU hay không. Thay vì sử dụng các tính năng tuyến tính, chúng tôi sử dụng Swinv2 [43] và tiền huấn luyện thiết lập này trên 1M tài liệu. Khi được tinh chỉnh trên DocVQA, chúng tôi quan sát rằng thiết lập với Swinv2 như backbone hình ảnh, hoạt động kém hơn đáng kể so với phương pháp của chúng tôi (+4.3%). Đối với nhiệm vụ này, các tính năng hình ảnh phức tạp từ Swinv2 ít có lợi hơn so với các tính năng tuyến tính đơn giản của chúng tôi.
+
+Model image encoder DocVQA [49] eval ANLS (%)
+baseline - 69.0
+DocFormerv2 small Swinv2 small[43] 66.2
+DocFormerv2 small Linear (của chúng tôi) 70.5 (+4.3%)
+
+Bảng 12: Loại bỏ Bộ mã hóa Hình ảnh: Tất cả các mô hình được tiền huấn luyện trên 1M docs từ IDL. Swinv2 cũng được tiền huấn luyện và tinh chỉnh.
+
+Kích thước lưới đúng cho tiền huấn luyện Token-to-Grid? Trong §3.2, chúng tôi trình bày nhiệm vụ tiền huấn luyện Token-to-Grid mới. Trong phần loại bỏ tiền huấn luyện này §10, nhiệm vụ này được quan sát để cung cấp lợi ích. Ở đây kích thước lưới ảo phù hợp được xác định theo kinh nghiệm. Từ Hình 8, lưới 4x4 có vẻ tối ưu. Các cấu trúc lưới nhỏ hơn hoặc bất đối xứng (4x1) dường như gây hại. Ở đầu kia, nếu lưới quá chi tiết (12x12, 8x8), hiệu suất dường như cũng bị tổn hại. Tất cả các mô hình được tiền huấn luyện trên DFv2 small và 1M tài liệu từ IDL, với Vision và Token-to-line được kích hoạt.
+
+6. Kết luận
+Công trình DocFormerv2 của chúng tôi nêu bật tầm quan trọng của hai nhiệm vụ tiền huấn luyện mới và hiệu quả của việc làm phong phú các biểu diễn bộ mã hóa với thông tin ngữ nghĩa cục bộ thông qua các nhiệm vụ tiền huấn luyện. Chúng tôi thực hiện thí nghiệm trên tám bộ dữ liệu khác nhau (năm trên VDU và ba trên scene-text VQA) đạt được số liệu tốt nhất trên tất cả bộ dữ liệu. Dựa trên các loại bỏ, chúng tôi cũng cho thấy các lựa chọn thiết kế khác nhau và tác động của nó đến hiệu suất downstream.
+
+Tài liệu tham khảo
+[1] Jean-Baptiste Alayrac, Jeff Donahue, Pauline Luc, Antoine Miech, Iain Barr, Yana Hasson, Karel Lenc, Arthur Mensch, Katie Millican, Malcolm Reynolds, Roman Ring, Eliza Rutherford, Serkan Cabi, Tengda Han, Zhitao Gong, Sina Samangooei, Marianne Monteiro, Jacob Menick, Sebastian Borgeaud, Andy Brock, Aida Nematzadeh, Sahand Sharifzadeh, Mikolaj Binkowski, Ricardo Barreira, Oriol Vinyals, Andrew Zisserman, và Karen Simonyan. Flamingo: một mô hình ngôn ngữ hình ảnh cho học few-shot. ArXiv, abs/2204.14198, 2022. 1, 2, 7
+
+[2] Srikar Appalaraju, Bhavan Jasani, Bhargava Urala Kota, Yusheng Xie, và R Manmatha. Docformer: Transformer end-to-end cho hiểu tài liệu. Trong Proceedings of the IEEE/CVF International Conference on Computer Vision, trang 993–1003, 2021. 1, 2, 3, 4, 6
+
+[3] Srikar Appalaraju, Yi Zhu, Yusheng Xie, và István Fehérvári. Hướng tới các thực hành tốt trong học biểu diễn tự giám sát. Neural Information Processing Systems (NeurIPS Self-Supervision Workshop 2020), 2020. 1
+
+[4] Hangbo Bao, Li Dong, Furu Wei, Wenhui Wang, Nan Yang, Xiaodong Liu, Yu Wang, Songhao Piao, Jianfeng Gao, Ming Zhou, và Hsiao-Wuen Hon. Unilmv2: Các mô hình ngôn ngữ giả-mặt nạ cho tiền huấn luyện mô hình ngôn ngữ thống nhất, 2020. 6
+
+[5] Ali Furkan Biten, Ron Litman, Yusheng Xie, Srikar Appalaraju, và R Manmatha. Latr: Transformer nhận thức bố cục cho scene-text vqa. Trong Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition, trang 16548–16558, 2022. 1, 4, 6, 7
+
+[6] Ali Furkan Biten, Ruben Tito, Andres Mafla, Lluis Gomez, Marçal Rusinol, Minesh Mathew, CV Jawahar, Ernest Valveny, và Dimosthenis Karatzas. Cuộc thi icdar 2019 về trả lời câu hỏi hình ảnh văn bản cảnh. Trong 2019 International Conference on Document Analysis and Recognition (ICDAR), trang 1563–1570, 2019. 5
+
+[7] Ali Furkan Biten, Ruben Tito, Andres Mafla, Lluis Gomez, Marçal Rusinol, Ernest Valveny, CV Jawahar, và Dimosthenis Karatzas. Trả lời câu hỏi hình ảnh văn bản cảnh. Trong Proceedings of the IEEE/CVF international conference on computer vision, trang 4291–4301, 2019. 5, 7
+
+[8] Jingye Chen, Tengchao Lv, Lei Cui, Changrong Zhang, và Furu Wei. Xdoc: Tiền huấn luyện thống nhất cho hiểu tài liệu đa định dạng. Trong Conference on Empirical Methods in Natural Language Processing, 2022. 2
+
+[9] Wenhu Chen, Hongmin Wang, Jianshu Chen, Yunkai Zhang, Hong Wang, SHIYANG LI, Xiyou Zhou, và William Yang Wang. Tabfact: Một bộ dữ liệu quy mô lớn cho xác minh sự thật dựa trên bảng. ArXiv, abs/1909.02164, 2019. 1, 5
+
+[10] Xi Chen, Xiao Wang, Soravit Changpinyo, A. J. Piergiovanni, Piotr Padlewski, Daniel M. Salz, Sebastian Goodman, Adam Grycner, Basil Mustafa, Lucas Beyer, Alexander Kolesnikov, Joan Puigcerver, Nan Ding, Keran Rong, Hassan Akbari, Gaurav Mishra, Linting Xue, Ashish V. Thapliyal, James Bradbury, Weicheng Kuo, Mojtaba Seyedhosseini, Chao Jia, Burcu Karagol Ayan, Carlos Riquelme, Andreas Steiner, Anelia Angelova, Xiaohua Zhai, Neil Houlsby, và Radu Soricut. Pali: Một mô hình ngôn ngữ-hình ảnh đa ngữ được chia tỷ lệ chung. ArXiv, abs/2209.06794, 2022. 1, 2, 7
+
+[11] Brian L. Davis, B. Morse, Bryan Price, Chris Tensmeyer, Curtis Wigington, và Vlad I. Morariu. Nhận dạng và hiểu tài liệu end-to-end với dessurt. Trong ECCV Workshops, 2022. 6
+
+[12] Jacob Devlin, Ming-Wei Chang, Kenton Lee, và Kristina Toutanova. Bert: Tiền huấn luyện các transformer hai chiều sâu cho hiểu ngôn ngữ. arXiv preprint arXiv:1810.04805, 2018. 6
+
+[13] Alexey Dosovitskiy, Lucas Beyer, Alexander Kolesnikov, Dirk Weissenborn, Xiaohua Zhai, Thomas Unterthiner, Mostafa Dehghani, Matthias Minderer, Georg Heigold, Sylvain Gelly, và những người khác. Một hình ảnh đáng giá 16x16 từ: Transformer cho nhận dạng hình ảnh ở quy mô. Trong International Conference on Learning Representations, 2020. 2, 3
+
+[14] Chengyang Fang, Gangyan Zeng, Yu Zhou, Daiqing Wu, Can Ma, Dayong Hu, và Weiping Wang. Hướng tới thoát khỏi thiên vị ngôn ngữ và lỗi ocr: Trả lời câu hỏi hình ảnh văn bản tập trung ngữ nghĩa. 2022 IEEE International Conference on Multimedia and Expo (ICME), trang 01–06, 2022. 7
+
+[15] Jiuxiang Gu, Jason Kuen, Vlad I. Morariu, Handong Zhao, Nikolaos Barmpalios, R. Jain, Ani Nenkova, và Tong Sun. Khung tiền huấn luyện thống nhất cho hiểu tài liệu. ArXiv, abs/2204.10939, 2022. 2, 6
+
+[16] Zhangxuan Gu, Changhua Meng, Ke Wang, Jun Lan, Weiqiang Wang, Ming Gu, và Liqing Zhang. Xylayoutlm: Hướng tới mạng đa phương thức nhận thức bố cục cho hiểu tài liệu giàu hình ảnh. 2022 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR), trang 4573–4582, 2022. 2
+
+[17] Wei Han, Hantao Huang, và Tao Han. Tìm bằng chứng: Dự đoán câu trả lời nhận thức định vị cho trả lời câu hỏi hình ảnh văn bản. Trong Proceedings of the 28th International Conference on Computational Linguistics, trang 3118–3131, 2020. 6, 7
+
+[18] Xiaoshuai Hao, Yi Zhu, Srikar Appalaraju, Aston Zhang, Wanqian Zhang, Boyang Li, và Mu Li. Mixgen: Một phương pháp tăng cường dữ liệu đa phương thức mới. Trong IEEE WACV 2023 - Pre train Workshop, tập abs/2206.08358, 2023. 1
+
+[19] Adam W Harley, Alex Ufkes, và Konstantinos G Derpanis. Đánh giá mạng tích chập sâu cho phân loại và truy xuất hình ảnh tài liệu. Trong International Conference on Document Analysis and Recognition (ICDAR). 1
+
+[20] Kaiming He, Xiangyu Zhang, Shaoqing Ren, và Jian Sun. Học Tàn dư Sâu cho Nhận dạng Hình ảnh. Trong CVPR. 2016. 2
+
+[21] Chih-Hui Ho, Srikar Appalaraju, Bhavan Jasani, R Manmatha, và Nuno Vasconcelos. Yoro-lightweight end to end visual grounding. Trong European Conference on Computer Vision - ECCV CAMP Workshop, 2022. 1
+
+[22] Teakgyu Hong, DongHyun Kim, Mingi Ji, Wonseok Hwang, Daehyun Nam, và Sungrae Park. Bros: Một mô hình ngôn ngữ được tiền huấn luyện để hiểu văn bản trong tài liệu. under review https://openreview.net/references/pdf?id=uCz3OR6CJT, 2020. 2, 6
+
+[23] Teakgyu Hong, DongHyun Kim, Mingi Ji, Wonseok Hwang, Daehyun Nam, và Sungrae Park. Bros: Một mô hình ngôn ngữ được tiền huấn luyện để hiểu văn bản trong tài liệu. https://openreview.net/forum?id=punMXQEsPr0, 2020. 2
+
+[24] Ronghang Hu, Amanpreet Singh, Trevor Darrell, và Marcus Rohrbach. Dự đoán câu trả lời lặp với transformer đa phương thức tăng cường con trỏ cho textvqa. Trong Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition, trang 9992–10002, 2020. 6, 7
+
+[25] Yupan Huang, Tengchao Lv, Lei Cui, Yutong Lu, và Furu Wei. Layoutlmv3: Tiền huấn luyện cho document ai với che mặt văn bản và hình ảnh thống nhất. arXiv preprint arXiv:2204.08387, 2022. 2, 4, 5, 6
+
+[26] Wonseok Hwang, Jinyeong Yim, Seunghyun Park, Sohee Yang, và Minjoon Seo. Phân tích cú pháp phụ thuộc không gian cho trích xuất thông tin tài liệu bán cấu trúc, 2020. 6
+
+[27] Guillaume Jaume, Hazim Kemal Ekenel, và Jean-Philippe Thiran. Funsd: Một bộ dữ liệu cho hiểu biểu mẫu trong tài liệu quét có nhiễu. 2019 International Conference on Document Analysis and Recognition Workshops (ICDARW), 2:1–6, 2019. 1, 5
+
+[28] Yash Kant, Dhruv Batra, Peter Anderson, Alexander Schwing, Devi Parikh, Jiasen Lu, và Harsh Agrawal. Transformer đa phương thức nhận thức không gian cho textvqa. Trong European Conference on Computer Vision, trang 715–732, 2020. 7
+
+[29] Jihyung Kil, Soravit Changpinyo, Xi Chen, Hexiang Hu, Sebastian Goodman, Wei-Lun Chao, và Radu Soricut. Prestu: Tiền huấn luyện cho hiểu văn bản cảnh. ArXiv, abs/2209.05534, 2022. 7
+
+[30] Geewook Kim, Teakgyu Hong, Moonbin Yim, Jeongyeon Nam, Jinyoung Park, Jinyeong Yim, Wonseok Hwang, Sangdoo Yun, Dongyoon Han, và Seunghyun Park. Transformer hiểu tài liệu không cần ocr. Trong European Conference on Computer Vision, 2021. 5
+
+[31] Wonjae Kim, Bokyung Son, và Ildoo Kim. Vilt: Transformer thị giác-và-ngôn ngữ không có tích chập hoặc giám sát vùng. Trong ICML, 2021. 1
+
+[32] Taku Kudo và John Richardson. Sentencepiece: Một tokenizer và detokenizer từ con đơn giản và độc lập ngôn ngữ cho xử lý văn bản thần kinh. Trong Conference on Empirical Methods in Natural Language Processing, 2018. 3
+
+[33] Chen-Yu Lee, Chun-Liang Li, Timothy Dozat, Vincent Perot, Guolong Su, Nan Hua, Joshua Ainslie, Renshen Wang, Yasuhisa Fujii, và Tomas Pfister. Formnet: Mã hóa cấu trúc vượt ra ngoài mô hình hóa tuần tự trong trích xuất thông tin tài liệu biểu mẫu. Trong Annual Meeting of the Association for Computational Linguistics, 2022. 2, 6
+
+[34] Kenton Lee, Mandar Joshi, Iulia Turc, Hexiang Hu, Fangyu Liu, Julian Martin Eisenschlos, Urvashi Khandelwal, Peter Shaw, Ming-Wei Chang, và Kristina Toutanova. Pix2struct: Phân tích ảnh chụp màn hình như tiền huấn luyện cho hiểu ngôn ngữ hình ảnh. ArXiv, abs/2210.03347, 2022. 5
+
+[35] Bingjia Li, Jie Wang, Minyi Zhao, và Shuigeng Zhou. Hợp nhất đa phương thức hai giai đoạn cho trả lời câu hỏi hình ảnh dựa trên văn bản hiệu suất cao. Trong Asian Conference on Computer Vision, 2022. 7
+
+[36] Chenliang Li, Bin Bi, Ming Yan, Wei Wang, Songfang Huang, Fei Huang, và Luo Si. Structurallm: Tiền huấn luyện cấu trúc cho hiểu biểu mẫu. Trong Proceedings of the 59th Annual Meeting of the Association for Computational Linguistics and the 11th International Joint Conference on Natural Language Processing (Volume 1: Long Papers), trang 6309–6318, 2021. 2, 6
+
+[37] Chenge Li, István Fehérvári, Xiaonan Zhao, Ives Macêdo, và Srikar Appalaraju. Seetek: Nhận dạng logo mở rộng quy mô rất lớn với học metric nhận thức văn bản. 2022 IEEE/CVF Winter Conference on Applications of Computer Vision (WACV), trang 587–596, 2022. 1
+
+[38] Junlong Li, Yiheng Xu, Lei Cui, và Furu Wei. Markuplm: Tiền huấn luyện văn bản và ngôn ngữ đánh dấu cho hiểu tài liệu giàu hình ảnh. Trong Annual Meeting of the Association for Computational Linguistics, 2021. 2
+
+[39] Peizhao Li, Jiuxiang Gu, Jason Kuen, Vlad I. Morariu, Handong Zhao, R. Jain, Varun Manjunatha, và Hongfu Liu. Selfdoc: Học biểu diễn tài liệu tự giám sát. 2021 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR), trang 5648–5656, 2021. 2, 6
+
+[40] Yulin Li, Yuxi Qian, Yuechen Yu, Xiameng Qin, Chengquan Zhang, Yan Liu, Kun Yao, Junyu Han, Jingtuo Liu, và Errui Ding. Structext: Hiểu văn bản có cấu trúc với transformer đa phương thức. Trong Proceedings of the 29th ACM International Conference on Multimedia, 2021. 6
+
+[41] Ron Litman, Oron Anschel, Shahar Tsiper, Roee Litman, Shai Mazor, và R Manmatha. Scatter: Bộ nhận dạng văn bản cảnh chú ý ngữ cảnh chọn lọc. Trong Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition, trang 11962–11972, 2020. 1
+
+[42] Yinhan Liu, Myle Ott, Naman Goyal, Jingfei Du, Mandar Joshi, Danqi Chen, Omer Levy, Mike Lewis, Luke Zettlemoyer, và Veselin Stoyanov. Roberta: Một phương pháp tiền huấn luyện bert được tối ưu hóa mạnh mẽ. arXiv preprint arXiv:1907.11692, 2019. 6
+
+[43] Ze Liu, Han Hu, Yutong Lin, Zhuliang Yao, Zhenda Xie, Yixuan Wei, Jia Ning, Yue Cao, Zheng Zhang, Li Dong, Furu Wei, và Baining Guo. Swin transformer v2: Mở rộng dung lượng và độ phân giải. 2022 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR), trang 11999–12009, 2021. 8
+
+[44] Ze Liu, Yutong Lin, Yue Cao, Han Hu, Yixuan Wei, Zheng Zhang, Stephen Lin, và Baining Guo. Swin transformer: Transformer thị giác phân cấp sử dụng cửa sổ dịch chuyển. 2021 IEEE/CVF International Conference on Computer Vision (ICCV), trang 9992–10002, 2021. 2, 3
+
+[45] Xiaopeng Lu, Zhen Fan, Yansen Wang, Jean Oh, và Carolyn P Rosé. Localizegroup, and select: Tăng cường text-vqa bằng mô hình hóa văn bản cảnh. Trong Proceedings of the IEEE/CVF International Conference on Computer Vision, trang 2631–2639, 2021. 7
+
+[46] Siwen Luo, Feiqi Cao, Felipe Weason Núñez, Zean Wen, Josiah Poon, và Caren Han. Scenegate: Mạng đồng chú ý dựa trên đồ thị cảnh cho trả lời câu hỏi hình ảnh văn bản. ArXiv, abs/2212.08283, 2022. 7
+
+[47] Minesh Mathew, Viraj Bagal, Rubèn Tito, Dimosthenis Karatzas, Ernest Valveny, và CV Jawahar. Infographicvqa. Trong Proceedings of the IEEE/CVF Winter Conference on Applications of Computer Vision, trang 1697–1706, 2022. 5
+
+[48] Minesh Mathew, Dimosthenis Karatzas, và CV Jawahar. Docvqa: Một bộ dữ liệu cho vqa trên hình ảnh tài liệu. Trong Proceedings of the IEEE/CVF Winter Conference on Applications of Computer Vision, trang 2200–2209, 2021. 1
+
+[49] Minesh Mathew, Dimosthenis Karatzas, R. Manmatha, và C. V. Jawahar. DocVQA: Một bộ dữ liệu cho vqa trên hình ảnh tài liệu, 2020. 1, 5, 8
+
+[50] Anand Mishra, Shashank Shekhar, Ajeet Kumar Singh, và Anirban Chakraborty. Ocr-vqa: Trả lời câu hỏi hình ảnh bằng cách đọc văn bản trong hình ảnh. Trong 2019 international conference on document analysis and recognition (ICDAR), trang 947–952. IEEE, 2019. 5, 6, 7
+
+[51] Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory Chanan, Trevor Killeen, Zeming Lin, Natalia Gimelshein, Luca Antiga, và những người khác. Pytorch: Một thư viện học sâu mệnh lệnh, hiệu suất cao. arXiv preprint arXiv:1912.01703, 2019. 5
+
+[52] Qiming Peng, Yinxu Pan, Wenjin Wang, Bin Luo, Zhenyu Zhang, Zhengjie Huang, Teng Hu, Weichong Yin, Yongfeng Chen, Yin Zhang, và những người khác. Ernie-layout: Tiền huấn luyện tăng cường kiến thức bố cục cho hiểu tài liệu giàu hình ảnh. arXiv preprint arXiv:2210.06155, 2022. 2
+
+[53] Rafał Powalski, Łukasz Borchmann, Dawid Jurkiewicz, Tomasz Dwojak, Michał Pietruszka, và Gabriela Pałka. Đi full-tilt boogie về hiểu tài liệu với transformer văn bản-hình ảnh-bố cục. Trong International Conference on Document Analysis and Recognition, trang 732–747, 2021. 2, 3, 4, 5, 6
+
+[54] Alec Radford, Jong Wook Kim, Chris Hallacy, Aditya Ramesh, Gabriel Goh, Sandhini Agarwal, Girish Sastry, Amanda Askell, Pamela Mishkin, Jack Clark, Gretchen Krueger, và Ilya Sutskever. Học các mô hình hình ảnh có thể chuyển giao từ giám sát ngôn ngữ tự nhiên. Trong International Conference on Machine Learning, 2021. 1
+
+[55] Colin Raffel, Noam M. Shazeer, Adam Roberts, Katherine Lee, Sharan Narang, Michael Matena, Yanqi Zhou, Wei Li, và Peter J. Liu. Khám phá giới hạn của học chuyển giao với transformer text-to-text thống nhất. ArXiv, abs/1910.10683, 2019. 4, 5
+
+[56] Shaoqing Ren, Kaiming He, Ross B. Girshick, và Jian Sun. Faster r-cnn: Hướng tới phát hiện đối tượng thời gian thực với mạng đề xuất vùng. IEEE Transactions on Pattern Analysis and Machine Intelligence, 39:1137–1149, 2015. 3
+
+[57] Olaf Ronneberger, Philipp Fischer, và Thomas Brox. U-net: Mạng tích chập cho phân đoạn hình ảnh y sinh. ArXiv, abs/1505.04597, 2015. 3
+
+[58] Park Seunghyun, Shin Seung, Lee Bado, Lee Junyeop, Surh Jaeheung, Seo Minjoon, và Lee Hwalsuk. Cord: Một bộ dữ liệu biên lai hợp nhất cho phân tích post-ocr. 2019. 1, 5, 6
+
+[59] Amanpreet Singh, Vivek Natarajan, Meet Shah, Yu Jiang, Xinlei Chen, Dhruv Batra, Devi Parikh, và Marcus Rohrbach. Hướng tới các mô hình vqa có thể đọc. Trong Proceedings of the IEEE/CVF conference on computer vision and pattern recognition, trang 8317–8326, 2019. 5, 7
+
+[60] Zineng Tang, Ziyi Yang, Guoxin Wang, Yuwei Fang, Yang Liu, Chenguang Zhu, Michael Zeng, Chao-Yue Zhang, và Mohit Bansal. Thống nhất thị giác, văn bản, và bố cục cho xử lý tài liệu toàn diện. ArXiv, abs/2212.02623, 2022. 2, 5, 6
+
+[61] Wolf Thomas, Debut Lysandre, Sanh Victor, Chaumond Julien, Delangue Clement, Moi Anthony, Cistac Pierric, Rault Tim, Louf Rémi, Morgan Funtowicz, và những người khác. Transformers của Huggingface: Xử lý ngôn ngữ tự nhiên tốt nhất. arXiv preprint arXiv:1910.03771, 2019. 5
+
+[62] Jun Wang, Mingfei Gao, Yuqian Hu, Ramprasaath R Selvaraju, Chetan Ramaiah, Ran Xu, Joseph F JaJa, và Larry S Davis. Tag: Tăng cường text-vqa thông qua tạo câu hỏi-trả lời hình ảnh nhận thức văn bản. arXiv preprint arXiv:2208.01813, 2022. 7
+
+[63] Jiapeng Wang, Lianwen Jin, và Kai Ding. Lilt: Một transformer bố cục đơn giản nhưng hiệu quả độc lập ngôn ngữ cho hiểu tài liệu có cấu trúc. Trong Annual Meeting of the Association for Computational Linguistics, 2022. 2
+
+[64] Jianfeng Wang, Zhengyuan Yang, Xiaowei Hu, Linjie Li, Kevin Lin, Zhe Gan, Zicheng Liu, Ce Liu, và Lijuan Wang. Git: Một transformer tạo hình ảnh-văn bản cho thị giác và ngôn ngữ. arXiv preprint arXiv:2205.14100, 2022. 1, 2, 6, 7
+
+[65] Zilong Wang, Yichao Zhou, Wei Wei, Chen-Yu Lee, và Sandeep Tata. Một benchmark cho trích xuất có cấu trúc từ tài liệu phức tạp. ArXiv, abs/2211.15421, 2022. 2
+
+[66] Yiheng Xu, Minghao Li, Lei Cui, Shaohan Huang, Furu Wei, và Ming Zhou. Layoutlm: Tiền huấn luyện văn bản và bố cục cho hiểu hình ảnh tài liệu. Trong Proceedings of the 26th ACM SIGKDD International Conference on Knowledge Discovery & Data Mining, trang 1192–1200, 2020. 2, 4, 6
+
+[67] Yang Xu, Yiheng Xu, Tengchao Lv, Lei Cui, Furu Wei, Guoxin Wang, Yijuan Lu, Dinei Florencio, Cha Zhang, Wanxiang Che, và những người khác. Layoutlmv2: Tiền huấn luyện đa phương thức cho hiểu tài liệu giàu hình ảnh. arXiv preprint arXiv:2012.14740, 2020. 2, 5, 6, 7, 8
+
+[68] Yang Xu, Yiheng Xu, Tengchao Lv, Lei Cui, Furu Wei, Guoxin Wang, Yijuan Lu, Dinei Florencio, Cha Zhang, Wanxiang Che, và những người khác. Layoutlmv2: Tiền huấn luyện đa phương thức cho hiểu tài liệu giàu hình ảnh. Trong Proceedings of the 59th Annual Meeting of the Association for Computational Linguistics and the 11th International Joint Conference on Natural Language Processing (Volume 1: Long Papers), trang 2579–2591, 2021. 3, 4
+
+[69] Zhengyuan Yang, Yijuan Lu, Jianfeng Wang, Xi Yin, Dinei Florencio, Lijuan Wang, Cha Zhang, Lei Zhang, và Jiebo Luo. Tap: Tiền huấn luyện nhận thức văn bản cho text-vqa và text-caption. Trong Proceedings of the IEEE/CVF conference on computer vision and pattern recognition, trang 8751–8761, 2021. 7
+
+[70] Łukasz Borchmann, Michał Pietruszka, Tomasz Stanisławek, Dawid Jurkiewicz, Michał P. Turski, Karolina Szyndler, và Filip Gralinski. Due: Benchmark hiểu tài liệu end-to-end. Trong NeurIPS Datasets and Benchmarks, 2021. 2, 5
