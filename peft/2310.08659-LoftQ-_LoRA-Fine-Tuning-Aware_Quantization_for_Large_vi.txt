@@ -1,0 +1,201 @@
+LoftQ: Lượng tử hóa nhận biết tinh chỉnh LoRA cho các mô hình ngôn ngữ lớn
+
+Yixiao Li∗∗, Yifan Yu∗∗, Chen Liang, Pengcheng He,
+Nikos Karampatziakis, Weizhu Chen, Tuo Zhao∗
+29 tháng 11, 2023
+
+Tóm tắt
+
+Lượng tử hóa là một kỹ thuật không thể thiếu để phục vụ các mô hình ngôn ngữ lớn (LLM) và gần đây đã tìm được chỗ đứng trong việc tinh chỉnh LoRA (Dettmers et al., 2023). Trong công trình này, chúng tôi tập trung vào kịch bản mà lượng tử hóa và tinh chỉnh LoRA được áp dụng cùng nhau trên một mô hình đã được tiền huấn luyện. Trong những trường hợp như vậy, thường quan sát thấy một khoảng cách nhất quán về hiệu suất trên các tác vụ hạ nguồn giữa tinh chỉnh đầy đủ và phương pháp tinh chỉnh LoRA cộng lượng tử hóa. Để đáp ứng, chúng tôi đề xuất LoftQ (Lượng tử hóa nhận biết tinh chỉnh LoRA), một khung lượng tử hóa mới đồng thời lượng tử hóa một LLM và tìm ra khởi tạo thứ bậc thấp phù hợp cho tinh chỉnh LoRA. Việc khởi tạo như vậy giảm thiểu sự khác biệt giữa mô hình lượng tử hóa và mô hình độ chính xác đầy đủ và cải thiện đáng kể khả năng tổng quát hóa trong các tác vụ hạ nguồn. Chúng tôi đánh giá phương pháp của mình trên các tác vụ hiểu ngôn ngữ tự nhiên, trả lời câu hỏi, tóm tắt và sinh ngôn ngữ tự nhiên. Các thí nghiệm cho thấy phương pháp của chúng tôi rất hiệu quả và vượt trội hơn các phương pháp lượng tử hóa hiện tại, đặc biệt trong các chế độ độ chính xác hỗn hợp 2-bit và 2/4-bit đầy thách thức. Mã nguồn có sẵn tại https://github.com/yxli2123/LoftQ.
+
+1 Giới thiệu
+
+Sự xuất hiện của các mô hình ngôn ngữ đã được tiền huấn luyện (PLM) đã đánh dấu một sự chuyển đổi biến đổi trong lĩnh vực xử lý ngôn ngữ tự nhiên (NLP), cung cấp các giải pháp đa dạng cho nhiều ứng dụng khác nhau (He et al., 2021b; Lewis et al., 2019; Touvron et al., 2023). Chúng đã thể hiện năng lực vô song trong việc thực hiện nhiều tác vụ ngôn ngữ đa dạng, bao gồm hiểu ngôn ngữ tự nhiên (NLU) và sinh ngôn ngữ tự nhiên (NLG). Những mô hình này thường có hàng triệu hoặc thậm chí hàng tỷ tham số, đòi hỏi yêu cầu tính toán và bộ nhớ đáng kể. Tuy nhiên, nhu cầu tính toán và bộ nhớ rộng lớn của những mô hình này tạo ra những thách thức đáng kể, đặc biệt trong các triển khai thực tế nơi tài nguyên thường bị hạn chế và cần được chia sẻ giữa nhiều người dùng.
+
+Để giảm thiểu yêu cầu lưu trữ rộng lớn của các mô hình đã được tiền huấn luyện, lượng tử hóa đóng vai trò là một kỹ thuật nén then chốt (Zafrir et al., 2019; Shen et al., 2020; Bai et al., 2022; Dettmers et al., 2022), chuyển đổi các giá trị số độ chính xác cao thành một tập hợp rời rạc các giá trị. Thông thường, các tham số mô hình, ban đầu được lưu trữ ở định dạng số thực 16-bit, được chuyển đổi thành định dạng số nguyên 4-bit thông qua lượng tử hóa, dẫn đến giảm 75% chi phí lưu trữ. Ngoài ra, để tạo điều kiện thuận lợi cho việc thích ứng các mô hình đã được tiền huấn luyện và lượng tử hóa với các tác vụ hạ nguồn một cách hiệu quả, thích ứng thứ bậc thấp (LoRA) là một phương pháp khả thi (Hu et al., 2021). Kỹ thuật này là một phương pháp tinh chỉnh hiệu quả về tham số được áp dụng truyền thống cho các mô hình đã được tiền huấn luyện có độ chính xác cao. Nó dựa trên giả thuyết rằng sự khác biệt giữa các trọng số đã được tinh chỉnh đầy đủ và các trọng số đã được tiền huấn luyện thể hiện các tính chất thứ bậc thấp. Điều này cho phép những sự khác biệt này được biểu diễn bằng các ma trận thứ bậc thấp. Kết quả là, các trọng số đã được tiền huấn luyện ban đầu vẫn không thay đổi, với các thích ứng chỉ giới hạn trong những ma trận thứ bậc thấp này, cho phép thích ứng tác vụ hiệu quả.
+
+Khi lượng tử hóa các mô hình đã được tiền huấn luyện, các nhà thực hành thường tập trung chủ yếu vào kỹ thuật lượng tử hóa, vô tình bỏ qua tầm quan trọng của việc tinh chỉnh LoRA tiếp theo (Dettmers et al., 2023; Diao et al., 2023). Ví dụ, QLoRA kế thừa khởi tạo fixup (Zhang et al., 2019) được sử dụng trong LoRA, mà (Dettmers et al., 2023) gắn các bộ thích ứng thứ bậc thấp được khởi tạo zero (xem mục 2.3) vào mô hình đã được tiền huấn luyện và lượng tử hóa. Sự khác biệt không thể tránh khỏi được đưa ra bởi lượng tử hóa trong quá trình xấp xỉ các số độ chính xác cao ban đầu, một kịch bản đặc biệt rõ ràng trong các tình huống bit thấp như chế độ 2-bit, có thể ảnh hưởng tiêu cực đến việc khởi tạo tinh chỉnh LoRA. Như được minh họa trong hình 1a, mô hình đã được tiền huấn luyện và lượng tử hóa thu được bởi QLoRA thể hiện sự suy giảm nghiêm trọng dưới mức 3-bit. Sự lệch lạc trong khởi tạo này thường dẫn đến hiệu suất tinh chỉnh kém hơn. Như được minh họa trong hình 1b, hiệu suất tinh chỉnh giảm khi bit lượng tử hóa giảm khi áp dụng QLoRA. Hơn nữa, điều đáng chú ý là QLoRA thất bại dưới mức 3-bit.
+
+Trong bài báo này, chúng tôi giới thiệu một khung lượng tử hóa mới, được gọi là lượng tử hóa nhận biết tinh chỉnh LoRA (LoftQ). Nó được thiết kế đặc biệt cho các mô hình đã được tiền huấn luyện đòi hỏi lượng tử hóa và tinh chỉnh LoRA. Khung này tích cực tích hợp xấp xỉ thứ bậc thấp, làm việc song song với lượng tử hóa để cùng xấp xỉ các trọng số đã được tiền huấn luyện có độ chính xác cao ban đầu. Sự kết hợp này tăng cường đáng kể sự liên kết với các trọng số đã được tiền huấn luyện ban đầu như được minh họa trong hình 2. Do đó, phương pháp của chúng tôi cung cấp một điểm khởi tạo thuận lợi cho tinh chỉnh LoRA tiếp theo, dẫn đến cải thiện trong các tác vụ hạ nguồn.
+
+Chúng tôi đánh giá khung lượng tử hóa của mình bằng cách tiến hành các thí nghiệm rộng rãi trên các tác vụ hạ nguồn, chẳng hạn như NLU, trả lời câu hỏi, tóm tắt và NLG. Các thí nghiệm cho thấy LoftQ liên tục vượt trội hơn QLoRA ở tất cả các mức độ chính xác. Ví dụ, với lượng tử hóa 4-bit, chúng tôi đạt được 1,1 và 0,8 điểm cải thiện Rouge-1 cho XSum (Narayan et al., 2018) và CNN/DailyMail (Hermann et al., 2015), tương ứng. LoftQ vượt trội đặc biệt trong các kịch bản bit thấp và hoạt động hiệu quả với các phương pháp lượng tử hóa khác nhau. Ví dụ, chúng tôi đạt được hơn 8% cải thiện trên MNLI (Wang et al., 2019) và hơn 10% trên SQuADv1.1 (Rajpurkar et al., 2016) với cả lượng tử hóa đồng đều 2-bit NormalFloat và 2-bit. Chúng tôi chưa thấy phương pháp của mình hoạt động tệ hơn QLoRA.
+
+2 Nền tảng
+
+2.1 Mô hình Transformer
+
+Một mô hình transformer chứa một chuỗi các lớp, trong đó mỗi lớp gồm hai lớp con: một cơ chế chú ý tự đa đầu (MHA) và một mạng nơ-ron truyền thẳng kết nối đầy đủ (FFN) (Vaswani et al., 2017). Với đầu vào X∈Rn×d, trong đó n là độ dài chuỗi và d là chiều ẩn của mô hình, MHA tính toán h đầu chú ý song song:
+
+MHA(X) = Concat(head₁,...,headₕ)Wₒ,
+
+trong đó headᵢ=Softmax(XWqᵢ(XWkᵢ)⊤/√dₕ)XWvᵢ cho i=1,...,h,
+
+trong đó Wqᵢ,Wkᵢ,Wvᵢ∈Rd×dₕ là các ma trận truy vấn, khóa và giá trị, Wₒ∈Rd×d là ma trận đầu ra, và dₕ=d/h. FFN bao gồm hai phép biến đổi tuyến tính và một hàm kích hoạt, và được định nghĩa là FFN(X) = σ(XWf₁+b₁)Wf₂+b₂, trong đó Wf₁∈Rd×dₘ, Wf₂∈Rdₘ×d, và σ(·) là hàm kích hoạt. Một kết nối dư được sử dụng và theo sau bởi chuẩn hóa lớp.
+
+2.2 Lượng tử hóa
+
+Lượng tử hóa. Với một số độ chính xác cao, ví dụ như số thực dấu phẩy động 32-bit, XHP∈R, lượng tử hóa N-bit mã hóa nó thành một số nguyên XINT∈{0,1,...,2N-1}. Quá trình này có thể được biểu diễn như sau:
+
+XINT = round((2N-1)F(XHP)), (1)
+
+trong đó F(·):R→[0,1] là một hàm chuẩn hóa. Lượng tử hóa đồng đều giả định F(X) = (X-Xmin)/(Xmax-Xmin). Dettmers et al. (2023) đề xuất lượng tử hóa 4-bit NormalFloat (NF4). Nó giả định X∼N(0,σ²) và do đó F(X) = Φ(X/σ), trong đó Φ(·) là hàm phân phối tích lũy của phân phối chuẩn.
+
+Giải lượng tử hóa. Một bảng tra cứu T, trong đó
+
+T[i] = F⁻¹(i/(2N-1)), i = 0,1,...,2N-1, (2)
+
+được sử dụng để giải mã số nguyên XINT thành đối tác độ chính xác cao mô phỏng XD∈R. Do đó, giải lượng tử hóa có thể được biểu diễn như sau:
+
+XD = T[XINT]. (3)
+
+Lượng tử hóa mô phỏng cho ma trận. Mặc dù có thể thực hiện phép nhân trực tiếp giữa các biểu diễn lượng tử hóa, việc áp dụng lượng tử hóa mô phỏng cho ma trận là phổ biến (Bai et al., 2020; Shen et al., 2020). Ở đó, các ma trận trọng số lượng tử hóa được lưu trữ dưới dạng số nguyên được mã hóa trong bộ nhớ và được giải lượng tử hóa tạm thời thành các ma trận độ chính xác cao mô phỏng bởi bảng tra cứu khi tham gia vào các phép toán nhân. Trong lượng tử hóa mô phỏng, chỉ cần phân tích ánh xạ từ ma trận độ chính xác cao đến ma trận độ chính xác cao mô phỏng. Chúng tôi ký hiệu quá trình đầu cuối này bằng qN(·):Rm×n→Rm×n, trong đó RN = {T[i]∈R|0≤i<2N}.
+
+2.3 Thích ứng thứ bậc thấp
+
+LoRA (Hu et al., 2021) cập nhật hai ma trận trọng số nhỏ A và B được gắn vào ma trận trọng số đã được tiền huấn luyện bị đóng băng W. Do đó, một phép biến đổi tuyến tính, Y=XW, được tái cơ cấu thành
+
+Y = XW + XAB⊤, (4)
+
+trong đó X∈Rn×d₁, W∈Rd₁×d₂, A∈Rd₁×r, B∈Rd₂×r, và r≪min{d₁,d₂}. Ban đầu,
+
+A∼N(0,σ²), B=0, (5)
+
+để liên kết với các trọng số đã được tiền huấn luyện. Trong quá trình tinh chỉnh, W được cố định trong khi A và B được cập nhật bởi một phương pháp tối ưu hóa kiểu SGD.
+
+Đáng chú ý rằng nếu các bộ thích ứng thứ bậc thấp A và B được gắn vào một backbone lượng tử hóa Q=qN(W) và được khởi tạo bởi (5), trọng số bắt đầu Q+AB⊤ không còn bằng trọng số đã được tiền huấn luyện W do sự khác biệt được giới thiệu bởi lượng tử hóa.
+
+3 Phương pháp
+
+Chúng tôi đề xuất lượng tử hóa nhận biết tinh chỉnh LoRA (LoftQ), một khung lượng tử hóa cho LLM. Nó luân phiên áp dụng lượng tử hóa và xấp xỉ thứ bậc thấp để xấp xỉ các trọng số đã được tiền huấn luyện ban đầu. Khung lượng tử hóa này cung cấp một khởi tạo đầy hứa hẹn cho tinh chỉnh LoRA, giúp giảm thiểu sự khác biệt lượng tử hóa trong QLoRA và cải thiện khả năng tổng quát hóa trong các tác vụ hạ nguồn đáng kể.
+
+3.1 Lượng tử hóa nhận biết LoRA
+
+Chúng tôi sử dụng trọng số lượng tử hóa N-bit Q∈Rd₁×d₂ và xấp xỉ thứ bậc thấp A∈Rd₁×r, B∈Rd₂×r để xấp xỉ trọng số đã được tiền huấn luyện độ chính xác cao ban đầu W∈Rd₁×d₂ như khởi tạo của tinh chỉnh LoRA. Cụ thể, trước khi tinh chỉnh, chúng tôi khởi tạo mạng bằng cách tối thiểu hóa mục tiêu sau:
+
+min Q,A,B ||W - Q - AB⊤||F, (6)
+
+trong đó ||·||F ký hiệu chuẩn Frobenius. Mục tiêu này trong (6) xem xét tinh chỉnh LoRA bằng cách tối ưu hóa đồng thời các giá trị khởi tạo của backbone lượng tử hóa Q và các bộ thích ứng thứ bậc thấp A, B. Ngược lại, các nhà thực hành thường chuyển đổi trọng số đã được tiền huấn luyện W thành trọng số lượng tử hóa Q một cách trực tiếp, bỏ qua quá trình tinh chỉnh LoRA tiếp theo. Sự thiếu sót này dẫn đến sự suy giảm hiệu suất đáng kể trong các tác vụ hạ nguồn phát sinh từ sự khác biệt lượng tử hóa.
+
+3.2 Tối ưu hóa luân phiên
+
+Chúng tôi giải quyết vấn đề tối thiểu hóa trong (6) bằng cách luân phiên giữa lượng tử hóa và phân tích giá trị đơn (SVD). Để bắt đầu, chúng tôi đặt A₀ và B₀ bằng 0.
+
+Lượng tử hóa. Ở bước thứ t, chúng tôi lượng tử hóa sự khác biệt giữa trọng số đã được tiền huấn luyện ban đầu W và xấp xỉ thứ bậc thấp At-1B⊤t-1 từ bước trước để thu được trọng số lượng tử hóa Qt bằng
+
+Qt = qN(W - At-1B⊤t-1), (7)
+
+trong đó qN(·) ánh xạ ma trận trọng số độ chính xác cao thành ma trận lượng tử hóa.
+
+Chúng tôi lưu ý rằng thuật toán của chúng tôi tương thích với các hàm lượng tử hóa qN(·) khác nhau. Chúng tôi áp dụng NF4 và lượng tử hóa đồng đều trong phần 4 như các ví dụ. Chúng tôi cũng lưu ý rằng Qt không phải là nghiệm chính xác của phép tối thiểu hóa trong (6), với At-1B⊤t-1 cố định, nhưng nó là một xấp xỉ hiệu quả.
+
+SVD. Sau khi thu được trọng số lượng tử hóa thứ t Qt, SVD được áp dụng cho phần dư của lượng tử hóa ký hiệu bởi Rt = W - Qt bằng
+
+Rt = Σᵢ₌₁ᵈ σt,i ut,i v⊤t,i, (8)
+
+trong đó d = min{d₁,d₂}, σt,1 ≥ σt,2 ≥ ... ≥ σt,d là các giá trị đơn của Rt, ut,i và vt,i là các vectơ đơn trái và phải liên kết của Rt. Sau đó chúng tôi thu được xấp xỉ bậc r của Rt bằng AtB⊤t, trong đó
+
+At = [√σt,1 ut,1, ..., √σt,r ut,r],
+Bt = [√σt,1 vt,1, ..., √σt,r vt,r]. (9)
+
+Chúng tôi tóm tắt phương pháp của mình trong thuật toán 1. Đáng chú ý là T=1 là trường hợp đặc biệt trong đó Q₁ là trọng số lượng tử hóa chính xác thu được bởi QLoRA, và xấp xỉ thứ bậc thấp A₁, B₁ được thu được bởi SVD của phần dư lượng tử hóa W-Q₁. T=1 đủ để giảm thiểu sự khác biệt lượng tử hóa, và tối ưu hóa luân phiên giúp tìm ra khởi tạo gần hơn với trọng số đã được tiền huấn luyện W, điều này cải thiện thêm hiệu suất (xem phần 3).
+
+Chúng tôi lưu ý rằng chi phí tính toán của LoftQ là không đáng kể vì nó được áp dụng cho các ma trận trọng số riêng lẻ và do đó có thể được thực hiện song song. Chúng tôi cũng lưu ý rằng có thể áp dụng LoftQ chỉ một lần cho mô hình đã được tiền huấn luyện và tái sử dụng khởi tạo thu được bởi LoftQ cho các tác vụ hạ nguồn khác nhau.
+
+Thuật toán 1 LoftQ
+đầu vào: Trọng số đã được tiền huấn luyện W, bậc mục tiêu r, hàm lượng tử hóa N-bit qN(·), bước luân phiên T
+1: Khởi tạo A₀ ← 0, B₀ ← 0
+2: for t = 1 to T do
+3:    Thu được trọng số lượng tử hóa Qt ← qN(W - At-1B⊤t-1)
+4:    Thu được xấp xỉ thứ bậc thấp At, Bt ← SVD(W - Qt) bằng (9)
+5: end for
+đầu ra: QT, AT, BT
+
+3.3 Áp dụng cho tinh chỉnh LoRA
+
+Chúng tôi lưu trữ QT∈Rd₁×d₂ thu được bởi LoftQ sử dụng ma trận số nguyên M bằng (1) và bảng tra cứu T bằng (2). Chúng tôi khởi tạo backbone với ma trận số nguyên M và khởi tạo các bộ thích ứng thứ bậc thấp với AT, BT thu được bởi LoftQ.
+
+Trong quá trình tinh chỉnh LoRA, chúng tôi đóng băng trọng số số nguyên M và tối ưu hóa các bộ thích ứng thứ bậc thấp với thuật toán tối ưu hóa hiệu quả, ví dụ AdamW (Loshchilov và Hutter, 2017). Trong lan truyền tiến, trọng số số nguyên M được giải lượng tử hóa tạm thời thành trọng số độ chính xác cao mô phỏng QT bằng bảng tra cứu của nó, như được mô tả trong (3). Trong lan truyền ngược, gradient và trạng thái tối ưu hóa chỉ liên quan đến các bộ thích ứng thứ bậc thấp A, B, điều này giảm chi phí huấn luyện đáng kể.
+
+4 Thí nghiệm
+
+Chúng tôi đánh giá phương pháp của mình trên các tác vụ NLU và NLG. Chúng tôi áp dụng LoftQ để lượng tử hóa DeBERTaV3-base (He et al., 2021b), BART-large (Lewis et al., 2019), và chuỗi LLAMA-2 (Touvron et al., 2023).
+
+Chi tiết triển khai. Theo các công trình trước đây của các biến thể LoRA (Zhang et al., 2023; He et al., 2021a), chúng tôi đóng băng tất cả các ma trận trọng số backbone và thêm các bộ thích ứng thứ bậc thấp vào các ma trận trọng số trong MHA và FFN của tất cả các lớp. Chúng tôi lượng tử hóa các ma trận trọng số được gắn bởi các bộ thích ứng thứ bậc thấp. Tất cả các mô hình lượng tử hóa và bộ thích ứng được sử dụng trong bài báo này có sẵn trên https://huggingface.co/LoftQ. Triển khai của chúng tôi dựa trên mã nguồn công khai Huggingface Transformers (Paszke et al., 2019). Tất cả các thí nghiệm được tiến hành trên GPU NVIDIA A100.
+
+Phương pháp lượng tử hóa. Chúng tôi áp dụng hai phương pháp lượng tử hóa để chứng minh LoftQ tương thích với các hàm lượng tử hóa khác nhau:
+
+• Lượng tử hóa đồng đều là một phương pháp lượng tử hóa cổ điển. Nó chia đồng đều một khoảng liên tục thành 2N danh mục và lưu trữ giá trị tuyệt đối lớn nhất cục bộ để giải lượng tử hóa.
+
+• NF4 và biến thể 2-bit NF2 là các phương pháp lượng tử hóa được sử dụng trong QLoRA (Dettmers et al., 2023). Chúng giả định rằng các giá trị độ chính xác cao được rút ra từ phân phối Gaussian và ánh xạ những giá trị này thành các slot rời rạc có xác suất bằng nhau.
+
+Chúng tôi thực hiện lượng tử hóa 2-bit và 4-bit trên tất cả các mô hình, đạt tỷ lệ nén 25-30% và 15-20% ở mức 4-bit và 2-bit, tương ứng. Tỷ lệ nén và tỷ lệ tham số có thể huấn luyện cho tất cả các mô hình được trình bày chi tiết trong phụ lục A.
+
+Đường cơ sở. Chúng tôi so sánh LoftQ với các phương pháp đường cơ sở sau:
+
+• Tinh chỉnh đầy đủ là phương pháp phổ biến nhất để thích ứng mô hình đã được tiền huấn luyện với các tác vụ hạ nguồn. Mô hình được khởi tạo với trọng số đã được tiền huấn luyện và tất cả các tham số được cập nhật thông qua phương pháp tối ưu hóa kiểu SGD.
+
+• LoRA độ chính xác đầy đủ (LoRA) là phương pháp nhẹ cho thích ứng tác vụ, trong đó nó lưu trữ backbone sử dụng số 16-bit và chỉ tối ưu hóa các bộ thích ứng thứ bậc thấp. Các bộ thích ứng được áp dụng cho cùng các ma trận như trong LoftQ.
+
+• QLoRA tương tự như LoRA ngoại trừ backbone được lượng tử hóa thành chế độ bit thấp. Các bộ thích ứng thứ bậc thấp được khởi tạo bằng (5) và được áp dụng cho cùng các ma trận như trong LoftQ.
+
+4.1 Mô hình chỉ mã hóa: DeBERTaV3
+
+Mô hình và tập dữ liệu. Chúng tôi lượng tử hóa DeBERTaV3-base (He et al., 2021b) với LoftQ, sau đó tinh chỉnh và đánh giá mô hình trên benchmark đánh giá hiểu ngôn ngữ tổng quát (GLUE) (Wang et al., 2019), SQuADv1.1 (Rajpurkar et al., 2016), và ANLI (Nie et al., 2019). Các tác vụ cụ thể của GLUE được đưa ra trong phụ lục C. Theo các công trình trước đây (Zhang et al., 2023), chúng tôi loại trừ WNLI trong các thí nghiệm.
+
+Chi tiết triển khai. Chúng tôi chọn tỷ lệ học từ {1×10⁻⁵, 5×10⁻⁵, 1×10⁻⁴, 5×10⁻⁴}. Chúng tôi lượng tử hóa toàn bộ backbone. Với việc GLUE, SQuADv1.1 và ANLI là các tác vụ NLU tương đối dễ, chúng tôi cũng lượng tử hóa lớp embedding để hiệu quả nén cao hơn. Chúng tôi áp dụng lượng tử hóa NormalFloat và đồng đều cho LoftQ và QLoRA ở cả mức 2-bit và 4-bit. Chúng tôi sử dụng bậc 16 và 32 cho các bộ thích ứng thứ bậc thấp. Thêm chi tiết triển khai, chẳng hạn như epochs huấn luyện và kích thước batch, được trình bày trong phụ lục D.2.
+
+Kết quả chính. Bảng 1 và Bảng 2 tóm tắt kết quả cho lượng tử hóa 2-bit trên các tập dữ liệu GLUE, SQuADv1.1 và ANLI, bằng lượng tử hóa NF2 và đồng đều, tương ứng. Phương pháp của chúng tôi liên tục vượt trội hơn QLoRA trên tất cả các cài đặt liên quan đến các bậc khác nhau, phương pháp lượng tử hóa và tập dữ liệu. Khi sử dụng lượng tử hóa đồng đều (Bảng 2), phương pháp của chúng tôi đạt 88,0% độ chính xác trên MNLI-m, vượt trội hơn đường cơ sở QLoRA 8%. Đối với các tác vụ như SST và SQuADv1.1, phương pháp của chúng tôi thậm chí tiếp cận hiệu suất tinh chỉnh đầy đủ ở mức 2-bit. Kết quả thí nghiệm lượng tử hóa 4-bit được trình bày trong phụ lục D.1 vì cả LoftQ và QLoRA đều đạt hiệu suất gần với tinh chỉnh đầy đủ.
+
+Phương pháp của chúng tôi cũng ổn định hơn so với QLoRA trong chế độ bit thấp. Ví dụ, trong khi QLoRA không thể hội tụ trên CoLA cho cả hai phương pháp lượng tử hóa và bậc, LoftQ hội tụ trong tất cả các trường hợp và đạt điểm số 60,5 sử dụng lượng tử hóa đồng đều ở bậc 32. LoftQ nổi bật trong khả năng liên tục đạt được hiệu suất mạnh mẽ và cải thiện bằng cách bảo tồn hiệu quả điểm khởi đầu của các trọng số đã được tiền huấn luyện.
+
+Bảng 1: Kết quả với LoftQ 2-bit của các mô hình DeBERTaV3-base trên tập phát triển GLUE, tập phát triển SQuADv1.1, tập kiểm tra ANLI sử dụng lượng tử hóa NF2. Chúng tôi báo cáo trung vị trên bốn seed. N.A. chỉ ra mô hình không hội tụ. Kết quả tốt nhất trên mỗi tập dữ liệu được hiển thị in đậm.
+
+Bảng 2: Kết quả với LoftQ 2-bit của các mô hình DeBERTaV3-base trên tập phát triển GLUE, tập phát triển SQuADv1.1 sử dụng lượng tử hóa đồng đều. Chúng tôi báo cáo trung vị trên bốn seed. N.A. chỉ ra mô hình không hội tụ. Kết quả tốt nhất trên mỗi tác vụ được hiển thị in đậm.
+
+4.2 Mô hình mã hóa-giải mã: BART
+
+Mô hình và tập dữ liệu. Chúng tôi lượng tử hóa mô hình BART-large (Lewis et al., 2020) với LoftQ, sau đó tinh chỉnh và đánh giá mô hình trên hai tập dữ liệu tóm tắt thường được sử dụng: XSum (Narayan et al., 2018) và CNN/DailyMail (Hermann et al., 2015).
+
+Chi tiết triển khai. Chúng tôi áp dụng LoftQ cho các ma trận trọng số trong MHA và FFN của cả lớp mã hóa và giải mã. Chúng tôi báo cáo điểm số ROUGE 1/2/L, là các số đo cho các tác vụ tóm tắt (Lin, 2004). Chúng tôi tiến hành các thí nghiệm lượng tử hóa trong cả kịch bản 2-bit và 4-bit. Chúng tôi thử nghiệm với cả lượng tử hóa NormalFloat và đồng đều trong cả kịch bản 2-bit và 4-bit. Trong mỗi độ chính xác, chúng tôi chọn bậc bằng 8 và 16 để so sánh công bằng với đường cơ sở LoRA độ chính xác đầy đủ (Zhang et al., 2023). Vui lòng xem phụ lục E cho các cấu hình chi tiết.
+
+Kết quả chính. Bảng 3 tóm tắt kết quả thí nghiệm lượng tử hóa 4-bit của chúng tôi trên các tập kiểm tra XSum và CNN/DailyMail. Phương pháp của chúng tôi liên tục vượt trội hơn QLoRA ở cả hai bậc trên cả hai tập dữ liệu. Nó thậm chí vượt trội hơn LoRA độ chính xác đầy đủ ở cả hai bậc trên XSum. Chúng tôi sẽ thảo luận về kết quả bất ngờ này trong phần 5. Kết quả lượng tử hóa 2-bit được hiển thị trong Bảng 4. Quan sát của chúng tôi phù hợp với các thí nghiệm NLU, rằng LoftQ chứng minh sự hội tụ đến kết quả hợp lý, trong khi QLoRA không hội tụ. Điều này cho thấy phương pháp của chúng tôi mạnh mẽ hơn bằng cách thu hẹp khoảng cách khởi tạo.
+
+Bảng 3: Kết quả với LoftQ 4-bit của BART-large trên XSum và CNN/DailyMail. Chúng tôi báo cáo ROUGE-1/2/L, càng cao càng tốt. Lead-3 có nghĩa là chọn 3 câu đầu tiên làm tóm tắt. N.A. chỉ ra mô hình không hội tụ. Full FT đề cập đến tinh chỉnh đầy đủ nơi tất cả các tham số được điều chỉnh. Chúng tôi báo cáo trung vị trên năm seed.
+
+Bảng 4: Kết quả với LoftQ 2-bit của BART-large trên XSum và CNN/DailyMail sử dụng lượng tử hóa NF2. N.A. chỉ ra mô hình không hội tụ. Chúng tôi báo cáo ROUGE-1/2/L, càng cao càng tốt. Chúng tôi báo cáo trung vị trên năm seed.
+
+4.3 Mô hình chỉ giải mã: LLAMA-2
+
+Mô hình và tập dữ liệu. Chúng tôi lượng tử hóa LLAMA-2-7b và LLAMA-2-13b (Touvron et al., 2023) với LoftQ. Sau đó chúng tôi tinh chỉnh và đánh giá các mô hình trên hai tập dữ liệu NLG: GSM8K (Cobbe et al., 2021) và WikiText-2 (Merity et al., 2016). Vui lòng xem phụ lục F để biết thêm chi tiết về các tập dữ liệu.
+
+Chi tiết triển khai. Tương tự, chúng tôi áp dụng LoftQ cho các ma trận trọng số trong MHA và FFN của tất cả các lớp. Trong đánh giá WikiText-2, chúng tôi báo cáo độ phức tạp. Trong đánh giá GSM8K, chúng tôi trích xuất các câu trả lời số trong các giải pháp được tạo ra và sau đó tính toán độ chính xác sử dụng những câu trả lời số đó. Chúng tôi tiến hành thí nghiệm với cả NF2 và NF4. Vui lòng xem phụ lục F cho các cấu hình chi tiết.
+
+Kết quả chính. Bảng 5 trình bày tóm tắt các thí nghiệm của chúng tôi trên LLAMA-2-7b và LLAMA-2-13b sử dụng các phương pháp lượng tử hóa NormalFloat 2-bit, 4-bit và độ chính xác hỗn hợp trên các tập dữ liệu WikiText-2 và GSM8K. Trong WikiText-2, phương pháp của chúng tôi liên tục vượt trội hơn QLoRA trên tất cả các cài đặt độ chính xác lượng tử hóa trên cả hai mô hình. Khi xử lý độ chính xác 2-bit đầy thách thức, nơi QLoRA không thể hội tụ, LoftQ quản lý để đạt độ phức tạp 7,85. Trong GSM8K, phương pháp của chúng tôi đạt hiệu suất tốt hơn hoặc ngang bằng so với QLoRA trên các mức độ chính xác lượng tử hóa và kích thước mô hình khác nhau. Ví dụ, phương pháp của chúng tôi đạt 20,9% độ chính xác sử dụng độ chính xác 2-bit, nơi QLoRA không hội tụ.
+
+Chúng tôi thấy LoftQ vượt trội hơn LoRA độ chính xác đầy đủ trong GSM8K với LLAMA-2-13b. Một giải thích có thể là việc thiếu chính quy hóa gây ra overfitting trên tinh chỉnh LoRA độ chính xác đầy đủ. Do đó, chúng tôi tiến hành LoRA độ chính xác đầy đủ với weight decay trên GSM8K. Từ Bảng 5, chính quy hóa giúp tinh chỉnh LoRA độ chính xác đầy đủ LLAMA-2-13b, nhưng thất bại trong LLAMA-2-7b. Điều này cho thấy LLAMA-2-13b dễ bị overfitting và lượng tử hóa có chính quy hóa ngầm để vượt qua overfitting như vậy.
+
+Để cung cấp sự đánh đổi tùy chỉnh giữa hiệu suất và độ chính xác, chúng tôi cũng khám phá lượng tử hóa độ chính xác hỗn hợp nơi các ma trận trong 4 lớp đầu được lượng tử hóa sử dụng 4 bit, và các ma trận còn lại vẫn 2 bit. Chúng tôi chứng kiến sự cải thiện đáng kể 5,9% độ chính xác trên tập dữ liệu GSM8K sử dụng LLAMA-2-7b và cải thiện 12,7% sử dụng LLAMA-2-13b. Kết quả này nhấn mạnh tiềm năng của LoftQ cho các kịch bản lượng tử hóa độ chính xác hỗn hợp phức tạp.
+
+Bảng 5: Kết quả của LoftQ sử dụng NormalFloat cho chuỗi LLAMA-2 trên WikiText-2 và GSM8K. 3/2.5/2.25-bit chỉ ra lượng tử hóa độ chính xác hỗn hợp: độ chính xác 4-bit cho 16/8/4 lớp đầu tiên và độ chính xác 2-bit cho các lớp còn lại. Chúng tôi báo cáo độ phức tạp (càng nhỏ càng tốt) cho WikiText-2 và độ chính xác cho GSM8K. Bậc của các bộ thích ứng thứ bậc thấp là 64. N.A. chỉ ra mô hình không hội tụ. Chúng tôi báo cáo trung vị trên năm seed ngẫu nhiên.
+
+4.4 Phân tích
+
+Hiệu quả của tối ưu hóa luân phiên. Chúng tôi tiến hành thí nghiệm với các bước luân phiên T khác nhau để xác minh hiệu quả của tối ưu hóa luân phiên và tìm giá trị T tốt nhất như một siêu tham số cho các mô hình khác nhau. Trên tất cả các tác vụ và mô hình, chúng tôi quan sát thấy rằng tối ưu hóa luân phiên mang lại cải thiện đáng kể ngay cả với bước luân phiên tối thiểu. Điều này cho thấy rằng nó nhanh chóng thu hẹp sự khác biệt giữa trọng số lượng tử hóa và trọng số đã được tiền huấn luyện, làm cho phương pháp của chúng tôi dễ áp dụng. Ví dụ, phương pháp của chúng tôi đạt 88,0% độ chính xác trên tập dữ liệu MNLI-m chỉ sử dụng 5 bước luân phiên và 21,14 điểm số Rouge-2 chỉ sử dụng 1 bước. Thú vị là, chúng tôi nhận thấy rằng tăng bước luân phiên vượt quá một điểm nhất định có xu hướng dẫn đến kết quả giảm dần. Chúng tôi nghi ngờ hiện tượng này xảy ra vì, khi khoảng cách trở nên nhỏ hơn, việc tối ưu hóa luân phiên trở nên khó khăn hơn để liên tục tối thiểu hóa khoảng cách ở mỗi bước. Thách thức này xuất hiện vì các lỗi vốn có được đưa ra bởi phương pháp lượng tử hóa. Tuy nhiên, kết quả từ hình 3 cho thấy phương pháp của chúng tôi không nhạy cảm với bước luân phiên T và có thể liên tục tăng cường hiệu suất tinh chỉnh hạ nguồn.
+
+Hình 3: So sánh các bước luân phiên T khác nhau được sử dụng trong LoftQ. T=0 chỉ ra chúng tôi sử dụng phương pháp QLoRA khởi tạo các bộ thích ứng thứ bậc thấp bằng (5). T=1,5,10 chỉ ra chúng tôi sử dụng T khác nhau cho LoftQ được mô tả trong thuật toán 1. Trái: DeBERTaV3-base 2-bit đồng đều. Giữa: LLAMA-2-13b NF4 2-bit. Phải: BART-large NF4.
+
+5 Thảo luận
+
+Bắt đầu với lượng tử hóa hay SVD trong tối ưu hóa luân phiên? Một thuật toán thay thế cho tối ưu hóa luân phiên là chúng tôi đầu tiên thu được xấp xỉ thứ bậc thấp At, Bt và sau đó thu được trọng số lượng tử hóa Qt bằng cách hoán đổi dòng 3 và dòng 4 trong thuật toán 1. Chúng tôi lưu ý đây là một phương pháp thay thế hợp lệ vì cả hai vẫn cùng tối thiểu hóa mục tiêu trong (6). Bảng 6 tóm tắt hiệu suất của phương pháp thay thế này. Đáng chú ý là phương pháp thay thế vẫn vượt trội hơn QLoRA đáng kể, mặc dù nó tệ hơn phiên bản chính. Quan sát này nhấn mạnh tiềm năng cải thiện hiệu suất bằng cách đạt được xấp xỉ gần hơn của các trọng số đã được tiền huấn luyện trong chế độ độ chính xác thấp.
+
+Bảng 6: Kết quả của DeBERTaV3-base lượng tử hóa đồng đều 2-bit trên một phần của GLUE. LoftQ(SVD First) chỉ ra LoftQ thay thế hoán đổi dòng 3 và dòng 4 trong thuật toán 1. Chúng tôi báo cáo trung vị trên bốn seed ngẫu nhiên. Kết quả tốt nhất trên mỗi tác vụ được hiển thị in đậm.
+
+6 Công trình liên quan
+
+Huấn luyện nhận biết lượng tử hóa (QAT) thường được sử dụng để thu được các mô hình lượng tử hóa được thích ứng trong các tác vụ hạ nguồn (Peri et al., 2020; Liu et al., 2023). Nó bao gồm lượng tử hóa và tinh chỉnh mô hình đầy đủ cùng lúc. Tuy nhiên, QAT đòi hỏi chi phí huấn luyện lớn, chẳng hạn như gradient và trạng thái tối ưu hóa. Hơn nữa, khó tính toán gradient của các trọng số lượng tử hóa. Phương pháp của chúng tôi, với sự giúp đỡ của LoRA, tránh được các vấn đề nêu trên, cung cấp một phương pháp nhẹ cho thích ứng tác vụ hạ nguồn.
+
+Lượng tử hóa sau huấn luyện (PTQ) là một danh mục của các khung lượng tử hóa phổ biến (Frantar et al., 2022; Xiao et al., 2023), cũng có thể được sử dụng cho thích ứng tác vụ. Nó hiệu chỉnh mô hình độ chính xác cao với một tập con nhỏ của tập dữ liệu huấn luyện. Do đó, lượng tử hóa tiếp theo được hướng dẫn bởi tập dữ liệu huấn luyện, cung cấp các mô hình lượng tử hóa cụ thể theo tác vụ. Bên cạnh đó, nó không liên quan đến bất kỳ lan truyền ngược gradient nào, vì vậy nó hiệu quả về chi phí. Tuy nhiên, nó thường dẫn đến độ chính xác thấp hơn so với QAT.
+
+7 Kết luận
+
+Chúng tôi đề xuất LoftQ, một khung lượng tử hóa cho LLM, luân phiên áp dụng lượng tử hóa và xấp xỉ thứ bậc thấp cho các trọng số đã được tiền huấn luyện độ chính xác cao ban đầu, để thu được khởi tạo cho tinh chỉnh LoRA tiếp theo. Các thí nghiệm trên hiểu ngôn ngữ tự nhiên, trả lời câu hỏi, tóm tắt và sinh ngôn ngữ tự nhiên cho thấy khung của chúng tôi vượt trội đáng kể so với các phương pháp hiện tại, ví dụ QLoRA, để lượng tử hóa các mô hình chỉ mã hóa, mã hóa-giải mã và chỉ giải mã. Chúng tôi chưa quan sát thấy phương pháp của mình thể hiện hiệu suất tệ hơn QLoRA. Hơn nữa, khung lượng tử hóa của chúng tôi chứng minh hiệu quả và độ mạnh mẽ đặc biệt trong các chế độ lượng tử hóa bit thấp, ví dụ mức 2-bit.

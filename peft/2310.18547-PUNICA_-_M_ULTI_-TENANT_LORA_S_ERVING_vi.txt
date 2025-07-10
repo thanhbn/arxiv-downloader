@@ -1,0 +1,368 @@
+# 2310.18547.pdf
+# Được chuyển đổi từ PDF sang TXT
+# Đường dẫn nguồn: /home/admin88/arxiv-downloader/peft/2310.18547.pdf
+# Kích thước tệp: 866772 bytes
+
+===============================================
+NỘI DUNG TỆP PDF
+===============================================
+
+--- TRANG 1 ---
+PUNICA: PHỤC VỤ ĐA THUÊ BAO LORA
+Lequn Chen*1 Zihao Ye*1 Yongji Wu2 Danyang Zhuo2 Luis Ceze1 Arvind Krishnamurthy1
+
+TÓM TẮT
+Thích ứng thứ hạng thấp (LoRA) đã trở thành một phương pháp quan trọng và phổ biến để thích ứng các mô hình được đào tạo trước với các miền cụ thể. Chúng tôi trình bày Punica, một hệ thống phục vụ nhiều mô hình LoRA trong một cụm GPU dùng chung. Punica chứa một thiết kế kernel CUDA mới cho phép gộp các hoạt động GPU cho các mô hình LoRA khác nhau. Điều này cho phép GPU chỉ cần giữ một bản copy duy nhất của mô hình được đào tạo trước cơ bản khi phục vụ nhiều mô hình LoRA khác nhau, nâng cao đáng kể hiệu quả GPU về cả bộ nhớ và tính toán. Bộ lập lịch của chúng tôi hợp nhất các khối lượng công việc phục vụ LoRA đa thuê bao trong một cụm GPU chung. Với cụm GPU có kích thước cố định, các đánh giá của chúng tôi cho thấy Punica đạt được thông lượng cao hơn 12 lần trong việc phục vụ nhiều mô hình LoRA so với các hệ thống phục vụ LLM tiên tiến nhất trong khi chỉ thêm 2ms độ trễ mỗi token. Punica là mã nguồn mở tại https://github.com/punica-ai/punica .
+
+1 GIỚI THIỆU
+Thích ứng thứ hạng thấp (LoRA) (Hu et al., 2022) đang trở nên ngày càng phổ biến trong việc chuyên môn hóa các mô hình ngôn ngữ lớn được đào tạo trước (LLM) cho các tác vụ chuyên biệt theo miền với dữ liệu đào tạo tối thiểu. LoRA giữ lại trọng số của mô hình được đào tạo trước và giới thiệu các ma trận phân rã thứ hạng có thể đào tạo được đến mỗi lớp của kiến trúc Transformer, giảm đáng kể số lượng tham số có thể đào tạo được và cho phép các tenant đào tạo các mô hình LoRA khác nhau với chi phí thấp. LoRA đã được tích hợp vào nhiều framework tinh chỉnh phổ biến (Mangrulkar et al., 2022). Do đó, các nhà cung cấp ML phải phục vụ một số lượng lớn mô hình LoRA chuyên biệt cùng lúc cho nhu cầu của tenant.
+
+Việc chỉ đơn giản phục vụ các mô hình LoRA như thể chúng được đào tạo độc lập từ đầu sẽ lãng phí tài nguyên GPU. Giả sử chúng ta cần k GPU để phục vụ mỗi mô hình LoRA, phục vụ n mô hình LoRA khác nhau có vẻ sẽ yêu cầu k×n GPU. Cách tiếp cận đơn giản này bỏ qua tiềm năng tương quan trọng số giữa các mô hình LoRA này, với điều kiện chúng có nguồn gốc từ cùng các mô hình được đào tạo trước.
+
+Chúng tôi tin rằng một hệ thống hiệu quả để phục vụ nhiều mô hình LoRA khác nhau cần tuân theo ba hướng dẫn thiết kế. (G1) GPU là tài nguyên đắt đỏ và khan hiếm, vì vậy chúng ta cần hợp nhất các khối lượng công việc phục vụ LoRA đa thuê bao vào một số lượng nhỏ GPU, tăng việc sử dụng GPU tổng thể. (G2) Như các công trình trước đây đã chú ý (Yu et al., 2022), batching là một trong những, nếu không muốn nói là, cách tiếp cận hiệu quả nhất để hợp nhất các khối lượng công việc ML nhằm cải thiện hiệu suất và việc sử dụng GPU. Tuy nhiên, batching chỉ hoạt động khi các yêu cầu dành cho cùng một mô hình chính xác. Do đó chúng ta cần cho phép batching cho các mô hình LoRA khác nhau. (G3) Giai đoạn decode là yếu tố chủ yếu trong chi phí phục vụ mô hình. Do đó chúng ta chỉ cần tập trung vào hiệu suất giai đoạn decode. Các khía cạnh khác của việc phục vụ mô hình ít quan trọng hơn, và chúng ta có thể áp dụng các kỹ thuật đơn giản, ví dụ như tải theo yêu cầu trọng số mô hình LoRA.
+
+Dựa trên ba hướng dẫn này, chúng tôi thiết kế và triển khai Punica, một framework phục vụ đa thuê bao cho các mô hình LoRA trên một cụm GPU chung. Một điểm mới chính là thiết kế kernel CUDA mới, Nhân Ma trận-Vector Thu thập Phân đoạn (SGMV). SGMV cho phép gộp các hoạt động GPU cho việc thực thi đồng thời của nhiều mô hình LoRA khác nhau. Với SGMV, một GPU chỉ cần lưu trữ một bản copy duy nhất của mô hình được đào tạo trước trong bộ nhớ, cải thiện đáng kể hiệu quả GPU về cả bộ nhớ và tính toán. Chúng tôi kết hợp kernel CUDA mới này với một loạt các kỹ thuật tối ưu hóa hệ thống tiên tiến.
+
+SGMV cho phép gộp các yêu cầu từ các mô hình LoRA khác nhau, và đáng ngạc nhiên, chúng tôi quan sát thấy sự khác biệt hiệu suất không đáng kể giữa việc gộp các mô hình LoRA giống nhau và gộp các mô hình LoRA khác nhau. Đồng thời, việc tải theo yêu cầu các mô hình LoRA chỉ có độ trễ cấp độ millisecond. Điều này mang lại cho Punica sự linh hoạt để hợp nhất các yêu cầu người dùng vào một tập hợp nhỏ GPU mà không bị ràng buộc bởi những mô hình LoRA nào đã đang chạy trên GPU.
+
+Vì vậy Punica lập lịch các khối lượng công việc đa thuê bao theo hai cách sau. Đối với một yêu cầu mới, Punica định tuyến yêu cầu đến một tập hợp nhỏ GPU hoạt động, đảm bảo rằng chúng đạt được công suất đầy đủ. Chỉ khi các GPU hiện có được sử dụng hoàn toàn, Punica mới cấp phát thêm tài nguyên GPU. Đối với các yêu cầu hiện có, Punica định kỳ di chuyển chúng để hợp nhất. Điều này cho phép giải phóng các tài nguyên GPU được cấp phát cho Punica.
+
+Chúng tôi đánh giá các mô hình LoRA được thích ứng từ các mô hình Llama2 7B, 13B, và 70B (Touvron et al., 2023) trên các cụm GPU NVIDIA A100. Với cùng lượng tài nguyên GPU, Punica đạt được thông lượng cao hơn 12 lần so với các hệ thống phục vụ LLM tiên tiến nhất trong khi chỉ thêm 2ms độ trễ mỗi token.
+
+Bài báo này đóng góp những điểm sau:
+• Chúng tôi xác định cơ hội xử lý gộp các yêu cầu của nhiều mô hình LoRA khác nhau.
+• Chúng tôi thiết kế và triển khai một kernel CUDA hiệu quả để chạy nhiều mô hình LoRA đồng thời.
+• Chúng tôi phát triển các cơ chế lập lịch mới để hợp nhất các khối lượng công việc LoRA đa thuê bao.
+
+2 KIẾN THỨC NỀN TẢNG
+Chúng tôi trước tiên trình bày quy trình tạo văn bản cho các mô hình transformer. Sau đó chúng tôi mô tả Thích ứng Thứ hạng Thấp (LoRA) của các mô hình transformer.
+
+2.1 Transformer và Tạo Văn bản
+Các LLM dựa trên Transformer hoạt động trên một chuỗi token. Một token gần bằng ¾ từ tiếng Anh. Hoạt động của LLM bao gồm hai giai đoạn. Giai đoạn prefill nhận một prompt người dùng và tạo ra một token tiếp theo và một bộ đệm Key-Value (KvCache). Giai đoạn decode nhận một token và KvCache, sau đó nó tạo ra thêm một token nữa và thêm một cột trong KvCache. Giai đoạn decode là một quy trình lặp lại. Token được tạo ra sau đó trở thành đầu vào cho bước tiếp theo. Quy trình này kết thúc khi token kết thúc chuỗi được tạo ra.
+
+Một khối transformer chứa một lớp self-attention và một perceptron đa lớp (MLP). Hãy giả sử rằng độ dài của prompt là s và chiều kích thước đầu attention là d. Đối với giai đoạn prefill, tính toán của lớp self-attention là (s, d)×(d, s)×(s, d), và tính toán MLP là (s, h)×(h, h). Đối với một bước decode, giả sử s biểu thị độ dài chuỗi quá khứ, tính toán của lớp self-attention là (1, d)×(d, s+ 1)×(s+ 1, d) và tính toán MLP là (1, h)×(h, h). Giai đoạn decode có việc sử dụng GPU thấp vì đầu vào là một vector đơn.
+
+Hình 1 cho thấy độ trễ cho giai đoạn prefill và giai đoạn decode với các kích thước batch khác nhau. Khả năng tính toán của GPU được sử dụng hoàn toàn trong giai đoạn prefill. Độ trễ prefill tỷ lệ thuận với kích thước batch. Tuy nhiên, điều này không đúng với giai đoạn decode. Tăng kích thước batch từ 1 lên 32, độ trễ bước decode tăng từ 11ms lên 13ms cho các chuỗi ngắn, và từ 17ms lên 34ms cho các chuỗi dài hơn. Điều này có nghĩa là batching có thể cải thiện việc sử dụng GPU đáng kể cho giai đoạn decode. Orca (Yu et al., 2022) đã tận dụng cơ hội này để xây dựng một hệ thống phục vụ LLM hiệu quả. Loại batching này đặc biệt quan trọng vì giai đoạn decode chủ yếu quyết định độ trễ phục vụ cho các phản hồi có độ dài đầu ra dài.
+
+2.2 Thích ứng Thứ hạng Thấp (LoRA)
+Tinh chỉnh cho phép một mô hình được đào tạo trước thích ứng với một miền mới hoặc một tác vụ mới hoặc được cải thiện với dữ liệu đào tạo mới. Tuy nhiên, vì các LLM lớn, việc tinh chỉnh tất cả các tham số mô hình đòi hỏi nhiều tài nguyên.
+
+Thích ứng Thứ hạng Thấp (LoRA) (Hu et al., 2022) giảm đáng kể số lượng tham số cần được đào tạo trong quá trình tinh chỉnh. Quan sát chính là sự khác biệt trọng số giữa mô hình được đào tạo trước và mô hình sau tinh chỉnh có thứ hạng thấp. Sự khác biệt trọng số này do đó có thể được biểu diễn dưới dạng tích của hai ma trận nhỏ và dày đặc. Tinh chỉnh LoRA sau đó trở nên tương tự như đào tạo một mạng neural nhỏ, dày đặc. Chính thức, hãy xem xét trọng số của mô hình được đào tạo trước là W∈R^(h1×h2). Tinh chỉnh LoRA đào tạo hai ma trận A∈R^(h1×r) và B∈R^(r×h2), trong đó r là Thứ hạng LoRA. W+AB là trọng số mới cho mô hình được tinh chỉnh. Thứ hạng LoRA thường nhỏ hơn nhiều so với chiều kích thước gốc (ví dụ, 16 thay vì 4096). Ngoài việc tinh chỉnh nhanh, LoRA có chi phí lưu trữ và bộ nhớ rất thấp. Mỗi mô hình được tinh chỉnh chỉ thêm 0,1% đến 1% trọng số mô hình. LoRA thường được áp dụng cho tất cả các phép chiếu dày đặc trong lớp transformer (Dettmers et al., 2023), bao gồm các phép chiếu Query-Key-Value-Output trong cơ chế attention và MLP. Lưu ý rằng hoạt động self-attention bản thân không chứa bất kỳ trọng số nào.
+
+Làm thế nào để phục vụ các mô hình LoRA đa thuê bao hiệu quả trên một cụm GPU chung? LoRA cung cấp một thuật toán hiệu quả để tinh chỉnh các LLM. Bây giờ câu hỏi là: làm thế nào để phục vụ các mô hình LoRA đó một cách hiệu quả? Một cách tiếp cận là xem mỗi mô hình LoRA như một mô hình độc lập và sử dụng các hệ thống phục vụ LLM truyền thống (ví dụ, vLLM). Tuy nhiên, điều này bỏ qua việc chia sẻ trọng số giữa các mô hình LoRA khác nhau
+
+--- TRANG 3 ---
+Punica: Phục vụ Đa Thuê bao LoRA
+
+Runner
+GPU
+LoRALLM
+LoRAKvCache
+…GPU
+LoRALLM
+LoRAKvCache
+……Runner
+GPU
+LoRALLM
+LoRAKvCache
+…GPU
+LoRALLM
+LoRAKvCache
+………SchedulerFrontends Users
+
+Frontends UsersUnary RPC
+Stream Response
+
+Hình 2. Kiến trúc hệ thống của Punica.
+
+có thể được sử dụng để cải thiện đáng kể hiệu quả GPU. Hơn nữa, nếu chúng ta đối xử với mỗi mô hình LoRA như một mô hình độc lập, thời gian tải mô hình có thể là một nút thắt cổ chai hiệu suất đáng kể khi khởi động phục vụ mô hình. Ngay cả khi chúng ta chia sẻ mô hình backbone qua các mô hình LoRA, vẫn còn câu hỏi về cách gộp tính toán addon LoRA một cách hiệu quả.
+
+3 TỔNG QUAN PUNICA
+Chúng tôi thiết kế Punica như một hệ thống đa thuê bao quản lý một cụm GPU để phục vụ nhiều mô hình LoRA với các mô hình backbone được đào tạo trước dùng chung. Hình 2 cho thấy kiến trúc hệ thống của Punica. Giống như các hệ thống phục vụ mô hình khác, Punica có các máy chủ frontend tiếp xúc RESTful API với người dùng cuối và chuyển tiếp yêu cầu phục vụ của người dùng đến bộ lập lịch Punica. Một yêu cầu người dùng chứa định danh của mô hình LoRA và một prompt. Bộ lập lịch gửi yêu cầu đến các GPU. Mỗi máy chủ GPU khởi động một runner, giao tiếp với bộ lập lịch và điều khiển việc thực thi của tất cả các GPU. Khi các GPU tạo ra token mới, các token mới được truyền từ các runner đến bộ lập lịch, đến frontend, và cuối cùng đến người dùng cuối.
+
+Trong Punica, mỗi GPU tải mô hình ngôn ngữ lớn backbone được đào tạo trước. Một phần lớn bộ nhớ GPU được dành riêng cho KvCache. Chỉ các thành phần LoRA của mô hình mới được hoán đổi từ lưu trữ từ xa khi cần thiết. Lưu ý rằng thiết kế này cho phép khởi động nhanh cho việc phục vụ mô hình. Bởi vì mô hình được đào tạo trước đã được tải vào bộ nhớ GPU, Punica chỉ cần tải các ma trận A và B cho một mô hình LoRA mới.
+
+Punica cần giải quyết hai thách thức nghiên cứu chính. Thách thức đầu tiên là cách chạy nhiều mô hình LoRA hiệu quả trên một GPU. Bởi vì các yêu cầu phải được phục vụ bởi các mô hình LoRA khác nhau, mỗi yêu cầu phải trải qua một tính toán GPU khác nhau. Chúng tôi sử dụng phép nhân ma trận hiện có cho tính toán backbone. Và chúng tôi trình bày một kernel CUDA mới để thêm các addon LoRA vào tính toán backbone theo cách gộp. Chúng tôi gọi kernel này là
+
++=
++=
++=@
+@
+@Segmented Gather Matrix-Vector Multiplication
+
+Y[s[i]:s[i+1]] += X[s[i]:s[i+1]] @ W[i]
+
+Hình 3. Ngữ nghĩa của SGMV.
+
+Nhân Ma trận-Vector Thu thập Phân đoạn (SGMV). SGMV song song hóa phép nhân feature-weight của các yêu cầu khác nhau trong batch và nhóm các yêu cầu tương ứng với cùng một mô hình LoRA để tăng cường độ hoạt động của kernel và sử dụng các đơn vị GPU Tensor Cores để gia tốc.
+
+Thách thức thứ hai là cách thiết kế một hệ thống hiệu quả trên SGMV cho việc phục vụ mô hình LoRA đa thuê bao. Mục tiêu của chúng tôi ở đây là hợp nhất các khối lượng công việc đa thuê bao vào tập hợp GPU nhỏ nhất có thể, chiếm ít tài nguyên GPU nhất. Punica lập lịch yêu cầu người dùng cho các GPU hoạt động, đã phục vụ hoặc đào tạo các mô hình LoRA. Điều này khả thi trong Punica, bởi vì với SGMV việc thêm kích thước batch, ngay cả với các mô hình LoRA khác nhau, cũng cải thiện việc sử dụng GPU. Đối với các yêu cầu cũ, Punica di chuyển chúng định kỳ để hợp nhất các khối lượng công việc, từ đó giải phóng tài nguyên GPU.
+
+Tiếp theo, chúng tôi mô tả chi tiết kernel CUDA của Punica và các chi tiết thiết kế khác của Punica.
+
+4 NHÂN MA TRẬN-VECTOR THU THẬP PHÂN ĐOẠN
+Khi một mô hình LoRA có nhiều đầu vào trong batch, chúng ta có thể gộp chúng lại với nhau. Chúng ta nhóm các đầu vào cho cùng một mô hình LoRA liên tiếp. Ký hiệu n là số lượng mô hình LoRA trong một batch. Ký hiệu chuỗi s_i là chỉ số phần tử cuối cùng cho mô hình thứ i trong batch. Đặc biệt, s_0 = 0 và s_n là kích thước batch. Đầu vào {x_i|i∈[1, s_n]} sau đó được phân vùng thành {{x_j|j∈(s_{i-1}, s_i]} |i∈[1, n]}.
+
+Đầu ra phép chiếu dày đặc sau đó có thể được viết như:
+
+[y_1; ...; y_{s_1}; ...; y_{s_{n-1}+1}; ...; y_{s_n}] := [x_1; ...; x_{s_1}; ...; x_{s_{n-1}+1}; ...; x_{s_n}]W + [x_1; ...; x_{s_1}]A_1B_1 + ... + [x_{s_{n-1}+1}; ...; x_{s_n}]A_nB_n
+
+Phép nhân bên trái là tính toán cho mô hình backbone, được gộp thông qua GEMM thông thường.
+
+--- TRANG 4 ---
+Punica: Phục vụ Đa Thuê bao LoRA
+
+SGMV
+ExpandSGMV
+Shrink
+blockIdx.xblockIdx.x 123
+123
+blockIdx.y = 2blockIdx.y = 1
+blockIdx.y = 1
+blockIdx.y = 2
+
+Hình 4. Lập lịch của kernel SGMV expand/shrink
+
+Chúng ta cần một kernel nhanh để tính toán addon LoRA bên phải. Lưu ý rằng toán tử y += xAB có thể được tách thành hai lần khởi chạy của cùng một kernel: Khởi tạo v := 0. Sau đó chúng ta chạy v += xA và tiếp theo bởi y += vB.
+
+Chúng tôi đặt tên toán tử này là SGMV, Nhân Ma trận-Vector Thu thập Phân đoạn. Hình 3 minh họa ngữ nghĩa của SGMV.
+
+Lập lịch Kernel CUDA Chúng tôi phân loại toán tử SGMV thành hai loại, SGMV-shrink và SGMV-expand, dựa trên các chiều kích thước feature đầu vào và đầu ra của chúng. Toán tử đầu tiên trong module LoRA: v = xA là SGMV-shrink vì nó thu hẹp một feature đầu vào nhiều chiều thành đầu ra thứ hạng thấp. Toán tử thứ hai y = vB là SGMV-expand vì nó mở rộng feature đầu vào thứ hạng thấp thành một feature đầu ra nhiều chiều.
+
+Hình 4 cho thấy cách chúng tôi lập lịch kernel SGMV trong hai trường hợp này: Đối với cả hai kernel, chúng tôi gắn chỉ số LoRA với BLOCK_IDX.Y trong CUDA. Sau đó, tính toán trên mỗi BLOCK_IDX.Y là một phép nhân ma trận giữa các feature và một trọng số LoRA cụ thể. Chúng tôi thiết kế các lịch trình khác nhau cho phép nhân ma trận dưới cài đặt expand và shrink: cho kernel expand, chúng tôi chia A trên chiều kích thước feature đầu ra A = [A^(1)...A^(n)] và gửi các v^(i) = xA^(i) khác nhau đến các threadblock khác nhau trong GPU, và việc nối v^(i) trên các threadblock khác nhau tạo thành kết quả cuối cùng v = [v^(1)...v^(n)]; cho kernel shrink, chiều kích thước đầu ra quá mỏng và chúng tôi áp dụng chiến lược Split-K (Thakkar et al., 2023) để tăng tính song song: chúng tôi chia B trên chiều kích thước feature đầu vào B = [B^(1); ...; B^(k)]. Chúng tôi gửi các y^(i) = vB^(i) khác nhau đến các threadblock khác nhau trong GPU, sau khi tính toán tổng cục bộ {y^(i)} trên tất cả threadblock hoàn thành, chúng tôi thực hiện một đồng bộ lưới theo sau bởi một phép giảm cross threadblock y = Σ^k_{i=1} y^(i) để tổng hợp các kết quả cục bộ. Chúng tôi sử dụng GPU Tensor Cores để gia tốc phép nhân ma trận cho cả hai kernel.
+
+Trong trường hợp mỗi yêu cầu có một chỉ số LoRA riêng biệt, tính toán tương ứng với mỗi chỉ số LoRA suy giảm thành phép nhân ma trận-vector, hoàn toàn bị giới hạn bởi IO. Chúng tôi thiết kế một lịch trình cụ thể cho trường hợp này nhằm tối đa hóa việc sử dụng băng thông bộ nhớ và không sử dụng Tensor Cores vì cường độ hoạt động thấp của toán tử.
+
+5 PUNICA CHI TIẾT
+Punica lập lịch yêu cầu người dùng mới ở cấp độ từng yêu cầu và di chuyển các yêu cầu cũ giữa các GPU ở cấp độ từng lần lặp. Bộ lập lịch thêm yêu cầu vào một GPU hoặc hủy một yêu cầu đang hoạt động từ một GPU. Mỗi GPU gộp tất cả yêu cầu trong tập hợp làm việc của nó cho việc gọi LLM. GPU chạy các bước Prefill và Decode liên tục. Khi một yêu cầu đạt đến điều kiện dừng (token kết thúc chuỗi hoặc giới hạn độ dài), GPU loại bỏ yêu cầu khỏi batch và thông báo cho bộ lập lịch về việc dừng.
+
+Chúng tôi chạy các yêu cầu batch của giai đoạn prefill và decode trong một lần gọi mô hình duy nhất. Để giảm thiểu penalty độ trễ, chúng tôi giới hạn kích thước batch prefill thành 1 cho mỗi batch. Prefill đơn và batch các decode gọi hai kernel CUDA riêng biệt cho hoạt động self-attention. Tất cả các hoạt động khác, bao gồm phép chiếu dày đặc và addon LoRA, coi tất cả token trong giai đoạn prefill và decode như một đầu vào batch duy nhất. Theo cách này, chúng tôi tăng hiệu quả batch của phép chiếu dày đặc và addon LoRA.
+
+5.1 Lập lịch yêu cầu mới
+Bộ lập lịch Punica có cái nhìn toàn cầu về trạng thái của tất cả các GPU. Cụ thể, đối với mỗi GPU, Punica duy trì tập hợp làm việc của các yêu cầu, đây là đầu vào batch của việc gọi LLM. Khi các yêu cầu mới được thêm vào tập hợp làm việc và khi các bước decode tiến triển, KvCache tiêu thụ ngày càng nhiều bộ nhớ GPU. Do đó, Punica cũng liên tục theo dõi không gian bộ nhớ có sẵn cho KvCache trên mỗi GPU.
+
+Punica lập lịch một yêu cầu mới cho GPU hiện tại có tập hợp làm việc yêu cầu lớn nhất (tức là kích thước batch gọi LLM) trong khi thỏa mãn các ràng buộc sau: (1) Nó chưa đạt đến giới hạn kích thước batch tối đa. (2) Nó có đủ bộ nhớ cho KvCache của yêu cầu mới. Khi có nhiều ứng cử viên, cái có GPU UUID cao nhất sẽ nhận yêu cầu mới. Khi tất cả các GPU đã bận hoàn toàn (tức là đã đạt kích thước batch tối đa hoặc không đủ bộ nhớ), yêu cầu được đưa vào hàng đợi. Khi một số GPU trở nên có sẵn trong tương lai, các yêu cầu được xếp hàng sẽ được lập lịch theo cách first-come-first-serve (FCFS).
+
+Giới hạn kích thước batch tối đa cân bằng thông lượng cụm và độ trễ mỗi token. Các batch quá lớn làm chậm độ trễ rất nhiều trong khi cung cấp lợi ích thông lượng cận biên. Chúng tôi profile các GPU A100 và quyết định đặt kích thước batch tối đa là 32.
+
+Logic lựa chọn GPU nhấn mạnh thông lượng cụm trong khoảng độ trễ tối ưu. Cách tiếp cận lập lịch của chúng tôi có các thuộc tính sau: một GPU bận rộn có khả năng tiếp tục bận rộn vì nhiều yêu cầu hơn sẽ được gán cho nó, một GPU được tải nhẹ có khả năng giảm tải của nó khi các yêu cầu kết thúc, và một GPU nhàn rỗi có khả năng tiếp tục nhàn rỗi. Kết quả là, bộ lập lịch của chúng tôi duy trì thông lượng đỉnh và hợp nhất việc sử dụng GPU dựa trên tải hệ thống tổng thể hiện tại. Điều này cho phép các quyết định dễ dàng hơn để scale up/down cụm GPU. Trong môi trường cloud nơi Punica có thể cấp phát và hủy cấp phát các máy chủ GPU, chúng tôi thực hiện các cấp phát cụm sau: (1) Nếu không có GPU được tải nhẹ nào tồn tại trong cụm, Punica nên yêu cầu thêm GPU. (2) Punica có thể trả lại tài nguyên GPU cho các máy chủ GPU không có tải.
+
+5.2 Tải mô hình theo yêu cầu
+Việc chia sẻ trọng số giữa mô hình LoRA và mô hình được đào tạo trước cơ bản làm cho việc tải mô hình nhanh chóng. Kích thước của mô hình LoRA (đó là các ma trận A và B trong §2.2) chỉ chiếm 1% của mô hình được đào tạo trước cơ bản.
+
+Tải một mô hình LoRA từ bộ nhớ chính vào bộ nhớ GPU chỉ là một bản sao bộ nhớ host-to-device không đồng bộ. Độ trễ bị giới hạn bởi băng thông PCIe. Trên PCIe Gen4 x16, mất khoảng 50 µs để tải một lớp và 2ms để tải toàn bộ mô hình. Vì bản sao bộ nhớ và tính toán GPU có thể chồng chéo, việc triển khai tải theo từng lớp hoặc thậm chí theo từng ma trận phức tạp để giảm thiểu độ trễ tải mô hình là khả thi.
+
+Tuy nhiên, lưu ý rằng mỗi bước decode mất khoảng 30ms để hoàn thành, và mỗi yêu cầu có thể cần hàng nghìn bước decode. Chúng tôi chọn sử dụng một phương pháp đơn giản nhưng hiệu quả tương đương. Khi một yêu cầu mới được thêm vào một GPU, nếu mô hình LoRA của nó chưa được tải, chúng tôi đưa ra một bản sao bộ nhớ không đồng bộ để tải trọng số LoRA, và để GPU tiếp tục chạy các đầu vào khác trong batch. Đến cuối việc thực thi mô hình, trọng số đã hoàn thành việc tải. Sau đó, yêu cầu mới có thể tham gia batch một cách tự nhiên.
+
+5.3 Di chuyển yêu cầu
+Khi mỗi yêu cầu tạo ra thêm token, KvCache của chúng chiếm nhiều bộ nhớ GPU hơn. Khi một GPU hết không gian cho KvCache, nó di chuyển một số yêu cầu đến các GPU khác. Việc di chuyển yêu cầu gồm hai bước — evict và add. Bộ lập lịch evict yêu cầu mới nhất từ GPU. Điều này bảo tồn ngữ nghĩa FCFS. Việc lập lịch cho yêu cầu được evict giống như thêm một yêu cầu mới.
+
+Bộ lập lịch Punica hỗ trợ hủy yêu cầu. Việc hủy bỏ rất đơn giản: loại bỏ yêu cầu khỏi cả trạng thái GPU và bộ lập lịch. Một tình huống điển hình cho việc hủy bỏ là ngắt kết nối người dùng. Quan trọng hơn, việc hủy yêu cầu như một nguyên tắc lập lịch cho phép di chuyển yêu cầu.
+
+GPU 1 GPU 2Frontend Scheduler
+1
+23 4
+56
+1
+2
+3Cancel 
+Release KvCache
+Stop streaming 
+Add 
+Build KvCache
+Start streaming 4
+5
+6
+
+Hình 5. Quy trình di chuyển yêu cầu cho Yêu cầu R3.
+
+Hình 5 cho thấy quy trình làm việc để di chuyển một yêu cầu, R3, từ GPU 1 đến GPU 2. Bộ lập lịch trước tiên gửi việc hủy yêu cầu đến GPU 1. Sau khi GPU 1 hoàn thành chạy batch trước đó, nó thực hiện việc hủy và giải phóng KvCache. GPU 1 cũng bỏ qua token mới của R3 được tạo ra trong batch trước đó. Ngay sau khi gửi việc hủy đến GPU 1, bộ lập lịch thêm R3 vào GPU 2. GPU 2 chạy một bước prefill trên prompt gốc của R3 cộng với tất cả các token được tạo ra trước đó. Điều này tái lập KvCache của R3 trên GPU 2. GPU 2 sau đó bắt đầu stream các token mới của R3 đến bộ lập lịch.
+
+Chúng tôi chọn tính toán lại thay vì di chuyển KvCache vì tính đơn giản của nó. PagedAttention (Kwon et al., 2023) đã chỉ ra rằng độ trễ tính toán lại bằng hoặc tốt hơn so với di chuyển KvCache trong hầu hết các trường hợp, điều này phù hợp với quan sát của chúng tôi.
+
+5.4 Bố cục bộ nhớ cho KvCache
+Punica sử dụng bố cục KvCache có thể tách rời, điều này quan trọng cho thông lượng batching tạo văn bản. Bố cục KvCache của thư viện HuggingFace Transformers gồm các danh sách tensor lồng nhau phức tạp, về mặt khái niệm có thể được xem như hình dạng sau:
+
+[L, 2, B, N, S, D]
+
+trong đó L là số lớp, 2 là cho phép chiếu Key và Value, B là kích thước batch, N là số đầu, S là độ dài chuỗi, và D là chiều kích thước đầu. Trong mỗi bước decode, HuggingFace Transformers nối một tensor dọc theo chiều kích thước độ dài chuỗi. Việc nối không hiệu quả vì nó cần đọc toàn bộ KvCache và viết một bản sao mới, trong khi tensor mới chỉ chiếm 1/S của KvCache.
+
+Vấn đề lớn hơn với cách tiếp cận của HuggingFace Transformer là chiều kích thước batching không phải là chiều kích thước ngoài cùng, điều này có nghĩa là các yêu cầu trong batch khó tách rời trong KvCache. Dưới hạn chế này, các yêu cầu tham gia batch cùng nhau cần phải ở cùng nhau trong suốt tất cả các bước decode cho đến khi tất cả yêu cầu đáp ứng điều kiện dừng riêng của chúng.
+
+Hình 6 là hình minh họa giải thích vấn đề. Trong hình, 4 yêu cầu liên tiếp được gộp cùng nhau. Thanh sọc biểu thị số bước decode mà mỗi yêu cầu thực sự cần để đạt đến điều kiện dừng của nó. Do KvCache không thể tách rời, các yêu cầu ngắn hơn trong batch chạy thêm các bước decode, về bản chất là tính toán lãng phí. FasterTransformer (Hsueh, 2021) và DeepSpeed (Aminabadi et al., 2022) cũng gặp phải các vấn đề tương tự.
+
+Thay vào đó, bố cục KvCache của chúng tôi là
+
+[Σ_i⌈S_i/P⌉, L, 2, N, P, D]
+
+trong đó S_i là độ dài của chuỗi i và P là kích thước trang. Chúng tôi sử dụng KvCache được phân trang (Kwon et al., 2023) để giảm thiểu phân mảnh bộ nhớ. Chúng tôi đặt chiều kích thước batching ở ngoài cùng để cho phép batching liên tục.
+
+Request IndexNumber of decode stepsWaste
+Actual
+
+Hình 6. KvCache không thể tách rời thêm các bước decode lãng phí.
+
+6 TRIỂN KHAI
+Việc triển khai Punica gồm hai phần: một thư viện Python trên PyTorch chạy các mô hình ngôn ngữ lớn trên một GPU đơn và các thành phần hệ thống khác để hỗ trợ phục vụ mô hình qua một cụm GPU.
+
+Thư viện Python Chúng tôi tiếp xúc các kernel CUDA của mình như một PyTorch Extension sử dụng PyBind11. Việc triển khai mô hình Llama được điều chỉnh từ thư viện HuggingFace Transformers. Chúng tôi sử dụng dự án mã nguồn mở FlashInfer (Ye, 2023) để tính toán nhanh và hiệu quả bộ nhớ của self-attention. Ngoài việc融合 tính toán của softmax(QK^T)V như FlashAttention (Dao et al., 2022) làm, FlashInfer hỗ trợ thêm batch decoding mà không cần padding. Tương tự như PagedAttention (Kwon et al., 2023), FlashInfer hỗ trợ KvCache được phân trang để giảm thiểu phân mảnh bộ nhớ GPU do KvCache. Chúng tôi cũng融合 LayerNorm, giảm độ trễ từ 110µs xuống 4µs.
+
+Chúng tôi trộn các yêu cầu mới trong giai đoạn Prefill và các yêu cầu hiện có trong giai đoạn Decode trong một batch cùng nhau. Theo cách này, các phép chiếu dày đặc và LoRA có thể được hưởng lợi từ kích thước batch lớn hơn. Để batching, chúng tôi nối tất cả đầu vào dọc theo chiều kích thước độ dài chuỗi. Chúng tôi luôn đặt các yêu cầu Prefill ở đầu và các yêu cầu Decode ở phần sau. Sau đó chúng tôi truyền một struct BatchLen để phân biệt các yêu cầu khác nhau. BatchLen chứa một danh sách các chỉ số chỉ ra chỉ số bắt đầu của mỗi yêu cầu Prefill. Nó cũng chứa một số chỉ ra số lượng yêu cầu Decode. Trong lớp self-attention, chúng tôi truyền các chỉ số và trạng thái đầu vào dẫn đầu đến kernel BatchPrefill, và chúng tôi truyền các trạng thái đầu vào theo sau đến kernel BatchDecode. Trong một batch, chúng tôi tổ chức thêm thứ tự đầu vào batch sao cho các yêu cầu chia sẻ cùng mô hình LoRA liên tiếp. Phần cuối của các yêu cầu Prefill và phần đầu của các yêu cầu Decode có thể chia sẻ một mô hình LoRA nếu có thể. Sau đó chúng tôi tạo ra các chỉ số segment cho kernel SGMV. Trước mỗi lần gọi mô hình được gộp, chúng tôi nối các đầu vào batch và xây dựng BatchLen và các chỉ số segment SGMV. Cả BatchLen và các chỉ số segment SGMV đều giữ nguyên trong suốt lần gọi mô hình. Thiết kế này tránh tính toán lại (L lần cho BatchLen và 7L lần cho các chỉ số segment SGMV, trong đó L là số lớp).
+
+Các thành phần hệ thống khác Chúng tôi viết bộ lập lịch, frontend, và runner của mình bằng Rust. Cả Unary RPC và các chunk văn bản streaming đều được triển khai qua web socket. I/O được xử lý không đồng bộ. Runner sinh ra một subprocess Python cho mỗi GPU. Subprocess là một wrapper mỏng xung quanh thư viện PyTorch của chúng tôi. Quá trình chính Runner giao tiếp với các subprocess sử dụng pipe.
+
+7 ĐÁNH GIÁ
+Chúng tôi đánh giá Punica trên hai testbed. Testbed #1 là một máy chủ đơn với một GPU NVIDIA A100 80GB. Testbed #2 gồm hai máy chủ NVIDIA HGX A100 40GB với 8 GPU trên mỗi máy chủ. Testbed #1 chứa một GPU có bộ nhớ GPU lớn, cho phép chúng tôi nghiên cứu hiệu ứng batching LoRA. Testbed #2 được trang bị công nghệ NvSwitch nhanh để chúng tôi nghiên cứu tensor parallelism và đánh giá triển khai cụm. Chúng tôi sử dụng mô hình Llama-2 (Touvron et al., 2023) với 7B, 13B, và 70B tham số. Đối với tất cả thí nghiệm, chúng tôi sử dụng 16 làm thứ hạng LoRA. LoRA được áp dụng cho tất cả các phép chiếu dày đặc. Chúng tôi sử dụng trọng số ngẫu nhiên cho các mô hình LoRA vì trọng số không ảnh hưởng đến hiệu suất độ trễ.
+
+Khối lượng công việc Độ dài prompt và độ dài phản hồi là các đặc tính khối lượng công việc chính cho việc phục vụ LLM. Chúng tôi sử dụng phân phối độ dài prompt và phản hồi từ ShareGPT (ShareGPT, 2023), gồm các cuộc trò chuyện người dùng-bot từ người dùng Internet. Chúng tôi xem xét bốn loại phân phối yêu cầu giữa các mô hình LoRA. (1) Distinct: mỗi yêu cầu dành cho một mô hình LoRA riêng biệt. (2) Uniform: tất cả các mô hình LoRA đều phổ biến như nhau. Với n yêu cầu, chúng tôi sử dụng ⌈√n⌉ mô hình. (3) Skewed: độ phổ biến mô hình tuân theo phân phối Zipf-α. Số yêu cầu cho mô hình phổ biến thứ i là α lần so với mô hình thứ i+1. Trong các thí nghiệm của chúng tôi, chúng tôi chọn α là 1.5. (4) Identical: tất cả yêu cầu dành cho cùng một mô hình LoRA.
+
+Baseline Vì không có hệ thống phục vụ multi-LoRA nổi tiếng, chúng tôi so sánh Punica với nhiều hệ thống phục vụ backbone LLM phổ biến. Chúng tôi cho phép các mức độ nới lỏng khác nhau có lợi cho các hệ thống baseline. Chúng tôi sử dụng thư viện HuggingFace PEFT (Mangrulkar et al., 2022) để thêm trọng số LoRA vào thư viện HuggingFace Transformers (Wolf et al., 2020) và DeepSpeed (Aminabadi et al., 2022). Chúng tôi chạy chỉ backbone cho FasterTransformer (Hsueh, 2021) và vLLM (Kwon et al., 2023) vì hai hệ thống này không hỗ trợ mô hình LoRA. Chúng tôi bỏ qua chi phí chuyển đổi mô hình cho các hệ thống baseline.
+
+7.1 Microbenchmark
+Chúng tôi sử dụng phân tích và đánh giá testbed để benchmark SGMV và chắt lọc các tác động hiệu suất cho toán tử LoRA và một lớp transformer đơn.
+
+Phân tích roofline cho SGMV Đầu tiên, chúng tôi sử dụng mô hình roofline (Williams et al., 2009) để hiểu hiệu suất của kernel SGMV. Số lượng phép toán dấu phẩy động (FLOP) và số byte I/O bộ nhớ của SGMV được tính như sau:
+
+FLOP = s_n × h_i × h_o × 2
+I/O = [s_n × (h_i + h_o) + n × h_1 × h_2] × 2
+
+trong đó n là số lượng mô hình LoRA, s là các chỉ số segment, s_n là tổng số đầu vào, và h_i và h_o là các chiều kích thước đầu vào và đầu ra của ma trận trọng số SGMV. Hệ số 2 trong FLOP đến từ các phép toán multiply-add cho phép nhân ma trận. Hệ số 2 trong I/O đến từ kích thước byte của kiểu dữ liệu dấu phẩy động 16-bit. Chúng tôi sử dụng h_i = 16, h_o = 4096 cho nghiên cứu trường hợp này. Chúng tôi đo độ trễ của kích thước batch 1 đến 64 dưới bốn phân phối độ phổ biến khác nhau trên Testbed #1.
+
+Hình 7 cho thấy biểu đồ mô hình roofline. Trục x trong mô hình roofline là cường độ số học, được định nghĩa là tỷ lệ của FLOP và I/O. Trục y là thông lượng đạt được tính theo FLOP mỗi giây, được tính bằng độ trễ đo được. Đường chấm chéo và đường chấm trên cùng biểu thị băng thông bộ nhớ và hiệu suất FP16 đỉnh của GPU NVIDIA A100, tương ứng.
+
+Trong trường hợp Distinct, cường độ số học không thay đổi vì FLOP và I/O tăng cùng tỷ lệ. Vì mỗi đầu vào chỉ sử dụng một lượng nhỏ đơn vị tính toán GPU, việc tăng kích thước batch làm tăng hiệu suất. Trong trường hợp Identical, đường đi lên theo đường chéo theo độ dốc của băng thông bộ nhớ, nghĩa là SGMV bị giới hạn bởi băng thông bộ nhớ. Trường hợp Uniform và Skewed nằm ở giữa, như một sự kết hợp của cả hai hiệu ứng, mức độ song song tăng và cường độ số học tăng.
+
+Microbenchmark toán tử LoRA Chúng tôi triển khai toán tử LoRA được gộp như hai lần khởi chạy kernel SGMV. Chúng tôi so sánh việc triển khai dựa trên SGMV của mình với hai việc triển khai baseline dựa trên PyTorch. Một là vòng lặp for qua mỗi mô hình LoRA. Một khác là Gather-BMM. Trong bước gather, chúng tôi xếp chồng các ma trận trọng số mà mỗi đầu vào cần thành một ma trận duy nhất. Sau đó, chúng tôi sử dụng torch.bmm() để thực hiện phép nhân ma trận gộp trên đầu vào và ma trận được xếp chồng. Tương tự như SGMV, Gather-BMM khởi chạy Gather hai lần và BMM hai lần. Lưu ý rằng Gather-BMM sử dụng I/O nhiều hơn SGMV rất nhiều. Gather đọc vào n × h_i × h_o phần tử và viết ra s_n × h_i × h_o. Sau đó, BMM cần đọc vào s_n × h_i × h_o phần tử trọng số mà Gather vừa viết. Kết hợp lại, Gather-BMM phát sinh thêm s_n × h_i × h_o × 2 phần tử I/O bộ nhớ so với SGMV.
+
+Hình 8 cho thấy so sánh độ trễ của ba việc triển khai qua bốn khối lượng công việc trên Testbed #1. Gather và BMM cũng được đo riêng để tham khảo. Vì BMM độc lập với dữ liệu, độ trễ của nó nhất quán qua bốn khối lượng công việc.
+
+Kết quả benchmark của chúng tôi khớp rất tốt với phân tích của chúng tôi. Trong trường hợp Distinct, Loop hoạt động tệ vì nó chạy nhiều vòng với kích thước batch 1. Độ trễ Gather-BMM tăng nhanh do sự chậm lại của Gather. Độ trễ SGMV tăng dần từ 37 µs đến 116 µs, vì batching không thay đổi cường độ số học. Trường hợp Uniform và Skewed tương tự như trường hợp Distinct. Gather-BMM hoạt động tốt hơn một chút so với trường hợp Distinct vì có ít ma trận hơn để đọc. Độ trễ SGMV chỉ tăng nhẹ, từ 37 µs đến 46 µs, như một sự kết hợp của cả hai hiệu ứng: mức độ song song tăng và cường độ số học tăng. Trong trường hợp Identical, tất cả các việc triển khai có cùng ngữ nghĩa: BMM. Do đó chúng ta có thể suy ra rằng SGMV triển khai BMM hiệu quả hơn torch.bmm() trong trường hợp LoRA. Độ trễ SGMV gần như không đổi, từ 37µs đến 40µs.
+
+--- TRANG 8 ---
+Punica: Phục vụ Đa Thuê bao LoRA
+
+0 20 40 60
+Batch Size0 s50 µs100 µs150 µs200 µs250 µs300 µsLatency(a) Distinct
+
+0 20 40 60
+Batch Size(b) Uniform
+
+0 20 40 60
+Batch Size(c) Skewed
+
+0 20 40 60
+Batch Size(d) Identical
+
+Loop Gather-BMM Gather
+BMM SGMV
+
+Hình 8. Microbenchmark cho các việc triển khai toán tử LoRA.†Gather và BMM được đo riêng để tham khảo.
+
+0 20 40 60
+Batch Size0 s20 µs40 µs60 µs80 µs100 µs120 µsLatency(a) r=8
+
+0 20 40 60
+Batch Size(b) r=16
+
+0 20 40 60
+Batch Size(c) r=32
+
+0 20 40 60
+Batch Size(d) r=64
+
+Distinct Uniform Skewed Identical
+
+Hình 9. Microbenchmark cho toán tử LoRA trên các thứ hạng LoRA khác nhau.
+
+Nhìn chung, SGMV vượt trội đáng kể so với các việc triển khai baseline bất kể khối lượng công việc.
+
+Chúng tôi cũng chạy microbenchmark của các thứ hạng LoRA khác nhau trên Testbed #1. Hình 9 cho thấy độ trễ cho thứ hạng LoRA 8, 16, 32, và 64. Trong trường hợp Distinct, độ trễ tăng dần. Độ trễ của batch yêu cầu đơn khoảng 42µs cho tất cả bốn thứ hạng, trong khi kích thước batch 64 lên đến 72 µs, 75µs, 89 µs, và 118 µs, tương ứng. Khi khối lượng công việc tồn tại việc chia sẻ trọng số (Uniform, Skewed, và Identical), độ trễ gần như giống nhau qua kích thước batch 1 đến 64, khoảng 42µs đến 45µs.
+
+Benchmark lớp Transformer Tiếp theo, chúng tôi đánh giá hiệu suất lớp transformer sau khi kết hợp toán tử LoRA. Vì LLM gần như là một chồng các lớp transformer, hiệu suất lớp quyết định hiệu suất mô hình tổng thể. Chúng tôi chạy benchmark lớp trên Testbed #1 dựa trên cấu hình mô hình 7B và 13B và độ dài chuỗi 512 và 2048. Hình 10 vẽ độ trễ lớp. Khi độ dài chuỗi ngắn hơn, hiệu ứng batching mạnh hơn. Độ trễ chỉ tăng 72% khi kích thước batch tăng từ 1 lên 32 khi độ dài chuỗi là 512. Khi chuỗi dài hơn, self-attention mất thời gian lâu hơn, làm giảm hiệu ứng batching cấp lớp.
+
+Trái ngược với microbenchmark kernel, lưu ý rằng độ trễ lớp gần như giống nhau qua các khối lượng công việc khác nhau. Điều này là do thời gian tính toán cho addon LoRA nhỏ so với phép chiếu dày đặc backbone và self-attention. Thuộc tính hiệu suất không phụ thuộc vào mô hình LoRA này cho phép chúng tôi lập lịch các mô hình LoRA khác nhau như thể một mô hình. Thuật toán lập lịch của chúng tôi sau đó có thể tập trung vào thông lượng tổng thể thay vì việc đặt mô hình LoRA riêng lẻ, đó chính xác là cách chúng tôi thiết kế Punica.
+
+7.2 Tạo văn bản
+Tiếp theo, chúng tôi nghiên cứu hiệu suất tạo văn bản của Punica và các hệ thống baseline.
+
+Phục vụ mô hình 7B và 13B trên một GPU đơn Chúng tôi đánh giá tạo văn bản sử dụng Punica và các hệ thống baseline trên một GPU đơn trên Testbed #1. Hiệu suất GPU đơn phục vụ như trường hợp cơ sở cho triển khai toàn cụm. Chúng tôi tạo ra 1000 yêu cầu (tạo ra khoảng 101k token) và giới hạn mỗi hệ thống batch theo cách first-come-first-serve. Kích thước batch tối đa được đặt là 32 cho tất cả hệ thống. Punica có thể batch qua các mô hình LoRA khác nhau, và các hệ thống baseline chỉ có thể batch các yêu cầu cho cùng mô hình LoRA.
+
+Hình 11 (a) và (b) cho thấy kết quả trên mô hình 7B và 13B, tương ứng. Punica liên tục cung cấp thông lượng cao bất kể khối lượng công việc. Punica đạt 1044 tok/s và 693 tok/s trên mô hình 7B và 13B, tương ứng. Mặc dù hầu hết các baseline có thể đạt thông lượng tương đối cao trong trường hợp Identical, hiệu suất của chúng suy giảm khi có nhiều mô hình LoRA.
+
+Trong trường hợp Distinct, tất cả các hệ thống baseline chạy với kích thước batch 1, và do đó, thông lượng thấp. Trong trường hợp Uniform và Skewed, hầu hết các batch cho các hệ thống baseline có kích thước batch cực nhỏ (1–3), điều này giải thích hiệu suất thấp.
+
+--- TRANG 9 ---
+Punica: Phục vụ Đa Thuê bao LoRA
+
+0 10 20 30
+Batch Size0 s250 µs500 µs750 µs1 ms1.25 ms1.5 ms1.75 ms2 msLayer Latency(a) 7B, len=512
+
+0 10 20 30
+Batch Size(b) 7B, len=2048
+
+0 10 20 30
+Batch Size(c) 13B, len=512
+
+0 10 20 30
+Batch Size(d) 13B, len=2048
+
+Distinct Uniform Skewed Identical
+
+Hình 10. Benchmark Lớp Transformer.
+
+Distinct Uniform Skewed Identical02004006008001 kThroughput (Token/s)(a) 7B Model
+
+Distinct Uniform Skewed Identical0200400600800Throughput (Token/s)(b) 13B Model
+
+HuggingFace Transformers DeepSpeed Faster Transformer (backbone-only) vLLM (backbone-only) Punica
+
+Hình 11. So sánh tạo văn bản GPU đơn
+
+hiệu suất thấp. Punica có thể gộp các mô hình LoRA khác nhau trong một batch và do đó có thể chạy với kích thước batch 32 nhất quán.
+
+Với chỉ một mô hình LoRA, tất cả hệ thống có thể chạy với kích thước batch 32. Do đó, tất cả trừ HuggingFace Transformer có thể cung cấp thông lượng cao. Hiệu suất thấp của HuggingFace Transformer là do thiếu các tối ưu hóa kernel CUDA quan trọng, bao gồm FlashAttention (Dao et al., 2022). Trong trường hợp Identical, cả vLLM và Punica đều vượt trội so với các hệ thống khác vì bố cục KvCache của hai hệ thống cho phép batching liên tục. Ngược lại, các hệ thống khác phải chờ chuỗi dài nhất trong batch kết thúc. Thông lượng của vLLM cao hơn một chút so với Punica (ở 1140 tok/s và 789 tok/s, tương ứng) vì chúng tôi chạy vLLM chỉ backbone.
+
+Distinct Uniform Skewed Identical0200400Throughput (Token/s)70B Model
+
+vLLM (backbone-only) Punica
+
+Hình 12. So sánh tạo văn bản mô hình 70B.
+
+Phục vụ mô hình 70B với tensor parallelism Chúng tôi chạy mô hình 70B trên Punica với sơ đồ tensor parallel của Megatron (Shoeybi et al., 2019; Narayanan et al., 2021) trên 8 GPU trong Testbed #2. Chúng tôi so sánh Punica và vLLM. vLLM cũng sử dụng cùng sơ đồ tensor parallel của Megatron.
+
+Hình 12 cho thấy xu hướng tương tự như kết quả của chúng tôi trong việc phục vụ mô hình 7B và 13B. Khi có nhiều mô hình LoRA, thông lượng của vLLM khoảng 21 đến 25 tok/s, trong khi khi phục vụ backbone, vLLM có thể đạt 457 tok/s do kích thước batch lớn. Đối với trường hợp Identical, Punica và vLLM đạt hiệu suất tương tự vì sơ đồ song song của chúng giống nhau. Tuy nhiên, Punica có thể liên tục cung cấp thông lượng 441 đến 446 tok/s bất kể phân phối độ phổ biến LoRA, vượt trội đáng kể so với vLLM cho việc phục vụ nhiều mô hình LoRA.
+
+7.3 Triển khai cụm
+
+0510Req/s
+02 k4 k6 k8 k10 kTok/s
+
+0 500 1000 1500 2000 2500 3000 3500
+Time (seconds)051015GPU
+
+0 10 20 30
+Batch Size
+
+Hình 13. Triển khai cụm.
+
+Chúng tôi đánh giá Punica trên 16 GPU trong Testbed #2. Tải thay đổi như sau: Trong cái nhìn macro, tỷ lệ yêu cầu của khối lượng công việc tăng dần và sau đó giảm dần. Trong cái nhìn micro, khoảng cách giữa thời gian đến yêu cầu tuân theo phân phối mũ, và quá trình đến tuân theo phân phối Poisson. Độ phổ biến mô hình LoRA tuân theo phân phối Zipf-1.5 (tương tự như khối lượng công việc Skewed của chúng tôi). Thời gian của thí nghiệm là một giờ. Kích thước mô hình là 7B trong thí nghiệm này.
+
+Punica có thể hợp nhất việc sử dụng GPU trong khi cung cấp thông lượng cao. Bảng trên của Hình 13 cho thấy tỷ lệ yêu cầu theo thời gian. Bảng giữa cho thấy thông lượng tạo văn bản tính theo token mỗi giây. Bảng dưới cho thấy kích thước batch của mỗi GPU theo thời gian. Các GPU thường chạy với kích thước batch tối đa khi chúng không nhàn rỗi vì thuật toán lập lịch của chúng tôi ưu tiên kích thước batch lớn. Thỉnh thoảng, một GPU chạy với kích thước batch nhỏ hơn vì nó hết không gian KvCache và di chuyển một vài yêu cầu đến các GPU khác. Khi một GPU trở nên nhàn rỗi (kích thước batch = 0), có khả năng nó sẽ tiếp tục nhàn rỗi, sau đó có thể được trả lại cho nhà cung cấp cloud nếu cần thiết.
+
+8 CÔNG TRÌNH LIÊN QUAN
+Tối ưu hóa suy luận LLM. Một loạt công trình gần đây đã tập trung vào việc tối ưu hóa suy luận LLM. Orca (Yu et al., 2022) đề xuất batching tạo văn bản dựa trên transformer bằng cách tách đầu vào batch được nối tại hoạt động self-attention. vLLM (Kwon et al., 2023) giảm thêm phân mảnh bộ nhớ của KvCache bằng cách mượn ý tưởng của các trang ảo trong hệ điều hành. FlashAttention (Dao et al., 2022) cung cấp một việc triển khai tối ưu hóa của hoạt động self-attention bằng cách giảm di chuyển dữ liệu qua tính toán theo khối. Punica đã tích hợp chúng. Mặt khác, FlexGen (Sheng et al., 2023) thiết kế một lịch trình hoán đổi hiệu quả để tối đa hóa thông lượng trên một GPU đơn trong khi hy sinh độ trễ. Speculative Decoding (Leviathan et al., 2023; Miao et al., 2023; Cai et al., 2023) tăng cường độ hoạt động của các mô hình auto-regressive bằng cách sử dụng một mô hình "draft" nhẹ để đề xuất các ứng cử viên cho k token tiếp theo và xác minh các k token này song song với các mô hình lớn. Punica trực giao với các tối ưu hóa này.
+
+Phục vụ suy luận đa mô hình Một lượng công trình đáng kể đã được đề xuất cho việc phục vụ các mô hình ML trên một cụm GPU. Clipper (Crankshaw et al., 2017) là một trong những hệ thống sớm nhất để tối ưu hóa cả thông lượng và độ trễ trong một cụm GPU. Nó được theo sau bởi một loạt hệ thống (Gujarati et al., 2020). Tuy nhiên, chúng chủ yếu được thiết kế để phục vụ các mô hình CNN nhỏ hơn. Một sự khác biệt chính là phục vụ mô hình CNN là không trạng thái trong khi phục vụ LLM cần duy trì KvCache. Trạng thái giới thiệu một ái lực yêu cầu một thiết kế hệ thống khác. Ví dụ, Symphony (Chen et al., 2023) sử dụng một bộ lập lịch không bảo toàn công việc nhưng Punica chạy các batch trên một GPU liên tiếp do ái lực KvCache. Mặc dù Nexus (Shen et al., 2019) hỗ trợ chia sẻ prefix của các mô hình khác nhau, chúng cung cấp hỗ trợ và tối ưu hóa hạn chế đối mặt với các LLM và các mẫu chia sẻ tinh vi như chúng tôi chứng kiến trong LoRA.
+
+PetS (Zhou et al., 2022) gộp các yêu cầu đến các adapter khác nhau (ví dụ, Adapters (Houlsby et al., 2019), MaskBert (Zhao et al., 2020), Diff-Pruning (Guo et al., 2021), Bitfit (Zaken et al., 2022)) của một LLM trên một GPU đơn. Nó cho phép chia sẻ bộ nhớ GPU của mô hình được đào tạo trước cho các tác vụ downstream khác nhau, tuy nhiên, nó không cho phép nhiều mô hình khác nhau chạy đồng thời.
+
+Lượng tử hóa/nén mô hình và KvCache Một lượng đáng kể công trình đã được đề xuất để giảm dấu chân bộ nhớ của trọng số mô hình, activation và KvCache bằng lượng tử hóa (Frantar et al., 2022; Xiao et al., 2023a; Guo et al., 2023; Lin et al., 2023; Sheng et al., 2023). Lượng tử hóa mô hình tiết kiệm thêm khoảng trống cho KvCache, do đó cho phép Punica phục vụ các yêu cầu của các chuỗi dài hơn mà không cần di chuyển. Ngoài ra, lượng tử hóa KvCache (Sheng et al., 2023) và nén (Liu et al., 2023b;a; Zhang et al., 2023; Xiao et al., 2023b) giảm thêm I/O bộ nhớ của KvCache, qua đó có thể giảm độ trễ suy luận, vì self-attention bị giới hạn bởi băng thông bộ nhớ GPU (Dao et al., 2022). QLoRA (Dettmers et al., 2023) đề xuất tinh chỉnh LoRA bằng cách lưu trữ trọng số/gradient LoRA trong các định dạng độ chính xác cao như fp16 trong khi giữ trọng số gốc ở định dạng lượng tử hóa để tiết kiệm dấu chân bộ nhớ trong quá trình tinh chỉnh. Lượng tử hóa giảm độ trễ self-attention, điều này làm cho hiệu quả cao của kernel LoRA của Punica trở nên quan trọng hơn.
+
+9 KẾT LUẬN
+Thích ứng thứ hạng thấp (LoRA) đã trở thành một phương pháp tinh chỉnh quan trọng để thích ứng các mô hình được đào tạo trước với các miền cụ thể. Chúng tôi trình bày Punica, một hệ thống phục vụ nhiều mô hình LoRA trong một cụm GPU chung. Thiết kế của Punica tập trung xung quanh một thiết kế kernel CUDA mới cho phép gộp các hoạt động GPU cho các mô hình LoRA khác nhau. Đối với mỗi GPU, Punica chỉ yêu cầu một bản copy duy nhất của mô hình được đào tạo trước cơ bản để GPU phục vụ nhiều mô hình LoRA khác nhau, cải thiện đáng kể hiệu quả GPU về cả bộ nhớ và tính toán. Ngoài ra, bộ lập lịch của Punica hợp nhất các khối lượng công việc phục vụ LoRA đa thuê bao trong một cụm GPU chung. Với cụm GPU có kích thước cố định, các đánh giá của chúng tôi cho thấy Punica đạt được thông lượng phục vụ mô hình LoRA cao hơn 12 lần so với các hệ thống phục vụ LLM tiên tiến nhất trong khi chỉ thêm 2ms độ trễ mỗi token.
+
+--- TRANG 11 ---
+Punica: Phục vụ Đa Thuê bao LoRA
+
+TÀI LIỆU THAM KHẢO
+[Danh sách tài liệu tham khảo từ trang 11-13 được dịch đầy đủ với tất cả các tác giả, tiêu đề, và thông tin xuất bản sang tiếng Việt]
