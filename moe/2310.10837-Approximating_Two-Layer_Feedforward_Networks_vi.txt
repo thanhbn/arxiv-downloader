@@ -1,0 +1,177 @@
+# Xấp xỉ Mạng Feedforward Hai Lớp
+để Tối ưu hóa Transformers
+Róbert Csordás1Kazuki Irie2†Jürgen Schmidhuber1,3
+1The Swiss AI Lab IDSIA, USI & SUPSI2Harvard University3AI Initiative, KAUST
+{robert,juergen}@idsia.ch ,kirie@fas.harvard.edu
+Tóm tắt
+Làm thế nào để giảm yêu cầu tính toán và bộ nhớ của mạng nơ-ron (NN) mà không hy sinh hiệu suất? Nhiều nghiên cứu gần đây sử dụng Mixture of Experts (MoE) thưa để xây dựng các mô hình ngôn ngữ lớn (LM) hiệu quả về tài nguyên. Ở đây chúng tôi giới thiệu một số góc nhìn mới về MoE, trình bày một khung tổng quát hợp nhất các phương pháp khác nhau để xấp xỉ mạng nơ-ron hai lớp (ví dụ, khối feedforward của Transformers), bao gồm product-key memories (PKM). Tận dụng những hiểu biết từ khung này, chúng tôi đề xuất các phương pháp cải thiện cả MoE và PKM. Không giống như các nghiên cứu trước chỉ so sánh MoE với baseline dense trong điều kiện tính toán bằng nhau, điều kiện đánh giá của chúng tôi là tham số bằng nhau, điều quan trọng để đánh giá đúng LM. Chúng tôi chỉ ra rằng MoE của chúng tôi có thể cạnh tranh với Transformer-XL dense trên cả tập dữ liệu WikiText-103 và enwiki8 ở hai quy mô khác nhau, trong khi hiệu quả hơn nhiều về tài nguyên. Điều này chứng minh rằng MoE không chỉ liên quan đến LM cực lớn mà còn đến LM hiệu quả tài nguyên ở mọi quy mô. Mã của chúng tôi được công khai.1
+1 Giới thiệu
+Mặc dù đạt được kết quả ấn tượng gần đây bởi các mô hình ngôn ngữ lớn (LLM; Radford et al. (2019); Brown et al. (2020); Rae et al. (2021)), yêu cầu tài nguyên khổng lồ vẫn là hạn chế rõ ràng của chúng. Thực tế, hầu hết các LLM hiện có, như GPT-3 (Brown et al., 2020), không thể được huấn luyện, tinh chỉnh hoặc thậm chí đánh giá mà không có quyền truy cập vào tài nguyên tính toán to lớn. Nhiều nghiên cứu gần đây nỗ lực phát triển LLM ít nhất cho phép suy luận với tài nguyên hạn chế (ví dụ, trên phần cứng người tiêu dùng), ví dụ bằng cách xây dựng LM "nhỏ hơn" nhưng có khả năng (Touvron et al., 2023; Taori et al., 2023; Chiang et al., 2023) hoặc phát triển các phương pháp lượng tử hóa sau huấn luyện (Zafrir et al., 2019; Dettmers et al., 2022). Trong khi những phương pháp này đang trở nên phổ biến, một giải pháp có nguyên lý cho mạng nơ-ron hiệu quả tài nguyên vẫn còn khó nắm bắt.
+
+Một cách tiếp cận đầy hứa hẹn được khám phá bởi một số nghiên cứu gần đây về LM cực lớn là mixture of experts thưa (MoE; Shazeer et al. (2017); Lewis et al. (2021); Lepikhin et al. (2021); Fedus et al. (2022); Clark et al. (2022); Chi et al. (2022)). Không giống như các đối tác dense, MoE chỉ tính toán một tập con các activation (tức là chỉ một vài experts) ở mỗi bước, mang lại chi phí tính toán và bộ nhớ giảm. Tuy nhiên, MoE chưa được áp dụng rộng rãi như một cách tiếp cận chung/sẵn có, có lẽ do một số niềm tin phổ biến về MoE: (1) Chúng khó huấn luyện (liên quan đến các thủ thuật kỹ thuật phức tạp để ngăn sự sụp đổ), (2) chúng không cạnh tranh với các đối tác dense có cùng số lượng tham số (thực tế, các nghiên cứu trước tập trung vào so sánh FLOP bằng nhau, "không công bằng" khi so sánh MoE với baseline dense có ít tham số huấn luyện hơn nhiều), và cuối cùng, (3) chúng được dành riêng cho các mô hình cực lớn (chúng hiếm khi/không bao giờ được xem xét để cải thiện thêm hiệu quả của các mô hình "nhỏ"). Thực tế, ngay cả các nghiên cứu trước về Transformer LM dựa trên MoE chỉ triển khai MoE trong một vài khối feedforward; trong khi lý tưởng nhất, tất cả các khối như vậy nên được hưởng lợi từ việc thay thế bằng MoE. Ở đây chúng tôi thách thức những niềm tin phổ biến này và đề xuất những góc nhìn mới về MoE.
+
+Chúng tôi trình bày MoE trong một khung thống nhất của các phương pháp xấp xỉ mạng feedforward hai lớp, bao gồm product-key memories (PKM; Lample et al. (2019)) và sparsification top-k. Góc nhìn có nguyên lý này không chỉ cho phép chúng tôi nhóm và so sánh MoE với PKM về mặt khái niệm, mà còn cung cấp cái nhìn sâu sắc về các lựa chọn thiết kế để cải thiện những phương pháp này. Biến thể Transformer MoE kết quả của chúng tôi vượt trội hơn PKM cải tiến của chúng tôi, và hoạt động tốt như hoặc thậm chí vượt trội hơn baseline dense, trong khi sử dụng một phần tài nguyên tính toán cho cả huấn luyện và suy luận. Quan trọng, không giống như các nghiên cứu trước, chúng tôi so sánh MoE của chúng tôi với baseline dense có cùng số lượng tham số huấn luyện tổng, điều quan trọng cho đánh giá phù hợp trong mô hình hóa ngôn ngữ. Chúng tôi thực hiện thí nghiệm trên các tập dữ liệu WikiText-103 tiêu chuẩn (ở hai quy mô mô hình khác nhau) và Enwik8. Chúng tôi chứng minh rằng MoE không giới hạn ở LM cực lớn, mà hữu ích như một cách tiếp cận chung cho NN hiệu quả tài nguyên ở mọi quy mô, và phù hợp với xu hướng gần đây về cải thiện các mô hình "nhỏ hơn" (Touvron et al., 2023; Taori et al., 2023; Chiang et al., 2023). Cuối cùng, chúng tôi phát hành kernel CUDA cho các lớp MoE của chúng tôi cho phép đạt được thời gian thực hiện nhanh hơn và giảm bộ nhớ lớn so với mô hình dense.2
+
+2 Kiến thức nền tảng
+Transformer (Vaswani et al., 2017) có hai khối xây dựng chính: lớp self-attention (Parikh et al., 2016; Cheng et al., 2016; Bahdanau et al., 2015), và khối feedforward hai lớp, tức là khối perceptron đa lớp (MLP). Tăng tốc và giảm bộ nhớ của self-attention đã được khám phá khá tốt (xem, ví dụ, linear attention có từ các Transformer tuyến tính không chuẩn hóa từ năm 1991 (Schmidhuber, 1991; Katharopoulos et al., 2020; Choromanski et al., 2021; Schlag et al., 2021)), và các triển khai rất hiệu quả (Dao et al., 2022) cũng có sẵn. Ngược lại, các khối MLP hiệu quả tài nguyên vẫn còn ít được khám phá. Đây là trọng tâm chính của chúng tôi, và nó đặc biệt liên quan ngày nay, khi tỷ lệ tổng số tham số, tính toán và yêu cầu bộ nhớ do các khối MLP trong Transformer đang tăng lên trong các LLM ngày càng phát triển.
+
+Gọi dmodel, dff là các số nguyên dương. Mỗi khối MLP Transformer bao gồm một lớp up-projection với ma trận trọng số W1 ∈ Rdff×dmodel trong đó thường dff = 4dmodel, và một lớp down-projection với tham số W2 ∈ Rdmodel×dff chiếu nó trở lại kích thước ban đầu. Phi tuyến tính (thường là ReLU) được áp dụng giữa hai lớp này. Nghĩa là, đầu vào x ∈ Rdmodel được biến đổi thành đầu ra y ∈ Rdmodel như sau:
+
+u = ReLU(W1x) (1)
+y = W2u (2)
+
+trong đó u ∈ Rdff, và chúng tôi bỏ qua bias (cũng như các chiều batch và thời gian) để đơn giản.
+
+Thay thế, lớp này có thể được xem như một bộ nhớ key-value được truy cập bởi attention (Vaswani et al. (2017)3, Geva et al. (2021)), trong đó keys và values là các hàng và cột của ma trận trọng số W1 và W2:
+
+W1 = [k1⊺, k2⊺, ..., kdff⊺] (3)
+W2 = [v1, v2, ..., vdff] (4)
+
+trong đó ki ∈ Rdmodel, vi ∈ Rdmodel cho i ∈ {1, ..., dff}. Khi đó, đầu ra được tính như "attention":
+
+y = Σ(i=1 to dff) vi ReLU(ki⊺x) = Σ(i=1 to dff) αivi (5)
+
+trong đó αi = ReLU(ki⊺x) ∈ R≥0 là các "trọng số attention." Lưu ý rằng αi = u[i] trong đó u[i] ∈ R biểu thị thành phần thứ i của u ∈ Rdff trong Phương trình 1. Không giống như self-attention tiêu chuẩn, khối MLP sử dụng hàm kích hoạt ReLU (thay vì softmax) mà không có scale.
+
+Đã được quan sát rằng, trong thực tế, chỉ một vài trong số các yếu tố ki⊺x là dương (Li et al., 2023; Shen et al., 2023), làm cho đầu ra của lớp đầu tiên, tức là u, thưa. Cụ thể, Shen et al. (2023) báo cáo rằng trong một Transformer với dmodel = 256 và dff = 1024, 10% các kênh chiếm 90% tổng khối lượng activation. Chúng tôi xác nhận xu hướng này trong nghiên cứu sơ bộ của riêng mình. Hình 1 cho thấy số lượng trung bình của các đơn vị khác không trong u có kích thước dff = 2053 trong mô hình dense 47M tham số của chúng tôi được huấn luyện trên WikiText-103 (chúng tôi tham khảo App. A.2 để biết thêm chi tiết). Số lượng dưới 200 cho tất cả các lớp. Điều này gợi ý rằng khối MLP có thể được xấp xỉ mà không mất hiệu suất đáng kể. Lưu ý rằng điều này cũng được hỗ trợ bởi các phát hiện của Zhang et al. (2022).
+
+3 Xấp xỉ MLP 2 lớp
+Ở đây chúng tôi trình bày một góc nhìn thống nhất về các phương pháp xấp xỉ MLP 2 lớp (Phần 2) bao gồm nhiều phương pháp hiện có như MoE (Phần 3.3) và PKM (Phần 3.2).
+
+Kiến thức cơ bản. Gọi ŷ ∈ Rdmodel biểu thị một xấp xỉ của y ∈ Rdmodel trong Phương trình 5. Gọi yi ∈ Rdmodel biểu thị yi = αivi cho i ∈ {1, ..., dff}. Ý tưởng cốt lõi là xấp xỉ tổng trong Phương trình 5, tức là y = Σ(i=1 to dff) yi bằng cách chỉ giữ một tập con S ⊂ {1, ..., dff} của các cặp key-value, tức là ŷ = Σ(i∈S) yi. Trực quan của phép xấp xỉ này như sau. Chúng tôi giả định rằng một phép xấp xỉ tốt ŷ của y là phép xấp xỉ tối thiểu hóa khoảng cách Euclidean e = ||ŷ-y||2² ∈ R, hiện có thể được biểu diễn là e = ||Σ(i∈S̄) αivi||2² trong đó S̄ biểu thị bù của S, tức là S̄ = {1, ..., dff}\S. Vì chúng ta có e = ||Σ(i∈S̄) αivi||2² ≤ Σ(i∈S̄) αi||vi||2² (bất đẳng thức tam giác; trong đó đẳng thức đạt được khi vi trực giao), cận trên này Σ(i∈S̄) αi||vi||2² có thể được tối thiểu hóa nếu mỗi hạng tử ci = αi||vi||2² ∈ R đều nhỏ. Nếu chúng ta tiếp tục giả định rằng tất cả các vector value vi có cùng norm, yếu tố quan trọng cho chất lượng xấp xỉ được giảm xuống thành các trọng số attention αi. Trong ngữ cảnh này, chúng tôi cũng gọi αi là đóng góp của cặp key-value i.
+
+Gọi K là một số nguyên dương. Ý tưởng chung của tất cả các phương pháp được thảo luận trong công trình này là giữ K cặp (ki, vi) có đóng góp αi cao nhất, và bỏ qua các cặp đóng góp thấp khác. Mục tiêu là tìm cơ chế tốt nhất để chọn K cặp như vậy. Ở đây chúng tôi thảo luận ba biến thể: Top-K activation (Phần 3.1), Product-Key Memories (PKM, Phần 3.2), và Mixture of Experts (MoE, Phần 3.3).
+
+3.1 Hàm Kích hoạt Top-K
+Triển khai đơn giản nhất của phép xấp xỉ được mô tả ở trên là hàm kích hoạt top-K:
+
+Ex = arg topk(u, K) ⊂ {1, ..., dff} (6)
+ŷ = Σ(i∈Ex) αivi (7)
+
+Tiếc là điều này chỉ tiết kiệm được ít hơn một nửa toàn bộ tính toán: trong khi điều này cho phép chúng ta giảm tính toán của Phương trình 2, không có tính toán nào có thể được tiết kiệm trong Phương trình 1 vì cần tính toán đầy đủ của u = ReLU(W1x) cho Phương trình 6. Vượt ra ngoài điều này đòi hỏi phải giới thiệu một số xấp xỉ cho Phương trình 6 như trong PKM (Phần 3.2) và MoE (Phần 3.3).
+
+3.2 Product-Key Memories (PKM)
+Product-Key memories (Lample et al., 2019) bao gồm việc thay thế W1 ∈ Rdff×dmodel trong Phương trình 1 bằng hai ma trận Wa, Wb ∈ R√dff×dmodel/2. Nó chia vector đầu vào x ∈ Rdmodel thành hai nửa, xa, xb ∈ Rdmodel/2, sao cho x = xa|xb, trong đó | biểu thị nối. Phép nhân ma trận sau đó được thực hiện trên những vector nhỏ hơn này: ua = Waxa và ub = Wbxb. Sau đó u ∈ Rdff được tính bằng cách kết hợp các phần tử của ua ∈ R√dff và ub ∈ R√dff theo mọi cách có thể (tức là, tích Cartesian), tương tự như tích ngoài, nhưng sử dụng phép cộng thay vì phép nhân, tức là, cho tất cả i ∈ {1, ..., dff},
+
+u[i] = ub[⌊i/√dff⌋] + ua[i mod √dff] (8)
+
+Ngoài việc áp dụng Top-K ở đầu ra như trong Phần 3.1, ở đây Top-K cũng có thể được sử dụng để tăng tốc hoạt động ở trên. Bằng cách áp dụng Top-K cho ua và ub trước khi kết hợp chúng để tính u, chỉ có K² << dff thành phần của u[i] phải được tính toán, và chúng được đảm bảo chứa K thành phần lớn nhất của u đầy đủ.
+
+Trong công thức ban đầu (Lample et al., 2019), PKM sử dụng hàm kích hoạt softmax, lấy cảm hứng từ self-attention (Vaswani et al., 2017). Thay vào đó, chúng tôi sẽ chỉ ra cách một hàm kích hoạt không cạnh tranh, như ReLU là lựa chọn tốt hơn (xem Phần 6.2).
+
+3.3 Mixture of Experts (MoE)
+Gọi NE, G biểu thị các số nguyên dương. MoE phân vùng dff cặp (ki, vi) (xem định nghĩa của chúng trong Phần 2) thành NE nhóm có kích thước G mỗi nhóm, sao cho G·NE = dff. Điều này có nghĩa là các ma trận trọng số W1 ∈ Rdff×dmodel và W2 ∈ Rdmodel×dff (Phương trình 1-2) được phân vùng thành các ma trận W1e ∈ Rdff/NE×dmodel và W2e ∈ Rdmodel×dff/NE cho e ∈ {1, ..., NE},
+
+W1e = [k⊺eG+1, k⊺eG+2, ..., k⊺(e+1)G] (9)
+W2e = [veG+1, veG+2, ..., v(e+1)G] (10)
+
+Đầu ra được tính như:
+
+ŷ = Σ(e∈Ex) W2e s[e] ReLU(W1e x) (11)
+
+trong đó s[e] ∈ R là phần tử thứ e của vector s ∈ RNE được tính bởi một hàm chấm điểm expert sel: Rdmodel → RNE (thường s = sel(x) = softmax(W3x) với W3 ∈ RNE×dmodel), và Ex biểu thị một tập con các chỉ số {1, ..., NE} kết quả từ phép toán Top-K trên s, tức là Ex = arg topk(s, K). Lưu ý rằng trong một số biến thể, chuẩn hóa lại bổ sung được áp dụng sau Top-K, sao cho Σ(e∈Ex) s[e] = 1, s[e] ≥ 0; chúng tôi định nghĩa thao tác như vậy là norm topk, xem định nghĩa chính xác của nó trong App. A.14. Hiệu quả của MoE đến từ việc NE ≪ dff, do đó tính toán s rẻ. Hơn nữa, G và K được chọn sao cho G*K ≪ dff, do đó tính toán được thực hiện bởi các expert ít tốn kém hơn MLP dense.
+
+Với ký hiệu trên, thật đơn giản để thấy rằng MoE cũng có thể được xem như xấp xỉ MLP 2 lớp với một thành phần có thể huấn luyện (tức là, hàm lựa chọn sel để tạo ra s). Tương tự như Phương trình 5 và 7, Phương trình 11 có thể được biểu diễn là:
+
+ŷ = Σ(e∈Ex) Σ(i=1 to G) αeG+i s[e] veG+i (12)
+
+trong đó, so với Phương trình 5 và 7, "điểm số đóng góp" của cặp key-value i (được định nghĩa trong Phần 3/Kiến thức cơ bản) có một yếu tố bổ sung s[e] của một nhóm expert e mà cặp key-value thuộc về.
+
+Thách thức chính của MoE là học một cơ chế/hàm lựa chọn expert sel ở trên gán điểm cao cho chỉ một vài expert (để chúng ta có thể bỏ qua những expert khác mà không hy sinh hiệu suất), trong khi tránh một vấn đề nổi tiếng, được gọi là expert collapsing, trong đó chỉ một vài expert được sử dụng và phần còn lại không bao giờ được chọn. Để tránh điều này, một số regularization thường được áp dụng cho điểm số lựa chọn sel(x), khuyến khích việc định tuyến expert đồng đều hơn trên toàn bộ batch token. Chúng tôi cung cấp đánh giá toàn diện về các biến thể MoE và chi tiết của chúng trong Phần 4 và phiên bản cải tiến của chúng tôi trong Phần 5.
+
+4 Các biến thể MoE hiện có
+Một số biến thể của MoE đã được đề xuất với nhiều chi tiết khác nhau. Ở đây chúng tôi xem xét ngắn gọn những biến thể phổ biến và đại diện nhất (ví dụ, chúng tôi không bao gồm những biến thể sử dụng học tăng cường cho định tuyến expert) trước khi mô tả phiên bản cải tiến của chúng tôi trong Phần 5. Chúng tôi sẽ xem xét hàm lựa chọn expert và phương pháp regularization của chúng, và nêu bật các đặc điểm chính.
+
+Sparsely Gated Mixtures of Experts. Shazeer et al. (2017) đã xem xét lại MoE (Jacobs et al., 1991; Ivakhnenko và Lapa, 1965) với phép toán Top-K, cho phép giảm yêu cầu tài nguyên của nó. Phương pháp của họ về cơ bản là phương pháp được mô tả trong Phần 3.3 (với chuẩn hóa lại sau Top-K) ngoại trừ việc họ sử dụng hàm gating có nhiễu:
+
+sel(x) = softmax(W3x + N(0,1)·softplus(W4x)) (13)
+
+trong đó W4 ∈ RNE×dmodel, hạng tử nhiễu Gaussian N(0,1) là từng phần tử và độc lập cho mỗi kênh, và softplus(x) = log(1 + ex). Họ sử dụng hạng tử regularization phụ trợ sau cho cân bằng tải,
+
+L = CV(Σ(x∈B) norm topk(sel(x))) (14)
+
+trong đó CV(x) = μx/σx là hệ số biến thiên và B là tập hợp tất cả các token trong batch.
+
+Đặc điểm chính: Các điểm số được chuẩn hóa sau phép toán top-K (với K > 1), tương đương với việc áp dụng top-K trước softmax.
+
+Switch Transformer. Fedus et al. (2022) tích hợp MoE ở trên vào Transformer để có được Switch Transformer của họ. Về chi tiết MoE, một trong những tuyên bố chính của Fedus et al. (2022) là định tuyến top-1 là đủ. Hàm lựa chọn của họ đơn giản là: sel(x) = softmax(W3x), nhưng họ đề xuất một cân bằng tải cứng giữa các expert chạy trên các bộ gia tốc phần cứng khác nhau: Tối đa μ|B|/NE token được phép định tuyến đến một expert, trong đó μ ∈ R>0 là hệ số dung lượng (thường từ 1 đến 1.5), định nghĩa có bao nhiêu lần nhiều token có thể được xử lý bởi một expert so với trường hợp lý tưởng của định tuyến đồng đều. Mỗi expert bị cấm xử lý nhiều hơn số lượng token này. Để regularization, tỷ lệ token f ∈ RNE được xử lý bởi mỗi expert, và xác suất lựa chọn trung bình p ∈ RNE cho mỗi expert được tính (K = 1; top-1 được sử dụng) là:
+
+fi = (1/|B|) Σ(x∈B) 1{i ∈ arg topk(sel(x), K)} (15)
+p = (1/|B|) Σ(x∈B) sel(x) (16)
+L = NE f·p (17)
+
+trong đó 1 biểu thị hàm chỉ báo (bằng 1 nếu đối số đúng, và 0 nếu sai), và · biểu thị tích vô hướng. Trực quan, điều này phục vụ như một regularization thích ứng phạt các expert được sử dụng thường xuyên với "trọng số" cao. Ngoài ra, họ sử dụng dropout với tỷ lệ drop cao (40%) trong các expert (nhưng chỉ 10% trong các lớp bình thường). Hơn nữa, Fedus et al. (2022) cũng đề xuất khởi tạo các expert với √(0.1/G). Như chúng ta sẽ thấy trong Phần 5, chúng tôi sử dụng phiên bản sửa đổi của sơ đồ này.
+
+Lưu ý rằng việc áp dụng Top-K sau softmax khuyến khích sụp đổ: nếu điểm số của expert được chọn tăng, điểm số của tất cả các expert khác tự động giảm. Điều này không xảy ra với Shazeer et al. (2017): Trong phương pháp của họ, chỉ các expert được chọn cạnh tranh với nhau, vì vậy nếu sự hiện diện của chúng có lợi, điểm số của chúng có thể được tăng.
+
+Đặc điểm chính: Lưu ý rằng Top-1 được áp dụng sau softmax mà không chuẩn hóa lại.
+
+BASE layers và S-BASE. Lấy cảm hứng từ chiến lược định tuyến và hệ số dung lượng cứng của Switch Transformer, Lewis et al. (2021) đề xuất các lớp BASE. Họ sử dụng định tuyến top-1 và kích hoạt sigmoid σ trong hàm lựa chọn:
+
+sel(x) = σ(W3x) (18)
+
+Bây giờ thay vì sử dụng arg topk, họ giải quyết bài toán gán tuyến tính sau để tìm chỉ số ex ∈ {1, ..., NE} của expert mà mỗi đầu vào x ∈ B được định tuyến tới,
+
+maximize Σ(x∈B) sel(x)[ex] (19)
+s.t. ∀i ∈ {1, ..., NE}, Σ(x∈B) 1{ex == i} = |B|/NE
+
+Điều này đảm bảo việc gán expert đồng đều, hiệu quả cho huấn luyện đa bộ gia tốc. Đầu ra được tính bằng Phương trình 11 với Ex = {ex} (một tập hợp với một phần tử duy nhất; "top-1"). Tuy nhiên, tại thời điểm suy luận, không có cân bằng như vậy là khả thi vì không phải tất cả token của chuỗi đều có sẵn tại mỗi bước; Ex = {arg max(sel(x))} được sử dụng thay thế. Lewis et al. (2021) chỉ ra rằng, trong khi trong quá trình huấn luyện, định tuyến được thực thi hoàn toàn đồng đều, trong thời gian kiểm tra, phân phối trông giống như hàm mũ (thực tế, điều này tương tự như Switch Transformer nhưng cân bằng hơn cho BASE).
+
+Thuật toán để giải quyết bài toán gán tuyến tính (Phương trình 19) khó triển khai hiệu quả trên các bộ gia tốc hiện đại. Clark et al. (2022) đã đề xuất sử dụng thuật toán Sinkhorn (Sinkhorn, 1964; Sinkhorn và Knopp, 1967) thay thế (dẫn đến mô hình gọi là Sinkhorn-BASE hoặc S-BASE), để xấp xỉ nghiệm của bài toán này (lưu ý rằng định tuyến tương tự được thảo luận độc lập bởi Kool et al. (2021)). Họ báo cáo rằng điều này hoạt động tốt, trong khi đơn giản hơn để triển khai. Do đó, triển khai lại BASE của chúng tôi là S-BASE sử dụng thuật toán Sinkhorn.
+
+Đặc điểm chính: Trong quá trình huấn luyện, các lần lặp Sinkhorn được sử dụng trên điểm số để có được một phân công cân bằng. Kích hoạt sigmoid luôn được áp dụng để tính điểm số trọng số.
+
+Nhìn chung, tất cả các phương pháp cân bằng tải ở trên khá phức tạp. Chúng tôi đề xuất cách tiếp cận đơn giản nhưng hiệu quả cho MoE trong Phần 5.
+
+5 Cải thiện Mixture of Experts
+Ở đây chúng tôi trình bày biến thể MoE cải tiến của chúng tôi, mà chúng tôi gọi là σ-MoE. Chúng tôi thực hiện nghiên cứu ablation kỹ lưỡng về các lựa chọn thiết kế của chúng tôi trong Phần 6.
+
+Hàm Lựa chọn Expert σ-MoE. MoE của chúng tôi sử dụng phép toán top-K (không giống như BASE). Kích hoạt mà chúng tôi sử dụng trên hàm lựa chọn là sigmoid (như trong Phương trình 18 của BASE) thay vì softmax được sử dụng trong Switch Transformer và Sparsely Gated Mixtures of Experts. Lựa chọn này được thúc đẩy bởi góc nhìn về MoE như xấp xỉ MLP 2 lớp (Phần 3). Thực tế, softmax đưa ra sự cạnh tranh giữa các expert. Không có sự cạnh tranh như vậy giữa các kênh được sử dụng trong MLP 2 lớp thông thường (tức là, không có ràng buộc về αi trong Phương trình 5). Điều này gợi ý rằng, về nguyên tắc, không cần cạnh tranh giữa các hạng tử trong tổng của Phương trình 12 trong MoE, để tạo ra sự thưa thớt. Cũng được biết rõ với các nhà thực hành rằng softmax như kích hoạt thông thường ảnh hưởng tiêu cực đến khả năng huấn luyện của MLP tiêu chuẩn. Softmax kết hợp với top-K cũng có thể khuyến khích expert collapsing: khi điểm số lựa chọn của một expert tăng, điểm số của những expert khác tự động giảm. Vì tất cả những lý do này, chúng tôi chọn sigmoid thay vì softmax; chúng tôi xác nhận thực nghiệm rằng đây thực sự là một lựa chọn tốt.
+
+Ngoài ra, nhìn MoE trong khung này cung cấp cho chúng tôi gợi ý về việc kết hợp chúng với kích hoạt Top-K (Phần 3.1) để tăng tốc thêm. Chúng ta có thể tính ue = s[e] ReLU(W1e x) (Phương trình 11) cho các expert được chọn và thực hiện Top-K bổ sung để giữ các đơn vị cao nhất trong số chúng và đặt phần còn lại về không. Chúng tôi để điều này cho công việc tương lai.
+
+Khởi tạo σ-MoE. Một lựa chọn thiết kế khác được hướng dẫn bởi góc nhìn xấp xỉ-MLP về MoE (Phần 3) là sơ đồ khởi tạo cho các expert. Thông thường, các expert được giả định là độc lập, và độ lệch chuẩn của khởi tạo (Glorot và Bengio, 2010; He et al., 2015) của W2e được tính dựa trên G thay vì dff. Các thí nghiệm của chúng tôi trong Phần 6.3 cho thấy điều này là không tối ưu.
+
+Ngược lại, chúng tôi khởi tạo tất cả các ma trận trọng số giống hệt với baseline dense pre-layernorm, không tính đến kích thước nhỏ hơn của các expert riêng lẻ, tức là W1e ~ N(0, √(2/(dmodel·nlayers))) và W2e ~ N(0, √(2/(dff·nlayers))) trong đó nlayers biểu thị số lượng lớp, sử dụng dmodel và dff thay vì G.
+
+Chúng tôi cũng đặc biệt chú ý khi khởi tạo W3 của hàm lựa chọn. Chúng tôi khởi tạo nó theo phân phối chuẩn có cùng độ lệch chuẩn như W1e, nhưng chúng tôi cũng đảm bảo rằng các hàng của W3 có cùng norm5. Điều này có thể dễ dàng đạt được trong thực tế bằng cách khởi tạo trọng số thành W'3 ~ N(0,1), scale lại các hàng của nó thành norm 1, và sau đó scale lại toàn bộ ma trận lần nữa để có độ lệch chuẩn mong muốn. Lưu ý rằng mỗi điểm số vô hướng trong s là tích vô hướng của một hàng của W3 và x. Phương pháp khởi tạo này đảm bảo rằng chỉ có góc giữa x và các hàng của W3 ban đầu ảnh hưởng đến điểm số s, thay vì một yếu tố ngẫu nhiên bổ sung do khởi tạo.
+
+Regularization σ-MoE. Như đã lưu ý trong Phần 4, các phương pháp regularization hiện có cho cân bằng tải phức tạp (ví dụ, Switch Transformer cần xử lý riêng biệt phân phối lựa chọn thực tế và điểm số, Sparsely Gated Mixture of Experts cần nhiễu trong hàm lựa chọn). Ngược lại, chúng tôi đề xuất đơn giản tối đa hóa entropy của phân phối lựa chọn p ∈ RNE được tính trên toàn bộ batch. Trực quan, đây là cách đơn giản để khuyến khích việc sử dụng expert bằng nhau trong batch và ngăn chặn sự tự tin không cần thiết trong việc chọn các expert riêng lẻ. Gọi B là tập hợp tất cả các token trong batch (đếm qua cả chiều batch và thời gian). Chúng tôi giới thiệu hạng tử regularization L sau:
+
+p = (1/|B|) Σ(x∈B) softmax(W3x) (20)
+L = -Σ(e=1 to NE) p[e] log p[e] (21)
+
+Hơn nữa, chúng tôi đề xuất ngẫu nhiên drop các expert hoàn chỉnh, trong quá trình huấn luyện; chúng tôi gọi điều này là expert dropout. Không giống như dropout tiêu chuẩn ở mức activation, chúng tôi không áp dụng rescaling, tức là
+
+sel(x) = { σ(Wsx) ⊙ m nếu huấn luyện, σ(Wsx) nếu không } (22)
+
+trong đó m ∈ {0,1}NE, m ~ Bernoulli(1-δ), trong đó δ là tỷ lệ dropout, và ⊙ là tích từng phần tử. Điều này ngăn các expert bị drop được chọn trong khi không ảnh hưởng đến những expert khác. Trực quan, khi expert dropout loại bỏ một expert phổ biến, nó buộc những expert ít phổ biến hơn phải đảm nhận. Do đó, cơ hội để chúng được huấn luyện và cải thiện tăng lên. Chúng tôi chỉ ra thực nghiệm rằng phương pháp regularization của chúng tôi (Phương trình 21) và expert dropout (Phương trình 22) đều hiệu quả mặc dù đơn giản.
+
+6 Thí nghiệm
+Thiết lập thí nghiệm của chúng tôi dựa trên Transformer XL của Dai et al. (2019) với một số sửa đổi: chúng tôi sử dụng pre-layer norm và giảm số bước huấn luyện xuống 100k để giảm ngân sách tính toán. Ngoài ra, để khớp số lượng tham số giữa baseline và MoE, chúng tôi sửa đổi nhẹ các siêu tham số của baseline (Dai et al., 2019). Thực tế, kernel CUDA MoE của chúng tôi chỉ có thể hoạt động với các chiều chia hết cho 4. Chúng tôi làm tròn kích thước ban đầu lên đến số phù hợp tiếp theo, ví dụ, chúng tôi thay đổi dmodel của mô hình WikiText-103 47M tham số từ 410 ban đầu thành 412. Hơn nữa, vì MoE yêu cầu tham số bổ sung cho hàm lựa chọn expert, chúng tôi bù đắp điều này bằng cách tăng dff của mô hình baseline để khớp số lượng tham số. Mô hình baseline sửa đổi của chúng tôi trên Enwik8 vẫn có 41M tham số và hoạt động tương tự như Transformer XL ban đầu (xem Bảng 1). Đối với WikiText-103, chúng tôi sử dụng đơn vị subword (Sennrich et al., 2016) sử dụng tokenizer SentencePiece (Kudo và Richardson, 2018) thay vì từ vựng mức từ, để tránh các thủ thuật bổ sung cần thiết để giảm số lượng tham số và yêu cầu tính toán do kích thước từ vựng khổng lồ. Trên WikiText-103, chúng tôi xem xét hai kích thước mô hình khác nhau: một mô hình 47M tham số (được ký hiệu là "WT-S" cho "small"), và một mô hình 262M tham số ("WT-B" cho "big"). Chúng tôi gọi Enwik8 là "E8" trong một số bảng. Để biết thêm chi tiết, xem Phụ lục B.
+
+Đối với tất cả các phương pháp được xem xét, chúng tôi sử dụng chúng trong mọi khối MLP của mô hình, điều này không phải là thực hành phổ biến trong tài liệu. Thông thường, MoE (hoặc các phương pháp xấp xỉ khác) chỉ được sử dụng một lần mỗi n lớp hoặc thậm chí chỉ trong một lớp. Điều này không thỏa mãn vì mục tiêu của chúng tôi là tìm một phương pháp có thể áp dụng chung có thể tăng tốc tất cả các lớp trên toàn bộ mô hình. Hơn nữa, điều này khuếch đại sự khác biệt giữa các phương pháp khác nhau, giúp minh họa tốt hơn tác động của từng lựa chọn thiết kế.
+
+6.1 Top-K
+Chúng tôi đầu tiên đánh giá phương pháp Top-K (Phần 3.1). Đánh giá độc lập này quan trọng vì Top-K là cơ sở của cả xấp xỉ PKM và MoE. Bảng 1 cho thấy kết quả. Chúng tôi quan sát rằng không chỉ Top-K trong các khối MLP bảo toàn hiệu suất của Transformer, mà còn cải thiện hiệu suất. Chúng tôi giả thuyết rằng những cải thiện này do việc giảm nhiễu đặc trưng như được mô tả bởi Elhage et al. (2022). Tuy nhiên, chúng ta rõ ràng không thể giảm K một cách tùy ý; phải có sự đánh đổi giữa hiệu ứng khử nhiễu và khả năng của mạng. Ở đây, giá trị tối ưu mà chúng tôi tìm thấy là K = 128 hoặc K = 512.
+
+6.2 Product-Key Memory (PKM)
+Góc nhìn của chúng tôi trong Phần 3 gợi ý sử dụng kích hoạt không cạnh tranh như ReLU thay vì softmax được sử dụng trong PKM ban đầu (Lample et al., 2019). Các thí nghiệm của chúng tôi xác nhận lợi ích của lựa chọn này (Bảng 2): hiệu suất của các biến thể ReLU gần hơn nhiều với baseline dense (xem cũng các phát hiện liên quan trong Shen et al. (2023)). Nhưng ngay cả các mô hình PKM tốt nhất cũng kém hiệu suất hơn baseline dense, cho thấy hạn chế cơ bản của PKM. Lưu ý rằng, như đã nêu ở trên, chúng tôi thực hiện so sánh cẩn thận giữa phương pháp xấp xỉ (ở đây là PKM) và baseline dense sử dụng cùng số lượng tham số. Để biết thêm kết quả và chi tiết về PKM, chúng tôi tham khảo App. A.3.
+
+6.3 Mixture of Experts (MoE)
+Ở đây chúng tôi đánh giá các mô hình σ-MoE (Phần 5) trên Enwik8 và WikiText-103 cũng như hai tập dữ liệu bổ sung, C4 (Raffel et al., 2020) và peS2o mới được đề xuất (Soldaini và Lo, 2023). Với kích thước lớn của C4 và peS2o, chúng tôi không thể huấn luyện cho một epoch đầy đủ; chúng tôi huấn luyện cho 100k bước với cùng siêu tham số như cho WikiText-103.
+
+Kết quả chính. Bảng 3 cho thấy kết quả chính. Các mô hình σ-MoE của chúng tôi khớp hiệu suất của baseline dense có tham số bằng nhau, trong khi đạt được giảm bộ nhớ và tính toán đáng kể. Những mô hình này sử dụng K = 4 cho NE = 16 hoặc NE = 32, là mức độ thưa thớt "vừa phải" nhưng đã mang lại giảm tính toán đáng kể như được hiển thị trong cột "% FLOPs"; giảm tính toán và bộ nhớ cụ thể được hiển thị thêm trong Hình 2 (xem Phụ lục A.5 để biết chi tiết). Tự nhiên, có giới hạn về mức độ thưa thớt tối thiểu để bảo toàn hiệu suất tốt của MoE, được xác định bởi một số yếu tố. Đầu tiên, chúng tôi tìm thấy thực nghiệm rằng các expert có kích thước nhóm G < 128 thường làm giảm hiệu suất. Thứ hai, các benchmark của chúng tôi với phép toán Top-K (Bảng 1) và các ablation (Bảng 10 trong Phụ lục) cho thấy số lượng tối thiểu các kênh hoạt động đồng thời G·K cần phải trên một ngưỡng quan trọng nhất định (thường khoảng 256-512). Cuối cùng, chúng tôi khớp số lượng tham số của mô hình baseline; đây là ràng buộc cuối cùng. Dưới những ràng buộc này, chúng tôi thấy rằng hiệu suất của baseline dense có thể được khớp bằng cách sử dụng 25% FLOPs và bộ nhớ cần thiết cho activation cho các mô hình nhỏ của chúng tôi, và độ thưa thớt 12.5% cho mô hình lớn (lưu ý rằng FLOPs ở đây không tính đến phép chiếu tuyến tính được sử dụng để chọn các expert, là không đáng kể trong phạm vi NE được sử dụng ở đây).
+
+Tăng NE và Tác động của Độ thưa thớt. Kết quả trên chứng minh rằng σ-MoE của chúng tôi có thể được cấu hình để khớp hiệu suất mong muốn với ít tài nguyên hơn. Ở đây chúng tôi thực hiện thí nghiệm bổ sung trong đó chúng tôi tăng NE một cách đơn giản (trong khi giữ K = 4) từ 16 đến 128. Điều này tăng số lượng tham số lên 238M, trong khi giữ tốc độ và yêu cầu bộ nhớ có thể so sánh với mô hình ban đầu (cột "WT-S*" trong Bảng 4). Mô hình này đạt được perplexity test là 10.37, tồi tệ hơn 9.46 của mô hình dense 262M (xem Bảng 1). Thực tế, ngay cả khi số lượng tham số được khớp, vẫn có những nút thắt cổ chai khác quan trọng, ví dụ, ở đây dmodel nhỏ hơn nhiều (412 vs 1024).
+
+Chúng tôi xây dựng một baseline dense khác bằng cách đặt mọi siêu tham số như trong mô hình 47M, ngoại trừ dff, được đặt thành 16480 để khớp số lượng tham số của MoE NE = 128. Baseline này đạt perplexity 10.03: do đó, khoảng cách giữa MoE mở rộng và đối tác dense của nó vẫn còn đáng kể (10.37 vs 10.03), không giống như MoE với độ thưa thớt vừa phải. Điều này cho thấy tầm quan trọng của việc kiểm soát độ thưa thớt MoE để bảo toàn hiệu suất của nó so với baseline dense.
+
+So sánh với MoE Hiện có. Chúng tôi cũng so sánh σ-MoE với các biến thể MoE khác (Phần 4), cụ thể là Switch Transformer (Fedus et al., 2022), S-BASE (Clark et al., 2022)6 và biến thể softmax cơ bản. Bảng 4 cho thấy kết quả cho nhiều biến thể trên WikiText-103 và Enwik8. Ngoài ra, chúng tôi so sánh σ-MoE với các baseline quan trọng nhất trên C4 và peS2o trong Bảng 5. Vì Switch Transformer và S-BASE chỉ chọn một expert duy nhất (K = 1), chúng tôi tăng kích thước expert lên hệ số 4 (thay vì G = 128 trong các mô hình của chúng tôi, chúng tôi sử dụng G = 512), và chúng tôi giảm NE cùng hệ số để so sánh công bằng về số lượng tham số. Cả hai đều không sử dụng expert dropout được đề xuất của chúng tôi. Đối với Switch Transformer, chúng tôi thử nghiệm một biến thể với dropout tiêu chuẩn trong các expert (xem App. B để biết chi tiết), và một phiên bản không có. Chúng tôi cũng mở rộng S-BASE thành K = 4, tương tự như của chúng tôi, ngoại trừ phương pháp cân bằng. Ngay cả khi xem xét tất cả những trường hợp này, σ-MoE của chúng tôi vượt trội hơn Switch Transformer và S-BASE. Lưu ý rằng về FLOPs và sử dụng bộ nhớ, tất cả các biến thể MoE tương đương với cùng siêu tham số (G, dmodel, và K).
+
+Nghiên cứu Ablation. Cuối cùng chúng tôi thực hiện nghiên cứu ablation về các lựa chọn thiết kế riêng lẻ (Phần 5). Bảng 4 cho thấy kết quả. Dropout tiêu chuẩn thay vì expert dropout dẫn đến giảm hiệu suất cho hầu hết các trường hợp, ngoại trừ mô hình với NE = 128 expert. Các hàm lựa chọn dựa trên softmax (có và không có chuẩn hóa lại) nhất quán hoạt động tệ hơn sigmoid của chúng tôi. Điều tương tự cũng đúng cho khởi tạo tiêu chuẩn; của chúng tôi tốt hơn. Thú vị, việc loại bỏ tất cả các phương pháp regularization làm giảm hiệu suất nhưng không gây ra sự sụp đổ thảm khốc ngay cả với NE = 128. Chúng tôi cũng kiểm tra các kết hợp (G, K) tốt nhất, với số lượng không đổi (G·K) của các cặp ki, vi hoạt động; chúng tôi thấy K = 4 cao hoạt động tốt nhất trong phạm vi này. Phân tích thêm về σ-MoE của chúng tôi có thể được tìm thấy trong App. A.4.
+
+Phân tích việc sử dụng expert. Một chế độ thất bại điển hình của MoE là expert collapse, trong đó chỉ một vài expert được sử dụng trong khi những expert khác bị bỏ qua hoàn toàn hoặc sử dụng ít. Ở đây chúng tôi thực hiện phân tích để đánh giá xem các mô hình khác nhau bao gồm cả chúng tôi có bị ảnh hưởng bởi vấn đề này không. Đối với mỗi lớp, chúng tôi tính tỷ lệ trọng số lựa chọn expert được gán cho mỗi expert (sel(x)) trên toàn bộ tập validation của WikiText-103. Chúng tôi sử dụng các mô hình WT-S* từ Bảng 4 với 128 expert. Một lớp đại diện được hiển thị trong Hình 3. Các mô hình có hiệu suất kém (xem Bảng 4), tức là Switch Transformer (đỏ) và một biến thể "xấu" của σ-MoE với softmax và chuẩn hóa lại "softmax (renom.)" (xanh lá), có thể dễ dàng nhận biết: chúng bị ảnh hưởng nghiêm trọng bởi vấn đề expert collapse. Thống kê khá tương tự cho tất cả các mô hình khác; sự khác biệt hiệu suất nhỏ giữa những mô hình này dường như không do expert collapse. Đáng chú ý, các mô hình regularized entropy với expert dropout của chúng tôi, đặc biệt là σ-MoE, có khả năng khớp việc cân bằng sử dụng expert của S-BASE mà không sử dụng hàm kích hoạt Sinkhorn. Lưu ý rằng nói chung, chúng tôi không coi việc kích hoạt expert đồng đều là tối ưu: chúng tôi mong đợi sự chuyên môn hóa expert, và do đó tần suất sử dụng của chúng nên phụ thuộc vào sự xuất hiện của nhiệm vụ mà chúng đang thực hiện.
+
+7 Kết luận
+Góc nhìn mới của chúng tôi hợp nhất các phương pháp xấp xỉ MLP 2 lớp, như Top-K, Mixture of Experts (MoE) và các phương pháp product-key memory (PKM). Trong khi Top-K tự nó cung cấp cải thiện hiệu suất và tăng tốc hạn chế, tăng tốc thêm đòi hỏi PKM hoặc MoE. Hàm kích hoạt không cạnh tranh lấy cảm hứng từ góc nhìn thống nhất của chúng tôi cải thiện cả PKM và MoE. Các cải tiến mới thêm của MoE tạo ra σ-MoE của chúng tôi vượt trội hơn các MoE hiện có. Quan trọng, σ-MoE của chúng tôi với độ thưa thớt vừa phải khớp hiệu suất của baseline dense có tham số bằng nhau trong khi hiệu quả hơn nhiều về tài nguyên. Những hiểu biết mới của chúng tôi cải thiện việc huấn luyện các mô hình ngôn ngữ với tài nguyên phần cứng hạn chế, làm cho nghiên cứu mô hình hóa ngôn ngữ dễ tiếp cận hơn.
