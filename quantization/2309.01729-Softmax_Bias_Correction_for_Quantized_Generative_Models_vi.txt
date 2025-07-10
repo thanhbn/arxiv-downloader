@@ -1,0 +1,111 @@
+# Hiệu chỉnh Độ lệch Softmax cho Các Mô hình Sinh Đã Lượng tử hóa
+Nilesh Prasad Pandey, Marios Fournarakis, Chirag Patel, Markus Nagel
+Qualcomm AI Research*
+{nileshpr, mfournar, cpatel, markusn }@qti.qualcomm.com
+
+## Tóm tắt
+Lượng tử hóa sau huấn luyện (PTQ) là kỹ thuật nén phổ biến cho các mô hình sinh lớn, như stable diffusion hoặc các mô hình ngôn ngữ lớn. Các phương pháp PTQ thường giữ hàm kích hoạt softmax ở độ chính xác cao hơn vì đã được chứng minh là rất nhạy cảm với nhiễu lượng tử hóa. Tuy nhiên, điều này có thể dẫn đến chi phí thời gian chạy và điện năng đáng kể trong quá trình suy luận trên các thiết bị biên hạn chế tài nguyên. Trong nghiên cứu này, chúng tôi điều tra nguồn gốc của độ nhạy cảm softmax đối với lượng tử hóa và chỉ ra rằng hoạt động lượng tử hóa dẫn đến độ lệch lớn trong đầu ra softmax, gây ra suy giảm độ chính xác. Để khắc phục vấn đề này, chúng tôi đề xuất một kỹ thuật hiệu chỉnh độ lệch ngoại tuyến cải thiện khả năng lượng tử hóa của softmax mà không cần tính toán bổ sung trong quá trình triển khai, vì nó có thể được hấp thụ vào các tham số lượng tử hóa. Chúng tôi chứng minh hiệu quả của phương pháp trên stable diffusion v1.5 và mô hình ngôn ngữ OPT kích thước 125M, đạt được cải thiện độ chính xác đáng kể cho softmax lượng tử hóa 8-bit.
+
+## 1. Giới thiệu
+Sự phổ biến ngày càng tăng của các mạng nơ-ron sinh lớn, như stable diffusion [4, 13, 24], ChatGPT, và OPT [33], đã cách mạng hóa các lĩnh vực thị giác máy tính và xử lý ngôn ngữ tự nhiên. Các mô hình này thể hiện khả năng đặc biệt trong việc tạo ra hình ảnh thực tế và văn bản giống con người. Tuy nhiên, việc triển khai chúng trên các thiết bị biên gặp thách thức do kích thước và yêu cầu tính toán. Để giải quyết vấn đề này, lượng tử hóa đã nổi lên như kỹ thuật hứa hẹn nhất để tối ưu hóa triển khai mô hình trên các thiết bị hạn chế tài nguyên, với nhiều nghiên cứu xuất hiện cho cả mô hình thị giác [14, 3, 18] và ngôn ngữ [19, 8, 6].
+
+Lượng tử hóa sau huấn luyện (PTQ) là phương pháp phổ biến để lượng tử hóa các mô hình như vậy vì việc truy cập dữ liệu huấn luyện và pipeline gốc có thể khó khăn, và huấn luyện chúng đòi hỏi tài nguyên tính toán khổng lồ. Tuy nhiên, lượng tử hóa kích hoạt vẫn thách thức vì một số lớp nhất định, như softmax trong transformer, đặc biệt nhạy cảm với lượng tử hóa. Vấn đề này còn rõ rệt hơn trong các mô hình khuếch tán do bản chất lặp của quá trình khử nhiễu dẫn đến tích lũy lỗi. Vì lý do này, thông lệ phổ biến là giữ softmax không lượng tử hóa hoặc ở độ chính xác cao hơn dẫn đến chi phí độ trễ đáng kể, đặc biệt trong các mạng có độ dài chuỗi lớn hơn [29].
+
+Trong nghiên cứu này, chúng tôi có hệ thống điều tra nguồn gốc của độ nhạy cảm softmax đối với lượng tử hóa và chỉ ra rằng hoạt động lượng tử hóa dẫn đến độ lệch lớn làm suy giảm độ chính xác. Chúng tôi giới thiệu một hiệu chỉnh độ lệch thân thiện với phần cứng hoạt động như một offset ở đầu ra softmax, có thể được hấp thụ vào các tham số lượng tử hóa. Dù đơn giản, phương pháp của chúng tôi cải thiện đáng kể điểm SQNR và perplexity cho các mô hình diffusion [4] và ngôn ngữ OPT [33] tương ứng, với softmax lượng tử hóa 8-bit.
+
+## 2. Kiến thức nền
+
+### 2.1. Nghiên cứu liên quan
+Lượng tử hóa là một trong những phương pháp hiệu quả nhất có sẵn để giảm độ trễ và tiêu thụ điện năng trong suy luận mạng nơ-ron. Điều này đạt được không chỉ nhờ giảm kích thước mô hình mà còn vì các phép toán điểm cố định hiệu quả hơn so với các phép toán điểm thả tương ứng. Trong nghiên cứu này, chúng tôi tập trung vào lượng tử hóa sau huấn luyện (PTQ), lấy một mạng FP32 đã huấn luyện trước và chuyển đổi trực tiếp thành mạng điểm cố định mà không cần pipeline huấn luyện gốc [20, 21, 15]. Các phương pháp này đòi hỏi không có dữ liệu hoặc chỉ một tập hiệu chuẩn nhỏ và dễ sử dụng hơn so với huấn luyện nhận biết lượng tử hóa (QAT) [5, 11, 10, 23]. Để biết thêm chi tiết về lượng tử hóa mạng nơ-ron, chúng tôi giới thiệu người đọc đến [9, 22].
+
+Khi thành công của các mô hình ngôn ngữ tăng đồng thời với kích thước của chúng, nhiều nghiên cứu gần đây đã tập trung vào lượng tử hóa các mô hình này [27, 32, 27, 7]. Trong khi một số phương pháp đã xuất hiện để giải quyết vấn đề các giá trị ngoại lai trong đầu ra của transformer [1, 2, 30], nghiên cứu của chúng tôi bổ sung vì chúng tôi tập trung vào lượng tử hóa trọng số attention. Tương tự, trong khi nghiên cứu gần đây về lượng tử hóa các mô hình khuếch tán [17, 12, 26] đã thảo luận về các vấn đề và phương pháp khác nhau để vượt qua thách thức lượng tử hóa, hầu hết các phương pháp này giữ các kích hoạt nhạy cảm, như softmax, ở độ chính xác cao hơn. Tuy nhiên, softmax có thể là nút thắt cổ chai độ trễ lớn nhất do thực thi không hiệu quả trong phần cứng [29]. Nghiên cứu của chúng tôi trực giao với các phương pháp hiện có vì chúng tôi tập trung vào cải thiện khả năng lượng tử hóa của các lớp softmax xuống bit thấp hơn.
+
+### 2.2. Động lực
+Softmax chiếm một phần đáng kể trong tổng thời gian chạy của transformer, chiếm đến 40% cho độ dài chuỗi lớn hơn 2048 [29]. Do đó, giữ softmax ở độ chính xác thấp có thể tăng tốc suy luận bằng cách giảm kích thước của các bảng tra cứu cần thiết để ước tính các hàm mũ. Vì các mô hình khuếch tán hiện đại, ví dụ stable diffusion v1.5 đạt độ dài chuỗi 4096, softmax bit thấp là bắt buộc nếu chúng ta muốn đạt được hiệu suất cạnh tranh trên thiết bị.
+
+Tuy nhiên, khi lượng tử hóa softmax trong stable diffusion xuống 8 bit, chúng tôi quan sát thấy độ lệch đáng kể trong các hình ảnh được tạo so với mô hình điểm thả (xem cột FP32 và W8A16-SM8 trong hình 2). Ngược lại, khi giữ softmax ở 16 bit (cột W8A16 trong hình 2), hình ảnh được tạo khớp với mô hình điểm thả rất gần.
+
+Để xác nhận giả thuyết rằng các lớp softmax trong quá trình khuếch tán đặc biệt nhạy cảm với lượng tử hóa, chúng tôi thực hiện phân tích độ nhạy sau: chúng tôi lượng tử hóa từng tensor attention riêng lẻ xuống 8 bit trong U-Net khử nhiễu trong khi giữ phần còn lại của mạng ở FP32 và đo tỷ lệ tín hiệu trên nhiễu lượng tử hóa (SQNR) giữa lượng tử hóa và độ chính xác đầy đủ ở cuối quá trình khử nhiễu. Chúng tôi sử dụng tập hiệu chuẩn X gồm 400 latent đầu vào được lấy mẫu đồng nhất trên tất cả các bước thời gian và báo cáo SQNR trung bình theo dB trong bảng 1. Chúng tôi tính SQNR bằng công thức sau:
+
+SQNRdB = 10 log Ex∥ϕ(x)∥²₂ / ∥q(ϕ(x))−ϕ(x)∥²₂     (1)
+
+trong đó x∈X, ϕ(·) là đầu ra của U-Net khử nhiễu, và ∥ · ∥₂ là chuẩn Frobenius.
+
+| Kích hoạt ở 8 bit | SQNR(↑) |
+|-------------------|---------|
+| Query (Q) | 32.36 |
+| Key (K) | 29.77 |
+| Value (V) | 26.58 |
+| Điểm attention (đầu vào softmax) | 28.09 |
+| Đầu ra softmax | 3.24 |
+
+Bảng 1: Phân tích độ nhạy lượng tử hóa cho các lớp attention trong U-Net khử nhiễu của stable diffusion. Chúng tôi lượng tử hóa mỗi kích hoạt xuống 8 bit trong khi giữ phần còn lại của mạng không lượng tử hóa, và báo cáo SQNR trung bình (↑): cao hơn thì tốt hơn.
+
+Chúng ta có thể thấy từ bảng 1 rằng lượng tử hóa đầu ra softmax dẫn đến suy giảm SQNR gấp 8 lần so với kích hoạt nhạy cảm thứ hai, tensor value (V).
+
+### 2.3. Softmax lượng tử hóa bị lệch
+Tại sao đầu ra softmax lại nhạy cảm với lượng tử hóa như vậy? Nhìn kỹ hơn vào các giá trị của softmax lượng tử hóa, chúng tôi phát hiện rằng đến 99% các giá trị được làm tròn về không. Vì tất cả các giá trị này được làm tròn xuống, lỗi lượng tử hóa kết quả bị lệch, và các xác suất softmax không được chuẩn hóa chính xác nữa, điều này có thể làm suy giảm hiệu suất của mô hình. Trong biểu đồ phân tán của hình 1, chúng ta thấy rằng nhiều đầu ra softmax lượng tử hóa không cộng lại bằng 1.0. Thực tế, tổng kỳ vọng của đầu ra softmax trên tập hiệu chuẩn có thể thấp đến 0.3. Chúng tôi cũng quan sát thấy mối tương quan cao giữa độ lệch lượng tử hóa và suy giảm của quá trình khử nhiễu: khoảng cách lớn hơn từ đầu ra softmax kỳ vọng (1.0), SQNR thấp hơn ở đầu ra U-Net.
+
+## 3. Hiệu chỉnh độ lệch kích hoạt lượng tử hóa
+Trong phần trước, chúng tôi đã thiết lập thực nghiệm rằng lượng tử hóa softmax trong transformer có thể dẫn đến đầu ra rất lệch gây biến dạng đáng kể trong đầu ra của stable diffusion. Trong phần này, chúng tôi phác thảo một phương pháp đơn giản nhưng hiệu quả để hiệu chỉnh độ lệch này và cải thiện hiệu suất.
+
+Chúng tôi định nghĩa độ lệch lượng tử hóa như sự khác biệt có hệ thống giữa vector kích hoạt lượng tử hóa và không lượng tử hóa:
+
+β(y;T) = E[Ty] − E[q(Ty)]     (2)
+
+trong đó T là hàm biến đổi tác động lên y, và q(·) là hàm lượng tử hóa. Biến đổi T có thể là đồng nhất hoặc một biến đổi tuyến tính đơn giản, như một phép rút gọn dọc theo một trục nhất định. Bây giờ chúng ta có thể hiệu chỉnh độ lệch này bằng cách cộng trở lại vào kích hoạt lượng tử hóa yq = q(Ty), sao cho
+
+E[Tyq + β(y;T)] = E[Ty]     (3)
+
+Trong thực tế, chúng tôi tính toán một ước tính thực nghiệm của độ lệch, β̂, sử dụng dữ liệu hiệu chuẩn có sẵn.
+
+### 3.1. Hiệu chỉnh độ lệch softmax
+Trong trường hợp kích hoạt softmax, chúng ta biết trước rằng đầu ra của nó được chuẩn hóa và do đó nên cộng lại bằng 1.0. Sử dụng ký hiệu của phương trình (2), biến đổi T là một tích vô hướng với vector một dọc theo chiều chuẩn hóa: E[1ᵀy] = 1. Trong transformer, đầu vào của lớp softmax thường là ba chiều X ∈ ℝⁿʰᵉᵃᵈˢˣⁿˢᵉᑫˣⁿˢᵉᑫ và softmax được áp dụng trên chiều cuối cùng. Tùy thuộc vào khả năng của phần cứng có sẵn, chúng ta có thể có hệ số hiệu chỉnh per-tensor hoặc per attention-head, điều này sẽ đòi hỏi giảm đầu ra của đầu ra softmax tương ứng. Ví dụ, hệ số hiệu chỉnh per-tensor được tính bằng:
+
+β = (1/nseq) - Ex[∑ᵢ∑ⱼ∑ₖYᵢ,ⱼ,ₖ / (nheads × n²seq)]     (4)
+
+trong đó Y = q(softmax(X)) và β được cộng theo phần tử vào toàn bộ đầu ra lượng tử hóa Y. Trong các phần sau (xem Phần 4.1), chúng tôi thực hiện một nghiên cứu ablation cho độ chi tiết hiệu chỉnh độ lệch.
+
+### 3.2. Hấp thụ hiệu chỉnh độ lệch
+Một lợi ích quan trọng của phương pháp hiệu chỉnh độ lệch của chúng tôi là nó có thể dễ dàng được hấp thụ vào offset của lượng tử hóa bất đối xứng. Đối với một bộ lượng tử hóa đồng nhất b bitwidth với scale s và zero-point z, lượng tử hóa bất đối xứng được định nghĩa là:
+
+yq = q(y; s, z, b) = s · [clamp([y/s] + z, 0, 2ᵇ-1) - z] = s · yint - c     (5)
+
+trong đó c = s · z là một offset điểm thả của lưới lượng tử hóa, vì scale s thường là một số điểm thả [15]. Đối với hiệu chỉnh độ lệch, chúng ta chỉ phải hấp thụ hệ số hiệu chỉnh vào offset, c' = s · z - β, trong khi giữ mọi thứ khác giống nhau. Cho rằng các kích hoạt thường được lượng tử hóa bất đối xứng [1, 30, 22, 2], hiệu chỉnh độ lệch của chúng tôi không dẫn đến tính toán bổ sung.
+
+## 4. Thí nghiệm
+Trong phần này, chúng tôi chứng minh các ưu điểm của hiệu chỉnh độ lệch softmax. Chúng tôi thực hiện thí nghiệm trên stable diffusion v1.5 và mở rộng phân tích của chúng tôi cho một mô hình ngôn ngữ dựa trên transformer. Chúng tôi thí nghiệm với biến thể kích thước 125M của OPT [33] được huấn luyện trước sử dụng mục tiêu mô hình hóa ngôn ngữ nhân quả (CLM). Chúng tôi sử dụng pipeline xác thực cho thư viện HuggingFace [31, 16] và đánh giá trên tập xác thực Wikipedia. Chúng tôi báo cáo SQNR giữa đầu ra U-Net độ chính xác đầy đủ và lượng tử hóa cho stable diffusion (cao hơn thì tốt hơn), và perplexity CLM cho OPT (thấp hơn thì tốt hơn).
+
+Chúng tôi sử dụng PyTorch v1.11 và AI Model Efficiency Toolkit (AIMET) [28] để lượng tử hóa các mô hình đến bitwidth mong muốn. Chúng tôi triển khai lượng tử hóa đối xứng per-tensor cho trọng số và lượng tử hóa bất đối xứng cho kích hoạt.
+
+### 4.1. Độ chi tiết của hiệu chỉnh độ lệch
+Như đã đề cập trong phần 3.1, tùy thuộc vào phần cứng đích, chúng ta có thể áp dụng hiệu chỉnh độ lệch ở các độ chi tiết khác nhau của tensor attention, ví dụ per-attention head hoặc per-tensor. Do bản chất lặp của quá trình khử nhiễu trong các mô hình khuếch tán, phân phối kích hoạt trong U-Net phụ thuộc vào bước thời gian, do đó thúc đẩy chúng ta sử dụng bước thời gian như một trục độ chi tiết bổ sung để thực hiện hiệu chỉnh độ lệch nhận biết bước thời gian. Chúng tôi so sánh kết quả từ các sơ đồ khác nhau trong bảng 2.
+
+| Loại hiệu chỉnh | SD (SQNR ↑) |
+|-----------------|-------------|
+| Không có | 3.17 |
+| Per-tensor | 5.77 |
+| Per attention-head | 6.05 |
+| Nhận biết bước thời gian, per-tensor | 5.93 |
+| Nhận biết bước thời gian, per attention-head | 6.06 |
+
+Bảng 2: Nghiên cứu ablation độ chi tiết cho hiệu chỉnh độ lệch: chúng tôi lượng tử hóa softmax xuống 8 bit, giữ phần còn lại của mạng ở FP32. Chúng tôi báo cáo SQNR cho stable diffusion (SD) (↑): cao hơn thì tốt hơn.
+
+Chúng tôi quan sát thấy rằng sơ đồ hiệu chỉnh per-attention head hoạt động ngang bằng hoặc tốt hơn tất cả các sơ đồ khác, làm cho nó trở thành lựa chọn thuận lợi cho triển khai trên thiết bị do chi phí tính toán tối thiểu so với đối tác nhận biết thời gian.
+
+### 4.2. Kết quả chính
+Chúng tôi mở rộng phân tích của chúng tôi để bao gồm mô hình ngôn ngữ OPT kích thước 125M, và chúng tôi báo cáo kết quả sử dụng hiệu chỉnh độ lệch per-attention head trong bảng 3. Chúng tôi lượng tử hóa softmax xuống 8 bit (SM8) và giữ phần còn lại của mạng ở độ chính xác đầy đủ (FP32) hoặc trọng số 8-bit và kích hoạt 16-bit (W8A16). Với hiệu chỉnh độ lệch, chúng tôi đạt được cải thiện hơn 2.7dB cho stable diffusion và khoảng 4.8 cải thiện perplexity cho OPT trong cả hai cài đặt lượng tử hóa. Trong trường hợp khuếch tán, chúng tôi cũng chứng minh cải thiện trực quan trong hình 2, bằng cách hiển thị các hình ảnh được tạo của khuếch tán lượng tử hóa có và không có hiệu chỉnh độ lệch. Như chúng ta có thể thấy, hình ảnh được tạo với hiệu chỉnh độ lệch rất giống với đầu ra độ chính xác đầy đủ.
+
+| Cấu hình | SD (SQNR ↑) | OPT (ppl ↓) |
+|----------|-------------|-------------|
+| Baseline FP32 | - | 27.73 |
+| FP32-SM8 | 3.17 | 34.98 |
+| FP32-SM8 + hiệu chỉnh độ lệch | 6.05 | 30.19 |
+| Baseline W8A16 | 9.66 | 27.77 |
+| W8A16-SM8 | 3.05 | 35.11 |
+| W8A16-SM8 + hiệu chỉnh độ lệch | 5.76 | 30.24 |
+
+Bảng 3: Hiệu chỉnh độ lệch per-attention cho stable diffusion (SD) và mô hình OPT 125M cho các cấu hình lượng tử hóa khác nhau (W8A16 & FP32), trong khi giữ softmax ở 8 bit (SM8). Chúng tôi báo cáo SQNR cho stable diffusion (SD) và perplexity CLM cho OPT. (↑): cao hơn thì tốt hơn; (↓): thấp hơn thì tốt hơn.
+
+## 5. Kết luận
+Trong nghiên cứu này, chúng tôi đã điều tra một vấn đề phổ biến về độ nhạy cảm softmax đối với lượng tử hóa trong trường hợp các mô hình sinh. Để hiểu nguồn gốc của độ nhạy cảm softmax đối với lượng tử hóa, chúng tôi đã phân tích các phân phối softmax và chỉ ra rằng hoạt động lượng tử hóa dẫn đến độ lệch đáng kể trong đầu ra softmax làm suy giảm hiệu suất của các mô hình sinh khi được biểu diễn ở độ chính xác thấp hơn. Để khắc phục vấn đề này, chúng tôi đã đề xuất một hiệu chỉnh offset đơn giản nhưng hiệu quả thân thiện với phần cứng để cải thiện khả năng lượng tử hóa của các lớp softmax xuống bit thấp hơn, điều này là chìa khóa để đạt được hiệu suất cạnh tranh trên thiết bị, đặc biệt cho các mạng dựa trên transformer với độ dài chuỗi dài hơn. Chúng tôi đã chứng minh hiệu quả của phương pháp trên stable diffusion v1.5 và mô hình ngôn ngữ OPT kích thước 125M, đạt được cải thiện hơn 2.7dB cho stable diffusion và khoảng 4.8 cải thiện perplexity cho OPT tương ứng cho cài đặt lượng tử hóa trọng số 8-bit và kích hoạt 16-bit (W8A16).

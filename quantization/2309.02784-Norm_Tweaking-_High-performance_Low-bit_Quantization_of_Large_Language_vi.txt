@@ -1,0 +1,223 @@
+# Norm Tweaking: Lượng tử hóa hiệu suất cao ở mức bit thấp cho các mô hình ngôn ngữ lớn
+
+Liang Li, Qingyuan Li, Bo Zhang, Xiangxiang Chu
+Meituan
+
+## Tóm tắt
+
+Khi kích thước của các mô hình ngôn ngữ lớn (LLM) tiếp tục tăng, việc nén mô hình mà không hy sinh độ chính xác đã trở thành một thách thức quan trọng cho việc triển khai. Trong khi một số phương pháp lượng tử hóa, chẳng hạn như GPTQ, đã có tiến bộ trong việc đạt được lượng tử hóa trọng số 4-bit có thể chấp nhận được, các nỗ lực lượng tử hóa ở mức bit thấp hơn thường dẫn đến suy giảm hiệu suất nghiêm trọng. Trong bài báo này, chúng tôi giới thiệu một kỹ thuật được gọi là norm tweaking, có thể được sử dụng như một plugin trong các phương pháp PTQ hiện tại để đạt được độ chính xác cao trong khi tiết kiệm chi phí. Cách tiếp cận của chúng tôi được lấy cảm hứng từ quan sát rằng việc điều chỉnh phân phối kích hoạt đã lượng tử hóa để phù hợp với đối tác dấu phẩy động của nó có thể dễ dàng khôi phục độ chính xác cho LLM. Để đạt được điều này, chúng tôi thiết kế cẩn thận một chiến lược tweaking bao gồm việc tạo dữ liệu hiệu chuẩn và ràng buộc khoảng cách theo kênh để cập nhật các trọng số của các lớp chuẩn hóa để tổng quát hóa tốt hơn. Chúng tôi tiến hành các thí nghiệm rộng rãi trên các bộ dữ liệu khác nhau sử dụng một số LLM mã nguồn mở. Phương pháp của chúng tôi cho thấy những cải thiện đáng kể trong cả lượng tử hóa chỉ trọng số và lượng tử hóa kết hợp trọng số và kích hoạt, vượt trội hơn các phương pháp PTQ hiện có. Trên GLM-130B và OPT-66B, phương pháp của chúng tôi thậm chí đạt được cùng mức độ chính xác ở lượng tử hóa 2-bit như các phiên bản dấu phẩy động của chúng. Cách tiếp cận đơn giản và hiệu quả của chúng tôi làm cho nó thực tế hơn cho các ứng dụng thế giới thực.
+
+## Giới thiệu
+
+Gần đây, ChatGPT của OpenAI (OpenAI 2023b) đã thể hiện hiệu suất xuất sắc trong việc tạo văn bản, gây ra một cơn sốt nghiên cứu về các mô hình ngôn ngữ lớn (LLM). Một số LLM nổi tiếng nhất bao gồm các chuỗi GPT như GPT-3 (Brown et al. 2020), GPT-4 (OpenAI 2023a), và PaLM (Chowdhery et al. 2022), Ernie (Zhang et al. 2019). Các mô hình mã nguồn mở như GLM (Du et al. 2021), BLOOM (Laurençon et al. 2022), OPT (Zhang et al. 2022) và chuỗi LLaMa (Touvron et al. 2023) đã thúc đẩy đáng kể sự phát triển của cộng đồng. Về bản chất, LLM là các mô hình tạo sinh được huấn luyện trên lượng dữ liệu văn bản cực lớn mô phỏng cách con người sử dụng ngôn ngữ, và chúng thể hiện hiệu suất zero-shot vượt trội trong một loạt các nhiệm vụ xử lý ngôn ngữ tự nhiên (NLP), bao gồm dịch ngôn ngữ, phân tích tình cảm, phân loại văn bản và trả lời câu hỏi, v.v. Chúng ngày càng được sử dụng trong các ứng dụng như chatbot, hiểu ngôn ngữ và hệ thống nhận dạng giọng nói.
+
+Tuy nhiên, do quy mô lớn (thường là hàng chục tỷ hoặc thậm chí hàng nghìn tỷ tham số) của các mô hình ngôn ngữ lớn, nó gây ra tiêu thụ tài nguyên lớn ngay cả khi triển khai. Lấy GPT-3 làm ví dụ, nó có 175 tỷ tham số và sử dụng FP16 để suy luận, chiếm khoảng 350 GB bộ nhớ GPU, có nghĩa là cần ít nhất 8 GPU NVIDIA A100 để hỗ trợ triển khai một mô hình duy nhất. Do đó, việc giảm chi phí là điều cần thiết.
+
+Lượng tử hóa mô hình, như một phương pháp cổ điển của nén mô hình, có thể hiệu quả giảm tiêu thụ bộ nhớ của LLM. Ví dụ, khi sử dụng lượng tử hóa 4-bit, GPT-3 có thể được triển khai trên 2 GPU A100 do giảm một phần tư bộ nhớ. GPTQ (Frantar et al. 2022) hiện tại là phương pháp lượng tử hóa chỉ trọng số bit thấp nổi bật nhất, có thể nén một số LLM xuống 4-bit trong khi duy trì suy giảm độ chính xác có thể chấp nhận được. Smoothquant (Xiao et al. 2023) có thể đạt được lượng tử hóa 8-bit cho cả trọng số và kích hoạt, bằng cách chuyển giao tương đương các yếu tố nhân trong trọng số và kích hoạt. Tuy nhiên, các phương pháp này gặp phải mất mát độ chính xác đáng kể khi áp dụng cho lượng tử hóa bit thấp hơn, chẳng hạn như lượng tử hóa chỉ trọng số 2-bit sử dụng GPTQ hoặc lượng tử hóa W4A8 (4-bit cho trọng số và 8-bit cho kích hoạt) sử dụng SmoothQuant. Theo ZeroQuant-V2 (Yao et al. 2023), LLaMa-65B với lượng tử hóa GPTQ 2-bit, độ chính xác trên bộ dữ liệu LAMBADA (Paperno et al. 2016) giảm từ 79% xuống 57%, vì lý do này nó đề xuất một phương pháp huấn luyện nhận thức lượng tử hóa dựa trên bù trừ hạng thấp. Tuy nhiên, nó không chỉ đòi hỏi chi phí huấn luyện bổ sung mà còn giới thiệu các tham số bổ sung, không phải là lựa chọn khả thi cho triển khai hiệu quả.
+
+Để cải thiện hiệu suất bit thấp hơn của các mô hình đã lượng tử hóa, trước tiên chúng tôi rút ra trực quan rằng LLM có khả năng chống nhiễu đủ, do đó nó yêu cầu một giải pháp nhẹ nhàng cho việc khôi phục độ chính xác. Điều này được chứng minh trong Prompt Quantization (Xu et al. 2023) rằng đối với một LLM đã nén, việc cung cấp một prompt phù hợp có thể tạo ra sinh ra độ chính xác cao mà không cập nhật tham số. ZeroQuantV2 (Yao et al. 2023) chỉ ra rằng mô hình có tham số càng lớn thì suy giảm do lượng tử hóa sẽ càng ít. Tiếp theo, chúng tôi khám phá tại sao LLM hoạt động kém trong lượng tử hóa bit thấp hơn từ góc độ số học. Chúng tôi quan sát thấy rằng phân phối của tensor đầu ra của mô hình đã lượng tử hóa lệch đáng kể so với mô hình dấu phẩy động gốc, và nó tích lũy từng lớp để trở nên khó kiểm soát, xem Hình 1. Do đó một câu hỏi được đặt ra: liệu chúng ta có thể cải thiện hiệu suất của mô hình đã lượng tử hóa bằng cách đơn giản phù hợp phân phối kích hoạt của nó với mô hình dấu phẩy động không?
+
+Để đạt được mục tiêu này, chúng tôi đề xuất một phương pháp được gọi là Norm-Tweaking để tăng cường mô hình đã lượng tử hóa bằng cách điều chỉnh nhẹ các tham số của lớp LayerNorm để tinh chỉnh phân phối đã lượng tử hóa. Phương pháp này có thể được áp dụng rộng rãi cho nhiều phương pháp lượng tử hóa, đạt được cải thiện độ chính xác đáng kể với chi phí tính toán bổ sung tối thiểu. Phương pháp của chúng tôi được đánh giá trên các mô hình và bộ dữ liệu khác nhau, và kết quả cho thấy Norm-Tweaking liên tục cải thiện hiệu suất của GPTQ và SmoothQuant trên các mô hình ngôn ngữ lớn khác nhau. Đối với các mô hình LLaMa, Norm-Tweaking thể hiện cải thiện hiệu suất chung so với GPTQ trên các bộ dữ liệu đa dạng, với cải thiện độ chính xác đáng chú ý khoảng 10% trên bộ dữ liệu LAMBADA. Hơn nữa, trong các đánh giá chủ quan của các mô hình đã lượng tử hóa, chúng tôi quan sát thấy rằng Norm-Tweaking vượt trội trong việc bảo tồn khả năng ngữ nghĩa chung của các mô hình đã lượng tử hóa ở mức bit cực thấp. Tóm lại, đóng góp của chúng tôi gồm ba phần:
+
+1. Thứ nhất, chúng tôi phát hiện rằng các mô hình ngôn ngữ lớn nói chung mạnh mẽ chống lại biến dạng trọng số, chỉ cần điều chỉnh trọng số từng phần nhẹ có thể khôi phục độ chính xác của nó ngay cả trong chế độ bit cực thấp. Không cần thiết phải áp dụng huấn luyện nhận thức lượng tử hóa nặng hoặc các kỹ thuật tinh vi khác.
+
+2. Thứ hai, chúng tôi thiết kế cẩn thận một chiến lược tinh chỉnh LLM gồm ba phần (1) chỉ điều chỉnh các tham số của các lớp LayerNorm trong khi đóng băng các trọng số khác, có thể được áp dụng cho gần như tất cả LLM vì nó được sử dụng phổ biến; (2) tạo dữ liệu có ràng buộc được khai sáng bởi LLM-QAT (Liu et al. 2023) để có được bộ dữ liệu hiệu chuẩn cần thiết, giảm hiệu quả sự phụ thuộc vào các bộ dữ liệu cụ thể trong quá trình lượng tử hóa và tinh chỉnh mô hình; (3) một mất mát tinh chỉnh theo kênh để cụ thể giảm thiểu sự khác biệt của phân phối kích hoạt của mô hình đã lượng tử hóa so với đối tác dấu phẩy động của nó.
+
+3. Cuối cùng nhưng không kém phần quan trọng, kỹ thuật của chúng tôi đơn giản và hiệu quả với tiêu thụ tài nguyên tối thiểu có thể được sử dụng như một plugin trong các phương pháp PTQ khác. Các thí nghiệm rộng rãi chứng minh rằng phương pháp norm-tweaking được đề xuất của chúng tôi đạt được lượng tử hóa hiệu suất cao cho LLM chung, vượt trội hơn các thuật toán như GPTQ.
+
+## Nghiên cứu liên quan
+
+**Tối ưu hóa LLM.** Vì hầu hết LLM đều dựa trên Transformer (Vaswani et al. 2017), đây là kiến trúc tiêu thụ bộ nhớ điển hình. Nút thắt cổ chai suy luận nằm nhiều hơn ở băng thông bộ nhớ của GPU, do đó giảm truy cập bộ nhớ của nó có thể cải thiện đáng kể tốc độ suy luận. FlashAttention (Dao et al. 2022), DeepSpeed (Aminabadi et al. 2022), và FlexGen (Sheng et al. 2023) đề xuất các triển khai transformer được tối ưu hóa hoặc quản lý bộ nhớ hiệu quả để cải thiện thông lượng của LLM. Những người khác đạt được mục tiêu này thông qua cắt tỉa mô hình, chẳng hạn như LoSparse (Li et al. 2023), SparseGPT (Frantar và Alistarh 2023), và LLM-Pruner (Ma, Fang, và Wang 2023). MiniMoE (Zhang et al. 2023) có được các mô hình nhỏ hơn với hiệu suất cao thông qua chưng cất.
+
+**Lượng tử hóa sau huấn luyện.** Các sơ đồ lượng tử hóa chỉ trọng số như GPTQ (Frantar et al. 2022) nén và lưu trữ các tham số trọng số, và giải nén chúng thành FP16 để suy luận trong quá trình tính toán. Cách tiếp cận này có thể hiệu quả giảm tỷ lệ thời gian truy cập bộ nhớ trong suy luận trong khi duy trì độ chính xác mô hình. LLM.int8() (Dettmers et al. 2022) đề xuất sử dụng tính toán dấu phẩy động hoặc điều chỉnh các phép toán nhân của LayerNorm để giảm mất mát lượng tử hóa. Smoothquant (Xiao et al. 2023) đề xuất một phương pháp giảm phạm vi kích hoạt bằng cách chuyển giao tương đương các yếu tố nhân trong trọng số và kích hoạt. GPTQ (Frantar et al. 2022) tái cấu trúc trọng số dựa trên phương pháp trong OBS (Hassibi, Stork, và Wolff 1993) thông qua ma trận Hessian để giảm lỗi lượng tử hóa. GPTQ đã được áp dụng rộng rãi trong nhiều tình huống mà một số LLM có thể đạt được độ chính xác cao ở lượng tử hóa 4-bit. RPTQ (Yuan et al. 2023) và AWQ (Lin et al. 2023) cải thiện thêm phương pháp này.
+
+**Huấn luyện nhận thức lượng tử hóa.** Một phương pháp khác để cải thiện hiệu suất của các mô hình đã lượng tử hóa là huấn luyện nhận thức lượng tử hóa (QAT), đó là tinh chỉnh các mô hình đã lượng tử hóa để phù hợp với các mô hình dấu phẩy động gốc. QAT được nghiên cứu rộng rãi trong các mạng tích chập, nhưng nó gặp phải những thất bại đáng kể trong lượng tử hóa mô hình ngôn ngữ lớn. Vì quá trình huấn luyện của LLM tiêu thụ một lượng lớn dữ liệu văn bản (thường theo thứ tự nghìn tỷ token), cách tinh chỉnh hiệu quả các LLM đã lượng tử hóa trong khi duy trì kiến thức chung và khả năng tổng quát hóa của chúng vẫn là một câu hỏi mở. Để kể tên một vài nỗ lực, LLM-QAT (Liu et al. 2023) yêu cầu cập nhật toàn bộ tham số của LLM trên một tập hợp ít nhất 100k dữ liệu được lấy mẫu. ZeroQuantV2 (Yao et al. 2023) giới thiệu Bù trừ Hạng Thấp để đạt được tinh chỉnh hiệu quả tham số, nhưng cách tiếp cận này không loại bỏ nhu cầu về một lượng lớn dữ liệu huấn luyện cũng không tránh được việc giới thiệu các tham số bổ sung.
+
+## Phương pháp
+
+### Động lực
+
+Dựa trên quan sát được hiển thị trong Hình 1, sự khác biệt giữa các tensor đầu ra của mỗi lớp trong mô hình đã lượng tử hóa và đối tác dấu phẩy động của nó tích lũy, trong khi đầu ra của mô hình đã lượng tử hóa dần dần lệch khỏi phân phối zero-mean thân thiện với lượng tử hóa. Điều này có phần dự kiến được vì LayerNorm phóng đại outlier (Xiao et al. 2023) và không có biện pháp nào được thực hiện để xử lý hiệu ứng này. Do đó, khi chúng ta lặp đi lặp lại cập nhật các trọng số đã lượng tử hóa của mỗi lớp bằng GPTQ, nó không thể tránh khỏi việc phá vỡ phân phối zero-mean của lớp hiện tại và tăng độ lệch.
+
+Vì mục đích này, chúng tôi nhằm cải thiện hiệu suất của mô hình đã lượng tử hóa bằng cách điều chỉnh phân phối đầu ra của nó để tiếp cận với đối tác dấu phẩy động của nó. Tinh chỉnh hoàn toàn mô hình đã lượng tử hóa thông qua QAT là một cách tiếp cận trực tiếp, nhưng số lượng lớn tham số trong mô hình LLM và lượng lớn dữ liệu huấn luyện cần thiết làm cho QAT không thể chấp nhận được. Để đạt được hiệu suất cao cho mô hình đã lượng tử hóa trong ràng buộc thời gian, chúng tôi được thúc đẩy cải thiện các phương pháp PTQ hiện tại. Vì LayerNorm rất tiện lợi để thao tác phân phối, chúng tôi chọn điều chỉnh lớp này để đạt được mục tiêu. Nó cũng tiết kiệm khi cập nhật trọng số của nó xem xét số lượng tham số nhỏ. Hơn nữa, gần như tất cả LLM chính thống đều sử dụng LayerNorm hoặc các toán tử tương tự, do đó phương pháp có thể được áp dụng phổ quát cho nhiều mô hình ngôn ngữ lớn. Do đó, mục tiêu cốt lõi của chúng tôi có thể được tóm tắt là điều chỉnh các tham số của LayerNorm để làm cho phân phối đầu ra của mô hình đã lượng tử hóa tiếp cận với mô hình dấu phẩy động, có thể được biểu thị chính thức là:
+
+argmin_Wln L_dist(T(X), T̂(X))  (1)
+
+trong đó T(X|W_attn, W_mlp, W_ln) biểu thị một khối Transformer, bao gồm mô-đun Attention, mô-đun MLP, lớp LayerNorm và các hàm kích hoạt, và T̂(X) đại diện cho phiên bản đã lượng tử hóa của nó. L_dist(·) biểu thị hàm mất mát phân phối giữa các mô hình đã lượng tử hóa và dấu phẩy động. Mục tiêu của chúng tôi sau đó là thiết kế một chiến lược để tối ưu hóa Ŵ_ln để giảm thiểu L_dist(·), trong khi giữ Ŵ_attn và Ŵ_mlp đóng băng.
+
+### Norm Tweaking
+
+Được thúc đẩy bởi phân tích trên, chúng tôi đề xuất một phương pháp PTQ cho LLM, được gọi là Norm-Tweaking, để nhanh chóng khôi phục hiệu suất của mô hình bằng cách tinh chỉnh nhẹ các lớp LayerNorm của mô hình đã lượng tử hóa. Norm tweaking đóng vai trò như một plugin có thể dễ dàng được nhúng vào các phương pháp lượng tử hóa khác. Ở đây, chúng tôi lấy GPTQ làm ví dụ và trình bày một pipeline thuật toán lượng tử hóa sau chỉ trọng số, như được hiển thị trong Thuật toán 1.
+
+Đầu tiên, chúng tôi sử dụng mô hình LLM để tạo ra một tập dữ liệu văn bản để hiệu chuẩn (được giải thích chi tiết trong phần về Tạo Bộ dữ liệu Hiệu chuẩn), thay vì lấy mẫu trực tiếp từ các bộ dữ liệu thực. Tiếp theo, chúng tôi xử lý lặp từng lớp transformer, lượng tử hóa và cập nhật trọng số của các lớp Linear, giống như GPTQ. Cuối cùng, chúng tôi tính toán một mất mát theo kênh dựa trên sự khác biệt giữa phân phối đầu ra đã lượng tử hóa và đầu ra dấu phẩy động. Sau đó, chúng tôi sử dụng gradient descent ngẫu nhiên để cập nhật các tham số của LayerNorm trong lớp này, buộc phân phối kích hoạt của mô hình đã lượng tử hóa bắt chước mô hình dấu phẩy động. Trong quá trình này, các tham số còn lại của lớp hiện tại như Linear được đóng băng và không tham gia vào việc cập nhật trọng số.
+
+Mặc dù chỉ có các tham số của LayerNorm được cập nhật, quá trình của chúng tôi khác biệt với các chiến lược tinh chỉnh hiệu quả tham số. Cần lưu ý rằng các tham số của lớp LayerNorm rất nhạy cảm và việc tinh chỉnh quá mức có thể làm hỏng nghiêm trọng hiệu suất của các mô hình đã lượng tử hóa (xem Bảng 6). Chúng tôi cập nhật nhẹ LayerNorm với một ràng buộc thoải mái, mục tiêu là làm cho phân phối của các mô hình đã lượng tử hóa tiếp cận với các mô hình dấu phẩy động. Đây chính là lý do tại sao chúng tôi định nghĩa phương pháp của mình là tweaking, thay vì finetuning.
+
+Nhìn thoáng qua, chúng tôi thiết kế cẩn thận toàn bộ quy trình tweaking để đạt được mục tiêu của mình. Ví dụ, chúng tôi sử dụng một số lượng rất nhỏ các lần lặp trong quá trình tinh chỉnh, thường chỉ cần một lần lặp trên văn bản hiệu chuẩn. Chúng tôi cũng áp dụng tỷ lệ học nhỏ và thiết kế một bộ lập lịch bước để gán các tỷ lệ học khác nhau cho các lớp tiếp theo. Ngoài ra, việc tạo dữ liệu hiệu chuẩn và thiết kế hàm mất mát phân phối của chúng tôi hài hòa cộng hưởng với nguyên tắc tweaking của chúng tôi.
+
+**Thuật toán 1: Norm-Tweaking**
+Input: Mô hình LLM đã được huấn luyện trước
+Output: Mô hình LLM đã lượng tử hóa
+1: Tạo bộ dữ liệu hiệu chuẩn (nsamples = 128, độ dài token = 2048) sử dụng mô hình LLM đã được huấn luyện trước
+2: for each lớp l trong cấu trúc Transformer (tổng cộng L lớp) do
+3:  if l = 0 then
+4:   sử dụng dữ liệu hiệu chuẩn làm đầu vào
+5:  else
+6:   sử dụng đầu ra cuối qOut_{l-1} làm đầu vào
+7:  end if
+8:  Tính toán đầu ra dấu phẩy động fOut_l
+9:  Lượng tử hóa trọng số của lớp l
+10: Đóng băng tất cả trọng số Linear trong lớp l
+11: for each it for total Iters do
+12:  Tính toán đầu ra dấu phẩy động qOut_l
+13:  Tính toán L_dist giữa fOut_l và qOut_l
+14:  Lan truyền ngược và cập nhật tham số LayerNorms
+15: end for
+16: end for
+17: Nhận được LLM đã lượng tử hóa hiệu suất cao
+
+### Tạo Dữ liệu Hiệu chuẩn
+
+Một vấn đề quan trọng ảnh hưởng đến khả năng tổng quát hóa của mô hình đã lượng tử hóa là lựa chọn phù hợp dữ liệu hiệu chuẩn. Chúng tôi phát hiện rằng các bộ dữ liệu hiệu chuẩn khác nhau ảnh hưởng đáng kể đến hiệu suất của mô hình đã lượng tử hóa. Nó thường hoạt động tốt trên bộ dữ liệu hiệu chuẩn, nhưng nó thường ức chế hiệu suất trên các bộ dữ liệu khác. LLM-QAT (Liu et al. 2023) chứng minh rằng việc huấn luyện mô hình đã lượng tử hóa với một bộ dữ liệu cụ thể làm hỏng thêm khả năng tổng quát hóa của LLM. Do đó, chúng tôi áp dụng một sơ đồ tạo dữ liệu theo LLM-QAT sử dụng dữ liệu được tạo của chính mô hình để hiệu chuẩn thay vì một bộ dữ liệu thực cụ thể. Lợi ích là dữ liệu được tạo như vậy có thể hiệu quả kích hoạt các neuron của LLM điều này tạo thuận lợi cho lượng tử hóa mô hình. Nó cũng tận hưởng thông tin ngữ nghĩa phong phú được lưu trữ trong mô hình và ít thiên vị hơn đối với một bộ dữ liệu cụ thể, do đó có thể tổng quát hóa hơn.
+
+Quá trình tạo của chúng tôi là một biến thể của LLM-QAT. Đầu tiên, một token ngẫu nhiên được lấy từ danh sách các ngôn ngữ đã cho và sau đó một mẫu hai giai đoạn được đề xuất bởi LLM-QAT được sử dụng trong đó token được chọn được đưa vào làm prompt đầu vào để cho LLM tạo ra các token tiếp theo. Chúng tôi tăng cường quá trình tạo dữ liệu này bằng cách áp đặt một hạn chế đối với token ngẫu nhiên đầu tiên. Chúng tôi quan sát một sự khác biệt đáng kể về tỷ lệ giữa các danh mục ngôn ngữ trong kho văn bản huấn luyện và từ vựng token hóa. Như được hiển thị trong Bảng 1, lấy BLOOM làm ví dụ, nó được huấn luyện trên tổng cộng 1.61 TB văn bản, với năm loại ngôn ngữ hàng đầu chiếm hơn 75% kho văn bản. Nếu chúng ta xem xét kho văn bản liên quan (ví dụ: zht như phiên bản truyền thống của zhs) và những kho văn bản phái sinh (ví dụ: ngôn ngữ lập trình) của năm loại ngôn ngữ này, tỷ lệ vượt quá 90%. Ngược lại, có 250680 token trong từ vựng token hóa, tổng số token tương ứng với năm ngôn ngữ này chỉ chiếm 17%. Do đó, token đầu tiên của đầu vào trực tiếp ảnh hưởng đến loại ngôn ngữ của văn bản được tạo. Nếu chúng ta chọn ngẫu nhiên từ toàn bộ từ vựng, chúng ta không thể có được dữ liệu hiệu chuẩn phù hợp khớp với kho văn bản huấn luyện. Vì mục đích này, chúng tôi hạn chế token ngẫu nhiên đầu tiên chỉ được chọn từ các danh mục ngôn ngữ trong danh sách các ngôn ngữ hàng đầu có tỷ lệ cao nhất, điều này được chứng minh là hiệu quả cải thiện tổng quát hóa của mô hình đã lượng tử hóa trên các bộ dữ liệu khác nhau (Bảng 8).
+
+**Bảng 1:** Kích thước văn bản và số lượng token cho 5 ngôn ngữ hàng đầu.
+| Ngôn ngữ | en    | zhs   | fr     | es    | pt    |
+|----------|-------|-------|--------|-------|-------|
+| Kho(MB)  | 485.0 | 261.0 | 208.2  | 175.1 | 79.3  |
+| Từ vựng  | 7943  | 380   | 15483  | 6999  | 8669  |
+
+### Mất mát Phân phối theo Kênh
+
+Để hướng dẫn hướng cập nhật tham số, việc thiết kế một hàm mất mát tương ứng là rất quan trọng. Trong bối cảnh này, chúng tôi nhằm giảm thiểu sự khác biệt giữa phân phối kích hoạt của mô hình đã lượng tử hóa và mô hình dấu phẩy động gốc của nó. Đầu tiên, vì phân phối kích hoạt của LLM thể hiện sự khác biệt đáng kể dọc theo chiều kênh, với một số kênh hiển thị các giá trị cực trị (được gọi là outlier) (Xiao et al. 2023), nó đặt ra những thách thức lớn cho quá trình lượng tử hóa. Để bảo tồn sự khác biệt giữa các kênh trong khi tinh chỉnh các tham số mô hình và để giữ lại dung lượng mô hình gốc càng nhiều càng tốt, chúng tôi áp đặt một ràng buộc theo kênh. Thứ hai, việc căn chỉnh nghiêm ngặt các giá trị kích hoạt điểm-wise giữa các mô hình đã lượng tử hóa và dấu phẩy động có thể dẫn đến overfitting với dữ liệu hiệu chuẩn, do đó làm tổn hại hiệu suất tổng quát hóa trên các bộ dữ liệu khác nhau. Do đó, chúng tôi áp dụng một chiến lược căn chỉnh thoải mái hơn bằng cách căn chỉnh trực tiếp trung bình và phương sai giữa mỗi kênh, thay vì căn chỉnh nghiêm ngặt các mục tiêu ở mức điểm-wise. Kết quả là, chúng tôi giới thiệu một hàm mất mát phân phối theo kênh, như được hiển thị dưới đây:
+
+L_dist = (1/C) ∑_{c=1}^C (|μ_c^f - μ_c^q|^2 + |(σ_c^f)^2 - (σ_c^q)^2|^2)  (2)
+
+trong đó C là số kênh, μ và σ đại diện cho trung bình và phương sai của mỗi kênh trong tensor T, chỉ số f và q chỉ ra mô hình dấu phẩy động và đã lượng tử hóa.
+
+Hơn nữa, các thuật toán hiện tại như GPTQ lặp lượng tử hóa LLM từng lớp, độ lệch của phân phối kích hoạt trung gian dần dần tích lũy, dẫn đến lỗi lớn trong các lớp cuối. Do đó, chúng tôi áp dụng một bộ lập lịch mức lớp để điều chỉnh tỷ lệ học của mỗi lớp trong quá trình tweaking trong đó chúng tôi đơn giản áp dụng tăng bước để phân bổ các tỷ lệ học khác nhau trên các lớp khác nhau.
+
+lr_i = lr_0 * (1 + scale * (i/L))  (3)
+
+## Thí nghiệm
+
+### Cài đặt
+
+Chúng tôi thử nghiệm phương pháp của mình trên các LLM có kích thước và loại khác nhau, bao gồm GLM (Du et al. 2021), BLOOM (Laurençon et al. 2022), OPT (Zhang et al. 2022) và chuỗi LLaMa (Touvron et al. 2023). Kết quả Norm-Tweaking của chúng tôi được trình bày trong bài báo, trừ khi có ghi chú khác, được thu thập bằng lượng tử hóa chỉ trọng số dựa trên thuật toán GPTQ. Xem xét hỗ trợ kernel cho các framework triển khai, chẳng hạn như FasterTransformer (NVIDIA 2023), chúng tôi sử dụng lượng tử hóa đối xứng theo kênh. Trong quá trình tweaking, chúng tôi chọn bộ tối ưu hóa Adam (Kingma và Ba 2015) để cập nhật các tham số LayerNorm của LLM hoặc các tham số RMSNorm (Zhang và Sennrich 2019) của LLaMA. Tỷ lệ học cần được đặt cẩn thận. Tỷ lệ học lớn sẽ làm hỏng kết quả cuối cùng. Trong các thí nghiệm của chúng tôi, chúng tôi thường sử dụng tìm kiếm lưới để có được tỷ lệ học tối ưu, với giá trị ban đầu được đặt ở 1e-5.
+
+Các đánh giá thí nghiệm chính của chúng tôi được thực hiện trên bộ dữ liệu LAMBADA (Paperno et al. 2016), nổi tiếng với yêu cầu cao về khả năng hiểu ngôn ngữ tự nhiên. Bộ dữ liệu này đòi hỏi hiểu biết toàn diện về toàn bộ văn bản để cung cấp câu trả lời chính xác. Để củng cố thêm tính tổng quát của phương pháp trên các bộ dữ liệu khác nhau, chúng tôi đã sử dụng Benchmark Harness (Gao et al. 2021) để tiến hành thử nghiệm trên một phổ rộng hơn của các bộ dữ liệu, bao gồm HellaSwag (Zellers et al. 2019), PIQA (Bisk et al. 2020), WinoGrande (Sakaguchi et al. 2021), OpenBookQA (Mihaylov et al. 2018), và một số bộ dữ liệu từ tiêu chuẩn General Language Understanding Evaluation (GLUE). Chúng tôi cũng sử dụng WikiText-2 (Merity et al. 2016), PTB (Marcus et al. 1994), C4 (Raffel et al. 2020) trong Bảng 5, để cung cấp một số minh họa văn bản được tạo bởi các LLM đã lượng tử hóa, giúp trực quan hóa trực quan hơn việc khôi phục hiệu suất của Norm-Tweaking. Theo cài đặt trong GPTQ, chúng tôi đã sử dụng kích thước bộ dữ liệu hiệu chuẩn với nsamples = 128, với độ dài chuỗi tối đa token length = 2048.
+
+### Chi phí Tweaking
+
+Chúng tôi chứng minh rằng Norm-Tweaking tốn chi phí cực thấp. Lấy BLOOM (Laurençon et al. 2022) làm ví dụ, cho chiều ẩn là h, mỗi khối transformer thường có 4 lớp Linear, với tổng số tham số khoảng 12h² + 9h, trong khi LayerNorm có hai lớp, với số tham số là 4h. Chiều ẩn h thường rất lớn (ví dụ: 14336 cho BLOOM-176B), vì vậy số lượng tham số của lớp Linear lớn hơn nhiều so với lớp LayerNorm (theo thứ tự 10⁷∼10⁹). Ngoài ra, để tránh overfitting trên dữ liệu hiệu chuẩn cụ thể, chúng tôi chỉ thực hiện một lần lặp trên mỗi mẫu văn bản. Do đó, phương pháp Norm-Tweaking được đề xuất có tiêu thụ tài nguyên tối thiểu và thời gian bổ sung.
+
+**Bảng 3:** Thời gian chạy lượng tử hóa được đo bằng phút cho GPTQ và Norm-Tweaking trên các LLM khác nhau.
+| Mô hình     | BLOOM-7B | LLaMA-7B | OPT-13B |
+|-------------|----------|----------|---------|
+| GPTQ        | 19.6     | 15.5     | 27      |
+| GPTQ+NT     | 22.8     | 27.3     | 46.6    |
+
+Bảng 3 hiển thị chi phí thời gian để lượng tử hóa LLM bằng GPTQ và Norm-Tweaking. Tất cả thí nghiệm được tiến hành trên một GPU NVIDIA A100 duy nhất. Chi phí thời gian bổ sung của Norm-Tweaking ít hơn chi phí thời gian của chính GPTQ, và phương pháp của chúng tôi vẫn nằm trong danh mục lượng tử hóa sau huấn luyện. Đối với BLOOM-7B, việc tăng chi phí thời gian chỉ chiếm 16%.
+
+### Kết quả trên LAMBADA
+
+Như được hiển thị trong Bảng 2, phương pháp lượng tử hóa mô hình được đề xuất của chúng tôi được áp dụng cho các LLM ở quy mô khác nhau, bao gồm BLOOM, LLaMa, GLM và OPT, trong đó độ chính xác của mỗi mô hình đã lượng tử hóa được đánh giá trên bộ dữ liệu LAMBADA và được so sánh toàn diện với GPTQ. Ngoài ra, chúng tôi cũng tiến hành thí nghiệm trên lượng tử hóa chỉ trọng số 2-bit với lượng tử hóa mịn với một nhóm 64. Phương pháp lượng tử hóa sau Norm-Tweaking của chúng tôi thường vượt trội hơn thuật toán GPTQ về độ chính xác mô hình. Trong lượng tử hóa 2-bit, thuật toán GPTQ gây ra mất mát độ chính xác đáng kể cho hầu hết các mô hình, khiến kết quả gần như không thể sử dụng được. Tuy nhiên, phương pháp lượng tử hóa được đề xuất của chúng tôi có thể đạt được hiệu suất độ chính xác gần với mô hình dấu phẩy động ngay cả trên các mô hình GLM-130B và OPT-66B, và nó vượt trội hơn GPTQ gần 10% trên LLaMa.
+
+**Bảng 2:** Kết quả độ chính xác đã lượng tử hóa của LLM trên bộ dữ liệu LAMBADA. W4/2: lượng tử hóa chỉ trọng số 4/2-bit.
+
+| Mô hình                              | FP16    | W4              |                     | W2              |                      |
+|--------------------------------------|---------|-----------------|---------------------|-----------------|----------------------|
+|                                      |         | GPTQ            | Norm-Tweaking       | GPTQ            | Norm-Tweaking        |
+| BLOOM-7b1                           | 57.6751 | 55.0615         | 57.4811 (2.4196 ↑) | 33.4714         | 37.4539 (3.9825 ↑)  |
+| BLOOM-176b                          | 67.7081 | 67.1842         | 67.6887 (0.5045 ↑) | 63.0507         | 65.6317 (2.581↑)    |
+| LLaMa-7b                            | 73.5106 | 71.8999         | 72.4820 (0.5387 ↑) | 11.8766         | 21.3856 (9.509↑)    |
+| LLaMa-65b                           | 79.0996 | 78.0516         | 79.2354 (1.1838 ↑) | 57.1512         | 67.4753 (10.3241 ↑) |
+| GLM-130b                            | 69.4159 | 69.2218         | 69.1964 (0.0254 ↓) | 67.6499         | 69.4293 (1.7794 ↑)  |
+| OPT-66b                             | 73.2971 | 73.0060         | 73.8405 (0.8345 ↑) | 71.3953         | 73.4912 (2.0959 ↑)  |
+
+### So sánh với RTN và SmoothQuant
+
+Chúng tôi tích hợp Norm-Tweaking vào hai phương pháp lượng tử hóa sau thường được sử dụng, round-to-nearest (RTN) (Yao et al. 2022; Dettmers et al. 2022) và SmoothQuant (Xiao et al. 2023), để xác minh tính hiệu quả chung của nó trên các thuật toán khác nhau. Một số LLM được lượng tử hóa ở các chế độ khác nhau và được đánh giá trên bộ dữ liệu LAMBADA, kết quả được hiển thị trong Bảng 4. Cụ thể, chúng tôi áp dụng lượng tử hóa chỉ trọng số 4-bit cho RTN, và lượng tử hóa W4A8 (4-bit cho trọng số và 8-bit cho kích hoạt) cho SmoothQuant. Lưu ý OPT-13b bị tổn hại nghiêm trọng khi sử dụng lượng tử hóa SmoothQuant W4A8, dẫn đến độ chính xác là 0. Kết quả chứng minh tính phổ quát của Norm-Tweaking, vì nó cung cấp cải thiện hiệu suất ổn định cho các phương pháp lượng tử hóa khác nhau, bao gồm RTN, GPTQ và SmoothQuant, cũng như cho các chế độ lượng tử hóa khác nhau, bao gồm chỉ trọng số và cả trọng số và kích hoạt. Thêm kết quả được báo cáo trong phụ lục.
+
+**Bảng 4:** Norm-Tweaking (NT) trên các phương pháp PTQ LLM khác nhau. Lưu ý cho OPT-13B, W5A8 được sử dụng cho SmoothQuant và SmoothQuant+NT.
+
+| Phương pháp       | Chế độ   | BLOOM-7B | OPT-13B  |
+|-------------------|----------|----------|----------|
+| w/o PTQ           | FP16     | 57.6751  | 69.0860  |
+| RTN               | W4A16    | 48.3602  | 62.7402  |
+| RTN+NT            | W4A16    | 51.5622  | 64.7584  |
+| SmoothQuant       | W4A8     | 53.9492  | 68.6590  |
+| SmoothQuant+NT    | W4A8     | 54.5896  | 69.7264  |
+
+### Benchmark Harness
+
+Chúng tôi đánh giá các LLM đã lượng tử hóa 2-bit trên framework đánh giá few-shot LM Evaluation Harness (Gao et al. 2021) trong Bảng 7. Phương pháp được đề xuất của chúng tôi thường vượt trội hơn kết quả GPTQ 2-bit, với một số thậm chí tốt hơn độ chính xác FP16. Điều này một lần nữa chứng minh tính mạnh mẽ của phương pháp chúng tôi và khả năng tổng quát hóa mạnh mẽ cho một loạt các bộ dữ liệu. Chúng tôi thảo luận về các biến thiên hiệu suất giữa các bộ dữ liệu trong phụ lục.
+
+### Đánh giá chủ quan
+
+Đánh giá chủ quan về kết quả được tạo là một phương pháp phổ biến và hiệu quả để đánh giá hiệu suất của các mô hình ngôn ngữ như LLM. Trong Bảng 5, chế độ FP16 của LLaMa-65B và BLOOM-176B, cũng như mô hình đã lượng tử hóa với GPTQ và Norm-Tweaking được đánh giá thông qua lăng kính đánh giá con người về kết quả được tạo. Với cùng một prompt đầu vào, có thể thấy rằng các mô hình khác nhau đưa ra kết quả khác nhau đáng kể, đặc biệt là mô hình lượng tử hóa bit thấp GPTQ, bị lỗi rõ ràng. Những lỗi này chủ yếu biểu hiện hoặc lỗi ngữ pháp (ví dụ: từ viết sai hoặc sử dụng dấu câu hoặc khoảng trắng không chính xác), lỗi logic trong ngôn ngữ (ví dụ: câu lặp lại), và lỗi thực tế (ví dụ: ngày sinh). Tuy nhiên, khi áp dụng phương pháp lượng tử hóa được đề xuất trong bài báo này, mô hình đã lượng tử hóa thu được dưới cùng cài đặt không có những lỗi rõ ràng này trong kết quả đầu ra, gợi ý tính mạnh mẽ của phương pháp lượng tử hóa của chúng tôi.
+
+**Bảng 5:** Ví dụ về tạo văn bản BLOOM-176B đã lượng tử hóa 4-bit và LLaMa-65B đã lượng tử hóa 2-bit trên prompt được chỉ định "Beijing is the capital of China". Văn bản màu đỏ có lỗi ngữ pháp hoặc phản thực tế.
+
+| Mô hình                    | Nội dung |
+|----------------------------|----------|
+| **BLOOM-176B**             |          |
+| FP16                       | Beijing is the capital of China. Beijing is also one of the world's oldest cities. It is also one of the most modern and beautiful cities of China. As of 2016, it had a population of over 20 million. Beijing is considered the most beautiful city in China. It is known for its many beautiful and ancient buildings and sites. These include the Forbidden City, the Temple of Heaven, and the Great Wall of China. |
+| GPTQ (4-bit)              | Beijing is the capital of China. There are 13.7 million people in the city of Beijing. The city is divided into 16 districts, and the most important districts are Dongcheng, Xicheng,Haidian, Chaoyang,Fengtai, Shijingshan and Daxing. The city is located in the north-east of China. The city is located in the north-east of China, close to the Pacific coast. The city is located on the left bank of the Beijing River. |
+| Norm-Tweaking (4-bit)     | Beijing is the capital of China, and the city is one of the most popular tourist destinations in the world. You can find here a lot of interesting places. You can visit the Forbidden City. It is located in the center of the city and is considered the most significant attraction. Also you can visit the Temple of Heaven. This place is located a few kilometers from the center of the city. You can admire the beauty of the Beijing city from the observation deck of the World Trade Center. |
+| **LLaMa-65B**              |          |
+| FP16                       | Beijing is the capital of China, and also one of the largest cities in the world. It is a modern city that has successfully managed to retain its ancient Chinese roots and the essence of its culture. A city of over 21 million people, Beijing is a major hub for international business, and as such attracts a large number of travelers. |
+| GPTQ (2-bit)              | Beijing is the capital of China, and has a rich history datin back to 5th in 1910s. Peking was the old capital in 1910s and renamed as Beijing in 1913, and became capital in 1972. Beijing is an interesting city, with the Forbidden City in the Forbidden City, which is a world heritage site. |
+| Norm-Tweaking (2-bit)     | Beijing is the capital of China. The country has a population of around 1.3 billion Chinese people. The country is one of the leading exporters in the world, and also one of the leading importers of the world. China is one of the leading manufacturers of the world. China is a large country, and is one of the largest countries in the world. |
+
+### Ablation
+
+**Lần lặp Tweaking**
+
+Chúng tôi điều tra ảnh hưởng của số lần lặp cho Norm-Tweaking và báo cáo kết quả của BLOOM-7B được thử nghiệm trên bộ dữ liệu LAMBADA trong Bảng 6. Hóa ra việc tăng số lần lặp trong quá trình tweaking làm hỏng đáng kể hiệu suất độ chính xác của mô hình. Điều này như mong đợi vì các tham số của LayerNorm rất nhạy cảm, trong đó các lần lặp quá mức có thể dễ dàng dẫn đến sự sụp đổ của hiệu suất mô hình. Đây cũng là lý do tại sao chúng tôi khuyến nghị tweaking thay vì tuning, điều này cũng phân biệt rõ ràng chúng tôi với các phương pháp QAT như LLM-QAT.
+
+**Bảng 6:** Ảnh hưởng của các lần lặp tweaking.
+
+| Lần lặp | 1       | 2       | 5       |
+|---------|---------|---------|---------|
+| Độ chính xác | 57.4811 | 55.7539 | 52.1056 |
+
+| Lần lặp | 10      | 20      | 50      |
+|---------|---------|---------|---------|
+| Độ chính xác | 46.8465 | 32.3307 | 11.3332 |
+
+**Dữ liệu Hiệu chuẩn**
+
+Bảng 8 cho thấy cách lựa chọn bộ dữ liệu hiệu chuẩn ảnh hưởng đáng kể đến hiệu suất của các mô hình đã lượng tử hóa trên các bộ dữ liệu khác nhau. Chúng tôi sử dụng ba bộ dữ liệu thực WikiText2 (Merity et al. 2016), PTB (Marcus et al. 1994), và C4 (Raffel et al. 2020), cũng như dữ liệu ngẫu nhiên và dữ liệu được tạo, làm bộ hiệu chuẩn để lượng tử hóa mô hình BLOOM-7B bằng GPTQ. Và chúng tôi đưa ra perplexity (PPL) trên WikiText2, PTB và C4 tương ứng, với PPL thấp hơn cho thấy hiệu suất tốt hơn. Ba hàng đầu tiên cho thấy mối tương quan mạnh giữa GPTQ và bộ dữ liệu hiệu chuẩn, tức là một LLM được hiệu chuẩn trên một bộ dữ liệu nhất định hoạt động tốt hơn trên bộ dữ liệu đó, nhưng tương ứng tệ hơn trên các bộ dữ liệu khác.
+
+Để tránh sự phụ thuộc vào dữ liệu thực, chúng tôi ngẫu nhiên lấy mẫu dữ liệu từ phân phối Gaussian với cùng trung bình và phương sai của dữ liệu thực để hiệu chuẩn. Tuy nhiên, hiệu suất của mô hình đã lượng tử hóa cực kỳ kém. Chúng tôi đoán rằng điều này là do dữ liệu ngẫu nhiên không có ý nghĩa ngữ nghĩa thực tế, không thể tạo ra kích hoạt tích cực cho LLM khi được sử dụng làm bộ dữ liệu hiệu chuẩn. Chúng tôi khai thác chính LLM để tạo dữ liệu hiệu chuẩn. Nó có thể tạo ra văn bản có ý nghĩa và hiệu quả kích hoạt mô hình. Kết quả cho thấy việc sử dụng dữ liệu được tạo để hiệu chuẩn có thể cải thiện hiệu suất của mô hình đã lượng tử hóa, và nó không thể hiện sự phụ thuộc vào dữ liệu cụ thể. Việc sử dụng hạn chế phạm vi ngôn ngữ được đề xuất trong bài báo này có thể cải thiện thêm chất lượng của dữ liệu được tạo.
+
+**Bảng 8:** Ảnh hưởng của các bộ dữ liệu hiệu chuẩn khác nhau. V1 là triển khai tạo dữ liệu chính thức của LLM-QAT, và V2 là phiên bản cải tiến của chúng tôi.
+
+| Dữ liệu Hiệu chuẩn | WikiText2 | PTB   | C4    |
+|--------------------|-----------|-------|-------|
+| WikiText2          | 12.16     | 21.17 | 18.28 |
+| PTB                 | 12.51     | 20.72 | 18.42 |
+| C4                  | 12.28     | 20.97 | 18.16 |
+| Ngẫu nhiên          | 13.25     | 22.82 | 19.60 |
+| GenData V1          | 12.43     | 21.25 | 18.34 |
+| GenData V2          | 12.32     | 20.95 | 18.28 |
+
+**Hàm Mất mát**
+
+Để thể hiện tầm quan trọng của mất mát phân phối theo kênh L_Dist được đề xuất của chúng tôi, chúng tôi so sánh nó với một số hàm mất mát khác nhau như mean square error L_MSE và Kullback-Leibler Divergence loss L_KD (Hinton, Vinyals, và Dean 2015), kết quả được hiển thị trong Bảng 9 trong đó L_Dist được đề xuất hoạt động tốt nhất trong tất cả các trường hợp. Kết quả này phù hợp với phân tích của chúng tôi rằng xử lý theo kênh là cần thiết (tốt hơn L_KL) để xử lý outlier trong khi căn chỉnh điểm-wise (L_MSE) làm hại hiệu suất. Như một kết quả hợp tác của nhiều thành phần trong Norm-Tweaking, sự khác biệt của phân phối kích hoạt đã lượng tử hóa so với đối tác dấu phẩy động của nó được thu hẹp phần lớn, như được hiển thị trong Hình 1. Quan sát này khá trả lời câu hỏi ban đầu của chúng tôi rằng việc giảm thiểu phân phối kích hoạt của LLM giữa hai độ chính xác dễ dàng mang lại hiệu suất cao, ngay cả đối với lượng tử hóa bit cực thấp.
+
+**Bảng 9:** So sánh các hàm mất mát khác nhau cho norm-tweaking.
+
+| Mô hình    | L_MSE   | L_KL    | L_Dist  |
+|------------|---------|---------|---------|
+| BLOOM-7b   | 55.8704 | 56.2779 | 57.4811 |
+| LLaMa-7b   | 72.3850 | 71.7446 | 72.4820 |
+| OPT-13b    | 68.3291 | 68.2709 | 68.7173 |
+
+## Kết luận
+
+Tóm lại, chúng tôi đã đề xuất một phương pháp nén lượng tử hóa mới cho các mô hình ngôn ngữ quy mô lớn (LLM) vượt trội hơn các phương pháp hiện đại hiện có như GPTQ và SmoothQuant. Phương pháp của chúng tôi được đặc trưng bởi việc tạo dữ liệu hiệu chuẩn có thể tổng quát hóa và tinh chỉnh lớp chuẩn hóa với mất mát phân phối theo kênh, cho phép chúng tôi nhanh chóng đạt được lượng tử hóa mô hình độ chính xác cao theo cách chi phí thấp. Đáng chú ý, chúng tôi đã khám phá nén mô hình LLM ở phạm vi 2-bit, đánh dấu hiệu suất hiện đại. Cách tiếp cận của chúng tôi mang lại một giải pháp đầy hứa hẹn để giảm chi phí tính toán và lưu trữ liên quan đến LLM trong khi duy trì hiệu suất cao của chúng.
+
+**Lời cảm ơn:** Công trình này được hỗ trợ bởi Chương trình R&D Trọng điểm Quốc gia Trung Quốc (Số 2022ZD0118700).

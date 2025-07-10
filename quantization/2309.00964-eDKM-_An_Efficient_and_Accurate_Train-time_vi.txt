@@ -1,0 +1,166 @@
+# eDKM: Một phương pháp phân cụm trọng số hiệu quả và chính xác trong thời gian huấn luyện cho các mô hình ngôn ngữ lớn
+
+Minsik Cho
+Apple. USA
+minsik@apple.com
+
+Keivan A. Vahid
+Apple. USA
+kalizadehvahid@apple.com
+
+Qichen Fu
+Apple. USA
+qfu22@apple.com
+
+Saurabh Adya
+Apple. USA
+sadya@apple.com
+
+Carlo C Del Mundo
+Apple. USA
+cdelmundo@apple.com
+
+Mohammad Rastegari
+Apple. USA
+mrastegari@apple.com
+
+Devang Naik
+Apple. USA
+naik.d@apple.com
+
+Peter Zatloukal
+Apple. USA
+pzatloukal@apple.com
+
+TÓM TẮT
+Vì các Mô hình Ngôn ngữ Lớn hay LLMs đã chứng minh hiệu suất chất lượng cao trên nhiều tác vụ ngôn ngữ phức tạp, có sự quan tâm lớn trong việc đưa các LLMs này lên thiết bị di động để có phản hồi nhanh hơn và bảo vệ quyền riêng tư tốt hơn. Tuy nhiên, kích thước của LLMs (tức là hàng tỷ tham số) đòi hỏi nén rất hiệu quả để phù hợp với các thiết bị có bộ nhớ hạn chế. Trong số nhiều kỹ thuật nén, phân cụm trọng số, một dạng lượng tử hóa phi tuyến, là một trong những ứng cử viên hàng đầu cho việc nén LLM và được hỗ trợ bởi các điện thoại thông minh hiện đại. Tuy nhiên, chi phí huấn luyện của nó là đáng kể một cách cấm đoán đối với việc tinh chỉnh LLM. Đặc biệt, Phân cụm KMeans Khả vi, hay DKM, đã cho thấy sự cân bằng tối ưu nhất giữa tỷ lệ nén và suy giảm độ chính xác, nhưng độ phức tạp bộ nhớ lớn của nó khiến việc áp dụng vào nén LLM thời gian huấn luyện gần như không thể. Trong bài báo này, chúng tôi đề xuất một triển khai DKM tiết kiệm bộ nhớ, eDKM được hỗ trợ bởi các kỹ thuật mới để giảm dấu chân bộ nhớ của DKM theo thứ tự độ lớn. Đối với một tensor nhất định cần được lưu trên CPU cho lượt truyền ngược của DKM, chúng tôi nén tensor bằng cách áp dụng phép duy nhất hóa và phân mảnh sau khi kiểm tra xem có tensor trùng lặp nào đã được sao chép trước đó vào CPU hay không. Kết quả thực nghiệm của chúng tôi chứng minh rằng eDKM có thể tinh chỉnh và nén một mô hình LLaMA 7B đã được huấn luyện trước từ 12.6 GB xuống 2.5 GB (3bit/trọng số) với bộ dữ liệu Alpaca bằng cách giảm dấu chân bộ nhớ thời gian huấn luyện của một lớp decoder đi 130 lần, trong khi vẫn mang lại độ chính xác tốt trên các benchmark LLM rộng hơn (tức là 77.7% cho PIQA, 66.1% cho Winograde, và nhiều hơn nữa).
+
+1. GIỚI THIỆU
+Các mô hình ngôn ngữ lớn hay LLMs, và đặc biệt là các mô hình Generative Pre-trained Transformer (GPT) đã cho thấy hiệu suất xuất sắc trên nhiều tác vụ ngôn ngữ phức tạp [11, 23]. Đột phá như vậy dẫn đến mong muốn chạy các LLMs này cục bộ trên thiết bị di động vì quyền riêng tư của người dùng [20, 21], nhưng ngay cả các LLMs nhỏ cũng quá lớn để thực thi trên thiết bị. Ví dụ, mô hình LLaMA nhỏ nhất có 7B tham số tức là 14GB trong FP16 [18], trong khi các thiết bị di động cao cấp chỉ có tối đa 18GB DRAM. Do đó, việc nén mạnh mẽ LLMs thông qua tối ưu hóa thời gian huấn luyện, chẳng hạn như thưa hóa, lượng tử hóa, hoặc phân cụm trọng số, là một bước quan trọng cho việc triển khai LLM trên thiết bị [3,5,6,8,12,13,14,15,16,16,19,20,22,24]
+
+Tuy nhiên, tối ưu hóa thời gian huấn luyện của LLM rất tốn kém do kích thước mô hình và chi phí tài nguyên tính toán. Đặc biệt, nhu cầu tài nguyên tính toán từ phân cụm trọng số khả vi thời gian huấn luyện trong DKM [3], một trong những thuật toán phân cụm trọng số tiên tiến nhất là cực kỳ cao, vì nó cần phân tích các tương tác giữa tất cả các trọng số và tất cả các tùy chọn phân cụm có thể. Theo đó, nhiều kỹ thuật nén LLM hiện có, chẳng hạn như GTPQ [7], và AWQ [9] dựa vào tối ưu hóa sau huấn luyện.
+
+Trong công trình này, chúng tôi đề xuất các kỹ thuật tối ưu hóa bộ nhớ để cho phép phân cụm trọng số thời gian huấn luyện và ứng dụng của chúng vào DKM [3], dẫn đến eDKM. Các kỹ thuật của chúng tôi bao gồm sắp xếp tensor xuyên thiết bị và duy nhất hóa/phân mảnh ma trận trọng số. Khi chúng tôi sử dụng eDKM để tinh chỉnh và nén mô hình LLaMA 7B thành 3bit-per-weight, chúng tôi đạt được khoảng 130 lần giảm dấu chân bộ nhớ cho một ngăn xếp decoder, nhưng vẫn vượt trội hơn các kỹ thuật nén 3bit hiện có.
+
+2. DKM HIỆU QUẢ BỘ NHỚ
+Cắt tỉa, lượng tử hóa, và chuẩn hóa đều là các kỹ thuật/hệ thống tối ưu hóa trọng số phổ biến lấy các trọng số gốc, W và xuất ra các trọng số tối ưu ˜W cho độ trễ suy luận, độ chính xác kiểm tra, hoặc kích thước mô hình, như được hiển thị trong Hình 1. Trong số các kỹ thuật, chúng tôi tập trung vào phân cụm trọng số, đáng chú ý là thuật toán phân cụm trọng số thời gian huấn luyện tiên tiến nhất, DKM [3]. Phân cụm trọng số là một rời rạc hóa trọng số phi tuyến, và một ma trận trọng số sẽ được nén thành một bảng tra cứu và một danh sách các chỉ số độ chính xác thấp đến bảng tra cứu, có thể được tiêu thụ bởi các bộ tăng tốc suy luận hiện đại [1].
+
+DKM thực hiện phân cụm trọng số khả vi bằng cách phân tích tương tác giữa các trọng số (ký hiệu W) và các tâm (ký hiệu C), và đã cho thấy sự cân bằng tiên tiến nhất giữa tỷ lệ nén và độ chính xác. Do đó, sử dụng DKM cho việc nén LLM sẽ mang lại kết quả chất lượng cao. Tuy nhiên, DKM tính toán một bản đồ chú ý lớn với độ phức tạp bộ nhớ O(|W||C|) (tức là ma trận trong Hình 1) cho các lượt truyền thuận/ngược (xem Phụ lục trong [3]), điều này đặc biệt thách thức đối với việc nén LLM. Ví dụ, một mô hình LLaMA 7B cần ít nhất 224GB chỉ để tính toán một bản đồ chú ý cho phân cụm trọng số 4bit.
+
+Theo đó, chúng ta cần khai thác bộ nhớ CPU để xử lý nhu cầu bộ nhớ lớn như vậy bằng cách tràn sang bộ nhớ CPU và sao chép lại vào GPU khi cần thiết sau này. Tuy nhiên, điều này sẽ gây ra lưu lượng đáng kể giữa GPU và CPU (làm chậm quá trình huấn luyện), và cần dung lượng bộ nhớ CPU khổng lồ. Do đó, việc giảm số lượng giao dịch giữa CPU và GPU, và giảm thiểu lưu lượng của mỗi giao dịch là rất quan trọng. Để giải quyết những thách thức như vậy, chúng tôi giới thiệu hai kỹ thuật tối ưu hóa bộ nhớ mới trong PyTorch.
+
+• Sắp xếp Tensor Xuyên Thiết bị: Chúng tôi theo dõi các tensor được sao chép qua các thiết bị và tránh sao chép dư thừa để giảm dấu chân bộ nhớ và đẩy nhanh quá trình huấn luyện.
+
+• Duy nhất hóa và Phân mảnh Trọng số: Chúng tôi sử dụng thực tế rằng các trọng số trong 16 bit chỉ có 2^16 giá trị duy nhất để giảm biểu diễn bản đồ chú ý (trong Hình 1) và phân mảnh thêm nó trên nhiều người học.
+
+2.1 Sắp xếp Tensor Xuyên Thiết bị
+PyTorch biểu diễn một tensor với lưu trữ dữ liệu liên kết đến bố cục dữ liệu thực tế và siêu dữ liệu giữ các hình dạng tensor, loại, và những thứ khác. Kiến trúc tensor như vậy cho phép PyTorch tái sử dụng lưu trữ dữ liệu bất cứ khi nào có thể và giảm hiệu quả dấu chân bộ nhớ. Tuy nhiên, khi một tensor di chuyển đến thiết bị khác (tức là từ GPU sang CPU), lưu trữ dữ liệu không thể được tái sử dụng và một tensor mới cần được tạo. Bảng 1 cho thấy một ví dụ về chi phí dấu chân bộ nhớ khi một tensor di chuyển giữa các thiết bị trong PyTorch.
+
+Tensor, x0 được phân bổ trong dòng 0, tiêu thụ 4MB trên GPU. Khi view của nó được thay đổi trong dòng 1, không cần thêm bộ nhớ GPU vì lưu trữ dữ liệu cơ bản có thể được tái sử dụng (tức là x0 và x1 thực tế là giống hệt nhau). Tuy nhiên, khi x0 và x1 di chuyển đến CPU như trong dòng 2 và 3, việc tiêu thụ bộ nhớ CPU trở thành 8MB, mặc dù y0 và y1 có thể chia sẻ cùng một lưu trữ dữ liệu trên CPU, điều này dẫn đến sự dư thừa trên bộ nhớ CPU và tăng lưu lượng GPU-CPU.
+
+dòng | mã | GPU | CPU
+0 | x0 = torch.rand([1024,1024]) | 4 | 0
+1 | x1 = x0.view(-1,1) | 4 | 0
+2 | y0 = x0.to('cpu') | 4 | 4
+3 | y1 = x1.to('cpu') | 4 | 8
+
+Bảng 1: Tinh chỉnh LLM có thể cần sử dụng bộ nhớ CPU để giảm tải các kích hoạt lớn. Thiếu quản lý tensor xuyên thiết bị có thể dẫn đến các bản sao dư thừa qua các thiết bị (đặc biệt là khi đồ thị tính toán phức tạp), điều này có thể đặc biệt không mong muốn đối với tối ưu hóa LLM thời gian huấn luyện. Ví dụ, mặc dù x0 và x1 là cùng một tensor chỉ với một view khác, khi được sao chép vào CPU, các tensor kết quả y0 và y1 không chia sẻ lưu trữ dữ liệu trong khi x0 và x1 có trên GPU.
+
+(a) Không có Sắp xếp
+(b) Có Sắp xếp
+
+Hình 2: Khi sơ đồ sắp xếp tensor xuyên thiết bị được đề xuất được áp dụng cho trường hợp trong Bảng 1, chúng ta có thể tránh sự trùng lặp ở phía CPU, điều này tiết kiệm bộ nhớ/lưu lượng. Trước khi sao chép x1 vào CPU, sơ đồ sắp xếp của chúng tôi kiểm tra xem có tồn tại tensor với cùng lưu trữ dữ liệu trên CPU (tức là y0) hay không. Nếu có, chúng tôi tái sử dụng tham chiếu cho y0 cùng với các phép toán cần thiết (view trong trường hợp này) để truy xuất tương lai.
+
+Để giải quyết sự thiếu hiệu quả như vậy, chúng tôi đặt một lớp sắp xếp như trong Hình 2 (b), trong đó màu đen đại diện cho lưu trữ dữ liệu thực tế và siêu dữ liệu, và màu xám chỉ ra chỉ siêu dữ liệu. Hình 2 (a) minh họa ví dụ trong Bảng 1 (với các số dòng tương ứng) trong đó x1 chia sẻ bố cục dữ liệu với x0 nhưng y0 và y1 có lưu trữ dữ liệu độc lập/trùng lặp trên CPU. Bằng cách chèn một lớp sắp xếp như trong Hình 2 (b), chúng tôi tránh sự dư thừa như vậy và giảm lưu lượng GPU-CPU.
+
+Chúng tôi sử dụng save-tensor-hook trong PyTorch (xem [2] để tham khảo) để triển khai sơ đồ sắp xếp như vậy, trong đó chúng tôi kiểm tra xem cùng một lưu trữ dữ liệu đã được sao chép chưa. Tuy nhiên, việc kiểm tra xem cùng một tensor có tồn tại trên thiết bị đích hay không là cực kỳ tốn kém khi sử dụng sơ đồ quy ước như băm. Do đó, khi một tensor mới vào hệ thống sắp xếp của chúng tôi, chúng tôi chuyển sang đồ thị tiến và kiểm tra xem có tồn tại tensor khác đã ở trên CPU và có thể truy cập được chỉ qua các phép toán bất biến lưu trữ dữ liệu (tức là view, transpose, ...) từ tensor mới trong vài bước nhảy hay không. Nếu không tìm thấy, tensor được sao chép và một tham chiếu đến tensor được tạo ra. Nếu tìm thấy, chúng tôi trả về tham chiếu của tensor hiện có và danh sách các phép toán truy tìm ngược về tensor mới. Đối với ví dụ trong Hình 2 (b), thay vì sao chép x1 vào CPU, chúng tôi chỉ đơn giản trả về tham chiếu đến y0 và phép toán view giữa x1 và y0.
+
+Điều hướng đồ thị tính toán tốn thêm chu kỳ tính toán, nhưng tiết kiệm trên một bản sao không cần thiết có thể bù đắp cho chi phí như vậy. Chúng tôi thấy rằng tìm kiếm trong vòng 4 bước nhảy là đủ để phát hiện tất cả các trường hợp đủ điều kiện trong đồ thị tính toán từ triển khai DKM gốc.
+
+2.2 Duy nhất hóa và Phân mảnh Trọng số
+Trong hầu hết việc huấn luyện LLM, 16bit (ví dụ, BF16 hoặc FP16) được sử dụng rộng rãi cho các trọng số, điều này có nghĩa là mặc dù có hàng tỷ tham số trong LLMs, chỉ có 2^16 hệ số duy nhất do độ rộng bit. Điều này cho phép một cơ hội để nén đáng kể bản đồ chú ý giữa các trọng số và các tâm, như trong Hình 3. Bằng cách tính toán sự chú ý đến các tâm một lần cho mỗi giá trị trọng số duy nhất, bản đồ chú ý có thể được chuyển đổi thành một bảng chú ý với O(|C|) và danh sách chỉ số với O(|W|). Lưu ý rằng số lượng hàng trong bảng chú ý tối đa là 65,536.
+
+Danh sách chỉ số (ký hiệu L) có thể được phân mảnh thêm trên một tập hợp người học (tức là GPUs) trong một thiết lập huấn luyện hoàn toàn đồng bộ [4], vì các trọng số giống hệt nhau trong mỗi người học tại bất kỳ thời điểm nào (do đó, bản đồ chú ý và danh sách chỉ số cũng vậy). Phân mảnh như vậy sẽ đưa độ phức tạp bộ nhớ xuống O(|W|/|L|).
+
+Duy nhất hóa và phân mảnh đi kèm với chi phí giao tiếp và tính toán cao hơn, vì các trọng số được phân mảnh cần được thu thập tất cả và bảng chú ý và danh sách chỉ số cần được chuyển đổi trở lại thành bản đồ chú ý cho việc lan truyền ngược (xem Bảng 2 cho chi phí thời gian chạy).
+
+Giả sử {wi,wj,wk} ∈ W và {cp,cq,cr} ∈ C, ký hiệu các trọng số và các tâm tương ứng trong Hình 3. Thêm nữa xem xét trường hợp {wi,wk} có cùng biểu diễn 16bit BA45 và wj có CB1F. Sau đó, khi một bản đồ chú ý được tính toán trong lượt truyền thuận, wi và wk sẽ có cùng sự chú ý đến C. Sau duy nhất hóa, bản đồ chú ý được phân tách thành một bảng chú ý với độ phức tạp bộ nhớ O(|C|) và một danh sách chỉ số với độ phức tạp O(|W|). Ví dụ, giá trị 16bit, BA45 của wi và wk có thể phục vụ như một offset đến bảng chú ý trong danh sách chỉ số. Danh sách chỉ số có thể được phân mảnh thêm trên |L| người học để giảm độ phức tạp trong mỗi người học thành O(|W|/|L|). Bản đồ chú ý gốc cần được tái tạo cho lượt truyền ngược để duy trì tương thích với triển khai autograd hiện có. Do đó, chúng tôi thực hiện các bước ngược để khôi phục bản đồ chú ý bằng cách thực hiện all-gather và tra cứu.
+
+3. KẾT QUẢ THỰC NGHIỆM
+Chúng tôi sử dụng PyTorch 2.0.0 và áp dụng Fully Sharded Data Parallel (FSDP) để tinh chỉnh mô hình LLaMA 7B đã được huấn luyện trước trong brainfloat16 với bộ dữ liệu Alpaca [17]. Chúng tôi tinh chỉnh trong 2 epochs trong khi nén mô hình trên một nút duy nhất với 8×A100-80GB GPUs sử dụng eDKM. Độ dài chuỗi tối đa trong quá trình tinh chỉnh là 256. Chúng tôi sử dụng bộ tối ưu AdamW với tốc độ học là 5e-5, độ suy giảm trọng số là 0, và betas là (0.9,0.95). Kích thước batch toàn cục là 64, và cắt chuẩn gradient với 1.0 được sử dụng.
+
+3.1 Độ chính xác LLM
+Chúng tôi so sánh eDKM với các sơ đồ nén dựa trên lượng tử hóa khác: round-to-nearest (RTN), SmoothQuant, GPTQ [7], AWQ [9] và LLM-QAT [10]. Đối với eDKM, chúng tôi cũng nén các lớp embedding với 8 bits.
+
+Bảng 3 báo cáo độ chính xác với Lý luận Thông thường, và các benchmark Few-Shot với các mô hình LLaMA 7B nén từ mỗi kỹ thuật.
+
+• eDKM cho phép mô hình LLaMA 7B nén 3bit vượt trội hơn tất cả các sơ đồ khác trong cấu hình 3bit.
+
+• eDKM thậm chí mang lại độ chính xác tốt nhất cho benchmark ARC-e qua các cấu hình 3 và 4bit.
+
+• eDKM mang lại hiệu suất cạnh tranh cho các benchmark PIQA và MMLU với các mô hình nén 4bit.
+
+MaM | SbS | UcU | Bộ nhớ | Giảm Bộ nhớ (×) | Thời gian chạy (giây)
+    |     |     | (MB)   |                    |
+    |     |     | 1600   | 1                  | 8.67
+✓   |     |     | 544    | 2.9                | 8.97
+✓   | ✓   |     | 68     | 23.5               | 9.5
+✓   |     | ✓   | 97     | 16.4               | 15.9
+✓   | ✓   | ✓   | 12     | 129.9              | 14.9
+
+aM: sử dụng lớp sắp xếp
+bS: sử dụng phân mảnh
+cU: sử dụng duy nhất hóa
+
+Bảng 2: Nghiên cứu loại bỏ để hiểu ảnh hưởng của từng kỹ thuật: Với các kỹ thuật đề xuất, dấu chân bộ nhớ có thể được giảm 130x với sự chậm lại 1.7x.
+
+Phương pháp | bits | Kích thước Mô hình (GB) | Lý luận Thông thường | | | | | Few-shot | |
+           |      |                         | PIQA | HellaSwag | Winograde | ARC-e | ARC-c | TriviaQA | MMLU
+LLaMA-7B   | 16   | 12.6                    | 79.3 | 76.1      | 70.0      | 73.0  | 48.0  | 57.0     | 35.2
+RTN        | 4    | 3.5                     | 77.3 | 72.7      | 66.9      | 68.8  | 46.4  | 44.9     | 28.9
+GPTQ g128c | 4    | 3.7                     | 77.2 | 54.0      | 65.7      | 61.6  | –a–   | –        | –
+AWQ g128   | 4    | 3.7                     | 78.1 | 55.8      | 65.8      | 66.8  | –     | –        | –
+LLM-QAT    | 4    | 3.5                     | 78.3 | 74.0      | 69.0      | 70.0  | 45.0  | 50.8     | 30.8
+GPTQ g128  | 3    | 3.0                     | 70.9 | 46.8      | 60.9      | 66.1  | –     | –        | –
+AWQ g128   | 3    | 3.0                     | 76.7 | 53.6      | 66.1      | 65.7  | –     | –        | –
+eDKM       | 3    | 2.5                     | 77.7 | 54.6      | 66.1      | 72.3  | 40.3  | 35.2b    | 30.3
+
+aKết quả không được báo cáo cho sơ đồ tương ứng; bOne-shot được áp dụng; cKích thước nhóm là 128.
+
+Bảng 3: Khi so sánh các kỹ thuật của chúng tôi với sơ đồ nén tiên tiến nhất, eDKM đưa ra kích thước mô hình nhỏ nhất, nhưng có độ chính xác tương tự hoặc tốt hơn cho tập hợp benchmark rộng hơn với mô hình LLaMA 7B nén 3bit.
+
+3.2 Nghiên cứu Loại bỏ
+Đối với nghiên cứu loại bỏ, chúng tôi tạo một ví dụ với một lớp attention từ ngăn xếp decoder LLaMA 7B và đo sự cân bằng giữa dấu chân bộ nhớ so với tốc độ truyền thuận-ngược với nén 3bit, như được hiển thị trong Bảng 2.
+
+Sắp xếp tensor xuyên thiết bị một mình giảm dấu chân bộ nhớ đi 2.9× với ít chi phí thời gian chạy, và tiết kiệm thêm 23.5× và 16.4× được đạt được với phân mảnh và duy nhất hóa, tương ứng. Khi tất cả các kỹ thuật được kết hợp, như trong Hình 3, eDKM đưa ra khoảng 130x giảm. Mặc dù các bước này đòi hỏi tính toán/giao tiếp thêm (tức là all-gather), chi phí thời gian chạy là không đáng kể, vì lưu lượng giữa GPU và CPU đã giảm đáng kể.
+
+4. KẾT LUẬN
+Trong công trình này, chúng tôi đề xuất một sơ đồ phân cụm trọng số khả vi tiết kiệm bộ nhớ, eDKM, để cung cấp nén thời gian huấn luyện cho LLMs. Với các kỹ thuật đề xuất, việc tiêu thụ bộ nhớ được giảm gần 130x, và mô hình LLaMA nén 3bit kết quả mang lại độ chính xác tiên tiến nhất trên các benchmark LLM-harness khác nhau.
+
+5. CÁC TÁC GIẢ BỔ SUNG
+
+TÀI LIỆU THAM KHẢO
+[1] https://coremltools.readme.io/docs/training-time-palettization.
+[2] https://pytorch.org/docs/stable/autograd.html#torch.autograd.graph.saved_tensors_hooks.
+[3] M. Cho, K. Alizadeh-Vahid, S. Adya, và M. Rastegari, "DKM: Differentiable K-Means Clustering Layer for Neural Network Compression," trong International Conference on Learning Representations, 2022.
+[4] J. Dean, G. Corrado, R. Monga, K. Chen, M. Devin, M. Mao, M. a. Ranzato, A. Senior, P. Tucker, K. Yang, Q. Le, và A. Ng, "Large scale distributed deep networks," trong Advances in Neural Information Processing Systems, 2012.
+[5] Z. Dong, Z. Yao, D. Arfeen, A. Gholami, M. W. Mahoney, và K. Keutzer, "HAWQ-V2: Hessian Aware trace-Weighted Quantization of Neural Networks," trong Advances in Neural Information Processing Systems, 2020.
+[6] A. Fan, P. Stock, B. Graham, E. Grave, R. Gribonval, H. Jégou, và A. Joulin, "Training with quantization noise for extreme model compression," trong International Conference on Learning Representations, 2021.
+[7] E. Frantar, S. Ashkboos, T. Hoefler, và D. Alistarh, "GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers," trong arXiv, 2023.
+[8] S. Han, H. Mao, và W. J. Dally, "Deep compression: Compressing deep neural network with pruning, trained quantization and huffman coding," trong International Conference on Learning Representations, 2016.
+[9] J. Lin, J. Tang, H. Tang, S. Yang, X. Dang, và S. Han, "AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration," arXiv, 2023.
+[10] Z. Liu, B. Oguz, C. Zhao, E. Chang, P. Stock, Y. Mehdad, Y. Shi, R. Krishnamoorthi, và V. Chandra, "LLM-QAT: Data-Free Quantization Aware Training for Large Language Models," arXiv, 2023.
+[11] L. Ouyang, J. Wu, X. Jiang, D. Almeida, C. L. Wainwright, P. Mishkin, C. Zhang, S. Agarwal, K. Slama, A. Ray, J. Schulman, J. Hilton, F. Kelton, L. Miller, M. Simens, A. Askell, P. Welinder, P. Christiano, J. Leike, và R. Lowe, "Training language models to follow instructions with human feedback," trong Advances in Neural Information Processing Systems, 2022.
+[12] E. Park, S. Yoo, và P. Vajda, "Value-aware quantization for training and inference of neural networks," trong European Conference on Computer Vision, 2018.
+[13] S. Park, J. Lee, S. Mo, và J. Shin, "Lookahead: A far-sighted alternative of magnitude-based pruning," trong International Conference on Learning Representations, 2019.
+[14] A. Polino, R. Pascanu, và D.-A. Alistarh, "Model compression via distillation and quantization," trong International Conference on Learning Representations, 2018.
+[15] M. Rastegari, V. Ordonez, J. Redmon, và A. Farhadi, "Xnor-net: Imagenet classification using binary convolutional neural networks," trong European Conference on Computer Vision. Springer, 2016, trang 525–542.
+[16] P. Stock, A. Joulin, R. Gribonval, B. Graham, và H. Jégou, "And the bit goes down: Revisiting the quantization of neural networks," trong International Conference on Learning Representations, 2020.
+[17] R. Taori, I. Gulrajani, T. Zhang, Y. Dubois, X. Li, C. Guestrin, P. Liang, và T. B. Hashimoto, "Stanford Alpaca: An Instruction-following LLaMA model," https://github.com/tatsu-lab/stanford_alpaca, 2023.
+[18] H. Touvron, T. Lavril, G. Izacard, X. Martinet, M.-A. Lachaux, T. Lacroix, B. Rozière, N. Goyal, E. Hambro, F. Azhar, A. Rodriguez, A. Joulin, E. Grave, và G. Lample, "Llama: Open and efficient foundation language models," trong arXiv, 2023.
+[19] K. Ullrich, E. Meeds, và M. Welling, "Soft weight-sharing for neural network compression," trong International Conference on Learning Representations, 2017.
+[20] K. Wang, Z. Liu, Y. Lin, J. Lin, và S. Han, "Haq: Hardware-aware automated quantization with mixed precision," trong Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition, 2019.
+[21] J. Wu, Y. Wang, Z. Wu, Z. Wang, A. Veeraraghavan, và Y. Lin, "Deep k-means: Re-training and parameter sharing with harder cluster assignments for compressing deep convolutions," trong International Conference on Machine Learning, 2018.
+[22] R. Yu, A. Li, C.-F. Chen, J.-H. Lai, V. I. Morariu, X. Han, M. Gao, C.-Y. Lin, và L. S. Davis, "Nisp: Pruning networks using neuron importance score propagation," trong Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition, 2018, trang 9194–9203.
+[23] S. Zhang, S. Roller, N. Goyal, M. Artetxe, M. Chen, S. Chen, C. Dewan, M. Diab, X. Li, X. V. Lin, T. Mihaylov, M. Ott, S. Shleifer, K. Shuster, D. Simig, P. S. Koura, A. Sridhar, T. Wang, và L. Zettlemoyer, "Opt: Open pre-trained transformer language models," trong arXiv, 2022.
+[24] D. Zhou, X. Jin, Q. Hou, K. Wang, J. Yang, và J. Feng, "Neural epitome search for architecture-agnostic network compression," trong International Conference on Learning Representations, 2019.
