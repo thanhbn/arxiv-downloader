@@ -1,0 +1,431 @@
+# DeepSpeed-MoE: Thúc đẩy Suy luận và Huấn luyện Hỗn hợp Chuyên gia để Hỗ trợ Quy mô AI Thế hệ tiếp theo
+
+Samyam Rajbhandari, Conglong Li, Zhewei Yao, Minjia Zhang, Reza Yazdani Aminabadi, Ammar Ahmad Awan, Jeff Rasley, và Yuxiong He
+Microsoft
+
+## Tóm tắt
+
+Khi việc huấn luyện các mô hình dày đặc khổng lồ đạt đến giới hạn về tính sẵn có và khả năng của tài nguyên phần cứng hiện tại, các mô hình Hỗn hợp Chuyên gia (MoE) trở thành một trong những kiến trúc mô hình đầy hứa hẹn nhất do chi phí huấn luyện giảm đáng kể so với mô hình dày đặc tương đương về chất lượng. Việc tiết kiệm chi phí huấn luyện được chứng minh từ các mô hình encoder-decoder (các công trình trước đây) đến việc tiết kiệm 5x cho các mô hình ngôn ngữ tự hồi quy (công trình này cùng với các khám phá song song). Tuy nhiên, do kích thước mô hình lớn hơn nhiều và kiến trúc độc đáo, việc cung cấp suy luận mô hình MoE nhanh vẫn là thách thức và chưa được giải quyết, hạn chế việc sử dụng thực tế của nó. Để giải quyết vấn đề này, chúng tôi trình bày DeepSpeed-MoE, một giải pháp huấn luyện và suy luận MoE từ đầu đến cuối như một phần của thư viện DeepSpeed, bao gồm các thiết kế kiến trúc MoE mới và kỹ thuật nén mô hình giảm kích thước mô hình MoE lên đến 3.7x, và một hệ thống suy luận được tối ưu hóa cao cung cấp độ trễ và chi phí tốt hơn 7.3x so với các giải pháp suy luận MoE hiện có. DeepSpeed-MoE cung cấp quy mô và hiệu quả chưa từng có để phục vụ các mô hình MoE lớn với suy luận nhanh hơn 4.5x và rẻ hơn 9x so với các mô hình dày đặc tương đương về chất lượng. Chúng tôi hy vọng những đổi mới và hệ thống của chúng tôi sẽ giúp mở ra một con đường đầy hứa hẹn cho những hướng mới trong bối cảnh mô hình lớn, một sự chuyển đổi từ mô hình dày đặc sang mô hình MoE thưa thớt, nơi việc huấn luyện và triển khai các mô hình chất lượng cao hơn với ít tài nguyên hơn trở nên khả thi rộng rãi hơn.
+
+## 1 Giới thiệu
+
+Trong ba năm qua, mô hình được huấn luyện lớn nhất đã tăng kích thước hơn 1000x, từ vài trăm triệu tham số đến nửa nghìn tỷ tham số (Megatron-Turing NLG 530B). Những cải tiến về chất lượng mô hình theo kích thước cho thấy xu hướng này sẽ tiếp tục, với kích thước mô hình lớn hơn mang lại chất lượng mô hình tốt hơn.
+
+Tuy nhiên, việc duy trì sự tăng trưởng về kích thước mô hình ngày càng khó khăn hơn do yêu cầu tính toán gia tăng. Ví dụ, mô hình dày đặc đơn lẻ lớn nhất hiện có tính đến tháng 12 năm 2021, mô hình Megatron-Turing NLG 530B, mất khoảng 3 tháng để huấn luyện trên hơn 2000 GPU A100 trên Siêu máy tính NVIDIA Selene, tiêu thụ hơn 3 triệu giờ GPU [2]. Việc tăng thêm 3 đến 5 lần kích thước mô hình dày đặc sẽ không khả thi trong một khung thời gian hợp lý.
+
+Với tài nguyên tính toán đắt đỏ cần thiết để huấn luyện các mô hình tiên tiến, một câu hỏi tự nhiên là: "Có thể cải thiện đáng kể chất lượng mô hình mà không tăng chi phí tính toán không?" Hoặc tương đương, "Có thể tạo ra mô hình có chất lượng tương tự bằng cách sử dụng ít tài nguyên hơn 3 đến 5 lần không?"
+
+Đã có nhiều nỗ lực nhằm giảm yêu cầu tính toán để huấn luyện các mô hình lớn mà không hy sinh chất lượng mô hình. Để đạt được mục tiêu này, các kiến trúc dựa trên Hỗn hợp Chuyên gia (MoE) [3, 4, 5] đã mở ra một con đường đầy hứa hẹn, cho phép yêu cầu tính toán dưới tuyến tính đối với các tham số mô hình và cho phép cải thiện chất lượng mô hình mà không tăng chi phí huấn luyện. Tuy nhiên, các mô hình dựa trên MoE có những thách thức riêng hạn chế việc sử dụng chúng trong nhiều kịch bản thực tế:
+
+• **Phạm vi hạn chế**: Phạm vi của các mô hình dựa trên MoE trong lĩnh vực NLP chủ yếu giới hạn ở các mô hình encoder-decoder và các tác vụ sequence-to-sequence, với công việc hạn chế được thực hiện trong việc khám phá ứng dụng của nó trong các lĩnh vực khác. Việc áp dụng MoE cho việc sinh ngôn ngữ tự nhiên tự hồi quy (NLG) như GPT-3 và MT-NLG 530B, nơi chi phí tính toán của việc huấn luyện các mô hình ngôn ngữ tiên tiến có thể cao hơn hàng bậc so với các mô hình encoder-decoder, ít được khám phá.
+
+• **Yêu cầu bộ nhớ lớn**: Trong khi các mô hình MoE yêu cầu ít tính toán hơn để đạt được chất lượng mô hình như các đối tác dày đặc, chúng cần số lượng tham số nhiều hơn đáng kể. Ví dụ, mô hình Switch-Base dựa trên MoE có nhiều tham số hơn 10x so với T5-large (7.4B so với 0.74B) và vẫn không có cùng chất lượng mô hình khi so sánh trên nhiều tác vụ downstream [5]. Nói cách khác, các mô hình dựa trên MoE có "hiệu quả tham số" thấp hơn nhiều so với các mô hình dày đặc tương đương về chất lượng. Kích thước mô hình lớn hơn và hiệu quả tham số thấp hơn mang lại thách thức trong cả huấn luyện và suy luận.
+
+Đối với huấn luyện, việc tăng kích thước mô hình lớn này yêu cầu tăng tỷ lệ thuận trong bộ nhớ thiết bị. Lưu ý rằng T5-large (0.74B) được đề cập ở trên có thể vừa với bộ nhớ của một GPU V100 32GB duy nhất, trong khi việc huấn luyện Switch-Base (7.4B) yêu cầu ít nhất 8-10 GPU như vậy để chỉ vừa với mô hình trong bộ nhớ thiết bị để huấn luyện. Nếu chúng ta mở rộng kích thước mô hình dày đặc đến tương đương MT-NLG với 500B tham số, việc đạt được chất lượng tương tự với mô hình dựa trên MoE có thể cần một mô hình với hơn 5 nghìn tỷ tham số (giả sử việc mở rộng 10x vẫn giữ nguyên), điều này sẽ yêu cầu hơn 5K GPU chỉ để vừa với các trạng thái mô hình để huấn luyện. Kích thước mô hình lớn này làm cho việc huấn luyện mô hình dựa trên MoE ở quy mô lớn trở nên thách thức do cả bộ nhớ thiết bị yêu cầu cũng như hỗ trợ hệ thống cần thiết để sử dụng hiệu quả bộ nhớ thiết bị trên hàng nghìn GPU.
+
+• **Hiệu suất suy luận hạn chế**: Do kích thước mô hình lớn và hiệu quả tham số kém được đề cập ở trên, việc suy luận nhanh các mô hình dựa trên MoE thậm chí còn thách thức hơn. Một mặt, kích thước tham số lớn hơn yêu cầu nhiều GPU hơn để vừa, và công nghệ suy luận đa GPU không được thiết kế để làm việc với các mô hình dựa trên MoE. Mặt khác, khi suy luận thường bị giới hạn bởi băng thông bộ nhớ, các mô hình dựa trên MoE, có thể lớn hơn 10x so với tương đương dày đặc của chúng, có thể yêu cầu băng thông bộ nhớ khả thi cao hơn 10x để đạt được độ trễ suy luận tương tự như các mô hình dày đặc.
+
+Mặc dù có sự giảm chi phí huấn luyện đầy hứa hẹn và không tầm thường, những thách thức được đề cập ở trên hạn chế nghiêm trọng khả năng ứng dụng thực tế của MoE. Trong nỗ lực làm cho MoE thực tế, dễ tiếp cận và có thể áp dụng, trong bài báo này, chúng tôi giải quyết những thách thức này bằng cách cung cấp ba giải pháp tương ứng:
+
+• Chúng tôi mở rộng phạm vi của các mô hình dựa trên MoE cho các tác vụ NLG tự hồi quy, chứng minh việc giảm chi phí huấn luyện 5x để đạt được chất lượng mô hình tương tự cho các mô hình như GPT-3 và MT-NLG. Những kết quả này không chỉ chứng minh các cơ hội rõ ràng để giảm chi phí huấn luyện các mô hình NLG lớn, mà còn mở ra khả năng đạt được chất lượng mô hình thế hệ tiếp theo cao hơn nhiều dưới sự hạn chế của tài nguyên phần cứng thế hệ hiện tại.
+
+• Chúng tôi cải thiện hiệu quả tham số của các mô hình dựa trên MoE bằng cách phát triển một kiến trúc MoE mới mà chúng tôi gọi là Pyramid-Residual MoE (PR-MoE). PR-MoE là một mô hình hybrid dày đặc và MoE được tạo ra sử dụng các kết nối residual, trong khi áp dụng các chuyên gia chỉ ở nơi chúng hiệu quả nhất. PR-MoE có thể giảm kích thước tham số mô hình MoE lên đến 3x mà không thay đổi chất lượng mô hình và thay đổi tối thiểu yêu cầu tính toán. Ngoài ra, chúng tôi tạo ra một phiên bản chưng cất của PR-MoE, mà chúng tôi gọi là Mixture-of-Students (MoS), thông qua chưng cất kiến thức theo giai đoạn. MoS giảm kích thước mô hình MoE lên đến 3.7x trong khi duy trì chất lượng mô hình tương đương.
+
+• Chúng tôi phát triển hệ thống suy luận DeepSpeed-MoE, một hệ thống suy luận MoE được tối ưu hóa cao cho phép mở rộng hiệu quả khối lượng công việc suy luận trên hàng trăm GPU, cung cấp sự giảm lên đến 7.3x về độ trễ suy luận và chi phí khi so sánh với các giải pháp suy luận MoE hiện có. Nó cung cấp độ trễ suy luận siêu nhanh (dưới 25 ms) cho các mô hình MoE nghìn tỷ tham số. DeepSpeed-MoE cũng cung cấp suy luận nhanh hơn 4.5x và rẻ hơn 9x cho các mô hình MoE so với các mô hình dày đặc tương đương về chất lượng bằng cách kết hợp cả tối ưu hóa hệ thống và mô hình.
+
+Cùng nhau, những đổi mới và hệ thống của chúng tôi cho phép MoE trở thành một giải pháp thay thế hiệu quả và kinh tế hơn so với các mô hình dày đặc, đạt được chi phí huấn luyện và suy luận thấp hơn đáng kể trong khi có được chất lượng mô hình tương tự. Hoặc tương đương, chúng có thể được sử dụng để trao quyền cho các mô hình của quy mô AI thế hệ tiếp theo mà không yêu cầu tăng tài nguyên tính toán.
+
+Chúng tôi hy vọng DeepSpeed-MoE sẽ giúp mở ra một con đường đầy hứa hẹn cho những hướng mới trong bối cảnh mô hình lớn, một sự chuyển đổi từ mô hình dày đặc sang mô hình MoE thưa thớt, nơi việc huấn luyện và triển khai các mô hình chất lượng cao hơn với ít tài nguyên hơn trở nên khả thi rộng rãi hơn.
+
+**Đề cương bài báo**: Chúng tôi bắt đầu phần còn lại của bài báo này với kiến thức nền tảng cần thiết và công trình liên quan, tiếp theo là ba giải pháp trên được trình bày như các phần độc lập.
+
+**Phần mềm**: Chúng tôi đang trong quá trình mở nguồn DeepSpeed-MoE như một phần của thư viện DeepSpeed qua nhiều giai đoạn. Vui lòng tìm mã nguồn, hướng dẫn và tài liệu tại DeepSpeed GitHub (https://github.com/microsoft/DeepSpeed) và trang web (https://www.deepspeed.ai/). Các thí nghiệm trong bài báo này được thực hiện trên nền tảng Microsoft Azure AI, nơi tốt nhất để huấn luyện và phục vụ các mô hình sử dụng DeepSpeed. Các hướng dẫn của chúng tôi bao gồm cách bắt đầu với DeepSpeed trên Azure và thử nghiệm với các mô hình khác nhau sử dụng Azure ML.
+
+## 2 Công trình liên quan
+
+### 2.1 Các mô hình NLP dày đặc quy mô lớn
+
+Để kiểm tra và xác minh giới hạn trên của định luật mở rộng [6] cho khả năng mô hình đối với số lượng tham số, kích thước mô hình xử lý ngôn ngữ tự nhiên được huấn luyện trước đã tăng 10x mỗi năm trong vài năm qua. Các công trình trước đó thường ở quy mô hàng trăm triệu tham số, bao gồm BERT [7], XLNet [8], RoBERTa [9], ALBERT [10], và GPT [11], v.v. Sau đó, các mô hình hàng tỷ đến hàng chục tỷ, như GPT-2 [12], TuringNLG [13], Megatron-LM [14], T5 [15], v.v., được giới thiệu và chúng được chứng minh là có hiệu suất khái quát tốt hơn trên nhiều tác vụ hiểu và sinh ngôn ngữ tự nhiên khác nhau [16, 17, 18, 19, 20, 21]. GPT-3 [22] tiếp tục đẩy giới hạn trên lên 175 tỷ tham số, và cho thấy rằng với học zero/few-shot, nó có thể đạt được hiệu suất tương đương hoặc thậm chí tốt hơn so với các mô hình quy mô nhỏ trước đó với việc tinh chỉnh. Gần đây hơn, mô hình Megatron-Turing NLG 530B cực lớn [2] đạt 530 tỷ tham số nhờ hỗ trợ phần mềm từ DeepSpeed [23] và Megatron-LM [14], và nó đạt được kết quả tiên tiến mới của học zero/few-shot trong một mô hình dày đặc duy nhất. Tuy nhiên, vì việc huấn luyện mất 3 tháng trên hơn 2000 GPU A100, việc đạt được chất lượng mô hình tốt hơn bằng cách đơn giản tăng kích thước mô hình không còn khả thi do yêu cầu tính toán không thể vượt qua.
+
+### 2.2 Giảm chi phí huấn luyện bằng kiến trúc MoE
+
+Một cách đầy hứa hẹn để giảm chi phí huấn luyện là sử dụng Mixture of Expert (MoE) [24]. Trong [3], các tác giả mở rộng mô hình dựa trên LSTM lên 127B bằng cách áp dụng các lớp MoE tích chập giữa các lớp LSTM xếp chồng [25] cho mô hình hóa ngôn ngữ và dịch máy. Bản chất thưa thớt của MoE cải thiện đáng kể việc mở rộng kích thước mô hình mà không tăng chi phí tính toán. GShard [4] sử dụng MoE để huấn luyện mô hình dựa trên transformer [26] lên 600B tham số cho dịch đa ngôn ngữ, và nó cho thấy chi phí huấn luyện của mô hình MoE 600B này thậm chí còn rẻ hơn so với mô hình dày đặc 100B. Switch Transformer [5] tiếp tục dựa trên mô hình T5 và mở rộng mô hình lên 1.6 nghìn tỷ. Để đạt được cùng hiệu suất độ chính xác, [5] cho thấy tốc độ huấn luyện nhanh hơn 2.5x của các mô hình MoE so với các mô hình dày đặc lớn. Tiếp theo, các công trình gần đây hơn [27, 28, 29] thể hiện lợi thế thưa thớt của MoE.
+
+Một số công trình gần đây và song song [30, 31] cho thấy mô hình MoE cũng có thể được áp dụng cho các tác vụ sinh ngôn ngữ tự nhiên tự hồi quy, bao gồm kết quả sơ bộ về nhiều tác vụ đánh giá downstream. Tuy nhiên, công trình của chúng tôi có sự khác biệt lớn so với các khám phá song song này: (1) công trình của chúng tôi điều tra các cơ hội huấn luyện, thiết kế mô hình và suy luận của các mô hình MoE trong khi [30, 31] chủ yếu tập trung vào huấn luyện MoE; (2) chúng tôi đề xuất kiến trúc PR-MoE và chưng cất kiến thức MoS để đạt được hiệu quả tham số MoE tốt hơn và chất lượng đánh giá zero-shot ngang bằng/tốt hơn như mô tả trong Phần 3.3; (3) chúng tôi phát triển hệ thống suy luận DeepSpeed-MoE để phục vụ hiệu quả các mô hình MoE quy mô lớn với thông lượng cao và độ trễ thấp. Trong khi các nghiên cứu gần đây như [30] và [31] thảo luận về việc giảm FLOP, điều cần đề cập là không giống như huấn luyện, độ trễ và chi phí suy luận không chỉ phụ thuộc vào tính toán. Suy luận hiệu quả phụ thuộc vào kích thước mô hình, băng thông bộ nhớ, và khả năng của hệ thống đọc dữ liệu từ bộ nhớ một cách hiệu quả. Hệ thống suy luận DeepSpeed-MoE là một hệ thống từ đầu đến cuối kết hợp các đổi mới kiến trúc mô hình (Phần 4) và vô số tối ưu hóa và kỹ thuật (Phần 5) để cung cấp độ trễ cực thấp và tăng tốc siêu tuyến tính cho thông lượng.
+
+### 2.3 Hệ thống huấn luyện và suy luận MoE
+
+Với sự gia tăng gần đây của các mô hình MoE bởi nhiều nhà nghiên cứu trên thế giới, các hệ thống và framework mã nguồn mở đang được phát triển hoặc mở rộng để hỗ trợ huấn luyện mô hình MoE. Theo hiểu biết của chúng tôi, chưa có hệ thống MoE nào được thiết kế và tối ưu hóa đặc biệt cho suy luận. Một số hệ thống huấn luyện MoE đã được trình bày gần đây. Dưới đây chúng tôi thảo luận về một số trong số chúng.
+
+Hệ thống huấn luyện DeepSpeed MoE [32] chủ yếu được nhắm mục tiêu cho việc huấn luyện tối ưu hóa các mô hình MoE ở quy mô lớn. Mục tiêu chính của công trình này là thiết lập một API linh hoạt hướng người dùng để mở rộng các mã huấn luyện hiện có cho việc huấn luyện mô hình MoE hiệu quả và có thể mở rộng. Nó hỗ trợ kích thước mô hình lớn hơn 8x bằng cách tận dụng các kết hợp linh hoạt của các loại song song khác nhau bao gồm tensor-slicing, song song dữ liệu, song song dữ liệu được hỗ trợ bởi ZeRO [23], và song song chuyên gia. Nó đã được sử dụng để huấn luyện Z-code MoE, một mô hình MoE đa nhiệm vụ đa ngôn ngữ 10 tỷ tham số (kiến trúc transformer encoder-decoder) trên 50 ngôn ngữ với thời gian huấn luyện ít hơn 5x so với mô hình dày đặc có chất lượng tương đương.
+
+FastMoE [33] là một phần mềm nghiên cứu được phát triển để cho thấy cách các mô hình MoE có thể được huấn luyện dưới song song dữ liệu và chuyên gia (mô hình). Sự kết hợp của các chiều song song khác nhau không được hỗ trợ đầy đủ. Các ví dụ Fast-MoE bao gồm Transformer-XL và Megatron-LM nhưng kết quả về huấn luyện từ đầu đến cuối quy mô lớn chưa có sẵn. Fairseq-MoE [31] cung cấp API MoE cũng như pipeline huấn luyện cho các mô hình ngôn ngữ tổng quát. Hệ thống Fairseq đã được tối ưu hóa thêm bởi Tutel [34], cung cấp cải thiện lên đến 40 phần trăm so với Fairseq.
+
+## 3 DeepSpeed-MoE cho NLG: Giảm chi phí huấn luyện của các mô hình ngôn ngữ 5 lần
+
+Các mô hình sinh ngôn ngữ tự nhiên (NLG) dựa trên transformer tự hồi quy cung cấp giải pháp thuyết phục cho một loạt rộng các tác vụ ngôn ngữ từ tóm tắt tài liệu, sinh tiêu đề, hỏi đáp đến thậm chí sinh mã trong nhiều ngôn ngữ lập trình khác nhau. Do khả năng ứng dụng rộng rãi của các mô hình này, việc cải thiện chất lượng của chúng đã được cả học giới và công nghiệp quan tâm lớn. Với yêu cầu tính toán và năng lượng rất lớn để huấn luyện họ mô hình NLG, chúng tôi khám phá các cơ hội mà MoE mang lại để giảm chi phí huấn luyện của chúng. Chúng tôi cho thấy MoE có thể được áp dụng cho họ mô hình NLG để cải thiện đáng kể chất lượng mô hình của chúng với cùng chi phí huấn luyện. Hoặc, nó có thể đạt được sự giảm 5x về chi phí huấn luyện để đạt được chất lượng mô hình tương tự của mô hình NLG dày đặc.
+
+### 3.1 Kiến trúc mô hình NLG dựa trên MoE
+
+Để tạo ra mô hình NLG dựa trên MoE, chúng tôi nghiên cứu mô hình NLG dựa trên transformer giống GPT. Để hoàn thành huấn luyện trong khung thời gian hợp lý, các mô hình sau được chọn: 350M (24 lớp, 1024 kích thước ẩn, 16 đầu attention), 1.3B (24 lớp, 2048 kích thước ẩn, 16 đầu attention), và 6.7B (32 lớp, 4096 kích thước ẩn, 32 đầu attention). Chúng tôi sử dụng "350M+MoE-128" để biểu thị mô hình MoE sử dụng mô hình dày đặc 350M làm mô hình cơ sở và thêm 128 chuyên gia vào mọi lớp feedforward khác. Có nghĩa là, có tổng cộng 12 lớp MoE cho cả 350M+MoE-128 và 1.3B+MoE-128.
+
+Chúng tôi sử dụng hàm gating để kích hoạt một tập con các chuyên gia trong lớp MoE cho mỗi token. Cụ thể, trong các thí nghiệm của chúng tôi, chỉ chuyên gia top-1 được chọn. Do đó, trong cả huấn luyện và suy luận, mô hình MoE của chúng tôi sẽ có cùng số lượng tham số được kích hoạt cho mỗi token như phần dày đặc của chúng (được minh họa trong Hình 3 (trái)). Ví dụ, 1.3B+MoE-128 sẽ chỉ kích hoạt 1.3B tham số mỗi token, và lượng tính toán huấn luyện mỗi token sẽ tương tự như mô hình dày đặc 1.3B. Chúng tôi cũng thử nghiệm hàm gating top-2 và thấy nó cung cấp một số cải thiện hội tụ, nhưng đó là lợi ích giảm dần và nó đi kèm với chi phí tính toán/giao tiếp huấn luyện lớn so với gating top-1.
+
+### 3.2 Cài đặt huấn luyện và đánh giá
+
+Chúng tôi huấn luyện trước cả phiên bản dày đặc và MoE của các mô hình trên bằng DeepSpeed trên 128 GPU Ampere A100 (instances Azure ND A100). Các instance Azure này được hỗ trợ bởi các image docker Azure HPC mới nhất cung cấp môi trường được tối ưu hóa đầy đủ và các phiên bản thư viện hiệu suất tốt nhất của NCCL, Mellanox OFED, Sharp, và CUDA. DeepSpeed sử dụng kết hợp huấn luyện song song dữ liệu và song song chuyên gia để mở rộng hiệu quả việc huấn luyện mô hình MoE. Chúng tôi sử dụng cùng dữ liệu huấn luyện cho mô hình MT-NLG [2]. Để so sánh công bằng, chúng tôi sử dụng 300B token để huấn luyện cả mô hình dày đặc và mô hình MoE.
+
+Bảng 1 tóm tắt các siêu tham số để huấn luyện các mô hình dày đặc và MoE. Đối với các mô hình dày đặc, chúng tôi làm theo các siêu tham số từ công trình GPT-3 [22]. Đối với các mô hình MoE, chúng tôi thấy rằng sử dụng tốc độ học thấp hơn và thời gian suy giảm tốc độ học dài hơn so với các đối tác dày đặc (ví dụ, dày đặc 1.3B so với 1.3B+MoE-128) có thể cung cấp sự hội tụ tốt hơn. Chúng tôi tin rằng điều này là do các mô hình MoE có số lượng tham số lớn hơn nhiều. Các mô hình MoE có hai siêu tham số bổ sung: số lượng chuyên gia mỗi lớp MoE, và một hệ số khi thêm các mất mát lớp MoE vào tổng mất mát huấn luyện.
+
+Ngoài việc so sánh mất mát validation trong quá trình huấn luyện trước, chúng tôi sử dụng 6 tác vụ đánh giá zero-shot để so sánh chất lượng mô hình cuối cùng: 1 tác vụ dự đoán hoàn thành (LAMBADA [16]), 1 tác vụ lý luận thông thường (PIQA [35]), 2 tác vụ đọc hiểu (BoolQ [18], RACE-h [36]), và 2 tác vụ hỏi đáp (TriviaQA [21], WebQs [20]).
+
+### 3.3 MoE dẫn đến chất lượng tốt hơn cho các mô hình NLG
+
+Hình 1 cho thấy mất mát validation cho các phiên bản MoE của mô hình tốt hơn đáng kể so với các đối tác dày đặc của chúng. Hơn nữa, chú ý rằng mất mát validation của mô hình MoE, 350M+MoE-128, ngang bằng với mất mát validation của mô hình dày đặc 1.3B với cơ sở lớn hơn 4x. Điều này cũng đúng cho 1.3B+MoE-128 so với mô hình dày đặc 6.7B với cơ sở lớn hơn 5x. Hơn nữa, chất lượng mô hình ngang bằng không chỉ cho mất mát validation mà còn cho đánh giá zero-shot trên 6 tác vụ downstream như được hiển thị trong Bảng 2, chứng minh rằng các mô hình MoE và đối tác dày đặc của chúng với cơ sở lớn hơn 4-5x có chất lượng mô hình rất tương tự.
+
+Ngoài ra, trong Bảng 2, chúng tôi cũng so sánh kết quả zero-shot của chúng tôi với các công trình liên quan đã khám phá MoE cho các mô hình NLG song song với chúng tôi [30, 31]. Mặc dù với cảnh báo rằng dữ liệu huấn luyện và siêu tham số không giống nhau, các so sánh chứng minh rằng trên một số tác vụ nhất định, các mô hình MoE của chúng tôi có thể đạt được chất lượng ngang bằng hoặc tốt hơn với ít tham số hơn: So với 8B+MoE-64 (143B) trong [30], các mô hình MoE của chúng tôi (1.3B+MoE-128 (52B), 1.3B+PR-MoE-64/128 (31B), 1.3B+PR-MoE+L21+MoS (27B)) có thể đạt được độ chính xác LAMBADA tốt hơn với lên đến 5.3x ít tham số hơn. So với 355M+MoE-512 (52B) trong [31], các mô hình MoE của chúng tôi (1.3B+PR-MoE-64/128 (31B) và 1.3B+PR-MoE+L21+MoS (27B)) có thể đạt được độ chính xác PIQA/BoolQ tốt hơn với lên đến 1.9x ít tham số hơn.
+
+### 3.4 Chất lượng tương tự với chi phí huấn luyện ít hơn 5x
+
+Như chúng ta đã thấy từ các kết quả trên, việc thêm MoE với 128 chuyên gia vào mô hình NLG cải thiện đáng kể chất lượng của mô hình NLG. Tuy nhiên, những chuyên gia này không thay đổi yêu cầu tính toán của mô hình vì mỗi token chỉ được xử lý bởi một chuyên gia duy nhất. Do đó, yêu cầu tính toán cho mô hình dày đặc và các mô hình MoE tương ứng với cùng cơ sở là tương tự. Cụ thể hơn, việc huấn luyện mô hình 1.3B+MoE-128 yêu cầu lượng phép toán tính toán gần như tương tự mô hình dày đặc 1.3B, trong khi cung cấp chất lượng mô hình tốt hơn nhiều.
+
+Hơn nữa, kết quả của chúng tôi cho thấy bằng cách áp dụng MoE, chúng ta có thể đạt được chất lượng mô hình của mô hình dày đặc 6.7B tham số với chi phí huấn luyện của mô hình dày đặc 1.3B tham số, dẫn đến sự giảm tính toán huấn luyện hiệu quả 5x. Sự giảm chi phí tính toán này có thể được chuyển đổi trực tiếp thành tăng thông lượng, giảm thời gian huấn luyện và chi phí huấn luyện bằng cách tận dụng hệ thống huấn luyện DeepSpeed MoE hiệu quả. Bảng 3 cho thấy thông lượng huấn luyện của mô hình 1.3B+MoE-128 so với mô hình dày đặc 6.7B trên 128 GPU NVIDIA A100.
+
+Để kết luận, phần này cho thấy việc tiết kiệm chi phí huấn luyện đáng kể khi sử dụng MoE trên các mô hình NLG: bằng cách áp dụng MoE, chúng tôi đạt được chất lượng mô hình của mô hình NLG dày đặc 6.7B tham số với chi phí huấn luyện mô hình cơ sở 1.3B, nhờ vào cấu trúc thưa thớt của MoE. Giả sử việc mở rộng giữ nguyên, kết quả có tiềm năng biến đổi bối cảnh huấn luyện mô hình lớn và cung cấp năng lượng cho quy mô mô hình lớn hơn nhiều dưới thời gian và chi phí phải chăng hơn sử dụng tài nguyên cứng có sẵn ngày nay. Ví dụ, một mô hình có độ chính xác tương đương như mô hình dày đặc nghìn tỷ tham số có thể được huấn luyện với chi phí của mô hình dày đặc kích thước 200B tham số (như GPT-3), chuyển đổi thành hàng triệu đô la tiết kiệm chi phí huấn luyện và năng lượng [22].
+
+## 4 PR-MoE và MoS: Giảm kích thước mô hình và cải thiện hiệu quả tham số
+
+Trong khi các mô hình dựa trên MoE đạt được chất lượng tương tự với sự giảm chi phí huấn luyện 5x trong ví dụ NLG, mô hình kết quả có khoảng 8x tham số của mô hình dày đặc tương ứng (ví dụ, mô hình dày đặc 6.7B có 6.7 tỷ tham số và 1.3B+MoE-128 có 52 tỷ tham số). Một mô hình MoE lớn như vậy yêu cầu bộ nhớ nhiều hơn đáng kể trong quá trình huấn luyện, và việc đáp ứng yêu cầu độ trễ cho các mô hình như vậy trong quá trình suy luận là thách thức vì băng thông bộ nhớ tiêu thụ để đọc trọng số mô hình là nút thắt hiệu suất chính trong suy luận. Để giảm số lượng tham số và cải thiện hiệu quả tham số của các mô hình dựa trên MoE, chúng tôi trình bày những đổi mới trong kiến trúc mô hình MoE (gọi là PR-MoE) giảm kích thước mô hình tổng thể lên đến 3 lần mà không ảnh hưởng đến chất lượng mô hình. Ngoài ra, chúng tôi thiết kế kỹ thuật chưng cất kiến thức MoE-to-MoE mới để tạo ra phiên bản chưng cất của PR-MoE, mà chúng tôi gọi là Mixture-of-Students (MoS), giúp giảm thêm kích thước mô hình MoE, tối ưu hóa thời gian và chi phí suy luận. Dưới đây chúng tôi bắt đầu với kiến trúc PR-MoE mới của chúng tôi và sau đó thảo luận về MoS.
+
+### 4.1 PR-MoE: Pyramid-Residual-MoE cho kích thước mô hình nhỏ hơn và suy luận nhanh
+
+#### 4.1.1 Hai quan sát và trực giác
+
+**Hiện tượng-I**: Đầu tiên, kiến trúc MoE tiêu chuẩn có cùng số lượng và cấu trúc chuyên gia trong tất cả các lớp MoE. Điều này nhắc nhở chúng ta một câu hỏi cơ bản trong cộng đồng học máy: tất cả các lớp trong Mạng Neural Sâu có học cùng một biểu diễn không? Câu hỏi này đã được nghiên cứu kỹ trong Thị giác Máy tính (CV): các lớp nông (gần với đầu vào) học các biểu diễn tổng quát và các lớp sâu (gần với đầu ra) học các biểu diễn cụ thể hơn theo mục tiêu [37]. Điều này cũng truyền cảm hứng cho học chuyển giao trong CV để đóng băng các lớp nông cho việc tinh chỉnh [38]. Hiện tượng này, tuy nhiên, chưa được khám phá kỹ trong Xử lý Ngôn ngữ Tự nhiên, đặc biệt là cho các kiến trúc MoE.
+
+Để điều tra câu hỏi này, chúng tôi so sánh hiệu suất của hai kiến trúc Half-MoE khác nhau dựa trên mô hình 350M+MoE. Cụ thể hơn, a) chúng tôi đặt các lớp MoE trong nửa đầu các lớp của mô hình và để nửa thứ hai của các lớp giống hệt với mô hình dày đặc (được gọi là First-Half-MoE), và b) chúng tôi chuyển các lớp MoE sang nửa thứ hai và sử dụng dày đặc ở nửa đầu (được gọi là Second-Half-MoE). Kết quả được hiển thị trong Hình 2 (trái). Như có thể thấy, Second-Half-MoE có hiệu suất tốt hơn đáng kể so với đối tác của nó. Điều này xác nhận rằng không phải tất cả các lớp MoE đều học cùng mức độ biểu diễn. Các lớp sâu hơn hưởng lợi nhiều hơn từ số lượng lớn các chuyên gia. Để đơn giản, chúng tôi gọi hiện tượng này là Hiện tượng-I.
+
+**Hiện tượng-II**: Thứ hai, để cải thiện hiệu suất khái quát của các mô hình MoE, có hai phương pháp phổ biến: (1) tăng số lượng chuyên gia trong khi giữ khả năng chuyên gia (tức là cho mỗi token, số lượng chuyên gia nó đi qua) là như nhau; (2) tăng gấp đôi khả năng chuyên gia với chi phí tính toán nhiều hơn một chút (33%) trong khi giữ cùng số lượng chuyên gia. Tuy nhiên, đối với (1), yêu cầu bộ nhớ cho tài nguyên huấn luyện cần được tăng lên do số lượng chuyên gia lớn hơn; đối với (2), khả năng cao hơn cũng làm tăng gấp đôi khối lượng giao tiếp có thể làm chậm đáng kể việc huấn luyện và suy luận. Có cách nào để giữ hiệu quả huấn luyện/suy luận trong khi có được lợi ích hiệu suất khái quát không?
+
+Một trực giác về lý do tại sao khả năng chuyên gia lớn hơn giúp độ chính xác là những chuyên gia bổ sung đó có thể giúp sửa "biểu diễn" của cái đầu tiên. Tuy nhiên, chuyên gia đầu tiên này có cần được thay đổi mỗi lần không? Hay chúng ta có thể cố định chuyên gia đầu tiên và chỉ gán các chuyên gia bổ sung khác nhau cho các token khác nhau? Để điều tra thuộc tính chưa biết này, chúng tôi thực hiện so sánh theo hai cách (1) tăng gấp đôi khả năng (được gọi là Top2-MoE), và (2) cố định một chuyên gia và thay đổi chuyên gia thứ hai qua các chuyên gia khác nhau (được gọi là Residual-MoE). Đặc biệt, đối với (2), một token sẽ luôn đi qua một module MLP dày đặc và một chuyên gia từ module MoE, có thể được xem như một trường hợp đặc biệt của mạng residual. Sau đó, chúng tôi cộng đầu ra của hai nhánh này lại với nhau để có được đầu ra cuối cùng. Trực giác chính là coi chuyên gia từ module MoE như một số hạng sửa lỗi của module MLP dày đặc. Như vậy, chúng ta có thể đạt được lợi ích của việc sử dụng 2 chuyên gia mỗi lớp với cùng lượng khối lượng giao tiếp như hàm gating Top-1.
+
+Chúng tôi thực hiện so sánh cho mô hình 350M+MoE với 32 chuyên gia và các đường cong validation được trình bày trong Hình 2 (phải). Chúng tôi thấy rằng hiệu suất khái quát của hai cái này (tức là Top2-MoE và Residual-MoE) ngang bằng với nhau. Tuy nhiên, tốc độ huấn luyện của thiết kế mới của chúng tôi, Residual-MoE, nhanh hơn hơn 10% so với Top2-MoE do việc giảm khối lượng giao tiếp. Hiện tượng này được gọi là Hiện tượng-II.
+
+#### 4.1.2 Kiến trúc Pyramid Residual MoE
+
+Dựa trên những điều trên, chúng tôi đề xuất kiến trúc MoE mới của chúng tôi. Như Hiện tượng-I trong Phần 4.1.1 cho thấy rằng việc tận dụng MoE tại các lớp sau mang lại nhiều lợi ích hơn, kiến trúc mới của chúng tôi sử dụng nhiều chuyên gia hơn trong vài lớp cuối so với các lớp trước đó. Điều này tạo ra thiết kế Pyramid-MoE, nơi chúng tôi cho thấy một ví dụ trong Hình 3 (phải) - hai lớp cuối có 2x chuyên gia so với các lớp trước đó. Đồng thời, xem xét Hiện tượng II, chúng tôi đề xuất kiến trúc Residual-MoE, nơi mỗi token riêng biệt đi qua một module MLP cố định và một chuyên gia được chọn như được hiển thị trong Hình 3 (phải), nơi các khối màu cam là MLP cố định.
+
+Bằng cách kết hợp Pyramid-MoE và Residual-MoE lại với nhau, chúng tôi có mô hình Pyramid-Residual-MoE (PR-MoE gọi tắt), nơi tất cả các lớp MoE tiêu chuẩn được thay thế bằng lớp PR-MoE mới. Hình 3 cho thấy minh họa của các kiến trúc standard-MoE và PR-MoE.
+
+#### 4.1.3 Thiết kế hệ thống
+
+Trong phần này, chúng tôi bắt đầu bằng cách thảo luận về cách một mô hình MoE có thể được huấn luyện hiệu quả bằng cách sử dụng song song chuyên gia. Sau đó chúng tôi thảo luận về hạn chế của phương pháp như vậy khi áp dụng cho mô hình PR-MoE. Cuối cùng, chúng tôi thảo luận về cách chúng tôi có thể mở rộng các hệ thống huấn luyện dựa trên song song chuyên gia hiện có để huấn luyện hiệu quả các mô hình PR-MoE.
+
+**Huấn luyện hiệu quả mô hình MoE**: Huấn luyện mô hình MoE hiệu quả đòi hỏi có kích thước batch đủ lớn cho mỗi chuyên gia trong module MoE để đạt được hiệu quả tính toán tốt. Điều này là thách thức vì số lượng token đầu vào cho MoE được phân chia trên tất cả các chuyên gia, giảm số lượng token mỗi chuyên gia tỷ lệ với số lượng chuyên gia khi so sánh với phần còn lại của mô hình nơi không có sự phân chia như vậy được thực hiện. Cách đơn giản nhất để tránh sự giảm token mỗi chuyên gia này là huấn luyện mô hình với song song dữ liệu kết hợp với song song chuyên gia [32] bằng số lượng chuyên gia. Điều này tăng tổng số token trong batch mỗi bản sao MoE sẽ được phân chia giữa các chuyên gia, dẫn đến không có sự giảm token mỗi chuyên gia so với phần còn lại của mô hình.
+
+**Thách thức của PR-MoE**: Thiết kế một cơ sở hạ tầng huấn luyện có thể huấn luyện hiệu quả mô hình PR-MoE là không tầm thường do sự hiện diện của số lượng chuyên gia khác nhau ở các giai đoạn khác nhau của mô hình. Như đã thảo luận ở trên, phương pháp hiệu quả nhất để huấn luyện các mô hình dựa trên MoE là làm cho song song chuyên gia bằng số lượng chuyên gia, để tránh giảm token đầu vào mỗi chuyên gia. Tuy nhiên, do sự thay đổi số lượng chuyên gia trong PR-MoE, không có mức độ song song chuyên gia duy nhất nào là tối ưu cho tất cả các lớp MoE. Hơn nữa, nếu song song chuyên gia được đặt thành số lượng chuyên gia nhỏ nhất trong mô hình, thì nó sẽ yêu cầu nhiều chuyên gia mỗi GPU cho các lớp MoE có số lượng chuyên gia lớn hơn, dẫn đến hiệu quả kém do kích thước batch giảm mỗi chuyên gia, cũng như tăng bộ nhớ cần thiết mỗi GPU. Mặt khác, nếu chúng ta đặt song song chuyên gia là số lượng chuyên gia lớn nhất trong mô hình, thì điều này sẽ dẫn đến vấn đề cân bằng tải, nơi một số GPU có nhiều chuyên gia để xử lý hơn những cái khác, cuối cùng hạn chế hiệu quả thông lượng huấn luyện.
+
+**DeepSpeed-MoE với hỗ trợ song song đa chuyên gia và đa dữ liệu**: Để giải quyết những thách thức này, chúng tôi phát triển và triển khai một thiết kế song song đa chuyên gia và đa dữ liệu linh hoạt trên đỉnh DeepSpeed-MoE, cho phép huấn luyện các phần khác nhau của mô hình với mức độ song song chuyên gia và dữ liệu khác nhau. Ví dụ, một mô hình PR-MoE chạy trên 128 GPU, với 32, 64, và 128 chuyên gia tại các lớp MoE khác nhau, có thể được huấn luyện với song song dữ liệu 128-way cho song song không chuyên gia, và song song chuyên gia {32, 64, 128} cộng với song song dữ liệu {4, 2, 1} cho các tham số MoE. Lưu ý rằng mỗi GPU bây giờ có thể huấn luyện chính xác 1 chuyên gia mỗi lớp MoE bất kể số lượng chuyên gia trong đó, dẫn đến không có sự giảm token đầu vào mỗi chuyên gia, không có mất cân bằng tải, hoặc tăng yêu cầu bộ nhớ mỗi GPU.
+
+Thông qua extension linh hoạt này, DeepSpeed-MoE [32] có thể huấn luyện các mô hình PR-MoE, cùng với bất kỳ biến thể MoE tương lai nào khác có thể yêu cầu các chuyên gia khác nhau ở các giai đoạn khác nhau của mô hình, mà không làm giảm hiệu quả huấn luyện hoặc yêu cầu bộ nhớ.
+
+#### 4.1.4 Đánh giá PR-MoE
+
+**So sánh giữa PR-MoE và Standard-MoE**: Chúng tôi đánh giá kiến trúc mới của chúng tôi, PR-MoE trên hai kích thước mô hình khác nhau, tức là kích thước cơ sở 350M và 1.3B, và so sánh hiệu suất với các kiến trúc Standard-MoE lớn hơn. Cụ thể hơn, chúng tôi so sánh 350M+PR-MoE-32/64 với 350M+MoE-128, và chúng tôi so sánh 1.3B+PR-MoE-64/128 với 1.3B+MoE-128.
+
+Kết quả được hiển thị trong Bảng 4. Đối với cả trường hợp 350M và 1.3B, PR-MoE của chúng tôi sử dụng ít tham số hơn nhiều nhưng đạt được độ chính xác tương đương như các mô hình Standard-MoE. Đặc biệt, (1) đối với trường hợp 350M, PR-MoE chỉ sử dụng ít hơn 1/3 tham số so với Standard-MoE; (2) đối với trường hợp 1.3B, PR-MoE chỉ sử dụng khoảng 60% tham số so với Standard-MoE, trong khi đạt được độ chính xác tương tự.
+
+**Nghiên cứu ablation của các kiến trúc MoE khác nhau**: Để nghiên cứu đầy đủ hiệu suất của các kiến trúc MoE khác nhau, đặc biệt là so sánh giữa Standard-MoE và Residual-MoE/Pyramid-MoE/PR-MoE, chúng tôi đánh giá 5 mô hình dựa trên MoE khác nhau, bao gồm 350M+MoE-32, 350M+MoE-128, 350M+Pyramid-MoE-32/64 (có 10 lớp MoE sử dụng 32 chuyên gia và 2 lớp MoE sử dụng 64 chuyên gia), 350M+Residual-MoE-32, và 350M+PR-MoE-32/64 (cài đặt chuyên gia giống như 350M+Pyramid-MoE-32/64).
+
+Các đường cong validation cho toàn bộ huấn luyện được hiển thị trong Hình 4. Như có thể thấy, khoảng cách mất mát validation giữa 350M+MoE-128 và 350M+MoE-32 có thể được giảm đáng kể bởi Pyramid-MoE và Residual-MoE. Khi chúng tôi sử dụng PR-MoE, sự kết hợp của Pyramid-MoE và Residual-MoE, khoảng cách mất mát có thể được giảm thêm xuống khoảng 0.01, chứng minh hiệu quả tham số tuyệt vời của PR-MoE với tác động chất lượng tối thiểu.
+
+### 4.2 Mixture-of-Students: Chưng cất cho kích thước mô hình nhỏ hơn và suy luận nhanh hơn
+
+Nén mô hình và chưng cất kiến thức mang lại những cơ hội bổ sung để cải thiện hiệu suất suy luận hơn nữa. Mặc dù có nhiều cách để nén mô hình, chẳng hạn như lượng tử hóa [39, 40, 41] và cắt tỉa [42, 43], những nỗ lực hiện tại của chúng tôi tập trung vào việc giảm lớp thông qua chưng cất kiến thức [44] (KD) - giảm cả kích thước mô hình và tính toán mô hình, và bảo tồn cấu trúc MoE tại mô hình học sinh.
+
+KD đã được chứng minh là một cách thành công để nén một mô hình lớn thành một mô hình nhỏ, chứa ít tham số và tính toán hơn nhiều nhưng vẫn có được kết quả cạnh tranh. Đã có một số công trình áp dụng KD cho việc chưng cất cụ thể tác vụ của các LM lớn được huấn luyện trước thành các mô hình nhỏ [45, 46, 47, 48]. Tuy nhiên, chúng chỉ xem xét các transformer nhỏ (vài trăm tham số) và các mô hình LM dày đặc dựa trên encoder (ví dụ, BERT). Ngược lại, chúng tôi tập trung vào việc nghiên cứu KD cho các mô hình LM sinh tự động dựa trên MoE thưa thớt ở quy mô nhiều tỷ tham số. Phân tích duy nhất khác về chưng cất MoE mà chúng tôi biết là bởi [49, 31], những người nghiên cứu chưng cất MoE thành các mô hình dày đặc. Tuy nhiên, bằng cách làm như vậy, mô hình học sinh chưng cất mất đi các lợi ích tinh chỉnh và suy luận thưa thớt được cung cấp bởi MoE. Ngược lại, nghiên cứu của chúng tôi cho thấy có thể đạt được hiệu suất tương tự, chẳng hạn như đánh giá zero-shot trên nhiều tác vụ downstream, cho mô hình MoE nhỏ hơn được huấn luyện trước với chưng cất kiến thức, dẫn đến các mô hình nhẹ hơn và nhanh hơn trong thời gian suy luận.
+
+#### 4.2.1 Mixture-of-Students thông qua KD theo giai đoạn
+
+**Lựa chọn kiến trúc và mục tiêu tối ưu hóa**: Để áp dụng chưng cất kiến thức cho MoE, đầu tiên chúng tôi huấn luyện mô hình MoE giáo viên. Chúng tôi giảm độ sâu của mỗi nhánh chuyên gia trong mô hình giáo viên để có được học sinh tương ứng. Bằng cách làm như vậy, mô hình học sinh cuối cùng có cùng kiến trúc gating thưa thớt như MoE giáo viên ngoại trừ việc mỗi nhánh chuyên gia có độ sâu nhỏ hơn. Vì lý do này, chúng tôi gọi mô hình kết quả là Mixture-of-Students (MoS). Vì cấu trúc MoE mang lại lợi ích đáng kể bằng cách cho phép huấn luyện và suy luận thưa thớt, Mixture-of-Students không phụ thuộc tác vụ chưng cất của chúng tôi kế thừa những lợi ích này trong khi bảo tồn lợi thế suy luận so với mô hình dày đặc tương đương chất lượng. Sau khi tạo ra MoS, chúng tôi buộc MoS bắt chước các đầu ra từ MoE giáo viên trên tập dữ liệu huấn luyện. Chúng tôi áp dụng công thức tổng quát của mất mát KD [50] là:
+
+min E(x,y)∼D[L(x,θ) + L_KD(x',θ)], (1)
+
+nơi là tổng có trọng số của mất mát cross-entropy giữa các dự đoán và nhãn cứng đã cho và mất mát KL divergence giữa các dự đoán và nhãn mềm của giáo viên. Hơn nữa, với hiệu suất xuất sắc của PR-MoE, chúng tôi kết hợp PR-MoE với KD (PR-MoS) để giảm thêm kích thước mô hình MoE. Nói cách khác, chúng tôi chọn cả mô hình giáo viên và mô hình học sinh đều là PR-MoE.
+
+**Cải thiện độ chính xác học sinh với chưng cất kiến thức theo giai đoạn**: Một quan sát thú vị trong quá trình chưng cất mô hình MoE là việc sử dụng PR-MoE giáo viên dẫn đến độ chính xác học sinh thấp hơn so với học sinh PR-MoE được huấn luyện từ đầu (hàng 2 và 4 trong Bảng 5). Vì KD thường cải thiện khái quát hóa học sinh, điều này đặt ra câu hỏi về lý do tại sao KD không cải thiện độ chính xác cho việc huấn luyện trước MoE trên mô hình ngôn ngữ sinh. Vì không có thí nghiệm chưng cất nào trước đây báo cáo kết quả thí nghiệm chưng cất trên MoE chưng cất, chúng tôi đào sâu vào kết quả. Hình 5 cho thấy so sánh mất mát validation giữa PR-MoE được huấn luyện từ đầu và sử dụng chưng cất kiến thức với giáo viên của nó. Chúng tôi thấy rằng trong khi mất mát KD cải thiện độ chính xác validation ban đầu, nó bắt đầu làm tổn hại độ chính xác về cuối quá trình huấn luyện (ví dụ, sau 400K bước).
+
+Chúng tôi giả thuyết rằng vì PR-MoE đã giảm khả năng so với MoE tiêu chuẩn bằng cách khai thác sự thay đổi kiến trúc (ví dụ, giảm chuyên gia trong các lớp thấp hơn), việc giảm thêm độ sâu của mô hình khiến học sinh có khả năng không đủ, làm cho nó rơi vào chế độ underfitting. Do đó, học sinh PR-MoE có thể không có đủ khả năng để tối thiểu hóa cả mất mát huấn luyện và mất mát chưng cất kiến thức, và có thể kết thúc việc tối thiểu hóa một mất mát (mất mát KD) với chi phí của cái khác (mất mát cross entropy), đặc biệt là về cuối quá trình huấn luyện. Giả thuyết nói trên cho thấy chúng ta có thể muốn dần dần giảm tác động từ KD hoặc dừng KD sớm trong quá trình huấn luyện và thực hiện tối ưu hóa chỉ chống lại mất mát mô hình hóa ngôn ngữ tiêu chuẩn cho phần còn lại của quá trình huấn luyện.
+
+#### 4.2.2 Đánh giá Mixture-of-Students
+
+Chúng tôi đánh giá phương pháp của chúng tôi trên hai cấu hình mô hình PR-MoE khác nhau, 350M+PR-MoE-32/64 và 1.3B+PR-MoE-64/128. Chúng tôi xây dựng các mô hình học sinh bằng cách giảm độ sâu của các giáo viên xuống 21 (12.5%) trong cả hai trường hợp và so sánh mô hình MoS kết quả với giáo viên của nó bằng phương pháp được mô tả trong phần trước.
+
+Đầu tiên chúng tôi đánh giá cách stage-KD được đề xuất ảnh hưởng đến sự hội tụ huấn luyện trước. Hình 6 cho thấy so sánh đường cong validation của việc dừng KD tại 400K bước và so sánh của nó với mô hình giáo viên. Chúng tôi thấy rằng phiên bản theo giai đoạn của KD này bây giờ mang lại cho chúng tôi lợi ích hứa hẹn của chưng cất kiến thức: mô hình học sinh bây giờ có đường cong validation tương tự như giáo viên. Kết quả đánh giá trên các tác vụ downstream cũng cho thấy KD theo giai đoạn đạt được độ chính xác đánh giá zero-shot tốt hơn nhiều so với việc áp dụng KD cho toàn bộ quá trình huấn luyện, như được hiển thị tiếp theo.
+
+Tiếp theo chúng tôi thực hiện đánh giá zero-shot trên một tập hợp các tác vụ NLP. Kết quả trên mỗi tác vụ được hiển thị trong Bảng 5. Chúng tôi đưa ra một vài quan sát. Đầu tiên, với cùng mức độ giảm độ sâu nhưng không có KD dựa trên MoS (hàng 2), mô hình PR-MoE gặp phải sự sụt giảm độ chính xác đáng chú ý trên một số tác vụ như LAMBADA (1.3 điểm) và BoolQ (7.5 điểm), cho thấy việc trực tiếp giảm độ sâu chuyên gia có thể làm tổn hại độ chính xác mô hình. Thứ hai, với KD theo giai đoạn (hàng 4), chúng tôi có thể cải thiện hiệu suất của học sinh PR-MoE và quan sát được sự cải thiện độ chính xác trên 5 trong 6 tác vụ. Đáng chú ý, cải thiện 1.1 điểm cho LAMBADA, cao hơn 6.5 điểm cho BoolQ, cao hơn 1.7 điểm cho RACE-h, cao hơn 4.5 điểm cho TriviaQA. Một ngoại lệ là PIQA, trong trường hợp này học sinh PR-MoE trải qua một số sự sụt giảm độ chính xác nhỏ. Những kết quả này chỉ ra hiệu quả của phương pháp Mixture-of-Students được đề xuất của chúng tôi như một kỹ thuật KD mới cho các mô hình MoE. Thứ ba, thực hiện KD cho toàn bộ quá trình huấn luyện (KD đầy đủ, hàng 3) làm tổn hại độ chính xác tác vụ downstream trên LAMBADA (thấp hơn 0.8 điểm) và PIQA (thấp hơn 0.7 điểm). Như đã giải thích trong phần trước, điều này là do mô hình học sinh không có khả năng đủ để tối ưu hóa cả mất mát KD và mất mát LM tiêu chuẩn về cuối quá trình huấn luyện, do underfitting. Ngược lại, staged-KD được đề xuất của chúng tôi có thể giải quyết vấn đề này và mang lại những lợi ích hứa hẹn từ KD. Nhìn chung, mô hình MoE chưng cất thông qua KD theo giai đoạn đạt được độ chính xác trung bình 42.87 và 47.96, duy trì 99.5% và 99.1% hiệu suất của mô hình giáo viên 350M (43.08) và 1.3B (48.37) mặc dù có ít lớp hơn 12.5%. Điều này cho phép giảm độ trễ và giảm thông lượng bổ sung cho suy luận, mà chúng tôi hiển thị trong phần tiếp theo.
+
+Như kết luận của Phần 4, trong quá trình huấn luyện PR-MoE dẫn đến giảm lên đến 3x tiêu thụ bộ nhớ so với mô hình MoE tiêu chuẩn ban đầu. Trong quá trình suy luận, PR-MoE và MoS cùng nhau giảm kích thước mô hình MoE lên đến 3.7x trong khi duy trì độ chính xác mô hình. Điều này có lợi đáng kể cho suy luận về độ trễ và chi phí, như chúng tôi mô tả trong phần tiếp theo.
+
+## 5 Suy luận DeepSpeed-MoE: Phục vụ các mô hình MoE ở quy mô và tốc độ chưa từng có
+
+Tối ưu hóa độ trễ và chi phí suy luận là rất quan trọng để các mô hình MoE trở nên hữu ích trong thực tế. Trong quá trình suy luận, kích thước batch thường nhỏ, vì vậy độ trễ suy luận của mô hình MoE phụ thuộc chủ yếu vào thời gian cần thiết để tải các tham số mô hình từ bộ nhớ chính, trái ngược với niềm tin thông thường rằng ít tính toán hơn nên dẫn đến suy luận nhanh hơn. Do đó, hiệu suất suy luận MoE phụ thuộc vào hai yếu tố chính: kích thước mô hình tổng thể và băng thông bộ nhớ tổng thể có thể đạt được.
+
+Trong phần trước, chúng tôi đã trình bày PR-MoE và MoS để giảm kích thước mô hình MoE trong khi bảo tồn độ chính xác mô hình. Phần này trình bày các giải pháp tối ưu hóa hệ thống của chúng tôi để tối đa hóa băng thông bộ nhớ có thể đạt được bằng cách tạo ra một hệ thống suy luận MoE đa GPU tận dụng băng thông bộ nhớ tổng hợp trên hàng chục GPU phân tán để tăng tốc suy luận. Cùng nhau, DeepSpeed-MoE (DS-MoE gọi tắt) cung cấp quy mô và hiệu quả chưa từng có để phục vụ các mô hình MoE lớn với độ trễ tốt hơn 7.3x và chi phí thấp hơn so với các hệ thống MoE cơ sở, và suy luận MoE nhanh hơn 4.5x và rẻ hơn 9x so với các mô hình dày đặc tương đương chất lượng. DS-MoE là một phần của nỗ lực DeepSpeed-inference lớn hơn được trình bày trong [51].
+
+### 5.1 Thiết kế hệ thống suy luận DeepSpeed-MoE
+
+Hiệu suất suy luận MoE là một nghịch lý thú vị:
+
+• **Từ góc nhìn tốt nhất**: mỗi token đầu vào của mô hình MoE (với gating top-1) chỉ kích hoạt một chuyên gia duy nhất tại mỗi lớp MoE, dẫn đến đường dẫn dữ liệu quan trọng tương đương với kích thước mô hình dày đặc cơ sở, nhỏ hơn hàng bậc so với kích thước mô hình thực tế. Ví dụ, khi suy luận mô hình 1.3B+MoE-128, mỗi token đầu vào cần chỉ 1.3 tỷ tham số, mặc dù kích thước tham số tổng thể là 52 tỷ.
+
+• **Từ góc nhìn tệ nhất**: các tham số tổng hợp cần thiết để xử lý một batch token (ví dụ, một câu hoặc một đoạn văn bản) có thể lớn bằng kích thước mô hình đầy đủ (vì các token khác nhau có thể kích hoạt các chuyên gia khác nhau), toàn bộ 52 tỷ tham số trong ví dụ trước, làm cho việc đạt được độ trễ ngắn và thông lượng cao trở nên thách thức.
+
+Mục tiêu thiết kế của hệ thống suy luận DeepSpeed-MoE là hướng hiệu suất về phía góc nhìn tốt nhất. Nó được đạt được thông qua ba bộ tối ưu hóa được phối hợp tốt:
+
+• Phân chia mô hình cẩn thận và bao quát các loại song song khác nhau; nhóm và định tuyến tất cả các token với cùng đường dẫn dữ liệu quan trọng lại với nhau để giảm truy cập dữ liệu mỗi thiết bị và đạt được băng thông tổng hợp tối đa;
+
+• Tối ưu hóa lập lịch giao tiếp với phối hợp song song để nhóm và định tuyến token một cách hiệu quả; và
+
+• Tối ưu hóa các kernel liên quan đến transformer và MoE để cải thiện hiệu suất mỗi thiết bị.
+
+Chúng tôi trình bày thảo luận sâu về những tối ưu hóa này trong ba phần tiếp theo.
+
+### 5.2 Kết hợp linh hoạt Tensor-Slicing, Expert-Slicing, Data Parallelism, và Expert Parallelism
+
+Để đạt được độ trễ thấp và thông lượng cao ở quy mô chưa từng có cho MoE, chúng tôi thiết kế hệ thống suy luận của chúng tôi để tối thiểu hóa đường dẫn dữ liệu quan trọng mỗi thiết bị, tối đa hóa băng thông bộ nhớ tổng hợp có thể đạt được, và cung cấp bộ nhớ tổng hợp dồi dào đồng thời để cho phép kích thước mô hình lớn bằng cách sử dụng (1) song song chuyên gia [32] và slicing trên các tham số chuyên gia và (2) song song dữ liệu và tensor-slicing cho các tham số không chuyên gia. Hình 7 minh họa một lớp MoE Transformer duy nhất, chứa cả các chuyên gia (ví dụ, MLP) và các tham số không chuyên gia (ví dụ, Attention), và cách chúng tôi sử dụng kết hợp các chiến lược song song để xử lý từng thành phần. Dưới đây chúng tôi mô tả cách mô hình và dữ liệu được phân chia, và chi tiết của từng hình thức song song chúng tôi sử dụng để xử lý từng phần.
+
+**Song song chuyên gia và Expert-slicing cho các tham số chuyên gia**: Như được minh họa trong nghịch lý hiệu suất MoE, trong khi mỗi token chỉ kích hoạt một chuyên gia duy nhất tại mỗi lớp MoE, đối với suy luận batch với nhiều token, các tham số tổng hợp cần thiết cho tất cả các token có thể lớn bằng toàn bộ tập hợp các tham số, làm cho việc đạt được cả độ trễ thấp và thông lượng cao trở nên thách thức. Để giải quyết vấn đề này, chúng tôi phân chia các chuyên gia trên các thiết bị, nhóm tất cả các token đầu vào được gán cho cùng các chuyên gia dưới cùng đường dẫn dữ liệu quan trọng, và song song hóa việc xử lý các nhóm token với các đường dẫn dữ liệu quan trọng khác nhau giữa các thiết bị khác nhau sử dụng song song chuyên gia.
+
+Trong ví dụ về 1.3B+MoE-128, khi song song chuyên gia bằng 128, mỗi GPU chỉ xử lý một nhóm token duy nhất tương ứng với các chuyên gia trên thiết bị đó. Điều này dẫn đến đường dẫn tuần tự là 1.3 tỷ tham số mỗi thiết bị, nhỏ hơn 5x so với mô hình dày đặc tương đương chất lượng với 6.7B tham số. Do đó, về lý thuyết, mô hình dựa trên MoE có tiềm năng chạy nhanh hơn 5x so với mô hình dày đặc tương đương chất lượng sử dụng song song chuyên gia giả sử không có chi phí giao tiếp, một chủ đề chúng tôi thảo luận trong phần tiếp theo.
+
+Ngoài ra, chúng tôi đề xuất "expert-slicing" để tận dụng khái niệm tensor-slicing cho các tham số trong một chuyên gia, phân chia các tham số chuyên gia theo chiều ngang/dọc trên nhiều GPU. Chiều song song bổ sung này hữu ích cho các kịch bản yêu cầu độ trễ nghiêm ngặt mà chúng tôi mở rộng đến nhiều thiết bị hơn số lượng chuyên gia.
+
+**Song song dữ liệu và Tensor-slicing cho các tham số không chuyên gia**: Trong khi song song chuyên gia giảm số lượng tham số chuyên gia trong đường dẫn quan trọng mỗi thiết bị, nó không giảm các tham số không chuyên gia trong đường dẫn quan trọng. Điều này dẫn đến hai hạn chế: (1) kích thước tối đa của các tham số không chuyên gia trong mô hình MoE có thể được suy luận bị giới hạn bởi bộ nhớ thiết bị đơn lẻ, và (2) độ trễ thực thi của các thành phần không chuyên gia của mô hình bị giới hạn bởi băng thông bộ nhớ thiết bị đơn lẻ.
+
+Chúng tôi sử dụng tensor-slicing trong một node để giải quyết những nút thắt cổ chai này, cho phép hàng trăm tỷ tham số không chuyên gia bằng cách tận dụng bộ nhớ GPU tổng hợp, đồng thời cũng tận dụng băng thông bộ nhớ GPU tổng hợp trên tất cả các GPU trong một node. Mặc dù có thể thực hiện tensor-slicing trên các node, chi phí giao tiếp của tensor-slicing cùng với độ chi tiết tính toán giảm thường làm cho tensor-slicing liên node không khả thi. Để mở rộng các tham số không chuyên gia trên nhiều node, chúng tôi sử dụng song song dữ liệu bằng cách tạo các bản sao tham số không chuyên gia xử lý các batch khác nhau trên các node mà không phát sinh chi phí giao tiếp hoặc giảm độ chi tiết tính toán.
+
+**Sự hợp lực của Song song đa chiều**: Bằng cách kết hợp song song chuyên gia và expert-slicing với tensor-slicing và song song dữ liệu, suy luận DS-MoE có thể mở rộng mô hình MoE đa nghìn tỷ tham số (với nghìn tỷ tham số chuyên gia và hàng trăm tỷ tham số không chuyên gia) đến hàng chục hoặc thậm chí hàng trăm thiết bị trên các node. Băng thông tổng hợp trên những thiết bị này và đường dẫn dữ liệu quan trọng được tối thiểu hóa mỗi thiết bị mở ra cơ hội để cho phép suy luận độ trễ thấp và thông lượng cao ở quy mô chưa từng có. Tuy nhiên, đến đó vẫn yêu cầu các collective giao tiếp hiệu suất cao và các kernel thiết bị đơn lẻ, mà chúng tôi nói về tiếp theo.
+
+### 5.3 Hệ thống con giao tiếp được tối ưu hóa: Nhóm và định tuyến Token hiệu quả hơn
+
+Song song chuyên gia yêu cầu giao tiếp all-to-all giữa tất cả các thiết bị song song chuyên gia. Theo mặc định, DS-MoE sử dụng NCCL cho giao tiếp này thông qua interface "torch.distributed", nhưng chúng tôi quan sát chi phí lớn khi nó được sử dụng ở quy mô (nhiều kết quả trong Phần 5.5). Để tối ưu hóa điều này, chúng tôi phát triển interface giao tiếp tùy chỉnh để sử dụng Microsoft SCCL [52] và đạt được hiệu suất tốt hơn NCCL. Mặc dù có các tối ưu hóa plug-in, rất khó để mở rộng song song chuyên gia đến nhiều thiết bị vì độ trễ tăng tuyến tính với việc tăng thiết bị. Để giải quyết thách thức mở rộng quan trọng này, chúng tôi thiết kế hai chiến lược tối ưu hóa giao tiếp mới khai thác các hoạt động NCCL point-to-point cơ bản và các kernel CUDA tùy chỉnh để thực hiện các biến đổi bố cục dữ liệu cần thiết.
+
+**All-to-all phân cấp**: Các thuật toán dựa trên cây phân cấp thường được sử dụng với các collective giao tiếp như allreduce, broadcast, v.v. để giảm số lượng hop giao tiếp. Chúng tôi triển khai all-to-all phân cấp như một quá trình hai bước với một biến đổi bố cục dữ liệu, tiếp theo là all-to-all nội node, tiếp theo là biến đổi bố cục dữ liệu thứ hai, và all-to-all liên node cuối cùng. Điều này giảm số hop giao tiếp từ O(p) đến O(G + p/G), trong đó G là số lượng GPU trong một node và p là tổng số thiết bị GPU. Hình 8 cho thấy tổng quan thiết kế của việc triển khai này. Mặc dù tăng 2x khối lượng giao tiếp, việc triển khai phân cấp này cho phép mở rộng tốt hơn cho kích thước batch nhỏ vì giao tiếp ở kích thước thông điệp này bị giới hạn bởi độ trễ hơn là băng thông.
+
+**Tối ưu hóa giao tiếp phối hợp song song**: Kết hợp song song chuyên gia và tensor-slicing với song song dữ liệu trong một mô hình duy nhất không tầm thường về mặt xử lý giao tiếp hiệu quả. Tensor-slicing chia các toán tử riêng lẻ trên các GPU và yêu cầu all-reduce giữa chúng, trong khi song song chuyên gia đặt các toán tử chuyên gia trên các GPU mà không chia chúng và yêu cầu all-to-all giữa chúng. Một cách tiếp cận ngây thơ để xử lý những giao tiếp này là coi mỗi song song như một hộp đen, thực hiện giao tiếp cần thiết một cách độc lập. Tuy nhiên, điều này sẽ dẫn đến hiệu suất dưới tối ưu.
+
+Hoạt động all-reduce trong tensor-slicing sao chép dữ liệu giữa các thiết bị có liên quan. Khi thực thi các toán tử tensor song song tiếp theo là các toán tử song song chuyên gia, việc sao chép này cho phép tạo ra lịch trình giao tiếp tối ưu hóa cho toán tử all-to-all không yêu cầu giao tiếp giữa tất cả các quá trình song song chuyên gia. Thay vào đó, all-to-all có thể xảy ra chỉ trong tập con các thiết bị chia sẻ cùng thứ hạng tensor-slicing, vì dữ liệu trên các thứ hạng song song tensor được sao chép (Hình 9). Kết quả là, độ trễ của all-to-all được giới hạn bởi O(p/L) thay vì O(p) trong đó L là mức độ song song tensor-slicing và p là tổng số thiết bị GPU.
+
+Tương tự, khi thực thi toán tử song song chuyên gia tiếp theo là các toán tử tensor-slicing, all-to-all cuối cùng có thể được thực hiện theo cùng một cách, nhưng lần này tiếp theo là toán tử allgather giữa các thứ hạng tensor song song để sao chép dữ liệu cần thiết bởi tensor-slicing (Hình 9). Điều này giảm chi phí độ trễ từ O(p) xuống O(p/L) + O(L).
+
+Chi phí độ trễ giảm này cho phép mở rộng tốt hơn đến số lượng lớn thiết bị. Ví dụ, khi mở rộng đến 128 GPU với tensor-slicing 8-way và song song chuyên gia 128-way, phương pháp này giảm chi phí độ trễ của all-to-all từ (128 × C1 + C2) xuống (16 × C1 + C2) do tensor-slicing 8-way, trong đó C1 và C2 là một số hằng số được xác định bởi độ trễ point-to-point, kích thước thông điệp, và băng thông.
+
+### 5.4 Các kernel liên quan đến Transformer và MoE được tối ưu hóa cao
+
+Hệ thống suy luận DS-MoE bao gồm các kernel transformer đa GPU được tối ưu hóa cao cũng như các kernel liên quan đến MoE được tối ưu hóa cao. Chúng tôi sử dụng các kernel suy luận DeepSpeed để tối đa hóa việc sử dụng băng thông cho các lớp transformer không chuyên gia. Vui lòng xem [53] để tìm hiểu thêm.
+
+Trong bài báo này, chúng tôi tập trung vào các toán tử liên quan đến MoE để thực hiện gating và các biến đổi bố cục dữ liệu khác nhau thường được triển khai bằng cách sử dụng einsum thưa-dày đặc trong tài liệu. Ở mức độ cao, chúng tôi tối ưu hóa những toán tử này bằng cách triển khai chúng như các biến đổi bố cục dữ liệu rõ ràng thay vì einsum thưa-dày đặc cao, để giảm độ phức tạp tính toán từ bậc ba xuống bậc hai. Chúng tôi cũng hợp nhất hầu hết những toán tử này thành một kernel duy nhất.
+
+Cụ thể hơn, tính toán liên quan đến MoE bao gồm ba thành phần chính:
+
+• Hàm gating xác định việc gán token cho các chuyên gia, nơi kết quả được biểu diễn như một tensor thưa (một vector one-hot biểu diễn chuyên gia được gán cho mỗi token trong chuỗi).
+
+• Một toán tử einsum thưa, giữa tensor one-hot và tất cả các token, sắp xếp thứ tự của các token dựa trên id chuyên gia được gán.
+
+• Một einsum cuối cùng ở cuối tính toán MoE mà thay đổi tỷ lệ và sắp xếp lại các token về thứ tự ban đầu của chúng.
+
+Biểu diễn tensor thưa trong hàm gating và các toán tử einsum thưa tạo ra chi phí độ trễ đáng kể. Đầu tiên, hàm gating bao gồm nhiều hoạt động để tạo token-mask, chọn top-k chuyên gia, và thực hiện cumulative-sum (cumsum) để tìm token-id đi đến mỗi chuyên gia và matrix-multiply thưa, tất cả đều không chỉ lãng phí do biểu diễn tensor thưa, mà còn cực kỳ chậm do nhiều lần gọi kernel. Hơn nữa, các einsum thưa có độ phức tạp S × E × M × ce, trong đó S biểu thị tổng số token, E biểu thị số lượng chuyên gia, M biểu thị chiều ẩn mô hình, và ce biểu thị khả năng chuyên gia (S, E, và M là các yếu tố phức tạp chính, trong khi ce thường rất nhỏ). Trong phương trình này, (E-1) trong số E toán tử cho mỗi token là phép nhân và cộng với số không, vì chỉ có một chuyên gia thường được chọn để xử lý ce token. Điều này đến từ thực tế rằng việc tổng quát hóa các hoạt động gating dẫn đến einsum trên một số ma trận masking hoặc vector one-hot tạo ra rất nhiều tính toán không cần thiết với số không để chọn token chính xác cho mỗi chuyên gia.
+
+Chúng tôi tối ưu hóa những toán tử này sử dụng biểu diễn dày đặc và kernel-fusion.
+
+Đầu tiên, chúng tôi hợp nhất hàm gating thành một kernel duy nhất, và sử dụng bảng ánh xạ token-to-expert dày đặc để biểu diễn việc gán từ token đến chuyên gia, giảm rất nhiều chi phí khởi chạy kernel, cũng như chi phí bộ nhớ và tính toán từ biểu diễn thưa. Cụ thể hơn, kernel gating bao gồm top-k, cumsum, và scatter để phân phối đúng token cho mỗi chuyên gia. Toán tử top-k chọn k chuyên gia với k-highest logit cho mỗi token đầu vào, và vì k thường nhỏ (ví dụ, 1 hoặc 2) cho các mô hình MoE, chúng tôi lưu trữ các chỉ số chuyên gia tốt nhất trong bảng ánh xạ thay vì tạo mask cho phần còn lại của các hoạt động hàm gating. Cumsum tính toán ID cho các token được xử lý bởi mỗi chuyên gia, được định nghĩa bởi yếu tố khả năng trong cấu hình MoE. Chúng tôi sử dụng thuật toán scan Blelloch được gọi là để song song hóa cumsum trên kiến trúc GPU. Cuối cùng, chúng tôi sử dụng bảng ánh xạ và ID token để định tuyến các token chính xác đến các chuyên gia MoE.
+
+Thứ hai, để tối ưu hóa hai einsum thưa còn lại, chúng tôi triển khai chúng như các biến đổi bố cục dữ liệu sử dụng bảng ánh xạ được đề cập ở trên, để đầu tiên sắp xếp chúng dựa trên id chuyên gia và sau đó trở về thứ tự ban đầu mà không yêu cầu bất kỳ einsum thưa nào, giảm độ phức tạp của những hoạt động này từ S × E × M × ce xuống S × M × ce. Cùng với biến đổi dữ liệu, chúng tôi sử dụng các logit gating tương ứng (trong miền xác suất) để cập nhật đầu ra chuyên gia.
+
+Kết hợp, những tối ưu hóa này dẫn đến sự giảm hơn 6x về độ trễ liên quan đến MoE Kernel.
+
+### 5.5 Đánh giá hiệu suất suy luận DS-MoE
+
+Trong các môi trường sản xuất hiện đại, các mô hình DL mạnh mẽ thường được phục vụ bằng cách sử dụng hàng trăm thiết bị GPU để đáp ứng nhu cầu lưu lượng và cung cấp độ trễ thấp. Trong phần này, chúng tôi khám phá cách hai mục tiêu rộng lớn này của thông lượng cao và độ trễ thấp có thể được thực hiện cho suy luận mô hình MoE ở quy mô. Chúng tôi cũng khám phá cách suy luận mô hình MoE khác biệt so với các đối tác dày đặc của chúng.
+
+Các câu hỏi chính chúng tôi cố gắng khám phá bao gồm:
+
+1) Các tính chất độc đáo của suy luận MoE là gì?
+2) Nó hoạt động và mở rộng như thế nào với kích thước mô hình và tài nguyên tăng?
+3) Các tối ưu hóa mô hình như PR-MoE và MoS mang lại những lợi ích gì cho suy luận mô hình MoE?
+4) Các mô hình MoE so sánh như thế nào với các mô hình dày đặc tương đương chất lượng về độ trễ và chi phí?
+
+Sử dụng các cấu hình mô hình khác nhau được hiển thị trong Bảng 6, chúng tôi cố gắng trả lời những câu hỏi này ở quy mô (lên đến 256 GPU A100 trên Azure).
+
+#### 5.5.1 Đạt được độ trễ thấp và tăng thông lượng siêu tuyến tính đồng thời
+
+Đối với các mô hình dày đặc, thông lượng có thể được tăng bằng cách sử dụng nhiều GPU và song song dữ liệu (các bản sao độc lập không có giao tiếp liên GPU), trong khi độ trễ thấp hơn có thể được đạt được bằng các kỹ thuật như tensor-slicing để phân chia mô hình trên nhiều GPU [53]. Việc mở rộng tốt nhất về tổng thông lượng là tuyến tính đối với số lượng GPU tăng, tức là thông lượng không đổi mỗi GPU. Điều này có thể đối với các kịch bản suy luận song song dữ liệu thuần túy vì không có giao tiếp giữa các GPU. Để giảm độ trễ, kiểu song song mô hình tensor-slicing đã được chứng minh là có lợi [53] nhưng nó đi kèm với chi phí - chi phí giao tiếp giữa các GPU - thường làm giảm thông lượng mỗi GPU và dẫn đến mở rộng dưới tuyến tính của tổng thông lượng. Nói cách khác, đối với các mô hình dày đặc, chúng ta không thể tận dụng song song để tối ưu hóa cả độ trễ và thông lượng cùng một lúc; có sự đánh đổi giữa chúng. Tuy nhiên, suy luận MoE cung cấp những cơ hội độc đáo để cung cấp độ trễ và thông lượng được tối ưu hóa đồng thời trong khi mở rộng đến số lượng lớn thiết bị.
+
+Để nghiên cứu những cơ hội này, chúng tôi mở rộng mô hình MoE 52B (mô hình cơ sở 1.3B và 128 chuyên gia) từ 8 GPU đến 64 GPU và quan sát các xu hướng độ trễ và thông lượng trên hệ thống suy luận DeepSpeed-MoE so với baseline mạnh: một triển khai PyTorch phân tán đầy đủ tính năng có khả năng cả tensor-slicing và song song chuyên gia [32]. Như được hiển thị trong Hình 10, chúng tôi quan sát thấy cả DeepSpeed và PyTorch đều giảm độ trễ suy luận khi chúng tôi tăng số lượng GPU, như mong đợi; mặc dù PyTorch chậm hơn nhiều so với DeepSpeed và chỉ mở rộng đến 32 GPU.
+
+Các xu hướng thông lượng, mặt khác, thú vị và đáng phân tích thêm. Như đã đề cập trước đó, việc mở rộng thông lượng tốt nhất cho mô hình dày đặc là tuyến tính đối với số lượng GPU. Tuy nhiên, kết quả của chúng tôi trong Hình 10 cho thấy DeepSpeed có được thông lượng tăng mỗi GPU khi chúng tôi tăng số lượng GPU từ 8 đến 64 và do đó tăng siêu tuyến tính trong tổng thông lượng. Điều này hoàn toàn trái ngược với các mô hình dày đặc và cho thấy lợi ích chính của việc mở rộng các mô hình MoE so với các mô hình dày đặc.
+
+Đi sâu hơn một chút, chúng ta thấy hai tính chất quan trọng của song song chuyên gia tại đây: 1) khi sử dụng song song chuyên gia, số lượng chuyên gia mỗi GPU giảm khi chúng ta tăng số lượng GPU. Ví dụ, mô hình MoE 52B này có 128 chuyên gia tổng cộng; nếu chúng ta phục vụ điều này bằng 8 GPU, chúng ta cần 16 chuyên gia mỗi GPU, trong khi trên 64 GPU, chúng ta chỉ cần 2 chuyên gia mỗi GPU. Việc giảm chuyên gia mỗi GPU là tốt cho địa phương dữ liệu vì mỗi GPU bây giờ đang đọc ít dữ liệu hơn (cần thiết cho các tham số chuyên gia) từ bộ nhớ, và 2) việc tăng GPU có thể gây ra suy giảm hiệu suất do tăng giao tiếp giữa các chuyên gia (all-to-all) nằm trên nhiều GPU. Những tính chất này của song song chuyên gia đúng cho cả PyTorch và DeepSpeed. Tuy nhiên, DeepSpeed-MoE có thể khai thác lợi ích của song song chuyên gia đến toàn bộ tiềm năng trong khi PyTorch không thể làm như vậy. Khi DeepSpeed khai thác các tối ưu hóa giao tiếp tiên tiến (Phần 5.3), nó vượt qua đáng kể nút thắt cổ chai giao tiếp trong song song chuyên gia. Đồng thời, nó có các kernel được tối ưu hóa cao (Phần 5.4) cho phép nó tận dụng tính địa phương dữ liệu tăng khi chuyên gia mỗi GPU được giảm. Cả hai chiến thắng lớn này so với PyTorch làm cho DeepSpeed-MoE trở thành framework lựa chọn để có được sự tăng siêu tuyến tính trong thông lượng với việc mở rộng lớn, đạt được độ trễ thấp và thông lượng cao đồng thời.
+
+#### 5.5.2 Độ trễ thấp và thông lượng cao ở quy mô chưa từng có
+
+Để nghiên cứu tác động của quy mô mô hình đến suy luận MoE, bây giờ chúng tôi khám phá các mô hình MoE từ 107 tỷ tham số đến 2 nghìn tỷ tham số sử dụng PyTorch và DeepSpeed trong Hình 11.
+
+• DeepSpeed-MoE đạt được sự giảm lên đến 7.3x về độ trễ trong khi đạt được thông lượng cao hơn 7.3x so với baseline.
+
+• Bằng cách khai thác hiệu quả hàng trăm GPU song song, DeepSpeed-MoE đạt được quy mô chưa từng có cho suy luận ở độ trễ thấp đáng kinh ngạc - một mô hình MoE nghìn tỷ tham số tuyệt vời có thể được suy luận dưới 25ms.
+
+#### 5.5.3 Lợi ích nâng cao của PR-MoE và MoS
+
+Bằng cách kết hợp các tối ưu hóa hệ thống được cung cấp bởi hệ thống suy luận DeepSpeed-MoE và các đổi mới mô hình của PR-MoE và MoS, DeepSpeed-MoE mang lại hai lợi ích nữa:
+
+(1) Giảm số lượng GPU tối thiểu cần thiết để thực hiện suy luận trên các mô hình này như được hiển thị trong Hình 12.
+
+(2) Cải thiện thêm cả độ trễ và thông lượng của các kích thước mô hình MoE khác nhau (như được hiển thị trong Hình 13).
+
+Đối với cả Hình 12 và 13, chúng tôi hiển thị so sánh của ba biến thể mô hình cùng với phiên bản baseline (MoE tiêu chuẩn trên PyTorch): (i) Mô hình MoE tiêu chuẩn được biểu thị bởi MoE (DeepSpeed), (ii) PR-MoE (DeepSpeed), và (iii) PR-MoE+MoS (DeepSpeed). Kết quả cho thấy mô hình PR-MoE+MoS cung cấp độ trễ thấp nhất và cho phép chúng tôi phục vụ mô hình chỉ bằng 16 GPU thay vì 32 GPU.
+
+#### 5.5.4 Độ trễ và thông lượng tốt hơn so với các mô hình dày đặc tương đương chất lượng
+
+Để hiểu rõ hơn hiệu suất suy luận của các mô hình MoE so với các mô hình dày đặc tương đương chất lượng, điều quan trọng cần lưu ý là mặc dù các mô hình MoE nhanh hơn và rẻ hơn 5x để huấn luyện, điều đó có thể không đúng cho suy luận. Hiệu suất suy luận có các nút thắt cổ chai khác nhau và yếu tố chính của nó là lượng dữ liệu được đọc từ bộ nhớ thay vì tính toán.
+
+Chúng tôi hiển thị độ trễ và thông lượng suy luận cho hai mô hình MoE tiêu chuẩn so với các mô hình dày đặc tương đương chất lượng của chúng: (1) mô hình MoE 52 tỷ tham số (1.3B-MoE-128) so với mô hình dày đặc 6.7 tỷ tham số và (2) mô hình MoE 1.5 nghìn tỷ tham số so với mô hình dày đặc 175 tỷ tham số trong Hình 14 và 15, tương ứng. Chúng tôi cũng thử nghiệm mô hình PR-MoE+MoS tương đương chất lượng.
+
+Khi sử dụng PyTorch, suy luận mô hình MoE đắt hơn và chậm hơn so với các mô hình dày đặc tương đương chất lượng. Điều này đúng cho cả hai kích thước mô hình. Tuy nhiên, các tối ưu hóa trong DeepSpeed đảo ngược xu hướng này và làm cho suy luận mô hình MoE cả nhanh hơn và rẻ hơn so với các mô hình dày đặc tương đương chất lượng. Đây là kết quả quan trọng: cho thấy lợi ích của các mô hình MoE so với các mô hình dày đặc không chỉ trong huấn luyện mà còn trong độ trễ và chi phí suy luận, nơi các triển khai thực tế quan tâm nhất.
+
+Khi so sánh kết quả của Hình 14 với Hình 15, chúng tôi quan sát thấy lợi ích của các mô hình MoE so với các mô hình dày đặc trở nên lớn hơn với việc tăng kích thước mô hình. Trong khi trong Hình 14 mô hình PR-MoE+MoS quy mô tỷ (được phục vụ trên DeepSpeed-MoE) nhanh hơn và rẻ hơn 2.4x so với mô hình dày đặc 6.7 tỷ tham số (được phục vụ trên PyTorch), trong Hình 15 mô hình PR-MoE+MoS quy mô nghìn tỷ nhanh hơn 4.5x và rẻ hơn 9x so với mô hình dày đặc 175 tỷ tham số. Lợi ích tăng cho các mô hình lớn hơn vì DeepSpeed tận dụng tối ưu hóa phối hợp song song để giảm chi phí giao tiếp khi sử dụng tensor-slicing trên phần không chuyên gia của mô hình. Hơn nữa, chúng tôi có thể tận dụng expert-slicing ở quy mô này, cho phép chúng tôi mở rộng đến số lượng GPU cao hơn so với PyTorch baseline. Ngoài ra, đối với mô hình MoE 1.5 nghìn tỷ tham số lớn hơn, chúng tôi quan sát được cải thiện 2x bổ sung về thông lượng so với độ trễ như được hiển thị trong Hình 15. Điều này là do các mô hình MoE có thể chạy với một nửa mức độ tensor-slicing của mô hình dày đặc (8-way so với 16-way) và do đó kích thước batch cao hơn hai lần.
+
+Nhìn chung, DeepSpeed-MoE cung cấp suy luận mô hình MoE nhanh hơn 4.5x và rẻ hơn 9x so với việc phục vụ các mô hình dày đặc tương đương chất lượng sử dụng PyTorch. Với những lợi ích mở rộng theo kích thước mô hình và tài nguyên phần cứng, như được hiển thị từ những kết quả này, nó làm cho chúng tôi tin rằng các mô hình MoE sẽ quan trọng để mang lại những tiến bộ thế hệ tiếp theo trong quy mô AI.
+
+## 6 Nhìn về tương lai quy mô AI thế hệ tiếp theo
+
+Với sự tăng trưởng theo cấp số nhân của kích thước mô hình gần đây, chúng ta đã đến giới hạn của những gì các cụm siêu máy tính hiện đại có thể làm để huấn luyện và phục vụ các mô hình lớn. Việc đạt được chất lượng mô hình tốt hơn bằng cách đơn giản tăng kích thước mô hình trở nên ngày càng khó khăn hơn do yêu cầu không thể vượt qua về tài nguyên phần cứng. Những lựa chọn chúng ta có là đợi thế hệ phần cứng tiếp theo hoặc đổi mới và cải thiện hiệu quả huấn luyện và suy luận sử dụng phần cứng hiện tại.
+
+Chúng tôi, cùng với tài liệu gần đây [30, 31], đã chứng minh cách các mô hình dựa trên MoE có thể giảm chi phí huấn luyện của các mô hình NLG lớn nhiều lần so với các đối tác dày đặc tương đương chất lượng, cung cấp khả năng huấn luyện quy mô AI tiếp theo trên thế hệ phần cứng hiện tại. Tuy nhiên, trước công trình này, theo hiểu biết của chúng tôi, không có công trình nào hiện có về cách phục vụ các mô hình MoE (với nhiều tham số hơn) với độ trễ và chi phí tương đương hoặc tốt hơn so với các mô hình dày đặc. Đây là một vấn đề thách thức chặn triển khai thực tế của các mô hình MoE quy mô lớn.
+
+Để cho phép suy luận thực tế và hiệu quả cho các mô hình MoE, chúng tôi cung cấp kiến trúc mô hình PR-MoE mới và kỹ thuật chưng cất MoS để giảm đáng kể yêu cầu bộ nhớ của những mô hình này. Chúng tôi cũng cung cấp một framework suy luận MoE để đạt được độ trễ và chi phí thấp đáng kinh ngạc ở quy mô mô hình chưa từng có. Kết hợp những đổi mới này, chúng tôi có thể làm cho những mô hình MoE này không chỉ khả thi để phục vụ mà còn có thể được sử dụng cho suy luận ở độ trễ thấp hơn và chi phí thấp hơn so với các đối tác dày đặc tương đương chất lượng của chúng.
+
+Như một tổng thể, những đổi mới và cơ sở hạ tầng mới cung cấp một con đường đầy hứa hẹn hướng tới huấn luyện và suy luận của quy mô AI thế hệ tiếp theo, mà không yêu cầu tăng tài nguyên tính toán. Một sự chuyển đổi từ các mô hình dày đặc sang các mô hình MoE thưa thớt có thể mở ra con đường cho những hướng mới trong bối cảnh mô hình lớn, nơi việc triển khai các mô hình chất lượng cao hơn với ít tài nguyên hơn trở nên khả thi rộng rãi hơn.
+
+## Đóng góp
+
+SR thiết kế các thí nghiệm huấn luyện NLG và kiến trúc hệ thống suy luận.
+CL dẫn đầu các thí nghiệm huấn luyện NLG (Phần 3) và đóng góp vào Phần 4.
+ZY dẫn đầu thiết kế và thí nghiệm của PR-MoE, và hỗ trợ hệ thống của nó (Phần 4.1).
+MZ dẫn đầu thiết kế và thí nghiệm của MoS (Phần 4.2) và checkpointing hiệu quả bộ nhớ.
+RYA và AAA dẫn đầu phát triển và thí nghiệm của hệ thống suy luận (Phần 5).
+JR phát triển, debug và tích hợp nhiều tính năng phần mềm vào DeepSpeed.
+YH thiết kế, quản lý và dẫn đầu dự án nghiên cứu tổng thể.
+
+## Lời cảm ơn
+
+Chúng tôi cảm ơn Olatunji Ruwase từ Đội DeepSpeed Microsoft về những đóng góp của anh ấy trong việc phát triển, debug, kiểm tra và phát hành phần mềm DeepSpeed-MoE. Công trình này được thực hiện với sự hợp tác của Brandon Norick, Zhun Liu, và Xia Song từ Đội Microsoft Turing, Young Jin Kim, Alex Muzio, và Hany Hassan Awadalla từ Đội Microsoft Z-Code, và cả Saeed Maleki và Madan Musuvathi từ đội Microsoft SCCL.
+
+## Tài liệu tham khảo
+
+[1] Samyam Rajbhandari, Conglong Li, Zhewei Yao, Minjia Zhang, Reza Yazdani Aminabadi, Ammar Ahmad Awan, Jeff Rasley, và Yuxiong He. DeepSpeed-MoE: Advancing mixture-of-experts inference and training to power next-generation AI scale. Trong Kamalika Chaudhuri, Stefanie Jegelka, Le Song, Csaba Szepesvari, Gang Niu, và Sivan Sabato, editors, Proceedings of the 39th International Conference on Machine Learning, tập 162 của Proceedings of Machine Learning Research, trang 18332–18346. PMLR, 17–23 Jul 2022.
+
+[2] Nvidia. Using DeepSpeed and Megatron to Train Megatron-Turing NLG 530B, the World's Largest and Most Powerful Generative Language Model. https://developer.nvidia.com/blog/using-deepspeed-and-megatron-to-train-megatron-turing-nlg-530b-the-worlds-largest-and-most-powerful-generative-language-model/, 2021.
+
+[3] Noam Shazeer, Azalia Mirhoseini, Krzysztof Maziarz, Andy Davis, Quoc Le, Geoffrey Hinton, và Jeff Dean. Outrageously large neural networks: The sparsely-gated mixture-of-experts layer. arXiv preprint arXiv:1701.06538, 2017.
+
+[4] Dmitry Lepikhin, HyoukJoong Lee, Yuanzhong Xu, Dehao Chen, Orhan Firat, Yanping Huang, Maxim Krikun, Noam Shazeer, và Zhifeng Chen. Gshard: Scaling giant models with conditional computation and automatic sharding. arXiv preprint arXiv:2006.16668, 2020.
+
+[5] William Fedus, Barret Zoph, và Noam Shazeer. Switch transformers: Scaling to trillion parameter models with simple and efficient sparsity. arXiv preprint arXiv:2101.03961, 2021.
+
+[6] Jared Kaplan, Sam McCandlish, Tom Henighan, Tom B Brown, Benjamin Chess, Rewon Child, Scott Gray, Alec Radford, Jeffrey Wu, và Dario Amodei. Scaling laws for neural language models. arXiv preprint arXiv:2001.08361, 2020.
+
+[7] Jacob Devlin, Ming-Wei Chang, Kenton Lee, và Kristina Toutanova. BERT: Pre-training of deep bidirectional transformers for language understanding. Trong NAACL-HLT (1), 2019.
+
+[8] Zhilin Yang, Zihang Dai, Yiming Yang, Jaime Carbonell, Russ R Salakhutdinov, và Quoc V Le. Xlnet: Generalized autoregressive pretraining for language understanding. Trong Advances in neural information processing systems, trang 5753–5763, 2019.
+
+[9] Yinhan Liu, Myle Ott, Naman Goyal, Jingfei Du, Mandar Joshi, Danqi Chen, Omer Levy, Mike Lewis, Luke Zettlemoyer, và Veselin Stoyanov. Roberta: A robustly optimized bert pretraining approach. arXiv preprint arXiv:1907.11692, 2019.
+
+[10] Zhenzhong Lan, Mingda Chen, Sebastian Goodman, Kevin Gimpel, Piyush Sharma, và Radu Soricut. ALBERT: A lite bert for self-supervised learning of language representations. Trong International Conference on Learning Representations, 2019.
+
+[11] Alec Radford, Karthik Narasimhan, Tim Salimans, và Ilya Sutskever. Improving language understanding by generative pre-training. OpenAI Blog, 2018.
+
+[12] Alec Radford, Jeffrey Wu, Rewon Child, David Luan, Dario Amodei, Ilya Sutskever, et al. Language models are unsupervised multitask learners. OpenAI blog, 1(8):9, 2019.
+
+[13] Corby Rosset. Turing-nlg: A 17-billion-parameter language model by microsoft. Microsoft Blog, 1:2, 2020.
+
+[14] Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper, và Bryan Catanzaro. Megatron-LM: Training multi-billion parameter language models using gpu model parallelism. arXiv preprint arXiv:1909.08053, 2019.
+
+[15] Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan Narang, Michael Matena, Yanqi Zhou, Wei Li, và Peter J Liu. Exploring the limits of transfer learning with a unified text-to-text transformer. arXiv preprint arXiv:1910.10683, 2019.
+
+[16] Denis Paperno, Germán Kruszewski, Angeliki Lazaridou, Quan Ngoc Pham, Raffaella Bernardi, Sandro Pezzelle, Marco Baroni, Gemma Boleda, và Raquel Fernández. The lambada dataset: Word prediction requiring a broad discourse context. arXiv preprint arXiv:1606.06031, 2016.
+
+[17] Alex Wang, Amanpreet Singh, Julian Michael, Felix Hill, Omer Levy, và Samuel R Bowman. Glue: A multi-task benchmark and analysis platform for natural language understanding. arXiv preprint arXiv:1804.07461, 2018.
+
+[18] Alex Wang, Yada Pruksachatkun, Nikita Nangia, Amanpreet Singh, Julian Michael, Felix Hill, Omer Levy, và Samuel R Bowman. Superglue: A stickier benchmark for general-purpose language understanding systems. arXiv preprint arXiv:1905.00537, 2019.
+
+[19] Nasrin Mostafazadeh, Nathanael Chambers, Xiaodong He, Devi Parikh, Dhruv Batra, Lucy Vanderwende, Pushmeet Kohli, và James Allen. A corpus and evaluation framework for deeper understanding of commonsense stories. arXiv preprint arXiv:1604.01696, 2016.
+
+[20] Jonathan Berant, Andrew Chou, Roy Frostig, và Percy Liang. Semantic parsing on freebase from question-answer pairs. Trong Proceedings of the 2013 conference on empirical methods in natural language processing, trang 1533–1544, 2013.
+
+[21] Mandar Joshi, Eunsol Choi, Daniel S Weld, và Luke Zettlemoyer. Triviaqa: A large scale distantly supervised challenge dataset for reading comprehension. arXiv preprint arXiv:1705.03551, 2017.
+
+[22] Tom B Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared Kaplan, Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, et al. Language models are few-shot learners. arXiv preprint arXiv:2005.14165, 2020.
+
+[23] Samyam Rajbhandari, Jeff Rasley, Olatunji Ruwase, và Yuxiong He. Zero: Memory optimizations toward training trillion parameter models. Trong SC20: International Conference for High Performance Computing, Networking, Storage and Analysis, trang 1–16. IEEE, 2020.
+
+[24] Saeed Masoudnia và Reza Ebrahimpour. Mixture of experts: a literature survey. Artificial Intelligence Review, 42(2):275–293, 2014.
+
+[25] Sepp Hochreiter và Jürgen Schmidhuber. Long short-term memory. Neural computation, 9(8):1735–1780, 1997.
+
+[26] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Łukasz Kaiser, và Illia Polosukhin. Attention is all you need. Trong Advances in neural information processing systems, trang 5998–6008, 2017.
+
+[27] Junyang Lin, An Yang, Jinze Bai, Chang Zhou, Le Jiang, Xianyan Jia, Ang Wang, Jie Zhang, Yong Li, Wei Lin, et al. M6-10t: A sharing-delinking paradigm for efficient multi-trillion parameter pretraining. arXiv preprint arXiv:2110.03888, 2021.
+
+[28] Young Jin Kim, Ammar Ahmad Awan, Alexandre Muzio, Andres Felipe Cruz Salinas, Liyang Lu, Amr Hendy, Samyam Rajbhandari, Yuxiong He, và Hany Hassan Awadalla. Scalable and efficient moe training for multitask multilingual models. arXiv preprint arXiv:2109.10465, 2021.
+
+[29] Simiao Zuo, Xiaodong Liu, Jian Jiao, Young Jin Kim, Hany Hassan, Ruofei Zhang, Tuo Zhao, và Jianfeng Gao. Taming sparsely activated transformer with stochastic experts. arXiv preprint arXiv:2110.04260, 2021.
+
+[30] Nan Du, Yanping Huang, Andrew M Dai, Simon Tong, Dmitry Lepikhin, Yuanzhong Xu, Maxim Krikun, Yanqi Zhou, Adams Wei Yu, Orhan Firat, et al. Glam: Efficient scaling of language models with mixture-of-experts. arXiv preprint arXiv:2112.06905, 2021.
+
+[31] Mikel Artetxe, Shruti Bhosale, Naman Goyal, Todor Mihaylov, Myle Ott, Sam Shleifer, Xi Victoria Lin, Jingfei Du, Srinivasan Iyer, Ramakanth Pasunuru, Giri Anantharaman, Xian Li, Shuohui Chen, Halil Akin, Mandeep Baines, Louis Martin, Xing Zhou, Punit Singh Koura, Brian O'Horo, Jeff Wang, Luke Zettlemoyer, Mona Diab, Zornitsa Kozareva, và Ves Stoyanov. Efficient large scale language modeling with mixtures of experts. arXiv preprint arXiv:2112.10684, 2021.
+
+[32] Young Jin Kim, Ammar Ahmad Awan, Alexandre Muzio, Andrés Felipe Cruz-Salinas, Liyang Lu, Amr Hendy, Samyam Rajbhandari, Yuxiong He, và Hany Hassan Awadalla. Scalable and efficient moe training for multitask multilingual models. CoRR, abs/2109.10465, 2021.
+
+[33] Jiaao He, Jiezhong Qiu, Aohan Zeng, Zhilin Yang, Jidong Zhai, và Jie Tang. Fastmoe: A fast mixture-of-expert training system. CoRR, abs/2103.13262, 2021.
+
+[34] Microsoft. Tutel: An efficient mixture-of-experts implementation for large dnn model training. https://www.microsoft.com/en-us/research/blog/tutel-an-efficient-mixture-of-experts-implementation-for-large-dnn-model-training/, 2021.
+
+[35] Yonatan Bisk, Rowan Zellers, Jianfeng Gao, Yejin Choi, et al. Piqa: Reasoning about physical commonsense in natural language. Trong Proceedings of the AAAI Conference on Artificial Intelligence, tập 34, trang 7432–7439, 2020.
+
+[36] Guokun Lai, Qizhe Xie, Hanxiao Liu, Yiming Yang, và Eduard Hovy. Race: Large-scale reading comprehension dataset from examinations. arXiv preprint arXiv:1704.04683, 2017.
+
+[37] Matthew D Zeiler và Rob Fergus. Visualizing and understanding convolutional networks. Trong European conference on computer vision, trang 818–833. Springer, 2014.
+
+[38] Jason Yosinski, Jeff Clune, Yoshua Bengio, và Hod Lipson. How transferable are features in deep neural networks? arXiv preprint arXiv:1411.1792, 2014.
+
+[39] Sheng Shen, Zhen Dong, Jiayu Ye, Linjian Ma, Zhewei Yao, Amir Gholami, Michael W. Mahoney, và Kurt Keutzer. Q-BERT: hessian based ultra low precision quantization of BERT. Trong The Thirty-Fourth AAAI Conference on Artificial Intelligence, AAAI 2020, The Thirty-Second Innovative Applications of Artificial Intelligence Conference, IAAI 2020, The Tenth AAAI Symposium on Educational Advances in Artificial Intelligence, EAAI 2020, New York, NY, USA, February 7-12, 2020, trang 8815–8821. AAAI Press, 2020.
+
+[40] Zhen Dong, Zhewei Yao, Amir Gholami, Michael W. Mahoney, và Kurt Keutzer. HAWQ: hessian aware quantization of neural networks with mixed-precision. Trong 2019 IEEE/CVF International Conference on Computer Vision, ICCV 2019, Seoul, Korea (South), October 27 - November 2, 2019, trang 293–302. IEEE, 2019.
+
+[41] Zhen Dong, Zhewei Yao, Daiyaan Arfeen, Amir Gholami, Michael W. Mahoney, và Kurt Keutzer. HAWQ-V2: hessian aware trace-weighted quantization of neural networks. Trong Hugo Larochelle, Marc'Aurelio Ranzato, Raia Hadsell, Maria-Florina Balcan, và Hsuan-Tien Lin, editors, Advances in Neural Information Processing Systems 33: Annual Conference on Neural Information Processing Systems 2020, NeurIPS 2020, December 6-12, 2020, virtual, 2020.
+
+[42] Rewon Child, Scott Gray, Alec Radford, và Ilya Sutskever. Generating long sequences with sparse transformers. CoRR, abs/1904.10509, 2019.
+
+[43] François Lagunas, Ella Charlaix, Victor Sanh, và Alexander M. Rush. Block pruning for faster transformers. Trong Marie-Francine Moens, Xuanjing Huang, Lucia Specia, và Scott Wen-tau Yih, editors, Proceedings of the 2021 Conference on Empirical Methods in Natural Language Processing, EMNLP 2021, Virtual Event / Punta Cana, Dominican Republic, 7-11 November, 2021, trang 10619–10629. Association for Computational Linguistics, 2021.
+
+[44] Geoffrey E. Hinton, Oriol Vinyals, và Jeffrey Dean. Distilling the knowledge in a neural network. CoRR, abs/1503.02531, 2015.
+
+[45] Victor Sanh, Lysandre Debut, Julien Chaumond, và Thomas Wolf. Distilbert, a distilled version of BERT: smaller, faster, cheaper and lighter. CoRR, abs/1910.01108, 2019.
+
+[46] Siqi Sun, Yu Cheng, Zhe Gan, và Jingjing Liu. Patient knowledge distillation for BERT model compression. Trong Kentaro Inui, Jing Jiang, Vincent Ng, và Xiaojun Wan, editors, Proceedings of the 2019 Conference on Empirical Methods in Natural Language Processing and the 9th International Joint Conference on Natural Language Processing, EMNLP-IJCNLP 2019, Hong Kong, China, November 3-7, 2019, trang 4322–4331. Association for Computational Linguistics, 2019.
+
+[47] Wenhui Wang, Furu Wei, Li Dong, Hangbo Bao, Nan Yang, và Ming Zhou. Minilm: Deep self-attention distillation for task-agnostic compression of pre-trained transformers. Trong Hugo Larochelle, Marc'Aurelio Ranzato, Raia Hadsell, Maria-Florina Balcan, và Hsuan-Tien Lin, editors, Advances in Neural Information Processing Systems 33: Annual Conference on Neural Information Processing Systems 2020, NeurIPS 2020, December 6-12, 2020, virtual, 2020.
+
+[48] Zhiqing Sun, Hongkun Yu, Xiaodan Song, Renjie Liu, Yiming Yang, và Denny Zhou. Mobilebert: a compact task-agnostic BERT for resource-limited devices. Trong Dan Jurafsky, Joyce Chai, Natalie Schluter, và Joel R. Tetreault, editors, Proceedings of the 58th Annual Meeting of the Association for Computational Linguistics, ACL 2020, Online, July 5-10, 2020, trang 2158–2170. Association for Computational Linguistics, 2020.
+
+[49] William Fedus, Barret Zoph, và Noam Shazeer. Switch transformers: Scaling to trillion parameter models with simple and efficient sparsity. CoRR, abs/2101.03961, 2021.
+
+[50] Dong Yu, Kaisheng Yao, Hang Su, Gang Li, và Frank Seide. Kl-divergence regularized deep neural network adaptation for improved large vocabulary speech recognition. Trong IEEE International Conference on Acoustics, Speech and Signal Processing, ICASSP 2013, Vancouver, BC, Canada, May 26-31, 2013, trang 7893–7897. IEEE, 2013.
+
+[51] Reza Yazdani Aminabadi, Samyam Rajbhandari, Minjia Zhang, Ammar Ahmad Awan, Cheng Li, Du Li, Elton Zheng, Jeff Rasley, Shaden Smith, Olatunji Ruwase, và Yuxiong He. Deepspeed inference: Enabling efficient inference of transformer models at unprecedented scale. https://arxiv.org/abs/2207.00032, 2022.
+
+[52] Zixian Cai, Zhengyang Liu, Saeed Maleki, Madan Musuvathi, Todd Mytkowicz, Jacob Nelson, và Olli Saarikivi. SCCL: Synthesizing Optimal Collective Algorithms. CoRR, abs/2008.08708, 2020.
+
+[53] DeepSpeed Team, Rangan Majumder, và Andrey Proskurin. DeepSpeed: Accelerating large-scale model inference and training via system optimizations and compression. https://www.microsoft.com/en-us/research/blog/deepspeed-accelerating-large-scale-model-inference-and-training-via-system-optimizations-and-compression/, 2021. [Online].
