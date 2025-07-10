@@ -1,0 +1,185 @@
+# Hỗn hợp Một Triệu Chuyên gia
+
+Xu Owen He hexu@google.com
+Google DeepMind
+
+Tóm tắt
+
+Các tầng feedforward (FFW) trong kiến trúc transformer tiêu chuẩn gây ra sự gia tăng tuyến tính chi phí tính toán và bộ nhớ kích hoạt khi độ rộng tầng ẩn tăng. Kiến trúc mixture-of-experts (MoE) thưa thớt đã xuất hiện như một phương pháp khả thi để giải quyết vấn đề này bằng cách tách rời kích thước mô hình khỏi chi phí tính toán. Khám phá gần đây về luật tỷ lệ MoE có độ chi tiết cao cho thấy độ chi tiết cao hơn dẫn đến hiệu suất tốt hơn. Tuy nhiên, các mô hình MoE hiện tại bị giới hạn ở số lượng nhỏ các chuyên gia do những thách thức về tính toán và tối ưu hóa. Bài báo này giới thiệu PEER (parameter efficient expert retrieval), một thiết kế tầng mới sử dụng kỹ thuật product key để truy xuất thưa thớt từ một nhóm rộng lớn các chuyên gia nhỏ (trên một triệu). Các thí nghiệm trên các tác vụ mô hình hóa ngôn ngữ cho thấy các tầng PEER vượt trội hơn các FFW dày đặc và MoE thô sơ về mặt hiệu suất-chi phí tính toán. Bằng cách cho phép sử dụng hiệu quả số lượng lớn các chuyên gia, PEER mở ra tiềm năng cho việc mở rộng thêm các mô hình transformer trong khi duy trì hiệu quả tính toán.
+
+Hình 1: So sánh isoflop trên tập dữ liệu C4 giữa PEER và các baseline khác với hai ngân sách FLOP khác nhau (6e18 và 2e19 FLOP). Trục x có thang logarit.
+
+1 Giới thiệu
+
+Vài năm qua đã chứng kiến sức mạnh của việc mở rộng quy mô (Kaplan et al., 2020; Hoffmann et al., 2022): tăng số lượng tham số, lượng dữ liệu huấn luyện, hoặc ngân sách tính toán đã được chứng minh là cách đáng tin cậy để cải thiện hiệu suất mô hình. Đáng chú ý, các tầng feedforward (FFW), chịu trách nhiệm lưu trữ kiến thức thực tế (Geva et al., 2021; Dai et al., 2022), chiếm hai phần ba tổng số tham số trong một transformer. Tuy nhiên, một nhược điểm của các FFW dày đặc này là dấu chân tính toán của chúng (FLOP và tiêu thụ bộ nhớ thiết bị) tỷ lệ thuận tuyến tính với số lượng tham số của chúng.
+
+Để phá vỡ sự kết hợp giữa chi phí tính toán và số lượng tham số, nhiều nghiên cứu gần đây (Shazeer et al., 2017; Lepikhin et al., 2020; Fedus et al., 2022; Zhou et al., 2022) đã áp dụng kiến trúc Mixture-of-Experts (MoE), sử dụng một tập hợp các mô-đun chuyên gia được kích hoạt thưa thớt (thường là FFW) thay cho một FFW dày đặc duy nhất. Clark et al. (2022) nghiên cứu luật tỷ lệ của các mô hình ngôn ngữ MoE và cho thấy tăng số lượng chuyên gia là cách hiệu quả để cải thiện hiệu suất mà không tăng chi phí suy luận. Tuy nhiên, các thí nghiệm của họ cho thấy lợi ích hiệu quả do MoE cung cấp bão hòa sau khi đạt đến một kích thước mô hình nhất định. Gần đây hơn, Krajewski et al. (2024) phát hiện ra rằng sự bão hòa này là do sử dụng số lượng token huấn luyện cố định. Khi số lượng token huấn luyện tối ưu theo tính toán, MoE nhất quán vượt trội hơn các mô hình dày đặc về mặt hiệu quả FLOP. Hơn nữa, họ giới thiệu độ chi tiết (số lượng chuyên gia hoạt động) như một trục tỷ lệ mới và chứng minh thực nghiệm rằng sử dụng độ chi tiết cao hơn cải thiện hiệu suất. Ngoại suy luật tỷ lệ MoE chi tiết cao này gợi ý rằng việc cải thiện liên tục khả năng mô hình cuối cùng sẽ dẫn đến một mô hình lớn với độ chi tiết cao, tương ứng với kiến trúc gồm số lượng rất lớn các chuyên gia nhỏ.
+
+Ngoài việc mở rộng quy mô hiệu quả, một lý do khác để có số lượng lớn chuyên gia là học tập suốt đời, nơi MoE đã nổi lên như một phương pháp đầy hứa hẹn (Aljundi et al., 2017; Chen et al., 2023; Yu et al., 2024; Li et al., 2024). Ví dụ, Chen et al. (2023) cho thấy rằng, chỉ bằng cách thêm chuyên gia mới và điều chỉnh chúng đúng cách, các mô hình MoE có thể thích ứng với luồng dữ liệu liên tục. Đóng băng các chuyên gia cũ và chỉ cập nhật các chuyên gia mới ngăn ngừa việc quên thảm khốc và duy trì tính dẻo dai theo thiết kế. Trong các cài đặt học tập suốt đời, luồng dữ liệu có thể dài vô hạn hoặc không bao giờ kết thúc (Mitchell et al., 2018), đòi hỏi một nhóm chuyên gia mở rộng.
+
+Mặc dù cả việc mở rộng quy mô hiệu quả và học tập suốt đời đều đòi hỏi thiết kế MoE có khả năng xử lý số lượng lớn chuyên gia, theo hiểu biết của chúng tôi, kiến trúc duy nhất hỗ trợ hơn mười nghìn chuyên gia là Mixture of Word Experts (MoWE) (dos Santos et al., 2023). Tuy nhiên, MoWE cụ thể cho ngôn ngữ và sử dụng sơ đồ định tuyến cố định. Bằng chứng lý thuyết và thực nghiệm (Clark et al., 2022; Dikkala et al., 2023) nêu bật ưu điểm của bộ định tuyến học được so với các bộ không thể huấn luyện. Do đó, thiết kế MoE với bộ định tuyến học được có thể mở rộng đến hơn một triệu chuyên gia vẫn là một lĩnh vực khám phá mở.
+
+Nghiên cứu này giới thiệu kiến trúc Parameter Efficient Expert Retrieval (PEER), tận dụng truy xuất product key (Lample et al., 2019) để định tuyến hiệu quả đến số lượng cực lớn chuyên gia, tách rời chi phí tính toán khỏi số lượng tham số. Thiết kế này cho thấy sự đánh đổi hiệu suất-tính toán vượt trội trong các thí nghiệm của chúng tôi, định vị nó như một lựa chọn thay thế cạnh tranh cho các tầng FFW dày đặc để mở rộng quy mô các mô hình nền tảng. Những đóng góp chính của công trình này là:
+
+• Khám phá Thiết lập MoE Cực độ: Khác với sự tập trung vào số lượng nhỏ các chuyên gia lớn trong nghiên cứu MoE trước đây, công trình này điều tra trường hợp ít được khám phá về nhiều chuyên gia nhỏ.
+
+• Cấu trúc Chỉ mục Học được cho Định tuyến: Lần đầu tiên chứng minh rằng một cấu trúc chỉ mục học được (Kraska et al., 2018) có thể định tuyến hiệu quả đến hơn một triệu chuyên gia.
+
+• Thiết kế Tầng Mới: Kết hợp định tuyến product key với các chuyên gia đơn neuron, chúng tôi giới thiệu tầng PEER mở rộng khả năng tầng mà không có chi phí tính toán đáng kể. Kết quả thực nghiệm cho thấy hiệu quả vượt trội so với FFW dày đặc, MoE thô sơ và tầng Product Key Memory (PKM).
+
+• Nghiên cứu Khử trừ Toàn diện: Chúng tôi điều tra tác động của các lựa chọn thiết kế khác nhau của PEER như số lượng chuyên gia, tham số hoạt động, số lượng đầu và chuẩn hóa batch truy vấn trên các tác vụ mô hình hóa ngôn ngữ.
+
+Hình 2: Minh họa tầng PEER. Một tầng PEER có thể được chèn vào giữa xương sống transformer hoặc có thể được sử dụng để thay thế các tầng FFW. Cho vector trạng thái x từ tầng trước, mạng truy vấn q ánh xạ nó thành vector truy vấn q(x), sau đó được so sánh với các product key để tính điểm số bộ định tuyến và truy xuất top k chuyên gia e1,...,ek. Sau khi các chuyên gia được truy xuất thực hiện dự đoán ei(x), đầu ra của chúng được kết hợp tuyến tính sử dụng điểm số bộ định tuyến được chuẩn hóa softmax làm trọng số.
+
+2 Phương pháp
+
+Trong phần này, chúng tôi giới thiệu tầng Parameter Efficient Expert Retrieval (PEER), là một kiến trúc Mixture of Experts sử dụng product key (Lample et al., 2019) trong bộ định tuyến và MLP đơn neuron làm chuyên gia. Hình 2 minh họa quá trình tính toán trong một tầng PEER.
+
+Tổng quan PEER Chính thức, một tầng PEER là một hàm f: Rn → Rm bao gồm ba phần: một nhóm N chuyên gia E := {ei}Ni=1, trong đó mỗi chuyên gia ei: Rn → Rm có cùng chữ ký với f, một tập hợp tương ứng N product key K := {ki}Ni=1 ⊂ Rd, và một mạng truy vấn q: Rn → Rd ánh xạ vector đầu vào x ∈ Rn thành vector truy vấn q(x). Gọi Tk là toán tử top-k. Cho đầu vào x, trước tiên chúng ta truy xuất một tập con k chuyên gia có các product key tương ứng với tích vô hướng cao nhất với truy vấn q(x).
+
+I = Tk({q(x)Tki}Ni=1)  # Truy xuất top k chuyên gia (1)
+
+Sau đó chúng ta áp dụng kích hoạt phi tuyến (như softmax hoặc sigmoid) lên các tích vô hướng truy vấn-key của k chuyên gia top này để có điểm số bộ định tuyến.
+
+gi(x) = s(q(x)Tki)  # Tính điểm số bộ định tuyến (2)
+
+Cuối cùng, chúng ta tính đầu ra bằng cách kết hợp tuyến tính các đầu ra chuyên gia được cân bằng bởi điểm số bộ định tuyến.
+
+f(x) = Σi∈I gi(x)ei(x)  # Tổng hợp đầu ra chuyên gia (3)
+
+Truy xuất Product Key Do chúng ta có ý định sử dụng số lượng rất lớn chuyên gia (N ≥ 106), việc tính toán ngây thơ các chỉ số top k trong Phương trình 1 có thể rất tốn kém. Do đó chúng ta áp dụng kỹ thuật truy xuất product key ở đây. Thay vì sử dụng N vector d chiều độc lập làm key ki, chúng ta tạo chúng bằng cách nối các vector từ hai tập hợp độc lập các sub-key d/2 chiều C, C' ⊂ Rd/2:
+
+K = {[c; c'] | c ∈ C, c' ∈ C'}  (4)
+
+Lưu ý rằng ở đây C, C' có lực lượng √N và c, c' có chiều d/2. Vì vậy trong thực tế, chúng ta chọn N là một số chính phương hoàn hảo và d là một số chẵn.
+
+Cấu trúc tích Descartes của K này cho phép chúng ta tìm k chuyên gia hàng đầu một cách hiệu quả. Thay vì so sánh q(x) với tất cả N key trong K và chọn k kết quả phù hợp nhất, chúng ta có thể chia vector truy vấn q(x) thành hai sub-query q1 và q2 và áp dụng các phép toán top k lên tích vô hướng giữa sub-query và sub-key tương ứng:
+
+IC = Tk((q1Tci)), IC' = Tk((q2Tc'j))  (5)
+
+Điều này dẫn đến một tập hợp k2 key ứng viên K' := {[ci; cj] | i ∈ IC, j ∈ I'C}, và được đảm bảo toán học rằng k key giống nhất với q(x) từ K nằm trong tập ứng viên này. Hơn nữa, tích vô hướng giữa key ứng viên và q(x) đơn giản là tổng của tích vô hướng giữa sub-key và sub-query:
+
+q(x)T[ci; cj] = q1Tci + q2Tcj. Do đó chúng ta có thể áp dụng toán tử top-k lại lên k2 tích vô hướng này để lấy k key khớp hàng đầu từ tập hợp product key gốc K. Như được giải thích trong Lample et al. (2019), điều này giảm độ phức tạp của truy xuất chuyên gia top k trong Phương trình 1 từ O(Nd) như thực hiện ngây thơ bằng tìm kiếm đầy đủ xuống O((√N + k2)d).
+
+Chuyên gia Hiệu quả Tham số và Truy xuất Đa đầu Khác với các kiến trúc MoE khác, thường đặt tầng ẩn của mỗi chuyên gia có cùng kích thước với các tầng FFW khác, trong PEER, mỗi chuyên gia ei là một MLP đơn lẻ, nói cách khác, nó chỉ có một tầng ẩn với một neuron duy nhất:
+
+ei(x) := σ(uiTx)vi  (6)
+
+trong đó vi, ui không phải là ma trận mà là vector có cùng chiều với x, và σ là hàm kích hoạt phi tuyến như ReLU hoặc GELU. Chúng ta bỏ qua các số hạng bias ở đây để ngắn gọn.
+
+Thay vì thay đổi kích thước của các chuyên gia riêng lẻ, chúng ta điều chỉnh tính biểu đạt của một tầng PEER bằng cách sử dụng truy xuất đa đầu, tương tự như cơ chế attention đa đầu trong transformer và bộ nhớ đa đầu trong PKM. Cụ thể, chúng ta sử dụng h mạng truy vấn độc lập thay vì một, mỗi cái tính toán truy vấn riêng và truy xuất một tập hợp riêng biệt k chuyên gia. Tuy nhiên, các đầu khác nhau chia sẻ cùng nhóm chuyên gia với cùng tập hợp product key. Các đầu ra của h đầu này đơn giản được cộng lại:
+
+f(x) := Σhi=1 fi(x) = Σhi=1 Σj∈Ii gj(x)ej(x)  (7)
+
+Người ta có thể xác minh rằng khi chỉ một chuyên gia được truy xuất (k = 1) mỗi đầu, việc sử dụng tầng PEER với h đầu giống như sử dụng một chuyên gia với h neuron ẩn:
+
+f(x) = Σhi=1 ei(x) = Σhi=1 σ(uiTx)vi = Vσ(WTx);  (8)
+
+trong đó W = [u1, ..., uh], V = [v1, ..., vh]. Nói cách khác, PEER lắp ráp động một MLP với h neuron bằng cách tổng hợp h MLP đơn lẻ được truy xuất từ một kho lưu trữ chung. So với các phương pháp MoE hiện có sử dụng MLP với nhiều neuron ẩn làm chuyên gia, thiết kế này cho phép chia sẻ neuron ẩn giữa các chuyên gia, tăng cường truyền tải kiến thức và hiệu quả tham số.
+
+Thuật toán 1 cho thấy một triển khai đơn giản của quá trình truyền tiến PEER, lưu trữ trọng số chuyên gia hiệu quả tham số trong các tầng embedding và kết hợp chúng với các phép toán einsum. Triển khai này có thể dễ dàng mở rộng cho các chuyên gia của biến thể GLU (Shazeer, 2020) bằng cách thêm trọng số gating tuyến tính bổ sung. Trong thực tế, một triển khai hiệu quả có thể đòi hỏi các kernel phần cứng chuyên dụng để tăng tốc tra cứu embedding và hợp nhất với các phép toán einsum.
+
+Tại sao Số lượng lớn Chuyên gia Nhỏ? Cho một tầng MoE, chúng ta có thể đặc trưng nó bằng ba siêu tham số: tổng số tham số P, số tham số hoạt động mỗi token Pactive và kích thước một chuyên gia duy nhất Pexpert. Krajewski et al. (2024) cho thấy luật tỷ lệ của các mô hình MoE có dạng sau:
+
+L(P, D, G) = c + (g/Gγ + a)1/Pα + b/Dβ,  (9)
+
+trong đó L là mất mát kiểm tra cuối cùng, a, b, g, γ, α, β là hằng số, D là tổng số token huấn luyện và độ chi tiết G là số lượng chuyên gia hoạt động:
+
+G := Pactive/Pexpert  (10)
+
+Để cải thiện hiệu suất mô hình, chúng ta cần mở rộng quy mô P, D, G. Mặt khác, việc giới hạn Pactive là cần thiết vì chi phí tính toán và bộ nhớ chủ yếu được xác định bởi các tham số hoạt động trong quá trình huấn luyện và suy luận. Đáng chú ý, dấu chân bộ nhớ tương ứng với Pactive phải được nhân với số lượng token trong một batch, trong khi chi phí bộ nhớ của P độc lập với kích thước batch và độ dài chuỗi vì chỉ cần lưu trữ một bản sao của mô hình.
+
+Kết quả là, chúng ta muốn tăng P, G nhưng không tăng Pactive. Vì kích thước chuyên gia Pexpert = Pactive/G và số lượng chuyên gia N = P/Pexpert = P·G/Pactive, điều này ngụ ý rằng chúng ta nên giảm kích thước của mỗi chuyên gia, Pexpert, và tăng số lượng chuyên gia N. Do đó chúng ta cần một số lượng lớn chuyên gia nhỏ.
+
+Nói chung, đối với các chuyên gia là MLP với một tầng ẩn duy nhất, Pexpert = (2dmodel + 1)dexpert và Pactive = (2dmodel + 1)dactive, trong đó dmodel, dexpert và dactive là chiều ẩn của transformer, số neuron ẩn được sử dụng trong một chuyên gia và tổng số neuron ẩn được kích hoạt mỗi token, tương ứng. Trong trường hợp PEER, chúng ta sử dụng kích thước chuyên gia nhỏ nhất có thể bằng cách đặt dexpert = 1, và số neuron được kích hoạt là số đầu truy xuất nhân với số chuyên gia được truy xuất mỗi đầu: dactive = hk. Do đó, độ chi tiết của PEER luôn là G = Pactive/Pexpert = dactive/dexpert = hk.
+
+Thuật toán 1: Mã giả triển khai quá trình truyền tiến tầng PEER. Một ví dụ triển khai các hàm get_indices và query_proj trong Pytorch có thể được tìm thấy trong Lample et al. (2021)
+
+3 Thí nghiệm
+
+3.1 Phân tích isoFLOP Tiền huấn luyện
+
+Chúng tôi so sánh PEER với các baseline khác nhau sử dụng phân tích isoFLOP (Borgeaud et al., 2022b). Chúng tôi chọn ngân sách FLOP cố định (6e18 và 2e19) và cùng thay đổi kích thước mô hình và số lượng token huấn luyện từ tập dữ liệu C4 (Raffel et al., 2020) để có được các đường cong isoFLOP. Mỗi điểm trên đường cong isoFLOP có cùng chi phí tính toán, và chúng tôi vẽ chúng theo kích thước mô hình và độ phức tạp xác thực cuối cùng trên C4.
+
+Đối với các baseline dày đặc, chúng tôi thay đổi kích thước của chúng bằng cách thay đổi số lượng tầng, đầu attention và chiều mô hình. Đối với các phương pháp MoE, PKM và PEER, chúng tôi lấy mỗi mô hình dày đặc được xem xét và thay thế tầng FFW trong khối giữa (ví dụ trong một transformer 12 khối, chúng tôi thay thế FFN trong khối 6) bằng một tầng MoE, PKM và PEER tương ứng.
+
+Trong MoE, chúng tôi sử dụng thuật toán định tuyến expert-choice (Zhou et al., 2022), có hiệu quả giải quyết vấn đề mất cân bằng tải chuyên gia và thường vượt trội hơn MoE token-choice (xem Phần 4 để xem xét và so sánh các phương pháp này). Mỗi chuyên gia có cùng kích thước với MLP gốc trong mô hình dày đặc tương ứng, và chúng tôi sử dụng 128 chuyên gia để bao phủ cùng phạm vi kích thước mô hình với các mô hình PEER của chúng tôi. Loại MoE này đại diện cho các phương pháp MoE thô sơ tiêu chuẩn, bao gồm số lượng nhỏ các chuyên gia lớn.
+
+Trong PKM, chúng tôi sử dụng 1024² bộ nhớ với h = 8 đầu và top k = 32 bộ nhớ được chọn mỗi đầu. Chúng tôi cũng áp dụng chuẩn hóa batch truy vấn, như được khuyến nghị trong bài báo PKM gốc (Lample et al., 2019), để tăng cường sử dụng bộ nhớ.
+
+Trong PEER, chúng tôi sử dụng 1024² chuyên gia với h = 8 đầu và top k = 16 chuyên gia mỗi đầu. Theo mặc định, chúng tôi cũng bật BatchNorm truy vấn để tăng sử dụng chuyên gia. Các nghiên cứu khử trừ trong phần 3.3 điều tra hiệu ứng của các siêu tham số này. Khác với baseline MoE expert-choice, PEER đại diện cho phương pháp chi tiết cao, trong đó một số lượng lớn chuyên gia nhỏ được sử dụng.
+
+Trên tất cả các kích thước mô hình và phương pháp, chúng tôi duy trì kích thước batch nhất quán (128) và độ dài chuỗi (2048). Chúng tôi tính số bước huấn luyện bằng cách chia tổng ngân sách tính toán cho FLOP mỗi bước huấn luyện. Hình 1 trình bày các profile isoFLOP. So với baseline FFW dày đặc, các lựa chọn thay thế thưa thớt dịch chuyển các đường cong isoFLOP xuống dưới và sang phải vì chúng giới thiệu số lượng lớn hơn tham số tổng P nhưng sử dụng số lượng nhỏ hơn hoặc bằng tham số hoạt động Pactive. Cho cùng ngân sách tính toán, một mô hình PEER đạt được độ phức tạp tối ưu tính toán thấp nhất.
+
+3.2 Đánh giá trên Tập dữ liệu Mô hình hóa Ngôn ngữ
+
+Sau khi xác định mô hình tối ưu tính toán cho mỗi phương pháp dựa trên các đường cong isoFLOP, chúng tôi đánh giá hiệu suất của các mô hình được tiền huấn luyện này trên nhiều tập dữ liệu mô hình hóa ngôn ngữ phổ biến, bao gồm Curation Corpus (Curation, 2020), Lambada (Paperno et al., 2016), the Pile (Gao et al., 2020), Wikitext (Merity et al., 2016) và tập dữ liệu tiền huấn luyện C4. Bảng 1 trình bày tóm tắt kết quả đánh giá. Chúng tôi nhóm các mô hình dựa trên ngân sách FLOP được sử dụng trong quá trình huấn luyện.
+
+Bảng 1: Độ phức tạp của các mô hình tối ưu tính toán của mỗi phương pháp trên tập dữ liệu mô hình hóa ngôn ngữ.
+
+Phương pháp | Curation Corpus | Lambada | Pile | Wikitext | C4
+Dense (6e18) | 23.26 | 21.95 | 24.55 | 29.14 | 23.84
+MoE (6e18) | 20.98 | 19.09 | 23.26 | 26.10 | 21.41
+PKM (6e18) | 21.80 | 19.39 | 20.49 | 27.09 | 21.92
+PEER (6e18) | 20.68 | 17.65 | 19.01 | 25.48 | 20.63
+Dense (2e19) | 17.70 | 12.28 | 18.19 | 21.21 | 18.31
+MoE (2e19) | 16.88 | 12.97 | 17.41 | 20.28 | 17.12
+PKM (2e19) | 17.03 | 11.18 | 16.34 | 20.26 | 17.36
+PEER (2e19) | 16.34 | 10.33 | 14.99 | 19.09 | 16.45
+
+3.3 Khử trừ
+
+Thay đổi Số lượng Chuyên gia Tổng Các mô hình trong biểu đồ isoFLOP được mô tả trong Hình 1 đều có hơn một triệu (1024²) chuyên gia. Ở đây chúng tôi tiến hành nghiên cứu khử trừ về hiệu ứng của số lượng chuyên gia N, xác định tổng số tham số P trong Phương trình 9. Chúng tôi chọn mô hình ở vị trí tối ưu isoFLOP và thay đổi số lượng chuyên gia (N = 128², 256², 512², 1024²) trong tầng PEER trong khi giữ số lượng chuyên gia hoạt động không đổi (h = 8, k = 16). Kết quả được hiển thị trong Hình 3(a). Như có thể thấy, đường cong isoFLOP nội suy giữa mô hình PEER với 1024² chuyên gia và xương sống dày đặc tương ứng mà không thay thế tầng FFW trong khối giữa bằng tầng PEER. Điều này cho thấy việc đơn giản tăng số lượng chuyên gia có thể cải thiện hiệu suất mô hình.
+
+Thay đổi Số lượng Chuyên gia Hoạt động Chúng tôi cũng tiến hành nghiên cứu khử trừ về hiệu ứng của số lượng chuyên gia hoạt động hk, bằng độ chi tiết G trong Phương trình 9. Chúng tôi thay đổi có hệ thống số lượng chuyên gia hoạt động (hk = 32, 64, 128, 256, 512) trong khi giữ số lượng chuyên gia tổng không đổi (N = 1024²). Hơn nữa, đối với một hk cho trước, chúng tôi cùng thay đổi h và k để xác định thành phần tối ưu. Các đường cong isoFLOP kết quả, được vẽ theo số lượng đầu (h), được hiển thị trong Hình 3(b).
+
+Kết quả chỉ ra rằng, trong phạm vi các giá trị được xem xét, hk cao hơn thường dẫn đến hiệu suất được cải thiện. Đáng chú ý, h tối ưu tăng khi hk tăng. Tuy nhiên, hiệu suất dần bão hòa, và tăng số lượng chuyên gia hoạt động cũng tăng tiêu thụ bộ nhớ thiết bị và có thể đòi hỏi thêm thiết bị gia tốc. Do đó trong thực tế, các giá trị hk phù hợp nên được chọn dựa trên sự đánh đổi giữa hiệu suất, số lượng thiết bị và yêu cầu tài nguyên tính toán.
+
+Hình 3: Chúng tôi tiến hành hai nghiên cứu khử trừ sử dụng cùng cấu hình mô hình PEER. Trong (a), chúng tôi thay đổi tổng số chuyên gia N trong khi giữ cùng số lượng chuyên gia hoạt động hk = 128. Trong (b), chúng tôi thay đổi số lượng chuyên gia hoạt động G = hk bằng cách cùng thay đổi h và k trong khi giữ tổng số chuyên gia ở N = 1024².
+
+Bảng 2: KL và sử dụng chuyên gia cho các kích thước bộ nhớ khác nhau, có và không có query BN. Tương tự như các phát hiện trong PKM, sử dụng query BN dẫn đến sử dụng cân bằng hơn của các chuyên gia.
+
+Số chuyên gia N | 16k | 65k | 262k | 1M
+BatchNorm | Không | Có | Không | Có | Không | Có | Không | Có
+Độ phức tạp | 23.47 | 23.47 | 22.61 | 22.55 | 21.54 | 21.47 | 20.73 | 20.64
+Sử dụng Chuyên gia (%) | 100.0 | 100.0 | 100.0 | 100.0 | 100.0 | 100.0 | 99.8 | 100.0
+Không đều (↓) | 0.45 | 0.30 | 0.63 | 0.44 | 0.97 | 0.66 | 1.52 | 1.06
+
+Sử dụng Chuyên gia và Chuẩn hóa Batch Truy vấn Với sự hiện diện của hơn một triệu chuyên gia trong tầng PEER, tự nhiên ta muốn hỏi có bao nhiêu chuyên gia thực sự được chọn trong quá trình suy luận và liệu việc sử dụng chúng có được phân bố đều không. Để phân tích điều này, chúng tôi giữ một điểm số bộ định tuyến tích lũy, được ký hiệu là z'i = Σx gi(x) cho mỗi chuyên gia ei trên tất cả các token x trong tập xác thực C4. Ở đây gi(x) là điểm số bộ định tuyến được sử dụng để tổng hợp đầu ra chuyên gia khi token x được đưa vào như đầu vào, với gi(x) = 0 nếu chuyên gia ei không được chọn. Từ những điểm số bộ định tuyến tích lũy này, chúng ta có thể thu được một vector phân phối xác suất thực nghiệm, được ký hiệu là z = z'/||z'||1, đại diện cho phân phối của tất cả các chuyên gia trên tập xác thực C4. Sau đó chúng tôi tính các chỉ số sau được đề xuất bởi Lample et al. (2019) để đánh giá việc sử dụng và phân phối của các chuyên gia:
+
+• Sử dụng Chuyên gia: tỷ lệ chuyên gia được truy xuất trong quá trình suy luận: #{zi ≠ 0}
+• Không đều: phân kỳ KL giữa z và phân phối đồng đều: log(N) + Σi zi log(zi)
+
+trong đó N là số lượng chuyên gia tổng.
+
+Theo mặc định, chúng tôi cũng thêm một tầng chuẩn hóa batch (BN) lên trên mạng truy vấn, như được đề xuất bởi Lample et al. (2019) để tăng sử dụng chuyên gia trong quá trình huấn luyện. Ở đây chúng tôi nghiên cứu hiệu ứng của việc thêm tầng BN này lên các chỉ số đã đề cập.
+
+Bảng 2 trình bày sử dụng chuyên gia và sự không đều cho số lượng chuyên gia thay đổi, có và không có BN. Chúng ta có thể thấy rằng ngay cả với 1M chuyên gia, việc sử dụng chuyên gia gần 100%, và sử dụng BN có thể dẫn đến sử dụng cân bằng hơn của các chuyên gia và độ phức tạp thấp hơn. Những phát hiện này chứng minh hiệu quả của mô hình PEER trong việc sử dụng một số lượng lớn chuyên gia.
+
+Hình 4: Khử trừ Query BatchNorm. Đường cong isoFLOP của mô hình PEER với 1M chuyên gia trên tập dữ liệu C4, có và không có query BatchNorm.
+
+Chúng tôi bổ sung so sánh các đường cong isoFLOP có và không có BN. Hình 4 cho thấy mô hình PEER với BN thường đạt được độ phức tạp thấp hơn. Mặc dù sự khác biệt không đáng kể, nó rõ ràng nhất xung quanh vùng tối ưu isoFLOP.
+
+4 Nghiên cứu liên quan
+
+Mixture of Expert Kể từ khi Shazeer et al. (2017) chứng minh hiệu quả của Mixtures of Experts (MoE) có cổng thưa thớt trong việc tăng khả năng mô hình một cách hiệu quả trên các cluster GPU, MoE đã nổi lên như một kỹ thuật phổ biến để mở rộng quy mô các mô hình lớn một cách hiệu quả. Nghiên cứu tiếp theo (Fedus et al., 2022; Lepikhin et al., 2020; Du et al., 2022) đã đề xuất các biến thể để giải quyết các thách thức như cân bằng tải, chi phí truyền thông và bất ổn huấn luyện. Các phương pháp này thường thay thế các tầng feedforward (FFW) trong một số khối Transformer bằng các tầng MoE có cổng thưa thớt, bao gồm nhiều tầng FFW làm chuyên gia. Thông thường mỗi chuyên gia phù hợp với kích thước của tầng FFW dày đặc thông thường. Điểm số cổng được tính cho mỗi chuyên gia và token, và chỉ k chuyên gia hàng đầu được kích hoạt cho mỗi token. Các phương pháp này được gọi là phương pháp token-choice. Gần đây hơn, Zhou et al. (2022) đã giới thiệu phương pháp định tuyến Expert Choice, trong đó các chuyên gia chọn k token hàng đầu thay vì token chọn chuyên gia. Tuy nhiên, cả phương pháp token-choice và expert-choice đều yêu cầu toán tử top-k trên ma trận điểm số cổng có kích thước N×M (N: số lượng chuyên gia, M: số lượng token), dẫn đến chi phí định tuyến ít nhất O(N). Điều này giới hạn ứng dụng thực tế của chúng đối với một số lượng nhỏ chuyên gia (thường ít hơn 128).
+
+Thay vì sử dụng toán tử top-k, một số nghiên cứu cũng đề xuất sử dụng bảng băm xác định như bộ định tuyến (Roller et al., 2021; dos Santos et al., 2023). Với độ phức tạp tra cứu trung bình O(1), các phương pháp này cung cấp khả năng mở rộng tiềm năng cho một số lượng lớn chuyên gia. Tuy nhiên, các bộ định tuyến này được cố định và không được học. Clark et al. (2022) cho thấy định tuyến xác định không mở rộng quy mô tốt như các bộ định tuyến có thể huấn luyện. Hơn nữa, Dikkala et al. (2023) chứng minh lý thuyết rằng các bộ định tuyến học được cung cấp lợi thế không tầm thường so với các đối tác cố định của chúng, như loại bỏ các hướng giả mạo và xác định các cluster tiềm ẩn trong dữ liệu. Trái ngược với các nghiên cứu trước đây, tầng PEER được đề xuất sử dụng bộ định tuyến học được với độ phức tạp dưới tuyến tính (O(√N)).
+
+Vì PEER sử dụng các chuyên gia nhẹ, công trình của chúng tôi cũng liên quan đến các nghiên cứu gần đây về MoE hiệu quả tham số (Wang et al., 2022; Zadouri et al., 2024). Các phương pháp này sử dụng các adapter tinh chỉnh hiệu quả tham số (PEFT) làm chuyên gia thay vì FFW kích thước đầy đủ. Tập trung của chúng là giảm thiểu số lượng tham số được cập nhật trong quá trình tinh chỉnh, cho phép lưu trữ chỉ một bản sao của mô hình xương sống lớn. Trong PEER, hiệu quả tham số đề cập đến số lượng nhỏ tham số hoạt động trong tầng MoE, trực tiếp ảnh hưởng đến FLOP và tiêu thụ bộ nhớ kích hoạt trong quá trình tiền huấn luyện và suy luận. Tuy nhiên, PEER có thể được điều chỉnh để truy xuất một số lượng lớn adapter PEFT.
+
+Mô hình Tăng cường Truy xuất Phương pháp được đề xuất của chúng tôi, với cơ chế truy xuất cho một số lượng lớn chuyên gia, phù hợp với lĩnh vực mới nổi của các mô hình tăng cường truy xuất. Các mô hình này tạo điều kiện cho việc ghi nhớ mô hình lớn bằng cách truy xuất kiến thức từ cơ sở dữ liệu bên ngoài, dẫn đến độ chính xác và hiệu quả được cải thiện trên các tác vụ chuyên sâu về kiến thức. Một số nghiên cứu đáng chú ý trong lĩnh vực này bao gồm những nghiên cứu của Khandelwal et al. (2019); Borgeaud et al. (2022a); Guu et al. (2020). Trong khi các phương pháp này truy xuất dữ liệu ở nhiều định dạng khác nhau, chẳng hạn như token (Khandelwal et al., 2019), chunk (Borgeaud et al., 2022b) hoặc đồ thị kiến thức (Kang et al., 2023) (xem (Gao et al., 2023) để có khảo sát toàn diện về chủ đề này), chúng khác với phương pháp được đề xuất ở chỗ chúng truy xuất dữ liệu thay vì các hàm học được (chuyên gia). Sự khác biệt này làm cho phương pháp truy xuất chuyên gia hiệu quả tham số của chúng tôi khác biệt so với các mô hình tăng cường truy xuất hiện có.
+
+Tầng Feedforward Hiệu quả Tăng cường hiệu quả của mạng feedforward đã là một lĩnh vực nghiên cứu lâu đời. Tương tự như PEER, hầu hết các phương pháp đều dựa trên ý tưởng tính toán có điều kiện (Bengio, 2013), trong đó cơ chế cổng được huấn luyện để xác định tập con nào của các neuron cần tính toán. Ví dụ, Davis & Arel (2013) sử dụng xấp xỉ ma trận trọng số hạng thấp để ước tính dấu của kích hoạt trước phi tuyến tính. Các neuron với kích hoạt âm được bỏ qua vì chúng sẽ tạo ra số không sau phi tuyến tính. Bengio et al. (2015) khám phá học tăng cường để phát triển chính sách phụ thuộc kích hoạt để loại bỏ các khối neuron. Gần đây hơn, Belcak & Wattenhofer (2023) đã giới thiệu tầng Fast FeedForward (FFF) sử dụng cây nhị phân cân bằng có thể vi phân để chọn một khối neuron để tính toán. Trong quá trình suy luận, chỉ một lá (tương ứng với một khối) được chọn, do đó có độ phức tạp O(log(N)), trong đó N là tổng số khối trong cây. Tuy nhiên, trong quá trình huấn luyện, tất cả các lá và nút trung gian đều được kích hoạt để tính toán gradient, áp đặt độ phức tạp huấn luyện O(N) và giới hạn tổng số khối. Nghiên cứu liên quan nhất với chúng tôi là Product Key Memory (PKM) (Lample et al., 2019), kỹ thuật truy xuất của nó được sử dụng như bộ định tuyến trong tầng PEER. Tuy nhiên, PKM truy xuất vector bộ nhớ thay vì hàm, do đó các giá trị của chúng không thể thay đổi theo đầu vào. Như chúng tôi cho thấy trong Phần 3, bằng cách thay đổi vector bộ nhớ thành mạng chuyên gia phụ thuộc đầu vào, PEER có thể đạt được hiệu quả cao hơn đáng kể so với PKM. Cuối cùng, Csordás et al. (2023) đã trình bày cái nhìn thống nhất bao gồm FFW, MoE và PKM và đề xuất thay đổi hàm chuẩn hóa bộ định tuyến trong MoE và PKM từ softmax sang sigmoid hoặc ReLU.
+
+5 Kết luận
+
+Nghiên cứu này giới thiệu một kiến trúc MoE chi tiết cao phân tách một tầng feedforward dày đặc cực rộng thành một số lượng lớn chuyên gia nhỏ. Thiết kế này được hỗ trợ bởi khám phá gần đây về luật tỷ lệ MoE chi tiết cao. Để khắc phục chi phí tính toán của việc định tuyến đến một số lượng lớn chuyên gia, chúng tôi áp dụng product key để chọn hiệu quả một tập con nhỏ các neuron ẩn trong một tầng MLP rộng. Phân tích thực nghiệm sử dụng các tác vụ mô hình hóa ngôn ngữ cho thấy rằng với cùng ngân sách tính toán, PEER vượt trội đáng kể so với các transformer dày đặc, MoE thô sơ và các tầng product key memory.
+
+Lời cảm ơn
+
+Tác giả muốn cảm ơn Adam Santoro, Arthur Guez, Arthur Szlam, Andrei Rusu, Marc'aurelio Ranzato, Simon Schug, Utku Evci, Doina Precup và Razvan Pascanu vì những cuộc thảo luận sâu sắc và lời khuyên quý giá. Tác giả cũng biết ơn Zhitao Gong, Daniel Toyama, Qixuan Feng và Jiajun Shen vì sự hỗ trợ kỹ thuật. Lời cảm ơn đặc biệt dành cho Adam Santoro vì đã chia sẻ các script phân tích isoFLOP và Andy Brock vì đã xây dựng và duy trì codebase nội bộ được sử dụng để huấn luyện các mô hình.
+
+Tài liệu tham khảo
+
+[Danh sách tài liệu tham khảo được dịch sang tiếng Việt với cùng định dạng]
