@@ -1,0 +1,162 @@
+# Tăng tốc Mô hình Ngôn ngữ Đa ngôn ngữ cho
+Các Ngôn ngữ Được Phân đoạn Quá mức
+Jimin Hong Gibbeum Lee Jaewoong Cho
+KRAFTON
+{jimmy.h, pirensisco, jwcho}@krafton.com
+Tóm tắt
+Những tiến bộ gần đây trong các mô hình ngôn ngữ lớn (LLM) đã cải thiện đáng kể hiệu suất trên nhiều tác vụ khác nhau bằng nhiều ngôn ngữ. Tuy nhiên, các bộ phân đoạn từ trong LLM được đào tạo chủ yếu trên các kho ngữ liệu lấy tiếng Anh làm trung tâm thường phân mảnh quá mức văn bản thành các token cấp ký tự hoặc Unicode trong các ngôn ngữ bảng chữ cái không phải La Mã, dẫn đến việc tạo văn bản không hiệu quả. Chúng tôi giới thiệu một framework đơn giản nhưng hiệu quả để tăng tốc tạo văn bản trong các ngôn ngữ như vậy. Phương pháp của chúng tôi bao gồm việc sử dụng một đầu mô hình ngôn ngữ mới với bộ từ vựng được thiết kế riêng cho một ngôn ngữ đích cụ thể cho một LLM đã được tiền đào tạo. Tiếp theo là tinh chỉnh đầu mới trong khi kết hợp bước xác minh để đảm bảo hiệu suất của mô hình được bảo tồn. Chúng tôi cho thấy rằng việc tinh chỉnh có mục tiêu này, trong khi đóng băng các tham số mô hình khác, làm giảm hiệu quả việc phân mảnh token cho ngôn ngữ đích. Các thí nghiệm mở rộng của chúng tôi cho thấy framework được đề xuất tăng tốc độ tạo lên 1,7 lần trong khi duy trì hiệu suất của các mô hình đa ngôn ngữ đã được tiền đào tạo trên các tác vụ đơn ngôn ngữ đích.
+
+1 Giới thiệu
+Các mô hình ngôn ngữ lớn (LLM) hiện đại (OpenAI, 2023; Touvron et al., 2023a; Antropic, 2023) đã thể hiện khả năng đáng chú ý cho nhiều tác vụ khác nhau bằng nhiều ngôn ngữ (Eloundou et al., 2023; Solaiman et al., 2023). Mặc dù các mô hình này chủ yếu được đào tạo trên dữ liệu lấy tiếng Anh làm trung tâm, chúng đã cho thấy mức độ thành thạo đa ngôn ngữ đáng kể (Bandarkar et al., 2023).
+
+Tuy nhiên, khi được áp dụng cho các ngôn ngữ không phải bảng chữ cái, các mô hình này thường gặp phải tình trạng tạo văn bản chậm hơn do việc phân đoạn từ lấy tiếng Anh làm trung tâm (Rust et al., 2021; Ahia et al., 2023; Petrov et al., 2023). Các kỹ thuật phân đoạn từ hiện tại được sử dụng trong Mô hình Ngôn ngữ Lớn (LLM) dựa trên dữ liệu và tối ưu hóa việc phân đoạn dựa trên tần suất của các ký tự hoặc byte trong một kho ngữ liệu cụ thể (Sennrich et al., 2016; Kudo, 2018). Kết quả là, các bộ phân đoạn của các mô hình đa ngôn ngữ, bị ảnh hưởng mạnh bởi dữ liệu đào tạo có tiếng Anh chiếm ưu thế, chủ yếu bao gồm các từ phụ tiếng Anh. Điều này dẫn đến phân mảnh quá mức, trong đó các từ không phải tiếng Anh bị phân đoạn quá mức thành một số lượng lớn các đơn vị từ phụ (Rust et al., 2021; Ahia et al., 2023; Petrov et al., 2023). Bản chất tự hồi quy của LLM càng làm tăng thêm sự không hiệu quả này, vì nó đòi hỏi việc tạo văn bản tuần tự.
+
+Để giải quyết những thách thức này, các nghiên cứu trước đây (Wang et al., 2019; Rust et al., 2021; Cui et al., 2023) đã đề xuất thay thế hoặc bổ sung từ vựng hiện có của các mô hình đa ngôn ngữ đã được tiền đào tạo bằng các từ vựng đặc thù ngôn ngữ để mã hóa hiệu quả hơn các kho ngữ liệu văn bản đơn ngôn ngữ. Cụ thể, Rust et al. (2021) đã cải thiện mBERT (Devlin et al., 2019) bằng cách thay thế bộ phân đoạn từ của nó bằng một bộ đơn ngôn ngữ và kết hợp thêm 100.000 bước tiền đào tạo. Mặt khác, Cui et al. (2023) đã nâng cao Llama (Touvron et al., 2023a) bằng cách mở rộng từ vựng tiếng Trung và tiền đào tạo thêm trên kho ngữ liệu văn bản 120GB bao gồm các văn bản tiếng Trung. Tuy nhiên, phương pháp này đòi hỏi một giai đoạn tiền đào tạo rộng rãi với một lượng dữ liệu đáng kể.
+
+Một phương pháp khác để giải quyết các thách thức là sử dụng các mô hình draft nhỏ (Leviathan et al., 2023; Chen et al., 2023a). Các mô hình này tạo ra các token đầu ra dự thảo, sau đó được xác minh bởi mô hình ngôn ngữ gốc. Tuy nhiên, một thách thức đáng kể nảy sinh khi cố gắng xác định hoặc huấn luyện một mô hình nhỏ phù hợp có thể xử lý nhiều ngôn ngữ với hiệu suất đáng tin cậy (Conneau et al., 2020; Bandarkar et al., 2023).
+
+Để đáp ứng những thách thức này, nghiên cứu của chúng tôi giới thiệu MuMo, tăng tốc các mô hình ngôn ngữ Đa ngôn ngữ cho việc tạo văn bản Đơn ngôn ngữ có mục tiêu, đặc biệt là trong các ngôn ngữ không phải bảng chữ cái. MuMo kết hợp một từ vựng mới của một ngôn ngữ đích vào lớp đầu ra, còn được gọi là đầu Mô hình Ngôn ngữ (LM), và dự đoán token tiếp theo từ từ vựng mở rộng này. Phương pháp này chỉ đòi hỏi việc đào tạo phần mở rộng của lớp đầu ra và các lớp cụ thể của mạng feed-forward. Quan trọng là, MuMo loại bỏ nhu cầu về các kho ngữ liệu văn bản rộng lớn hoặc một mô hình draft, chỉ cần một kho ngữ liệu khiêm tốn của ngôn ngữ đích, khoảng 44M token kích thước.
+
+Kết quả thực nghiệm trên các tác vụ tóm tắt và dịch thuật bằng tiếng Hàn và tiếng Nhật cho thấy MuMo tăng tốc đáng kể việc tạo văn bản, đạt được sự gia tăng tốc độ hơn 1,7 lần mà không làm giảm đáng kể chất lượng đầu ra.
+
+2 Công trình Liên quan
+Sự Khác biệt Phân đoạn từ Việc phân đoạn từ con, một phương pháp phổ biến trong LM, thường dựa trên dữ liệu. Hầu hết các bộ phân đoạn đã được tiền đào tạo, thường được đào tạo trên các kho ngữ liệu chủ yếu là tiếng Anh, thường dẫn đến việc phân mảnh quá mức các chữ viết không phải tiếng Anh (Rust et al., 2021; Zhang et al., 2022). Ahia et al. (2023); Petrov et al. (2023) đã tìm thấy sự khác biệt phân đoạn từ đáng kể giữa các ngôn ngữ trong các LLM phổ biến (Xue et al., 2021, 2022; Scao et al., 2022; OpenAI, 2023). Công trình của chúng tôi nỗ lực giải quyết sự chậm lại trong suy luận phát sinh do sự khác biệt phân đoạn từ trong các ngôn ngữ không phải bảng chữ cái.
+
+Sửa đổi Từ vựng Đã được Tiền đào tạo Các công trình trước đây đã khám phá việc thích ứng các từ vựng đã được tiền đào tạo hoặc việc thêm các token mới (Artetxe et al., 2020; Rust et al., 2021; Hong et al., 2021; Liu et al., 2023), các phương pháp này thường đòi hỏi việc tiền đào tạo rộng rãi để tích hợp hiệu quả các token mới (Wang et al., 2019; Chau et al., 2020; Cui et al., 2023; Liu et al., 2023). Ngược lại, framework MuMo của chúng tôi tránh được nhu cầu tinh chỉnh các tham số của các mô hình đã được tiền đào tạo để bảo tồn các khả năng ban đầu của mô hình ngôn ngữ đã được tiền đào tạo. Các nỗ lực để lựa chọn các mục của ma trận embedding đã được tiền đào tạo đã được thực hiện (Abdaoui et al., 2020; Domhan et al., 2022; Ushio et al., 2023), nhưng những nỗ lực này không mang lại sự tăng tốc đáng kể khi kích thước của lớp embedding tương đối nhỏ (Bogoychev et al., 2023).
+
+Tăng tốc Suy luận LLM Việc tìm cách tăng tốc suy luận trong các mô hình ngôn ngữ lớn tự hồi quy (LLM) đã dẫn đến nhiều phương pháp khác nhau. Đã có sự phát triển mạnh mẽ của các hệ thống được thiết kế đặc biệt cho suy luận LLM (Yu et al., 2022; Sheng et al., 2023; Xiao et al., 2023). Phương pháp được đề xuất của chúng tôi có thể được tích hợp hài hòa với các kỹ thuật đã nêu trên. Giải mã suy đoán (Leviathan et al., 2023; Chen et al., 2023a) cũng đã được khám phá để tăng tốc độ suy luận. Tuy nhiên, phương pháp này thường dựa trên giả định rằng một mô hình nhỏ có thể duy trì độ trung thực cao khi tạo ra một chuỗi nhiều token. Hơn nữa, việc có được một mô hình nhỏ nhưng cạnh tranh có thể khó khăn, đặc biệt là trong thiết lập đa ngôn ngữ (Conneau et al., 2020; Bandarkar et al., 2023). Công trình của chúng tôi khác biệt bằng cách giải quyết cụ thể sự không hiệu quả suy luận phát sinh từ việc phân mảnh quá mức trong bối cảnh không phải bảng chữ cái.
+
+Học Chuyển giao Đa ngôn ngữ Hiệu quả Tham số Lời nguyền của tính đa ngôn ngữ, đề cập đến sự đánh đổi giữa độ bao phủ ngôn ngữ và khả năng mô hình (Conneau et al., 2020), là một vấn đề đáng kể ngay cả trong các mô hình đa ngôn ngữ quy mô lớn, như mBERT, XLM-R, và mT5 (Devlin et al., 2019; Conneau et al., 2020; Xue et al., 2021; Ansell et al., 2021). Vấn đề này đã được giảm thiểu thông qua các thích ứng hiệu quả tham số theo mô-đun của các mô hình đa ngôn ngữ thông qua các adapter nhẹ (Houlsby et al., 2019): các tham số có thể đào tạo bổ sung được chèn vào các lớp transformer của mô hình (Pfeiffer et al., 2020; Üstün et al., 2020; Vidoni et al., 2020; Parović et al., 2022) cho một ngôn ngữ đích. Các kỹ thuật này có sự tương đồng với của chúng tôi, ở chỗ chúng bao gồm việc đào tạo các tham số một phần của mô hình ngôn ngữ với một lượng nhỏ kho ngữ liệu ngôn ngữ đích. Tuy nhiên, mục tiêu của chúng tôi về cơ bản khác biệt: chúng tôi nhắm đến tăng tốc suy luận, trong khi các nghiên cứu trước đây tập trung vào cải thiện khả năng đại diện trong các ngôn ngữ đích cho các mô hình đa ngôn ngữ.
+
+3 Framework Được Đề xuất
+Chúng tôi đề xuất một framework có tên MuMo để tăng tốc độ suy luận của một LM đa ngôn ngữ đã được tiền đào tạo cho một ngôn ngữ đơn ngôn ngữ không phải bảng chữ cái thông qua một bộ dữ liệu đơn ngôn ngữ nhỏ được cho. Trong phần này, chúng tôi giới thiệu 1) kiến trúc mô hình, 2) quá trình tinh chỉnh trên một bộ dữ liệu ngôn ngữ đích nhỏ, và 3) quá trình suy luận của framework được đề xuất.
+
+3.1 Kiến trúc Mô hình
+Chúng tôi minh họa kiến trúc mô hình của MuMo trong Hình 3.
+
+Mô hình Đa ngôn ngữ Đã được Tiền đào tạo Chúng tôi xem xét một thiết lập trong đó một mô hình đa ngôn ngữ đã được tiền đào tạo fmulti được cho. Mô hình bao gồm 1) các lớp Transformer bao gồm attention và mạng feed-forward, và 2) một lớp embedding đầu ra được gọi là đầu mô hình ngôn ngữ (LM). Chúng tôi ký hiệu Vmulti là tập từ vựng đa ngôn ngữ của mô hình với mục tiêu là LMLE(pmulti,x) = ∑|x|t=1 log pmulti(xt|x<t).
+
+Đầu LM Đơn ngôn ngữ Đích Khái niệm chính bao gồm việc sửa đổi các biểu diễn đã được tiền đào tạo để dự đoán một đơn vị token duy nhất trong một từ vựng đơn ngôn ngữ đích Vmono. Đầu LM Đơn ngôn ngữ Đích fmono chiếu biểu diễn ẩn h, bao gồm hai thành phần chính: một mạng feed-forward (FFN) và một lớp tuyến tính đầu ra, được biểu diễn như gmono: Rdmono → R|Vmono|:
+
+FFN(h) = q(W⊤1h)W2 ∈ Rdmono, (1)
+
+trong đó W1 ∈ Rdmulti×dffn và W2 ∈ Rdffn×dmono là các ma trận trọng số, q là hàm phi tuyến, và dmono biểu diễn kích thước của biểu diễn ngôn ngữ đích. Chúng tôi đặt dffn là dmulti/4, và hàm phi tuyến q là SwiGLU (Shazeer, 2020). Lớp tuyến tính đầu ra gmono sau đó tạo ra một token từ phụ:
+
+fmono(h) = gmono(FFN(h)) ∈ R|Vmono|. (2)
+
+Đầu LM MuMo Lưu ý rằng không gian đầu ra của fmono bị hạn chế với các token trong Vmono. Lấy cảm hứng từ Lan et al. (2023), chúng tôi đơn giản mở rộng fmono bằng cách nối lớp tuyến tính đầu ra của mô hình đa ngôn ngữ đã được tiền đào tạo. Điều này đặc biệt hữu ích khi không có token phù hợp trong Vmono để dự đoán, như các ký hiệu đặc biệt hoặc các token dựa trên bảng chữ cái cho các ngôn ngữ không phải bảng chữ cái.
+
+Chính thức, cho biểu diễn ngữ cảnh ht−1, đầu ra của đầu LM MuMo được tính như:
+
+fmumo(ht−1) = [fmulti(ht−1); fmono(ht−1)] ∈ R|Vmulti|+|Vmono| (3)
+
+trong đó ký hiệu ; chỉ ra việc nối hai vector, và fmumo chỉ ra đầu ra của đầu LM MuMo. Do đó, đầu LM MuMo được tạo thành từ sự kết hợp của đầu mô hình ngôn ngữ đã được tiền đào tạo và đầu LM Đơn ngôn ngữ Đích.
+
+3.2 Tinh chỉnh
+Trong framework được đề xuất, chúng tôi chỉ tinh chỉnh đầu LM đơn ngôn ngữ đích fmono bằng cách tận dụng một bộ dữ liệu đơn ngôn ngữ đích nhỏ được cho. Lưu ý rằng các tham số của mô hình đa ngôn ngữ đã được tiền đào tạo vẫn bị đóng băng trong quá trình này. Mô hình được tinh chỉnh bằng cách tối đa hóa log-likelihood của một chuỗi:
+
+max fmono LMLE(pmumo,x) = ∑T t=1 log pmumo(xt|x<t), (4)
+
+trong đó pmumo(xt|x<t) = Softmax(fmumo(ht−1)).
+
+3.3 Suy luận
+Mặc dù có sự sẵn có của việc tạo trực tiếp dựa trên pmumo, đầu LM Đơn ngôn ngữ Đích mới được khởi tạo, được đào tạo trên dữ liệu hạn chế, có thể bị hạn chế bởi khả năng tổng quát hóa ngoài bộ dữ liệu đào tạo. Khái niệm chính là tận dụng kiến thức xác suất được mô hình đã được tiền đào tạo pmulti thu được, đã được đào tạo rộng rãi trên các kho ngữ liệu văn bản lớn.
+
+3.3.1 Bước 1: Lựa chọn Top-k
+Ban đầu, chúng tôi lựa chọn k ứng viên hàng đầu dựa trên xác suất pmumo(xt|x<t). Chúng tôi đặt k là 10 cho tất cả các thí nghiệm. Cho thực tế là chúng tôi không sửa đổi embedding đầu vào của mô hình đã được tiền đào tạo, chúng tôi không thể đưa từ được dự đoán nếu một từ không thuộc Vmulti trong lần lặp tiếp theo. Thay vào đó, chúng tôi nhập từ được dự đoán như các đơn vị phân đoạn từ của từ vựng đã được tiền đào tạo.
+
+Ví dụ, hãy xem xét từ tiếng Hàn "수소", tương ứng với một chuỗi hai token ("수", "소") trong Vmulti. Nếu từ tiếng Hàn "수소" được chọn trong số các ứng viên Top-k, chúng tôi sử dụng hai token đa ngôn ngữ này.
+
+3.3.2 Bước 2: Xác minh
+Sau đó, tính khả thi của các hoàn thành tiềm năng này được đo bằng phân phối xác suất log-joint trên pmulti. Để tính đến các chuỗi ngắn hơn tự nhiên có điểm cao hơn (Jean et al., 2015; Murray and Chiang, 2018), chúng tôi chuẩn hóa điểm của mỗi ứng viên theo độ dài token của nó.
+
+Chúng tôi đo tính khả thi cho một chuỗi ứng viên như sau:
+
+σ(ci) = 1/li ∑li k=1 log pmulti(ci t+k|ci <t+k,x<t), (5)
+
+trong đó ci biểu thị một token được dự đoán trong các ứng viên top-k, pmulti biểu thị xác suất như được xác định bởi mô hình đa ngôn ngữ đã được tiền đào tạo, và li tương ứng với độ dài chuỗi của ứng viên ci.
+
+Từ k ứng viên, dự đoán cuối cùng có thể được rút ra từ cả cách thức xác định và ngẫu nhiên, tùy thuộc vào các chiến lược giải mã.
+
+4 Thí nghiệm
+4.1 Thiết lập
+Ngôn ngữ Như một nghiên cứu trường hợp, chúng tôi tập trung vào hai ngôn ngữ bảng chữ cái không phải La Mã: tiếng Hàn và tiếng Nhật. Vì chúng tôi nhằm mục đích sử dụng một mô hình đã được tiền đào tạo với mức độ hiệu quả hợp lý trong ngôn ngữ đích, điều cần thiết là ngôn ngữ được đề cập rõ ràng là đã được đào tạo trong kho ngữ liệu tiền đào tạo. Trong bối cảnh này, chúng tôi xem xét các ngôn ngữ được bao gồm trong kho ngữ liệu tiền đào tạo Llama-2 (Touvron et al., 2023b). Hơn nữa, ngôn ngữ được chọn cần thể hiện vấn đề phân mảnh quá mức (Ahia et al., 2023; Petrov et al., 2023) bởi bộ phân đoạn từ đã được tiền đào tạo lấy tiếng Anh làm trung tâm. (Xem Hình 1) Tiêu chí này dẫn đến việc loại trừ hầu hết các ngôn ngữ châu Âu như tiếng Pháp, tiếng Đức, và tiếng Bồ Đào Nha. Cuối cùng, chúng tôi tiến hành nghiên cứu về nhiều tác vụ, đòi hỏi sự tồn tại của một bộ dữ liệu hướng dẫn cho ngôn ngữ đích. Do những cân nhắc này, chúng tôi chỉ thực hiện thí nghiệm bằng tiếng Hàn và tiếng Nhật.
+
+Mô hình Chúng tôi sử dụng mô hình Llama-2 13B (Touvron et al., 2023b) cho tất cả các thí nghiệm. Chúng tôi quan sát một số sự khác biệt về sắp xếp ngôn ngữ giữa hướng dẫn và phản hồi khi sử dụng mô hình chat Llama-2 13B. Để giải quyết vấn đề này, chúng tôi tiến hành tinh chỉnh hướng dẫn đa ngôn ngữ (Muennighoff et al., 2022) cho các ngôn ngữ tiếng Anh, tiếng Hàn, và tiếng Nhật bằng cách sử dụng ShareGPT và Alpaca (Chen et al., 2023c). Quá trình này cải thiện độ lưu loát của mô hình trong mỗi ngôn ngữ (Muennighoff et al., 2022; Chen et al., 2023b). Chúng tôi cũng báo cáo kết quả của chúng tôi được thử nghiệm trên Llama-1 13B (Touvron et al., 2023a) trong Phụ lục.
+
+Triển khai MuMo Để xây dựng các từ vựng đơn ngôn ngữ đích trong Framework MuMo, chúng tôi tận dụng các bộ phân đoạn từ từ các mô hình có sẵn, như được hiển thị trong Bảng 2. Chúng tôi chọn các token đơn ngôn ngữ bằng cách lọc các mục từ vựng dựa trên phạm vi Unicode của mỗi chữ viết đơn ngôn ngữ. Ngoài ra, chúng tôi loại trừ các mục khỏi lựa chọn nếu chúng đã có mặt trong từ vựng đã được tiền đào tạo. Về thuật toán tiền xử lý, chúng tôi sử dụng chiến lược khớp tối đa tiến để xác định các từ trong từ vựng ngôn ngữ đích. Chiến lược này xác định chuỗi token dài nhất phù hợp với một từ trong từ vựng ngôn ngữ đích.
+
+Về việc khởi tạo gmono, chúng tôi sử dụng đầu LM của mô hình đa ngôn ngữ đã được tiền đào tạo. Ví dụ, khi từ tiếng Hàn "태양" được phân đoạn thành các đơn vị từ phụ ("\0xed", ..., "\0x91") bằng cách sử dụng từ vựng đã được tiền đào tạo, chúng tôi khởi tạo đầu LM tiếng Hàn của "태양" bằng cách lấy trung bình của các embedding từ phụ tương ứng của đầu LM đa ngôn ngữ. Quá trình này đảm bảo rằng các embedding được khởi tạo của đầu Đơn ngôn ngữ Đích đại diện cho từ gốc trong bối cảnh đa ngôn ngữ.
+
+Tinh chỉnh Chúng tôi chỉ đào tạo đầu LM Đơn ngôn ngữ Đích gmono với các bộ dữ liệu ShareGPT và Alpaca được dịch (Chen et al., 2023c) bằng tiếng Hàn và tiếng Nhật. Việc đào tạo được thực hiện với 1500 bước với một batch gồm 128 ví dụ. Chúng tôi sử dụng bộ tối ưu hóa AdamW (Loshchilov and Hutter, 2019) với tốc độ học 0.001, weight decay 0.01, và 150 bước khởi động.
+
+Đánh giá Chúng tôi chọn hai tác vụ tạo đại diện: tóm tắt và dịch thuật. Đối với tóm tắt, chúng tôi sử dụng 500 ví dụ từ XLSum (Hasan et al., 2021), và đối với dịch thuật, chúng tôi sử dụng 500 ví dụ từ bộ dữ liệu FLoRes-200 (Goyal et al., 2022). Chúng tôi dịch các câu tiếng Anh sang mỗi câu ngôn ngữ đích.
+
+Đối với mỗi tác vụ, chúng tôi báo cáo kết quả 0-shot cho tóm tắt, và kết quả 3-shot cho dịch thuật. Chúng tôi đặt độ dài chuỗi tối đa là 512. Chúng tôi sử dụng flash-attention 2 (Dao, 2023) và loại bfloat16 cho việc tạo văn bản.
+
+Metrics Trong tác vụ tóm tắt, chúng tôi đo độ tin cậy của nội dung được tạo bằng cách tính điểm ROUGE-2 và ROUGE-L (Lin, 2004), lấy trung bình kết quả trên 5 bản tóm tắt được tạo khác nhau. Tương tự, đối với tác vụ dịch thuật, chúng tôi đo chất lượng của các bản dịch bằng cách tính điểm BLEU (Papineni et al., 2002), một lần nữa lấy trung bình trên 5 kết quả dịch thuật. Chúng tôi báo cáo Tokens/sec để đo tốc độ suy luận của các mô hình.
+
+4.2 Baselines
+Chúng tôi xem xét các baseline sau đây để so sánh với phương pháp được đề xuất. Lưu ý rằng tất cả các baseline đều được triển khai mô hình được tinh chỉnh hướng dẫn với bộ dữ liệu hướng dẫn đa ngôn ngữ (Chen et al., 2023c).
+
+Vanilla Decoding Việc tạo tự hồi quy là lấy mẫu tuần tự từ tiếp theo dựa trên phân phối xác suất trên từ vựng đã được tiền đào tạo. Phương pháp này phục vụ như tiêu chuẩn để đo lường các cải tiến. Tính đến bản chất của tác vụ, tất cả các baseline và framework của chúng tôi sử dụng chiến lược giải mã dựa trên lấy mẫu với nhiệt độ là 0.1, k là 10 cho lấy mẫu top-k (Fan et al., 2018) và p là 0.7 cho lấy mẫu nucleus (Holtzman et al., 2020).
+
+Speculative Decoding Phương pháp giải mã suy đoán (Chen et al., 2023a; Leviathan et al., 2023) sử dụng một mô hình "draft" sơ bộ để nhanh chóng tạo ra một tập hợp các ứng viên token tại mỗi bước giải mã. Tiếp theo, các ứng viên này trải qua một quá trình xác thực bởi mô hình ngôn ngữ gốc để xác định khả năng của chúng như những sự tiếp nối hợp lý của văn bản. Chúng tôi triển khai hai biến thể của phương pháp này: một với khả năng từ chối các ứng viên không phù hợp (Spec.) và một khác không có mô-đun từ chối (Spec. w/o Rejection). Đối với mô hình draft, chúng tôi sử dụng Llama-2 7B (Touvron et al., 2023b). Theo triển khai của Chen et al. (2023a), chúng tôi tạo 5 token draft tại mỗi lần lặp.
+
+Lexical Shortlisting Lexical Shortlisting (Shortlisting) (Abdaoui et al., 2020; Ushio et al., 2023), hoặc lựa chọn từ vựng, là phương pháp tối ưu hóa quá trình giải mã bằng cách cho phép nó tạo ra một từ trong một tập hợp các token trong giai đoạn suy luận (Ushio et al., 2023). Chúng tôi triển khai để lọc ra các token không có mặt trong tập hợp con ngôn ngữ đích tương ứng của kho ngữ liệu mC4 (Xue et al., 2021), như Ushio et al. (2023).
+
+4.3 Kết quả
+Bảng 3 hiển thị kết quả tạo trong cả tác vụ tóm tắt và dịch thuật. Đối với tác vụ tóm tắt bằng tiếng Hàn, MuMo vượt trội hơn tất cả các baseline về tốc độ, đạt được tăng tốc 1.92x so với Vanilla Decoding trong khi duy trì điểm ROUGE cạnh tranh. Trong dịch thuật, MuMo một lần nữa thể hiện hiệu suất vượt trội với tăng tốc 1.70x và thậm chí cho thấy sự cải thiện trong điểm BLEU so với Vanilla Decoding.
+
+Trong trường hợp tiếng Nhật, kết quả tương tự, với MuMo đạt được tăng tốc 2.02x trong tóm tắt và tăng tốc 1.75x trong dịch thuật. Điểm ROUGE và BLEU cho MuMo ngang bằng hoặc thấp hơn một chút so với Vanilla Decoding, chỉ ra rằng sự gia tăng tốc độ không làm giảm đáng kể chất lượng đầu ra.
+
+Shortlisting chỉ hiển thị những cải thiện tốc độ nhỏ trên cả hai ngôn ngữ và mọi tác vụ, trong khi bảo tồn khả năng tạo. Điều này có thể là do chi phí tính toán tương đối của việc xử lý ma trận embedding giảm trong các mô hình lớn hơn, làm cho việc giảm từ vựng ít tác động hơn (Berard et al., 2021; Ushio et al., 2023). Mặt khác, Spec. phụ thuộc mạnh vào khả năng của mô hình draft, như được hiển thị trong so sánh với (Spec. w/o Rejection). Nếu mô hình draft thiếu khả năng đa ngôn ngữ đầy đủ, nó có thể không tạo ra các ứng viên chất lượng cao, dẫn đến tỷ lệ chấp nhận thấp hơn bởi mô hình gốc và do đó giảm hiệu quả.
+
+Hiệu suất vượt trội của MuMo về tốc độ suy luận có thể được quy cho chủ yếu vào khả năng dự đoán các đơn vị ngôn ngữ học lớn hơn so với những đơn vị trong từ vựng đã được tiền đào tạo. Chúng tôi thấy rằng các token ngôn ngữ đích trong Vmono thường được phân đoạn thành 3-4 token riêng biệt trong Vmulti, gợi ý rằng bước giải mã có thể được giảm 3-4 lần. Được giả thuyết rằng tốc độ suy luận bị ảnh hưởng đáng kể bởi sự khác biệt giữa từ vựng đa ngôn ngữ đã được tiền đào tạo và ngôn ngữ đích.
+
+5 Phân tích Thêm
+5.1 Phân tích So sánh các Chiến lược Tinh chỉnh
+Trong phần này, chúng tôi cung cấp phân tích so sánh của ba chiến lược tinh chỉnh riêng biệt cho các mô hình đa ngôn ngữ. Phân tích này nhằm mục đích nổi bật những ưu điểm và nhược điểm của mỗi chiến lược, đặc biệt là về yêu cầu bộ dữ liệu và số lượng tham số cần đào tạo.
+
+5.1.1 Thiết lập
+Hai chiến lược được so sánh trong phân tích là:
+1. Vanilla Fine-tuning: Chiến lược này, phục vụ như baseline, bao gồm việc tinh chỉnh một mô hình đa ngôn ngữ tiêu chuẩn trên một bộ dữ liệu hướng dẫn đơn ngôn ngữ đích (44M token) mà không có bất kỳ sửa đổi nào đối với từ vựng đã được tiền đào tạo.
+
+2. Vocabulary Expansion: Lấy cảm hứng từ công trình trước đây (Chau et al., 2020; Cui et al., 2023), chiến lược này bao gồm việc mở rộng từ vựng của mô hình đa ngôn ngữ đã được tiền đào tạo và tinh chỉnh trên bộ dữ liệu hướng dẫn. Phương pháp này, không giống như MuMo, mở rộng không chỉ đầu LM mà còn cả token embedding trong lớp đầu vào. Hai triển khai của chiến lược này được xem xét. Cái đầu tiên bao gồm việc tiền đào tạo trên các kho ngữ liệu văn bản quy mô lớn (60B token) trước khi tinh chỉnh trên bộ dữ liệu hướng dẫn. Chiến lược này được đánh dấu bằng dấu dao trong Bảng 4. Cái thứ hai chỉ trải qua giai đoạn tinh chỉnh trên bộ dữ liệu hướng dẫn.
+
+Để tính đến tính biến đổi của đơn vị token giữa các chiến lược khác nhau, chúng tôi báo cáo tốc độ suy luận với morphemes per second (Morphemes/sec), cung cấp một phép đo chuẩn hóa. Chúng tôi chỉ so sánh các baseline bằng tiếng Hàn, do tính sẵn có của mô hình.
+
+5.1.2 Thảo luận
+Bảng 4 tiết lộ một xu hướng nhất quán trên cả tác vụ tóm tắt và dịch thuật. Các chiến lược mở rộng từ vựng, mở rộng kích thước của cả token embedding và đầu LM, thể hiện sự gia tăng đáng kể về tốc độ suy luận, nhưng điều này đi kèm với sự giảm đáng kể về chất lượng của đầu ra được tạo khi không được đào tạo trên các kho ngữ liệu văn bản quy mô lớn. Điều này chỉ ra rằng việc chỉ tinh chỉnh với từ vựng mở rộng trên một bộ dữ liệu downstream hạn chế có thể không đủ để duy trì việc tạo văn bản chất lượng cao, như được gợi ý bởi (Conneau et al., 2020). Hơn nữa, trong khi mở rộng từ vựng với tiền đào tạo đạt được những cải thiện tốc độ đáng chú ý, nó không thể hiện những cải thiện đáng kể về chất lượng tạo.
+
+Ngược lại, phương pháp được đề xuất của chúng tôi thể hiện sự gia tăng khiêm tốn về tốc độ trong khi cũng cải thiện nhẹ điểm BLEU so với vanilla fine-tuning. Ưu điểm chính của phương pháp chúng tôi nằm ở khả năng đạt được những kết quả này mà không cần đến các kho ngữ liệu văn bản đơn ngôn ngữ rộng lớn. Phương pháp này không chỉ giảm số lượng tham số cần được tinh chỉnh, làm cho nó hiệu quả hơn về tham số mà còn giảm bớt sự phụ thuộc vào dữ liệu quy mô lớn để tiền đào tạo, làm cho nó trở thành một giải pháp hiệu quả hơn về dữ liệu.
+
+5.2 Khởi tạo Đầu LM Đơn ngôn ngữ Đích
+Chúng tôi điều tra tác động của ba chiến lược khởi tạo khác nhau trên đầu LM đơn ngôn ngữ đích gmono trong Đầu LM Đơn ngôn ngữ Đích. Chiến lược đầu tiên bao gồm việc tận dụng các embedding tương ứng với biểu diễn đã được tiền đào tạo của một đầu LM đơn ngôn ngữ đích, được gọi là MONO-INIT. Chiến lược thứ hai là khởi tạo các tham số với giá trị ngẫu nhiên bằng cách sử dụng phân phối Gaussian (RANDOM-INIT). Cuối cùng, chúng tôi sử dụng các embedding từ đầu LM đa ngôn ngữ đã được tiền đào tạo (MULTI-INIT), như thí nghiệm chính. Điều này được đạt được bằng cách lấy trung bình các embedding đầu ra của mô hình đa ngôn ngữ.
+
+Bảng 17 cho thấy MULTI-INIT đạt được điểm ROUGE-L là 36.3 và điểm BLEU là 21.7, gần với điểm ROUGE-L 36.2 và điểm BLEU 20.9 của MONO-INIT. Mặt khác, RANDOM-INIT cho thấy sự giảm hiệu suất, với điểm ROUGE-L là 35.5 và điểm BLEU là 17.2.
+
+Kết quả cho thấy rằng phương pháp MULTI-INIT gần như hiệu quả bằng MONO-INIT. Điều này gợi ý rằng framework của chúng tôi có thể được sử dụng cho một số ngôn ngữ có tập từ vựng có sẵn nhưng thiếu các biểu diễn đã được tiền đào tạo phù hợp.
+
+5.3 Hiệu quả của Bước Xác minh
+Chúng tôi thiết kế một nghiên cứu ablation để điều tra vai trò của bước xác minh trong quá trình suy luận (Sec. 3.3.2). Để đánh giá tác động của bước xác minh, chúng tôi tạo ra các chuỗi mà không sử dụng bước xác minh.
+
+Từ kết quả trong Bảng 6, được thực hiện cả bằng tiếng Hàn và tiếng Nhật, chúng tôi nhận thấy rằng tốc độ tạo tổng thể nhanh hơn khoảng 1.2 lần khi bỏ qua việc xác minh. Tuy nhiên, điều quan trọng cần nổi bật là việc loại bỏ bước xác minh trong giai đoạn suy luận dẫn đến sự giảm đáng kể về chất lượng tạo. Điều này rõ ràng trong sự giảm điểm ROUGE-2, ROUGE-L, và BLEU cho cả hai ngôn ngữ khi mô-đun xác minh không được sử dụng, như được hiển thị trong bảng. Điều này gợi ý rằng mặc dù bước xác minh có thể làm chậm quá trình tạo một chút, nó đóng vai trò quan trọng trong việc bảo tồn khả năng tạo của mô hình.
+
+5.4 Nghiên cứu So sánh trong Đào tạo Tác vụ Đơn
+Trong thí nghiệm, mục tiêu chính của chúng tôi là điều tra liệu các khả năng vốn có của mô hình đa ngôn ngữ được tinh chỉnh hướng dẫn, xử lý nhiều tác vụ khác nhau, có thể bị ảnh hưởng khi được đào tạo độc quyền trên các tác vụ đơn sử dụng Vocabulary Expansion hoặc MuMo. Cả hai phương pháp đều giới thiệu các tham số mới được khởi tạo, làm dấy lên lo ngại về tác động tiềm năng đến tính linh hoạt của mô hình. Để giải quyết những lo ngại này, chúng tôi đào tạo riêng mô hình trên mỗi tác vụ - Hỏi đáp (QA) (Lim et al., 2019; Kurihara et al., 2022) và Tóm tắt (Hasan et al., 2021) - và tiến hành phân tích so sánh giữa Vocabulary Expansion và MuMo.
+
+Để đánh giá, chúng tôi sử dụng các bộ dữ liệu đa tác vụ, cụ thể là tiếng Hàn và tiếng Nhật, bao gồm chỉ các câu hỏi. Để đo lường, chúng tôi sử dụng thiết lập chấm điểm câu trả lời đơn từ LLM-as-a-judge (Zheng et al., 2023). Điều này bao gồm việc trình bày một câu hỏi cùng với các câu trả lời do mô hình tạo ra cho GPT-4 (đóng vai trò là người xét) để đánh giá. Các câu trả lời được chấm điểm theo thang điểm từ 1 đến 10.
+
+Như được mô tả trong Hình 4, mô hình được tinh chỉnh hướng dẫn ban đầu đạt được điểm trung bình 7.2 trong thí nghiệm tiếng Hàn. Tuy nhiên, khi được tinh chỉnh chỉ sử dụng tác vụ QA, Vocabulary Expansion nhận điểm 1.8, trong khi MuMo nhận điểm 5.9. Khi được đào tạo chỉ trên tác vụ tóm tắt, Vocabulary Expansion nhận điểm 1.6, trong khi MuMo nhận điểm 4.7. Xu hướng tương tự được quan sát trong thí nghiệm tiếng Nhật. Mô hình gốc nhận điểm trung bình 6.8. Khi được tinh chỉnh chỉ với tác vụ QA, Vocabulary Expansion nhận điểm 2.1, trong khi MuMo nhận điểm 5.2. Khi được đào tạo độc quyền trên tác vụ tóm tắt, Vocabulary Expansion nhận điểm 1.2, trong khi MuMo nhận điểm 4.4.
+
+Những kết quả này gợi ý rằng trong khi điểm của mô hình giảm khi được đào tạo trên các tác vụ đơn sử dụng một trong hai phương pháp, sự giảm ít rõ rệt hơn với MuMo. Điều này chỉ ra rằng MuMo hiệu quả hơn trong việc bảo tồn khả năng thành thạo đa tác vụ của mô hình so với Vocabulary Expansion. Tuy nhiên, cũng rõ ràng rằng không phương pháp nào có thể duy trì hoàn toàn khả năng tuân theo hướng dẫn ban đầu của mô hình trên nhiều tác vụ khi được đào tạo chỉ trên các tác vụ đơn. Những phát hiện này gợi ý rằng bộ dữ liệu hướng dẫn, mà mô hình ban đầu được đào tạo trên đó, là quan trọng để bảo tồn các khả năng của mô hình đã được tiền đào tạo.
+
+6 Kết luận
+Nghiên cứu của chúng tôi đã giải quyết thành công các thách thức trong việc tạo văn bản cho các ngôn ngữ không phải bảng chữ cái, đặc biệt là những ngôn ngữ liên quan đến các vấn đề phân mảnh quá mức. Phương pháp này không chỉ tăng tốc việc tạo văn bản mà còn mở đường cho các ứng dụng ngôn ngữ đa ngôn ngữ hiệu quả hơn. Công trình tương lai của chúng tôi sẽ mở rộng phạm vi thí nghiệm cho các ngôn ngữ không được đại diện đầy đủ trong mô hình ngôn ngữ đa ngôn ngữ đã được tiền đào tạo.
+
+Hạn chế
+Framework được đề xuất của chúng tôi chưa được đánh giá với các ngôn ngữ thể hiện các vấn đề phân mảnh quá mức, như Tamil, Hebrew, và Arabic (Ahia et al., 2023; Petrov et al., 2023). Những ngôn ngữ này không được đề cập rõ ràng trong kho ngữ liệu tiền đào tạo của Llama-2 (Touvron et al., 2023b). Ngoài ra, framework của chúng tôi yêu cầu các bộ phân đoạn có sẵn cho các ngôn ngữ đích để tạo Đầu LM đơn ngôn ngữ Đích. Phương pháp của chúng tôi không thay đổi độ dài chuỗi đầu vào, vì chúng tôi chỉ tập trung vào việc cải thiện đơn vị dự đoán. Phương pháp này khác với các nghiên cứu trước đây (Rust et al., 2021; Cui et al., 2023) mã hóa hiệu quả văn bản ở độ dài chuỗi cấp đầu vào cho các ngôn ngữ được phân đoạn quá mức. Hơn nữa, các mô hình ngôn ngữ được đánh giá trong nghiên cứu bị hạn chế ở kích thước tối đa 13B. Các mô hình lớn hơn, như Llama-2 30B hoặc 70B, không được triển khai do hạn chế về tài nguyên tính toán có sẵn.
+
+Lời cảm ơn
+Chúng tôi cảm ơn Chaehun Park và Daeyoung Kim về các thảo luận có giá trị và phản hồi về bài báo.
