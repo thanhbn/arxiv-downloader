@@ -1,0 +1,228 @@
+# Ma trận thưa trong việc tinh chỉnh mô hình ngôn ngữ lớn
+
+Haoze He∗
+Trường Khoa học Máy tính
+Đại học Carnegie Mellon
+Pittsburgh, PA 15213
+haozeh@cs.cmu.edu
+
+Juncheng Billy Li∗
+Trường Khoa học Máy tính
+Đại học Carnegie Mellon
+Pittsburgh, PA 15213
+junchenl@cs.cmu.edu
+
+Xuan Jiang
+Trường Kỹ thuật
+Đại học California, Berkeley
+Berkeley, CA 94720
+xuanjiang@berkeley.edu
+
+Heather Miller†
+Trường Khoa học Máy tính
+Đại học Carnegie Mellon
+Pittsburgh, PA 15213
+heather.miller@cs.cmu.edu
+
+Bản thảo. Đang được xem xét.
+
+## Tóm tắt
+
+LoRA và các biến thể của nó đã trở thành các phương pháp tinh chỉnh hiệu quả tham số (PEFT) phổ biến nhờ khả năng tránh chi phí tính toán quá mức. Tuy nhiên, thường tồn tại khoảng cách độ chính xác giữa các phương pháp PEFT và tinh chỉnh đầy đủ (FT), và khoảng cách này vẫn chưa được nghiên cứu một cách có hệ thống. Trong nghiên cứu này, chúng tôi giới thiệu một phương pháp để chọn các ma trận con thưa nhằm tối thiểu hóa khoảng cách hiệu suất giữa PEFT và tinh chỉnh đầy đủ (FT) đồng thời cũng giảm cả chi phí tính toán và chi phí bộ nhớ trong tinh chỉnh. Phương pháp Tinh chỉnh Ma trận Thưa (SMT) của chúng tôi bắt đầu bằng việc xác định các ma trận con quan trọng nhất trong cập nhật gradient, chỉ cập nhật những khối này trong quá trình tinh chỉnh. Trong các thí nghiệm của chúng tôi, chúng tôi chứng minh rằng SMT luôn vượt trội hơn các baseline PEFT khác (ví dụ: LoRA và DoRA) trong việc tinh chỉnh các mô hình ngôn ngữ lớn phổ biến như LLaMA trên nhiều loại tác vụ, đồng thời giảm dung lượng bộ nhớ GPU 67% so với FT. Chúng tôi cũng kiểm tra cách hiệu suất của LoRA và DoRA có xu hướng đạt đỉnh và giảm khi số lượng tham số có thể huấn luyện tăng lên, ngược lại, phương pháp SMT của chúng tôi không gặp phải vấn đề này.
+
+## 1 Giới thiệu
+
+Trong khi khả năng tổng quát hóa vốn có của các Mô hình Ngôn ngữ Lớn (LLM) rất ấn tượng, việc nâng cao hiệu suất trên các tác vụ downstream thường vẫn cần thiết phải tinh chỉnh [Ding et al., 2022], [Chung et al., 2022]. Tuy nhiên, khi kích thước của các LLM này tăng lên, có một thách thức cấp bách là tối ưu hóa quá trình tinh chỉnh để có hiệu quả tính toán và sử dụng bộ nhớ tốt hơn. Ví dụ, tinh chỉnh một mô hình LLaMA 7B được huấn luyện trước mà không có CPU offloading³ cần ít nhất 58 GB vRAM GPU—13.6 GB cho các tham số có thể huấn luyện, 40 GB cho trạng thái bộ tối ưu hóa Adam và gradient, và 2 GB cho activation. Yêu cầu này khiến việc tinh chỉnh trên các GPU cấp độ tiêu dùng như NVIDIA RTX 4090 với 24 GB bộ nhớ trở nên không thực tế [Zhao et al., 2024].
+
+Để giải quyết những thách thức tính toán tốn kém của tinh chỉnh tham số đầy đủ, nhiều phương pháp tinh chỉnh hiệu quả tham số (PEFT) đã xuất hiện trong hai năm qua. LoRA và các biến thể của nó [Hu et al., 2021], [Zhao et al., 2024], [Dettmers et al., 2024], [Liu et al., 2024b,a] sử dụng phương pháp thích ứng trọng số thứ hạng thấp và thành công trong việc giảm cả bộ nhớ bộ tối ưu hóa và chi phí tính toán. Tuy nhiên, ngay cả trong nghiên cứu PEFT hiện đại (SoTA), kết quả cho thấy một khoảng cách hiệu suất đáng chú ý giữa các phương pháp thích ứng thứ hạng thấp và tinh chỉnh tham số đầy đủ trên nhiều tập dữ liệu [Liu et al., 2024a]. Thêm vào đó, trong nghiên cứu này, chúng tôi báo cáo một hiện tượng ít được nhận ra: các phương pháp PEFT thích ứng thứ hạng thấp trải qua một cao điểm hiệu suất và suy giảm tiếp theo khi số lượng tham số (thứ hạng r) tăng lên. Đáng ngạc nhiên, ngay cả với nhiều tham số có thể huấn luyện hơn, hiệu suất lại giảm.
+
+Mặt khác, các nghiên cứu trước đây đã phân tích rộng rãi logic nội bộ của các LLM. Một số phương pháp chỉnh sửa kiến thức, như Constrained fine-tuning [Zhu et al., 2020], ROME [Meng et al., 2022a], và MEMIT [Meng et al., 2022b], đã chỉ ra rằng các LLM có các phần bộ nhớ nằm ở các lớp riêng biệt. Những bộ nhớ này có thể được sửa đổi thông qua tinh chỉnh [Zhu et al., 2020]. Những nghiên cứu này quan sát thấy rằng kiến thức chuyên ngành có thể được phân bố riêng biệt và thưa thớt giữa các lớp. Được thúc đẩy bởi những quan sát này, và để giải quyết những thách thức của PEFT được đề cập ở trên, chúng tôi đề xuất một phương pháp Tinh chỉnh Ma trận Thưa (SMT). Bằng cách áp dụng tính thưa thớt ma trận, chúng tôi nhằm mục đích xác định và tinh chỉnh các phần bộ nhớ có liên quan nhất một cách hiệu quả. Trái ngược với tuyên bố của [Geva et al., 2020, 2022] rằng các lớp MLP của transformer chủ yếu phục vụ như bộ nhớ key-value, chúng tôi chứng minh thực nghiệm rằng các cơ chế attention, đặc biệt là vector value, lưu trữ số lượng bộ nhớ lớn nhất và có ảnh hưởng nhất trong quá trình tinh chỉnh.
+
+Trong các thí nghiệm của chúng tôi, phương pháp Tinh chỉnh Ma trận Thưa (SMT) của chúng tôi đạt được hiệu suất tốt hơn so với LoRA và DoRA khi sử dụng cùng lượng tham số có thể huấn luyện. Thêm vào đó, SMT thu hẹp khoảng cách độ chính xác giữa tinh chỉnh đầy đủ, vượt qua cao điểm hiệu suất của các phương pháp PEFT thích ứng thứ hạng thấp, và vượt trội đáng kể so với LoRA và DoRA trong khi sử dụng ít hơn 5% tham số có thể huấn luyện. Kết quả thí nghiệm của chúng tôi cho thấy SMT luôn vượt trội hơn các phương pháp PEFT SoTA (bao gồm LoRA và DoRA) từ 2+ điểm khi tinh chỉnh các LLM phổ biến (ví dụ: mô hình cơ sở dòng LLaMA⁴) trên các benchmark lý luận thông thường và lý luận số học. Kết quả thí nghiệm của chúng tôi cho thấy SMT luôn vượt trội hơn DoRA, như lý luận thông thường (+3.0/+2.8 trên LLaMA-7B/13B, +2.9 trên LLaMA2-7B, và +2.0 trên LLaMA3-8B) và lý luận số học (+2.3 trên LLaMA-7B). Ngoài ra, SMT loại bỏ khoảng cách độ chính xác giữa SMT và tinh chỉnh đầy đủ, vượt qua cao điểm của các phương pháp PEFT thích ứng thứ hạng thấp, và vượt trội đáng kể so với LoRA và DoRA với một tỷ lệ nhỏ tham số có thể huấn luyện (5%<). Đối với các lớp không có ma trận con được chọn, SMT đóng băng những lớp này, tiết kiệm toàn bộ chi phí tính toán lan truyền ngược, chi phí tính toán cập nhật tham số, chi phí bộ nhớ bộ tối ưu hóa, và chi phí bộ nhớ activation. Đối với các lớp có ma trận con được chọn, SMT giảm chi phí tính toán của lan truyền ngược và cập nhật tham số, cũng như chi phí bộ nhớ bộ tối ưu hóa và activation, xuống còn ít hơn 1% so với những chi phí phát sinh bởi tinh chỉnh đầy đủ chuẩn (FT).
+
+Dưới đây là những đóng góp chính của chúng tôi:
+
+• **Thuật toán PEFT SOTA** Chúng tôi đề xuất một phương pháp tinh chỉnh mới (SMT) đạt được hiệu suất hiện đại trong tinh chỉnh hiệu quả tham số, hiệu quả thu hẹp khoảng cách giữa SMT và tinh chỉnh đầy đủ. Ngược lại, việc bão hòa hiệu suất của LoRA và DoRA nhanh hơn SMT khi số lượng tham số có thể huấn luyện tăng lên.
+
+• **Giải phẫu Mô hình Ngôn ngữ**: Chúng tôi điều tra các tác động riêng biệt của các cơ chế attention so với MLP (Multi-Layer Perceptrons) trong các LLM. Phát hiện của chúng tôi cho thấy rằng các lớp attention quan trọng hơn MLP đối với hiệu suất downstream. Trong số các vector Q, K, V của các lớp attention, chúng tôi thấy V có ảnh hưởng nhất đến hiệu suất.
+
+• **Hiệu quả Hệ thống Mô hình Ngôn ngữ Lớn**: Việc triển khai SMT giảm đáng kể chi phí tính toán của lan truyền ngược, cập nhật tham số, bộ nhớ bộ tối ưu hóa, và bộ nhớ activation trong quá trình tinh chỉnh. Việc triển khai của chúng tôi là mã nguồn mở.
+
+## 2 Bối cảnh và Các nghiên cứu liên quan
+
+Nhiều nghiên cứu về tinh chỉnh hiệu quả tham số (PEFT) [Mangrulkar et al., 2022] đã nhằm mục đích cải thiện hiệu quả và hiệu suất bằng cách chỉ tinh chỉnh tham số hóa chiều thấp hơn của trọng số mô hình. Các ví dụ đáng chú ý bao gồm LoRA [Hu et al., 2021], DoRA [Liu et al., 2024a], QLoRA [Dettmers et al., 2023], và một số biến thể khác [Liu et al., 2024b], [Dettmers et al., 2023]. Tuy nhiên, kết quả của những nghiên cứu này vẫn cho thấy một khoảng cách hiệu suất giữa các phương pháp PEFT và tinh chỉnh đầy đủ (FT). Nghiên cứu đồng thời [Biderman et al., 2024] đã chứng minh thực nghiệm rằng khoảng cách như vậy là khó nếu không muốn nói là không thể loại bỏ, họ cũng nhận thấy vấn đề bão hòa hiệu suất của LoRA, như chúng tôi sẽ thảo luận trong Phần §4.3.
+
+Hình 1: Sự khác biệt giữa phương pháp thích ứng thứ hạng thấp LoRA và SMT. Hình trên mô tả phương pháp thích ứng trong LoRA và hình dưới thể hiện phương pháp thưa thớt ma trận con trong SMT.
+
+Bên cạnh các phương pháp thích ứng thứ hạng thấp, phương pháp lấy cảm hứng từ tính thưa thớt là một thay thế tự nhiên để giảm chi phí tính toán và dung lượng bộ nhớ. Vì chúng gần đây đã được áp dụng để tăng tốc suy luận LLM, H2O [Zhang et al., 2024] đã tận dụng tính thưa thớt trong chính sách loại bỏ cache KV; DeepSparse [Kurtic et al., 2023] sử dụng chưng cất dựa trên L2 để thúc đẩy tính thưa thớt. Trong trường hợp tinh chỉnh lấy cảm hứng từ tính thưa thớt, [Song et al., 2023] đã phát triển một phương pháp Tinh chỉnh Gia tăng Thưa (SIFT) để giảm chi phí bộ nhớ GPU. Tuy nhiên, SIFT [Song et al., 2023] vẫn yêu cầu lan truyền ngược đầy đủ để tính toán tất cả gradient, không có lợi thế tốc độ so với tinh chỉnh đầy đủ (FT). Hơn nữa, SIFT ánh xạ gradient bộ nhớ không liên tục đến địa chỉ bộ nhớ liên tục, tạo ra một nút thắt cổ chai thời gian đáng kể và dẫn đến thời gian tinh chỉnh dài hơn FT. Nghiên cứu của chúng tôi xây dựng trên các chiến lược hiện có, nhưng không giống như các phương pháp trước đây, phương pháp thưa thớt ma trận của chúng tôi trực tiếp kết hợp thông tin gradient cụ thể cho tác vụ để điều chỉnh động mức độ thưa thớt cho tối ưu hóa, và chúng tôi đạt được tăng tốc như chúng tôi mô tả trong Phần §3.3.
+
+Giả sử chúng ta được cho một mô hình ngôn ngữ tự hồi quy được huấn luyện trước P_Φ(y|x) được tham số hóa bởi Φ. Mỗi tác vụ downstream được đại diện bởi một tập dữ liệu huấn luyện các cặp ngữ cảnh-mục tiêu: Z = (x_i, y_i)_{i=1,...,N}, trong đó cả x_i và y_i đều là các chuỗi token. Phương trình (1) mô tả quá trình tinh chỉnh LoRA [Hu et al., 2021] để tối đa hóa mục tiêu mô hình hóa ngôn ngữ có điều kiện, sử dụng biểu diễn thứ hạng thấp để mã hóa các tham số cụ thể cho tác vụ. Cụ thể, LoRA đóng băng các trọng số mô hình được huấn luyện trước và chèn các ma trận phân tách thứ hạng có thể huấn luyện vào mỗi lớp của kiến trúc Transformer. Điều này được công thức hóa là ΔΦ = ΔΦ(Θ), trong đó Θ đại diện cho một tập tham số có kích thước nhỏ hơn nhiều với |Θ| ≪ |Φ_0|. Sự gia tăng kết quả ΔΦ có thể nhỏ đến 0.01% kích thước tham số trọng số được huấn luyện trước |Φ_0| trong các cập nhật gradient. Điều này giảm đáng kể số lượng tham số có thể huấn luyện và yêu cầu bộ nhớ GPU trong khi duy trì hoặc thậm chí nâng cao hiệu suất mô hình.
+
+max_Θ Σ_{(x,y)∈Z} Σ_{t=1}^{|y|} log(P_{Φ_0+ΔΦ(Θ)}(y_t|x, y_{<t})) (1)
+
+Trong nghiên cứu của chúng tôi, Tinh chỉnh Ma trận Thưa (SMT) được đề xuất sử dụng tính thưa thớt ma trận như phương pháp hiệu quả tham số. Trong trường hợp của SMT, tái sử dụng Phương trình (1), Θ đại diện cho các ma trận con trong các ma trận trọng số thưa. SMT chỉ tinh chỉnh các ma trận con thưa Θ thay vì tinh chỉnh toàn bộ trọng số được huấn luyện trước. Hình 1 minh họa sự khác biệt giữa phương pháp thích ứng trọng số thứ hạng thấp LoRA và phương pháp tinh chỉnh ma trận thưa SMT được đề xuất của chúng tôi. Đối với ma trận trọng số được huấn luyện trước W_0, LoRA ràng buộc cập nhật của nó bằng cách biểu diễn sau này với phân tách thứ hạng thấp W_0+ΔW=W_0+BA, trong đó B∈R^{d×r}, A∈R^{d×r}, và thứ hạng r≪min(d,k). Trong SMT, chúng tôi cắt trọng số được huấn luyện trước thành N ma trận con và chỉ tinh chỉnh M ma trận con được chọn. Chiều của ma trận con là l×l, tổng số ma trận con N trong một trọng số được huấn luyện trước là N=d×k/(l×l). SMT ràng buộc cập nhật của nó bằng cách biểu diễn sau này với ma trận gradient thưa ΔW_M, W_0+ ΔW=W_0+ ΔW_M, trong đó số lượng ma trận con tinh chỉnh m≪N.
+
+Vì phương pháp SMT được đề xuất của chúng tôi tập trung vào tinh chỉnh các ma trận con có liên quan nhất đến hiệu suất của các tác vụ downstream, việc xác định những ma trận con này là không tầm thường. Các nghiên cứu trước đây [Zhu et al., 2020], MEMIT [Meng et al., 2022b], và [Geva et al., 2020, 2022] chỉ ra rằng các lớp MLP feed-forward của LLM có ảnh hưởng nhất. Tuy nhiên, thông qua phân tích thí nghiệm §5.1 của chúng tôi, chúng tôi thấy các lớp attention có liên quan hơn đến hiệu suất so với các lớp MLP.
+
+## 3 Phương pháp luận
+
+### 3.1 Chọn các ma trận con thưa có ảnh hưởng nhất
+
+Hình 2: (a) Một ma trận trọng số thưa W. Các ma trận con màu xanh lá cây với gradient đáng kể có thể được cập nhật. (b) Tính toán lan truyền ngược cho gradient một phần cho ma trận trọng số w. (c) Đồ thị tính toán trong các hệ thống vi phân tự động.
+
+Bảng 1: Các thí nghiệm bao gồm Tinh chỉnh Đầy đủ, SMT, LoRA, và DoRA trên 4×A100 40GB GPU sử dụng data parallel, với batch size 16. Giao tiếp giữa GPU và CPU được thực hiện qua PCIe-G4.
+
+| LLaMA-7B | | | |
+|----------|---------|---------|---------|
+| Phương pháp PEFT | #Params% | Thời gian/s | Tăng tốc |
+| Tinh chỉnh đầy đủ | 100 | 243.84 | 1× |
+| SMT | 1.26 | 16.68 | 14.6× |
+| LoRA | 1.26 | 17.82 | 13.6× |
+| DoRA | 1.27 | 18.04 | 13.5× |
+
+Phương pháp luận của chúng tôi tập trung vào việc áp dụng phương pháp thưa thớt ma trận trong quá trình tinh chỉnh LLM. Cụ thể, chúng tôi chọn các ma trận con nhất định trong các ma trận trọng số trong các ma trận trọng số của mô hình mà thể hiện sự thay đổi gradient tối đa trong giai đoạn khởi động 100 vòng lặp (Hình 2.a) ở đầu tinh chỉnh. Một cách trực quan, phương pháp của chúng tôi nhằm mục đích chọn và sửa đổi các ma trận con có liên quan nhất đến tác vụ con tinh chỉnh. Khi tinh chỉnh LLM, SMT cải thiện hiệu quả tính toán và giảm nhu cầu bộ nhớ trong quá trình tinh chỉnh bằng cách không cập nhật một phần của các ma trận trọng số sau giai đoạn khởi động và lưu trữ trọng số thưa ở dạng nén.
+
+Đầu tiên và quan trọng nhất, SMT giảm chi phí tính toán ngược liên quan đến trọng số xuống 0.5% so với những chi phí liên quan đến Tinh chỉnh Đầy đủ (FT). SMT đạt được điều này bằng cách giảm chi phí tính toán của gradient trong lan truyền ngược, vì gradient chỉ được tính toán cho một tập con của trọng số. Đối với các lớp tuyến tính trong LLM, trong đó Z=Wx, gradient liên quan đến ma trận trọng số W và đầu vào x có thể được tính toán như Phương trình (2):
+
+∇_x f(x) = ∂l/∂Z · W; ∇_W f(x) = ∂l/∂Z · x (2)
+
+trong đó ∂l/∂z là thông tin gradient từ lan truyền ngược trong (Hình 2.b,c). ∇_w f(x) là ma trận gradient và x là activation trong (Hình 2.b). (Hình 2.b) cũng minh họa rằng chỉ cần tính toán ngược một phần khi chúng ta cập nhật các ma trận thưa được chọn. Để tính toán gradient ma trận con (được tô sáng màu vàng), chỉ cần nhân hàng màu vàng trong ∂l/∂z với cột màu vàng trong activation x. Tương tự, để tính toán gradient ma trận con màu xanh lá cây, chúng ta chỉ cần nhân hàng màu xanh lá cây trong ∂l/∂z với cột màu xanh lá cây trong activation x. Lưu ý rằng trong lan truyền ngược, chúng ta chỉ có thể giảm tính toán khi đạo hàm đến ma trận gradient w như được minh họa bởi các mũi tên màu xanh lá cây trong (Hình 2.c). nhưng không phải các tính toán cần thiết khác. (mũi tên đen)
+
+Bên cạnh đó, SMT giảm chi phí bộ nhớ activation cho quá trình forward xuống 0.5%. Vì SMT chỉ tính toán gradient một phần, nó chỉ lưu các phần liên quan của activation X cần thiết cho việc tính toán gradient như được thể hiện trong Phương trình 2. Trong (Hình 2.b), để tính toán gradient màu xanh lá cây và màu vàng trong ma trận gradient, chúng ta chỉ cần lưu các cột màu vàng và màu xanh lá cây của activation X. Phương pháp này giảm chi phí bộ nhớ cho quá trình forward của lớp tuyến tính được chọn.
+
+Ngoài ra, SMT giảm chi phí bộ nhớ của gradient bộ tối ưu hóa xuống 0.5%. Vì SMT chỉ cập nhật các ma trận con thưa được chọn, chỉ gradient một phần được lưu trữ. Phương pháp này cắt giảm đáng kể chi phí bộ nhớ của bộ tối ưu hóa Adam xuống 0.5%. Việc giảm này rất quan trọng vì chi phí bộ nhớ của bộ tối ưu hóa Adam thường gấp đôi kích thước của mô hình, thường tiêu thụ phần lớn RAM GPU.
+
+Hơn nữa, SMT giảm chi phí tính toán bước gradient xuống 0.5%. Bằng cách cập nhật các ma trận con thưa được chọn, SMT thực hiện các bước gradient một phần và giảm đáng kể chi phí tính toán bước.
+
+Trong SMT, tất cả các lớp ngoại trừ các vector Q, K, và V được chọn sẽ bị đóng băng trong quá trình tinh chỉnh. Bằng cách làm điều này, SMT tránh được tất cả chi phí tính toán lan truyền ngược trọng số, chi phí tính toán cập nhật tham số, chi phí bộ nhớ bộ tối ưu hóa, và chi phí bộ nhớ activation trong các lớp bị đóng băng. Lý do để chỉ tinh chỉnh vector Q, K, và V được chi tiết trong Phần §5.1.
+
+Bằng cách áp dụng tinh chỉnh ma trận con thưa, SMT có thể giảm chi phí bộ nhớ tinh chỉnh của LLaMA-7B và LLaMA2-7B xuống dưới 20GB và phù hợp với việc tinh chỉnh vào GPU 3090 24GB. Chúng tôi cũng giảm tính toán và đạt được tinh chỉnh nhanh hơn so với FT và LoRA/DoRA, Phần §3.3 cung cấp thêm chi tiết.
+
+### 3.2 Triển khai
+
+Trong SMT, đầu tiên chúng tôi tổng hợp gradient từ các lớp tuyến tính attention trong mỗi vòng lặp khởi động đơn lẻ. Thông tin gradient tổng hợp được sử dụng để xác định các khối thưa cụ thể cho tác vụ. Sau các bước khởi động, chúng tôi tính trung bình các giá trị tuyệt đối trong các ma trận con, chọn các ma trận con có giá trị lớn nhất, và lưu các chỉ số cho các ma trận con được chọn. Trong tất cả các thí nghiệm của chúng tôi, chúng tôi sử dụng l×l = 256×256 như kích thước khối ma trận con. Trong các bước khởi động, chúng tôi có thể áp dụng offload [Rajbhandari et al., 2020] trên các thiết bị GPU có ràng buộc bộ nhớ. Vì SMT cần ít hơn 100 bước khởi động trong các thí nghiệm của chúng tôi, nó không trở thành nút thắt cổ chai trong các epoch tinh chỉnh.
+
+Thêm vào đó, SMT triển khai một lớp tuyến tính thưa tùy chỉnh để đảm bảo rằng các gradient không được chọn không được tính toán, lưu và cập nhật (Code Snippet 6). Chúng tôi thay thế các lớp tuyến tính được chọn bằng những lớp tuyến tính thưa tùy chỉnh này.
+
+Lớp tuyến tính thưa tùy chỉnh áp dụng một hàm nhân tuyến tính thưa chuyên biệt, được tích hợp vào các lớp tuyến tính thưa tùy chỉnh của chúng tôi (Code Snippet 7). Hàm này tính toán gradient trọng số một phần dựa trên đầu vào, trọng số, và chỉ số trọng số được chọn. Nó giảm đáng kể chi phí tính toán của gradient trọng số lan truyền ngược xuống chỉ 0.5% và giảm thiểu việc sử dụng bộ nhớ của gradient một phần trả về xuống chỉ 0.5%.
+
+Hàm nhân tuyến tính thưa chuyên biệt viết lại cả hàm forward và backward. Trong quá trình forward (Code Snippet 7) của hàm nhân tuyến tính thưa, chúng tôi chỉ lưu activation x được chọn bằng ctx.save_for_backward(), và trong quá trình backward (Code Snippet 8), chúng tôi tùy chỉnh phép nhân ma trận để tính toán gradient một phần cần thiết dựa trên đầu vào một phần và chỉ số gradient (được hiển thị trong Hình 2(b)). Điều quan trọng cần lưu ý là chúng tôi không sử dụng Sparse Matrix-Matrix Multiplication (SPMM)⁵ vì chúng tôi nối các ma trận con thưa được chọn và tạo thành một ma trận dense m×l×l như được minh họa ở phần bên phải của hình 1. Điều này sẽ không tốn thêm thời gian vì việc phân bổ bộ nhớ vẫn liên tục trong mỗi ma trận con. Mặc dù sử dụng tính thưa thớt ma trận, chúng tôi vẫn tận dụng lợi thế của phép nhân ma trận dense.
+
+Hơn nữa, SMT thu thập ma trận thưa nhưng vẫn tận dụng ma trận dense. SMT tùy chỉnh hàm để thu thập các tham số có thể huấn luyện. Hàm tùy chỉnh này chọn lọc thu thập các ma trận con trọng số trong các lớp vector Q, K, và V và chuyển chúng đến bộ tối ưu hóa Adam. Bằng cách tiếp tục sử dụng FusedAdam được thiết kế tốt từ thư viện deepspeed [Aminabadi et al., 2022], chúng tôi duy trì tốc độ tính toán của các cập nhật trọng số ma trận dense. Tuy nhiên, phương pháp của chúng tôi giảm chi phí bộ nhớ gradient trong bộ tối ưu hóa xuống chỉ 0.5%.
+
+### 3.3 Tiết kiệm Bộ nhớ và Tính toán: SMT so với Các phương pháp Thích ứng Thứ hạng Thấp
+
+SMT hiệu quả tính toán hơn phương pháp thích ứng trọng số thứ hạng thấp khi số lượng tham số có thể huấn luyện giống nhau, các phương pháp thích ứng trọng số thứ hạng thấp cần duy trì các adapter bổ sung, đòi hỏi tính toán forward bổ sung. Ví dụ, vì LoRA duy trì các adapter A và B, và lan truyền forward là:
+
+h = W₀x + ΔWx = W₀x + BAx (3)
+
+trong đó thuật ngữ BAx yêu cầu tính toán lan truyền forward bổ sung, được cắt bỏ trong SMT.
+
+Về chi phí bộ nhớ, vì SMT không yêu cầu các adapter thứ hạng thấp bổ sung A và B, SMT có thể đạt được chi phí bộ nhớ thấp hơn LoRA và DoRA dưới cùng lượng tham số có thể huấn luyện. Chúng tôi minh họa điều này trong Hình 1, bằng cách từ bỏ trọng số adapter bổ sung A và B, SMT có thể đạt được chi phí bộ nhớ thấp hơn. Lấy mô hình LLaMA-13B phổ biến làm ví dụ, vì kích thước mô hình là khoảng 25 GB, nếu chúng ta tinh chỉnh 1% tham số, SMT có thể tiết kiệm 250MB bộ nhớ GPU. Trong Bảng 1, chúng tôi cung cấp chi phí thời gian tinh chỉnh cho SMT, Tinh chỉnh Đầy đủ, LoRA, và DoRA. SMT đạt được tăng tốc 14.6× so với Tinh chỉnh Đầy đủ và vượt trội hơn cả LoRA và DoRA. Chúng tôi thực hiện profiling thời gian bằng cách tính trung bình thời gian tinh chỉnh mỗi 10 vòng lặp trong 1000 vòng lặp, sau một giai đoạn khởi động 500 vòng lặp. Tinh chỉnh đầy đủ sử dụng cài đặt offload để chứa mô hình LLaMA, sử dụng bộ tối ưu hóa Adam, trong GPU 40GB.
+
+## 4 Thí nghiệm và Kết quả
+
+### 4.1 Cài đặt Thí nghiệm
+
+**Kiến trúc Mô hình và Tập dữ liệu**: Trong thiết lập thí nghiệm của chúng tôi, chúng tôi sử dụng các mô hình LLaMA-7B, LLaMA-13B, LLaMA2-7B, và LLaMA3-8B có trọng số mở [AI@Meta, 2024]. Trong Phần con §4.2 §4.3, Chúng tôi thực hiện tinh chỉnh trên các tác vụ Lý luận Thông thường với 8 tác vụ con, mỗi tác vụ có tập huấn luyện và kiểm tra được định trước. Chúng tôi tuân theo cài đặt của [Hu et al., 2023], [Liu et al., 2024a] và hợp nhất các tập dữ liệu huấn luyện từ tất cả 8 tác vụ để tạo ra tập dữ liệu huấn luyện cuối cùng commonsense_170k và tiến hành đánh giá trên tập dữ liệu kiểm tra riêng lẻ cho mỗi tác vụ. Chúng tôi tính toán điểm trung bình để bao quát hiệu quả tổng thể. Trong Phần con §4.4, chúng tôi thực hiện tinh chỉnh trên tập dữ liệu Math10K [Hu et al., 2023] bao gồm MultiArith, GSM_8K [Cobbe et al., 2021], AddSub, AQuA, SingleEq, các tập dữ liệu SVAMP và đánh giá hiệu quả trên các testset của chúng.
+
+**Framework Huấn luyện và Siêu tham số SMT**: Chúng tôi sử dụng thư viện DeepSpeed [Aminabadi et al., 2022] để tinh chỉnh và thư viện accelerate [Gugger et al., 2022] để đánh giá suy luận. Cả huấn luyện và tinh chỉnh đều sử dụng dtype bf16. Tất cả các thí nghiệm được tinh chỉnh trong 3 epoch. Trong tất cả các thí nghiệm của chúng tôi trong Phần §4, các ma trận con được chọn trong các khối có kích thước l = 256. Chúng tôi chọn chiều ma trận con cụ thể l này vì nó là ước chung lớn nhất của kích thước cột và hàng của tất cả các lớp tuyến tính trong các mô hình dòng LLaMA, việc sử dụng chiều này để cắt tránh các vấn đề dư. Chúng tôi đóng băng tất cả các lớp MLP và chỉ áp dụng SMT cho các vector Q, K, và V trong cơ chế attention. Trong Phần §5.1, chúng tôi giải thích lý do tại sao chúng tôi chỉ áp dụng SMT cho cơ chế attention thay vì MLP. Vào cuối vòng lặp khởi động gradient, SMT xếp hạng các giá trị gradient tuyệt đối trung bình trong mỗi ma trận con và chọn những ma trận có giá trị trung bình cao nhất. Lý do của việc lựa chọn như vậy được giải thích chi tiết hơn trong Phụ lục B. Chúng tôi áp dụng 100 vòng lặp khởi động cho tất cả các thí nghiệm SMT trên tập dữ liệu Commonsense và áp dụng 25 vòng lặp khởi động cho tất cả các thí nghiệm SMT trên tập dữ liệu Math10K.
+
+**Baseline PEFT**: Đối với các baseline hiện đại (SOTA), chúng tôi chọn bao gồm LoRA [Hu et al., 2021] và DoRA [Liu et al., 2024a], cả hai đều tập trung vào tinh chỉnh sử dụng phương pháp thích ứng thứ hạng thấp.
+
+**Tài nguyên Tính toán**: Chúng tôi tiến hành các thí nghiệm của mình và các baseline SOTA của LoRA [Microsoft, 2021] và DoRA [Shih-yang, 2024] để tinh chỉnh mô hình LLaMA-7B và LLaMA2-7B với 4 GPU NVIDIA A100_40GB và tinh chỉnh mô hình LLaMA-13B và LLaMA3-8B với 4 GPU NVIDIA A100_80GB. Giao tiếp giữa CPU và GPU được thực hiện qua PCIe-G4 và giao tiếp giữa các GPU được thực hiện qua Nvlink-3.
+
+**Thước đo Đánh giá**: Chúng tôi đã đánh giá hiệu suất của SMT về hiệu quả tính toán (tăng tốc thời gian thực), sử dụng bộ nhớ (phân tích độ phức tạp bộ nhớ) trong Phần phương pháp luận §3. Trong phần này, chúng tôi sẽ chủ yếu đánh giá SMT về các tác vụ NLP phổ biến để kiểm tra khả năng tổng quát hóa của nó cho tất cả các tác vụ downstream. Trong Phần con §4.2 §4.3, chúng tôi đánh giá hiệu suất của SMT trên 8 tác vụ trong tập dữ liệu Commonsense, bao gồm BoolQ, PIQA, SIQA, HellaSwag, ARC-e, ARC-c, và OBQA, và chúng tôi tính toán điểm trung bình để bao quát hiệu quả tổng thể. Trong Phần con §4.4, chúng tôi thực hiện tinh chỉnh trên tập dữ liệu Math10K [Hu et al., 2023] bao gồm MultiArith, GSM_8K, AddSub, AQuA, SingleEq, các tập dữ liệu SVAMP và đánh giá hiệu quả của SMT trên các testset của chúng. Tất cả các thí nghiệm được đánh giá bằng độ chính xác.
+
+### 4.2 Lý luận Thông thường
+
+Chúng tôi đánh giá SMT so với phương pháp adapter trọng số thứ hạng thấp hiện đại (SoTA) bao gồm LoRA và DoRA. Để đảm bảo so sánh công bằng, chúng tôi tinh chỉnh mô hình với SMT theo cấu hình LoRA và DoRA. Chúng tôi đảm bảo tất cả các siêu tham số bao gồm batch size, kiểu dữ liệu, tốc độ học tập, và độ dài chuỗi đều giống hệt với những gì được báo cáo trong LoRA và DoRA [Hu et al., 2021], [Liu et al., 2024a]. Chúng tôi tái triển khai LoRA và DoRA và đạt được hiệu suất tốt nhất của chúng được báo cáo trong [Liu et al., 2024a].
+
+Bảng 2 chứng minh rằng SMT luôn vượt trội hơn các phương pháp baseline trên LLaMA-7B, LLaMA13B, LLaMA2-7B, và LLaMA3-8B. Đáng chú ý, bằng cách vượt qua hiện tượng cao điểm, SMT tiếp tục nâng cao độ chính xác của DoRA lên 3.0%, 2.8%, 2.9%, và 2% trên LLaMA-7B, LLaMA-13B, LLaMA2-7B, và LLaMA3-8B tương ứng. Đáng chú ý, LoRA và DoRA sẽ không đạt được hiệu suất tốt hơn với các tham số có thể huấn luyện lớn hơn và thể hiện hiện tượng cao điểm. Trong Phần con §4.3, chúng tôi báo cáo và chứng minh vấn đề cao điểm trong LoRA và DoRA và chứng minh SMT vượt qua vấn đề này. Hơn nữa, bằng cách tinh chỉnh ít hơn 5% tất cả tham số, SMT đạt được hiệu suất độ chính xác tương tự như tinh chỉnh đầy đủ trong khi tăng tốc 14.6× (chi tiết tăng tốc trong Bảng 1) và tiết kiệm 99.5% bộ nhớ bộ tối ưu hóa (nút thắt cổ chai bộ nhớ trong tinh chỉnh, chi tiết thảo luận trong Phần §3).
+
+SMT cũng có thể luôn vượt trội hơn LoRA và DoRA dưới cùng số lượng tham số có thể huấn luyện mà LoRA và DoRA đạt được kết quả tốt nhất, SMT có thể vượt qua hiệu suất của chúng và cũng vượt trội hơn ChatGPT-3.5-turbo⁶. Ví dụ, SMT luôn vượt trội hơn DoRA trên LLaMA2-7B, LLaMA3-8B, LLaMA-13B, và LLaMA-7B lần lượt 1.3%, 1.6%, 0.9%, và 0.3%, dưới số lượng tham số có thể huấn luyện hiệu suất tốt nhất của chúng.
+
+### 4.3 Cao điểm trong các phương pháp thích ứng trọng số thứ hạng thấp
+
+Trong Bảng 3 và Hình 3, chúng tôi mở rộng kích thước mô hình và trình bày hiệu suất của LoRA và DoRA sẽ như thế nào dưới số lượng tham số có thể huấn luyện lớn hơn. Chúng tôi tái triển khai tất cả các thí nghiệm của LoRA [Microsoft, 2021] và DoRA [Shih-yang, 2024] sử dụng repository chính thức của chúng và tuân theo khuyến nghị siêu tham số của chúng để đạt được hiệu suất tốt nhất dưới mỗi kích thước tham số có thể huấn luyện đơn lẻ. Chúng tôi quan sát thấy rằng cả mô hình DoRA và LoRA, với một số thứ hạng lớn hơn, hiệu suất của chúng giảm nhẹ. Tuy nhiên, SMT tiếp tục cải thiện hiệu suất của nó khi chúng tôi mở rộng kích thước tham số có thể huấn luyện. Khi chúng tôi mở rộng kích thước tham số có thể huấn luyện lên 4.91%, SMT vượt trội đáng kể hơn DoRA 3.8% và 4.9% trên các mô hình tinh chỉnh LLaMA-7B và LLaMA-2-7B. Chúng tôi giả định rằng hiện tượng cao điểm như vậy của LoRA hoặc DoRA là do xấp xỉ thứ hạng thấp có tổn thất của thông tin trọng số đầy đủ (bao gồm nhiều nhiễu), trong khi SMT của chúng tôi tập trung vào các ma trận con nổi bật nhất (chứa ít nhiễu hơn) và vẫn duy trì các cập nhật gradient thứ hạng đầy đủ cho phần được chọn, làm cho SMT hoạt động tốt hơn.
+
+Hình 3: So sánh độ chính xác của LoRA, DoRA, và SMT dưới các mức độ khác nhau của tham số có thể huấn luyện trên các tập dữ liệu lý luận thông thường.
+
+Bảng 3: So sánh độ chính xác của LoRA, DoRA, và SMT dưới các mức độ khác nhau của tham số có thể huấn luyện trên các tập dữ liệu lý luận thông thường. Với mô hình cơ sở và phương pháp PEFT nhất định, chúng tôi tăng dần số lượng tham số có thể huấn luyện trên mỗi dòng từ trái sang phải. Trên mỗi dòng, mô hình hoạt động tốt nhất có ∗.
+
+| Phương pháp | 0.43 | 0.84 | 1.26 | 2.50 | 3.73 | 4.91 |
+|------------|------|------|------|------|------|------|
+| **LLaMA-7B** |  |  |  |  |  |  |
+| LoRA | 70.9 | 76.3∗ | 76.4 | 75.0 | 75.3 | 74.7 |
+| DoRA | 77.5 | 78.4∗ | 76.0 | 77.3 | 77.5 | 77.6 |
+| SMT | 77.3 | 78.6 | 79.2 | 80.2 | 80.8 | 81.4∗ |
+| **LLaMA2-7B** |  |  |  |  |  |  |
+| LoRA | 76.5 | 77.6∗ | 78.4 | 77.6 | 77.3 | 77.0 |
+| DoRA | 80.5∗ | 79.7 | 78.8 | 77.6 | 76.8 | 78.5 |
+| SMT | 81.1 | 81.8 | 81.7 | 82.2 | 82.8 | 83.4∗ |
+
+Bảng 4: Hiệu suất mô hình LLaMA-7B được tinh chỉnh trên Commonsense. AVG mô tả điểm kiểm tra trung bình của tám tập con trong Commonsense. MLP% và Attention% trình bày phần trăm tham số có thể huấn luyện áp dụng cho MLP và cơ chế attention tương ứng.
+
+| Mô hình | MLP% | Attention% | AVG |
+|---------|------|------------|-----|
+| **SMT(0.84%)** |  |  |  |
+| LLaMA-7B | 0.84 | 0 | 76.7 |
+|  | 0.42 | 0.42 | 77.3 |
+|  | 0.21 | 0.63 | 77.8 |
+|  | 0 | 0.84 | 78.7 |
+
+### 4.4 Tập dữ liệu khác
+
+Để đảm bảo các phát hiện của chúng tôi ở trên có thể tổng quát hóa, chúng tôi tiếp tục kiểm tra hiệu suất của SMT dưới tập dữ liệu lý luận số học, Math10K [Hu et al., 2023]. Tập dữ liệu Math10K có sáu tập con bao gồm GSM8k, SingleEq, SVAMP, MultiArith, AddSub, và AQuA. Thêm chi tiết về tập dữ liệu Math10K có thể được tìm thấy trong Phụ lục C. Để đảm bảo so sánh công bằng, chúng tôi tuân theo hướng dẫn siêu tham số mã nguồn mở trong [Hu et al., 2023] để đạt được hiệu suất tốt nhất cho LoRA và Dora, và áp dụng cùng siêu tham số cho SMT trong khi chỉ tinh chỉnh tốc độ học tập. Bảng 5 báo cáo hiệu suất của LoRA, DoRA, và SMT trên tập dữ liệu Math10K. Chúng tôi có thể quan sát thấy rằng SMT vượt trội hơn hiệu suất có thể đạt được tốt nhất của LoRA và DoRA lần lượt 1.3% và 1.1% khi sử dụng cùng lượng tham số có thể huấn luyện. Ngoài ra, bằng cách mở rộng kích thước mô hình có thể huấn luyện lên 1.26%, SMT đạt được hiệu suất tốt hơn và vượt trội hơn hiệu suất tốt nhất của LoRA và DoRA lần lượt 2.5% và 2.3%.
+
+Bảng 5: Kết quả tái tạo và thí nghiệm SMT, LoRA và DoRA trên tập dữ liệu Math10K.
+
+| Mô hình | Phương pháp PEFT | #Params% | GSM8k | SingleEq | SVAMP | MultiArith | AddSub | AQuA | AVG |
+|---------|------------------|----------|-------|----------|-------|------------|--------|------|-----|
+| **LLaMA-7B** | LoRA(Tốt nhất) | 0.86 | 35.4 | 83.2 | 52.1 | 92.8 | 83.4 | 18.6 | 60.9 |
+|  | DoRA(Tốt nhất) | 0.86 | 35.2 | 83.7 | 51.8 | 92.8 | 82.8 | 20.2 | 61.1 |
+|  | SMT | 0.86 | 34.2 | 84.6 | 53.6 | 91.5 | 85.8 | 23.6 | 62.2 |
+|  | SMT(Tốt nhất) | 1.26 | 35.6 | 85.3 | 54.8 | 93.4 | 86.8 | 24.2 | 63.4 |
+
+Bảng 6: K SMT, Q SMT, và V SMT gán tất cả tham số có thể huấn luyện chỉ cho K, hoặc chỉ Q, hoặc chỉ vector V tương ứng, và tinh chỉnh 0.86% tham số trên LLaMA-7B sử dụng tập dữ liệu Commonsense. QKV SMT gán tất cả tham số có thể huấn luyện cho vector QKV và chọn ma trận con tự động.
+
+| Mô hình | Vị trí Param | #Params% | BoolQ | PIQA | SIQA | HellaSwag | WinoGrande | ARC-e | ARC-c | OBQA | AVG |
+|---------|--------------|----------|-------|------|------|-----------|-------------|-------|-------|------|-----|
+| **LLaMA-7B** | K SMT | 0.84 | 65.5 | 79.1 | 76.2 | 88.3 | 73.2 | 80.3 | 60.8 | 68.0 | 73.9 |
+|  | Q SMT | 0.84 | 65.7 | 79.3 | 75.5 | 88.2 | 72.5 | 80.1 | 59.6 | 72.5 | 75.3 |
+|  | V SMT | 0.84 | 68.7 | 82.1 | 78.1 | 91.6 | 78.8 | 83.0 | 68.7 | 77.2 | 78.5 |
+|  | QKV SMT | 0.84 | 68.7 | 81.7 | 78.3 | 91.6 | 78.8 | 84.1 | 68.7 | 77.4 | 78.7 |
+
+## 5 Thảo luận Thêm
+
+### 5.1 Attention so với MLP
+
+Để nghiên cứu những thành phần nào quan trọng hơn đối với hiệu suất downstream của LLM, chúng tôi tiến hành các nghiên cứu ablation so sánh MLP với các lớp attention bằng cách điều chỉnh tỷ lệ tham số có thể huấn luyện của chúng tương ứng. Chúng tôi áp dụng SMT và tinh chỉnh 0.86% tham số trên LLaMA-7B sử dụng tập dữ liệu Commonsense. Trong Bảng 4, chúng tôi trình bày bốn thí nghiệm. Trong hàng đầu tiên, tất cả tham số có thể huấn luyện được phân bổ cho MLP. Trong hàng thứ hai, cả MLP và vector Q, K, V từ cơ chế attention đều nhận được 0.43% tham số có thể huấn luyện. Trong hàng thứ ba, 0.62% tham số có thể huấn luyện được gán cho vector Q, K, V từ cơ chế attention và 0.21% cho MLP. Trong hàng thứ tư, tất cả tham số có thể huấn luyện được dành riêng cho vector Q, K, V từ cơ chế attention. Để đảm bảo so sánh công bằng, tất cả các siêu tham số và cài đặt khác đều giống nhau giữa những thí nghiệm này.
+
+Trong những thí nghiệm này, việc phân bổ X% tham số có thể huấn luyện cho MLP hoặc cơ chế attention có nghĩa là xếp hạng các giá trị gradient tuyệt đối trung bình của mỗi ma trận con trong MLP hoặc cơ chế attention và chọn những ma trận có giá trị trung bình cao nhất cho đến khi số lượng tham số đạt X%. Kết quả cho thấy một khoảng cách hiệu suất đáng kể giữa hàng đầu tiên và hàng thứ tư. Càng nhiều tham số có thể huấn luyện chúng ta phân bổ cho cơ chế attention, mô hình được tinh chỉnh hoạt động càng tốt. Khi tất cả tham số có thể huấn luyện SMT được áp dụng cho cơ chế attention, mô hình vượt trội hơn mô hình mà tất cả tham số được phân bổ cho MLP 2.0%. Các phát hiện thực nghiệm của chúng tôi thách thức các giả định trước đây [Zhu et al., 2020], [Meng et al., 2022a], [Geva et al., 2020, 2022] rằng các phần bộ nhớ của các mô hình ngôn ngữ lớn chủ yếu nằm trong các lớp MLP feed-forward.
+
+### 5.2 Vector V so với Vector Q, K
+
+Dựa trên quan sát của chúng tôi rằng attention quan trọng hơn, trong tất cả các thí nghiệm SMT của chúng tôi trong Phần §4, chúng tôi chỉ phân bổ tham số có thể huấn luyện SMT cho vector Q, K, V từ cơ chế attention. Chúng tôi xếp hạng các giá trị gradient tuyệt đối trung bình của mỗi ma trận con đơn lẻ trong cơ chế attention và chọn những ma trận có giá trị trung bình cao nhất cho đến khi đạt đến giới hạn tỷ lệ tham số. Đáng ngạc nhiên, chúng tôi quan sát thấy rằng các tham số có thể huấn luyện chủ yếu được gán cho vector V. Trong các thí nghiệm ablation của chúng tôi, chúng tôi thí nghiệm với việc gán tất cả tham số có thể huấn luyện chỉ cho K, hoặc chỉ Q, hoặc chỉ vector V, và tinh chỉnh 0.86% tham số trên LLaMA-7B sử dụng tập dữ liệu Commonsense. Như được hiển thị trong Hình 5, 95.17% tham số có thể huấn luyện được tự động gán cho vector V bởi SMT. Hình 4 chỉ ra rằng tất cả vector V đều có tham số có thể huấn luyện, trong khi 22 vector Q và 21 vector K hoàn toàn bị đóng băng. Điều này gợi ý rằng vector V chứa hầu hết bộ nhớ và quan trọng nhất trong số Q, K, và V.
+
+Hình 4: Một hình ảnh trực quan của các lớp Q, K, V có thể huấn luyện khi tinh chỉnh 0.86% tham số có thể huấn luyện trên LLaMA-7B. LLaMA-7B có 32 lớp MLP, mỗi lớp chứa một vector Q, một vector K, và một vector V. Các lớp màu trắng bị đóng băng và các lớp màu xanh lá cây chứa tham số có thể huấn luyện.
+
+Hình 5: Phân bố tham số có thể huấn luyện giữa Q, K, V.
+
+Bảng 6 trình bày bốn thí nghiệm bổ sung trong đó chúng tôi tinh chỉnh 0.86% tham số của LLaMA-7B sử dụng SMT trên tập dữ liệu Commonsense. Trong ba hàng đầu tiên, tất cả tham số có thể huấn luyện được phân bổ cho vector K, vector Q, và vector V tương ứng. Trong hàng thứ tư, các tham số có thể huấn luyện được gán cho vector Q, K, V trực tiếp và được phân bổ bởi SMT tự động. Các tham số có thể huấn luyện được phân bố giữa các vector K, Q, và V, như được chi tiết trong Hình 5, với trạng thái có thể huấn luyện của các lớp QKV được hiển thị trong Hình 4.
+
+Kết quả cho thấy một khoảng cách hiệu suất đáng kể khi so sánh việc phân bổ tất cả tham số có thể huấn luyện cho vector V so với vector Q và K. Việc gán tất cả tham số cho vector V vượt trội hơn vector K 4.6% và vector Q 3.2%. Những quan sát này gợi ý rằng vector V quan trọng nhất trong số các vector Q, K, và V; nó cũng gợi ý rằng SMT có thể hiệu quả chọn các ma trận con chứa các phần bộ nhớ quan trọng.
+
+## 6 Kết luận
+
+Tinh chỉnh Ma trận Thưa (SMT) được đề xuất của chúng tôi đạt được hiệu suất SoTA, thu hẹp khoảng cách giữa SMT và tinh chỉnh đầy đủ. SMT cũng có thể giảm chi phí tính toán của lan truyền ngược, cập nhật tham số, bộ nhớ bộ tối ưu hóa, và bộ nhớ activation trong quá trình tinh chỉnh để đạt được tăng tốc 14.6×. Bằng chứng thực nghiệm được trình bày trong các thí nghiệm rộng rãi của chúng tôi gợi ý rằng các lớp attention quan trọng hơn MLP đối với hiệu suất downstream; vector V là vector có ảnh hưởng nhất đối với hiệu suất trong số các vector Q, K, V.
+
+## 7 Lời cảm ơn
+
+Chúng tôi chân thành cảm ơn Sida Wang vì những đóng góp có giá trị của cô ấy cho dự án này, bao gồm phát triển và hoàn thiện phương pháp luận triển khai, tạo ra những kết quả thí nghiệm quan trọng đã củng cố bài thuyết trình hội nghị của chúng tôi, và hỗ trợ việc phát hành mã nguồn mở của codebase.
+
+Chúng tôi cũng mở rộng lòng biết ơn đến Qianou (Christina) Ma, Chenyang Yang, Chen Liu, và Yu (Ivy) Yang vì những gợi ý trong việc viết bài báo và phản hồi có giá trị của họ.
+
+Nghiên cứu này sử dụng Bridges-2 tại Trung tâm Siêu máy tính Pittsburgh (PSC) và máy tính tiên tiến Delta. Trung tâm Siêu máy tính Pittsburgh được hỗ trợ bởi các grant của Quỹ Khoa học Quốc gia #2138259, #2138286, #2138307, #2137603, và #2138296. Máy tính tiên tiến Delta được hỗ trợ bởi Quỹ Khoa học Quốc gia (giải thưởng OAC 2005572) và Bang Illinois. Delta là một nỗ lực chung của Đại học Illinois Urbana-Champaign và Trung tâm Quốc gia cho Ứng dụng Siêu máy tính của nó.
+
+Mặc dù Heather Miller và Juncheng Billy Li là nhân viên của Two Sigma Investments, công việc này được thực hiện độc lập với Two Sigma Investments.

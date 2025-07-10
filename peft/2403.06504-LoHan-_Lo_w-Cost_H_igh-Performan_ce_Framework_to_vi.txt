@@ -1,0 +1,580 @@
+# LoHan: Khung Tương Tác Chi Phí Thấp Hiệu Suất Cao để Tinh Chỉnh Mô Hình 100B trên GPU Tiêu Dùng
+
+Changyue Liao∗†, Mo Sun∗†, Zihan Yang∗†, Jun Xie†, Kaiqi Chen†, Binhang Yuan‡, Fei Wu†, Zeke Wang†
+†Đại học Chiết Giang, Trung Quốc
+‡HKUST, Trung Quốc
+
+Tóm tắt—Ngày nay, các nhà nghiên cứu AI ngày càng quan tâm đến việc tinh chỉnh một LLM được đào tạo trước, có kích thước đã tăng lên tới hơn 100B tham số, cho các tác vụ downstream của họ. Một cách tiếp cận để tinh chỉnh các mô hình khổng lồ như vậy là tập hợp bộ nhớ thiết bị từ nhiều GPU. Tuy nhiên, cách tiếp cận này gây ra chi phí cấm đoán cho hầu hết các nhà khoa học dữ liệu với ngân sách hạn chế cho các máy chủ GPU cao cấp. Trong bài báo này, chúng tôi tập trung vào việc tinh chỉnh LLM trên một GPU cấp độ tiêu dùng đơn lẻ trong một máy chủ thông thường với dung lượng bộ nhớ chính hạn chế, điều này có thể tiếp cận được với hầu hết các nhà nghiên cứu AI. Trong kịch bản như vậy, các phương pháp dựa trên offloading hiện tại không thể tinh chỉnh một LLM một cách hiệu quả do thiếu quản lý di chuyển tensor intra-server toàn diện. Để giải quyết vấn đề này, chúng tôi trình bày LoHan, một khung đào tạo học sâu chi phí thấp, hiệu suất cao cho phép tinh chỉnh mô hình quy mô 100B hiệu quả trên một máy chủ thông thường với GPU cấp độ tiêu dùng và dung lượng bộ nhớ chính hạn chế. Ý tưởng chính là thêm lưu lượng offloading toàn diện như một chiều tối ưu hóa cho 1) offloading gradient chủ động, và 2) cơ chế hoán đổi kích hoạt nhận thức về lưu lượng toàn diện. Kết quả thử nghiệm cho thấy rằng 1) LoHan là hệ thống đầu tiên tinh chỉnh mô hình 175B trên RTX 4090 và 256 GB bộ nhớ chính, 2) LoHan đạt được thông lượng 2.32× so với các baseline tiên tiến nhất khi tinh chỉnh một mô hình 13B nhỏ, và 3) LoHan cho phép GPU tiêu dùng chi phí thấp có hiệu quả chi phí cao hơn so với cụm DGX-A100 khi tinh chỉnh mô hình 175B.
+
+I. GIỚI THIỆU
+
+Các mô hình ngôn ngữ lớn (LLM) đã đạt được độ chính xác ấn tượng trong các công việc xử lý ngôn ngữ tự nhiên [1]–[5] và các tác vụ quản lý dữ liệu [6], [7]. Có một nhu cầu mạnh mẽ đối với các nhà khoa học dữ liệu để tinh chỉnh một LLM được đào tạo trước để sử dụng cho các tác vụ AI downstream [8], [9]. Tuy nhiên, kích thước mô hình của các LLM đang tăng nhanh. Các mô hình transformer mã nguồn mở lớn nhất để tinh chỉnh trong những năm gần đây đã tăng lên hơn 100 tỷ (100B) tham số [10].¹ Tinh chỉnh một mô hình 100B đòi hỏi lưu trữ ~2.6 TB tensor tạm thời và cố định tại thời điểm cao điểm, trong khi GPU trung tâm dữ liệu mới nhất trên thị trường chỉ có tới 188 GB bộ nhớ thiết bị [11].
+
+Một cách tiếp cận bản địa để lưu trữ các mô hình khổng lồ là tập hợp bộ nhớ thiết bị từ nhiều GPU trung tâm dữ liệu trên các cụm cao cấp như nền tảng DGX [12] để tinh chỉnh mô hình quy mô 100B [13]–[30]. Ví dụ, cần 32 × $14177 GPU NVIDIA A100 với 80 GB bộ nhớ thiết bị để tinh chỉnh một mô hình với 100B tham số, vì vậy việc chứa một cụm GPU cao cấp gây ra chi phí cấm đoán cho hầu hết các nhà khoa học dữ liệu có ngân sách hạn hẹp.
+
+Trong bài báo này, chúng tôi nhằm khám phá liệu có khả thi để tinh chỉnh hiệu quả một LLM quy mô 100B trên một GPU 4090 cấp độ tiêu dùng đơn lẻ ($1600, tối đa 24 GB bộ nhớ thiết bị) với dung lượng bộ nhớ chính hạn chế (256 GB). Một giải pháp như vậy sẽ hấp dẫn các nhà nghiên cứu tìm cách tối thiểu hóa chi phí tinh chỉnh LLM. Để làm điều này, các công trình chi phí thấp hiện tại [31]–[36] offload các tensor trong quá trình tinh chỉnh từ bộ nhớ GPU sang bộ nhớ NVMe để tối đa hóa kích thước mô hình có thể đào tạo. Tuy nhiên, chúng tôi xác định rằng các hệ thống trang bị SSD này gặp phải hai vấn đề nghiêm trọng: thông lượng thấp và kích thước mô hình có thể đào tạo tối đa nhỏ.
+
+• Offloading Tensor Kích Hoạt sang SSD. Đào tạo LLM bao gồm hai loại tensor, cụ thể là kích hoạt và trạng thái mô hình. Các hệ thống hiện tại như FlashNeuron [37] chỉ offload kích hoạt sang SSD và giữ trạng thái mô hình trong bộ nhớ GPU. Chúng tôi thấy rằng việc giữ trạng thái mô hình trong bộ nhớ GPU hạn chế nghiêm trọng kích thước mô hình có thể đào tạo. Ví dụ, FlashNeuron chỉ có thể tinh chỉnh mô hình 1.55B trên RTX 4090, trong khi tinh chỉnh mô hình 175B (kích thước điển hình của mô hình quy mô 100B [2], [38]) đòi hỏi ~2.45 TB bộ nhớ GPU, vượt xa dung lượng bộ nhớ của GPU.
+
+• Offloading Tensor Trạng Thái Mô Hình sang SSD. Các hệ thống hiện tại như ZeRO-Infinity [39] và Colossal-AI [40] offload trạng thái mô hình sang NVMe SSD [41]–[43] để mở rộng kích thước mô hình có thể đào tạo. Chúng tôi xác định rằng các hệ thống này có ba vấn đề trong việc tinh chỉnh mô hình, như được hiển thị trong Hình 1a. Đầu tiên, các hệ thống này gặp phải tỷ lệ sử dụng GPU thấp, chủ yếu do chúng thực hiện Adam² CPU out-of-core đồng bộ [44] trong giai đoạn optimizer nơi GPU nhàn rỗi. Giai đoạn này chiếm 30% ~60% của một lần lặp đào tạo. Thứ hai, các hệ thống này chỉ offload kích hoạt khối inter-transformer (6% tổng kích hoạt) sang bộ nhớ chính và tính toán lại phần còn lại của kích hoạt. Phương pháp offloading như vậy dẫn đến 5.7 giây (22% giai đoạn backward) chi phí tính toán lại GPU bổ sung trong giai đoạn backward nơi băng thông PCIe bị sử dụng dưới mức. Thứ ba, các hệ thống này chỉ offload kích hoạt sang bộ nhớ chính, do đó đòi hỏi một lượng lớn bộ nhớ chính để tinh chỉnh một LLM. Chúng tôi ước tính rằng ZeRO-Infinity đòi hỏi ~1.1 TB bộ nhớ chính để tinh chỉnh mô hình 175B, trong khi hầu hết các máy chủ thông thường chỉ trang bị 128 GB ~1 TB bộ nhớ chính.
+
+² Ở đây chúng tôi đề cập đến optimizer out-of-core như optimizer thực hiện trên CPU thay vì GPU (tức là "optimizer in-core"). Cũng có các công trình như Angel-PTM [31] trình bày optimizer out-of-core bất đồng bộ. Tuy nhiên, chính sách cập nhật optimizer bất đồng bộ có thể ảnh hưởng đến sự hội tụ đào tạo mô hình. Do đó, chúng nằm ngoài phạm vi của bài báo này.
+
+• Naively Offloading Cả Tensor Trạng Thái Mô Hình và Tensor Kích Hoạt sang SSD. Các hệ thống hiện tại như G10 [45] offload cả trạng thái mô hình và kích hoạt sang SSD và thực hiện optimizer Adam trên GPU. Chúng tôi xác định rằng các hệ thống này có ba vấn đề, như được hiển thị trong Hình 1b. Đầu tiên, việc thực hiện optimizer Adam trên GPU đòi hỏi chuyển giao trạng thái mô hình lớn giữa GPU và NVMe SSD, khiến việc tính toán GPU 0.1 giây phải chờ 13 giây chuyển giao trạng thái mô hình. Thứ hai, các hệ thống này offload tất cả kích hoạt (213 GB khi tinh chỉnh mô hình 13B với kích thước batch 32) sang SSD, khiến việc tính toán GPU 5.9 giây phải chờ 10 giây chuyển giao kích hoạt trong giai đoạn forward. Thứ ba, các hệ thống này dựa vào công nghệ GPUDirect [46] không có sẵn cho GPU cấp độ tiêu dùng.
+
+Tóm lại, chúng không có quản lý tensor intra-server toàn diện, điều này cản trở việc tinh chỉnh hiệu quả trên mô hình 100B khi offloading kích hoạt hoặc trạng thái mô hình vào SSD.
+
+Để giải quyết vấn đề này, chúng tôi trình bày LoHan, một khung đào tạo học sâu chi phí thấp hiệu suất cao cho phép tinh chỉnh mô hình 100B hiệu quả trên một máy chủ thông thường với GPU cấp độ tiêu dùng và dung lượng bộ nhớ chính hạn chế. Ý tưởng chính là thêm lưu lượng offloading toàn diện như một chiều tối ưu hóa. Như vậy, LoHan cho phép GPU thông thường không có GPUDirect tinh chỉnh hiệu quả một mô hình khổng lồ, có kích thước bị hạn chế bởi dung lượng SSD, thay vì kích thước bộ nhớ chính/GPU, khi cả trạng thái mô hình và kích hoạt đều được offload sang NVMe SSD. Để thực hiện điều này, LoHan bao gồm hai đổi mới. Đầu tiên, đối với trạng thái mô hình, LoHan trình bày công nghệ offloading gradient chủ động đầu tiên cho phép thực hiện optimizer CPU out-of-core trực tiếp tiêu thụ gradient từ GPU sang CPU, nhằm ẩn việc thực hiện optimizer CPU sau tính toán GPU. Thứ hai, đối với kích hoạt, LoHan đề xuất quản lý hoán đổi kích hoạt nhận thức về lưu lượng toàn diện để tự động xác định lượng kích hoạt hoán đổi sao cho thời gian epoch được tối thiểu hóa khi đào tạo trên một GPU đơn lẻ trong một máy chủ thông thường. Tóm lại, bài báo này đóng góp như sau:
+
+• Chúng tôi nghiên cứu các chiến lược offloading hiện tại và xác định các vấn đề về thông lượng thấp và kích thước mô hình có thể đào tạo tối đa nhỏ do thiếu quản lý tensor intra-server toàn diện.
+
+• Để tối ưu hóa lưu lượng offloading toàn diện, chúng tôi thiết kế công nghệ offloading gradient chủ động và quản lý hoán đổi kích hoạt nhận thức về lưu lượng toàn diện để chồng lấp offloading và tính toán nhằm tối đa hóa tỷ lệ sử dụng GPU.
+
+• Chúng tôi triển khai LoHan trên khung học sâu PyTorch [47]. Các đánh giá cho thấy LoHan 1) là hệ thống đầu tiên tinh chỉnh mô hình 175B trên RTX 4090 và 256 GB bộ nhớ chính, 2) đạt được thông lượng lên tới 2.32× so với các baseline tiên tiến nhất khi tinh chỉnh mô hình 13B nhỏ, và 3) cho phép GPU tiêu dùng chi phí thấp có hiệu quả chi phí cao hơn so với máy DGX-A100.
+
+II. CƠ SỞ LÝ THUYẾT
+
+Giai Đoạn Đào Tạo LLM. Một mô hình bao gồm L lớp các hàm toán học fi(x,Pi), 1≤i≤L, trong đó i biểu thị ID lớp, x biểu thị đầu vào và P biểu thị các tham số có thể đào tạo của nó. Quy trình đào tạo cần nhiều lần lặp đào tạo để mô hình hội tụ. Mỗi lần lặp bao gồm ba giai đoạn:
+
+• 1) Lan truyền tiến, nơi mô hình lấy dữ liệu đào tạo a0 làm đầu vào, tính toán kích hoạt ai=fi(ai−1,Pi) như các giá trị trung gian cho mỗi lớp i liên tiếp và nhận giá trị mất mát lL=y−aL, trong đó y biểu thị đầu ra mong đợi.
+
+• 2) Lan truyền ngược, nơi mô hình thực hiện hai tính toán cho mỗi lớp i theo thứ tự ngược lại để nhận gradient được sử dụng cho cập nhật mô hình: đầu tiên, mỗi lớp lấy giá trị mất mát li và tính toán giá trị mất mát được chuyển đến lớp trước li−1=∇ai−1fi(ai−1,Pi)Tli; thứ hai, nó tính toán gradient của lớp Gi=∇Pifi(ai−1,Pi)Tli.
+
+• 3) Thực hiện optimizer, nơi các tham số được cập nhật theo gradient, tức là Pupdated=o(G,P), trong đó o là hàm optimizer. Khi đào tạo LLM, optimizer Adam [44] thường được áp dụng để tăng sự hội tụ của mô hình, điều này giới thiệu các trạng thái optimizer phụ để làm mịn quá trình cập nhật tham số.
+
+Ký hiệu. Bảng I liệt kê các ký hiệu được sử dụng trong phần còn lại của bài báo.
+
+Dấu chân Bộ nhớ. Theo quy trình đào tạo được giới thiệu ở trên, một lần lặp đào tạo LLM đòi hỏi lưu trữ các tensor sau: 1) Trạng thái mô hình, bao gồm tham số P32, trạng thái optimizer OS32, gradient G16, và bản sao tham số độ chính xác thấp P16 cho tính toán GPU; và 2) kích hoạt A16. Bảng II kết luận kích thước và chu kỳ sống của các tensor trong một lần lặp. Các giá trị mất mát được tiêu thụ trực tiếp sau khi được tạo ra, và do đó không được thảo luận ở đây.
+
+Offloading Tensor. Khi không áp dụng kỹ thuật tiết kiệm bộ nhớ nào, tất cả các tensor được tạo ra, lưu trữ và tiêu thụ trong bộ nhớ GPU. Offloading tensor là một kỹ thuật di chuyển một phần hoặc tất cả các tensor từ bộ nhớ GPU sang bộ nhớ chính hoặc SSD sau khi tensor được tạo ra bởi GPU, và di chuyển tensor trở lại bộ nhớ GPU trước khi tensor được tiêu thụ bởi GPU, nhằm giảm dấu chân bộ nhớ GPU. Quy trình offloading tạm thời một tensor được gọi là hoán đổi.
+
+Optimizer CPU. Offloading thực hiện optimizer sang CPU [34] là một công nghệ để giảm lưu lượng PCIe của GPU. Optimizer CPU loại bỏ việc chuyển giao tham số và trạng thái optimizer nặng nề giữa GPU và bộ nhớ chính vì khi offloading trạng thái mô hình sang NVMe SSD, P32 và OS32 được tạo ra bởi optimizer CPU trong bộ nhớ chính được di chuyển trực tiếp sang SSD. Ngược lại, P32 và OS32 được tạo ra bởi optimizer GPU trong bộ nhớ GPU cần di chuyển trước sang bộ nhớ chính, sau đó sang SSD.
+
+Tính toán lại Kích hoạt. Tính toán lại kích hoạt [48] là một kỹ thuật tiết kiệm bộ nhớ nơi chỉ một tập con của kích hoạt được giữ trong bộ nhớ trong quá trình lan truyền tiến trong khi những kích hoạt khác bị loại bỏ. Trong quá trình lan truyền ngược, khi thực hiện lan truyền ngược của một lớp có kích hoạt đầu vào bị loại bỏ, lan truyền tiến bổ sung từ kích hoạt được lưu cuối cùng được thực hiện để lấy kích hoạt bị loại bỏ. Quy trình lan truyền tiến bổ sung được gọi là tính toán lại.
+
+III. ĐỘNG LỰC
+
+Trong phần này, chúng tôi xác định các vấn đề của các công trình dựa trên offloading hiện tại, điều này thúc đẩy việc thiết kế LoHan.
+
+A. Vấn đề của Các Phương pháp: Offloading Kích hoạt sang SSD
+
+Các công trình hiện tại như FlashNeuron [37] offload kích hoạt sang SSD để đào tạo mô hình lớn hơn. Tuy nhiên, các hệ thống này giữ trạng thái mô hình trên bộ nhớ GPU, do đó hạn chế nghiêm trọng kích thước mô hình có thể đào tạo tối đa.
+
+Để minh họa vấn đề này, chúng tôi triển khai một nguyên mẫu của FlashNeuron và tinh chỉnh LLM trên máy chủ được đánh giá của chúng tôi (triển khai chi tiết và cấu hình máy chủ được hiển thị trong Phần V-A). Kết quả thử nghiệm trong Hình 2a cho thấy rằng FlashNeuron thậm chí không thể tinh chỉnh mô hình 6B, đây là quy mô phổ biến của các LLM được đào tạo trước ngày nay [9], [10], [38].
+
+B. Vấn đề của Các Phương pháp: Offloading Trạng thái Mô hình sang SSD
+
+Các hệ thống như ZeRO-Infinity [39] và Colossal-AI [40] offload trạng thái mô hình sang SSD để đào tạo mô hình lớn hơn. Đồng thời, họ đề xuất Adam CPU [44] thực hiện optimizer hiệu quả trong CPU. Các hệ thống này hoạt động kém trong máy chủ thông thường như vậy.³ Trong phần tiếp theo, chúng tôi xác định ba vấn đề cụ thể của các hệ thống này.
+
+1. Chi phí Thực hiện Optimizer Nặng nề. Các hệ thống này thực hiện optimizer CPU sau khi lan truyền ngược của toàn bộ mô hình kết thúc, như Hình 1a cho thấy. Do đó, việc thực hiện optimizer CPU không chồng lấp với tính toán GPU, và GPU hoàn toàn nhàn rỗi trong giai đoạn optimizer. Khi đào tạo trong cụm DGX cao cấp với nhiều CPU cao cấp, optimizer CPU đóng góp một tỷ lệ thời gian tầm thường. Tuy nhiên, khi tinh chỉnh trên một máy chủ thông thường với ít CPU, việc thực hiện optimizer chiếm một phần đáng kể của thời gian đào tạo, dẫn đến tỷ lệ sử dụng GPU thấp trong quá trình đào tạo.
+
+Để minh họa điều này, chúng tôi phân tích định lượng tỷ lệ thời gian GPU bận rộn so với tổng thời gian trôi qua khi tinh chỉnh các mô hình khác nhau bằng ZeRO-Infinity. Hình 2b cho thấy rằng GPU chỉ bận rộn trong 36% của một lần lặp, ngay cả khi mô hình tương đối nhỏ (như 13B) và kích thước batch đủ lớn để bão hòa tài nguyên tính toán GPU (như 32). Colossal-AI đạt được tỷ lệ sử dụng GPU thậm chí còn thấp hơn (GPU chỉ bận rộn 12% của một lần lặp, không hiển thị trong hình).
+
+Để hiển thị chi phí của việc thực hiện optimizer, chúng tôi đo tỷ lệ thời gian của giai đoạn optimizer trong ZeRO-Infinity khi tinh chỉnh các mô hình khác nhau trong Hình 2c. Việc thực hiện optimizer chiếm 30% ~60% của bước đào tạo.
+
+2. Chi phí Tính toán lại Kích hoạt Quá mức. Các hệ thống này áp dụng chiến lược quản lý kích hoạt tĩnh. Cụ thể, họ offload kích hoạt khối inter-transformer (12.5 GB cho mô hình 13B với kích thước batch 32) sang bộ nhớ chính và tính toán lại tất cả kích hoạt khối intra-transformer (200 GB cho mô hình 13B với kích thước batch 32). Tính toán lại kích hoạt giới thiệu tính toán GPU bổ sung trong quá trình lan truyền ngược vì tính toán GPU thường mất nhiều thời gian hơn chuyển giao tensor PCIe khi tinh chỉnh với kích thước batch lớn. Ví dụ, khi tinh chỉnh mô hình 13B với kích thước batch 32, lan truyền ngược GPU không có tính toán lại mất 1.91× lâu hơn thời gian I/O SSD và 1.88× lâu hơn chuyển giao kích hoạt và gradient GPU-CPU, do đó tính toán GPU là nút thắt cổ chai. Do đó, chiến lược tính toán lại này gây ra chi phí tính toán GPU trong quá trình lan truyền ngược.
+
+Để minh họa điều này, chúng tôi sử dụng ZeRO-Infinity để tinh chỉnh mô hình 13B và phân tích thời gian đào tạo của nó, như Hình 1a cho thấy. Chuyển giao tensor GPU-bộ nhớ chính PCIe G2M và chuyển giao tensor bộ nhớ chính-SSD PCIe SSD chỉ mất 3.18 và 6.25 giây tương ứng trong giai đoạn backward, trong khi tính toán GPU mất 17.6 giây, chỉ ra rằng tính toán lại kích hoạt quá mức của ZeRO-Infinity giới thiệu chi phí tính toán GPU.
+
+3. Kích thước Mô hình Có thể Đào tạo Hạn chế dưới Dung lượng GPU/Bộ nhớ Chính Hạn chế. ZeRO-Infinity chỉ offload kích hoạt sang bộ nhớ chính, như Hình 1a cho thấy, và Colossal-AI không offload kích hoạt sang bộ nhớ chính hoặc SSD. Các hệ thống này không offload kích hoạt sang SSD vì điều đó gây ra áp lực bổ sung lên I/O SSD và giới thiệu độ phức tạp thiết kế bổ sung. Tuy nhiên, việc lưu trữ kích hoạt trong GPU và bộ nhớ chính hạn chế kích thước mô hình có thể đào tạo tối đa khi tinh chỉnh trong một máy chủ với GPU và bộ nhớ chính hạn chế.
+
+Để minh họa điều này, chúng tôi tinh chỉnh LLM với kích thước khác nhau với hai hệ thống trong máy chủ được đánh giá của chúng tôi (cấu hình chi tiết xem Phần V-A). Chúng tôi đặt kích thước batch thành 1 để tối thiểu hóa ảnh hưởng của kích hoạt. Hình 2a cho thấy kích thước mô hình có thể đào tạo tối đa với hai hệ thống. Họ không thể tinh chỉnh mô hình 175B trong máy chủ được đánh giá của chúng tôi với bộ nhớ chính 768GB.
+
+C. Vấn đề của Các Phương pháp: Naively Offloading Cả Trạng thái Mô hình và Kích hoạt sang SSD
+
+Một công trình gần đây là G10 [45] hỗ trợ offloading cả trạng thái mô hình và kích hoạt sang bộ nhớ chính/NVMe thống nhất, về mặt lý thuyết hỗ trợ tinh chỉnh mô hình quy mô 100B với GPU và bộ nhớ chính khan hiếm. G10 không xem xét tính toán lại kích hoạt trong tinh chỉnh mô hình và offload hầu như tất cả kích hoạt sang SSD. Bên cạnh đó, nó thực hiện optimizer Adam trên GPU, như hầu hết các hệ thống đào tạo mô hình in-GPU làm. Chúng tôi xác định rằng G10 có ba vấn đề trong tinh chỉnh LLM.
+
+1. Chi phí Chuyển giao Trạng thái Mô hình Nặng nề. G10 thực hiện optimizer trên GPU, điều này giới thiệu chuyển giao trạng thái mô hình lớn (182 GB mỗi hướng cho mô hình 13B) trên liên kết PCIe trong quá trình thực hiện optimizer, gây ra chi phí chuyển giao PCIe nặng nề.
+
+Để minh họa điều này, chúng tôi mô phỏng hiệu suất của G10 khi tinh chỉnh mô hình 13B trên RTX 4090 với kích thước batch 32 giả sử GPUDirect có sẵn và tính toán GPU và chuyển giao PCIe được pipelined đầy đủ. Hình 1b cho thấy kết quả. Chúng tôi quan sát thấy rằng optimizer GPU chỉ mất 0.1 giây trong giai đoạn này, trong khi chuyển giao PCIe mất 13 giây (37% thời gian lặp).
+
+2. Chi phí Chuyển giao Kích hoạt Cao. G10 offload tất cả kích hoạt sang bộ nhớ chính và sau đó sang SSD không có tính toán lại, điều này gây ra chuyển giao kích hoạt lớn (213 GB cho mô hình 13B với kích thước batch 32) trên cổng PCIe của GPU, dẫn đến tỷ lệ sử dụng GPU thấp trong quá trình lan truyền tiến. Để minh họa điều này, chúng tôi phân tích thời gian đào tạo của giai đoạn forward, nơi offloading kích hoạt mất 10 giây, vượt xa thời gian tính toán GPU (5.96s). Chi phí hiệu suất này sẽ nghiêm trọng hơn nếu chúng tôi dự định chồng lấp thực hiện optimizer và lan truyền ngược có thời gian bị giới hạn bởi tính toán GPU, như một số công trình hiện tại [49]. Mô phỏng tương ứng của chúng tôi cho thấy rằng chuyển giao PCIe chiếm gần 100% thời gian giai đoạn forward và giai đoạn backward-optimizer chồng lấp, trong khi tính toán GPU chỉ chiếm 59% thời gian giai đoạn forward và 69% thời gian giai đoạn backward-optimizer chồng lấp, chỉ ra rằng chuyển giao PCIe cho trạng thái mô hình và kích hoạt trở thành nút thắt cổ chai trong suốt toàn bộ quá trình đào tạo!
+
+3. Yêu cầu GPUDirect. G10 phụ thuộc sâu vào GPUDirect cho offloading tensor. Tuy nhiên, GPU cấp độ tiêu dùng không hỗ trợ GPUDirect, do đó G10 không thể chạy trên GPU cấp độ tiêu dùng.
+
+IV. THIẾT KẾ LOHAN
+
+A. Tổng quan Thiết kế
+
+Để giải quyết các vấn đề của các công trình hiện tại, chúng tôi trình bày LoHan, một hệ thống quản lý tensor toàn diện cho phép tinh chỉnh mô hình 100B chi phí thấp hiệu quả trên một máy chủ thông thường với GPU cấp độ tiêu dùng và dung lượng bộ nhớ chính hạn chế. Ý tưởng chính là thêm quản lý offloading tensor toàn diện như một chiều tối ưu hóa. Như vậy, LoHan đạt được tỷ lệ sử dụng GPU cao khi tinh chỉnh mô hình 100B, ngay cả khi offloading cả trạng thái mô hình và kích hoạt sang NVMe SSD.
+
+Để thực hiện điều này, LoHan bao gồm ba thành phần chính:
+1) profiling nhận thức về phần cứng thu thập dữ liệu thiết yếu cho quản lý trạng thái mô hình và kích hoạt (Phần IV-B),
+2) offloading gradient chủ động cho phép thực hiện optimizer CPU out-of-core trực tiếp tiêu thụ gradient từ GPU sang CPU, nhằm ẩn việc thực hiện optimizer CPU sau tính toán GPU (Phần IV-C), và
+3) quản lý hoán đổi kích hoạt nhận thức về lưu lượng toàn diện tự động xác định lượng kích hoạt hoán đổi để tiến một bước tối thiểu hóa thời gian epoch (Phần IV-D). Hình 1c minh họa tổng quan về LoHan.
+
+B. Profiling Nhận thức về Phần cứng
+
+Trong giai đoạn profiling nhận thức về phần cứng, LoHan tự động thu thập dữ liệu thiết yếu từ cả cài đặt mô hình và phần cứng, được yêu cầu bởi các thành phần tiếp theo.
+
+Mục tiêu Profiling. Giai đoạn profiling nhằm cung cấp bộ nhớ chính chưa phân bổ tối thiểu MEMavail_M, tổng thời gian trôi qua của giai đoạn forward Tf và giai đoạn backward Tb, số lượng tham số mô hình P, kích thước kích hoạt mô hình Aall, thông lượng GPU cao điểm THPG, băng thông PCIe tối đa giữa GPU và bộ nhớ chính BWG, băng thông PCIe SSD sang bộ nhớ chính tối đa BWS2M, băng thông PCIe bộ nhớ chính sang SSD tối đa BWM2S, và số lượng phép toán dấu phẩy động GPU của mỗi lớp, được yêu cầu bởi quản lý hoán đổi kích hoạt nhận thức về lưu lượng toàn diện.
+
+Chi tiết Profiling. LoHan phân tích định nghĩa mô hình PyTorch trong quá trình khởi tạo để có được P, Aall, và số lượng phép toán dấu phẩy động GPU của mỗi lớp mô hình. Trong giai đoạn profiling, LoHan chỉ offload kích hoạt inter-layer và tính toán lại phần còn lại của kích hoạt, giống như ZeRO-Infinity, nhằm tối thiểu hóa chi phí offloading kích hoạt trong khi đảm bảo quá trình tính toán lại không vượt quá giới hạn bộ nhớ GPU. Bên cạnh đó, LoHan offload tất cả kích hoạt và trạng thái mô hình sang NVMe SSD ở giai đoạn này mà không có bất kỳ tối ưu hóa nào thêm để phân tích chính xác chi phí tính toán và truyền thông. Chúng tôi ghi lại thời gian tính toán của mỗi lớp trong mô hình trong quá trình lan truyền tiến để tính toán THPG. Để có được BWG, BWS2M, và BWM2S, LoHan lấy cấu trúc liên kết hệ thống từ cài đặt phần cứng trong quá trình khởi tạo, và giám sát lưu lượng PCIe trong giai đoạn profiling, nhằm ước tính băng thông PCIe của mỗi liên kết.
+
+Chi phí Profiling. Chúng tôi thực hiện giai đoạn profiling nhận thức về phần cứng chỉ trong lần lặp đầu tiên, mất khoảng 2 ~3× lần lâu hơn so với lần lặp tiếp theo. Tinh chỉnh một LLM đòi hỏi hàng nghìn lần lặp để hội tụ, vì vậy chi phí profiling không đáng kể so với toàn bộ quá trình tinh chỉnh.
+
+C. Offloading Gradient Chủ động
+
+Lấy cảm hứng từ Active Messages [50] cho phép người gửi chỉ định một handler cấp người dùng cùng với mỗi thông điệp và yêu cầu người nhận ngay lập tức gọi handler trên khi thông điệp đến với thân thông điệp làm đối số, chúng tôi trình bày công nghệ offloading gradient chủ động cho phép CPU thực hiện thực hiện optimizer CPU out-of-core (tức là handler cấp người dùng) khi bộ nhớ chính nhận gradient được offload (thân thông điệp) từ GPU, thay vì offload thêm sang SSD. Như vậy, LoHan có cơ hội chồng lấp việc thực hiện optimizer CPU với lan truyền ngược GPU. Trong phần tiếp theo, chúng tôi trình bày thách thức cụ thể, tiếp theo bởi offloading gradient chủ động naïve và offloading gradient chủ động được tối ưu hóa.
+
+Thách thức. Trạng thái mô hình của mô hình 100B được lưu trữ trong SSD băng thông thấp và độ trễ cao, do đó khai thác cơ hội như vậy đi kèm với một thách thức chính. Cụ thể, làm thế nào để cho phép optimizer CPU out-of-core tiêu thụ hiệu quả gradient được offload từ GPU trong quá trình lan truyền ngược, vì chúng cạnh tranh băng thông PCIe hạn chế.
+
+Offloading Gradient Chủ động Naïve. Do tính chất xếp chồng của các khối transformer, chúng tôi giả sử các tensor gradient đến optimizer CPU một cách tuần tự với chỉ số giảm dần trong giai đoạn backward. Khi tensor gradient i đến bộ nhớ chính, việc thực hiện optimizer của nó (handler do người dùng định nghĩa) bao gồm ba bước, như được hiển thị trong Hình 3a. Đầu tiên, trong bước SSD→Main, SSD ghi trạng thái mô hình tương ứng của tensor mô hình i sang bộ nhớ chính. Thứ hai, trong bước CPU Compute, CPU cập nhật trạng thái mô hình của tensor i và tạo ra bản sao tham số 16-bit. Thứ ba, trong bước Main→SSD, SSD đọc trạng thái mô hình và tham số 16-bit đã cập nhật trở lại.
+
+Chúng ta có thể dễ dàng quan sát thấy rằng cơ chế offloading gradient chủ động naïve tuần tự hóa ba bước, sao cho gradient được tiêu thụ chậm vì truy cập SSD đắt đỏ được liên quan đến hai bước.
+
+Offloading Gradient Chủ động Được Tối ưu hóa. Quan sát chính của chúng tôi là lan truyền ngược GPU, optimizer CPU in-core (CPU Compute), và I/O SSD (SSD→Main và Main→SSD) sử dụng gần như các tài nguyên tính toán và truyền thông khác nhau trong một máy chủ, như được hiển thị trong Hình 1c. Do đó, ba bước này có tiềm năng chồng lấp để tối đa hóa việc sử dụng GPU, PCIe, và CPU.
+
+Để thực hiện điều này, chúng tôi là người đầu tiên trình bày offloading gradient chủ động được tối ưu hóa chồng lấp I/O SSD, thực hiện optimizer in-core, và lan truyền ngược GPU để tối đa hóa tỷ lệ sử dụng GPU. Với lập lịch được tối ưu hóa, Main→SSD của tensor i được thực hiện sau SSD→Main của tensor (i−1), như được hiển thị trong Hình 3b. Bằng cách này, Main→SSD của tensor i có thể được chồng lấp với CPU Compute của tensor (i−1), do đó LoHan có thể chồng lấp tính toán CPU và I/O SSD trong quá trình thực hiện optimizer out-of-core, tăng tỷ lệ sử dụng băng thông PCIe giữa bộ nhớ chính và SSD. Như vậy, LoHan giữ cập nhật mô hình đồng bộ trong khi tối thiểu hóa thời gian nhàn rỗi của GPU.⁴
+
+⁴ Offloading gradient chủ động có thể bị nhầm lẫn với tối ưu hóa "cập nhật trễ một bước" của ZeRO-Offload [34]. Cập nhật trễ một bước hoãn việc thực hiện optimizer của lần lặp i cho đến lan truyền tiến của lần lặp (i+1), do đó giới thiệu sự lỗi thời tham số và ảnh hưởng đến sự hội tụ đào tạo mô hình. Ngược lại, LoHan không giới thiệu sự lỗi thời tham số vì lan truyền tiến/ngược đọc các mô hình đã cập nhật.
+
+D. Quản lý Hoán đổi Kích hoạt Nhận thức về Lưu lượng Toàn diện
+
+Hoán đổi kích hoạt từ GPU trước sang bộ nhớ chính sau đó sang SSD gây ra lưu lượng PCIe nặng nề, trong khi tính toán lại kích hoạt thay vì hoán đổi giảm áp lực lưu lượng PCIe với chi phí của thời gian tính toán GPU không cần thiết. Các công trình hoán đổi kích hoạt và tính toán lại hiện tại như Capuchin [32] chỉ xem xét thời gian tính toán GPU của lan truyền ngược và lưu lượng PCIe GPU-bộ nhớ chính để xác định lượng kích hoạt hoán đổi, giả sử gradient, tham số, và trạng thái mô hình được giữ trên bộ nhớ GPU.
+
+Thách thức. LoHan offload cả trạng thái mô hình và kích hoạt sang SSD và áp dụng offloading gradient chủ động, do đó đặt ra hai thách thức độc đáo cho thiết kế hoán đổi kích hoạt: 1) Trong quá trình lan truyền ngược, GPU cần hoán đổi trở lại không chỉ kích hoạt mà còn kích hoạt theo yêu cầu, gây ra lưu lượng PCIe phức tạp. 2) LoHan áp dụng offloading gradient chủ động cho phép optimizer CPU chồng lấp với lan truyền ngược, sao cho thời gian thực hiện tối đa của lan truyền ngược và optimizer CPU phục vụ xác định lượng hoán đổi của kích hoạt.
+
+Để giải quyết những thách thức này, LoHan đề xuất quản lý hoán đổi kích hoạt nhận thức về lưu lượng toàn diện tự động xác định lượng kích hoạt hoán đổi và do đó tối thiểu hóa thời gian mỗi lần lặp. Trong phần tiếp theo, chúng tôi mô tả thiết kế của LoHan chi tiết.
+
+Mục tiêu của chiến lược hoán đổi kích hoạt là tìm một AG2M tối thiểu hóa thời gian lặp Titer. Quan sát cấp cao là Titer là một hàm lồi của AG2M, sao cho AG2M tối ưu có thể được tìm thấy bằng cách lặp kích hoạt để hoán đổi, tính toán AG2M và thời gian lặp tương ứng, và tìm điểm uốn nơi Titer được tối thiểu hóa. Chúng tôi trước tiên thảo luận về cách chúng tôi tính toán Titer khi cho một AG2M, sau đó đưa ra bằng chứng rằng Titer là lồi, và cuối cùng cho thấy quy trình cụ thể của việc chọn kích hoạt để hoán đổi.
+
+Tính toán Thời gian Lặp. Titer trong LoHan là tổng của thời gian giai đoạn forward Tf và thời gian giai đoạn backward Tb, như được hiển thị trong Phương trình 1.
+
+Titer=Tf+Tb (1)
+
+Chúng tôi trước tiên đánh giá Tf. Khi tính toán GPU và chuyển giao tensor PCIe được chồng lấp đầy đủ, thời gian giai đoạn forward là tối đa trong số TG_f, TG2M_f, TM2G_f, và TS_f, có thể được biểu diễn bởi Phương trình 2. Lưu ý rằng liên kết PCIe GPU-CPU là duplex, trong khi SSD là simplex, do đó chúng tôi cần tính toán thời gian chuyển giao PCIe GPU-CPU và thời gian chuyển giao PCIe CPU-GPU riêng biệt nhưng xem xét thời gian I/O SSD như một toàn thể.
+
+Tf= max{TG_f, TG2M_f, TM2G_f, TS_f} (2)
+= max{FLOP_f/THP_G, AG2M/BW_G, 2P/BW_G, 2P/BW_S2M+αAG2M/BW_M2S}
+
+Thành phần cuối cùng của Tf bao gồm lượng kích hoạt được hoán đổi sang SSD αAG2M. Chúng tôi tiếp theo mô tả cách αAG2M được quyết định. Khi một kích hoạt được hoán đổi trong LoHan, nó được chứa bởi bộ nhớ chính hoặc SSD. LoHan quyết định lượng kích hoạt được chứa bởi bộ nhớ chính, AG2M−αAG2M, dựa trên việc sử dụng bộ nhớ chính cao điểm được thu thập trong giai đoạn profiling. Bộ nhớ chính trước tiên được sử dụng để lưu trữ tham số được prefetch từ SSD, và trạng thái mô hình được sử dụng cho việc thực hiện optimizer, trong khi phần còn lại của bộ nhớ chính được sử dụng để chứa kích hoạt. Do đó, lượng kích hoạt được chứa bởi SSD có thể được biểu diễn như được hiển thị trong Phương trình 3. Do đó, thời gian giai đoạn forward Tf có thể được biểu diễn thêm bởi Phương trình 4.
+
+αAG2M = AG2M − MEMavail_M (3)
+
+Tf= max{FLOP_f/THP_G, AG2M/BW_G, 2P/BW_G, 2P/BW_S2M+(AG2M−MEMavail_CPU)/BW_M2S} (4)
+
+Sau đó chúng tôi đánh giá Tb. Tương tự như giai đoạn forward, thời gian giai đoạn backward có thể được biểu diễn bởi Phương trình 5. Lưu ý rằng chúng tôi không xem xét thời gian thực hiện Adam CPU vì thời gian của nó ngắn hơn việc đọc/ghi trạng thái optimizer từ/sang SSD.
+
+Tb= max{TG_b, TG2M_b, TM2G_b, TS_b} (5)
+= max{(2FLOP_f+FLOP_r)/THP_G, 2P/BW_G, (2P+AG2M)/BW_G, (14P+αAG2M)/BW_S2M+14P/BW_M2S}
+
+Vì FLOP_r có thể được tính toán bằng cách tích lũy số lượng tính toán của các lớp cần được tính toán lại, chúng tôi có thể tính toán thời gian lặp một khi AG2M được cung cấp.
+
+Chứng minh Tính Lồi của Thời gian Lặp. Chúng tôi trước tiên liệt kê các định lý toán học được sử dụng trong các bằng chứng của chúng tôi.
+
+Định lý 1: Tổng của các hàm lồi là lồi.
+Định lý 2: Tối đa của các hàm lồi là lồi.
+Định lý 3: Một hàm tuyến tính là một hàm lồi.
+Định lý 4: f(y) = af(x) + b là lồi đối với x nếu f(x) là lồi đối với x và a > 0.
+
+Để chứng minh rằng thời gian lặp Titer là lồi đối với AG2M, chúng tôi chứng minh rằng Tf và Tb là lồi riêng biệt, do đó chứng minh Titer là lồi theo Định lý 1.
+
+Chúng tôi trước tiên chứng minh rằng Tf là lồi đối với AG2M. Theo Phương trình 4, thành phần thứ nhất và thứ ba độc lập với AG2M, trong khi thành phần thứ hai và cuối cùng là hàm tuyến tính của AG2M. Do đó, tất cả bốn thành phần đều lồi theo Định lý 3. Do đó chúng tôi kết luận rằng Tf là một hàm lồi của AG2M theo Định lý 2.
+
+Sau đó chúng tôi chứng minh rằng Tb là lồi đối với AG2M. Thành phần thứ hai của Phương trình 5 độc lập với AG2M, trong khi thành phần thứ ba và cuối cùng là hàm tuyến tính của AG2M, do đó ba thành phần cuối cùng là các hàm lồi của AG2M theo Định lý 3.
+
+Để chứng minh rằng thành phần thứ nhất TG_b cũng lồi, chúng tôi trước tiên giả sử rằng kích hoạt của một lớp có thể được offload một phần trong khi chi phí tính toán lại của nó tỷ lệ thuận với kích hoạt bị loại bỏ.⁵ Tiếp theo, chúng tôi giới thiệu thứ tự hoán đổi kích hoạt của LoHan cần thiết cho quá trình chứng minh. Đối với kích hoạt của mỗi lớp, LoHan gán các mức độ ưu tiên hoán đổi khác nhau. Kích hoạt của một lớp phù hợp hơn để hoán đổi thay vì tính toán lại nếu nó yêu cầu 1) nhiều thời gian hơn để tính toán lại hoặc 2) ít thời gian hơn để hoán đổi. Vì thời gian tính toán lại của một lớp tỷ lệ thuận với số lượng phép toán của nó, và thời gian offloading tỷ lệ thuận với kích thước kích hoạt, chúng tôi định nghĩa lợi ích offloading của một lớp (OBlayer) là các phép toán dấu phẩy động của nó trong tính toán lại (FLOP_layer) so với khối lượng tensor kích hoạt của nó (Alayer), như được hiển thị trong Phương trình 6.
+
+OBlayer = FLOP_layer / Alayer (6)
+
+Kích hoạt của một lớp có lợi ích offloading cao hơn có mức độ ưu tiên cao hơn trong hoán đổi thay vì tính toán lại. Đặt Ai biểu thị kích thước kích hoạt của lớp i, FLOP_i biểu thị số lượng phép toán của nó cần thiết trong tính toán lại, và OBi biểu thị lợi ích offloading của nó. Đối với mỗi i thỏa mãn ∑(k=1 to i)Ak ≤ AG2M ≤ ∑(k=1 to i+1)Ak (Nghĩa là, AG2M bao gồm i lớp đầu tiên và một phần của lớp (i+1)), chi phí tính toán lại của một mô hình có thể được biểu diễn bởi Phương trình 7.
+
+FLOP_r = FLOP_f - ∑(m=1 to i)FLOP_m - FLOP_i+1 × (AG2M - ∑(n=1 to i)An) / Ai+1 (7)
+= FLOP_f - ∑(m=1 to i)OBm×Am - OBi+1×Ai+1 × (AG2M - ∑(n=1 to i)An) / Ai+1
+
+Do đó đạo hàm của FLOP_r được biểu diễn bởi Phương trình 8.
+
+dFLOP_r/dAG2M = -OBi+1 (8)
+
+Vì OBi là một hàm giảm của i, dFLOP_r/dAG2M là một hàm tăng của AG2M, do đó FLOP_r là lồi. Do đó, TG_b cũng lồi theo Định lý 4. Theo Định lý 2, chúng tôi kết luận rằng thời gian giai đoạn backward Tb là một hàm lồi của AG2M.
+
+Theo đó, tổng của Tf và Tb, là thời gian lặp Titer, là lồi theo Định lý 1.
+
+Quy trình Cụ thể của Chiến lược Hoán đổi Kích hoạt. Bây giờ chúng tôi mô tả quy trình cụ thể của chiến lược hoán đổi kích hoạt. Từ tính lồi của Titer, chúng tôi suy ra ba trường hợp có thể có cho thời gian lặp liên quan đến kích thước kích hoạt được offload.
+
+Trường hợp 1: Thời gian lặp tăng khi AG2M tăng, chỉ ra rằng chuyển giao PCIe là nút thắt cổ chai đào tạo ngay cả khi không có tính toán lại. Trong trường hợp này, tốt hơn là giảm kích thước kích hoạt được offload miễn là tính toán lại không vượt quá dung lượng bộ nhớ GPU. Trong LoHan, chúng tôi chọn AinterBlock làm lượng kích hoạt được hoán đổi tối thiểu an toàn theo mặc định.
+
+Trường hợp 2: Thời gian lặp giảm khi AG2M tăng, chỉ ra rằng tính toán GPU là nút thắt cổ chai đào tạo ngay cả khi offloading tất cả kích hoạt. Trong trường hợp này, tất cả kích hoạt nên được offload (tức là AG2M = Aall).
+
+Trường hợp 3: Khi AG2M tăng, thời gian lặp giảm khi AG2M nhỏ hơn Aoptimal, và tăng khi AG2M lớn hơn Aoptimal, do đó Aoptimal là kích thước kích hoạt được offload tối ưu.
+
+Từ phân tích, chúng tôi có thể tìm Aoptimal bằng cách tính toán thời gian lặp khi lặp AG2M khác nhau và phát hiện điểm uốn của Titer liên quan đến AG2M (Trường hợp 3). Nếu không phát hiện điểm uốn nào, LoHan quyết định AG2M bằng cách khớp mẫu của Titer với Trường hợp 1 và 2. Thuật toán 1 mô tả chi tiết của quy trình này.
+
+Thuật toán 1: Tìm Chiến lược Hoán đổi Kích hoạt Tối ưu.
+Dữ liệu: layer_list: Danh sách tất cả các lớp trong LLM.
+Dữ liệu: swap_list: Danh sách kích hoạt được hoán đổi.
+1 swap_list ← [];
+2 Tmin ← ∞;
+3 AG2M ← 0;
+4 FLOP_r ← FLOP_f; // Tính toán lại đầy đủ
+5 i ← 0;
+6 layer_list.sortByOffloadingBenefit();
+7 for layer in layer_list do
+8   AG2M ← AG2M + layer.actSize;
+9   FLOP_r ← FLOP_r - layer.flop;
+10  Titer ← computeIterTime(AG2M, FLOP_r);
+11  if Titer ≥ Tmin then
+12    if AG2M ≥ AinterBlock then
+13      break;
+      // Đảm bảo AG2M ≥ AinterBlock để tránh OOM
+14    end
+15  else
+16    Tmin ← Titer;
+17  end
+18  swap_list.append(layer.activation)
+19 end
+
+E. Tích hợp Khung
+
+Chúng tôi triển khai LoHan trên đỉnh khung học sâu phổ biến PyTorch [47]. LoHan cung cấp một tập hợp wrapper để ẩn các chi tiết triển khai, sao cho người dùng có thể bật tinh chỉnh mô hình hiệu quả thông qua LoHan chỉ với vài dòng thay đổi mã. Hình 4 cho thấy so sánh giao diện người dùng giữa PyTorch và LoHan. LoHan thực hiện giai đoạn profiling thông qua wrapper LoHan_init. So với PyTorch, LoHan loại bỏ việc thực hiện optimizer khỏi luồng thực hiện tuần tự. Bên cạnh đó, việc hook các operator trong mô hình của LoHan cho phép quản lý kích hoạt tự động mà không cần thay đổi mã rõ ràng bởi người dùng.
+
+V. ĐÁNH GIÁ
+
+A. Thiết lập Thí nghiệm
+
+Máy Được Đánh giá. Chúng tôi thực hiện tất cả các thí nghiệm trên một máy chủ có cấu hình được tóm tắt trong Bảng III.
+
+Khối lượng công việc. Chúng tôi chọn một loạt mô hình chỉ decoder cho các thí nghiệm của chúng tôi. Việc chọn siêu tham số của các mô hình theo GPT-3 [4] và các mô hình được đào tạo trước mã nguồn mở như OPT [2] và được liệt kê trong Bảng IV. Chúng tôi chỉ đơn giản khởi tạo ngẫu nhiên các tham số mô hình và tập dữ liệu cho các đánh giá không yêu cầu sự hội tụ mô hình. Chúng tôi đào tạo các mô hình với độ chính xác hỗn hợp được áp dụng rộng rãi trong tinh chỉnh LLM. Trong các thí nghiệm của chúng tôi, độ dài chuỗi được đặt thành 1024 và kích thước từ vựng là 50257.
+
+Cấu hình Baseline. Chúng tôi chọn các baseline mã nguồn mở sau để đánh giá.
+
+Baseline đầu tiên là ZeRO-Infinity [39] và ZeRO-Offload [34] từ DeepSpeed. Cái trước offload trạng thái mô hình sang SSD trong khi cái sau offload trạng thái mô hình sang bộ nhớ chính. Cả hai hệ thống đều hoán đổi kích hoạt khối inter-transformer sang bộ nhớ chính và tính toán lại kích hoạt intra-block. Chúng tôi đánh giá với DeepSpeed phiên bản 0.9.3 và vô hiệu hóa optimizer trễ một bước của ZeRO-Offload vì nó giới thiệu sự lỗi thời tham số.
+
+Baseline thứ hai là Colossal-AI [40], một giải pháp đào tạo mô hình quy mô tỷ phổ biến. Colossal-AI giữ kích hoạt inter-block trong bộ nhớ GPU và tính toán lại kích hoạt intra-block. Chúng tôi đánh giá với Colossal-AI phiên bản 0.3.5 và bật trình quản lý bộ nhớ Gemini [51], [52].
+
+Baseline thứ ba là FlashNeuron [37], chỉ offload kích hoạt sang SSD. Chúng tôi triển khai một nguyên mẫu của FlashNeuron sử dụng POSIX file API thay vì GPUDirect để offload kích hoạt sang bộ nhớ chính, và sau đó sang SSD, sao cho FlashNeuron có thể chạy trên GPU cấp độ tiêu dùng của chúng tôi.
+
+B. Kích thước Mô hình Có thể Đào tạo Tối đa
+
+Chúng tôi trước tiên so sánh kích thước mô hình có thể đào tạo tối đa của LoHan và các baseline bằng cách tinh chỉnh các mô hình trên ba GPU cấp độ tiêu dùng, cụ thể là RTX 4090, 3090 (24GB bộ nhớ thiết bị), và 4080 (16 GB bộ nhớ thiết bị), với các dung lượng bộ nhớ chính khác nhau. Chúng tôi đặt kích thước batch thành 1 để tối thiểu hóa ảnh hưởng của kích thước batch. Để hạn chế dung lượng bộ nhớ chính, chúng tôi pin một lượng bộ nhớ nhất định sao cho các hệ thống được đánh giá không thể sử dụng bộ nhớ được pin. Chúng tôi tiến một bước vô hiệu hóa phân vùng swap Linux.
+
+Hình 6 minh họa kết quả so sánh. LoHan có thể tinh chỉnh các mô hình lớn hơn đáng kể so với các baseline dưới bất kỳ GPU và dung lượng bộ nhớ chính nào, vì LoHan tận dụng đầy đủ dung lượng bộ nhớ của bộ nhớ chính và GPU một cách tốt nhất bằng cách offload trạng thái mô hình và kích hoạt một cách toàn diện. LoHan cho phép tinh chỉnh mô hình 276B dưới bộ nhớ chính 768 GB trên RTX 4090, lớn hơn 2.04× so với ZeRO-Infinity. LoHan thành công trong việc đào tạo mô hình 175B ngay cả chỉ với 256 GB bộ nhớ chính và RTX 4080, điều này có thể tiếp cận được bởi hầu hết các nhà nghiên cứu.
+
+C. So sánh Thông lượng End-to-End
+
+Thông lượng w.r.t. Kích thước Batch. Để chứng minh hiệu quả của LoHan, chúng tôi trước tiên so sánh thông lượng đào tạo end-to-end của LoHan và ba baseline. Chúng tôi sử dụng LoHan và các baseline để tinh chỉnh mô hình 13B trên cả RTX 4090 và 3090 với các kích thước batch khác nhau.
+
+Hình 5a cho thấy thông lượng khi tinh chỉnh mô hình 13B trên RTX 4090. Chúng tôi quan sát thấy rằng LoHan đạt được thông lượng cao hơn 2.32×, 3.46×, và 8.02× so với ZeRO-Offload, ZeRO-Infinity, và Colossal-AI, tương ứng. Hình không bao gồm FlashNeuron vì nó không thể tinh chỉnh mô hình trên RTX 4090, vì nó chỉ offload checkpoint kích hoạt sang SSD trong khi giữ trạng thái mô hình lớn trong bộ nhớ GPU, do đó yêu cầu không gian bộ nhớ GPU lớn hơn nhiều so với dung lượng bộ nhớ 24GB của RTX 4090.
+
+Hình 5b cho thấy thông lượng khi tinh chỉnh mô hình 13B trên RTX 3090. LoHan đạt được cải thiện 1.57×, 2.48×, và 4.72× so với ZeRO-Offload, ZeRO-Infinity, và Colossal-AI, tương ứng, cho thấy xu hướng tương tự như trên 4090.
+
+Thông lượng w.r.t. Kích thước Mô hình. Chúng tôi so sánh TFLOPS tối đa của LoHan, ZeRO-Infinity, và ZeRO-Offload tinh chỉnh các mô hình khác nhau trên 4090, như được hiển thị trong Hình 5c, nơi đường màu xanh lá cây chỉ ra FLOPS cao điểm được đo bằng cách benchmark một khối transformer bên trong GPU mà không có bất kỳ lưu lượng PCIe nào.
+
+Chúng tôi quan sát thấy rằng LoHan đạt được 90% ~95% FLOPS cao điểm khi kích thước mô hình nhỏ hơn 70B, trong khi các baseline chỉ đạt được tối đa 40%. LoHan duy trì 53% FLOPS cao điểm tương đối nhỏ khi tinh chỉnh mô hình 175B, vì một lớp đơn lẻ của mô hình lớn có kích thước lớn của tham số và kích hoạt, do đó kích thước batch cho phép nhỏ để vừa với bộ nhớ GPU hạn chế. Tuy nhiên, điều này vẫn cao hơn đáng kể so với ZeRO-Infinity ở FLOPS tối đa của nó.
+
+Kết luận. LoHan có thể tinh chỉnh mô hình 175B trên RTX 4090 trong khi các baseline không thể. Bên cạnh đó, LoHan đạt được thông lượng cao hơn đáng kể so với các baseline, chỉ ra rằng LoHan cho phép tinh chỉnh hiệu quả trên các mô hình quy mô lớn.
+
+D. Hiệu ứng của Offloading Gradient Chủ động
+
+Để chứng minh lợi ích của offloading gradient chủ động (Phần IV-C), chúng tôi kiểm tra LoHan với ba triển khai: 1) LoHan Optimized, triển khai với offloading gradient chủ động được tối ưu hóa, 2) LoHan Naïve triển khai offloading gradient chủ động naïve, và 3) LoHan+ZeRO không chồng lấp backward và thực hiện optimizer như ZeRO-Infinity làm. Tất cả các triển khai theo cùng một quy trình đào tạo ngoại trừ chiến lược offloading gradient.
+
+Chúng tôi kiểm tra các triển khai bằng cách tinh chỉnh mô hình 13B và 175B trên GPU RTX 4090, như được hiển thị trong Hình 7. Chúng tôi có hai quan sát.
+
+Đầu tiên, offloading gradient chủ động được tối ưu hóa thường đạt được lợi ích hiệu suất cao hơn so với offloading gradient chủ động naïve. Ví dụ, LoHan Optimized đạt được thông lượng 1.22× so với LoHan Naïve và thông lượng 1.33× so với LoHan+ZeRO khi tinh chỉnh mô hình 13B với kích thước batch 64. Điều này là do offloading gradient chủ động được tối ưu hóa hoàn toàn chồng lấp tính toán CPU và I/O SSD, do đó tối thiểu hóa thời gian nhàn rỗi của GPU.
+
+Thứ hai, lợi ích thông lượng của offloading gradient chủ động so với tuần tự hóa giai đoạn backward và optimizer CPU giảm khi kích thước batch quá nhỏ (ví dụ, 8), vì lan truyền ngược GPU tốn ít thời gian hơn đáng kể so với optimizer CPU, do đó dẫn đến ít cơ hội chồng lấp hơn.
+
+E. Hiệu ứng của Quản lý Kích hoạt Nhận thức về Lưu lượng Toàn diện
+
+Để chứng minh lợi ích của quản lý hoán đổi kích hoạt nhận thức về lưu lượng toàn diện (Phần IV-D), chúng tôi trước tiên hiển thị lợi ích của việc hoán đổi kích hoạt sang SSD thay vì sang bộ nhớ chính trong kích thước mô hình có thể đào tạo tối đa, sau đó hiển thị lợi ích thông lượng của chiến lược quản lý kích hoạt.
+
+Lợi ích của Hoán đổi Kích hoạt sang SSD. Để hiển thị lợi ích của việc hoán đổi kích hoạt sang cả bộ nhớ chính và SSD thay vì chỉ sang bộ nhớ chính, chúng tôi đánh giá LoHan (LoHan Optimized) và một triển khai LoHan+CpuAct, theo cùng quy trình đào tạo như LoHan ngoại trừ LoHan+CpuAct hoán đổi kích hoạt chỉ sang bộ nhớ chính thay vì sang SSD. Chúng tôi đo kích thước mô hình có thể đào tạo tối đa của hai triển khai tinh chỉnh trên RTX 4090 với bộ nhớ chính và kích thước batch khác nhau.
+
+Hình 8 minh họa kết quả so sánh. Chúng tôi quan sát thấy rằng 1) hoán đổi kích hoạt sang SSD mở rộng đáng kể kích thước mô hình có thể đào tạo trong máy chủ GPU đơn lẻ thông thường với bộ nhớ chính/GPU khan hiếm. Ví dụ, LoHan Optimized có thể tinh chỉnh mô hình lớn hơn 2× ~5× so với LoHan+CpuAct với bộ nhớ chính 128 GB. 2) Sự khác biệt về kích thước mô hình có thể đào tạo không đáng kể khi kích thước batch quá lớn, ví dụ, kích thước mô hình tối đa của hai triển khai giống nhau với bộ nhớ chính 256 GB và kích thước batch 60, vì khi kích thước batch quá lớn, kích thước mô hình có thể đào tạo tối đa bị giới hạn bởi việc chứa kích hoạt của một lớp đơn lẻ trong dung lượng bộ nhớ GPU hạn chế, thay vì bộ nhớ chính.
+
+Lợi ích của Chiến lược Quản lý Kích hoạt. Để xác thực hiệu quả của chiến lược quản lý kích hoạt, chúng tôi đánh giá LoHan trên mô hình 70B với năm triển khai: 1) LoHan+Optimized sử dụng quản lý kích hoạt nhận thức về lưu lượng toàn diện để hoán đổi kích hoạt, 2) LoHan+ZeRO hoán đổi tĩnh kích hoạt inter-layer của mỗi khối transformer sang bộ nhớ chính và tính toán lại phần còn lại, 3) LoHan+Cap thông minh giữ, tính toán lại hoặc hoán đổi kích hoạt sang CPU bằng cách profiling chi phí hoán đổi kích hoạt và tính toán lại như được đề xuất bởi Capuchin [32], 4) LoHan+G10 thông minh giữ hoặc hoán đổi kích hoạt sang SSD dựa trên đo lường thời gian không hoạt động như được đề xuất bởi G10 [45], và 5) LoHan+CM thông minh tính toán lại hoặc offload kích hoạt sang bộ nhớ chính với mô hình chi phí và bộ giải MILP được đề xuất bởi Checkmate [53]. Tất cả các triển khai offload trạng thái mô hình sang SSD và thực hiện optimizer trong CPU, điều này cần thiết cho tinh chỉnh mô hình 70B.
+
+Hình 9a hiển thị so sánh thông lượng và Bảng V hiển thị các kích thước batch tương ứng. Chúng tôi quan sát thấy rằng 1) hiệu suất của tất cả baseline ngoại trừ G10 giảm khi có ít dung lượng bộ nhớ chính hơn vì các hệ thống này hoán đổi kích hoạt chỉ sang bộ nhớ chính, do đó hạn chế kích thước batch có thể đạt được với dung lượng bộ nhớ khan hiếm. Ngược lại, LoHan đạt được thông lượng ổn định bằng cách offload kích hoạt sang SSD; và 2) Với cùng kích thước batch (ví dụ, kích thước batch là 32 với bộ nhớ chính 512 GB), LoHan đạt được thông lượng cao hơn tất cả các baseline, vì chiến lược offloading của LoHan là toàn diện, xem xét lưu lượng từ cả kích hoạt và trạng thái mô hình.
+
+Hơn nữa, chúng tôi cho thấy rằng LoHan dự đoán lượng kích hoạt được hoán đổi tối ưu. Để minh họa điều này, chúng tôi kiểm tra thời gian lặp của LoHan khi tinh chỉnh mô hình 13B với các lượng kích hoạt được hoán đổi khác nhau. Hình 9b minh họa kết quả với các kích thước batch 24, 36, 48, và 60, nơi các ngôi sao chỉ ra lượng kích hoạt được hoán đổi tối ưu được dự đoán. Chúng tôi quan sát thấy rằng 1) đối với tất cả kích thước batch, mô hình thời gian lặp của LoHan tạo ra các dự đoán gần như tối ưu theo kết quả thí nghiệm. 2) Thời gian lặp tăng khi lượng kích hoạt được hoán đổi tăng ở kích thước batch 24, phù hợp với trường hợp 1 được suy ra trong Phần IV-D. Đồng thời, xu hướng thời gian lặp liên quan đến lượng kích hoạt được hoán đổi phù hợp tốt với trường hợp 3 được suy ra ở kích thước batch 36, 48, và 60, cho thấy tính đúng đắn của mô hình thời gian lặp của LoHan và tính chính xác của giai đoạn profiling.
+
+F. Hiệu ứng của Số lượng SSD
+
+Chúng tôi nghiên cứu thông lượng của LoHan w.r.t. số lượng SSD. Chúng tôi đánh giá thông lượng đào tạo tối đa của LoHan và ZeRO-Infinity khi tinh chỉnh mô hình 135B (mô hình lớn nhất mà ZeRO-Infinity có thể tinh chỉnh) trên RTX 4090 với số lượng SSD khác nhau. Chúng tôi áp dụng kích thước batch lớn nhất mà hai hệ thống có thể tinh chỉnh. Hình 10a minh họa hiệu ứng của số lượng SSD đối với thông lượng có thể đạt được.
+
+Chúng tôi có ba quan sát. Đầu tiên, LoHan đạt được khả năng mở rộng gần như tuyến tính khi số lượng SSD tăng từ 1 đến 3, chỉ ra rằng I/O SSD là nút thắt cổ chai đào tạo trong trường hợp này và LoHan tập hợp băng thông của nhiều SSD tốt. Thứ hai, lợi ích thông lượng của LoHan nhỏ khi số lượng SSD tăng từ 6 đến 12. Điều này là do nút thắt cổ chai hệ thống với băng thông I/O đầy đủ đã chuyển sang tính toán GPU và chuyển giao PCIe GPU-bộ nhớ chính. Thứ ba, thông lượng của ZeRO-Infinity tăng chậm khi số lượng SSD tăng. Điều này là do ZeRO-Infinity gần như tuần tự hóa tính toán GPU, tính toán CPU, và truy cập SSD, do đó băng thông I/O của SSD không được sử dụng tốt.
+
+Để nghiên cứu thêm các đặc tính thông lượng w.r.t. số lượng SSD, chúng tôi đo thông lượng đào tạo của LoHan khi tinh chỉnh mô hình 13B trên RTX 4090 với số lượng SSD và kích thước batch khác nhau. Hình 10b minh họa kết quả.
+
+Chúng tôi có hai quan sát. Đầu tiên, thông lượng của LoHan được tối đa hóa dưới SSD rẻ đầy đủ. Với hơn 6 SSD cho kích thước batch 32 và 48 hoặc 12 SSD cho kích thước batch 64, LoHan đạt được thông lượng gần tối đa. Thứ hai, LoHan cần ít SSD hơn để đạt thông lượng tối đa khi sử dụng kích thước batch lớn hơn. Ví dụ, cần 12 SSD để đạt 135 TFLOPS với kích thước batch 32, trong khi yêu cầu 6 và 3 SSD cho kích thước batch 48 và 64 tương ứng.
+
+G. Hiệu suất trên Máy chủ Đa-GPU
+
+Nhiều nhà khoa học dữ liệu có thể sở hữu một máy chủ thông thường với nhiều GPU cấp độ tiêu dùng. Chúng tôi cho thấy rằng các tối ưu hóa của LoHan cũng hoạt động cho các máy chủ đa-GPU. Chúng tôi đánh giá thông lượng đào tạo của LoHan và ZeRO-Infinity trên một máy chủ đa-GPU, có cấu hình giống như máy chủ 4090 đơn lẻ, ngoại trừ máy chủ đa-GPU trang bị 4 GPU NVIDIA RTX 4090 (Số lượng tối đa được hỗ trợ trong nguồn điện của máy chủ). Chúng tôi sử dụng hai hệ thống để tinh chỉnh mô hình 13B và mô hình 70B (Mô hình lớn nhất mà ZeRO-Infinity có thể tinh chỉnh⁶) với các kích thước batch toàn cầu khác nhau.
+
+⁶ Mặc dù ZeRO-Infinity có thể tinh chỉnh mô hình 135B với RTX 4090 đơn lẻ, nó chỉ có thể tinh chỉnh mô hình 70B trên máy chủ đa-GPU vì chi phí GPU và bộ nhớ chính bổ sung được giới thiệu bởi đồng bộ hóa đa-GPU và đa xử lý.
+
+Hình 11 cho thấy thông lượng toàn cầu của hai hệ thống tinh chỉnh trên 2 và 4 GPU RTX 4090.
+
+Kết quả thí nghiệm cho thấy rằng LoHan đạt được thông lượng cao hơn ZeRO-Infinity. LoHan đạt được thông lượng 2.21× và 1.69× so với ZeRO-Infinity khi tinh chỉnh mô hình 13B và 70B trên 4 GPU tương ứng. Lý do cơ bản là hai mặt. Đầu tiên, LoHan offload kích hoạt sang SSD, do đó cho phép tinh chỉnh với kích thước batch lớn hơn. Thứ hai, LoHan xem xét lưu lượng offloading toàn diện như một chiều tối ưu hóa, và do đó đạt được thông lượng cao hơn ZeRO-Infinity ngay cả với cùng kích thước batch. Kết luận, LoHan vẫn có lợi cho việc tinh chỉnh trên máy chủ đa-GPU.
+
+H. Hiệu suất trên Các Mô hình Quy mô Lớn Khác
+
+Các mô hình quy mô lớn không chỉ tồn tại trong các mô hình ngôn ngữ (LM) mà còn trong các mô hình cho các tác vụ như thị giác và tạo hình ảnh [54]–[57]. Chúng tôi lấy tinh chỉnh mô hình khuếch tán làm ví dụ để cho thấy rằng các tối ưu hóa của LoHan có lợi cho các mô hình học sâu quy mô lớn tổng quát hơn.
+
+Để đánh giá hiệu suất trên các mô hình khuếch tán lớn, chúng tôi áp dụng kiến trúc mô hình của mô hình DiT-XL/2 [54] và mở rộng số lượng lớp, số lượng đầu attention, và chiều ẩn của backbone, như được liệt kê trong Bảng VI. Kích thước hình ảnh đầu vào là 512 × 512. Chúng tôi so sánh thông lượng của LoHan và Fast-DiT [58], khung đào tạo mã nguồn mở tiên tiến nhất cho các mô hình DiT. Hình 12 minh họa kết quả.
+
+Chúng tôi có hai quan sát.
+
+Đầu tiên, LoHan cho phép tinh chỉnh các mô hình lớn hơn nhiều so với Fast-DiT vì LoHan offload kích hoạt và trạng thái mô hình sang bộ nhớ chính và SSD. Ngược lại, Fast-DiT giữ các tensor trong bộ nhớ GPU.
+
+Thứ hai, LoHan đạt được thông lượng cao hơn Fast-DiT khi tinh chỉnh cùng một mô hình. Lý do là hai mặt: 1) Fast-DiT gặp phải thông lượng thấp do kích thước batch có thể đào tạo nhỏ khi kích thước mô hình tăng (ví dụ, 1.4B), trong khi LoHan cho phép tinh chỉnh với kích thước batch cao; và 2) chiến lược quản lý kích hoạt của LoHan giảm thời gian tinh chỉnh so với chiến lược hoán đổi kích hoạt tĩnh của Fast-DiT, do đó cho phép LoHan đạt được thông lượng cao hơn ngay cả khi cả hai hệ thống tinh chỉnh ở cùng kích thước batch lớn.
+
+I. So sánh Hiệu quả Chi phí
+
+Để hiển thị hiệu quả chi phí của việc sử dụng offloading toàn diện trong việc cải thiện thông lượng đào tạo, chúng tôi so sánh thông lượng so với giá máy chủ của LoHan trên máy chủ GPU 4 × RTX 4090 và một baseline: Megatron-LM [62] trên máy chủ DGX-A100 được tăng cường NVLink [12] sử dụng song song tensor. Megatron-LM không dựa vào offloading dữ liệu. Chúng tôi tinh chỉnh mô hình 30B (mô hình lớn nhất mà Megatron-LM có thể tinh chỉnh trên máy DGX) trên hai hệ thống. Giá của các thành phần máy chủ được ước tính như được hiển thị trong Bảng VII. Chúng tôi đánh giá LoHan trên GPU RTX 4090 với số lượng SSD khác nhau khi tinh chỉnh mô hình 30B.
+
+Hình 13 minh họa kết quả so sánh. Chúng tôi quan sát thấy rằng LoHan trên RTX 4090 đạt được tối đa hiệu quả chi phí 2.17× so với Megatron-LM trên máy DGX-A100. Điều này cho thấy rằng đối với đào tạo quy mô lớn, LoHan cho phép GPU thông thường đạt được hiệu quả chi phí cao hơn so với các cụm trung tâm dữ liệu cao cấp không dựa vào offloading để đào tạo mô hình khổng lồ. Ở đây hiệu quả chi phí giảm khi số lượng SSD của LoHan tăng từ 6 đến 12 vì việc thêm SSD vượt quá số lượng SSD tối ưu chỉ có lợi ích hiệu suất nhỏ nhưng tăng chi phí.
+
+VI. CÁC CÔNG TRÌNH LIÊN QUAN
+
+Tối ưu hóa Offloading trong Các Tác vụ Quản lý Dữ liệu. Các công trình trước đây [41], [63]–[68] nghiên cứu các đặc tính của các thiết bị lưu trữ hiện đại như SSD và cung cấp hướng dẫn để tối ưu hóa offloading dữ liệu trong các tác vụ quản lý dữ liệu. Theo các công trình này, các thực hành hiện tại đã tối ưu hóa I/O lưu trữ của một số lĩnh vực quản lý dữ liệu như quản lý bộ đệm [69]–[73], lập chỉ mục [74], [75], lập lịch truy vấn [73], [76], và ghi nhật ký giao dịch [76], [77] của cơ sở dữ liệu hợp lý, hoặc các lĩnh vực khác như cơ sở dữ liệu phân tán [78], [79], cơ sở dữ liệu đối tượng [80], kho lưu trữ key-value [81]–[85], xử lý dữ liệu vector [86], xử lý dữ liệu đồ thị [87]–[94], và truy xuất thông tin [95].
+
+So với các hệ thống này, LoHan nhắm mục tiêu các tác vụ tinh chỉnh LLM có đặc tính ứng dụng khác nhau.
+
+Phương pháp Quản lý Tensor cho Tinh chỉnh LLM. Nhiều công trình hiện tại [48], [53], [96]–[101] xem xét các chiến lược tính toán lại tối ưu trong khi giữ phần còn lại của kích hoạt và toàn bộ trạng thái mô hình trên GPU, do đó các công trình này không thể tinh chỉnh ngay cả mô hình 1B. Ngược lại, LoHan là hệ thống đầu tiên lập lịch offloading kích hoạt và tính toán lại kích hoạt dưới offloading kích hoạt và trạng thái mô hình toàn diện.
+
+Nhiều công trình hiện tại [35], [36], [102]–[111] offload kích hoạt sang bộ nhớ chính để đào tạo các mô hình không thể vừa với bộ nhớ GPU. FlashNeuron [37] tiến một bước offload kích hoạt sang NVMe SSD. Tuy nhiên, các hệ thống này không offload trạng thái mô hình, do đó họ thậm chí không thể tinh chỉnh mô hình 6B, và chỉ xem xét hoán đổi kích hoạt tối ưu và tính toán lại không tối ưu khi offloading cả kích hoạt và trạng thái mô hình. Hơn nữa, một số công trình [32], [112]–[114] offload cả kích hoạt và trạng thái mô hình sang bộ nhớ chính, và G10 [45] tiến một bước offload các tensor này sang SSD. Tuy nhiên, các hệ thống này thực hiện optimizer trong GPU, do đó gây ra chi phí chuyển giao trạng thái mô hình nặng nề trên kết nối PCIe như đã thảo luận trong Phần III-C. Ngược lại, LoHan xem xét cả quản lý kích hoạt và offloading trạng thái mô hình sang SSD như các chiều tối ưu hóa, do đó cho phép tinh chỉnh LLM quy mô 100B trên một GPU đơn lẻ trong khi duy trì hiệu quả.
+
+Một số công trình trước đây [34], [49], [52], [115], [116] giới thiệu Adam CPU và offload trạng thái mô hình sang bộ nhớ chính nhằm mở rộng kích thước mô hình có thể đào tạo của LLM và ZeRO-Infinity [39] offload trạng thái mô hình sang SSD. Tuy nhiên, các hệ thống này không quản lý toàn diện hoán đổi kích hoạt, hoán đổi kích hoạt, và offloading trạng thái mô hình. Cụ thể, họ hoặc không áp dụng tính toán lại kích hoạt do đó gây ra chi phí chuyển giao kích hoạt nặng nề trên kết nối PCIe, hoặc chỉ áp dụng chiến lược tính toán lại kích hoạt naïve. Angel-PTM [31] áp dụng cập nhật trọng số bất đồng bộ dẫn đến sự lỗi thời tham số. Ngược lại, LoHan trình bày offloading gradient chủ động đầu tiên chồng lấp truy cập SSD của CPU, thực hiện optimizer, và lan truyền ngược GPU để tối đa hóa tỷ lệ sử dụng GPU. Ngược lại, LoHan là hệ thống đầu tiên đề xuất quản lý hoán đổi kích hoạt nhận thức về lưu lượng toàn diện đạt được quản lý kích hoạt tối ưu dưới kích thước mô hình lớn, như được hiển thị trong Phần V-E.
+
+VII. KẾT LUẬN
+
+Trong bài báo này, chúng tôi đề xuất LoHan, một khung đào tạo chi phí thấp hiệu suất cao cho phép tinh chỉnh mô hình khổng lồ 100B hiệu quả trên một máy chủ cấp thấp với GPU cấp thấp và dung lượng bộ nhớ chính hạn chế. Ý tưởng chính là thêm lưu lượng offloading toàn diện như một chiều tối ưu hóa. Kết quả thí nghiệm cho thấy rằng 1) LoHan là hệ thống đầu tiên tinh chỉnh mô hình 175B trên RTX 4090 và 256 GB bộ nhớ chính, và 2) LoHan cho phép GPU tiêu dùng chi phí thấp có hiệu quả chi phí cao hơn so với cụm DGX-A100 khi tinh chỉnh mô hình 175B. Artifact của LoHan có sẵn tại https://github.com/RC4ML/LoHan.
+
+Lời cảm ơn. Công trình được hỗ trợ bởi các khoản tài trợ sau: Chương trình R&D Trọng điểm Quốc gia của Trung Quốc (Grant No. 2022ZD0119301), Quỹ Khoa học Tự nhiên Quốc gia Trung Quốc theo số tài trợ (62472384, 62441605), Quỹ Khoa học Starry Night của Viện Nghiên cứu Tiên tiến Thượng Hải Đại học Chiết Giang (SN-ZJU-SIAS-0010). Zeke Wang là tác giả liên lạc.
+
+TÀI LIỆU THAM KHẢO
+
+[1] J. Devlin, M.-W. Chang, K. Lee, và K. Toutanova, "Bert: Pre-training of deep bidirectional transformers for language understanding," trong NAACL-HLT, 2019.
+
+[2] S. Zhang, S. Roller, N. Goyal, M. Artetxe, M. Chen, S. Chen, C. Dewan, M. Diab, X. Li, X. V. Lin, T. Mihaylov, M. Ott, S. Shleifer, K. Shuster, D. Simig, P. S. Koura, A. Sridhar, T. Wang, và L. Zettlemoyer, "Opt: Open pre-trained transformer language models," arXiv preprint, 2022.
+
+[3] A. Radford, J. Wu, R. Child, D. Luan, D. Amodei, và I. Sutskever, "Language models are unsupervised multitask learners," OpenAI blog, 2019.
+
+[4] T. Brown, B. Mann, N. Ryder, M. Subbiah, J. D. Kaplan, P. Dhariwal, A. Neelakantan, P. Shyam, G. Sastry, A. Askell, S. Agarwal, A. Herbert-Voss, G. Krueger, T. Henighan, R. Child, A. Ramesh, D. Ziegler, J. Wu, C. Winter, C. Hesse, M. Chen, E. Sigler, M. Litwin, S. Gray, B. Chess, J. Clark, C. Berner, S. McCandlish, A. Radford, I. Sutskever, và D. Amodei, "Language models are few-shot learners," trong NeurIPS, 2020.
+
+[5] T. L. Scao, A. Fan, C. Akiki, E. Pavlick, S. Ilić, D. Hesslow, R. Castagné, A. S. Luccioni, F. Yvon, M. Gallé, J. Tow, A. M. Rush, S. Biderman, A. Webson, P. S. Ammanamanchi, T. Wang, B. Sagot, N. Muennighoff, A. V. del Moral, O. Ruwase, R. Bawden, S. Bekman, A. McMillan-Major, T. Wolf, I. Beltagy, H. Nguyen, L. Saulnier, S. Tan, P. O. Suarez, V. Sanh, H. Laurençon, Y. Jernite, J. Launay, M. Mitchell, và C. Raffel, "Bloom: A 176b-parameter open-access multilingual language model," arXiv preprint, 2022.
+
+[6] I. Trummer, "The case for nlp-enhanced database tuning: towards tuning tools that" read the manual"," trong VLDB, 2021.
+
+[7] R. C. Fernandez, A. J. Elmore, M. J. Franklin, S. Krishnan, và C. Tan, "How large language models will disrupt data management," trong VLDB, 2023.
+
+[8] L. Ouyang, J. Wu, X. Jiang, D. Almeida, C. Wainwright, P. Mishkin, C. Zhang, S. Agarwal, K. Slama, A. Ray, J. Schulman, J. Hilton, F. Kelton, L. Miller, M. Simens, A. Askell, P. Welinder, P. F. Christiano, J. Leike, và R. Lowe, "Training language models to follow instructions with human feedback," trong NeurIPS, 2022.
+
+[9] H. Touvron, L. Martin, K. Stone, P. Albert, A. Almahairi, Y. Babaei, N. Bashlykov, S. Batra, P. Bhargava, S. Bhosale, D. Bikel, L. Blecher, C. C. Ferrer, M. Chen, G. Cucurull, D. Esiobu, J. Fernandes, J. Fu, W. Fu, B. Fuller, C. Gao, V. Goswami, N. Goyal, A. Hartshorn, S. Hosseini, R. Hou, H. Inan, M. Kardas, V. Kerkez, M. Khabsa, I. Kloumann, A. Korenev, P. S. Koura, M.-A. Lachaux, T. Lavril, J. Lee, D. Liskovich, Y. Lu, Y. Mao, X. Martinet, T. Mihaylov, P. Mishra, I. Molybog, Y. Nie, A. Poulton, J. Reizenstein, R. Rungta, K. Saladi, A. Schelten, R. Silva, E. M. Smith, R. Subramanian, X. E. Tan, B. Tang, R. Taylor, A. Williams, J. X. Kuan, P. Xu, Z. Yan, I. Zarov, Y. Zhang, A. Fan, M. Kambadur, S. Narang, A. Rodriguez, R. Stojnic, S. Edunov, và T. Scialom, "Llama 2: Open foundation and fine-tuned chat models," arXiv preprint, 2023.
+
+[10] LlamaTeam, "The llama 3 herd of models," https://ai.meta.com/research/publications/the-llama-3-herd-of-models/, 2024.
+
+[11] NVIDIA, "Nvidia h200 tensor core gpu," https://www.nvidia.com/en-us/data-center/h200/, 2023.
+
+[12] ——, "Nvidia dgx platform," https://www.nvidia.com/en-us/data-center/dgx-platform/, 2023.
+
+[13] X. Miao, Y. Wang, Y. Jiang, C. Shi, X. Nie, H. Zhang, và B. Cui, "Galvatron: Efficient transformer training over multiple gpus using automatic parallelism," trong VLDB, 2022.
+
+[14] M. Shoeybi, M. Patwary, R. Puri, P. LeGresley, J. Casper, và B. Catanzaro, "Megatron-lm: Training multi-billion parameter language models using model parallelism," arXiv preprint, 2020.
+
+[15] L. Zheng, Z. Li, H. Zhang, Y. Zhuang, Z. Chen, Y. Huang, Y. Wang, Y. Xu, D. Zhuo, E. P. Xing, J. E. Gonzalez, và I. Stoica, "Alpa: Automating inter- and Intra-Operator parallelism for distributed deep learning," trong OSDI, 2022.
+
+[16] X. Miao, H. Zhang, Y. Shi, X. Nie, Z. Yang, Y. Tao, và B. Cui, "Het: Scaling out huge embedding model training via cache-enabled distributed framework," trong VLDB, 2022.
+
+[17] M. Li, D. G. Andersen, J. W. Park, A. J. Smola, A. Ahmed, V. Josifovski, J. Long, E. J. Shekita, và B.-Y. Su, "Scaling distributed machine learning with the parameter server," trong OSDI, 2014.
+
+[18] T. Um, B. Oh, B. Seo, M. Kweun, G. Kim, và W.-Y. Lee, "Fastflow: Accelerating deep learning model training with smart offloading of input data pipeline," trong VLDB, 2023.
+
+[19] X. Miao, Y. Shi, Z. Yang, B. Cui, và Z. Jia, "Sdpipe: A semi-decentralized framework for heterogeneity-aware pipeline-parallel training," trong VLDB, 2023.
+
+[20] X. Nie, X. Miao, Z. Wang, Z. Yang, J. Xue, L. Ma, G. Cao, và B. Cui, "Flexmoe: Scaling large-scale sparse pre-trained model training via dynamic device placement," PACMMOD, 2023.
+
+[21] Y. Guo, Z. Zhang, J. Jiang, W. Wu, C. Zhang, B. Cui, và J. Li, "Model averaging in distributed machine learning: a case study with apache spark," VLDBJ, 2021.
+
+[22] Y. Huang, T. Jin, Y. Wu, Z. Cai, X. Yan, F. Yang, J. Li, Y. Guo, và J. Cheng, "Flexps: Flexible parallelism control in parameter server architecture," trong VLDB, 2018.
+
+[23] J. Jiang, B. Cui, C. Zhang, và L. Yu, "Heterogeneity-aware distributed parameter servers," trong SIGMOD, 2017.
+
+[24] J. Jiang, F. Fu, T. Yang, và B. Cui, "Sketchml: Accelerating distributed machine learning with data sketches," trong SIGMOD, 2018.
+
+[25] X. Miao, X. Nie, Y. Shao, Z. Yang, J. Jiang, L. Ma, và B. Cui, "Heterogeneity-aware distributed machine learning training via partial reduce," trong SIGMOD, 2021.
+
+[26] S. S. Sandha, W. Cabrera, M. Al-Kateb, S. Nair, và M. Srivastava, "In-database distributed machine learning: demonstration using teradata sql engine," trong VLDB, 2019.
+
+[27] Y. Zhang, F. Mcquillan, N. Jayaram, N. Kak, E. Khanna, O. Kislal, D. Valdano, và A. Kumar, "Distributed deep learning on data systems: a comparative analysis of approaches," trong VLDB, 2021.
+
+[28] N. Band, "Memflow: Memory-aware distributed deep learning," trong SIGMOD, 2020.
+
+[29] K. Nagrecha, "Model-parallel model selection for deep learning systems," trong SIGMOD, 2021.
+
+[30] X. Miao, Z. Jia, và B. Cui, "Demystifying data management for large language models," trong SIGMOD, 2024.
+
+[31] X. Nie, Y. Liu, F. Fu, J. Xue, D. Jiao, X. Miao, Y. Tao, và B. Cui, "Angel-ptm: A scalable and economical large-scale pre-training system in tencent," trong VLDB, 2023.
+
+[32] X. Peng, X. Shi, H. Dai, H. Jin, W. Ma, Q. Xiong, F. Yang, và X. Qian, "Capuchin: Tensor-based gpu memory management for deep learning," trong ASPLOS, 2020.
+
+[33] Q. Zhou, H. Wang, X. Yu, C. Li, Y. Bai, F. Yan, và Y. Xu, "Mpress: Democratizing billion-scale model training on multi-gpu servers via memory-saving inter-operator parallelism," trong HPCA, 2023.
+
+[34] J. Ren, S. Rajbhandari, R. Y. Aminabadi, O. Ruwase, S. Yang, M. Zhang, D. Li, và Y. He, "Zero-offload: Democratizing billion-scale model training," trong ATC, 2021.
+
+[35] M. Rhu, N. Gimelshein, J. Clemons, A. Zulfiqar, và S. W. Keckler, "vdnn: Virtualized deep neural networks for scalable, memory-efficient neural network design," trong MICRO, 2016.
+
+[36] L. Wang, J. Ye, Y. Zhao, W. Wu, A. Li, S. L. Song, Z. Xu, và T. Kraska, "Superneurons: Dynamic gpu memory management for training deep neural networks," trong PPoPP, 2018.
+
+[37] J. Bae, J. Lee, Y. Jin, S. Son, S. Kim, H. Jang, T. J. Ham, và J. W. Lee, "Flashneuron: Ssd-enabled large-batch training of very deep neural networks," trong FAST, 2021.
+
+[38] A. Q. Jiang, A. Sablayrolles, A. Mensch, C. Bamford, D. S. Chaplot, D. de las Casas, F. Bressand, G. Lengyel, G. Lample, L. Saulnier, L. R. Lavaud, M.-A. Lachaux, P. Stock, T. L. Scao, T. Lavril, T. Wang, T. Lacroix, và W. E. Sayed, "Mistral 7b," arXiv preprint, 2023.
+
+[39] S. Rajbhandari, O. Ruwase, J. Rasley, S. Smith, và Y. He, "Zero-infinity: Breaking the gpu memory wall for extreme scale deep learning," trong SC, 2021.
+
+[40] Z. Bian, H. Liu, B. Wang, H. Huang, Y. Li, C. Wang, F. Cui, và Y. You, "Colossal-ai: A unified deep learning system for large-scale parallel training," trong ICPP, 2023.
+
+[41] G. Haas và V. Leis, "What modern nvme storage can do, and how to exploit it: High-performance i/o for high-performance storage engines," trong VLDB, 2023.
+
+[42] A. Lerner và P. Bonnet, "Not your grandpa's ssd: The era of co-designed storage devices," trong SIGMOD, 2021.
+
+[43] I. Petrov, G. G. Almeida, A. P. Buchmann, và U. Gräf, "Building large storage based on flash disks," trong ADMS@VLDB, 2010.
+
+[44] D. P. Kingma và J. Ba, "Adam: A method for stochastic optimization," arXiv preprint, 2014.
+
+[45] H. Zhang, Y. Zhou, Y. Xue, Y. Liu, và J. Huang, "G10: Enabling an efficient unified gpu memory and storage architecture with smart tensor migrations," trong MICRO, 2023.
+
+[46] NVIDIA, "Nvidia gpudirect: Enhancing data movement and access for gpus," https://developer.nvidia.com/gpudirect, 2011.
+
+[47] A. Paszke, S. Gross, S. Chintala, G. Chanan, E. Yang, Z. DeVito, Z. Lin, A. Desmaison, L. Antiga, và A. Lerer, "Automatic differentiation in pytorch," trong NIPS Autodiff Workshop, 2017.
+
+[48] T. Chen, B. Xu, C. Zhang, và C. Guestrin, "Training deep nets with sublinear memory cost," arXiv preprint, 2016.
+
+[49] X. Sun, W. Wang, S. Qiu, R. Yang, S. Huang, J. Xu, và Z. Wang, "Stronghold: fast and affordable billion-scale deep learning model training," trong SC, 2022.
+
+[50] T. Eicken, D. Culler, S. Goldstein, và K. Schauser, "Active messages: A mechanism for integrated communication and computation," trong ISCA, 1992.
+
+[51] J. Fang và Y. You, "Meet gemini: The heterogeneous memory manager of colossal-ai," https://colossalai.org/docs/advanced_tutorials/meet_gemini/, 2022.
+
+[52] J. Fang, Z. Zhu, S. Li, H. Su, Y. Yu, J. Zhou, và Y. You, "Parallel training of pre-trained models via chunk-based dynamic memory management," TPDS, 2022.
+
+[53] P. Jain, A. Jain, A. Nrusimha, A. Gholami, P. Abbeel, J. Gonzalez, K. Keutzer, và I. Stoica, "Checkmate: Breaking the memory wall with optimal tensor rematerialization," trong MLSys, 2020.
+
+[54] W. Peebles và S. Xie, "Scalable diffusion models with transformers," trong ICCV, 2023.
+
+[55] A. Dosovitskiy, L. Beyer, A. Kolesnikov, D. Weissenborn, X. Zhai, T. Unterthiner, M. Dehghani, M. Minderer, G. Heigold, S. Gelly, J. Uszkoreit, và N. Houlsby, "An image is worth 16x16 words: Transformers for image recognition at scale," trong ICLR, 2021.
+
+[56] Z. Liu, Y. Lin, Y. Cao, H. Hu, Y. Wei, Z. Zhang, S. Lin, và B. Guo, "Swin transformer: Hierarchical vision transformer using shifted windows," trong ICCV, 2021.
+
+[57] M. D. M. Reddy, M. S. M. Basha, M. M. C. Hari, và M. N. Penchalaiah, "Dall-e: Creating images from text," UGC Care Group I Journal, 2021.
+
+[58] C. Jin và S. Xie, "Fast-dit: Fast diffusion models with transformers," https://github.com/chuanyangjin/fast-DiT, 2024.
+
+[59] Y. Feng, M. Xie, Z. Tian, S. Wang, Y. Lu, và J. Shu, "Mobius: Fine tuning large-scale models on commodity gpu servers," trong ASPLOS, 2023.
+
+[60] Supermicro, "Supermicro sys-420gp-tnr dual xeon scalable 4u gpu superserver," https://store.supermicro.com/us_en/4u-gpu-superserver-sys-420gp-tnr.html, 2023.
+
+[61] NVIDIA, "Geforce rtx 4090," https://www.nvidia.com/en-us/geforce/graphics-cards/40-series/rtx-4090/, 2022.
+
+[62] D. Narayanan, M. Shoeybi, J. Casper, P. LeGresley, M. Patwary, V. Korthikanti, D. Vainbrand, P. Kashinkunti, J. Bernauer, B. Catanzaro, A. Phanishayee, và M. Zaharia, "Efficient large-scale language model training on gpu clusters using megatron-lm," trong SC, 2021.
+
+[63] A. Kroviakov, P. Kurapov, C. Anneser, và J. Giceva, "Heterogeneous intra-pipeline device-parallel aggregations," trong DaMoN, 2024.
+
+[64] A. Lerner và G. Alonso, "Data flow architectures for data processing on modern hardware," trong ICDE, 2024.
+
+[65] F. Maschi và G. Alonso, "The difficult balance between modern hardware and conventional cpus," trong DaMoN, 2023.
+
+[66] G. Alonso, N. Ailamaki, S. Krishnamurthy, S. Madden, S. Sivasubramanian, và R. Ramakrishnan, "Future of database system architectures," trong SIGMOD, 2023.
+
+[67] L. von Merzljak, P. Fent, T. Neumann, và J. Giceva, "What are you waiting for? use coroutines for asynchronous i/o to hide i/o latencies and maximize the read bandwidth!" trong ADMS@VLDB, 2022.
+
+[68] J. Wei và X. Zhang, "How much storage do we need for high performance server," trong ICDE, 2022.
+
+[69] Y. Lv, B. Cui, B. He, và X. Chen, "Operation-aware buffer management in flash-based systems," trong SIGMOD, 2011.
+
+[70] J. Do, D. Zhang, J. M. Patel, và D. J. DeWitt, "Fast peak-to-peak behavior with ssd buffer pool," trong ICDE, 2013.
+
+[71] B. Lee, M. An, và S.-W. Lee, "Lru-c: Parallelizing database i/os for flash ssds," trong VLDB, 2023.
+
+[72] T. I. Papon và M. Athanassoulis, "Aceing the bufferpool management paradigm for modern storage devices," trong ICDE, 2023.
+
+[73] J. Li, H.-W. Tseng, C. Lin, Y. Papakonstantinou, và S. Swanson, "Hippogriffdb: Balancing i/o and gpu bandwidth in big data analytics," trong VLDB, 2016.
+
+[74] R. Thonangi và J. Yang, "On log-structured merge for solid-state drives," trong ICDE, 2017.
+
+[75] Z. Wang, L. Shou, K. Chen, và X. Zhou, "Bushstore: Efficient b+ tree group indexing for lsm-tree in non-volatile memory," trong ICDE, 2024.
+
+[76] J. Chu, Y. Tu, Y. Zhang, và C. Weng, "Latte: A native table engine on nvme storage," trong ICDE, 2020.
+
+[77] M. Haubenschild, C. Sauer, T. Neumann, và V. Leis, "Rethinking logging, checkpoints, and recovery for high-performance storage engines," trong SIGMOD, 2020.
+
+[78] T. Ziegler, C. Binnig, và V. Leis, "Scalestore: A fast and cost-efficient storage engine using dram, nvme, and rdma," trong ICDE, 2022.
+
+[79] X. Fan, S. Yan, Y. Huang, và C. Weng, "Tengine: A native distributed table storage engine," trong ICDE, 2024.
+
+[80] S. Shedge, N. Sharma, A. Agarwal, M. Abouzour, và G. Aluç, "An extended ssd-based cache for efficient object store access in sap iq," trong ICDE, 2022.
+
+[81] Y. Chai, Y. Chai, X. Wang, H. Wei, N. Bao, và Y. Liang, "Ldc: a lower-level driven compaction method to optimize ssd-oriented key-value stores," trong ICDE, 2019.
+
+[82] C. Duffy, J. Shim, S.-H. Kim, và J.-S. Kim, "Dotori: A key-value ssd based kv store," trong VLDB, 2023.
+
+[83] J. Do, I. L. Picoli, D. Lomet, và P. Bonnet, "Better database cost/performance via batched i/o on programmable ssd," VLDBJ, 2021.
+
+[84] Y. Wang, J. Yuan, S. Wu, H. Liu, J. Chen, C. Ma, và J. Qin, "Leaderkv: Improving read performance of kv stores via learned index and decoupled kv table," trong ICDE, 2024.
+
+[85] Y. Wang, J. He, K. Sun, Y. Dong, J. Chen, C. Ma, A. C. Zhou, và R. Mao, "Boosting write performance of kv stores: An nvm-enabled storage collaboration approach," trong ICDE, 2024.
+
+[86] Y. Huang, X. Fan, S. Yan, và C. Weng, "Neos: A nvme-gpus direct vector service buffer in user space," trong ICDE, 2024.
+
+[87] T. I. Papon, "Enhancing data systems performance by exploiting ssd concurrency & asymmetry," trong ICDE, 2024.
+
+[88] Y. Park, S. Min, và J. W. Lee, "Ginex: Ssd-enabled billion-scale graph neural network training on a single machine via provably optimal in-memory caching," trong VLDB, 2022.
+
+[89] M.-S. Kim, K. An, H. Park, H. Seo, và J. Kim, "Gts: A fast and scalable graph processing method based on streaming topology to gpus," trong SIGMOD, 2016.
+
+[90] J. B. Park, V. S. Mailthody, Z. Qureshi, và W.-m. Hwu, "Accelerating sampling and aggregation operations in gnn frameworks with gpu initiated direct storage accesses," trong VLDB, 2024.
+
+[91] J. Sun, Z. Shi, L. Su, W. Shen, Z. Wang, Y. Li, W. Yu, W. Lin, F. Wu, J. Zhou, và B. He, "Helios: Efficient distributed dynamic graph sampling for online gnn inference," trong PPoPP, 2025.
+
+[92] J. Sun, M. Sun, Z. Zhang, J. Xie, Z. Shi, Z. Yang, J. Zhang, F. Wu, và Z. Wang, "Hyperion: Optimizing ssd access is all you need to enable cost-efficient out-of-core gnn training," trong ICDE, 2025.
+
+[93] M. Zhang, J. Sun, Q. Hu, P. Sun, Z. Wang, Y. Wen, và T. Zhang, "Torchgt: A holistic system for large-scale graph transformer training," trong SC, 2024.
+
+[94] J. Sun, L. Su, Z. Shi, W. Shen, Z. Wang, L. Wang, J. Zhang, Y. Li, W. Yu, J. Zhou, và F. Wu, "Legion: Automatically pushing the envelope of Multi-GPU system for Billion-Scale GNN training," trong ATC, 2023.
+
+[95] J. Wang, C. Lin, Y. Papakonstantinou, và S. Swanson, "Evaluating list intersection on ssds for parallel i/o skipping," trong ICDE, 2021.
+
+[96] J. Feng và D. Huang, "Optimal gradient checkpoint search for arbitrary computation graphs," trong CVPR, 2021.
+
+[97] A. Gruslys, R. Munos, I. Danihelka, M. Lanctot, và A. Graves, "Memory-efficient backpropagation through time," trong NIPS, 2016.
+
+[98] J. Herrmann, O. Beaumont, L. Eyraud-Dubois, J. Hermann, A. Joly, và A. Shilova, "Optimal checkpointing for heterogeneous chains: how to train deep neural networks with limited memory," TOMS, 2024.
+
+[99] O. Beaumont, J. Herrmann, G. Pallez, và A. Shilova, "Optimal memory-aware backpropagation of deep join networks," Philosophical Transactions of the Royal Society A, 2020.
+
+[100] M. Kusumoto, T. Inoue, G. Watanabe, T. Akiba, và M. Koyama, "A graph theoretic framework of recomputation algorithms for memory-efficient backpropagation," trong NeurIPS, 2019.
+
+[101] M. Kirisame, S. Lyubomirsky, A. Haan, J. Brennan, M. He, J. Roesch, T. Chen, và Z. Tatlock, "Dynamic tensor rematerialization," arXiv preprint, 2020.
+
+[102] O. Beaumont, L. Eyraud-Dubois, và A. Shilova, "Efficient combination of rematerialization and offloading for training dnns," trong NeurIPS, 2021.
+
+[103] Z. Zong, L. Lin, L. Lin, L. Wen, và Y. Sun, "Str: Hybrid tensor re-generation to break memory wall for dnn training," TPDS, 2023.
+
+[104] T. D. Le, H. Imai, Y. Negishi, và K. Kawachiya, "Tflms: Large model support in tensorflow by graph rewriting," arXiv preprint, 2018.
+
+[105] H. Jin, B. Liu, W. Jiang, Y. Ma, X. Shi, B. He, và S. Zhao, "Layer-centric memory reuse and data migration for extreme-scale deep learning on many-core architectures," TACO, 2018.
+
+[106] J. Zhang, S. H. Yeung, Y. Shu, B. He, và W. Wang, "Efficient memory management for gpu-based deep learning systems," arXiv preprint, 2019.
+
+[107] S. Shriram, A. Garg, và P. Kulkarni, "Dynamic memory management for gpu-based training of deep neural networks," trong IPDPS, 2019.
+
+[108] O. Beaumont, L. Eyraud-Dubois, và A. Shilova, "Optimal gpu-cpu offloading strategies for deep neural network training," trong Euro-Par, 2020.
+
+[109] J. Ren, J. Luo, K. Wu, M. Zhang, H. Jeon, và D. Li, "Sentinel: Efficient tensor migration and allocation on heterogeneous memory systems for deep learning," trong HPCA, 2021.
+
+[110] L. Mei, K. Goetschalckx, A. Symons, và M. Verhelst, "Defines: Enabling fast exploration of the depth-first scheduling space for dnn accelerators through analytical modeling," trong HPCA, 2023.
+
+[111] J. Jung, J. Kim, và J. Lee, "Deepum: Tensor migration and prefetching in unified memory," trong ASPLOS, 2023.
+
+[112] C.-C. Huang, G. Jin, và J. Li, "Swapadvisor: Pushing deep learning beyond the gpu memory limit via smart swapping," trong ASPLOS, 2020.
+
+[113] X. Nie, X. Miao, Z. Yang, và B. Cui, "Tsplit: Fine-grained gpu memory management for efficient dnn training via tensor splitting," trong ICDE, 2022.
+
+[114] S. G. Patil, P. Jain, P. Dutta, I. Stoica, và J. Gonzalez, "Poet: Training neural networks on tiny devices with integrated rematerialization and paging," trong ICML, 2022.
+
+[115] B. Pudipeddi, M. Mesmakhosroshahi, J. Xi, và S. Bharadwaj, "Training large neural networks with constant memory using a new execution algorithm," arXiv preprint, 2020.
+
+[116] H. Huang, J. Fang, H. Liu, S. Li, và Y. You, "Elixir: Train a large language model on a small gpu cluster," arXiv preprint, 2022.

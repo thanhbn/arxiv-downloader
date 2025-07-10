@@ -1,0 +1,215 @@
+# GaLore: Huấn luyện LLM tiết kiệm bộ nhớ bằng phương pháp chiếu gradient hạng thấp
+
+Jiawei Zhao1 Zhenyu Zhang3 Beidi Chen2 4 Zhangyang Wang3 Anima Anandkumar* 1 Yuandong Tian* 2
+
+Tóm tắt
+Huấn luyện các Mô hình Ngôn ngữ Lớn (LLM) đặt ra những thách thức bộ nhớ đáng kể, chủ yếu do kích thước ngày càng tăng của các trọng số và trạng thái tối ưu hóa. Các phương pháp giảm bộ nhớ phổ biến, như thích ứng hạng thấp (LoRA), thêm một ma trận hạng thấp có thể huấn luyện vào trọng số tiền huấn luyện đóng băng trong mỗi lớp. Tuy nhiên, những phương pháp này thường hoạt động kém hơn so với huấn luyện với trọng số đầy đủ hạng trong cả giai đoạn tiền huấn luyện và tinh chỉnh vì chúng giới hạn việc tìm kiếm tham số trong không gian con hạng thấp và làm thay đổi động lực huấn luyện, và hơn nữa, có thể yêu cầu khởi động đầy đủ hạng. Trong nghiên cứu này, chúng tôi đề xuất Chiếu Gradient Hạng Thấp (GaLore), một chiến lược huấn luyện cho phép học tham số đầy đủ nhưng tiết kiệm bộ nhớ hơn các phương pháp thích ứng hạng thấp phổ biến như LoRA. Phương pháp của chúng tôi giảm sử dụng bộ nhớ lên đến 65,5% trong trạng thái tối ưu hóa trong khi duy trì cả hiệu quả và hiệu suất cho tiền huấn luyện trên kiến trúc LLaMA 1B và 7B với tập dữ liệu C4 với lên đến 19,7B token, và trên tinh chỉnh RoBERTa trên các nhiệm vụ GLUE. GaLore 8-bit của chúng tôi giảm thêm bộ nhớ tối ưu hóa lên đến 82,5% và tổng bộ nhớ huấn luyện 63,3%, so với baseline BF16. Đáng chú ý, chúng tôi chứng minh, lần đầu tiên, tính khả thi của việc tiền huấn luyện một mô hình 7B trên GPU người tiêu dùng với bộ nhớ 24GB (ví dụ, NVIDIA RTX 4090) mà không cần song song mô hình, checkpoint, hoặc các chiến lược offloading. Mã nguồn được cung cấp trong liên kết.
+
+1. Giới thiệu
+Các Mô hình Ngôn ngữ Lớn (LLM) đã cho thấy hiệu suất ấn tượng trên nhiều lĩnh vực, bao gồm AI đàm thoại và dịch thuật ngôn ngữ. Tuy nhiên, tiền huấn luyện và tinh chỉnh LLM không chỉ yêu cầu một lượng lớn tính toán mà còn rất tốn bộ nhớ. Yêu cầu bộ nhớ bao gồm không chỉ hàng tỷ tham số có thể huấn luyện, mà còn gradient và trạng thái tối ưu hóa của chúng (ví dụ, động lượng gradient và phương sai trong Adam) có thể lớn hơn chính việc lưu trữ tham số (Raffel et al., 2020; Touvron et al., 2023; Chowdhery et al., 2023). Ví dụ, tiền huấn luyện một mô hình LLaMA 7B từ đầu với kích thước batch đơn yêu cầu ít nhất 58 GB bộ nhớ (14GB cho tham số có thể huấn luyện, 42GB cho trạng thái tối ưu hóa Adam và gradient trọng số, và 2GB cho kích hoạt1). Điều này làm cho việc huấn luyện không khả thi trên GPU cấp người tiêu dùng như NVIDIA RTX 4090 với bộ nhớ 24GB.
+
+Ngoài các nỗ lực kỹ thuật và hệ thống, như checkpoint gradient (Chen et al., 2016), offloading bộ nhớ (Rajbhandari et al., 2020), v.v., để đạt được huấn luyện phân tán nhanh hơn và hiệu quả hơn, các nhà nghiên cứu cũng tìm cách phát triển các kỹ thuật tối ưu hóa khác nhau để giảm sử dụng bộ nhớ trong quá trình tiền huấn luyện và tinh chỉnh.
+
+Các kỹ thuật tinh chỉnh hiệu quả tham số (PEFT) cho phép thích ứng hiệu quả các mô hình ngôn ngữ tiền huấn luyện (PLM) cho các ứng dụng downstream khác nhau mà không cần tinh chỉnh tất cả các tham số của mô hình (Ding et al., 2022). Trong số đó, Thích ứng Hạng Thấp phổ biến (LoRA Hu et al. (2022)) tham số hóa lại ma trận trọng số W∈Rm×n thành W=W0+BA, trong đó W0 là ma trận đầy đủ hạng đóng băng và B∈Rm×r, A∈Rr×n là các bộ thích ứng hạng thấp cộng thêm cần học. Vì hạng r≪min(m, n), A và B chứa ít tham số có thể huấn luyện hơn và do đó trạng thái tối ưu hóa nhỏ hơn. LoRA đã được sử dụng rộng rãi để giảm sử dụng bộ nhớ cho tinh chỉnh trong đó W0 là trọng số tiền huấn luyện đóng băng. Biến thể ReLoRA của nó cũng được sử dụng trong tiền huấn luyện, bằng cách cập nhật định kỳ W0 sử dụng các bộ thích ứng hạng thấp đã học trước đó (Lialin et al., 2024).
+
+Tuy nhiên, nhiều công trình gần đây chứng minh hạn chế của việc tham số hóa lại hạng thấp như vậy. Đối với tinh chỉnh, LoRA không được chứng minh là đạt hiệu suất tương đương với tinh chỉnh đầy đủ hạng (Xia et al., 2024). Đối với tiền huấn luyện từ đầu, nó được chứng minh là yêu cầu huấn luyện mô hình đầy đủ hạng như một khởi động (Lialin et al., 2024), trước khi tối ưu hóa trong không gian con hạng thấp. Có hai lý do có thể: (1) các ma trận trọng số tối ưu có thể không phải hạng thấp, và (2) việc tham số hóa lại làm thay đổi động lực huấn luyện gradient.
+
+Phương pháp của chúng tôi: Để giải quyết thách thức trên, chúng tôi đề xuất Chiếu Gradient Hạng Thấp (GaLore), một chiến lược huấn luyện cho phép học tham số đầy đủ nhưng tiết kiệm bộ nhớ hơn các phương pháp thích ứng hạng thấp phổ biến, như LoRA. Ý tưởng chính của chúng tôi là tận dụng cấu trúc hạng thấp thay đổi chậm của gradient G∈Rm×n của ma trận trọng số W, thay vì cố gắng xấp xỉ chính ma trận trọng số như hạng thấp.
+
+Đầu tiên chúng tôi chứng minh về mặt lý thuyết rằng ma trận gradient G trở thành hạng thấp trong quá trình huấn luyện. Sau đó, chúng tôi đề xuất GaLore tính toán hai ma trận chiếu P∈Rm×r và Q∈Rn×r để chiếu ma trận gradient G thành dạng hạng thấp P⊤GQ. Trong trường hợp này, chi phí bộ nhớ của trạng thái tối ưu hóa, phụ thuộc vào thống kê gradient theo thành phần, có thể được giảm đáng kể. Cập nhật thỉnh thoảng của P và Q (ví dụ, mỗi 200 lần lặp) tạo ra chi phí tính toán bổ sung phân bổ tối thiểu. GaLore tiết kiệm bộ nhớ hơn LoRA như được thể hiện trong Bảng 1. Trên thực tế, điều này mang lại lên đến 30% giảm bộ nhớ so với LoRA trong tiền huấn luyện.
+
+Chúng tôi chứng minh rằng GaLore hoạt động tốt trong cả tiền huấn luyện và tinh chỉnh LLM. Khi tiền huấn luyện LLaMA 7B trên tập dữ liệu C4, GaLore 8-bit, kết hợp với tối ưu hóa 8-bit và kỹ thuật cập nhật trọng số theo lớp, đạt hiệu suất tương đương với đối tác đầy đủ hạng, với ít hơn 10% chi phí bộ nhớ của trạng thái tối ưu hóa.
+
+Đáng chú ý, đối với tiền huấn luyện, GaLore duy trì bộ nhớ thấp trong suốt quá trình huấn luyện, mà không yêu cầu khởi động huấn luyện đầy đủ hạng như ReLoRA. Nhờ hiệu quả bộ nhớ của GaLore, có thể huấn luyện LLaMA 7B từ đầu trên một GPU duy nhất với bộ nhớ 24GB (ví dụ, trên NVIDIA RTX 4090), mà không cần bất kỳ kỹ thuật offloading bộ nhớ tốn kém nào (Hình 1).
+
+GaLore cũng được sử dụng để tinh chỉnh LLM tiền huấn luyện trên các benchmark GLUE với kết quả tương đương hoặc tốt hơn các phương pháp hạng thấp hiện có. Khi tinh chỉnh RoBERTa-Base trên các nhiệm vụ GLUE với hạng 4, GaLore đạt điểm trung bình 85,89, vượt trội LoRA đạt điểm 85,61.
+
+Là một phương pháp chiếu gradient, GaLore độc lập với việc lựa chọn tối ưu hóa và có thể dễ dàng cắm vào các tối ưu hóa hiện có chỉ với hai dòng mã, như được thể hiện trong Thuật toán 1. Thí nghiệm của chúng tôi (Hình 3) cho thấy nó hoạt động với các tối ưu hóa phổ biến như AdamW, 8-bit Adam, và Adafactor. Ngoài ra, hiệu suất của nó không nhạy cảm với rất ít siêu tham số mà nó giới thiệu. Chúng tôi cũng cung cấp lý giải lý thuyết về tính hạng thấp của cập nhật gradient, cũng như phân tích hội tụ của GaLore.
+
+2. Các nghiên cứu liên quan
+Thích ứng hạng thấp. Hu et al. (2022) đề xuất Thích ứng Hạng Thấp (LoRA) để tinh chỉnh các mô hình tiền huấn luyện với các bộ thích ứng hạng thấp. Phương pháp này giảm dấu chân bộ nhớ bằng cách duy trì một bộ thích ứng trọng số hạng thấp cho mỗi lớp. Có một số biến thể của LoRA được đề xuất để nâng cao hiệu suất của nó (Renduchintala et al., 2023; Sheng et al., 2023; Zhang et al., 2023; Xia et al., 2024), hỗ trợ học đa nhiệm vụ (Wang et al., 2023b), và giảm thêm dấu chân bộ nhớ (Dettmers et al., 2024). Lialin et al. (2024) đề xuất ReLoRA, một biến thể của LoRA được thiết kế cho tiền huấn luyện, nhưng yêu cầu khởi động huấn luyện đầy đủ hạng để đạt hiệu suất tương đương với baseline tiêu chuẩn. Lấy cảm hứng từ LoRA, Hao et al. (2024) cũng đề xuất rằng gradient có thể được nén trong không gian con hạng thấp, và họ đề xuất sử dụng chiếu ngẫu nhiên để nén gradient. Cũng có các phương pháp đề xuất huấn luyện mạng với trọng số phân tích hạng thấp từ đầu (Kamalakara et al., 2022; Wang et al., 2023a; Zhao et al., 2023).
+
+Học không gian con. Các nghiên cứu gần đây đã chứng minh rằng việc học chủ yếu xảy ra trong một không gian con tham số có chiều thấp đáng kể (Gur-Ari et al., 2018; Larsen et al., 2022). Những phát hiện này thúc đẩy một loại học tập đặc biệt gọi là học không gian con, trong đó trọng số mô hình được tối ưu hóa trong một không gian con hạng thấp. Khái niệm này đã được sử dụng rộng rãi trong các lĩnh vực khác nhau của học máy, bao gồm meta-learning và học liên tục (Lee & Choi, 2018; Chaudhry et al., 2020).
+
+Gradient descent được chiếu. GaLore có liên quan chặt chẽ đến chủ đề truyền thống về gradient descent được chiếu (PGD) (Chen & Wainwright, 2015; Chen et al., 2019). Một điểm khác biệt quan trọng là, GaLore xem xét dạng gradient cụ thể xuất hiện tự nhiên trong huấn luyện mạng neural đa lớp (ví dụ, nó là một ma trận với cấu trúc cụ thể), chứng minh nhiều tính chất của nó (ví dụ, Bổ đề 3.3, Định lý 3.2, và Định lý 3.8). Ngược lại, PGD truyền thống chủ yếu coi mục tiêu như một hàm phi tuyến blackbox tổng quát, và nghiên cứu gradient chỉ trong không gian vector.
+
+Gradient hạng thấp. Gradient tự nhiên là hạng thấp trong quá trình huấn luyện mạng neural, và tính chất này đã được nghiên cứu trong cả lý thuyết và thực hành (Zhao et al., 2022; Cosson et al., 2023; Yang et al., 2023). Nó đã được áp dụng để giảm chi phí truyền thông (Wang et al., 2018; Vogels et al., 2020), và dấu chân bộ nhớ trong quá trình huấn luyện (Gooneratne et al., 2020; Huang et al., 2023; Modoranu et al., 2023).
+
+Tối ưu hóa tiết kiệm bộ nhớ. Đã có một số công trình cố gắng giảm chi phí bộ nhớ của thống kê gradient cho các thuật toán tối ưu hóa thích ứng (Shazeer & Stern, 2018; Anil et al., 2019; Dettmers et al., 2022). Lượng tử hóa được sử dụng rộng rãi để giảm chi phí bộ nhớ của trạng thái tối ưu hóa (Dettmers et al., 2022; Li et al., 2024). Các nghiên cứu gần đây cũng đề xuất giảm bộ nhớ gradient trọng số bằng cách kết hợp thao tác backward với cập nhật tối ưu hóa (Lv et al., 2023a;b).
+
+3. GaLore: Chiếu Gradient Hạng Thấp
+3.1. Nền tảng
+Huấn luyện đầy đủ hạng thông thường. Tại bước thời gian t, Gt = −∇Wφt(Wt)∈Rm×n là ma trận gradient (âm) được lan truyền ngược. Sau đó cập nhật trọng số tiền huấn luyện thông thường có thể được viết như sau (η là tỷ lệ học):
+WT=W0+ηT−1∑t=0G̃t=W0+ηT−1∑t=0ρt(Gt) (1)
+trong đó G̃t là gradient cuối cùng được xử lý để thêm vào ma trận trọng số và ρt là một bộ điều chỉnh gradient có trạng thái theo thành phần (ví dụ, Adam). Trạng thái của ρt có thể tốn bộ nhớ. Ví dụ, đối với Adam, chúng ta cần M, V∈Rm×n để điều chỉnh gradient Gt thành G̃t:
+Mt=β1Mt−1+(1−β1)Gt (2)
+Vt=β2Vt−1+(1−β2)G²t (3)
+G̃t=Mt/√(Vt+ε) (4)
+Ở đây G²t và Mt/√(Vt+ε) có nghĩa là phép nhân và chia theo thành phần. η là tỷ lệ học. Cùng với W∈Rm×n, điều này chiếm 3mn bộ nhớ.
+
+Cập nhật hạng thấp. Đối với một lớp tuyến tính W∈Rm×n, LoRA và các biến thể của nó sử dụng cấu trúc hạng thấp của ma trận cập nhật bằng cách giới thiệu một bộ thích ứng hạng thấp AB:
+WT=W0+BTAT, (5)
+trong đó B∈Rm×r và A∈Rr×n, và r≪min(m,n). A và B là các bộ thích ứng hạng thấp có thể học và W0 là một ma trận trọng số cố định (ví dụ, trọng số tiền huấn luyện).
+
+3.2. Tính chất hạng thấp của gradient trọng số
+Trong khi các cập nhật hạng thấp được đề xuất để giảm sử dụng bộ nhớ, vẫn còn là một câu hỏi mở liệu ma trận trọng số có nên được tham số hóa như hạng thấp hay không. Trong nhiều tình huống, điều này có thể không đúng. Ví dụ, trong hồi quy tuyến tính y=Wx, nếu W* tối ưu là hạng cao, thì áp đặt giả định hạng thấp trên W không bao giờ dẫn đến giải pháp tối ưu, bất kể sử dụng tối ưu hóa nào.
+
+Đáng ngạc nhiên, trong khi các ma trận trọng số không nhất thiết phải hạng thấp, gradient thực sự trở thành hạng thấp trong quá trình huấn luyện đối với một số dạng gradient và kiến trúc mạng liên quan.
+
+Mạng khả nghịch. Rõ ràng, đối với một hàm mất mát tổng quát, gradient của nó có thể tùy ý và không nhất thiết phải hạng thấp. Ở đây chúng tôi nghiên cứu cấu trúc gradient cho một họ tổng quát các mạng phi tuyến được gọi là "mạng khả nghịch" (Tian et al., 2020), bao gồm không chỉ mạng tuyến tính đơn giản mà còn mạng ReLU/đa thức sâu:
+
+Định nghĩa 3.1 (Tính khả nghịch (Tian et al., 2020)). Một mạng N ánh xạ đầu vào x tới đầu ra y=N(x) là khả nghịch, nếu tồn tại L(x;W) sao cho y=L(x;W)x, và gradient lan truyền ngược gx thỏa mãn gx=L⊤(x;W)gy, trong đó gy là gradient lan truyền ngược tại đầu ra y. Ở đây L(x;W) phụ thuộc vào đầu vào x và trọng số W trong mạng N.
+
+Vui lòng kiểm tra Phụ lục B.1 để biết các tính chất của nó. Đối với mạng khả nghịch, gradient có dạng cụ thể.
+
+Định lý 3.2 (Dạng gradient của mô hình khả nghịch). Xét một mạng neural khả nghịch chuỗi N(x) := NL(NL−1(...N1(x))) và định nghĩa Jl := Jacobian(NL)...Jacobian(Nl+1) và fl := Nl(...N1(x)). Khi đó ma trận trọng số Wl tại lớp l có gradient Gl có dạng sau với kích thước batch 1:
+(a) Đối với mục tiêu ℓ2 φ := ½∥y−fL∥²₂:
+Gl = (J⊤l(y−J⊤lJlWlfl−1))f⊤l−1 (6)
+(b) Đặt P⊥₁ := I−1/K11⊤ là ma trận chiếu PSD không trung bình. Đối với mất mát logsoftmax K-way φ(y;fL) := −log(exp(y⊤fL)/(1⊤exp(fL))) với logit nhỏ ∥P⊥₁fL∥∞≪√K:
+Gl = (JlP⊥₁(y−γK⁻¹J⊤lP⊥₁JlWlfl−1))f⊤l−1 (7)
+trong đó γ≈1 và y là nhãn dữ liệu với y⊤1=1.
+
+Từ phân tích lý thuyết trên, chúng ta có thể thấy rằng với kích thước batch N, gradient G có cấu trúc nhất định: G = 1/N∑ᵢ₌₁ᴺ(Ai−BiWCi) với ma trận phụ thuộc đầu vào Ai, ma trận Nửa xác định Dương (PSD) Bi và Ci. Trong phần tiếp theo, chúng tôi chứng minh rằng gradient như vậy sẽ trở thành hạng thấp trong quá trình huấn luyện trong một số điều kiện nhất định:
+
+Bổ đề 3.3 (Gradient trở thành hạng thấp trong quá trình huấn luyện). Giả sử gradient tuân theo dạng tham số:
+Gt = 1/N∑ᵢ₌₁ᴺ(Ai−BiWtCi) (8)
+với Ai hằng số, ma trận PSD Bi và Ci sau t≥t₀. Chúng tôi nghiên cứu cập nhật trọng số SGD vanilla: Wt=Wt−1+ηGt−1. Đặt S := 1/N∑ᵢ₌₁ᴺCi⊗Bi và λ₁<λ₂ là hai giá trị riêng nhỏ nhất khác biệt của nó. Khi đó hạng ổn định sr(Gt) thỏa mãn:
+sr(Gt) ≤ sr(G∥t₀) + ((1−ηλ₂)/(1−ηλ₁))^(2(t−t₀)) ∥G₀−G∥t₀∥²F/∥G∥t₀∥²₂ (9)
+trong đó G∥t₀ là phép chiếu của Gt₀ lên không gian riêng tối thiểu V₁ của S tương ứng với λ₁.
+
+Trên thực tế, giả định hằng số có thể gần đúng trong một thời gian, trong đó số hạng thứ hai trong Phương trình 9 tiến về 0 theo cấp số nhân và hạng ổn định của Gt giảm xuống, mang lại gradient hạng thấp Gt. Hạng ổn định cuối cùng được xác định bởi sr(G∥t₀), được ước tính là hạng thấp như sau:
+
+Hệ quả 3.4 (Gt hạng thấp). Nếu gradient có dạng tham số Gt = 1/N∑ᵢ₌₁ᴺ(ai−BiWtfi)f⊤i với tất cả Bi đầy đủ hạng, và N' := rank({fi})<n, thì sr(G∥t₀) ≤ n−N' và do đó sr(Gt) ≤ n/2 với t lớn.
+
+Nhận xét. Dạng gradient được biện minh bởi Định lý 3.2. Trực quan, khi N' nhỏ, Gt là tổng của N' cập nhật hạng-1 và tự nhiên hạng thấp; mặt khác, khi N' trở nên lớn hơn và gần với n, thì động lực huấn luyện có không gian null V₁ nhỏ hơn, điều này cũng làm cho Gt hạng thấp. Giả định đầy đủ hạng của {Bi} là hợp lý, ví dụ, trong LLM, kích thước đầu ra của mạng (tức là kích thước từ vựng) thường rất lớn so với kích thước ma trận.
+
+Nói chung nếu kích thước batch N lớn, thì việc đặc trưng không gian riêng tối thiểu V₁ của S trở nên hơi phức tạp. Mặt khác, nếu V₁ có cấu trúc đẹp, thì sr(Gt) có thể được giới hạn hơn nữa:
+
+Hệ quả 3.5 (Gt hạng thấp với cấu trúc đặc biệt của V₁). Nếu V₁(S) là 1-chiều với vector riêng có thể phân tách v=y⊗z, thì sr(G∥t₀) = 1 và do đó Gt trở thành hạng-1.
+
+Một trường hợp thất bại hiếm của Bổ đề 3.3 là khi G∥t₀ chính xác bằng 0, trong đó sr(G∥t₀) trở thành không xác định. Điều này xảy ra đúng nếu t₀ = 0, tức là Ai, Bi và Ci là hằng số trong suốt quá trình huấn luyện. May mắn thay, đối với huấn luyện thực tế, điều này không xảy ra.
+
+Transformer. Đối với Transformer, chúng tôi cũng có thể chứng minh riêng rằng gradient trọng số của lớp dưới (tức là project-up) của mạng feed forward (FFN) trở thành hạng thấp theo thời gian, sử dụng khung JoMA (Tian et al., 2024). Vui lòng kiểm tra Phụ lục (Mục B.3) để biết chi tiết.
+
+3.3. Chiếu Gradient Hạng Thấp (GaLore)
+Vì gradient G có thể có cấu trúc hạng thấp, nếu chúng ta có thể giữ thống kê gradient của một "lõi" nhỏ của gradient G trong trạng thái tối ưu hóa, thay vì chính G, thì tiêu thụ bộ nhớ có thể được giảm đáng kể. Điều này dẫn đến chiến lược GaLore đề xuất của chúng tôi:
+
+Định nghĩa 3.6 (Chiếu Gradient Hạng Thấp (GaLore)). Chiếu gradient hạng thấp (GaLore) biểu thị các quy tắc cập nhật gradient sau (η là tỷ lệ học):
+WT=W0+η∑t=0^(T−1)G̃t, G̃t=Ptρt(P⊤tGtQt)Q⊤t (10)
+trong đó Pt∈Rm×r và Qt∈Rn×r là các ma trận chiếu.
+
+Khác với LoRA, GaLore sử dụng rõ ràng các cập nhật hạng thấp thay vì giới thiệu các bộ thích ứng hạng thấp bổ sung và do đó không làm thay đổi động lực huấn luyện.
+
+Trong phần tiếp theo, chúng tôi chỉ ra rằng GaLore hội tụ dưới dạng tương tự (nhưng tổng quát hơn) của quy tắc cập nhật gradient (Phương trình 8). Dạng này tương ứng với Phương trình 6 nhưng với kích thước batch lớn hơn.
+
+Định nghĩa 3.7 (Tính liên tục L). Một hàm h(W) có tính liên tục L (Lipschitz), nếu với bất kỳ W₁ và W₂, ∥h(W₁)−h(W₂)∥F ≤ L∥W₁−W₂∥F.
+
+Định lý 3.8 (Hội tụ của GaLore với chiếu cố định). Giả sử gradient có dạng của Phương trình 8 và Ai, Bi và Ci có tính liên tục LA, LB và LC đối với W và ∥Wt∥ ≤ D. Đặt Rt := P⊤tGtQt, B̂it := P⊤tBi(Wt)Pt, Ĉit := Q⊤tCi(Wt)Qt và κt := 1/N∑iλmin(B̂it)λmin(Ĉit). Nếu chúng ta chọn Pt=P và Qt=Q hằng số, thì GaLore với ρt≡1 thỏa mãn:
+∥Rt∥F ≤ |1−η(κt−1−LA−LBLCD²)|∥Rt−1∥F (11)
+
+Kết quả là, nếu minₜκt > LA+LBLCD², Rt→0 và do đó GaLore hội tụ với Pt và Qt cố định.
+
+Thiết lập P và Q. Định lý cho biết P và Q nên chiếu vào các không gian con tương ứng với một vài vector riêng lớn nhất đầu tiên của B̂it và Ĉit để hội tụ nhanh hơn (κt lớn). Trong khi tất cả các giá trị riêng của ma trận nửa xác định dương (PSD) B và C đều không âm, một số trong chúng có thể rất nhỏ và cản trở hội tụ (tức là phải mất nhiều thời gian để Gt trở thành 0). Với chiếu P và Q, P⊤BitP và Q⊤CitQ chỉ chứa các không gian con riêng lớn nhất của B và C, cải thiện sự hội tụ của Rt và cùng lúc, giảm sử dụng bộ nhớ.
+
+Mặc dù khó khăn để có được cấu trúc riêng của B̂it và Ĉit (chúng là các phần của Jacobian), một cách là thay vào đó sử dụng phổ của Gt thông qua Phân tích Giá trị Đơn (SVD):
+Gt=USV⊤ ≈ ∑i=1^r sᵢuᵢvᵢ⊤ (12)
+Pt = [u₁, u₂, ..., uᵣ], Qt = [v₁, v₂, ..., vᵣ] (13)
+
+Khác biệt giữa GaLore và LoRA. Mặc dù cả GaLore và LoRA đều có "hạng thấp" trong tên, chúng tuân theo các quỹ đạo huấn luyện rất khác nhau. Ví dụ, khi r = min(m,n), GaLore với ρt≡1 tuân theo quỹ đạo huấn luyện chính xác của mô hình gốc, như G̃t = PtP⊤tGtQtQ⊤t = Gt. Mặt khác, khi BA đạt đầy đủ hạng (tức là B∈Rm×m và A∈Rm×n), tối ưu hóa B và A đồng thời tuân theo quỹ đạo huấn luyện rất khác so với mô hình gốc.
+
+4. GaLore cho Huấn luyện Tiết kiệm Bộ nhớ
+Đối với một bài toán tối ưu hóa phức tạp như tiền huấn luyện LLM, có thể khó khăn để nắm bắt toàn bộ quỹ đạo gradient với một không gian con hạng thấp duy nhất. Một lý do là các không gian con chính của Bt và Ct (và do đó Gt) có thể thay đổi theo thời gian. Thực tế, nếu chúng ta giữ cùng chiếu P và Q, thì các trọng số học được sẽ chỉ phát triển dọc theo các không gian con này, điều này không còn là huấn luyện tham số đầy đủ. May mắn thay, đối với điều này, GaLore có thể chuyển đổi không gian con trong quá trình huấn luyện và học trọng số đầy đủ hạng mà không tăng dấu chân bộ nhớ.
+
+4.1. Thành phần của các không gian con hạng thấp
+Chúng tôi cho phép GaLore chuyển đổi qua các không gian con hạng thấp:
+Wt = W0 + ΔWT₁ + ΔWT₂ + ... + ΔWTₙ, (14)
+trong đó t∈[∑ᵢ₌₁ⁿ⁻¹Tᵢ, ∑ᵢ₌₁ⁿTᵢ] và ΔWTᵢ = η∑t=0^(Tᵢ−1)G̃t là tổng của tất cả Tᵢ cập nhật trong không gian con thứ i. Khi chuyển đổi sang không gian con thứ i tại bước t=Tᵢ, chúng tôi tái khởi tạo bộ chiếu Pt và Qt bằng cách thực hiện SVD trên gradient hiện tại Gt theo Phương trình 12. Chúng tôi minh họa cách quỹ đạo của G̃t đi qua nhiều không gian con hạng thấp trong Hình 2. Trong phần thí nghiệm, chúng tôi cho thấy rằng cho phép nhiều không gian con hạng thấp là chìa khóa để đạt được tiền huấn luyện thành công các LLM.
+
+Theo quy trình trên, tần suất chuyển đổi T trở thành một siêu tham số. Nghiên cứu loại bỏ (Hình 5) cho thấy tồn tại một điểm ngọt ngào. Thay đổi không gian con rất thường xuyên tăng chi phí (vì Pt và Qt mới cần được tính toán) và phá vỡ điều kiện chiếu hằng số trong Định lý 3.8. Trên thực tế, nó cũng có thể ảnh hưởng đến độ trung thực của trạng thái tối ưu hóa, tích lũy qua nhiều bước huấn luyện. Mặt khác, thay đổi ít thường xuyên hơn có thể làm cho thuật toán bị mắc kẹt trong một vùng không còn quan trọng để tối ưu hóa (chứng minh hội tụ trong Định lý 3.8 chỉ có nghĩa là tiến bộ tốt trong không gian con được chỉ định, nhưng không có nghĩa là hiệu suất tổng thể tốt). Mặc dù T tối ưu phụ thuộc vào tổng số lần lặp huấn luyện và độ phức tạp nhiệm vụ, chúng tôi thấy rằng giá trị giữa T=50 đến T=1000 không tạo ra nhiều khác biệt. Do đó, tổng chi phí tính toán do SVD gây ra là không đáng kể (<10%) so với các kỹ thuật huấn luyện tiết kiệm bộ nhớ khác như offloading bộ nhớ (Rajbhandari et al., 2020).
+
+4.2. Tối ưu hóa tiết kiệm bộ nhớ
+Giảm dấu chân bộ nhớ của thống kê gradient. GaLore giảm đáng kể chi phí bộ nhớ của tối ưu hóa phụ thuộc nhiều vào thống kê gradient theo thành phần, như Adam (Kingma & Ba, 2015). Khi ρt≡Adam, bằng cách chiếu Gt thành dạng hạng thấp Rt, bộ điều chỉnh gradient Adam ρt(Rt) chỉ cần theo dõi thống kê gradient hạng thấp. trong đó Mt và Vt là động lượng bậc một và bậc hai, tương ứng. GaLore tính toán gradient chuẩn hóa hạng thấp Nt như sau:
+Nt = ρt(Rt) = Mt/√(Vt+ε). (15)
+
+GaLore cũng có thể áp dụng cho các tối ưu hóa khác (ví dụ, Adafactor) có quy tắc cập nhật tương tự và yêu cầu một lượng lớn bộ nhớ để lưu trữ thống kê gradient.
+
+Giảm sử dụng bộ nhớ của ma trận chiếu. Để đạt được sự cân bằng tối ưu giữa bộ nhớ và hiệu suất, chúng tôi chỉ sử dụng một ma trận chiếu P hoặc Q, chiếu gradient G thành P⊤G nếu m≤n và GQ ngược lại. Chúng tôi trình bày thuật toán áp dụng GaLore cho Adam trong Thuật toán 2.
+
+Với cài đặt này, GaLore yêu cầu ít bộ nhớ hơn LoRA trong quá trình huấn luyện. Vì GaLore luôn có thể hợp nhất ΔWt vào W0 trong quá trình cập nhật trọng số, nó không cần lưu trữ một phân tích hạng thấp riêng biệt BA. Tổng cộng, GaLore yêu cầu bộ nhớ (mn+mr+2nr), trong khi LoRA yêu cầu bộ nhớ (mn+3mr+3nr). So sánh giữa GaLore và LoRA được thể hiện trong Bảng 1.
+
+Vì Định lý 3.8 không yêu cầu ma trận chiếu phải được hiệu chỉnh cẩn thận, chúng tôi có thể giảm thêm chi phí bộ nhớ của ma trận chiếu bằng lượng tử hóa và tham số hóa hiệu quả, điều mà chúng tôi để lại cho công việc tương lai.
+
+4.3. Kết hợp với các kỹ thuật hiện có
+GaLore tương thích với các kỹ thuật tối ưu hóa tiết kiệm bộ nhớ hiện có. Trong công việc của chúng tôi, chúng tôi chủ yếu xem xét việc áp dụng GaLore với tối ưu hóa 8-bit và cập nhật trọng số theo lớp.
+
+Tối ưu hóa 8-bit. Dettmers et al. (2022) đề xuất tối ưu hóa Adam 8-bit duy trì hiệu suất tối ưu hóa 32-bit với một phần nhỏ của dấu chân bộ nhớ. Chúng tôi áp dụng GaLore trực tiếp vào triển khai hiện có của Adam 8-bit.
+
+Cập nhật trọng số theo lớp. Trên thực tế, tối ưu hóa thường thực hiện một cập nhật trọng số duy nhất cho tất cả các lớp sau lan truyền ngược. Điều này được thực hiện bằng cách lưu trữ toàn bộ gradient trọng số trong bộ nhớ. Để giảm thêm dấu chân bộ nhớ trong quá trình huấn luyện, chúng tôi áp dụng cập nhật trọng số theo lớp cho GaLore, thực hiện cập nhật trọng số trong quá trình lan truyền ngược. Đây là kỹ thuật tương tự được đề xuất trong các công trình gần đây để giảm yêu cầu bộ nhớ (Lv et al., 2023a;b).
+
+4.4. Siêu tham số của GaLore
+Ngoài các siêu tham số gốc của Adam, GaLore chỉ giới thiệu rất ít siêu tham số bổ sung: hạng r cũng có trong LoRA, tần suất thay đổi không gian con T (xem Mục 4.1), và hệ số tỷ lệ α.
+
+Hệ số tỷ lệ α điều khiển cường độ của cập nhật hạng thấp, tương tự như hệ số tỷ lệ α/r được gắn vào bộ thích ứng hạng thấp trong Hu et al. (2022). Chúng tôi lưu ý rằng α không phụ thuộc vào hạng r trong trường hợp của chúng tôi. Điều này là bởi vì, khi r nhỏ trong tiền huấn luyện, α/r ảnh hưởng đáng kể đến tốc độ hội tụ, không giống như tinh chỉnh.
+
+5. Thí nghiệm
+Chúng tôi đánh giá GaLore trên cả tiền huấn luyện và tinh chỉnh LLM. Tất cả thí nghiệm chạy trên GPU NVIDIA A100.
+
+Tiền huấn luyện trên C4. Để đánh giá hiệu suất của nó, chúng tôi áp dụng GaLore để huấn luyện các mô hình ngôn ngữ lớn dựa trên LLaMA trên tập dữ liệu C4. Tập dữ liệu C4 là phiên bản khổng lồ, được làm sạch của kho văn liệu web crawl Common Crawl, chủ yếu nhằm tiền huấn luyện các mô hình ngôn ngữ và biểu diễn từ (Raffel et al., 2020). Để mô phỏng tốt nhất tình huống tiền huấn luyện thực tế, chúng tôi huấn luyện mà không lặp lại dữ liệu trên một lượng dữ liệu đủ lớn, trên một loạt kích thước mô hình lên đến 7 tỷ tham số.
+
+Kiến trúc và siêu tham số. Chúng tôi tuân theo thiết lập thí nghiệm từ Lialin et al. (2024), sử dụng kiến trúc dựa trên LLaMA³ với RMSNorm và kích hoạt SwiGLU (Zhang & Sennrich, 2019; Shazeer, 2020; Touvron et al., 2023). Đối với mỗi kích thước mô hình, chúng tôi sử dụng cùng một bộ siêu tham số trên các phương pháp, ngoại trừ tỷ lệ học. Chúng tôi chạy tất cả thí nghiệm với định dạng BF16 để giảm sử dụng bộ nhớ, và chúng tôi điều chỉnh tỷ lệ học cho mỗi phương pháp dưới cùng lượng ngân sách tính toán và báo cáo hiệu suất tốt nhất. Chi tiết về thiết lập nhiệm vụ và siêu tham số được cung cấp trong phụ lục.
+
+Tinh chỉnh trên các nhiệm vụ GLUE. GLUE là một benchmark để đánh giá hiệu suất của các mô hình NLP trên nhiều nhiệm vụ khác nhau, bao gồm phân tích cảm xúc, trả lời câu hỏi, và kéo theo văn bản (Wang et al., 2019). Chúng tôi sử dụng các nhiệm vụ GLUE để đánh giá GaLore so với LoRA cho tinh chỉnh tiết kiệm bộ nhớ.
+
+5.1. So sánh với các phương pháp hạng thấp hiện có
+Đầu tiên chúng tôi so sánh GaLore với các phương pháp hạng thấp hiện có sử dụng tối ưu hóa Adam trên một loạt kích thước mô hình.
+
+Đầy đủ hạng: Phương pháp baseline của chúng tôi áp dụng tối ưu hóa Adam với trọng số và trạng thái tối ưu hóa đầy đủ hạng.
+
+Hạng thấp: Chúng tôi cũng đánh giá một phương pháp hạng thấp truyền thống biểu diễn trọng số bằng phân tích hạng thấp có thể học: W=BA (Kamalakara et al., 2022).
+
+LoRA: Hu et al. (2022) đề xuất LoRA để tinh chỉnh các mô hình tiền huấn luyện với các bộ thích ứng hạng thấp: W=W0+BA, trong đó W0 là trọng số khởi tạo cố định và BA là bộ thích ứng hạng thấp có thể học. Trong trường hợp tiền huấn luyện, W0 là ma trận khởi tạo đầy đủ hạng. Chúng tôi đặt alpha LoRA là 32 và dropout LoRA là 0.05 như cài đặt mặc định của chúng.
+
+ReLoRA: Lialin et al. (2024) đề xuất ReLoRA, một biến thể của LoRA được thiết kế cho tiền huấn luyện, định kỳ hợp nhất BA vào W, và khởi tạo BA mới với reset trên trạng thái tối ưu hóa và tỷ lệ học. ReLoRA yêu cầu điều chỉnh cẩn thận tần suất hợp nhất, reset tỷ lệ học, và reset trạng thái tối ưu hóa. Chúng tôi đánh giá ReLoRA mà không khởi động huấn luyện đầy đủ hạng để so sánh công bằng.
+
+Đối với GaLore, chúng tôi đặt tần suất không gian con T là 200 và hệ số tỷ lệ α là 0.25 trên tất cả kích thước mô hình trong Bảng 2. Đối với mỗi kích thước mô hình, chúng tôi chọn cùng hạng r cho tất cả các phương pháp hạng thấp, và chúng tôi áp dụng chúng cho tất cả các lớp attention đa đầu và lớp feed-forward trong các mô hình. Chúng tôi huấn luyện tất cả mô hình sử dụng tối ưu hóa Adam với các siêu tham số mặc định (ví dụ, β₁=0.9, β₂=0.999, ε=10⁻⁸). Chúng tôi cũng ước tính sử dụng bộ nhớ dựa trên định dạng BF16, bao gồm bộ nhớ cho tham số trọng số và trạng thái tối ưu hóa.
+
+Như được thể hiện trong Bảng 2, GaLore vượt trội các phương pháp hạng thấp khác và đạt hiệu suất tương đương với huấn luyện đầy đủ hạng. Chúng tôi lưu ý rằng đối với kích thước mô hình 1B, GaLore thậm chí vượt trội baseline đầy đủ hạng khi r=1024 thay vì r=512. So với LoRA và ReLoRA, GaLore yêu cầu ít bộ nhớ hơn để lưu trữ tham số mô hình và trạng thái tối ưu hóa. Thiết lập huấn luyện chi tiết của mỗi mô hình và ước tính bộ nhớ cho mỗi phương pháp có trong phụ lục.
+
+5.2. GaLore với tối ưu hóa tiết kiệm bộ nhớ
+Chúng tôi chứng minh rằng GaLore có thể được áp dụng cho các thuật toán học khác nhau, đặc biệt là các tối ưu hóa tiết kiệm bộ nhớ, để giảm thêm dấu chân bộ nhớ. Chúng tôi áp dụng GaLore cho các tối ưu hóa AdamW, 8-bit Adam, và Adafactor (Shazeer & Stern, 2018; Loshchilov & Hutter, 2019; Dettmers et al., 2022). Chúng tôi xem xét Adafactor với thống kê bậc một để tránh suy giảm hiệu suất.
+
+Chúng tôi đánh giá chúng trên kiến trúc LLaMA 1B với 10K bước huấn luyện, và chúng tôi điều chỉnh tỷ lệ học cho mỗi cài đặt và báo cáo hiệu suất tốt nhất. Như được thể hiện trong Hình 3, áp dụng GaLore không ảnh hưởng đáng kể đến sự hội tụ của chúng. Bằng cách sử dụng GaLore với hạng 512, dấu chân bộ nhớ được giảm lên đến 62,5%, ngoài việc tiết kiệm bộ nhớ từ việc sử dụng tối ưu hóa 8-bit Adam hoặc Adafactor. Vì 8-bit Adam yêu cầu ít bộ nhớ hơn các phương pháp khác, chúng tôi ký hiệu 8-bit GaLore là GaLore với 8-bit Adam, và sử dụng nó làm phương pháp mặc định cho các thí nghiệm tiếp theo về tiền huấn luyện mô hình 7B và đo lường bộ nhớ.
+
+5.3. Mở rộng lên kiến trúc LLaMA 7B
+Khả năng mở rộng lên mô hình 7B là một yếu tố quan trọng để chứng minh liệu GaLore có hiệu quả cho các tình huống tiền huấn luyện LLM thực tế hay không. Chúng tôi đánh giá GaLore trên kiến trúc LLaMA 7B với kích thước embedding 4096 và tổng cộng 32 lớp. Chúng tôi huấn luyện mô hình trong 150K bước với 19,7B token, sử dụng huấn luyện 8-node song song với tổng cộng 64 GPU A100.
+
+Do hạn chế tính toán, chúng tôi so sánh 8-bit GaLore (r=1024) với 8-bit Adam với một lần thử duy nhất mà không điều chỉnh siêu tham số. Như được thể hiện trong Bảng 3, sau 150K bước, 8-bit GaLore đạt perplexity 14,65, tương đương với 8-bit Adam có perplexity 14,61.
+
+5.4. Tinh chỉnh tiết kiệm bộ nhớ
+GaLore không chỉ đạt được tiền huấn luyện tiết kiệm bộ nhớ mà còn có thể được sử dụng cho tinh chỉnh tiết kiệm bộ nhớ. Chúng tôi tinh chỉnh các mô hình RoBERTa tiền huấn luyện trên các nhiệm vụ GLUE sử dụng GaLore và so sánh hiệu suất của nó với baseline tinh chỉnh đầy đủ và LoRA. Chúng tôi sử dụng siêu tham số từ Hu et al. (2022) cho LoRA và điều chỉnh tỷ lệ học và hệ số tỷ lệ cho GaLore. Như được thể hiện trong Bảng 4, GaLore đạt hiệu suất tốt hơn LoRA trên hầu hết các nhiệm vụ với dấu chân bộ nhớ ít hơn. Điều này chứng minh rằng GaLore có thể phục vụ như một chiến lược huấn luyện tiết kiệm bộ nhớ toàn diện cho cả tiền huấn luyện và tinh chỉnh LLM.
+
+5.5. Đo lường bộ nhớ và thông lượng
+Mặc dù Bảng 2 đưa ra lợi ích lý thuyết của GaLore so với các phương pháp khác về mặt sử dụng bộ nhớ, chúng tôi cũng đo lường dấu chân bộ nhớ thực tế của việc huấn luyện các mô hình LLaMA bằng các phương pháp khác nhau, với kích thước batch token 256. Huấn luyện được thực hiện trên thiết lập thiết bị đơn mà không có checkpoint kích hoạt, offloading bộ nhớ, và phân vùng trạng thái tối ưu hóa (Rajbhandari et al., 2020).
+
+Huấn luyện mô hình 7B trên GPU người tiêu dùng với bộ nhớ 24G. Như được thể hiện trong Hình 4, 8-bit GaLore yêu cầu ít bộ nhớ hơn đáng kể so với baseline BF16 và 8-bit Adam, và chỉ yêu cầu 22,0G bộ nhớ để tiền huấn luyện LLaMA 7B với kích thước batch token nhỏ trên mỗi GPU (lên đến 500 token). Dấu chân bộ nhớ này nằm trong khả năng VRAM 24GB của một GPU duy nhất như NVIDIA RTX 4090. Ngoài ra, khi checkpoint kích hoạt được bật, kích thước batch token trên mỗi GPU có thể tăng lên đến 4096. Mặc dù kích thước batch nhỏ trên mỗi GPU, nó có thể được mở rộng với song song dữ liệu, yêu cầu băng thông thấp hơn nhiều cho truyền thông liên GPU, so với song song mô hình. Do đó, có thể GaLore có thể được sử dụng cho huấn luyện đàn hồi (Lin et al., 2019) các mô hình 7B trên GPU người tiêu dùng như RTX 4090.
+
+Cụ thể, chúng tôi trình bày phân tích bộ nhớ trong Hình 1. Nó cho thấy rằng 8-bit GaLore giảm 37,92G (63,3%) và 24,5G (52,3%) tổng bộ nhớ so với baseline BF16 Adam và 8-bit Adam, tương ứng. So với 8-bit Adam, 8-bit GaLore chủ yếu giảm bộ nhớ trong hai phần: (1) chiếu gradient hạng thấp giảm 9,6G (65,5%) bộ nhớ lưu trữ trạng thái tối ưu hóa, và (2) sử dụng cập nhật trọng số theo lớp giảm 13,5G bộ nhớ lưu trữ gradient trọng số.
+
+Chi phí thông lượng của GaLore. Chúng tôi cũng đo lường thông lượng của tiền huấn luyện mô hình LLaMA 1B với 8-bit GaLore và các phương pháp khác, kết quả có thể được tìm thấy trong phụ lục. Đặc biệt, việc triển khai hiện tại của 8-bit GaLore đạt 1019,63 token/giây, tạo ra 17% chi phí so với triển khai 8-bit Adam. Tắt cập nhật trọng số theo lớp cho GaLore đạt 1109,38 token/giây, cải thiện thông lượng 8,8%. Chúng tôi lưu ý rằng kết quả của chúng tôi không yêu cầu chiến lược offloading hoặc checkpoint, có thể ảnh hưởng đáng kể đến thông lượng huấn luyện. Chúng tôi để lại tối ưu hóa hiệu quả triển khai GaLore cho công việc tương lai.
+
+6. Nghiên cứu loại bỏ
+Cần bao nhiêu không gian con trong tiền huấn luyện?
+Chúng tôi quan sát thấy rằng cả thay đổi không gian con quá thường xuyên và quá chậm đều làm tổn hại sự hội tụ, như được thể hiện trong Hình 5 (trái). Lý do đã được thảo luận trong Mục 4.1. Nói chung, đối với r nhỏ, việc chuyển đổi không gian con nên xảy ra nhiều hơn để tránh lãng phí các bước tối ưu hóa trong không gian con sai, trong khi đối với r lớn, các cập nhật gradient bao phủ nhiều không gian con hơn, cung cấp nhiều đệm hơn.
+
+Hạng của không gian con ảnh hưởng như thế nào đến sự hội tụ?
+Trong một phạm vi nhất định của giá trị hạng, việc giảm hạng chỉ ảnh hưởng nhẹ đến tốc độ hội tụ, gây ra chậm lại với xu hướng gần như tuyến tính. Như được thể hiện trong Hình 5 (phải), huấn luyện với hạng 128 sử dụng 80K bước đạt mất mát thấp hơn so với huấn luyện với hạng 512 sử dụng 20K bước. Điều này cho thấy rằng GaLore có thể được sử dụng để cân bằng giữa bộ nhớ và chi phí tính toán. Trong tình huống hạn chế bộ nhớ, việc giảm hạng cho phép chúng ta ở lại trong ngân sách bộ nhớ trong khi huấn luyện nhiều bước hơn để bảo toàn hiệu suất.
+
+7. Kết luận
+Chúng tôi đề xuất GaLore, một chiến lược tiền huấn luyện và tinh chỉnh tiết kiệm bộ nhớ cho các mô hình ngôn ngữ lớn. GaLore giảm đáng kể việc sử dụng bộ nhớ lên đến 65,5% trong trạng thái tối ưu hóa trong khi duy trì cả hiệu quả và hiệu suất cho tiền huấn luyện và tinh chỉnh LLM quy mô lớn.
+
+Chúng tôi xác định một số vấn đề mở cho GaLore, bao gồm (1) áp dụng GaLore trên huấn luyện các mô hình khác nhau như vision transformer (Dosovitskiy et al., 2021) và mô hình diffusion (Ho et al., 2020), (2) tăng cường hiệu quả bộ nhớ hơn nữa bằng cách sử dụng ma trận chiếu bộ nhớ thấp, và (3) khám phá tính khả thi của huấn luyện phân tán dữ liệu đàn hồi trên phần cứng cấp người tiêu dùng băng thông thấp.
+
+Chúng tôi hy vọng rằng công việc của chúng tôi sẽ truyền cảm hứng cho nghiên cứu tương lai về huấn luyện tiết kiệm bộ nhớ từ góc độ chiếu gradient hạng thấp. Chúng tôi tin rằng GaLore sẽ là một công cụ có giá trị cho cộng đồng, cho phép huấn luyện các mô hình quy mô lớn trên phần cứng cấp người tiêu dùng với tài nguyên hạn chế.
+
+Tuyên bố tác động
+Bài báo này nhằm cải thiện hiệu quả bộ nhớ của việc huấn luyện LLM để giảm tác động môi trường của tiền huấn luyện và tinh chỉnh LLM. Bằng cách cho phép huấn luyện các mô hình lớn hơn trên phần cứng có bộ nhớ thấp hơn, phương pháp của chúng tôi giúp giảm thiểu tiêu thụ năng lượng và dấu chân carbon liên quan đến huấn luyện LLM.
