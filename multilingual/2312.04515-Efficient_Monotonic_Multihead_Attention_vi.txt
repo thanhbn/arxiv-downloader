@@ -1,0 +1,247 @@
+# Attention Đơn Điệu Đa Đầu Hiệu Quả
+
+Xutai Ma, Anna Sun, Siqi Ouyang†, Hirofumi Inaguma, Paden Tomasello
+FAIR tại Meta, †UC Santa Barbara
+
+Chúng tôi giới thiệu Efficient Monotonic Multihead Attention (EMMA), một mô hình dịch đồng thời tiên tiến với khả năng ước tính căn chỉnh đơn điệu ổn định về mặt số học và không thiên vị. Ngoài ra, chúng tôi trình bày các chiến lược huấn luyện và suy luận được cải tiến, bao gồm việc tinh chỉnh đồng thời từ một mô hình dịch ngoại tuyến và giảm phương sai căn chỉnh đơn điệu. Kết quả thực nghiệm cho thấy mô hình được đề xuất đạt được hiệu suất tiên tiến trong dịch đồng thời từ giọng nói sang văn bản trên nhiệm vụ dịch tiếng Tây Ban Nha và tiếng Anh.
+
+Ngày: 30 tháng 11, 2023
+Liên hệ: xutaima@meta.com
+Mã nguồn: https://github.com/facebookresearch/seamless_communication.
+
+1. Giới thiệu
+
+Dịch đồng thời là một nhiệm vụ tập trung vào việc giảm độ trễ của hệ thống dịch máy. Trong phương pháp này, một mô hình dịch đồng thời bắt đầu quá trình dịch ngay cả trước khi người nói hoàn thành câu của họ. Loại mô hình này đóng vai trò quan trọng trong các tình huống độ trễ thấp khác nhau, như du lịch cá nhân và hội nghị quốc tế, nơi mọi người mong muốn trải nghiệm dịch thuật liền mạch và thời gian thực. Trái ngược với mô hình ngoại tuyến, xử lý toàn bộ câu đầu vào và tạo ra kết quả dịch trong một bước duy nhất, mô hình dịch đồng thời hoạt động trên một chuỗi đầu vào từng phần. Mô hình đồng thời kết hợp một cơ chế chính sách để xác định khi nào mô hình nên tạo ra kết quả dịch. Chính sách được đặc trưng bởi hai hành động: đọc và viết. Trong khi hành động viết cho biết mô hình nên tạo ra một bản dịch từng phần, hành động đọc tạo ra một khoảng dừng trong quá trình tạo, cho phép mô hình thu thập thêm thông tin đầu vào. Chính sách đồng thời có thể là dựa trên quy tắc hoặc học thông qua quá trình huấn luyện.
+
+Gần đây, trong lĩnh vực các chính sách đã học, một danh mục cụ thể được gọi là các chính sách dựa trên attention đơn điệu (Raffel et al., 2017; Chiu & Raffel, 2018; Arivazhagan et al., 2019), đặc biệt là Transformer-based Monotonic Multihead Attention (MMA) (Ma et al., 2019b) đã thể hiện hiệu suất tiên tiến trong các nhiệm vụ dịch văn bản sang văn bản đồng thời. Attention đơn điệu cung cấp một khung học chính sách không giám sát dựa trên ước tính căn chỉnh đơn điệu trong thời gian huấn luyện. Bất chấp những thành tích đáng chú ý của MMA trong dịch văn bản sang văn bản, việc thích ứng với đầu vào giọng nói gặp phải một số thách thức.
+
+Ma et al. (2020b) tiết lộ rằng mô hình MMA không thể mang lại những cải tiến đáng kể khi áp dụng cho đầu vào giọng nói so với đường cơ sở wait-k đơn giản. Ma et al. (2020b) quy hiệu suất kém tối ưu của MMA trên đầu vào giọng nói cho các đặc điểm độ chi tiết và tính liên tục của các trạng thái bộ mã hóa giọng nói.
+
+Trong bài báo này, chúng tôi tiếp tục điều tra việc thích ứng attention đơn điệu trên dịch giọng nói. Chúng tôi chứng minh hai yếu tố chính làm cơ sở cho hiệu suất kém tối ưu. Thứ nhất là sự bất ổn định về mặt số học và việc đưa ra thiên vị trong quá trình ước tính căn chỉnh đơn điệu, xuất phát từ các kỹ thuật được giới thiệu bởi Raffel et al. (2017). Thứ hai là phương sai đáng kể trong ước tính căn chỉnh đơn điệu, đặc biệt là ở phần sau của câu, do tính chất liên tục của các trạng thái bộ mã hóa. Để giải quyết những thách thức này, chúng tôi đề xuất Efficient Monotonic Multihead Attention (EMMA). Cụ thể, những đóng góp chính của công trình này bao gồm:
+
+• Một phương pháp ước tính căn chỉnh đơn điệu ổn định về mặt số học, không thiên vị mới, mang lại hiệu suất tiên tiến trong cả dịch văn bản sang văn bản và giọng nói sang văn bản đồng thời.
+
+• Một chiến lược định hình căn chỉnh đơn điệu mới, bao gồm điều chỉnh độ trễ mới và giảm phương sai căn chỉnh đơn điệu
+
+• Một sơ đồ huấn luyện được cải tiến, bao gồm tinh chỉnh mô hình đồng thời dựa trên mô hình ngoại tuyến đã được huấn luyện trước.
+
+2. Nền tảng
+
+2.1 Ký hiệu
+
+Với các ma trận A và B, chúng tôi chú thích các phép toán được sử dụng trong các chương sau, cùng với việc thực hiện chúng trong bộ công cụ PyTorch trong Bảng 1.
+
+[THIS IS TABLE: A table showing matrix operations and their PyTorch implementations, with columns for Notation, Definition, and PyTorch implementation]
+
+2.2 Dịch Đồng thời
+
+Ký hiệu X và Ŷ là các chuỗi đầu vào và đầu ra của hệ thống dịch. X là token văn bản cho đầu vào văn bản và các trạng thái bộ mã hóa giọng nói cho đầu vào giọng nói. Chúng tôi giới thiệu khái niệm chuỗi độ trễ ký hiệu là D, trong đó mỗi phần tử di là độ dài đầu vào được sử dụng để tạo ra phần tử đầu ra tương ứng ŷi. Cần lưu ý rằng D tạo thành một chuỗi không giảm đơn điệu nghiêm ngặt.
+
+Trong hệ thống dịch đồng thời, tồn tại Ŷ sao cho di < |X|. Trong khi đó, dịch ngoại tuyến có nghĩa là di = |X| cho tất cả i. Phép đo D thay đổi theo phương tiện đầu vào và đầu ra. Trong bài báo này, di được đo bằng số token cho đầu vào văn bản và giây cho đầu vào giọng nói.
+
+Có hai khía cạnh để đánh giá hệ thống dịch giọng nói đồng thời: chất lượng và độ trễ. Trong khi đánh giá chất lượng giống như hệ thống ngoại tuyến, để đánh giá độ trễ, chúng tôi sử dụng số liệu được sử dụng phổ biến nhất là Average Lagging (AL) Ma et al. (2019a), được định nghĩa là
+
+AL = 1/τ(|X|) ∑[i=1 to τ(|X|)] di - di*    (1)
+
+trong đó τ(|X|) = min{i|di = |X|} là chỉ số của bản dịch mục tiêu đầu tiên khi chính sách đầu tiên đạt đến cuối câu nguồn. di* là chính sách lý tưởng được định nghĩa là
+
+di* = (i-1)·|X|/|Y|    (2)
+
+trong đó Y là bản dịch tham chiếu. Như được đề xuất bởi Ma et al. (2020b), |X| được đo bằng số từ nguồn cho đầu vào văn bản và bằng số giây của giọng nói nguồn cho đầu vào giọng nói.
+
+2.3 Attention Đơn điệu
+
+Các mô hình attention đơn điệu (Raffel et al., 2017; Chiu & Raffel, 2018; Arivazhagan et al., 2019; Ma et al., 2019b) có chính sách có thể học dựa trên ước tính căn chỉnh đơn điệu trong thời gian huấn luyện. Tại thời điểm cho trước khi dự đoán dịch mục tiêu thứ i-1 đã được dự đoán và đầu vào nguồn thứ j đã được xử lý, một xác suất theo bước, ký hiệu là pi,j, mô tả khả năng mô hình sẽ viết dự đoán thứ i thay vì đọc đầu vào tiếp theo. Cụ thể, nó được định nghĩa là
+
+pi,j = P(action = write|i, j; θp) = Sigmoid(Nθp(si-1, hj))    (3)
+
+trong đó Nθp là mạng chính sách, si-1 là trạng thái bộ giải mã thứ i-1 và hj là trạng thái bộ mã hóa thứ j.
+
+Raffel et al. (2017) đề xuất một ước tính dạng đóng của căn chỉnh giữa nguồn và mục tiêu αi,j từ pi,j trong quá trình huấn luyện:
+
+αi,: = pi,: ⊙ cumprod2(1-pi,:) ⊙ cumsum2(αi-1,: ⊙ 1/cumprod2(1-pi,:))    (4)
+
+Trong khi Raffel et al. (2017) xử lý căn chỉnh cứng giữa nguồn và mục tiêu, Chiu & Raffel (2018) giới thiệu monotonic chunkwise attention (MoChA), cho phép attention mềm trong một khối theo sau đầu attention di chuyển. Arivazhagan et al. (2019) tiếp tục đề xuất monotonic infinite lookback attention (MILk), trong đó attention mềm được tính toán trên tất cả lịch sử trước đó. Với năng lượng ui,j cho trạng thái bộ giải mã thứ i và trạng thái bộ mã hóa thứ j, attention mềm kỳ vọng được tính toán trong Phương trình 5:
+
+βi,j = ∑[k=j to |X|] (αi,k exp(ui,j) / ∑[l=1 to k] exp(ui,l))    (5)
+
+trong đó β thay vì α sau đó được sử dụng trong huấn luyện. Arivazhagan et al. (2019) cũng giới thiệu huấn luyện tăng cường độ trễ để kiểm soát độ trễ. Ma et al. (2019b) tiếp tục mở rộng attention đơn điệu thành multihead attention (MMA) cho các mô hình Transformer. Thiết kế của MMA là để cho phép mỗi đầu attention như attention đơn điệu riêng lẻ.
+
+3. Efficient Monotonic Multihead Attention
+
+Trong phần này, chúng tôi sẽ thảo luận về ba yếu tố chính của Efficient Monotonic Multihead Attention (EMMA): ước tính ổn định về mặt số học, định hình căn chỉnh, và tinh chỉnh streaming. Đáng chú ý rằng ước tính căn chỉnh đơn điệu, ký hiệu là α, được thảo luận trong phần này dựa trên một đầu attention duy nhất. Theo cùng thiết kế như Ma et al. (2019b), cùng ước tính α được áp dụng cho mỗi đầu attention trong MMA như được tích hợp vào mô hình Transformer (Vaswani et al., 2017). Đáng chú ý, chỉ có biến thể infinite lookback (Arivazhagan et al., 2019) của attention đơn điệu được áp dụng.
+
+3.1 Ước tính Ổn định Số học
+
+Tương tự như Raffel et al. (2017), mục tiêu của ước tính đơn điệu là tính toán căn chỉnh kỳ vọng αi,j từ xác suất hành động viết theo bước pi,j. Tuy nhiên, sự bất ổn định về mặt số học phát sinh từ mẫu số trong Phương trình 4, đặc biệt khi xử lý phép nhân của nhiều xác suất nhỏ. Để giải quyết vấn đề này, chúng tôi giới thiệu một phương pháp sáng tạo ổn định về mặt số học cho ước tính attention đơn điệu.
+
+Theo phương pháp được đề xuất bởi Raffel et al. (2017), căn chỉnh đơn điệu giữa item mục tiêu thứ i và item nguồn thứ j có thể được biểu diễn như:
+
+αi,j = pi,j ∑[k=1 to j] αi-1,k ∏[l=k to j-1] (1-pi,l)    (6)
+
+Biểu thức này có thể được tái công thức hóa trong định dạng nhân ma trận:
+
+αi,: = pi,: ⊙ αi-1,:T(i)    (7)
+
+trong đó T(i) biểu diễn ma trận chuyển tiếp, với mỗi phần tử của nó được định nghĩa là:
+
+T(i)m,n = {
+  ∏[l=m to n-1] (1-pi,l)  nếu m < n
+  1                        nếu m = n
+  0                        nếu m > n
+}    (8)
+
+T(i)m,n chỉ ra xác suất của chính sách tại bước mục tiêu thứ (i-1) liên tiếp bỏ qua từ đầu vào thứ m đến thứ n. Hơn nữa, ma trận chuyển tiếp có thể được biểu diễn thêm như
+
+T(i) = triu0(cumprod2(1-triu1(J|X|×1 roll1(pi,:))))    (9)
+
+Các phép toán trong phương trình có thể được thực hiện hiệu quả song song trên GPU, như được trình bày chi tiết trong Bảng 1. Tái công thức hóa Phương trình 7, chúng ta đi đến biểu thức sau:
+
+αi,: = pi,: ⊙ αi-1,:triu0(cumprod2(1-triu1(J|X|×1 roll1(pi,:))))    (10)
+
+Đáng chú ý rằng quá trình ước tính này cũng là dạng đóng, với các đặc tính mong muốn là ổn định về mặt số học và không thiên vị, vì nó không yêu cầu mẫu số như tích của các xác suất trong phương trình. Một sự dẫn xuất toàn diện của ước tính dạng đóng này được cung cấp trong Phụ lục A.
+
+3.2 Định hình Căn chỉnh
+
+Khi huấn luyện biến thể infinite lookback của attention đơn điệu, cần thiết phải thêm điều chỉnh độ trễ để ngăn mô hình học một chính sách tầm thường. Không có điều chỉnh độ trễ, chính sách tối ưu để giảm thiểu tổn thất cross-entropy là đọc toàn bộ chuỗi trước khi bắt đầu dịch. Do đó, chúng tôi áp dụng các điều chỉnh độ trễ và phương sai để kiểm soát sự đánh đổi giữa chất lượng dịch và độ trễ của chính sách dịch đồng thời đã học.
+
+Độ trễ của căn chỉnh mô tả mức độ thông tin đầu vào từng phần cần thiết bởi mô hình để tạo ra phần dịch. Việc giảm độ trễ thường được thực hiện bằng cách giới thiệu một thuật ngữ điều chỉnh được dẫn xuất từ căn chỉnh ước tính. Phù hợp với công trình trước đó, như Arivazhagan et al. (2019); Ma et al. (2019b), các độ trễ kỳ vọng D̄ = d̄1, ..., d̄|Y| được ước tính từ căn chỉnh kỳ vọng α trong thời gian huấn luyện. Độ trễ kỳ vọng của token mục tiêu yi, ký hiệu là d̄i, được tính toán như
+
+d̄i = E[j|i] = ∑[k=1 to |X|] k αi,k    (11)
+
+Với số liệu độ trễ C, thuật ngữ tổn thất sau đó được tính toán như
+
+Llatency = C(D̄)    (12)
+
+Phương sai của căn chỉnh đặc trưng cho sự chắc chắn của một ước tính. Đáng chú ý rằng một ước tính căn chỉnh có thể có độ trễ thấp nhưng phương sai cao. Ví dụ, một chính sách random walk, mang lại căn chỉnh đơn điệu với độ trễ tuyến tính, có phương sai rất lớn trên ước tính. Arivazhagan et al. (2019) đề xuất một phương pháp để giảm sự không chắc chắn bằng cách giới thiệu nhiễu Gaussian vào đầu vào của mạng xác suất theo bước. Tuy nhiên, kết quả thực nghiệm cho thấy phương pháp này không hiệu quả, đặc biệt khi áp dụng cho các mô hình dịch giọng nói. Do đó, chúng tôi đề xuất một chiến lược thay thế dựa trên điều chỉnh.
+
+Ký hiệu V = v̄1, ..., v̄|Y| là các phương sai kỳ vọng của căn chỉnh đơn điệu. Phương sai kỳ vọng của token mục tiêu yi, ký hiệu là v̄i, có thể được biểu diễn như
+
+v̄i = E[(j-E[j|i])²|i] = E[j²|i] - E[j|i]² = ∑[k=1 to |X|] k²αi,k - (∑[k=1 to |X|] kαi,k)²    (13)
+
+Sau đó chúng tôi giới thiệu tổn thất phương sai căn chỉnh như sau:
+
+Lvariance = ∑[i=1 to |Y|] v̄i    (14)
+
+Để tiếp tục giảm phương sai căn chỉnh, chúng tôi đề xuất một mạng xác suất theo bước được cải tiến như
+
+pi,j = Sigmoid((FFNs(si-1)ᵀFFNh(hj) + b)/τ)    (15)
+
+FFNs và FFNh phục vụ như các phép chiếu năng lượng, được xây dựng bằng các mạng feedforward đa lớp, làm tăng khả năng biểu diễn của mạng xác suất theo bước so với phép chiếu tuyến tính được áp dụng bởi công trình đơn điệu trước đó. b là một bias có thể học, được khởi tạo bằng giá trị âm. Mục đích của nó là lập lịch quá trình tối ưu hóa chính sách dễ dàng hơn từ chính sách ngoại tuyến. τ là yếu tố nhiệt độ, để khuyến khích đầu ra phân cực từ mạng xác suất theo bước.
+
+Cuối cùng, chúng tôi tối ưu hóa mô hình với mục tiêu sau
+
+L(θ) = -log(Y|X) + λlatencyLlatency + λvarianceLvariance    (16)
+
+trong đó λlatency và λvariance là các trọng số tổn thất.
+
+3.3 Tinh chỉnh Đồng thời
+
+Trong hầu hết công trình trước đó về dịch đồng thời, mô hình thường được huấn luyện từ đầu. Tuy nhiên, phương pháp này thường đòi hỏi nguồn lực đáng kể khi xử lý các tình huống rộng lớn hoặc đa ngôn ngữ. Ví dụ, có thể là một thách thức đáng kể để huấn luyện lại mô hình đồng thời với cấu hình từ các mô hình đa ngôn ngữ quy mô lớn gần đây, như Whisper hoặc SeamlessM4T. Để tận dụng những tiến bộ gần đây đạt được với các mô hình dịch nền tảng lớn và tăng cường khả năng thích ứng của mô hình dịch đồng thời, chúng tôi giới thiệu một phương pháp cho Tinh chỉnh Đồng thời.
+
+Ký hiệu mô hình dịch encoder-decoder ngoại tuyến tùy ý là M(θᵒₑ, θᵒₐ), với θₑ biểu diễn các tham số encoder và θₐ biểu diễn các tham số decoder. Mô hình đồng thời được ký hiệu là M(θₑ, θₐ, θₚ), trong đó θₚ biểu thị mạng chính sách. Tinh chỉnh đồng thời bao gồm việc khởi tạo θₑ với θᵒₑ và θₐ với θᵒₐ. Trong quá trình huấn luyện, các tham số encoder θₑ vẫn cố định, và tối ưu hóa chỉ được thực hiện trên θₐ và θₚ. Thiết kế này được thúc đẩy bởi giả định rằng các thành phần sinh của mô hình, cụ thể là θₑ và θₐ, nên gần giống với những thành phần của mô hình ngoại tuyến. Trong thiết lập đồng thời, chúng được thích ứng với thông tin ngữ cảnh từng phần.
+
+3.3.1 Suy luận Streaming
+
+Chúng tôi sử dụng SimulEval (Ma et al., 2020a) để xây dựng pipeline suy luận. Thuật toán suy luận tổng thể được minh họa trong Thuật toán 1. Đối với đầu vào giọng nói streaming, chúng tôi cập nhật toàn bộ encoder mỗi khi một khối giọng nói mới được mô hình nhận. Sau đó, chúng tôi chạy decoder để tạo ra bản dịch văn bản từng phần dựa trên chính sách.
+
+4. Thiết lập Thực nghiệm
+
+Chúng tôi đánh giá các mô hình được đề xuất trên nhiệm vụ dịch giọng nói sang văn bản. Các mô hình được đánh giá với bộ công cụ SimulEval (Ma et al., 2020a). Đánh giá các mô hình tập trung vào hai yếu tố: chất lượng và độ trễ. Chất lượng được đo bằng BLEU không token hóa, sử dụng bộ công cụ SacreBLEU (Post, 2018). Đánh giá độ trễ được đo bằng Average Lagging (AL) (Ma et al., 2019a) Chúng tôi tuân theo chiến lược tinh chỉnh đồng thời được giới thiệu trong Phần 3.3. Mô hình đồng thời được khởi tạo từ một mô hình dịch ngoại tuyến. Thông tin chi tiết về các nhiệm vụ, tập dữ liệu đánh giá được sử dụng trong nghiên cứu này, và hiệu suất của mô hình ngoại tuyến được trình bày trong Bảng 2.
+
+Đối với nhiệm vụ dịch giọng nói sang văn bản (S2T), chúng tôi thiết lập hai cấu hình thực nghiệm: song ngữ và đa ngôn ngữ.
+
+Thiết lập song ngữ nhằm chứng minh tiềm năng của mô hình khi được cung cấp kho dữ liệu huấn luyện rộng lớn. Chúng tôi đã huấn luyện một mô hình cho mỗi hướng, spa-eng và eng-spa. Nhiệm vụ đa ngôn ngữ chứng minh khả năng thích ứng nhanh chóng của mô hình trong quá trình chuyển đổi từ ngoại tuyến sang đồng thời, từ một mô hình dịch đa ngôn ngữ quy mô lớn hiện có, SeamlessM4T (Seamless Communication et al., 2023).
+
+Trong thiết lập song ngữ, chúng tôi tuân theo thiết lập dữ liệu từ Inaguma et al. (2023). Trong thiết lập đa ngôn ngữ, chúng tôi sử dụng dữ liệu giọng nói sang văn bản từ dữ liệu được gán nhãn và giả gán nhãn trong Seamless Communication et al. (2023).
+
+Trong thiết lập S2T song ngữ, chúng tôi khởi tạo mô hình ngoại tuyến với encoder wav2vec 2.0 đã được huấn luyện trước (Baevski et al., 2020) và decoder mBART (Liu et al., 2020). Sau đó, chúng tôi khởi tạo mô hình đồng thời dựa trên mô hình ngoại tuyến đã được huấn luyện trước này. Mô hình song ngữ được huấn luyện trên dữ liệu có giám sát và bán không giám sát. Trong thiết lập đa ngôn ngữ, chúng tôi khởi tạo mô hình đồng thời với phần S2T của mô hình SeamlessM4T ngoại tuyến, được huấn luyện với cùng dữ liệu được gán nhãn và giả gán nhãn, và đánh giá mô hình trên 100 hướng về eng.
+
+5. Công trình Liên quan
+
+Nghiên cứu gần đây đã tập trung vào phương pháp end-to-end thần kinh, dự đoán rằng một hệ thống đơn giản hơn có thể giảm lỗi giữa các hệ thống con và nâng cao hiệu quả tổng thể trong dịch trực tiếp. Ban đầu áp dụng cho dịch văn bản, phương pháp này mở rộng sang các nhiệm vụ giọng nói sang văn bản, cho thấy tính cạnh tranh chống lại các phương pháp cascade. Duong et al. (2016) giới thiệu cấu trúc sequence-to-sequence dựa trên attention cho giọng nói sang văn bản, sử dụng kiến trúc encoder-decoder dựa trên mạng thần kinh hồi quy (RNN). Bất chấp tính mới lạ, có sự suy giảm chất lượng đáng kể so với các phương pháp cascade. Các nghiên cứu tiếp theo Berard et al. (2016); Weiss et al. (2017); Bansal et al. (2018); Bérard et al. (2018) đã thêm các lớp tích chập, cải thiện đáng kể hiệu suất mô hình end-to-end. Tận dụng thành công của Transformer trong dịch văn bản Vaswani et al. (2017), Di Gangi et al. (2019) và Inaguma et al. (2020) đã áp dụng nó cho dịch giọng nói, đạt được những cải tiến thêm về chất lượng và tốc độ huấn luyện.
+
+Các chính sách dịch đồng thời được phân loại thành ba nhóm. Nhóm đầu tiên bao gồm các chính sách dựa trên quy tắc không có ngữ cảnh được xác định trước. Cho & Esipova (2016) đề xuất chính sách Wait-If-* cho giải mã đồng thời ngoại tuyến, sau đó được sửa đổi bởi Dalvi et al. (2018) cho dự đoán liên tiếp. Một biến thể khác, chính sách Wait-k, được giới thiệu bởi Ma et al. (2019a), trong đó mô hình luân phiên giữa việc đọc k đầu vào và thực hiện các thao tác đọc-viết. Nhóm thứ hai bao gồm chính sách linh hoạt có thể học với một agent, áp dụng học tăng cường. Ví dụ bao gồm Grissom II et al. (2014), người đã sử dụng agent dựa trên chuỗi Markov cho dịch máy dựa trên cụm từ, và Gu et al. (2017), người giới thiệu agent học các quyết định dịch từ tương tác với mô hình dịch máy thần kinh đã được huấn luyện trước. Nhóm thứ ba có các mô hình sử dụng attention đơn điệu, thay thế attention Softmax và tận dụng attention kỳ vọng dạng đóng. Các công trình đáng chú ý bao gồm Raffel et al. (2017), Chiu & Raffel (2018), Arivazhagan et al. (2019), và Ma et al. (2019b), chứng minh những tiến bộ trong giải mã thời gian tuyến tính trực tuyến và cải thiện chất lượng dịch.
+
+6. Kết quả
+
+6.1 Đánh đổi Chất lượng-Độ trễ
+
+Chúng tôi trình bày sự đánh đổi chất lượng-độ trễ trong thiết lập song ngữ. Hình 1 cho thấy điểm BLEU dưới các thiết lập độ trễ khác nhau. Chúng ta có thể thấy rằng mô hình EMMA vượt trội đáng kể so với mô hình Wait-k trên tất cả các vùng độ trễ trong cả hai hướng.
+
+Chúng tôi trình bày sự đánh đổi chất lượng-độ trễ trong thiết lập đa ngôn ngữ, trong Bảng 3. SeamlessM4T-EMMA có thể đạt được chất lượng dịch tốt trong thời gian huấn luyện ngắn hơn nhiều so với huấn luyện từ đầu.
+
+6.2 Trực quan hóa
+
+Chúng tôi cũng trực quan hóa chính sách đã học từ EMMA như Hình 2. Chúng ta có thể thấy rằng với sự hướng dẫn của điều chỉnh độ trễ và phương sai, mô hình có thể học một chính sách đơn điệu căn chỉnh giọng nói đầu vào và văn bản đầu ra.
+
+7. Kết luận
+
+Chúng tôi đề xuất Efficient Monotonic Multihead Attention (EMMA), với một ước tính căn chỉnh ổn định về mặt số học mới. Chúng tôi tinh chỉnh mô hình được khởi tạo từ mô hình ngoại tuyến để tăng tốc huấn luyện và cải thiện hiệu suất. Chúng tôi đánh giá mô hình trong các thiết lập song ngữ và đa ngôn ngữ, và quan sát thấy cải thiện so với đường cơ sở trong cả hai.
+
+Tài liệu tham khảo
+
+[Các tài liệu tham khảo được giữ nguyên như trong bản gốc]
+
+Phụ lục
+
+A. Ước tính Ổn định Số học
+
+Trực quan, α có thể được ước tính từ lập trình động:
+
+αi,j = pi,j ∑[k=1 to j] αi-1,k ∏[l=k to j-1] (1-pi,l)    (17)
+
+Trong khi Phương trình (4) đưa ra một ước tính dạng đóng và song song của căn chỉnh, mẫu số trong phương trình có thể gây ra sự bất ổn định và sự biến mất căn chỉnh trong quá trình huấn luyện. Chúng tôi viết lại Phương trình (17) như
+
+αi,: = pi,: ⊙ αi-1,:T(i)    (18)
+
+trong đó T(i) là ma trận chuyển tiếp và mỗi phần tử của nó được định nghĩa là:
+
+T(i)m,n = {
+  ∏[l=m to n-1] (1-pi,l)  nếu m < n
+  1                        nếu m = n
+  0                        nếu m > n
+}    (19)
+
+T(i)m,n là xác suất của việc đọc từ xm đến xn với yi mà không viết. Ký hiệu ti m,n = ∏[l=m to n] (1-pi,l) Chúng ta có thể thấy rằng nếu chúng ta quản lý để có T(i), thì αi,: có thể được tính toán đơn giản thông qua nhân ma trận.
+
+Định nghĩa xác suất nhảy từ xm đến xn với việc viết token mới yi:
+
+thì chúng ta có thể mở rộng T(i) như
+
+T(i) = [Ma trận với các phần tử ti được mô tả]    (20)
+
+Nó có thể được biểu diễn thêm như
+
+T(i) = triu0([Ma trận mở rộng])    (21)
+
+= triu0(cumprod2(1-Pext(i)))    (22)
+
+trong đó triu b(·) là hàm để trích xuất tam giác trên của ma trận với offset b, và cumprod2 có nghĩa là tính toán được thực hiện theo chiều thứ hai. Ngoài ra, ma trận xác suất mở rộng Pext i được định nghĩa là
+
+Pext(i) = [Ma trận được mô tả]    (23)
+
+= triu1(J|X|×1 [pi,|X| pi,1 ... pi,|X|-1])    (24)
+
+= triu1(J|X|×1 roll1(pi,:))    (25)
+
+Trong đó J|X|×1 là ma trận toàn 1 với kích thước |X| nhân 1, và rollk là hàm để dịch chuyển ma trận k phần tử.
+
+Tóm lại, chúng ta có thể viết lại Phương trình (17) như
+
+αi,: = pi,: ⊙ αi,: triu0(cumprod2(1-triu1(J|X|×1 roll1(pi,:))))    (26)
+
+Một đoạn mã thực hiện EMMA trong PyTorch được hiển thị như sau:
+
+```python
+def monotonic_alignment(p):
+    bsz, tgt_len, src_len = p.size()
+    # Ma trận xác suất mở rộng
+    p_ext = p.roll(1, [-1]).unsqueeze(-2).expand(-1, -1, src_len, -1).triu(1)
+    # Ma trận chuyển tiếp
+    T = (1 - p_ext).cumprod(-1).triu()
+    alpha = [p[:, [0]] * T[:, [0]]
+    for i in range(1, tgt_len):
+        alpha.append(p[:, [i]] * torch.bmm(alpha[i - 1], T[:, i]))
+    return torch.cat(alpha[1:], dim=1)
+```
