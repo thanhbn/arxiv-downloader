@@ -1,0 +1,164 @@
+# Mô hình Ngôn ngữ Hiệu quả với Sparse all-MLP
+
+## Tóm tắt
+
+Các kiến trúc all-MLP đã thu hút ngày càng nhiều sự quan tâm như một lựa chọn thay thế cho các mô hình dựa trên attention. Trong NLP, các nghiên cứu gần đây như gMLP cho thấy rằng các all-MLP có thể sánh ngang với Transformer trong mô hình ngôn ngữ, nhưng vẫn thua kém trong các tác vụ downstream. Trong nghiên cứu này, chúng tôi phân tích các hạn chế của MLP về khả năng biểu đạt, và đề xuất các MLP được kích hoạt thưa thớt với mixture-of-experts (MoEs) trong cả chiều đặc trưng và chiều đầu vào (token). Các sparse all-MLP như vậy tăng đáng kể khả năng mô hình và tính biểu đạt trong khi giữ nguyên tính toán. Chúng tôi giải quyết các thách thức quan trọng trong việc kết hợp tính toán có điều kiện với hai chiến lược routing. Sparse all-MLP được đề xuất cải thiện perplexity mô hình ngôn ngữ và đạt được cải thiện lên đến 2× trong hiệu quả huấn luyện so với cả MoE dựa trên Transformer (GShard, Switch Transformer, Base Layers và HASH Layers) cũng như các Transformer dày đặc và all-MLP. Cuối cùng, chúng tôi đánh giá hiệu suất học trong ngữ cảnh zero-shot của nó trên sáu tác vụ downstream, và thấy rằng nó vượt trội hơn các MoE dựa trên Transformer và Transformer dày đặc.
+
+## 1. Giới thiệu
+
+Transformer đã là kiến trúc tiên tiến nhất cho các tác vụ xử lý ngôn ngữ tự nhiên (NLP) (Devlin et al., 2018; Radford et al., 2018; Raffel et al., 2019; Liu et al., 2019; Brown et al., 2020a). Gần đây, các kiến trúc chỉ sử dụng MLP (multi-layer perceptron) đã cho thấy tính cạnh tranh, đặc biệt trong các tác vụ thị giác máy tính (Tolstikhin et al., 2021; Liu et al., 2021b; Lee-Thorp et al., 2021; Hou et al., 2021; Lou et al., 2021). Trong lĩnh vực NLP, nghiên cứu gần đây như gMLP (Liu et al., 2021a) cho thấy rằng kiến trúc all-MLP có thể sánh ngang với Transformer (Vaswani et al., 2017b) trong perplexity mô hình ngôn ngữ, nhưng vẫn còn khoảng cách trong hiệu suất downstream.
+
+Trong bài báo này, chúng tôi nhằm mục đích đẩy mạnh hiệu suất của all-MLP trong việc pre-training NLP quy mô lớn (Devlin et al., 2018; Radford et al., 2018; Raffel et al., 2019; Liu et al., 2019; Brown et al., 2020a). Chúng tôi phân tích các phương pháp all-MLP hiện tại và tìm ra những hạn chế trong khả năng biểu đạt của chúng. Dựa trên thành công gần đây của Mixture-of-Experts (MoE) dựa trên Transformer (Lepikhin et al., 2020; Fedus et al., 2021; Lewis et al., 2021; Roller et al., 2021; Yang et al., 2021), chúng tôi đề xuất các all-MLP được kích hoạt thưa thớt như một giải pháp thay thế để giải quyết những hạn chế này. Kiến trúc được đề xuất của chúng tôi - sparse MLP (gọi tắt là sMLP) thay thế các khối dày đặc chính trong gMLP (Liu et al., 2021a) bằng các khối thưa thớt. Kết quả là, nó cải thiện sức mạnh biểu đạt của gMLP trong khi giữ nguyên chi phí tính toán.
+
+Cụ thể, chúng tôi áp dụng độ thưa thớt cho hai phép toán cơ bản thường gặp trong các mô hình NLP:
+
+• **Phép toán chiều ẩn**: Chúng tôi áp dụng các expert trong các lớp feed-forward như được sử dụng trong các MoE dựa trên Transformer gần đây như Switch Transformer (Fedus et al., 2021) và Base Layers (Lewis et al., 2021).
+
+• **Phép toán trộn token**: Điều này được thực hiện như self-attention trong Transformer và Spatial Gating Unit trong gMLP. Chúng tôi quan sát thấy rằng các mở rộng ngây thơ trong kiến trúc Transformer, chẳng hạn như biến module self-attention thành expert, hoạt động kém. Chúng tôi thiết kế một module MoE mới, được gọi là sMoE, để giải quyết thách thức này, module này chia nhỏ các biểu diễn ẩn của đầu vào thông qua chiều ẩn, gửi các vector được chia nhỏ đến các expert khác nhau, và thực hiện phép chiếu không gian bên trong mỗi expert.
+
+Chúng tôi cung cấp phân tích sâu về các cơ chế routing trong module sMoE, nơi chúng tôi chỉ ra rằng một thiết kế kém cẩn thận có thể dễ dàng dẫn đến rò rỉ thông tin khi trọng số routing được học từ các token tương lai. Trong bối cảnh mô hình ngôn ngữ, router sử dụng các token tương lai trong quá trình huấn luyện, trong khi tại thời điểm suy luận, mô hình cần dự đoán các token theo kiểu tự hồi quy mà không nhìn vào tương lai. Để giải quyết vấn đề này, chúng tôi đề xuất hai chiến lược routing: (1) **Routing Xác định**: thay vì học chiến lược routing, chúng tôi trực tiếp gửi các vector ẩn đến mỗi expert bằng cách cắt chiều ẩn. Nó có kết nối gián tiếp với cơ chế multi-head attention (Vaswani et al., 2017b), nơi mỗi expert đóng vai trò như một head; (2) **Dự đoán Một phần**: thay vì học chiến lược routing từ toàn bộ câu, chúng tôi chỉ sử dụng 20% token đầu tiên để học chiến lược routing và sử dụng nó để dự đoán 80% còn lại.
+
+Tóm lại, đóng góp của chúng tôi như sau:
+
+• Chúng tôi đề xuất một kiến trúc all-MLP được kích hoạt thưa thớt, được gọi là sMLP. Theo hiểu biết của chúng tôi, đây là nghiên cứu NLP đầu tiên kết hợp các mô hình dựa trên all-MLP với MoE. Chúng tôi cung cấp phân tích sâu về lý do tại sao kiến trúc MLP thua kém Transformer về khả năng biểu đạt và xác định hai thách thức cốt lõi trong việc biến MLP thành MoE được kích hoạt thưa thớt. Kiến trúc sMLP được đề xuất giải quyết những thách thức này với một module sMoE mới lạ và hai chiến lược routing.
+
+• Chúng tôi đánh giá thực nghiệm hiệu suất của nó trên mô hình ngôn ngữ và so sánh với các baseline mạnh của cả MoE dựa trên Transformer thưa thớt như Gshard (Lepikhin et al., 2020), Switch Transformer (Fedus et al., 2021), Base Layers (Lewis et al., 2021) và HASH Layers (Roller et al., 2021) cũng như các mô hình dày đặc bao gồm Transformer (Vaswani et al., 2017b) và gMLP (Liu et al., 2021a). sMLP của chúng tôi vượt trội hơn các mô hình này về valid perplexity trong khi đạt được cải thiện lên đến 2× trong tốc độ pre-training với cùng ngân sách tính toán (được thể hiện trong Hình 1). Ngoài ra, sMLP thể hiện khả năng mở rộng tốt khi nó vẫn vượt trội hơn các đối tác Transformer thưa thớt khi chúng tôi mở rộng sMLP lên 10B tham số với một corpus pre-training lớn 100B token.
+
+• Cuối cùng, chúng tôi đánh giá hiệu suất priming zero-shot của nó sau khi pre-training trên mô hình ngôn ngữ. Thông qua so sánh trực tiếp, mô hình ngôn ngữ all-MLP được kích hoạt thưa thớt được đề xuất vượt trội hơn Transformer được kích hoạt thưa thớt trên sáu tác vụ downstream từ suy luận thông thường ngôn ngữ tự nhiên đến các tác vụ QA. So với các Transformer dày đặc như GPT-3 (Brown et al., 2020b), mô hình sMLP của chúng tôi đạt được hiệu suất zero-shot tương tự mặc dù được pre-train trên một dataset nhỏ hơn nhiều (nhỏ hơn 3× so với dataset được sử dụng bởi GPT-3) với ít tài nguyên tính toán hơn.
+
+## 2. Nền tảng
+
+### 2.1. Các Phép toán Theo Token
+
+Transformer và all-MLP thực hiện các phép toán trộn token theo những cách khác nhau. Cái trước sử dụng self-attention (Vaswani et al., 2017b), trong khi cái sau sử dụng Spatial Gating Unit (Liu et al., 2021a).
+
+Cho biểu diễn token đầu vào X ∈ R^(T×H), trong đó T biểu thị độ dài chuỗi và H biểu thị chiều ẩn. Chúng tôi đặt h là tổng số head.
+
+**Module self attention** Module multi-head self attention là một phép nối của các phép toán trộn token từ mỗi head:
+
+Y = Concat(M₁; : : : ; Mₕ)
+
+với Mᵢ = Softmax(XW^Q_i(XW^K_i)^T)XW^V_i     (1)
+
+trong đó Y là đầu ra, W^Q_i, W^K_i, W^V_i ∈ R^(H×d) là các ma trận phép chiếu. d là chiều ẩn cho đầu vào của một head đơn d = H/h.
+
+**Spatial Gating Unit** gMLP (Liu et al., 2021a) thiết kế Spatial Gating Unit để thay thế module self attention. Trong mỗi head,
+
+Y = W_s ⊙ X     (2)
+
+, trong đó W_s ∈ R^(T×T). Lưu ý rằng, W_s tương ứng với điểm attention thay vì W^V trong Phương trình (1).
+
+### 2.2. Các Mô hình Expert Thưa thớt
+
+Các mô hình expert thưa thớt cung cấp một cách rất hiệu quả để mở rộng việc huấn luyện mạng neural. So với các mô hình dày đặc tiêu chuẩn đòi hỏi chi phí tính toán cực kỳ cao trong huấn luyện, các mô hình expert thưa thớt được chứng minh là có thể xử lý dữ liệu quy mô lớn hơn nhiều và hội tụ nhanh hơn đáng kể. Trong các mô hình thưa thớt, trọng số mô hình được phân phối cho các worker khác nhau theo cơ chế MoE (Lepikhin et al., 2020; Fedus et al., 2021; Lewis et al., 2021; Roller et al., 2021; Yang et al., 2021). MoE tiêu chuẩn ban đầu được thiết kế cho module feed-forward.
+
+**MoE Routing** Gọi {E_i(x)}^N_{i=1} là một tập hợp N expert cho một biểu diễn token x. Shazeer et al. (2017) đề xuất một lớp MoE học cách gửi biểu diễn token đến các expert top-k tốt nhất được xác định, được chọn từ một tập hợp {E_i(x)}^N_{i=1} của N expert. Biến router W_r tạo ra logit h(x) = xW_r được chuẩn hóa qua phân phối softmax trên N expert có sẵn tại lớp đó. Giá trị gate cho expert i được cho bởi,
+
+p_i(x) = e^{h(x)_i} / ∑^N_{j=1} e^{h(x)_j}     (3)
+
+Các giá trị gate top-k được chọn để routing token x. Nếu T là tập hợp các chỉ số top-k được chọn thì phép tính đầu ra của lớp là tổ hợp tuyến tính có trọng số của phép tính của mỗi expert trên token bởi giá trị gate,
+
+y = ∑_{i∈T} p_i(x)E_i(x)     (4)
+
+Cho rằng mỗi token sẽ được gửi đến các thiết bị khác nhau (expert), việc tải không cân bằng thêm ảnh hưởng nặng nề đến hiệu quả của mô hình. Switch Transformer (Fedus et al., 2021) thiết kế một loss cân bằng tải vi phân để giảm độ trễ giao tiếp khi gửi token đến các thiết bị khác nhau. Base Layers (Lewis et al., 2021) đơn giản hóa thêm framework bằng cách loại bỏ loss cân bằng, điều chỉnh thuật toán gán cân bằng (Bertsekas, 1992) để gửi token từ mỗi batch đến các thiết bị khác nhau một cách đều đặn. Thay vì học trọng số routing W_r, HASH Layers (Roller et al., 2021) sử dụng một hàm hashing ngẫu nhiên làm gate routing. Để phân biệt routing Transformer-MoE tiêu chuẩn này (Lepikhin et al., 2020; Fedus et al., 2021; Lewis et al., 2021; Roller et al., 2021; Yang et al., 2021) với của chúng tôi, chúng tôi gọi phương pháp này là tMoE.
+
+## 3. Phương pháp
+
+Việc mở rộng trực tiếp gMLP sang cấu trúc MoE làm giảm hiệu suất, mà chúng tôi cung cấp phân tích chi tiết trong Phụ lục A. Thay vì gửi token đến các expert khác nhau, trong Phần 3.1 chúng tôi đề xuất một module sMoE mới để gửi các vector ẩn đến các expert khác nhau. Chúng tôi đề xuất thêm hai chiến lược routing tương ứng trong Phần 3.2.1 và Phần 3.2.2.
+
+### 3.1. All-MLP được kích hoạt thưa thớt
+
+Kiến trúc tổng thể của sMLP được minh họa trong Hình 2. Mô hình sMLP của chúng tôi chứa N₁ khối dày đặc và N₂ khối thưa thớt. Cả N₁ và N₂ đều là siêu tham số. Trong mỗi khối thưa thớt, nó chứa hai module: (i) **module tMoE**: chúng tôi áp dụng MoE từ Base Layers (Lewis et al., 2021) để thay thế module FFN trong Transformer dày đặc (Vaswani et al., 2017b); (ii) **module sMoE**: chúng tôi thiết kế module sMoE này để thay thế module self attention trong Transformer (Vaswani et al., 2017b) và Spatial Gating Unit trong gMLP (Liu et al., 2021a);
+
+Cả khối tMoE và sMoE đều chứa hai yếu tố:
+
+**Các Module Expert** Đây là các module xử lý đầu vào. Module tMoE chứa một FFN trong mỗi expert. Đối với module sMoE của chúng tôi, mỗi expert chứa Spatial Gating Unit như được thể hiện trong Hình 6 (Phải) trong Phụ lục A.
+
+**Hàm Gating** Đây là module quyết định expert nào nên xử lý mỗi phần của đầu vào. tMoE sử dụng routing theo token tiêu chuẩn (được mô tả trong Phần 2.2). Tuy nhiên, việc áp dụng routing theo token một cách ngây thơ cho gMLP là có sai sót, vì nó gửi token từ cùng một câu đến các expert khác nhau. Token chỉ có thể chú ý đến các token trước đó trong cùng một thiết bị, có nghĩa là khi số lượng expert tăng lên, số lượng token trước đó mà mỗi từ có thể chú ý sẽ giảm xuống. Tham khảo Phụ lục A để biết thêm chi tiết. Vì lý do đó, chúng tôi phải thiết kế một phương pháp routing riêng biệt để mở rộng cấu trúc MoE sang chiều đặc trưng.
+
+Hình 3 (Trái) cho thấy một ví dụ về hàm gating từ các MoE dựa trên Transformer hiện có (Lepikhin et al., 2020; Fedus et al., 2021; Lewis et al., 2021; Roller et al., 2021). x_ij biểu thị giá trị của chiều ẩn thứ j trong token thứ i. tMoE gửi bốn token này đến ba expert này tại lớp FFN bằng cách sử dụng một hàm gating đã học được mô tả trong Phương trình (3) được tham số hóa bởi W_r ∈ R^(4×3).
+
+Không giống như các MoE hiện có này, trong kiến trúc sparse all-MLP chúng tôi đề xuất chia nhỏ biểu diễn ẩn dọc theo chiều ẩn và gửi các vector được chia nhỏ đến các expert khác nhau, như được thể hiện trong Hình 3 (Phải). Chúng tôi tiếp theo thảo luận về thiết kế của hàm gating cho cơ chế routing mới này.
+
+### 3.2. Routing trong Không gian Đặc trưng
+
+So với routing token, routing chiều ẩn đối mặt với một thách thức độc đáo trong các mô hình tự hồi quy, với việc rò rỉ thông tin từ việc nhìn trước vào các token tương lai nếu thực hiện một cách ngây thơ (chi tiết thêm có thể tìm thấy trong Phụ lục B). Hơn nữa, không giống như các MoE dựa trên Transformer với self-attention, việc masking phù hợp không thể được áp dụng trực tiếp để ngăn chặn rò rỉ thông tin. Do các vấn đề nêu trên, chúng tôi không thể áp dụng các phương pháp routing hiện có trong các MoE dựa trên Transformer cho mô hình ngôn ngữ. Chúng tôi đề xuất và so sánh hai giải pháp sau: routing xác định và dự đoán một phần.
+
+#### 3.2.1. ROUTING XÁC ĐỊNH
+
+Để quyết định nơi gửi các vector ẩn khác nhau, chúng tôi cần học một trọng số gating W_r ∈ R^(T×N). Trọng số gating này không thể tránh khỏi cần nhân với vector ẩn v để có được xác suất routing p_i(v). Vector này là một chiều ẩn cụ thể của toàn bộ câu, bao gồm các token tương lai.
+
+Để ngăn chặn các trọng số gating khai thác thông tin token tương lai, vốn không có sẵn tại thời điểm suy luận, phương pháp đầu tiên của chúng tôi loại bỏ trực tiếp W_r. Thay vào đó, chúng tôi chia nhỏ vector trong một chiều ẩn và gửi các vector ẩn đến các expert một cách xác định. Trong trường hợp này, nếu chúng tôi muốn gửi vector ẩn V ∈ R^(H×T) đến N module expert, chúng tôi sẽ chia nhỏ h(v)_i ∈ R^(H/N×T) từ vector ẩn V. Nếu i bằng 0, gating sẽ gửi các vector ẩn đầu tiên đến H/N đến E₁(v).
+
+Không giống như Spatial Gating Unit, module sMoE-deterministic không cần attention của chúng tôi chia tách các chiều ẩn giữa nhiều expert. Trong mỗi module expert, chúng tôi chèn một Spatial Gating Unit, tương tự như multi-head attention, nơi mỗi expert đóng vai trò như một head. Tổng số tham số là N×T×T trong đó N là số lượng expert/head. Hơn nữa, với mỗi head được đặt trên một thiết bị, việc tính toán được thực hiện song song.
+
+#### 3.2.2. DỰ ĐOÁN MỘT PHẦN
+
+Một cách khác để ngăn chặn trọng số gating W_r sử dụng thông tin token tương lai là dự đoán một phần. Thay vì dự đoán tất cả các token trong câu, chúng tôi điều kiện hóa trên 20% token đầu tiên, được sử dụng để quyết định routing, và dự đoán 80% token còn lại.
+
+Cho biểu diễn token đầu vào X ∈ R^(T×H), chúng tôi chia nó thành hai phần trong chiều token: 20% token đầu tiên X₁ ∈ R^(0.2T×H), và 80% token còn lại X₂ ∈ R^(0.8T×H). Thay vì huấn luyện mô hình ngôn ngữ trên toàn bộ độ dài chuỗi T, chúng tôi chỉ huấn luyện nó để dự đoán X₂. Chúng tôi sử dụng X₁ để học các trọng số gating W_r. Trong sMoE, chúng tôi chuyển vị đầu vào X₁ thành V₁ ∈ R^(H×0.2T), đầu vào X₂ thành V₂ ∈ R^(H×0.8T). Biến router W_r ∈ R^(0.2T×N) tạo ra h(V₁) = V₁W_r. V₁ chứa H vector ẩn v_i ∈ R^(0.2T).
+
+Xác suất để gửi vector ẩn thứ i được học bởi
+p_i(v) = e^{h(v)_i} / ∑^N_j e^{h(v)_j}     (5)
+
+Khác với phương pháp trước, sau khi học xác suất p_i(v), phương pháp dự đoán một phần này gửi các vector ẩn v_i ∈ R^(0.8T) từ V₂ đến module expert thay vì các vector ẩn từ V₁.
+
+## 4. Thí nghiệm và Kết quả
+
+### 4.1. Thiết lập Thí nghiệm
+
+**Baseline** Chúng tôi so sánh với các baseline mạnh bao gồm các mô hình dày đặc và thưa thớt tiên tiến, như được tóm tắt trong Bảng 1. Chúng tôi huấn luyện tất cả các baseline của chúng tôi (ngoại trừ GPT3 từ paper) và mô hình của chúng tôi trong PyTorch (Paszke et al., 2017) sử dụng FAIRSEQ (Ott et al., 2019).
+
+**Thiết lập Thí nghiệm và Dataset** Một mô hình được kích hoạt thưa thớt chia trọng số duy nhất trên các thiết bị khác nhau. Do đó, trọng số của mô hình tăng với số lượng thiết bị, tất cả trong khi duy trì dấu chân bộ nhớ và tính toán có thể quản lý trên mỗi thiết bị. Các nghiên cứu trước (Lepikhin et al., 2020; Fedus et al., 2021; Yang et al., 2021) kiểm soát các phép toán dấu phẩy động (FLOP) cho mỗi ví dụ để so sánh mô hình. Chúng tôi sử dụng thư viện fvcore để đo các phép toán dấu phẩy động (FLOP) cho mỗi batch token trong quá trình đánh giá để so sánh mô hình. Vì tất cả các mô hình chứa chính xác cùng số token trong mỗi batch, chúng tôi thực sự kiểm soát FLOP cho mỗi token.
+
+Thiết lập thí nghiệm của chúng tôi được tóm tắt trong Bảng 2. (i) chúng tôi so sánh với tất cả các baseline trong một thiết lập thường xuyên. Để kiểm soát FLOP, chúng tôi thay đổi số lượng lớp trong mô hình. Cụ thể hơn, vì Gshard (Lepikhin et al., 2020) và Switch Transformer (Fedus et al., 2021) có giá trị FLOP lớn hơn cho cùng một cấu trúc mô hình, chúng tôi giảm số lượng lớp của chúng trong khi giữ nguyên chiều ẩn để đạt được cùng FLOP. (ii) chúng tôi cũng tiến hành thí nghiệm ở quy mô và kích thước dữ liệu lớn hơn để kiểm tra khả năng mở rộng của nó. Chúng tôi sử dụng dataset pre-training từ RoBERTa (Liu et al., 2019) và phần tiếng Anh của CC100 (Conneau et al., 2019). Chi tiết thêm có thể tìm thấy trong Phụ lục C.3.
+
+**Chỉ số** (1). Perplexity mô hình ngôn ngữ: Chúng tôi báo cáo perplexity validation như chỉ số của hiệu suất mô hình ngôn ngữ. (2). Hiệu quả huấn luyện: Để đo tốc độ và hiệu quả huấn luyện, chúng tôi so sánh bằng cả số lượng cập nhật và từ trên giây (WPS). (3). Độ chính xác: chúng tôi báo cáo độ chính xác trên các tác vụ downstream để đo hiệu suất của zero-shot priming.
+
+### 4.2. So sánh các phép toán theo token
+
+Trong phần này, chúng tôi so sánh mô hình của chúng tôi với hai mô hình dày đặc: Transformer (Vaswani et al., 2017b) và gMLP (Liu et al., 2021a). Sự khác biệt chính giữa các mô hình dựa trên all-MLP và dựa trên Transformer là phép toán theo token. Chúng tôi so sánh ba loại phép toán theo token này: module self-attention trong Transformer, Spatial Gating Unit trong gMLP, và module sMoE trong mô hình của chúng tôi.
+
+Trong Bảng 3, chúng tôi so sánh ba phép toán theo token này và các cơ chế head tương ứng của chúng. Để mở rộng cơ chế multi-head vào chế độ gMLP, thay vì sử dụng một W_s trong Phương trình (2), chúng tôi chia nhỏ đầu vào X thành h phần dọc theo chiều ẩn, và mỗi phần được nhân với một W_s riêng biệt. Chúng tôi đặt số head h là 16 để so sánh Spatial Gating Unit từ gMLP với module Self-attention từ Transformer. Sau đó tổng số tham số là h×T×T.
+
+So với self attention của Transformer, một nhược điểm của Spatial Gating Unit là số lượng tham số tăng tuyến tính với số head h và tăng bậc hai với độ dài chuỗi T. Để so sánh, module s-MoE của chúng tôi đặt một expert trên mỗi thiết bị, và mỗi expert chỉ chứa một W_s, tương đương với số head là 1.
+
+Trong Hình 4, chúng tôi so sánh mô hình của chúng tôi với mô hình dày đặc với số head khác nhau. Mô hình Transformer được hưởng lợi rất nhiều từ cơ chế multi-head. Tuy nhiên, mặc dù mô hình gMLP tăng số lượng tham số, nó không cải thiện hiệu suất thông qua cơ chế multi-head. Mô hình của chúng tôi cũng có thể được xem như một giải pháp cho multi-head của gMLP. Mô hình của chúng tôi cải thiện đáng kể hiệu suất của mô hình dựa trên all-MLP và cũng vượt trội hơn mô hình Transformer.
+
+### 4.3. Kết quả về Sparse MLP
+
+Chúng tôi báo cáo chất lượng (valid perplexity) và hiệu quả huấn luyện trong Hình 5, được đo bằng số bước huấn luyện (Trên) và thời gian huấn luyện (Dưới). Chúng tôi thấy rằng sMLP với cả hai biến thể của chiến lược routing vượt trội hơn các mô hình MoE dựa trên Transformer tiên tiến với lượng FLOP gần như tương đương. Chúng tôi chỉ ra rằng hiệu quả mẫu quan sát được trên cơ sở bước không nhất thiết chuyển thành chất lượng mô hình tốt hơn khi được đo bằng thời gian thực do hai lý do. Thứ nhất, mô hình của chúng tôi có chi phí giao tiếp all2all bổ sung cho module sMoE. Thứ hai, Base Layers, HASH Layers, và mô hình của chúng tôi gửi token/vector đến module expert một cách cân bằng. Ngược lại, Gshard và Switch Transformer tận dụng một hàm loss để cân bằng việc gán, đây không phải là một phép gán cân bằng đều. Mặc dù chúng có cùng FLOP, việc tải không cân bằng có thể thêm thời gian tính toán bổ sung. Hình 5 (Dưới) cho thấy rằng với cùng thời gian huấn luyện, mô hình của chúng tôi đạt được kết quả tốt nhất (valid perplexity thấp nhất), cho thấy rằng các mô hình sparse all-MLP của chúng tôi đã cải thiện hiệu quả huấn luyện so với các mô hình MoE dựa trên Transformer tiên tiến trên mô hình ngôn ngữ.
+
+Bảng 4 (Trên) tóm tắt so sánh chi tiết trong các thí nghiệm chính. Chúng tôi kiểm soát FLOP của tất cả các mô hình ở mức khoảng 0.8T. Ngoại trừ số lượng lớp mô hình khác nhau, chiều embedding của chúng là 1024, và chiều ẩn là 4096. Chúng tôi có thể thấy rằng mô hình của chúng tôi đạt được khả năng tổng quát tốt nhất tại 25k bước huấn luyện và đồng thời đạt được tốc độ huấn luyện cao nhất. HASH Layers có hiệu suất tốt nhất trong tất cả các baseline Transformer và đòi hỏi ít thời gian nhất, điều này phù hợp với kết quả được báo cáo trong Roller et al. (2021).
+
+### 4.4. Đánh giá về Khả năng Mở rộng
+
+Để kiểm tra khả năng mở rộng của mô hình, chúng tôi tăng kích thước mô hình huấn luyện cho 2.0 TFLOP. Bảng 4 (Dưới) tóm tắt kết quả.
+
+So với các mô hình trong Bảng 4 (Trên), chúng tôi mở rộng tất cả các mô hình, thay đổi embedding từ 1024 thành 2048, và điều chỉnh chiều ẩn từ 4096 thành 8192 như được báo cáo trong Bảng 5. Chúng tôi cũng tăng kích thước dữ liệu pre-training như được mô tả trong Bảng 2.
+
+Trong thiết lập này, chúng tôi thấy Switch Transformer vẫn là một baseline mạnh. Mặc dù Base Layers và HASH Layers hoạt động tốt khi được huấn luyện trên các mô hình và dataset nhỏ, chúng tôi thấy các vấn đề về ổn định trong huấn luyện quy mô lớn. Mặc dù các bài báo trước (Fedus et al., 2021; Lepikhin et al., 2020) đã kiểm soát FLOP để so sánh mô hình, chúng tôi thấy Switch Transformer phù hợp với FLOP có ít tham số hơn mô hình của chúng tôi. Do đó, để cung cấp một so sánh công bằng hơn, chúng tôi cũng đã huấn luyện một phiên bản mở rộng của Switch Transformer (bằng cách thêm một lớp thưa thớt và lớp dày đặc bổ sung) với 10.31B tham số cũng tăng FLOP của nó lên 2.3T. sMLP của chúng tôi vẫn vượt trội hơn Switch Transformer-Enlarge mặc dù cái sau có nhiều FLOP hơn.
+
+### 4.5. Zero-shot Priming
+
+Các thí nghiệm trước đây chứng minh hiệu suất mạnh mẽ của sMLP trong mô hình ngôn ngữ. Trong phần này, chúng tôi đánh giá xem những cải thiện trong pre-training này có chuyển thành khả năng tổng quát được cải thiện trong các tác vụ downstream hay không. Cụ thể, chúng tôi đo khả năng học trong ngữ cảnh zero-shot như được thể hiện trong GPT-3 (Brown et al., 2020b).
+
+**Baseline** Các baseline của chúng tôi là Gshard (Lepikhin et al., 2020), Switch Transformer (Fedus et al., 2021), Base Layers (Lewis et al., 2021) và HASH Layers (Roller et al., 2021) với khoảng 2.0 TFLOP từ Phần 4.4.
+
+**Tác vụ và dataset** Chúng tôi chọn sáu tác vụ NLP đại diện khảo sát suy luận thông thường và trả lời câu hỏi, bao gồm COPA (Roemmele et al., 2011), PIQA (Bisk et al., 2020), StoryCloze (Mostafazadeh et al., 2016), Winogrande (Levesque et al., 2012), HellaSwag (Zellers et al., 2019), ReCoRD (Zhang et al., 2018). Chúng tôi sử dụng một mô hình ngôn ngữ để chấm điểm riêng biệt cho mỗi lựa chọn nhãn bằng cách sử dụng cùng template, và chọn cái có điểm cao nhất như Artetxe et al. (2021). Chi tiết thêm về các tác vụ và dataset có thể tìm thấy trong Phụ lục E.
+
+**Kết quả** Như được thể hiện trong Bảng 6, sMLP vượt trội hơn tất cả các Transformer thưa thớt về độ chính xác trung bình. Những cải thiện đáng chú ý đến từ các tác vụ suy luận thông thường như COPA, StoryCloze và HellaSwag. Chúng tôi cũng so sánh với một Transformer dày đặc phù hợp với FLOP được báo cáo trong bài báo GPT-3 (Brown et al., 2020b), đóng vai trò là baseline dày đặc mạnh nhất. Đáng chú ý là mô hình GPT-3 được huấn luyện với nhiều dữ liệu pre-training hơn (GPT-3 sử dụng 300 tỷ token để pre-training và dữ liệu pre-training của chúng tôi chứa 100 tỷ token).
+
+## 5. Nghiên cứu Liên quan
+
+Mixture of Experts (MoE) đã được chứng minh là hiệu quả trong Shazeer et al. (2017), nơi một lớp MoE được xếp chồng giữa các lớp LSTM (Hochreiter & Schmidhuber, 1997). Gần đây hơn, Gshard (Lepikhin et al., 2020) mở rộng ý tưởng này sang các lớp feed-forward của Transformer (Vaswani et al., 2017b) và cung cấp một cách để tính toán song song, mở rộng dịch máy neural đa ngôn ngữ với Sparsely-Gated Mixture-of-Experts vượt quá 600 tỷ tham số bằng cách sử dụng automatic parameter sharding.
+
+Một số nghiên cứu gần đây cải thiện chiến lược routing trong các MoE dựa trên Transformer. Switch Transformer (Fedus et al., 2021) cho thấy thiết kế có thể được đơn giản hóa bằng cách routing token chỉ đến một expert duy nhất (routing top-1). Ngoài ra, họ thiết kế một loss cân bằng tải vi phân để giảm độ trễ giao tiếp khi gửi token đến các thiết bị khác nhau. Base Layers (Lewis et al., 2021) đơn giản hóa thêm framework bằng cách loại bỏ hàm cân bằng, điều chỉnh thuật toán gán cân bằng (Bertsekas, 1992) để gửi token từ mỗi batch đến các thiết bị khác nhau một cách đều đặn. Thay vì học trọng số gating để gán token, HASH Layers (Roller et al., 2021) thiết kế một hàm Hash để thay thế các trọng số gating có thể học được. (Jaszczur et al., 2021) là người đầu tiên thành công trong việc mở rộng độ thưa thớt sang các lớp attention. Tuy nhiên, kết quả của họ chỉ có thể sánh ngang với transformer dày đặc và không có cải thiện trong tốc độ huấn luyện. Khác với tất cả các phương pháp routing ở trên, phương pháp sMoE-deterministic của chúng tôi (được mô tả trong Phần 3.2.1) chia nhỏ các vector bằng phép gán xác định.
+
+Cũng có một lượng nghiên cứu ngày càng tăng về thiết kế tổng thể và mở rộng các mô hình MoE dựa trên Transformer. Yang et al. (2021) khám phá các yếu tố chính bên trong các mô hình expert thưa thớt và điều tra cách chúng ảnh hưởng đến chất lượng mô hình và hiệu quả tính toán. Clark et al. (2022) nghiên cứu các quy luật mở rộng của các mô hình MoE về số lượng tham số hiệu quả và so sánh ba chiến lược routing. Zoph et al. (2022) điều tra một số chi tiết huấn luyện ảnh hưởng đến sự ổn định huấn luyện và hiệu suất fine-tuning. Ngoài NLP, Riquelme et al. (2021) lần đầu tiên áp dụng MoE trong lĩnh vực Computer Vision.
+
+Một nghiên cứu có liên quan chặt chẽ là Lou et al. (2021), đã phát triển các MoE dựa trên all-MLP cho computer vision. Khi áp dụng vào NLP, có những thách thức bổ sung trong việc thiết kế các phép toán trộn token được kích hoạt thưa thớt bằng cách bảo tồn bản chất tuần tự của đầu vào, nếu không sẽ dẫn đến rò rỉ thông tin như được thể hiện trong Phần 3.2.
+
+## 6. Kết luận
+
+Trong nghiên cứu này, chúng tôi đề xuất sMLP, mở rộng mô hình gMLP gần đây (Liu et al., 2021a) với tính toán có điều kiện được kích hoạt thưa thớt bằng cách sử dụng mixture-of-experts (MoE). Khác với các MoE dựa trên Transformer, chỉ chứa các lớp feed-forward thưa thớt trong khi vẫn giữ tính toán dày đặc cho self-attention, kiến trúc được đề xuất hoàn toàn thưa thớt. Chúng tôi đã phân tích các thách thức trong việc thiết kế chiến lược routing của kiến trúc sparse all-MLP cho mô hình ngôn ngữ và đề xuất hai giải pháp. Thông qua các đánh giá mở rộng trên mô hình ngôn ngữ, chúng tôi cho thấy rằng sMLP vượt trội hơn các mô hình MoE dựa trên Transformer thưa thớt tiên tiến về khả năng tổng quát và cải thiện 2× trong hiệu quả huấn luyện. Bên cạnh những lợi ích trong pre-training, sMLP cũng đạt được độ chính xác cao hơn trong học trong ngữ cảnh zero-shot của sáu tác vụ NLP đại diện, thu hẹp khoảng cách của kiến trúc all-MLP với Transformer như đã quan sát trong gMLP. Đáng chú ý là tất cả các thảo luận của chúng tôi về các thách thức routing và giải pháp đều dựa trên mô hình ngôn ngữ tự hồi quy. Trong tương lai, chúng tôi hy vọng sẽ thử phương pháp MoE dựa trên all-MLP với các mô hình chỉ encoder với attention hai chiều.

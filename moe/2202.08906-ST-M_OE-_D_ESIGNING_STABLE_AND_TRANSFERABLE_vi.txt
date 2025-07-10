@@ -1,0 +1,497 @@
+# ST-MoE: THIẾT KẾ CÁC MÔ HÌNH CHUYÊN GIA THƯA ỔN ĐỊNH VÀ CÓ THỂ CHUYỂN GIAO
+
+Barret Zoph
+Google Brain
+Irwan Bello
+Google Brain
+Sameer Kumar
+Google
+Nan Du
+Google Brain
+Yanping Huang
+Google Brain
+Jeff Dean
+Google Research
+Noam Shazeer
+Google Brain
+William Fedus
+Google Brain
+
+TÓM TẮT
+
+Quy mô đã mở ra những biên giới mới trong xử lý ngôn ngữ tự nhiên - nhưng với chi phí cao. Để đáp ứng, Mixture-of-Experts (MoE) và Switch Transformers đã được đề xuất như một con đường tiết kiệm năng lượng để có các mô hình ngôn ngữ lớn hơn và có khả năng cao hơn. Tuy nhiên, việc thúc đẩy hiện trạng trên một tập rộng các nhiệm vụ ngôn ngữ tự nhiên đã bị cản trở bởi sự không ổn định trong huấn luyện và chất lượng không chắc chắn trong quá trình fine-tuning. Công trình của chúng tôi tập trung vào những vấn đề này và đóng vai trò như một hướng dẫn thiết kế. Chúng tôi kết thúc bằng việc mở rộng một mô hình thưa lên 269B tham số, với chi phí tính toán có thể so sánh với một Transformer encoder-decoder dày đặc 32B (Stable and Transferable Mixture-of-Experts hoặc ST-MoE-32B). Lần đầu tiên, một mô hình thưa đạt được hiệu suất tốt nhất trong transfer learning, trên một tập đa dạng các nhiệm vụ bao gồm lý luận (SuperGLUE, ARC Easy, ARC Challenge), tóm tắt (XSum, CNN-DM), trả lời câu hỏi sách đóng (WebQA, Natural Questions), và các nhiệm vụ được xây dựng một cách đối kháng (Winogrande, ANLI R3).
+
+Đóng góp ngang nhau. Liên hệ với {barretzoph,liamfedus}@google.com.
+Công việc được thực hiện khi ở Google.
+Mã cho các mô hình của chúng tôi có sẵn tại https://github.com/tensorflow/mesh/blob/master/mesh_tensorflow/transformer/moe.py
+
+MỤC LỤC
+
+1 Giới thiệu 3
+2 Bối cảnh 3
+3 Ổn định hóa Huấn luyện các Mô hình Thưa 5
+3.1 Đánh đổi Ổn định và Chất lượng khi Loại bỏ Tương tác Nhân . . . . . . . . . . . . . . . . 6
+3.2 Đánh đổi Ổn định và Chất lượng khi Thêm Nhiễu . . . . . . . . . . . . . . . . . . . . . . 6
+3.3 Đánh đổi Ổn định và Chất lượng khi Ràng buộc Kích hoạt và Gradient . . . . . . . . . . 7
+3.4 Lựa chọn Định dạng Độ chính xác: Đánh đổi Hiệu quả và Ổn định . . . . . . . . . . . . 8
+4 Hiệu suất Fine-Tuning của các Mô hình Thưa 9
+4.1 Giả thuyết: Một Vấn đề Tổng quát hóa . . . . . . . . . . . . . . . . . . . . . . . . . . . 9
+4.2 Fine-Tuning một Tập con Tham số Mô hình để Cải thiện Tổng quát hóa . . . . . . . . . 11
+4.3 Các Mô hình Thưa và Dày đặc Yêu cầu Giao thức Fine-Tuning Khác nhau . . . . . . . 11
+4.4 Các Mô hình Thưa Bền vững với Token bị Bỏ trong Fine-Tuning . . . . . . . . . . . . 12
+4.5 Chèn Token Sentinel trong Fine-Tuning . . . . . . . . . . . . . . . . . . . . . . . . . . 13
+5 Thiết kế các Mô hình Thưa 13
+5.1 Thiết lập Số lượng Chuyên gia . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 13
+5.2 Chọn Hệ số Dung lượng và Thuật toán Định tuyến . . . . . . . . . . . . . . . . . . . . 14
+6 Kết quả Thực nghiệm 16
+6.1 ST-MoE-L . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 16
+6.2 ST-MoE-32B . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 16
+7 Theo dõi Token qua Mô hình 19
+7.1 Các Chuyên gia Encoder Thể hiện Chuyên môn hóa . . . . . . . . . . . . . . . . . . . 19
+7.2 Các Chuyên gia Decoder Thiếu Chuyên môn hóa . . . . . . . . . . . . . . . . . . . . 19
+7.3 Các Chuyên gia Đa ngôn ngữ Chuyên môn hóa, Nhưng Không theo Ngôn ngữ . . . . . 21
+8 Công trình Liên quan 21
+9 Thảo luận 22
+10 Kết luận 24
+
+A Mô tả Cân bằng Tải Token 31
+B Động học Huấn luyện Router Z-Loss 31
+C Các Cải tiến Kiến trúc Được Cải thiện 32
+D Batch Prioritized Routing cho Hệ số Dung lượng Thấp hơn 33
+E Chi tiết Tập dữ liệu Pre-Training 34
+F Dữ liệu Độ nhạy Fine-tuning Đầy đủ 35
+G Thiết lập Tối ưu Ngưỡng Định tuyến 36
+H Bố cục Mesh cho Data, Model và Expert Parallelism với Ít Chuyên gia 36
+I Ghi chú về Chi phí Giao tiếp cho Mô hình Phân tán 37
+J Kết quả Tiêu cực 38
+
+1 GIỚI THIỆU
+
+Các mạng neural chuyên gia thưa thể hiện lợi thế của quy mô khổng lồ và cung cấp một giải pháp thay thế hiệu quả cho các kiến trúc mạng neural tĩnh thường được sử dụng ngày nay (Raffel et al., 2019; Brown et al., 2020; Rae et al., 2021). Thay vì áp dụng cùng một tham số cho tất cả đầu vào, các mạng chuyên gia thưa động chọn tham số nào sử dụng cho từng đầu vào (Shazeer et al., 2017). Điều này cho phép các mạng mở rộng rất nhiều số lượng tham số của chúng, trong khi giữ cho FLOPs mỗi token gần như không đổi. Những phương pháp này đã mang lại các mô hình dịch thuật hiện đại nhất (Lepikhin et al., 2020), tăng tốc pre-training 4-7x (Fedus et al., 2021; Artetxe et al., 2021), và hiệu suất one-shot cấp độ GPT-3 sử dụng 1/3 chi phí năng lượng huấn luyện (Du et al., 2021). Và mặc dù có số lượng tham số đáng kinh ngạc, các mô hình thưa giảm dấu chân carbon cho việc huấn luyện mạng neural lớn theo thứ tự độ lớn (Patterson et al., 2021). Tuy nhiên, khó khăn vẫn còn.
+
+Fedus et al. (2021) quan sát thấy rằng một mô hình thưa 1.6T tham số đạt được tăng tốc pre-training 4x so với hiện trạng trước đó (Raffel et al., 2019), nhưng thua kém các mô hình nhỏ hơn khi được fine-tuned trên các benchmark phổ biến như SuperGLUE. Những khoảng cách tương tự được quan sát thấy trong Artetxe et al. (2021) khi các mô hình ngôn ngữ MoE được fine-tuned trên dữ liệu ngoài domain. Để đáp ứng, Switch-XXL, một mô hình với ít tham số hơn, nhưng với dấu chân tính toán lớn hơn 8x (FLOPs xấp xỉ bằng mô hình T5 lớn nhất), đã được đề xuất và cải thiện chất lượng trên các nhiệm vụ hiểu ngôn ngữ tự nhiên. Tuy nhiên, pre-training cần thiết đã bị cản trở bởi sự không ổn định huấn luyện trước đây không được phát hiện trong các nghiên cứu quy mô nhỏ hơn. Những sự không ổn định này sau đó được xác định trong các mô hình thưa khác (Du et al., 2021).
+
+Những kết quả này đã tiết lộ sự cân bằng cần thiết giữa tham số và tính toán, nhưng để lại một câu hỏi mở về cách huấn luyện đáng tin cậy các loại mô hình này.
+
+Mục tiêu của chúng tôi trong bài báo này là tăng tính thực tế và độ tin cậy của các mô hình thưa. Chúng tôi nghiên cứu hai vấn đề này và pre-train một mô hình thưa 269B đạt được kết quả hiện đại nhất khi được fine-tuned trên nhiều benchmark NLP cạnh tranh, bao gồm SuperGLUE. Chúng tôi cũng đưa ra phân tích bổ sung và hướng dẫn thiết kế (hoặc ít nhất là heuristic của chúng tôi) cho các mô hình chuyên gia thưa. Hơn nữa, công trình này nhấn mạnh tối ưu hóa chung cả metric pre-training upstream và metric fine-tuning downstream để tránh sự khác biệt (Tay et al., 2021).
+
+Đóng góp
+
+1. Một nghiên cứu quy mô lớn về đánh đổi chất lượng-ổn định của các kỹ thuật ổn định.
+2. Giới thiệu router z-loss giải quyết các vấn đề không ổn định, trong khi cải thiện nhẹ chất lượng mô hình.
+3. Phân tích fine-tuning của các mô hình thưa và dày đặc làm nổi bật độ nhạy siêu tham số khác nhau đối với kích thước batch và tốc độ học. Chúng tôi cho thấy siêu tham số xấu dẫn đến hầu như không có lợi ích fine-tuning so với các mô hình dày đặc, mặc dù tăng tốc pre-training lớn.
+4. Nguyên tắc thiết kế kiến trúc, định tuyến và mô hình để thiết kế các mô hình thưa hiệu quả Pareto trong môi trường phân tán.
+5. Phân tích định tính theo dõi quyết định định tuyến token qua các lớp chuyên gia.
+6. Một mô hình thưa 269B (Stable Transferable Mixture-of-Experts hoặc ST-MoE-32B) đạt được hiệu suất hiện đại nhất trên một tập đa dạng các benchmark ngôn ngữ tự nhiên.
+
+2 BỐI CẢNH
+
+Các mô hình chuyên gia thưa thường thay thế một lớp mạng neural bằng một tập các chuyên gia, mỗi chuyên gia có trọng số duy nhất (Jacobs et al., 1991; Jordan và Jacobs, 1994). Thông thường tất cả các chuyên gia trong một lớp có cùng loại và hình dạng (đồng nhất), tuy nhiên, các loại chuyên gia khác nhau (không đồng nhất) là có thể. Đầu vào chỉ được xử lý bởi một tập con các chuyên gia để tiết kiệm tính toán, vì vậy một cơ chế phải được thêm vào để xác định nơi gửi từng đầu vào. Thường một router hoặc mạng gating xác định nơi gửi đầu vào (tức là từ, câu, patch hình ảnh, v.v.), nhưng các sơ đồ thay thế đã được đề xuất (Lewis et al., 2021; Roller et al., 2021; Zuo et al., 2021; Clark et al., 2022).
+
+Cụ thể, trong xử lý ngôn ngữ tự nhiên, Shazeer et al. (2017) đã đề xuất một lớp Mixture-of-Experts (MoE) nhận biểu diễn token x làm đầu vào và định tuyến nó đến top-k chuyên gia được khớp tốt nhất được chọn từ một tập {Ei(x)}^N_{i=1} của N chuyên gia. Biến router W_r tạo ra logits h(x) = W_r x được chuẩn hóa thông qua phân phối softmax trên N chuyên gia có sẵn tại lớp đó. Giá trị gate cho chuyên gia i được cho bởi
+
+p_i(x) = e^{h(x)_i} / Σ^N_{j} e^{h(x)_j}     (1)
+
+và token x được định tuyến đến các chuyên gia với giá trị gate top-k cao nhất (tập chỉ số T). Đầu ra của lớp là tổng có trọng số của tính toán mỗi chuyên gia bởi giá trị gate
+
+y = Σ_{i∈T} p_i(x)E_i(x)     (2)
+
+Ban đầu được đề xuất trong LSTMs (Hochreiter và Schmidhuber, 1997), các lớp chuyên gia sau đó được sử dụng trong Transformer (Vaswani et al., 2017) bởi Shazeer et al. (2018) và Lepikhin et al. (2020). Công việc tiếp theo của Fedus et al. (2021) đã đơn giản hóa MoE hơn nữa để định tuyến token đến một chuyên gia duy nhất (top-1) và giảm các chi phí khác để cải thiện hiệu quả huấn luyện.
+
+Để cải thiện sử dụng phần cứng, hầu hết các triển khai mô hình thưa có kích thước batch tĩnh cho mỗi chuyên gia (Shazeer et al., 2017; 2018; Lepikhin et al., 2020; Fedus et al., 2021). Dung lượng chuyên gia đề cập đến số lượng token có thể được định tuyến đến mỗi chuyên gia. Nếu dung lượng này bị vượt quá (router gửi quá nhiều đầu vào đến chuyên gia đó) thì các token tràn không có tính toán nào được áp dụng cho chúng và được chuyển đến lớp tiếp theo thông qua kết nối residual.
+
+[Bảng thuật ngữ được bảo lưu trong tiếng Anh vì tính kỹ thuật]
+
+Batch B của token đầu vào được chia thành G nhóm duy nhất trên dimension data-parallelism, mỗi nhóm có kích thước B/G. Dung lượng chuyên gia bằng CF × tokens/experts trong đó CF biểu diễn siêu tham số capacity factor, experts là số chuyên gia và tokens là kích thước nhóm. Nếu capacity factor được tăng lên, nó tạo ra bộ đệm thêm để ít token hơn sẽ bị bỏ trong trường hợp mất cân bằng tải. Tuy nhiên, tăng capacity factor cũng tăng chi phí bộ nhớ và tính toán, vì vậy tồn tại một đánh đổi.
+
+Cuối cùng, một auxiliary load balancing loss khuyến khích token được phân phối đều trên các chuyên gia (Shazeer et al., 2017). Điều này cải thiện hiệu quả phần cứng bằng cách đảm bảo rằng tất cả các accelerator đang xử lý các chunk dữ liệu đáng kể song song như đã đề cập ở trên. Chi tiết của loss được trình bày trong Phụ lục A. Tuy nhiên, các giải pháp thay thế tồn tại: Lewis et al. (2021) và Clark et al. (2022) coi việc phân bổ token cân bằng như một vấn đề assignment và loại bỏ hoàn toàn auxiliary loss.
+
+3 ỔN ĐỊNH HÓA HUẤN LUYỆN CÁC MÔ HÌNH THƯA
+
+Các mô hình thưa thường gặp phải sự không ổn định huấn luyện (Hình 1) tệ hơn những gì quan sát thấy trong Transformer được kích hoạt dày đặc tiêu chuẩn.
+
+[Hình 1 miêu tả sự không ổn định huấn luyện]
+
+Rất đơn giản để tìm thấy những thay đổi cải thiện ổn định, tuy nhiên, chúng thường đi kèm với chi phí không thể chấp nhận được đối với chất lượng mô hình (chẳng hạn như sử dụng tốc độ học nhỏ tùy ý hoặc sử dụng gradient clipping chặt chẽ). Chúng tôi phân loại và kiểm tra một số phương pháp để cải thiện ổn định. Các kỹ thuật ổn định bao gồm các sửa chữa chung cho Transformer cũng như những kỹ thuật cụ thể cho mô hình thưa: (1) Loại bỏ tương tác nhân (2) Tiêm nhiễu mô hình (3) Ràng buộc kích hoạt và gradient.
+
+Chúng tôi kết thúc với khuyến nghị của chúng tôi: một auxiliary loss mới, router z-loss, cải thiện đáng kể ổn định huấn luyện mà không làm giảm chất lượng. Đây là một sự điều chỉnh của z-loss được sử dụng cho logits softmax cuối cùng trong codebase Mesh Tensorflow (Shazeer et al., 2018).
+
+Ổn định hóa Mô hình Thưa
+1. Nhiều phương pháp ổn định mô hình thưa, nhưng với chi phí chất lượng tệ hơn.
+2. Router z-loss ổn định mô hình mà không làm giảm chất lượng.
+3. Các sửa đổi Transformer với nhiều thành phần nhân hơn (GEGLU, chuẩn hóa RMS) làm tệ hơn ổn định, nhưng tăng chất lượng.
+
+Thiết kế nghiên cứu ổn định quy mô lớn. Chúng tôi thiết kế nghiên cứu ổn định quy mô lớn của các mô hình thưa được khớp FLOP với phiên bản T5-XL (Raffel et al., 2019) được pre-train trên corpus đa ngôn ngữ mC4 (Xue et al., 2020). Mỗi mô hình thưa có 32 chuyên gia và chúng tôi giới thiệu lớp MoE thưa cho mỗi FFN thứ tư. Train capacity factor là 1.25 và eval capacity factor là 2.0. Xem Bảng 11 để mô tả chi tiết hơn về các mô hình được sử dụng trong suốt bài báo này. Đối với mỗi kỹ thuật ổn định, chúng tôi ghi lại phần thành công ổn định, chất lượng trung bình (negative log perplexity trên tiếng Anh), và độ lệch chuẩn trên các seed.
+
+Vấn đề chính trong việc xây dựng nghiên cứu này là các mô hình nhỏ hiếm khi không ổn định nhưng các mô hình lớn không ổn định quá đắt để chạy trong đủ bước và seed. Chúng tôi thấy một mô hình thưa được khớp FLOP với T5-XL là đối tượng nghiên cứu tốt vì nó không ổn định khoảng 1/3 số lần chạy, nhưng vẫn tương đối rẻ để huấn luyện. Hơn nữa, chúng tôi chạy các thí nghiệm không ổn định trên dữ liệu đa ngôn ngữ vì chúng tôi thấy điều này làm trầm trọng thêm sự không ổn định mô hình, cho phép chúng tôi thử nghiệm trên các mô hình nhỏ hơn một chút. Xem Mục 9 để biết thêm chi tiết. Cấu hình baseline của chúng tôi được huấn luyện sử dụng sáu seed ngẫu nhiên và mỗi cấu hình với kỹ thuật ổn định sử dụng ba seed ngẫu nhiên. Chúng tôi sử dụng sáu seed cho baseline để đặc tả tốt hơn tỷ lệ không ổn định và ba seed cho các biến thể để tiết kiệm tính toán. Mỗi mô hình được pre-train trong 20k bước trên mC4 sử dụng masked language modeling objective (Fedus et al., 2018; Devlin et al., 2018).
+
+3.1 ĐÁNH ĐỔI ỔN ĐỊNH VÀ CHẤT LƯỢNG KHI LOẠI BỎ TƯƠNG TÁC NHÂN
+
+Một số cải tiến kiến trúc liên quan đến nhiều phép nhân hơn phép cộng hoặc không tổng nhiều item cùng một lúc. Chẳng hạn, một phép nhân ma trận có một phép nhân cho mỗi phép cộng và do đó chúng ta không coi nó là một phép toán "nhân". Chúng tôi trình bày và phân tích tác động của hai trường hợp tương tác nhân trong Transformer ở đây.
+
+GELU Gated Linear Units (GEGLU). Ví dụ đầu tiên của chúng tôi là Gated Linear Unit (Dauphin et al., 2017) là tích component-wise của hai phép chiếu tuyến tính, một trong số đó đầu tiên được truyền qua hàm sigmoid. Shazeer (2020) mở rộng điều này sang các biến thể khác và trình bày lớp FFN GELU-Linear (Hendrycks và Gimpel, 2016) như một sự thay thế cho FFN ReLU thông thường (Nair và Hinton, 2010) trong Transformer.
+
+FFN_GEGLU(x;W;V;b;c) = GELU(xW+b)⊙(xV+c)     (3)
+
+Lợi ích chất lượng này được corroborated trong công việc sau này (Narang et al., 2021).
+
+Root Mean Square Scale Parameters. Ví dụ thứ hai của chúng tôi là tham số scale trong root mean square (RMS) normalization (Zhang và Sennrich, 2019). Trong Transformer, thay vì gọi các lớp back-to-back, có một cấu trúc nội bộ (được gọi là sublayer calls) cải thiện gradient propagation và động lực huấn luyện. Sublayer calls của chúng tôi khớp với của Raffel et al. (2019) và bao gồm: (1) RMS normalization, (2) layer call (ví dụ: Self Attention), (3) dropout (Srivastava et al., 2014), (4) add residual (He et al., 2015). RMS normalization scale vector đầu vào x∈ℝ^d element-wise theo root-mean-square. Sau đó nó rescale đầu ra element-wise bằng cách nhân với tham số scale đã học g.
+
+y_i = x_i / √(1/d ∑_{i=1}^d x_i^2) g_i     (4)
+
+Bảng 2 cho thấy rằng việc loại bỏ cả lớp GEGLU hoặc tham số scale RMS cải thiện ổn định, nhưng với mất mát đáng kể đối với chất lượng mô hình. Chúng tôi lưu ý rằng những tham số scale này (g) có lợi ích không tỷ lệ với chất lượng mô hình so với các tham số khác (ví dụ: FFN). Phù hợp với phát hiện của chúng tôi, Shleifer et al. (2021) thấy rằng việc thêm scalar nhân học được vào residual connection trong Transformer khiến chúng không ổn định hơn nhiều.
+
+Trong Phụ lục C, chúng tôi nghiên cứu thêm tác động chất lượng của việc thêm tương tác nhân mới trong các lớp chuyên gia. Chúng tôi thấy rằng hoạt động này mang lại cải thiện chất lượng với hầu như không có sự chậm trễ trong thời gian bước mô hình.
+
+[Bảng 2 về loại bỏ tương tác nhân]
+
+3.2 ĐÁNH ĐỔI ỔN ĐỊNH VÀ CHẤT LƯỢNG KHI THÊM NHIỄU
+
+Tiếp theo chúng tôi khám phá một giả thuyết rằng việc thêm nhiễu vào mô hình có thể cải thiện ổn định huấn luyện (Neelakantan et al., 2015). Taleb (2012) lập luận rằng một số hệ thống nhất định thể hiện tính chất chống giòn, nơi chúng cải thiện thông qua nhiễu. Được truyền cảm hứng từ khái niệm và bằng quan sát của chúng tôi rằng fine-tuning (tiêm nhiễu thông qua dropout) hiếm khi không ổn định, chúng tôi xem xét liệu nhiễu huấn luyện có thể cải thiện ổn định của các mô hình thưa. Bảng 3 cho thấy cải thiện ổn định so với baseline, nhưng với chi phí chất lượng thấp hơn. Chúng tôi cũng thấy rằng input-jitter, được giới thiệu bởi Fedus et al. (2021), giảm chất lượng ở quy mô XL, do đó chúng tôi ablate nó trong các mô hình của chúng tôi. Input-jitter nhân logits đầu vào đến router với một biến ngẫu nhiên đồng nhất giữa [1-10^{-2}; 1 + 10^{-2}]. Dropout trong ablation của chúng tôi được áp dụng trong suốt Transformer. Như đã thấy trước đây, cải thiện trong các thiết lập quy mô nhỏ có thể thất bại trong việc tổng quát hóa khi được mở rộng và do đó các xu hướng phải luôn được giám sát và tái đánh giá ở quy mô tăng dần (Kaplan et al., 2020).
+
+[Bảng 3 về tiêm nhiễu]
+
+3.3 ĐÁNH ĐỔI ỔN ĐỊNH VÀ CHẤT LƯỢNG KHI RÀNG BUỘC KÍCH HOẠT VÀ GRADIENT
+
+Một trong những phương pháp thành công nhất để ổn định mạng neural là ràng buộc kích hoạt và gradient (Pascanu et al., 2013; Ioffe và Szegedy, 2015; Salimans và Kingma, 2016; Ba et al., 2016). Một phương pháp phổ biến bao gồm cắt ngắn norm gradient để khắc phục gradient bùng nổ khi backpropagating qua mạng sâu (Pascanu et al., 2013).
+
+Trong công việc này, chúng tôi sử dụng optimizer Adafactor do hiệu quả bộ nhớ của nó (mặc dù các optimizer 8-bit được giới thiệu gần đây (Dettmers et al., 2021) có thể cung cấp sự đánh đổi tốt hơn). Thay vì gradient clipping, Adafactor sử dụng update clipping, nơi các thay đổi đối với trọng số bị ràng buộc dưới một norm nhất định. Chúng tôi thử nghiệm với việc thắt chặt update clipping đến giá trị nhỏ hơn.
+
+Tiếp theo, chúng tôi nghiên cứu ràng buộc trên logits đi vào router. Router tính toán phân phối xác suất trên các chuyên gia trong độ chính xác float32 (tức là selective precision) (Fedus et al., 2021). Tuy nhiên, ở quy mô lớn nhất, chúng tôi thấy điều này không đủ để mang lại huấn luyện đáng tin cậy. Để khắc phục điều này, chúng tôi giới thiệu router z-loss,
+
+L_z(x) = 1/B ∑_{i=1}^B (log ∑_{j=1}^N e^{x_j^{(i)}})^2     (5)
+
+trong đó B là số token, N là số chuyên gia, và x∈ℝ^{B×N} là logits đi vào router. Điều này phạt logits lớn vào gating network và Mục 3.4 chứa giải thích chi tiết hơn về tại sao z-loss trước router lại hữu ích.
+
+[Bảng 4 về ràng buộc]
+
+Router z-loss giới thiệu siêu tham số khác (c_z), là hệ số để weight này như một phần của tổng loss được tối ưu hóa. Tổng loss là kết hợp tuyến tính có trọng số của cross entropy loss (L_{CE}), auxiliary load balance loss (L_B), và router z-loss (L_Z), tạo ra tổng loss
+
+L_{tot} = L_{CE} + c_B L_B + c_z L_Z     (6)
+
+Chúng tôi chọn giá trị c_z = 0.001 dựa trên chất lượng mô hình tốt nhất sau pre-training với hyperparameter sweep. Phụ lục B logs các loss kết quả trong suốt quá trình pre-training.
+
+3.4 CHỌN ĐỊNH DẠNG ĐỘ CHÍNH XÁC: ĐÁNH ĐỔI HIỆU QUẢ VÀ ỔN ĐỊNH
+
+Như trong hầu hết các Transformer phân tán hiện đại, chúng tôi huấn luyện với mixed precision (Micikevicius et al., 2017). Trọng số được lưu trữ trong float32 cho gradient updates và sau đó được chuyển đổi sang bfloat16 khi thực hiện phép nhân ma trận trong forward và backward pass. Hơn nữa, tất cả kích hoạt được lưu trữ và hoạt động trên bfloat16 và giao tiếp allreduce có thể được thực hiện trong độ chính xác bfloat16 hoặc float32. Đối với mô hình lớn nhất được khám phá trong công việc này (ST-MoE-32B được trình bày sau), chúng tôi thấy tăng tốc giảm một nửa độ chính xác số của allreduce, tuy nhiên điều này cũng có thể destabilize việc huấn luyện nên chúng tôi giữ điều này như float32 trong suốt công việc này.
+
+Định dạng độ chính xác thấp hơn cho phép các mô hình hiệu quả hơn bằng cách giảm (a) chi phí giao tiếp giữa bộ xử lý và bộ nhớ, (b) chi phí tính toán, (c) bộ nhớ để lưu trữ tensor (ví dụ: kích hoạt). Tuy nhiên, các định dạng độ chính xác thấp hơn đi kèm với chi phí là lỗi roundoff lớn hơn có thể dẫn đến sự không ổn định huấn luyện không thể khôi phục.
+
+[Hình 2 về precision formats và roundoff errors]
+
+Hiểu định dạng độ chính xác và lỗi roundoff. Hình 2 xem xét các tính chất của các định dạng độ chính xác khác nhau và lỗi roundoff tương ứng của chúng cho các dải số khác nhau. Số trong bất kỳ dải nào của hai lũy thừa liên tiếp của 2 (ví dụ: [2,4) và [1024, 2048)) được biểu diễn bằng số bit mantissa cố định (7 cho bfloat16, 23 cho float32). Kết quả là, (1) bfloat16 sẽ có khoảng 65,536x (tức là 2^{23-7} = 2^{16} = 65536) lỗi roundoff lớn như float32 và (2) số lớn hơn có lỗi roundoff lớn hơn. Do 8 bit exponent, số có thể lớn đến 3e38, điều này dẫn đến thậm chí float32 có một số vấn đề với lỗi roundoff.
+
+Các mô hình chuyên gia thưa nhạy cảm với lỗi roundoff vì chúng có nhiều hàm exponential hơn do các router. Các mô hình chuyên gia thưa giới thiệu các hàm exponential bổ sung – thông qua router – có thể làm trầm trọng lỗi roundoff và dẫn đến sự không ổn định huấn luyện. Trong khi lỗi roundoff không thay đổi thứ tự xác suất trong phép toán softmax, nó có tác động đến routing của token thứ hai trong MoE do thresholding tương đối (ví dụ: một token chỉ được định tuyến đến chuyên gia thứ hai nếu xác suất gating cho chuyên gia thứ hai lớn bằng 1/5 so với của chuyên gia thứ nhất). Ngoài ra, lỗi roundoff có thể thay đổi dramatically xác suất scaling đầu ra chuyên gia – điều mà chúng tôi thấy là quan trọng. Cuối cùng, chúng tôi phỏng đoán rằng ổn định cao hơn mà chúng tôi quan sát cho các mô hình chỉ decoder (không được hiển thị ở đây) là do chúng có ít hàm exponential hơn. Mục 9 chứa thảo luận chi tiết hơn.
+
+Aside về router z-loss. Người ta có thể nghĩ rằng router z-loss là một phương pháp phức tạp có thể thay thế bằng clipping logits (Wu et al., 2016). Chúng tôi giải thích tại sao đây không phải là trường hợp. Mục tiêu là giảm thiểu lỗi roundoff lớn đi vào các hàm exponential. Clipping logits xảy ra sau bất kỳ lỗi roundoff nào – dẫn đến sự gián đoạn thậm chí còn lớn hơn. Trong một góc nhìn, clipping bản thân là một lỗi roundoff; ngược lại, z-loss tự nhiên khuyến khích mô hình tạo ra logits có giá trị nhỏ và do đó được mô hình hóa chính xác hơn. Do những động lực này, chúng tôi đảm bảo tất cả tensor được exponentiated được cast thành float32. Điều này gợi ý về khả năng của các định dạng số tốt hơn cho mạng neural vì các bit exponent không được sử dụng khi z-loss được thêm vào trong suốt mạng (xem Mục 9).
+
+4 HIỆU SUẤT FINE-TUNING CỦA CÁC MÔ HÌNH THƯA
+
+Các mô hình ngôn ngữ hoạt động tốt nhất thường được thu được bằng (1) pre-training trên lượng lớn dữ liệu (ví dụ: internet) theo sau bởi (2) fine-tuning trên một nhiệm vụ quan tâm (ví dụ: SuperGLUE). Các kỹ thuật mới đầy hứa hẹn đã xuất hiện như một giải pháp thay thế, bao gồm few-shot inference (Brown et al., 2020), prefix tuning (Li và Liang, 2021), prompt tuning (Lester et al., 2021), và adapter modules (Houlsby et al., 2019) – tuy nhiên, khoảng cách chất lượng vẫn tồn tại so với fine-tuning. Vì điều này, chúng tôi tập trung vào fine-tuning trong công việc này, nhưng làm nổi bật thành công gần đây của các mô hình thưa trong thiết lập few-shot từ Du et al. (2021); Artetxe et al. (2021). Hơn nữa, chúng tôi để lại như công việc tương lai các kỹ thuật điều chỉnh mô hình ngôn ngữ lớn thông qua reinforcement learning (Ouyang et al., 2022)
+
+4.1 GIẢ THUYẾT: MỘT VẤN ĐỀ TỔNG QUÁT HÓA
+
+Các mô hình thưa đã hoạt động xuất sắc trong regime của tập dữ liệu lớn, nhưng đôi khi hoạt động kém khi fine-tuning (Fedus et al., 2021; Artetxe et al., 2021). Chúng tôi trình bày bằng chứng cho một giả thuyết (không quá ngạc nhiên) rằng các mô hình thưa dễ bị overfit. Chúng tôi minh họa vấn đề này thông qua hai nhiệm vụ trong SuperGLUE (Wang et al., 2019) – Commitment Bank (De Marneffe et al., 2019) và ReCORD (Zhang et al., 2018). Commitment Bank (CB) có 250 ví dụ huấn luyện trong khi ReCORD có hơn 100,000. Sự khác biệt kích thước đáng kể này tạo điều kiện cho một nghiên cứu tự nhiên về overfitting trên hai nhiệm vụ được chọn như một phần của cùng một benchmark.
+
+Trong Hình 3, chúng tôi so sánh đặc tính fine-tuning của mô hình Dense L và ST-MoE-L. Mỗi mô hình được pre-train trên 500B token từ corpus C4 (Raffel et al., 2019). Các mô hình được thiết kế để match FLOP gần đúng với các mô hình encoder-decoder T5-Large từ Raffel et al. (2019) với 770M tham số. Các mô hình ST-MoE có 32 chuyên gia với tần suất lớp chuyên gia 1/4 (mỗi lớp FFN thứ tư được thay thế bằng lớp MoE). Train capacity factor pre-training và fine-tuning là 1.25 và eval là 2.0. Chúng tôi đánh giá hiệu suất trên validation và train dataset partitions được giữ lại.
+
+Trên cả hai nhiệm vụ, mô hình thưa hội tụ nhanh hơn đến độ chính xác train set 100% hỗ trợ rằng các mô hình thưa tối ưu hóa hiệu quả dưới distribution shift dữ liệu. Trên nhiệm vụ lớn hơn, ReCORD, chất lượng validation của mô hình thưa theo sự tăng trong training và vượt xa mô hình dày đặc. Tuy nhiên, trên nhiệm vụ nhỏ hơn, CB, mô hình thưa thua kém đối tác dày đặc trên dữ liệu held-out. Theo khuyến nghị của Fedus et al. (2021), chúng tôi xem xét tăng dropout trong expert hidden state (tức là expert dropout), nhưng thấy rằng ở quy mô này, các giá trị cao hơn chỉ cải thiện chất lượng một cách vừa phải (Hình 4). Chúng tôi nghiên cứu cải thiện thêm cho fine-tuning trong Mục 4.2 và độ nhạy siêu tham số trong Mục 4.3.
+
+[Hình 3 và 4 về overfitting và regularization]
+
+4.2 FINE-TUNING MỘT TẬP CON THAM SỐ MÔ HÌNH ĐỂ CẢI THIỆN TỔNG QUÁT HÓA
+
+Để chống lại overfitting, chúng tôi thử nghiệm cập nhật chỉ một tập con tham số mô hình trong fine-tuning. Hình 5 đo chất lượng cho việc cập nhật 5 tập con tham số khác nhau: tất cả tham số (All), chỉ tham số không phải MoE (Non MoE), chỉ tham số MoE (MoE), chỉ tham số self-attention và enc-dec attention (Attention) và chỉ tham số FFN không phải MoE (FFN).
+
+[Hình 5 về cập nhật tập con tham số]
+
+Chúng tôi quan sát thấy rằng cập nhật tham số non MoE hoạt động tốt như cập nhật tất cả tham số và cập nhật chỉ tham số FFN hoạt động tốt hơn một chút. Cập nhật chỉ tham số MoE làm giảm đáng kể hiệu suất fine-tuning, đây là nơi có 80% tham số mô hình. Chỉ cập nhật tham số non MoE có thể là một cách hiệu quả để tăng tốc và giảm bộ nhớ cho fine-tuning.
+
+Chúng tôi giả thuyết rằng fine-tuning chỉ tham số MoE dẫn đến hiệu suất xấu vì các lớp chuyên gia chỉ xảy ra mỗi 1/4 lớp và một token sẽ thấy nhiều nhất hai chuyên gia mỗi lớp. Do đó, cập nhật tham số MoE sẽ ảnh hưởng đến ít lớp và FLOP hơn nhiều so với cập nhật bất kỳ tập con tham số nào khác mà chúng tôi thử. Cập nhật chỉ tham số MoE dẫn đến training loss cao hơn nhiều so với cập nhật tham số non MoE, mặc dù có nhiều tham số hơn đáng kể. Chúng tôi quan sát thêm rằng cập nhật tất cả tham số non-MoE dẫn đến training loss cao hơn so với cập nhật tất cả tham số, nhưng thật không may hiệu ứng regularization này không chuyển sang hiệu suất validation tốt hơn.
+
+Hơn nữa, một regularizer mà chúng tôi thử là một biến thể dropout nơi toàn bộ chuyên gia bị mask out stochastically trong training. Tuy nhiên, điều này thất bại trong việc cải thiện tổng quát hóa trong các nghiên cứu sơ bộ của chúng tôi. Phụ lục J mở rộng về thí nghiệm này và chứa các kết quả tiêu cực khác.
+
+4.3 CÁC MÔ HÌNH THƯA VÀ DÀY ĐẶC YÊU CẦU GIAO THỨC FINE-TUNING KHÁC NHAU
+
+Các mô hình thưa và dày đặc nhạy cảm như thế nào với giao thức fine-tuning? Chúng tôi nghiên cứu hai siêu tham số: batch size và learning rate. Chúng tôi pretrain Dense-L và ST-MoE-L trên 500B token C4 và sau đó fine-tune trên SuperGLUE. Hình 6 tóm tắt các thí nghiệm của chúng tôi với dữ liệu đầy đủ được trình bày trong Bảng 20 (Phụ lục F). Trên tất cả thiết lập siêu tham số, các mô hình thưa (màu cam) vượt trội so với đối tác dày đặc (màu xanh) – tuy nhiên, thiết lập tốt nhất cho mỗi loại có thể thay đổi kết quả một cách vật chất. Các mô hình thưa và dày đặc có hiệu suất rất khác nhau trên các batch size và learning rate khác nhau. Các mô hình thưa được lợi từ batch size nhỏ hơn và learning rate cao hơn. Phù hợp với giả thuyết overfitting (Mục 4.1), cả hai thay đổi này có thể cải thiện tổng quát hóa thông qua nhiễu cao hơn trong quá trình fine-tuning. Cuối cùng, chúng tôi chỉ ra tầm quan trọng của việc điều chỉnh đúng batch size và learning rate trong fine-tuning. Đơn giản sử dụng cùng siêu tham số fine-tuning hoạt động tốt cho mô hình dày đặc có thể che giấu bất kỳ cải thiện pre-training nào thu được bởi mô hình thưa.
+
+[Hình 6 về độ nhạy batch size và learning rate]
+
+4.4 CÁC MÔ HÌNH THƯA BỀN VỮNG VỚI TOKEN BỊ BỎ TRONG FINE-TUNING
+
+Các mô hình thưa định tuyến token đến một hoặc nhiều chuyên gia tại mỗi lớp. Để làm cho các mô hình này hiệu quả trong paradigm SPMD với phần cứng hiện đại, dung lượng chuyên gia (số lượng token mỗi chuyên gia xử lý) cần được cố định trước thời gian (xem Mục 2 để biết thêm chi tiết). Khi một chuyên gia nhận nhiều token hơn dung lượng của nó, các token thêm bị bỏ – không có tính toán nào được áp dụng cho những token đó. Chúng tôi lại cố gắng ngăn chặn điều này bằng (1) pre-training với auxiliary loss thúc đẩy lượng token bằng nhau được gửi đến mỗi chuyên gia và (2) capacity factor (siêu tham số) thêm chỗ cho token thêm tại mỗi chuyên gia. Chúng tôi thử nghiệm với việc tắt auxiliary loss trong fine-tuning và sử dụng capacity factor khác nhau. Bảng 5 tiết lộ một kết quả đáng ngạc nhiên rằng chất lượng fine-tuning không bị ảnh hưởng vật chất bởi việc bỏ lên đến 10-15% token. Các nghiên cứu trên ST-MoE-32B corroborate rằng capacity factor cao không cải thiện chất lượng fine-tuning. Điều này phù hợp với phát hiện của Yang et al. (2021) rằng load balance không đều có thể không ảnh hưởng đáng kể đến chất lượng mô hình.
+
+[Bảng 5 về sự bền vững với token bị bỏ]
+
+4.5 CHÈN TOKEN SENTINEL TRONG FINE-TUNING
+
+Token sentinel biểu thị các chuỗi được mask trong span-corruption objective (Fedus et al., 2018; Devlin et al., 2018). Điều này khác với bất kỳ nhiệm vụ fine-tuning nào mà chúng ta có thể gặp phải, dẫn đến domain mismatch giữa pre-training và fine-tuning. Bảng 6 minh họa sự khác biệt. Chúng tôi xem xét liệu việc sửa đổi nhiệm vụ fine-tuning để giống hơn với nhiệm vụ pre-training có ảnh hưởng đến kết quả.
+
+[Bảng 6 và 7 về sentinel tokens]
+
+Trong Bảng 7, chúng tôi thấy rằng việc thêm sentinel token khi fine-tuning chỉ cải thiện Grammar Error Correction (GEC) (Rothe et al., 2021), nhưng không cải thiện SuperGLUE. Chúng tôi thử giảm thêm data distribution shift bằng cách chèn nhiều sentinel token (như sẽ được gặp phải bởi mô hình trong pre-training), nhưng lại không thấy lợi ích universal. Tuy nhiên, mặc dù không có lợi ích nhất quán trên held-out data, chúng tôi thấy rằng hội tụ training được tăng tốc cho cả mô hình dày đặc và thưa.
+
+5 THIẾT KẾ CÁC MÔ HÌNH THƯA
+
+Thiết kế của các mô hình dày đặc đã được hướng dẫn bởi công trình nền tảng của Kaplan et al. (2020). Nhưng các mô hình thưa đặt ra vô số câu hỏi bổ sung: (1) Sử dụng bao nhiêu chuyên gia? (2) Thuật toán định tuyến nào? (3) Giá trị nào cho capacity factor? (4) Phần cứng thay đổi những quyết định này như thế nào? Trong mục này, chúng tôi nhận xét về những điều này và đưa ra khuyến nghị để xây dựng các mô hình thưa hiệu quả Pareto. Đồng thời, Clark et al. (2022) cung cấp khuyến nghị thiết kế bổ sung bao gồm tần suất lớp cao hơn và định tuyến top-1 như per Fedus et al. (2021).
+
+Thiết kế Mô hình Thưa
+1. Trong thiết lập của chúng tôi, chúng tôi khuyến nghị định tuyến top-2 với capacity factor 1.25 và nhiều nhất một chuyên gia mỗi core.
+2. Capacity factor có thể được thay đổi trong evaluation để điều chỉnh yêu cầu bộ nhớ/tính toán mới.
+3. Dense layer stacking và multiplicative bias có thể tăng chất lượng (Phụ lục C).
+
+5.1 THIẾT LẬP SỐ LƯỢNG CHUYÊN GIA
+
+Một trong những câu hỏi đầu tiên là số lượng chuyên gia sử dụng. Fedus et al. (2021) trình bày các tính chất scaling của Switch Transformer mang lại lợi ích pre-training monotonic (trên basis step) trên C4 lên đến 512-chuyên gia, Kim et al. (2021) lên đến 64-chuyên gia và Clark et al. (2022) lên đến 512-chuyên gia. Nhưng lợi ích incremental nhanh chóng giảm dần với nhiều chuyên gia (>256) hoặc tương đương, với các mô hình rất thưa (<1% chuyên gia được kích hoạt).
+
+Tuy nhiên, suy nghĩ về hệ thống phần cứng cụ thể có thể hướng dẫn thêm lựa chọn này. Tỷ lệ compute-to-memory (operational intensity) có thể đóng vai trò như một ước tính hiệu quả của các phép toán khác nhau (Williams et al., 2009; Shazeer, 2019). Một mô hình bị memory bound nếu thời gian load tensor đến computing core (ví dụ: ALU/MMU) vượt xa thời gian cần thiết để thực hiện tính toán trên tensor. Trên GPU và TPU hiện đại, tăng tỷ lệ compute to memory này cải thiện hiệu quả.
+
+Trở lại với các mô hình chuyên gia thưa, sử dụng nhiều hơn một chuyên gia mỗi core tăng memory transfer, có thể làm tổn hại hiệu quả. Tăng số lượng chuyên gia không thay đổi tính toán được thực hiện (các mô hình thưa áp dụng lượng tính toán cố định cho mỗi đầu vào), nhưng tăng yêu cầu memory transfer (các biến chuyên gia bổ sung phải được load từ device memory). Điều này giảm tỷ lệ compute-to-memory.
+
+Trên hệ thống TPU của chúng tôi, chúng tôi khuyến nghị một chuyên gia (hoặc ít hơn) mỗi core. Các mô hình lớn nhất của chúng tôi sử dụng cả data và model parallelism nơi data parallelism ở trên "rows" và model-parallelism ở trên "columns" của logical mesh. Chúng tôi sử dụng 1 chuyên gia mỗi data parallelism row để đảm bảo tỷ lệ compute-to-memory cao và giảm cores cần thiết cho evaluation và inference. Hơn nữa, sử dụng ít chuyên gia hơn cho phép chúng tôi phân bổ nhiều core hơn cho model parallelism "column" để có nhiều FLOP hơn trong mô hình của chúng tôi. Phụ lục H giải thích mesh layouts của chúng tôi khi có ít chuyên gia hơn data parallelism rows.
+
+5.2 CHỌN CAPACITY FACTOR VÀ THUẬT TOÁN ĐỊNH TUYẾN
+
+Chúng tôi tổng quát hóa định tuyến top-1 (Fedus et al., 2021; Roller et al., 2021) và top-2 (Shazeer et al., 2017; Lepikhin et al., 2020) để nghiên cứu định tuyến top-n nơi mỗi token được xử lý bởi nhiều nhất n chuyên gia. Trong nghiên cứu này, tất cả mô hình được pre-train trong 100k bước với 1M token mỗi batch và các mô hình thưa có 32 chuyên gia và được khớp FLOP với T5-Large Raffel et al. (2019). Chúng tôi rút ra hai kết luận chính.
+
+Đầu tiên, tăng cả train và eval capacity factor (CF) cải thiện chất lượng như thấy bằng cách so sánh qua các khối phân đoạn của Bảng 8. Chẳng hạn, định tuyến top-1 cải thiện +0.011 neg. log perp. khi tăng từ 1.0 → 1.25 train CF và định tuyến top-2 cải thiện +0.009 tăng từ 1.25 → 2.0 train CF. Để cung cấp context cho những con số này: tăng gấp ba kích thước của mô hình dày đặc (Dense-L đến Dense-XL) mang lại boost +0.090 neg. log perp. Do đó, những boost CF này là ~1/10 magnitude đó. Nhưng điều này đi kèm với chi phí. Tăng capacity factor tăng tuyến tính chi phí einsums, bộ nhớ cho kích hoạt, chi phí giao tiếp all2all, và chi phí giao tiếp allreduce model-parallelism cho các lớp chuyên gia.
+
+Thứ hai, có những lợi ích nhỏ của định tuyến top-(n+1) so với top-n cho capacity factor cố định (Bảng 8). Chẳng hạn, định tuyến top-2 cải thiện +0.004 so với top-1 tại train CF 1.25 hoặc khoảng 1/20 boost của một mô hình dày đặc tăng gấp ba. Điều này sửa đổi khuyến nghị trước đây từ Fedus et al. (2021). Sự khác biệt chính giữa các thiết lập thí nghiệm này là quy mô tính toán. Fedus et al. (2021) huấn luyện các mô hình khớp 220M-FLOP trong 50B token. Chúng tôi thấy ở quy mô thí nghiệm lớn hơn 8x (các mô hình khớp 1B-FLOP trong 100B token) thay vào đó có một lợi ích nhỏ để định tuyến đến nhiều hơn một chuyên gia. Hơn nữa, ở quy mô thí nghiệm lớn hơn, sự khác biệt tốc độ của định tuyến top-n so với top-(n+1) là không đáng kể. Sự khác biệt tốc độ được quan sát trong Fedus et al. (2021) vì tính toán router là một phần lớn hơn của tổng tính toán mô hình.
+
+[Bảng 8 về so sánh capacity factor và thuật toán định tuyến]
+
+Hệ thống phần cứng-phần mềm cụ thể sẽ xác định n tối ưu và capacity factor. Chẳng hạn, nếu hệ thống hỗ trợ giao tiếp all2all và allreduce nhanh, capacity factor lớn hơn và n lớn hơn trong định tuyến top-n có thể tối ưu. Tuy nhiên, nếu giao tiếp all2all và/hoặc allreduce chậm, capacity factor nhỏ hơn có thể chiếm ưu thế. Trong trường hợp của chúng tôi, hardware-software stack là TPU và Mesh Tensorflow. Chúng tôi ghi lại tốc độ huấn luyện của cả mô hình ST-MoE-L và ST-MoE-32B trong Bảng 9 khi chúng tôi tăng train capacity factor. Khi các mô hình scale, capacity factor cao hơn làm cho các mô hình chậm hơn ngày càng tăng. ST-MoE-L không yêu cầu model parallelism (nó vừa với bộ nhớ accelerator, ngụ ý không có giao tiếp allreduce bổ sung) làm cho nó phù hợp hơn cho capacity factor cao so với mô hình ST-MoE-32B của chúng tôi. Đối với mô hình lớn nhất của chúng tôi, do đó chúng tôi tiếp tục sử dụng train capacity factor nhỏ hơn 1.25 được ủng hộ bởi Fedus et al. (2021) cho hiệu quả Pareto, khác với công việc khác sử dụng capacity factor lớn hơn và đắt hơn 2.0 (Lepikhin et al., 2020; Du et al., 2021).
+
+[Bảng 9 về profiling mô hình thưa trên TPU]
+
+Kết quả của chúng tôi trong mục này tập trung vào định tuyến top-n, nhưng chúng tôi cũng thử nghiệm với nhiều kỹ thuật định tuyến khác trong Phụ lục J. Chúng tôi thấy hầu hết hoạt động tương tự hoặc tệ hơn so với định tuyến top-n. Tuy nhiên chúng tôi thấy Batch Prioritized Routing (BPR), được giới thiệu trong Riquelme et al. (2021), giúp đáng kể hiệu suất cho capacity factor ít hơn một (Phụ lục D). Chúng tôi khuyến nghị BPR cho các mô hình lớn hơn nơi all2all và allreduce đắt hơn và capacity factor thấp hơn là tối ưu.
+
+6 KẾT QUẢ THỰC NGHIỆM
+
+Với những cải thiện của chúng tôi về ổn định huấn luyện, fine-tuning và thiết kế mô hình, chúng tôi bắt đầu bằng việc validate một mô hình thưa được khớp FLOP gần đúng với T5-Large (Raffel et al., 2019). Chúng tôi kết thúc mục này bằng cách thiết kế và huấn luyện một mô hình tham số thưa 269B (khớp FLOP với mô hình dày đặc 32B) đạt được chất lượng hiện đại nhất trên một tập rộng các nhiệm vụ NLP.
+
+Chúng tôi nghiên cứu benchmark SuperGLUE (Wang et al., 2019) trong suốt công việc này bao gồm các nhiệm vụ sentiment analysis (SST-2), word sense disambiguation (WIC), sentence similarity (MRPC, STS-B, QQP), natural language inference (MNLI, QNLI, RTE, CB), question answering (MultiRC, RECORD, BoolQ), coreference resolution (WNLI, WSC) và sentence completion (COPA) và sentence acceptability (CoLA). Chúng tôi thường quan sát hiệu suất tốt trên SuperGLUE tương quan với (nhưng không đảm bảo) hiệu suất trên nhiều nhiệm vụ NLP. Chúng tôi cũng bao gồm một tập đa dạng các benchmark bổ sung. Tập dữ liệu CNN-DM (Hermann et al., 2015) và BBC XSum (Narayan et al., 2018) được sử dụng để đo khả năng tóm tắt bài viết. Question answering được thăm dò với tập dữ liệu SQuAD (Rajpurkar et al., 2016) cũng như trên câu hỏi khoa học cấp tiểu học trong ARC Easy và ARC Reasoning Challenge (Clark et al., 2018). Và như trong Roberts et al. (2020), chúng tôi đánh giá kiến thức của các mô hình bằng cách fine-tuning trên ba tập dữ liệu trả lời câu hỏi closed-book: Natural Questions (Kwiatkowski et al., 2019), Web Questions (Berant et al., 2013) và Trivia QA (Joshi et al., 2017). Closed-book đơn giản đề cập đến các câu hỏi được đặt ra mà không có tài liệu tham khảo hoặc context material bổ sung. Để đánh giá khả năng lý luận common sense của mô hình, chúng tôi đánh giá nó trên Winogrande Schema Challenge (Sakaguchi et al., 2020). Và cuối cùng, chúng tôi test khả năng natural language inference của mô hình trên Adversarial NLI Benchmark (Nie et al., 2019).
+
+6.1 ST-MOE-L
+
+Để đơn giản và cover hàng chục nhiệm vụ một cách dễ dàng, chúng tôi huấn luyện trên mixtures của các nhiệm vụ được liệt kê thay vì fine-tuning riêng biệt một mô hình trên mỗi nhiệm vụ. Tuy nhiên, vì các nhiệm vụ thay đổi về kích thước đáng kể, sampling đều theo số lượng ví dụ sẽ over-sample các nhiệm vụ lớn và under-sample các nhiệm vụ nhỏ. Do đó chúng tôi mix mỗi nhiệm vụ theo tỷ lệ với số lượng ví dụ trong 'train' split của nó (lên đến một số maxnumexamples = 65536) như trong Raffel et al. (2019). Điều này có nghĩa là các nhiệm vụ chứa nhiều hơn 65536 ví dụ training được weighted như thể chúng chỉ chứa maxnumexamples.
+
+Bảng 10 tóm tắt chất lượng của mô hình dense T5-Large (L) và mô hình thưa với số lượng FLOP xấp xỉ được pre-train trong 500k bước với batch size 1M (524B token) trên tập dữ liệu C4 (Raffel et al., 2019). Sequence length cho encoder là 512 và 114 cho decoder. Chúng tôi quan sát cải thiện trên validation (dev) sets trên một mảng rộng các nhiệm vụ kiểm tra natural language understanding, question answering, và summarization. Như thấy trong Fedus et al. (2021), những lợi ích nổi bật được quan sát trong closed book question answering (Roberts et al., 2020). Ngoài ra, để hỗ trợ giả thuyết overfitting được trình bày trong Mục 4.1, chúng tôi quan sát hai trong những nhiệm vụ nhỏ nhất CB và WSC (250 và 259 ví dụ training, tương ứng), là hai nhiệm vụ duy nhất nơi mô hình thưa không mang lại lợi ích so với đối tác dày đặc. Điều này lại gợi ý rằng các hình thức cải thiện regularization cho mô hình thưa có thể unleash hiệu suất cao hơn.
+
+[Bảng 10 về hiệu suất fine-tuning]
+
+6.2 ST-MOE-32B
+
+Với chất lượng được validate ở quy mô T5-Large, chúng tôi tìm cách đẩy khả năng của các mô hình thưa thông qua ST-MoE-32B. Khi thiết kế điều này, chúng tôi tìm kiếm sự cân bằng giữa FLOP và tham số. Các mô hình thưa FLOP cao trước đây không ổn định trong Fedus et al. (2021) trong thiết lập của chúng tôi (tức là các mô hình encoder-decoder, optimizer Adafactor), nhưng router z-loss cho phép chúng tôi tiếp tục. Để hiệu quả tính toán, chúng tôi mở rộng hidden size của các chuyên gia (d_ff trong Bảng 11 dưới đây). Cuối cùng, chúng tôi tăng d_kv lên 128 để có hiệu suất tốt hơn trên phần cứng của chúng tôi. Những thay đổi nổi bật nhất là ít tham số tổng thể hơn và nhiều FLOP hơn mỗi token so với cả Switch-C và Switch-XXL. ST-MoE-32B của chúng tôi có "chỉ" 269B tham số và được khớp FLOP xấp xỉ với Transformer dày đặc 32B tham số. Số lượng tham số giảm từ Switch-C và Switch-XXL giảm bớt gánh nặng cho cả serving và fine-tuning. Cuối cùng, chúng tôi sử dụng sparse-dense stacking được mô tả trong Phụ lục C.
+
+Chúng tôi pre-train trong 1.5T token trên mixture của tập dữ liệu C4 chỉ tiếng Anh (Raffel et al., 2019) và tập dữ liệu từ GLaM (Du et al., 2021) được tóm tắt trong Phụ lục E. Chúng tôi sử dụng 1M token mỗi batch, optimizer Adafactor với siêu tham số mặc định, và learning rate warm-up 10k bước theo sau bởi inverse square root decay. Mô hình của chúng tôi tuân theo sơ đồ initialization được đề xuất trong Fedus et al. (2021).
+
+[Bảng 11 về so sánh mô hình]
+
+Bảng 12 đánh giá mô hình ST-MoE-32B của chúng tôi so với các phương pháp hiện đại trước đây sử dụng inference-only (zero-shot, one-shot) cũng như fine-tuning. Trên SuperGLUE, mô hình của chúng tôi cải thiện so với mô hình hiện đại trước đó, đạt điểm trung bình 91.2 trên test server (93.2 validation accuracy) vượt hơn một phần trăm so với estimated human capability. Cho cả hai tập dữ liệu summarization, XSum và CNN-DM, mô hình của chúng tôi đạt hiện đại nhất mà không có thay đổi bổ sung nào đối với training hoặc fine-tuning (Raffel et al., 2019; Liang et al., 2021). ST-MoE-32B cải thiện hiện trạng hiện tại trên test server submissions cho cả ARC Easy (92.7 → 94.8) và ARC Challenge (81.4 → 86.5). Trên hai trong ba nhiệm vụ closed book QA, chúng tôi cải thiện so với hiện đại trước đó. Closed book WebQA đạt 47.4 accuracy (tốt nhất trước đây là 42.8 từ Roberts et al. (2020) và vượt kết quả từ hiệu suất zero-shot của mô hình ERNIE 3.0 Titan 260B dense parameter (Wang et al., 2021)). Closed book NatQA cải thiện lên 41.9 accuracy (tốt nhất trước đây là 41.5 từ Karpukhin et al. (2020)). Chúng tôi thấy cải thiện đáng kể trên các tập dữ liệu được xây dựng một cách đối kháng (ANLI R3 và WinoGrande XL). ANLI R3 (Nie et al., 2019) cải thiện hiện trạng hiện tại lên 74.7 (tốt nhất trước đây là 53.4).
+
+[Bảng 12 về ST-MoE-32B so với tốt nhất trước đây]
+
+Chúng tôi lưu ý một số điểm yếu trong mô hình của chúng tôi. ST-MoE-32B có hiệu suất lackluster trên tập dữ liệu SQuAD nhỏ, với exact match score 90.8 thấp hơn benchmark cũ được đặt bởi T5-XXL là 91.3. Hơn nữa, trong khi thiết lập hiện trạng hiện tại mới cho SuperGLUE tổng thể, một số nhiệm vụ nhất định, bao gồm những nhiệm vụ nhỏ như CB, WSC, thất bại trong việc cải thiện. Cuối cùng, trên closed book Trivia QA, mô hình của chúng tôi cải thiện so với baseline fine-tuned với SSM từ Roberts et al. (2020), nhưng thất bại trong việc tạo ra lợi ích so với cả GPT-3 và GLAM.
+
+Mặc dù không phải trọng tâm của bài báo này, chúng tôi trình bày sự khác biệt chất lượng giữa những tiến bộ gần đây trong các kỹ thuật inference-only như few-shot learning và fine-tuning trên những nhiệm vụ này (GPT-3 (Brown et al., 2020), GLAM (Du et al., 2021) và Gopher (Rae et al., 2021)). Như mong đợi và quan sát trước đây, fine-tuning vượt trội zero/one-shot learning, nhưng có nhược điểm là yêu cầu training bổ sung và các mô hình khác nhau cho mỗi nhiệm vụ.
+
+7 THEO DÕI TOKEN QUA MÔ HÌNH
+
+Cho đến nay chúng tôi đã trình bày các biện pháp định lượng và metric hiệu suất. Chúng tôi thay đổi tack để khám phá các đặc tính định tính bằng cách visualize cách token được định tuyến giữa các chuyên gia. Chúng tôi làm điều này bằng cách truyền một batch token đến mô hình và kiểm tra thủ công token assignment tại mỗi lớp. Chúng tôi xem xét mô hình ST-MoE-L được pre-train trên corpus C4 đơn ngôn ngữ (Raffel et al., 2019) hoặc trên corpus mC4 đa ngôn ngữ (Xue et al., 2020). Trên cả encoder và decoder, mô hình có sáu lớp thưa, mỗi lớp với 32 chuyên gia.
+
+Preliminaries
+Span corruption objective là để khôi phục span của các đoạn liên tiếp có độ dài biến thiên được mask out trong đầu vào. Điều này được format như:
+Inputs: I went to <extra_id_0> to buy <extra_id_1>
+Targets: <extra_id_0> the store <extra_id_1> milk
+
+Trong kiến trúc encoder-decoder của chúng tôi, inputs sẽ được truyền đến encoder và targets đến decoder.
+
+Mỗi nhóm token được định tuyến chung với load balancing qua chuyên gia được khuyến khích bởi auxiliary loss như đề xuất trong Shazeer et al. (2017) (xem Phụ lục A để biết chi tiết). Token cạnh tranh cho expert assignment so với token khác trong nhóm của chúng, thay vì toàn bộ batch, và chuyên môn hóa chuyên gia bị ảnh hưởng nặng nề bởi phân phối token trong mỗi nhóm. Khái niệm nhóm được giới thiệu để hạn chế chi phí dispatching và gathering token đúng đến chuyên gia đúng.
+
+7.1 CÁC CHUYÊN GIA ENCODER THỂ HIỆN CHUYÊN MÔN HÓA
+
+Quan sát đầu tiên của chúng tôi là, tại mỗi lớp, ít nhất một chuyên gia chuyên môn hóa trong sentinel token (mask token biểu diễn khoảng trống để fill-in). Ngoài ra, một số chuyên gia encoder thể hiện chuyên môn hóa rõ ràng, với một số chuyên gia chủ yếu hoạt động trên punctuation, verb, proper names, counting, v.v. Bảng 13 trình bày một vài ví dụ đáng chú ý về chuyên môn hóa qua các chuyên gia encoder. Và trong khi chúng tôi thấy nhiều trường hợp chuyên môn hóa, chúng được trích xuất cụ thể từ nhiều ví dụ mà không có chuyên môn hóa semantic hoặc syntactic rõ ràng.
+
+[Bảng 13 về chuyên môn hóa encoder]
+
+7.2 CÁC CHUYÊN GIA DECODER THIẾU CHUYÊN MÔN HÓA
+
+Ngược lại, chuyên môn hóa chuyên gia ít đáng chú ý hơn nhiều trong decoder. Không chỉ sentinel token được định tuyến một cách đồng nhất trên các chuyên gia decoder (xem Bảng 14), mà chúng tôi cũng không quan sát chuyên môn hóa có ý nghĩa (semantic hoặc syntax) trong các chuyên gia decoder.
+
+Chúng tôi giả thuyết rằng việc thiếu chuyên môn hóa chuyên gia có ý nghĩa này được gây ra bởi phân phối target token được induced bởi span corruption objective. Đặc biệt, (a) số lượng token nhỏ hơn được định tuyến chung trong decoder do sequence length dài hơn trong encoder (ví dụ: group size là 2048 trong encoder so với 456 trong decoder trong thiết lập của chúng tôi) và (b) tỷ lệ token cao hơn là sentinel token trong decoder. Kết quả là, target token trong mỗi nhóm thường cover không gian semantic nhỏ hơn (so với encoder), có thể giải thích việc thiếu chuyên môn hóa chuyên gia trong decoder. Sự tương tác phức tạp này giữa kiến trúc và training objective mời gọi nghiên cứu thêm về việc tận dụng tốt hơn sparsity và chuyên môn hóa chuyên gia trong decoder. Ngoài ra, công việc tương lai có thể nghiên cứu đơn giản loại bỏ các chuyên gia trong decoder layer, điều này cũng confer lợi ích trong autoregressive decoding (Kudugunta et al., 2021a).
+
+[Bảng 14 về entropy của sentinel token được định tuyến]
+
+7.3 CÁC CHUYÊN GIA ĐA NGÔN NGỮ CHUYÊN MÔN HÓA, NHƯNG KHÔNG THEO NGÔN NGỮ
+
+Tiếp theo chúng tôi xem xét mô hình thưa đa ngôn ngữ được pretrain trên mixture của các ngôn ngữ khác nhau và kiểm tra chuyên môn hóa chuyên gia trong encoder. Như trong trường hợp đơn ngôn ngữ, chúng tôi thấy bằng chứng mạnh mẽ về chuyên môn hóa chuyên gia. Bảng 15 trình bày một số ví dụ về chuyên gia chuyên môn hóa trong sentinel token, số, conjunction & article và proper names.
+
+[Bảng 15 về chuyên môn hóa đa ngôn ngữ]
+
+Người ta có thể mong đợi chuyên gia chuyên môn hóa theo ngôn ngữ, điều này xuất hiện như tiêu chí tự nhiên để chia batch dữ liệu giữa các chuyên gia. Tuy nhiên, chúng tôi không thấy bằng chứng về chuyên môn hóa ngôn ngữ (xem Bảng 15). Router thay vào đó truyền token từ tiếng Anh, Nhật, Pháp và Trung Quốc một cách không phân biệt và các chuyên gia xuất hiện là đa ngôn ngữ. Nhưng việc thiếu chuyên môn hóa ngôn ngữ này ít đáng ngạc nhiên hơn khi xem xét cơ chế token routing và load balancing. Vì mỗi nhóm token chỉ có thể chứa một, đến nhiều nhất vài ngôn ngữ (một nhóm thường bao gồm 2-4 sequence trong thiết lập của chúng tôi), thì tất cả chuyên gia được khuyến khích xử lý token từ tất cả ngôn ngữ. Chúng tôi thử nghiệm với global load balance loss, tuy nhiên, điều này thường dẫn đến load-balance tệ hơn và hiệu suất mô hình tệ hơn, vì vậy chúng tôi để lại việc cải thiện thêm các mô hình chuyên gia đa ngôn ngữ như một lĩnh vực công việc mở (Mục 9).
+
+Visualization của chúng tôi tiết lộ chuyên môn hóa rõ ràng được học trong các mô hình của chúng tôi (Bảng 13, 15) cho các lớp encoder. Các chuyên môn hóa chuyên gia khác cũng được quan sát trong phụ lục của Shazeer et al. (2017). Tuy nhiên, điều này dẫn đến một câu hỏi thú vị về cách các kiến trúc loại bỏ learned routing Roller et al. (2021); Zuo et al. (2021) xuất hiện để hoạt động tốt. Một nghiên cứu mở rộng về các tính chất scaling của learned so với random routing có thể hữu ích như công việc tương lai và giúp hướng dẫn chúng ta đến hiểu biết tốt hơn về hành vi routing.
+
+8 CÔNG TRÌNH LIÊN QUAN
+
+Mixture-of-Experts (MoE) có lịch sử ít nhất ba thập kỷ từ công trình của Jacobs et al. (1991); Jordan và Jacobs (1994). Trong các khái niệm ban đầu, MoE định nghĩa toàn bộ mạng neural tương tự như các phương pháp ensemble. Nhưng sau này Eigen et al. (2013) mở rộng ý tưởng bao gồm MoE như một thành phần như một phần của mạng sâu hơn. Shazeer et al. (2017) sau đó scale ý tưởng này thành mô hình 137B tham số để đạt được hiện trạng hiện tại trong dịch máy. Hầu hết công việc sau này (bao gồm của chúng tôi) tuân theo phương pháp MoE như một thành phần này.
+
+Scale trong natural language processing. Thành công đáng kể của scale trong natural language processing (Kaplan et al., 2020; Brown et al., 2020) đã reinvigorate nghiên cứu MoE được chứng minh bởi làn sóng công việc gần đây (Lepikhin et al., 2020; Fedus et al., 2021; Yang et al., 2021; Kim et al., 2021; Du et al., 2021; Artetxe et al., 2021; Zuo et al., 2021; Clark et al., 2022). Các mô hình chuyên gia thưa đã được đề xuất như một phương pháp để đạt được kết quả của các mô hình dày đặc quy mô lớn, hiệu quả hơn. Fedus et al. (2021) cho thấy tăng tốc pre-train 4x so với T5-XXL (Raffel et al., 2019) và Du et al. (2021) khớp chất lượng của GPT-3 (Brown et al., 2020) sử dụng chỉ 1/3 năng lượng. Và trong khoảng mười hai tháng qua, cột mốc huấn luyện hiệu quả mạng neural sâu trillion parameter đã được đạt bởi nhiều nhóm (Fedus et al., 2021; Yang et al., 2021; Du et al., 2021), và gần đây nhất, Lin et al. (2021) giới thiệu kỹ thuật để huấn luyện mô hình 10T parameter. Một side note là thành công đáng kể gần đây của các mô hình chuyên gia thưa thường trong các thiết lập với nhiều dữ liệu và không có distribution shift – hai ví dụ là language modeling/span corruption và machine translation (Shazeer et al., 2017; Lepikhin et al., 2020; Kim et al., 2021; Fedus et al., 2021). Ngược lại, sự khác biệt giữa chất lượng pre-training mạnh và chất lượng fine-tuning kém cho các mô hình thưa đã được quan sát trong Fedus et al. (2021); Narang et al. (2021); Artetxe et al. (2021), nhưng chúng tôi mong đợi tiến bộ trong các kỹ thuật regularization tiếp tục cải thiện chất lượng downstream.
+
+Hướng tới thuật toán routing tốt hơn. BASE layer (Lewis et al., 2021) recast token routing như một vấn đề linear assignment – loại bỏ nhu cầu cho auxiliary loss load balancing. Công việc này cũng demonstrated hiệu quả của một lớp chuyên gia duy nhất. Clark et al. (2022) nghiên cứu sâu các tính chất scaling của một số thuật toán routing khác nhau và đề xuất biến thể riêng của BASE layer sử dụng optimal transport formulation. Yang et al. (2021) giới thiệu kiến trúc M6-T và expert prototyping chia chuyên gia thành các nhóm khác nhau và áp dụng k top-1 routing procedure (đối lập với top-k routing thường được sử dụng ở nơi khác). Hazimeh et al. (2021) đề xuất sparse gate có thể differentiate liên tục với cải thiện được chứng minh so với vanilla top-k gating. Công việc khác (Bengio et al., 2016) xem xét việc casting lựa chọn routing như một vấn đề reinforcement learning. Các phiên bản radical hơn loại bỏ học routing hoàn toàn. Hash layer (Roller et al., 2021) cho thấy random fixed routing (per hash function) dẫn đến hiệu suất cạnh tranh với learned routing. Zuo et al. (2021) cũng đề xuất thuật toán randomly select chuyên gia trong training và inference và thấy lợi ích 2 BLEU point so với Switch Transformer và điểm cạnh tranh với các mô hình lớn hơn của Kim et al. (2021). Cuối cùng, Fan et al. (2021) thiết kế kiến trúc với explicit language-specific sublayer (thay vì cho phép arbitrary routing như được thực hiện trong Lepikhin et al. (2020)) để mang lại lợi ích +1 BLEU.
+
+Các mô hình chuyên gia thưa trong các modality khác. MoE và mô hình chuyên gia thưa cũng đã advance kết quả trong các modality bên cạnh ngôn ngữ. Riquelme et al. (2021) thiết kế V-MoE 15B parameter để khớp các mô hình ImageNet (Deng et al., 2009) hiện trạng hiện tại với ít tài nguyên tính toán hơn. Lou et al. (2021) tương tự cho thấy lợi ích so với các mô hình vision dày đặc bằng cách sử dụng các lớp MoE qua cả image patch và channel dimension. Ngoài ra, Automatic Speech Recognition đã được cải thiện bởi các biến thể SpeechMoE (You et al., 2021a;b). Kumatani et al. (2021) giảm word error rate sử dụng các mô hình MoE trong Sequence-to-Sequence Transformer và Transformer Transducer.
+
+Cải thiện deployment của các mô hình thưa. Thiết kế chuyên gia ban đầu (bao gồm công việc này) định tuyến mỗi token riêng biệt đến chuyên gia tại lớp đó. Một vấn đề là các loại kiến trúc này có thể burden để serve vì nó yêu cầu bộ nhớ đủ để lưu trữ các tham số. Distillation được cho thấy trong Fedus et al. (2021) là moderately hiệu quả, nhưng các phương pháp gần đây sửa đổi routing để thay vào đó định tuyến toàn bộ câu hoặc nhiệm vụ (Kudugunta et al., 2021b; Zuo et al., 2021) sau đó cho phép extraction của sub-network tại thời điểm serving (ví dụ: deploy chỉ mạng liên kết với nhiệm vụ mới). Như một giải pháp thay thế cho distillation, Kim et al. (2021) xem xét directly pruning away chuyên gia không cần thiết cho nhiệm vụ quan tâm.
+
+Multitask learning với MoE. Chúng tôi kết thúc tour nghiên cứu MoE gần đây với thành công trong thiết lập multitask. Ma et al. (2018) khuyến nghị sử dụng gating riêng biệt hoặc router network cho mỗi nhiệm vụ, một ý tưởng có thể sớm được revisit cho kiến trúc Transformer. Cuối cùng, Gururangan et al. (2021) khuyến nghị modularity thậm chí lớn hơn của mô hình ngôn ngữ và conditionally activate chuyên gia dựa trên domain/task label hoặc bởi inferred label.
+
+9 THẢO LUẬN
+
+Trong khi công việc này về các mô hình thưa, những mô hình này giao với nhiều chủ đề thú vị khác trong machine learning như adaptive computation, low-precision training, scaling principle, và tiến bộ kiến trúc mạng neural. Thảo luận của chúng tôi do đó cover một loạt chủ đề rộng hơn được đặt ra trong nghiên cứu này.
+
+Động lực không thể dự đoán khi pre-training trên dữ liệu đa ngôn ngữ. Chúng tôi thường quan sát rằng cùng mô hình được pre-train trên dữ liệu đa ngôn ngữ sẽ mang lại tăng tốc pre-training nhỏ hơn và không ổn định hơn. Một giả thuyết là điều này do variance của sequence per group qua các batch. Như một reminder, chúng tôi khuyến khích token trong một nhóm được load-balanced. Thường chỉ có 2-8 sequence per group (cao hơn trở nên đắt) nơi mỗi sequence được viết bằng một ngôn ngữ duy nhất. Do đó, nhiều nhất 2-8 ngôn ngữ phải được cân bằng qua chuyên gia – thậm chí khi huấn luyện với hơn 100 ngôn ngữ. Điều này dẫn đến variance cao qua nhóm và batch, dẫn đến routing hỗn loạn và không thể dự đoán. Trong một thí nghiệm tiếp theo (chỉ được highlight để ngắn gọn), chúng tôi pre-train trên mixture của English C4 cộng với một phần nhỏ của nhiệm vụ fine-tuning cũng dẫn đến mô hình không ổn định.
+
+Tính bền vững của các mô hình thưa. Mặc dù một bài báo tập trung vào chi tiết của các mô hình thưa-particular, zooming out chúng tôi thấy chúng bền vững với một tập rộng siêu tham số và thay đổi kiến trúc. Các mô hình thưa có được hiệu suất tuyệt vời dưới nhiều thuật toán routing, bỏ phần trăm cao token, và siêu tham số khác nhau. Trong khi chúng tôi chỉ ra tầm quan trọng của tuning batch size và learning rate cho fine-tuning, trực giác của chúng tôi, phù hợp với Kaplan et al. (2020), là người chiến thắng thực sự là scale. Chẳng hạn, Bảng 8 cho thấy lợi ích lớn hơn có được bằng cách đơn giản tăng capacity factor (tức là FLOP) thay vì bằng routing tinh vi hơn (tức là thuật toán).
+
+Adaptive computation. Các mô hình thưa là một subclass của mô hình adaptive computation vì mỗi đầu vào có tính toán khác nhau được áp dụng cho nó. Trong các mô hình thưa một token được định tuyến đến chuyên gia(s) theo lựa chọn của nó. Khi capacity factor ít hơn một, mô hình học không áp dụng tính toán cho token nhất định. Điều này đã cho thấy promise trong computer vision (Riquelme et al., 2021) và các thí nghiệm ngôn ngữ của chúng tôi (Phụ lục D). Chúng tôi hình dung các mô hình tương lai mở rộng điều này thông qua các chuyên gia heterogeneous (ví dụ: mỗi chuyên gia áp dụng tính toán khác nhau). Trực giác, các ví dụ đầu vào khác nhau có thể yêu cầu lượng xử lý khác nhau tùy thuộc vào độ khó. Các mô hình tương lai theo hướng này sẽ được enable hiệu quả thông qua computing infrastructure đang nổi lên (Dean, 2021).
+
+Tổng quát hóa phát hiện từ quy mô nhỏ đến quy mô lớn. Một vấn đề chính mà chúng tôi đối mặt trong suốt công việc của chúng tôi là xác định các mô hình quy mô nhỏ và thiết lập huấn luyện phản ánh các thí nghiệm quy mô lớn hơn. Điều này rõ ràng trong các nghiên cứu ổn định của chúng tôi trong Mục 3 nơi các thí nghiệm phải được chạy với các mô hình sized XL để surface động lực liên quan. Đối với kiến trúc và thí nghiệm thuật toán routing của chúng tôi, chúng tôi thường thấy cải thiện biến mất, hoặc thậm chí reverse, khi các mô hình được huấn luyện lâu hơn hoặc lớn hơn. Như một ví dụ, phát hiện top-n của Fedus et al. (2021) bị reverse trong các thí nghiệm quy mô lớn hơn 8x của chúng tôi được trình bày ở đây, tiết lộ boost nhỏ của định tuyến top-(n+1) so với top-n routing (xem Bảng 8).
+
+Huấn luyện mô hình với precision thậm chí thấp hơn. Phương pháp tốt nhất chúng tôi tìm thấy để ổn định mô hình của chúng tôi mà không hurt (và đôi khi cải thiện) chất lượng là router z-loss. Đây là auxiliary loss khuyến khích mô hình logits có giá trị nhỏ hơn về magnitude tuyệt đối. Với max range của số float32 và bfloat16 có thể hỗ trợ (3e38), điều này dẫn chúng tôi tin rằng hầu hết range này không cần thiết, và compress nó thực sự có thể cải thiện động lực huấn luyện mô hình. Do đó, các định dạng precision tương lai có thể tính đến exponential range nén hơn để huấn luyện các class mô hình nhất định.
+
+Thiết kế phép toán mới với nhiều tương tác multiplicative hơn. Mục 3.1 cho thấy các phép toán với nhiều tương tác multiplicative hơn addition, hoặc những phép toán không accumulate qua nhiều số, cải thiện hiệu suất mô hình. Chúng tôi test điều này thêm bằng cách inject nhiều tương tác multiplicative hơn vào các lớp chuyên gia làm tăng tốc pre-training 4% mà không có thay đổi nào đối với step-time (Phụ lục C). Chúng tôi nghĩ điều này gợi ý những cải thiện kiến trúc hứa hẹn cho mô hình và có thể là một nguyên tắc thiết kế tốt. Gần đây depthwise convolution, chỉ accumulate 3-5 element, cũng đã được cho thấy cải thiện đáng kể hiệu suất Transformer (So et al., 2021). Những phép toán này đặc biệt thú vị vì element-wise multiplication thường không giới thiệu bất kỳ communication overhead nào khi sử dụng model parallelism (làm cho các phép toán như depthwise convolution và tương tác multiplicative của chúng tôi rất hiệu quả). Trong khi chúng tôi lưu ý những phương pháp này tăng sự không ổn định mô hình trong Mục 3.1, sử dụng router z-loss trong các mô hình của chúng tôi ngăn chặn bất kỳ sự không ổn định thêm nào.
+
+Constrain activation để giảm thiểu các động lực scaling mô hình không mong muốn khác. Chúng tôi quan sát hai nguồn bổ sung của sự không ổn định huấn luyện. (1) Các mô hình Encoder-decoder không ổn định hơn mô hình chỉ decoder (cho lượng FLOP cố định). Các mô hình Encoder-decoder có tỷ lệ cao hơn của các lớp attention (ví dụ: nhiều hàm exponential hơn) do có cả self-attention và enc-dec attention layer cho mỗi FFN trên decoder. (2) Các mô hình sâu hơn không ổn định hơn các mô hình nông hơn cho lượng FLOP cố định. Các mô hình sâu hơn cũng giới thiệu nhiều hàm exponential hơn thông qua attention layer bổ sung. Chúng tôi giả thuyết rằng một yếu tố đóng góp cho cả hai quan sát này đơn giản là số lượng tăng của hàm exponential được tìm thấy trong mạng. Công việc tương lai có thể xem xét giải quyết những động lực huấn luyện này bằng cách thêm z-loss penalty vào attention softmax cho các mô hình không thưa, đặc biệt vì chúng tôi quan sát thêm chúng không thay đổi chất lượng mô hình.
+
+Các mô hình dày đặc và thưa phụ thuộc khác nhau vào siêu tham số. Phân tích fine-tuning của chúng tôi trong Mục 4.3 cho thấy siêu tham số fine-tuning tối ưu khác nhau đáng kể giữa mô hình dày đặc và thưa. Trong một số thiết lập, siêu tham số fine-tuning hoạt động tốt cho mô hình dày đặc che giấu bất kỳ cải thiện nào từ mô hình thưa (mặc dù tăng tốc pre-training lớn). Đối với các class mô hình mới, chúng tôi khuyến nghị các nhà nghiên cứu và thực hành test rộng rãi siêu tham số chính trước khi bỏ cuộc sớm một phương pháp.
+
+10 KẾT LUẬN
+
+Chúng tôi temper over-exuberance cho scale trong Fedus et al. (2021) bằng cách cho thấy cách một mô hình với 1/5 kích thước, nhưng với cân bằng tốt hơn của tính toán (FLOP) đối với tham số – là một learner thưa hiệu quả hơn. Hơn nữa, điều này cải thiện usability của mô hình thưa vì nó có thể được deploy với memory overhead ít hơn. Sử dụng biến thể mô hình thưa của chúng tôi, chúng tôi đạt được SOTA trên một loạt các benchmark công cộng cạnh tranh nhất. Chúng tôi hy vọng công việc này cho thấy power của model sparsity và accelerate việc áp dụng các mô hình như vậy.
+
+LỜI CẢM ƠN
+
+Chúng tôi muốn cảm ơn Alex Passos, Ekin Cubuk, Margaret Li, Noah Constant, Oriol Vinyals, Basil Mustafa, Joan Puigcerver, Diego de Las Casas, Mike Lewis, và Ryan Sepassi cho các nhận xét chi tiết và feedback trên các phiên bản đầu của bản thảo. Chúng tôi cũng cảm ơn Google Brain Team cho các thảo luận hữu ích trong suốt quá trình công việc này.
+
+TÀI LIỆU THAM KHẢO
+
+[Phần tài liệu tham khảo giữ nguyên định dạng gốc do tính chất kỹ thuật]
+
+PHỤ LỤC
+
+A MÔ TẢ CÂN BẰNG TẢI TOKEN
+
+Auxiliary load balancing loss từ Shazeer et al. (2017) cũng được sử dụng ở đây để cân bằng token qua chuyên gia. Giả sử chúng ta có N chuyên gia được indexed bởi i = 1 đến N và một batch B với T token. Auxiliary loss được tính như scaled dot-product giữa vector f và P,
+
+loss = N ∑^N_{i=1} f_i P_i     (7)
+
+trong đó f_i là phần token được dispatch đến chuyên gia i,
+
+f_i = 1/T ∑_{x∈B} 1{argmax p(x); i}     (8)
+
+và P_i là phần xác suất router được phân bổ cho chuyên gia i,
+
+P_i = 1/T ∑_{x∈B} p_i(x)     (9)
+
+Vì chúng ta tìm kiếm uniform routing của batch token qua N chuyên gia, chúng ta mong muốn cả hai vector có giá trị 1/N. Auxiliary loss của Phương trình 7 khuyến khích uniform routing vì nó được minimize dưới phân phối đồng nhất. Objective cũng có thể được differentiate vì P-vector có thể differentiate, nhưng f-vector thì không. Loss cuối cùng được nhân với expert count N để giữ loss không đổi khi số lượng chuyên gia thay đổi vì dưới uniform routing ∑^N_1 (f_i P_i) = ∑^N_1 (1/N 1/N) = 1/N. Cuối cùng, một siêu tham số α là hệ số multiplicative cho những auxiliary loss này; trong suốt công việc này chúng tôi sử dụng α = 10^{-2} đủ lớn để đảm bảo load balancing trong khi đủ nhỏ để không overwhelm primary cross-entropy objective.
+
+B ĐỘNG LỰC HUẤN LUYỆN ROUTER Z-LOSS
+
+Hình 7 plot router z-loss từ Phương trình 5 qua coefficient sweep nơi giá trị tốt nhất c_z = 0.001 được plot bằng màu xanh lá cho encoder và decoder.
+
+[Hình 7 về sweeping loss coefficient]
+
+C CÁC CẢI TIẾN KIẾN TRÚC ĐƯỢC CẢI THIỆN
+
+Chúng tôi xem xét một vài biến thể kiến trúc nhỏ ở đây. Sửa đổi đầu tiên là thêm các lớp FFN bổ sung (feed-forward network, xem Bảng 1 để biết thêm chi tiết) ngay trước hoặc sau mỗi lớp MoE (được gọi là Sparse-Dense). Bảng 16 tiết lộ hiệu quả của lớp FFN ngay trước hoặc sau mỗi lớp thưa và rằng những lớp FFN thêm này giúp ít hơn khi được thêm vào nơi khác trong mạng. Đảm bảo tất cả token có ít nhất một FFN được áp dụng cho chúng giữa mỗi attention layer xuất hiện hữu ích.
+
+[Bảng 16 về lớp FFN thêm]
+
+Thứ hai, chúng tôi giới thiệu bias bổ sung trong các lớp chuyên gia. Tất cả mô hình của chúng tôi sử dụng GELU-Linear FFN (Shazeer, 2020), thay vì ReLU FFN:
+
+FFN_{ReLU}(x) = (ReLU(xW_1))W_2
+FFN_{GEGLU}(x) = (GELU(xW_{11}) ⊙ xW_{12})W_2
+
+Additive bias là trọng số đã học (B) được thêm sau phép nhân ma trận đầu tiên trong lớp FFN có hình dạng [batch; d_{ff}]. Multiplicative bias (cũng được gọi là scale parameter) là trọng số đã học có cùng hình dạng, nhưng thực hiện phép nhân element-wise. Chúng tôi khởi tạo additive bias thành zero và multiplicative bias thành ones.
+
+FFN_{GEGLU+Add Bias}(x) = [(GELU(xW_{11}) ⊙ xW_{12}) + B]W_2
+FFN_{GEGLU+Mult Bias}(x) = [(GELU(xW_{11}) ⊙ xW_{12}) ⊙ B]W_2
+
+Bảng 17 cho thấy kết quả của các phương pháp khác nhau của chúng tôi. Cả additive và multiplicative bias về cơ bản là miễn phí: rẻ để tính toán, thêm ít tham số mới, và không có chi phí giao tiếp bổ sung với model và expert parallelism. Khi sử dụng router z-loss từ Mục 3.1, chúng tôi quan sát không có sự không ổn định từ multiplicative bias. Chúng tôi thấy rằng các tương tác multiplicative cải thiện hiệu suất, đạt được tăng tốc 4% trong thời gian hội tụ so với sparse baseline mạnh của chúng tôi. Điều này gợi ý rằng một avenue hứa hẹn cho nghiên cứu kiến trúc tương lai là tìm cách mới để thêm nhiều tương tác multiplicative vào mạng.
+
+[Bảng 17 về nhiều tương tác multiplicative]
+
+Cuối cùng, motivated bởi công việc của Roller et al. (2021), chúng tôi khám phá các phương pháp tương tự, nhưng không thấy cải thiện trong thiết lập của chúng tôi. Chúng tôi thử routing sử dụng word embedding độc quyền, cũng như đầu vào bổ sung vào layer embedding cho quyết định routing. Chúng tôi toggle dừng gradient thông qua word embedding hoặc cho phép nó có gradient được propagate từ router. Sử dụng chỉ word embedding hurt chất lượng, trong khi sử dụng nó thêm vào normal layer hidden activation ban đầu tích cực, nhưng sau khi pre-training trong 50B+ token trên các mô hình có quy mô 1B+ dense parameter nó có hiệu ứng trung tính. Phụ lục J có chi tiết thêm về các thí nghiệm với kết quả tiêu cực.
+
+D BATCH PRIORITIZED ROUTING CHO CAPACITY FACTOR THẤP HƠN
+
+Đáng ngạc nhiên, định tuyến top-1 và top-2 hoạt động tốt với CF ít hơn 1.0 mặc dù token routing được thực hiện theo thứ tự từ trái sang phải qua sequence. Nếu N token được gửi đến chuyên gia chỉ với M space thì N > M token sẽ bị bỏ. Thứ tự của việc bỏ là quan trọng: chúng tôi bỏ token đi từ trái sang phải (ví dụ: token sớm hơn trong câu sẽ được định tuyến trước so với token cuối). Điều này được thực hiện để tránh mô hình gian lận. Nếu chúng tôi bỏ token theo thứ tự khác, mô hình có thông tin về token nào xuất hiện sau trong sequence dựa trên việc token có bị bỏ hay không.
+
+Batch Prioritized Routing (BPR) từ Riquelme et al. (2021) được giới thiệu trong Vision Transformer (Dosovitskiy et al., 2020) cho image classification. Công việc của chúng tôi khám phá BPR với định tuyến top-1 trong context của language modeling. BPR nhằm có cái nhìn global về tất cả token để xác định token nào nên bị bỏ thay vì thứ tự trái-phải. Thuật toán hoạt động bằng cách nhìn vào tất cả N token được gửi đến Expert i và sau đó chỉ routing M token có xác suất cao nhất từ router. Bảng 18 cho thấy BPR top-1 routing cải thiện hiệu suất so với top-2 routing, đặc biệt khi capacity factor ít hơn 1.0. Chúng tôi để lại cho công việc tương lai thử top-n BPR routing, có thể sẽ mang lại cải thiện lớn hơn cho capacity factor cao hơn.
+
+Quan trọng, BPR routing chỉ có thể được thực hiện ở phía encoder của mô hình encoder-decoder. Ở phía encoder không có dự đoán autoregressive và tất cả token có thể nhìn thấy nhau. Nếu bạn sử dụng BPR trên decoder, nó học gian lận bằng cách sử dụng thông tin token tương lai để cải thiện dự đoán token hiện tại.
+
+[Bảng 18 về hiệu suất Batch Prioritized Top-1 Routing]
+
+E CHI TIẾT TẬP DỮ LIỆU PRE-TRAINING
+
+Tập dữ liệu pre-training được sử dụng để huấn luyện mô hình Sparse 32B của chúng tôi là mixture của C4 (Raffel et al., 2019) và tập dữ liệu được giới thiệu trong GLaM (Du et al., 2021).
+
+[Bảng 19 về dữ liệu và trọng số mixture]
+
+F DỮ LIỆU ĐỘ NHẠY FINE-TUNING ĐẦY ĐỦ
+
+Bảng 20 chứa dữ liệu thô cho Hình 6 đo độ nhạy giao thức fine-tuning. Dense và Sparse là các mô hình encoder-decoder được khớp FLOP với T5-Large được pre-train trong 500k bước với batch size 1M token trên corpus C4.
+
+[Bảng 20 về độ nhạy giao thức fine-tuning - dữ liệu đầy đủ]
+
+G THIẾT LẬP TỐI ƯU NGƯỠNG ĐỊNH TUYẾN
+
+Thuật toán Định tuyến Top-n
+1. Định tuyến mỗi token x đến chuyên gia có xác suất router cao nhất (gate₁(x)).
+2. Chuẩn hóa top-n expert router score cho mỗi token x, sao cho gateᵢ = gateᵢ(x) / Σⁿᵢ₌₁ gateᵢ(x).
+3. Định tuyến token đến n-1 chuyên gia khác (indexed bởi i) với xác suất min(1.0; gateᵢ(x) / threshold).
+
+Threshold là siêu tham số predefined thường được đặt thành 0.2.
+
+Chúng tôi mô tả siêu tham số MoE và cách chúng nên thay đổi khi thuật toán routing thay đổi. Thuật toán định tuyến top-2 MoE (Shazeer et al., 2017; 2018; Lepikhin et al., 2020) hoạt động như sau: đầu tiên router tìm chuyên gia được gán điểm router cao hơn (gate₁) và luôn gửi token đến chuyên gia đó. Token cũng được gửi đến chuyên gia cao thứ hai với xác suất min(1.0; gate₂/threshold). Threshold là siêu tham số thường được đặt thành 0.2, và gate₂ là xác suất router của token cho chuyên gia cao thứ hai. Lưu ý rằng gate₁ và gate₂ được chuẩn hóa bởi tổng của hai điểm của chúng, vì vậy chúng tổng bằng một.
+
+Chúng tôi extend một cách tầm thường thuật toán top-2 để hoạt động cho định tuyến top-n ở đây. Lấy điểm của top-n chuyên gia per token và tổng chúng, sau đó renormalize mỗi expert router score dựa trên tổng đó. Nếu renormalized expert score cụ thể có giá trị cao hơn threshold (ví dụ: 0.2), thì token sẽ được định tuyến, nếu không nó sẽ được định tuyến với xác suất score/threshold. Ở mức cao điều này chỉ định tuyến token đến n-1 chuyên gia tiếp theo nếu điểm của chúng không quá thấp so với chuyên gia điểm cao nhất.
+
+Đối với định tuyến top-3 vs top-2, tổng mà expert score được chuẩn hóa bởi lớn hơn, do đó chúng tôi thử nghiệm với việc giảm threshold. Kết quả thí nghiệm của chúng tôi được hiển thị trong Bảng 21. Thú vị, chúng tôi quan sát định tuyến top-3 được lợi nhẹ từ threshold thấp hơn, trong khi điều ngược lại đúng cho định tuyến top-2.
+
+Chúng tôi cũng thử nghiệm với absolute threshold policy thay vì relative. Đây là nơi n-1 token tiếp theo sẽ được định tuyến chỉ nếu router score của chúng lớn hơn một giá trị predefined (ví dụ: 0.2). Chúng tôi thấy nó có thể đạt được hiệu suất tốt nếu giá trị threshold được tuned.
+
+[Bảng 21 về hiệu suất top-2 và top-3 routing với threshold khác nhau]
+
+H BỐ CỤC MESH CHO DATA, MODEL VÀ EXPERT PARALLELISM VỚI ÍT CHUYÊN GIA
+
+Chúng tôi sử dụng data và model parallelism partitioning với Mesh-Tensorflow (Shazeer et al., 2018). Chiến lược partitioning hoạt động bằng cách đầu tiên hình thành logical 2D mesh kích thước d×m, với row tương ứng với data dimension (d) và column là model dimension (m) và tích bằng tổng số core, n = d×m. Mesh này chỉ là abstraction. Mỗi logical core phải được map thành physical core, được tối ưu hóa thông qua performance tuning.
+
+Như một refresher, mỗi row trong mesh sẽ có slice dữ liệu riêng và mỗi column sẽ có slice trọng số mô hình riêng. Giao tiếp gradient allreduce cuối cùng xảy ra qua mỗi column riêng lẻ. Giao tiếp model parallelism allreduce xảy ra qua mỗi row trong mesh. Một ràng buộc từ phương pháp này là số row phải chia đều số data sequence và số column phải chia đều model dimension được partition.
+
+Nhưng nếu chúng ta có ít hơn d chuyên gia thì layout này sẽ không hoạt động. Để cho phép ít chuyên gia hơn data parallelism row trong mesh của chúng tôi, chúng tôi factorize data dimension thành hai dimension mới: inner (i) và outer (o) nơi i×o = d và số chuyên gia bằng i. Điều này biến đổi logical 2D mesh có hình dạng d×m thành 3D mesh có hình dạng o×i×m. Xem Hình 8 để visualize cả hai mesh.
+
+[Hình 8 về Data và model parallelism mesh]
+
+I GHI CHÚ VỀ CHI PHÍ GIAO TIẾP CHO MÔ HÌNH PHÂN TÁN
+
+Các phép toán giao tiếp (allreduce và all2all) có thể ảnh hưởng đáng kể đến throughput huấn luyện mô hình thưa (xem Bảng 1 để mô tả các phép toán giao tiếp). Các cuộc gọi allreduce được thực hiện dọc theo model và batch dimension, thường được dominated bởi các cuộc gọi allreduce model dimension tổng kết quả của các phép toán nhân ma trận từng phần từ các worker. Những cuộc gọi này cần thiết khi phép nhân ma trận được partition qua nhiều core (ví dụ: model parallelism). Các cuộc gọi allreduce gradient summation có thể được amortized away bằng cách huấn luyện mô hình với batch size lớn hơn vì chi phí giao tiếp allreduce gradient accumulation độc lập với batch size. Để giảm thiểu vấn đề bộ nhớ của batch size lớn hơn, microbatch có thể được sử dụng. Microbatch thực hiện điều này bằng cách chia batch thành n chunk chia đều và tính toán gradient trên mỗi chunk tuần tự, sau đó tổng.
+
+Để tăng throughput allreduce, nhiều worker hơn có thể cần được gán cho model dimension (thay vì batch dimension). Tuy nhiên, tăng số worker có thể giảm compute per worker dẫn đến communication overhead cao hơn cancel một số lợi ích từ throughput giao tiếp cao hơn từ allreduce. Đối với kết quả trong bài báo này, đầu tiên chúng tôi khám phá các chiến lược model partitioning khác nhau. Tiếp theo hình dạng của các công việc pre-training được phân bổ dựa trên performance benchmarking cho thấy communication overhead tích lũy thấp nhất trong allreduce và all2all.
+
+J KẾT QUẢ TIÊU CỰC
+
+Chúng tôi kết thúc với một số ý tưởng mang lại kết quả tiêu cực trong thiết lập của chúng tôi.
+
+Thêm thông tin nếu token bị bỏ vào router. Chúng tôi thử nghiệm với việc có lớp chuyên gia có thông tin về việc token có được định tuyến hay bị bỏ trong các lớp chuyên gia trước đó. Chúng tôi triển khai điều này thông qua đếm số lần token được định tuyến trong tất cả lớp chuyên gia trước đó, có embedding cho mỗi giá trị có thể và sau đó thêm điều này vào router embedding. Chúng tôi thấy rằng điều này không tạo ra sự khác biệt trong hiệu suất.
+
+Thêm thông tin vị trí chuyên gia rõ ràng. Chúng tôi thử nghiệm với việc thêm thông tin vị trí rõ ràng vào đầu ra của lớp chuyên gia. Chúng tôi muốn xem liệu nó cải thiện hiệu suất hay tăng tốc hội tụ trong đầu training khi các lớp chuyên gia thay đổi dramatically. Chúng tôi thực hiện điều này thông qua việc thêm embedding tương ứng với chuyên gia nào mỗi token được gửi (bao gồm embedding nếu token bị bỏ), nhưng điều này không cải thiện hiệu suất.
+
+Thêm nhiễu pre-training để khắc phục sự khác biệt pre-training và fine-tuning. Để giúp khắc phục khoảng cách pre-training perplexity và fine-tuning, chúng tôi thử pre-training các mô hình thưa với nhiều loại nhiễu khác nhau. Mục tiêu là giúp pre-training khớp với điều kiện fine-tuning nơi dropout được sử dụng và nhiều token có thể bị bỏ. Một số loại nhiễu mà chúng tôi thử thêm trong pre-training là dropout, bỏ toàn bộ chuyên gia cho một batch token, và thêm entropy maximization auxiliary loss vào router. Thật không may, tất cả các phương pháp đều hurt chất lượng pre-training quá nhiều hoặc không giúp fine-tuning.
+
+Load balancing trong định tuyến top-n qua n-1 chuyên gia thấp hơn. Trong formalization MoE top-n tiêu chuẩn chỉ có loading balancing qua chuyên gia top mà token được gửi đến. Chúng tôi thử nghiệm với việc thêm auxiliary load balancing term vào n-1 chuyên gia khác trong định tuyến top-n, nhưng thấy điều này cung cấp lợi ích tối thiểu.
+
+Trộn dữ liệu pre-training và fine-tuning để ngăn overfitting. Để giúp chống lại overfitting của các mô hình thưa trong fine-tuning, chúng tôi thử trộn dữ liệu span corruption pre-training với lượng khác nhau (ví dụ: 1%, 5%, 25%, ...) trong fine-tuning. Điều này cuối cùng không giúp hiệu suất fine-tuning, nhưng tăng training loss.

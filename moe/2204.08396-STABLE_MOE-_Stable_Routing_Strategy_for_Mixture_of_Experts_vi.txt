@@ -1,0 +1,194 @@
+# STABLE MOE: Chiến lược định tuyến ổn định cho Hỗn hợp các Chuyên gia
+
+Damai Daiyz, Li Dongz, Shuming Maz, Bo Zhengz,
+Zhifang Suiy, Baobao Changy, Furu Weiz
+yMOE Key Lab of Computational Linguistics, Peking University
+zMicrosoft Research
+{daidamai,szf,chbb}@pku.edu.cn
+{lidong1,shumma,v-zhebo,fuwei}@microsoft.com
+
+## Tóm tắt
+
+Kỹ thuật Hỗn hợp các Chuyên gia (MoE) có thể mở rộng kích thước mô hình của các Transformer với chi phí tính toán có thể chấp nhận được. Chúng tôi chỉ ra rằng các phương pháp MoE học-để-định-tuyến hiện có gặp phải vấn đề dao động định tuyến, tức là chuyên gia đích của cùng một đầu vào có thể thay đổi theo quá trình huấn luyện, nhưng chỉ có một chuyên gia sẽ được kích hoạt cho đầu vào trong quá trình suy luận. Dao động định tuyến có xu hướng làm hại hiệu quả mẫu vì cùng một đầu vào cập nhật các chuyên gia khác nhau nhưng chỉ một chuyên gia được sử dụng cuối cùng. Trong bài báo này, chúng tôi đề xuất STABLE MOE với hai giai đoạn huấn luyện để giải quyết vấn đề dao động định tuyến. Trong giai đoạn huấn luyện đầu tiên, chúng tôi học một chiến lược định tuyến cân bằng và gắn kết và chưng cất nó thành một bộ định tuyến nhẹ tách biệt khỏi mô hình cốt lõi. Trong giai đoạn huấn luyện thứ hai, chúng tôi sử dụng bộ định tuyến đã chưng cất để xác định phân công token-đến-chuyên gia và đóng băng nó để có chiến lược định tuyến ổn định. Chúng tôi xác thực phương pháp của mình trên mô hình hóa ngôn ngữ và dịch máy đa ngôn ngữ. Kết quả cho thấy STABLE MOE vượt trội hơn các phương pháp MoE hiện có về cả tốc độ hội tụ và hiệu suất. Mã nguồn có sẵn tại https://github.com/Hunter-DDM/stablemoe .
+
+## 1 Giới thiệu
+
+Trong những năm gần đây, các Transformer quy mô lớn (Devlin et al., 2019; Dong et al., 2019; Raffel et al., 2020; Clark et al., 2020; Bao et al., 2020; Brown et al., 2020) đã thể hiện khả năng mô hình hóa ngôn ngữ ấn tượng. Tuy nhiên, khi quy mô mô hình tăng lên, tốc độ huấn luyện sẽ chậm lại và yêu cầu bộ nhớ cực lớn cũng gây ra gánh nặng kỹ thuật nặng nề. Hỗn hợp các Chuyên gia (MoE) (Jacobs et al., 1991; Jordan và Jacobs, 1994; Shazeer et al., 2017), theo cách dễ dàng hơn nhiều, cho phép các Transformer mở rộng số lượng tham số đồng thời giới thiệu chi phí tính toán có thể chấp nhận được. Các Transformer dựa trên MoE có một tập hợp các mô-đun chuyên gia, và chỉ một vài chuyên gia sẽ được kích hoạt cho mỗi token đầu vào. Bằng cách này, chúng ta có thể mở rộng quy mô mô hình bằng cách thêm các mô-đun chuyên gia, điều này sẽ giữ chi phí tính toán và bộ nhớ trong phạm vi có thể chấp nhận được.
+
+Hầu hết các phương pháp MoE hiện có (Lepikhin et al., 2021; Fedus et al., 2021; Lewis et al., 2021) quyết định định tuyến token-đến-chuyên gia theo các biểu diễn token thay đổi động. Tuy nhiên, chúng tôi chỉ ra rằng chúng phải đối mặt với vấn đề dao động định tuyến. Như được minh họa trong Hình 1, cùng một đầu vào có thể được gán cho các chuyên gia khác nhau trong quá trình huấn luyện. Tuy nhiên, trong quá trình suy luận, chỉ có một chuyên gia sẽ được kích hoạt cho đầu vào. Vấn đề dao động định tuyến có xu hướng làm hại hiệu quả mẫu vì cùng một đầu vào cập nhật các chuyên gia khác nhau trong khi chỉ một chuyên gia được sử dụng cuối cùng.
+
+Lấy BASE Layer (Lewis et al., 2021) làm ví dụ, trong suốt quá trình huấn luyện, chúng tôi kiểm tra phân công token-đến-chuyên gia cho các token trong tập validation. Đối với một token đầu vào, chúng tôi định nghĩa bước dao động cuối cùng là bước cuối cùng mà chuyên gia đích của nó khác với bước cuối cùng. Chúng tôi vẽ biểu đồ phần trăm token tích lũy theo bước dao động cuối cùng (được chú thích là phần trăm của nó so với tất cả các bước huấn luyện) trong Hình 2. Chúng tôi thấy rằng bước dao động cuối cùng của 40,9% token vượt quá 20%, có nghĩa là 40,9% token không có chuyên gia đích ổn định khi 20% tất cả các bước huấn luyện đã hoàn thành. Hơn nữa, 29,1% token vẫn thay đổi chuyên gia đích sau một nửa toàn bộ quá trình huấn luyện, và 15,4% token thậm chí thay đổi chuyên gia đích sau 80% tất cả các bước huấn luyện, gần với việc kết thúc huấn luyện. Những thống kê này chứng minh rằng vấn đề dao động định tuyến thực sự tồn tại trong các phương pháp MoE trước đây.
+
+Trong bài báo này, chúng tôi đề xuất STABLE MOE với hai giai đoạn huấn luyện để giải quyết vấn đề dao động định tuyến. Trong giai đoạn huấn luyện đầu tiên, chúng tôi theo mô hình học-để-định-tuyến và nhằm mục đích học một chiến lược định tuyến cân bằng và gắn kết. Chúng tôi thiết kế một loss cân bằng để đảm bảo phân công là cân bằng. Ngoài ra, được lấy cảm hứng từ Lewis et al. (2021), chúng tôi áp dụng cơ chế gating sigmoid, cho phép mục tiêu nhiệm vụ truyền tín hiệu có giám sát trở lại chiến lược định tuyến, để tạo điều kiện học một phân công gắn kết hơn. Khi chiến lược định tuyến đang được học, chúng tôi đồng thời chưng cất nó thành một bộ định tuyến nhẹ tách biệt khỏi mô hình cốt lõi. Trong giai đoạn huấn luyện thứ hai, chúng tôi sử dụng bộ định tuyến đã chưng cất để xác định phân công token-đến-chuyên gia. Bộ định tuyến đã chưng cất được đóng băng trong giai đoạn này để cung cấp một chiến lược định tuyến ổn định, giải quyết vấn đề dao động định tuyến trong phần huấn luyện còn lại. Chúng tôi tiến hành thí nghiệm trên mô hình hóa ngôn ngữ và dịch máy đa ngôn ngữ. Kết quả cho thấy STABLE MOE vượt trội hơn các phương pháp MoE hiện có về cả tốc độ hội tụ và hiệu suất.
+
+Các đóng góp của chúng tôi được tóm tắt như sau: (1) Chúng tôi chỉ ra vấn đề dao động định tuyến trong các phương pháp MoE học-để-định-tuyến hiện có. (2) Chúng tôi đề xuất STABLE MOE để giải quyết vấn đề dao động định tuyến. (3) Chúng tôi tiến hành các thí nghiệm đáng kể dưới các cài đặt khác nhau để thể hiện ưu điểm của STABLE MOE so với các phương pháp MoE hiện có.
+
+## 2 Nền tảng: Hỗn hợp các Chuyên gia cho Transformer
+
+Trước tiên, chúng tôi giới thiệu cơ chế MoE được thiết kế cho Transformer (Vaswani et al., 2017). Cho một mô hình Transformer L tầng tiêu chuẩn và một chuỗi đầu vào X chứa T token, đầu ra Transformer HL được tính bằng:
+
+HL = [hL1; hL2; ...; hLT],                     (1)
+
+hlt = FFN(ult) + ult,                          (2)
+
+ul1:T = self-att(hl-11:T) + hl-11:T,          (3)
+
+trong đó hlt là trạng thái ẩn của token thứ t sau tầng thứ l, Self-Att() là mô-đun self-attention, và FFN() là viết tắt của mạng feed-forward. Để đơn giản, chúng tôi bỏ qua layer normalization.
+
+Chúng tôi triển khai MoE cho Transformer bằng cách chèn các tầng MoE, được cấu thành từ một tập hợp các FFN, vào giữa hai khối Transformer láng giềng. Tại một tầng MoE, đối với mỗi token đầu vào, chỉ một vài hoặc một chuyên gia sẽ được kích hoạt, được điều khiển bởi một hàm gating g():
+
+hlt = ∑(i=1 to N) gi(hl-1t) FFNi(hl-1t) + hl-1t,    (4)
+
+trong đó N là tổng số chuyên gia, và FFNi là chuyên gia thứ i. Ở đây, hàm gating gi() là thưa thớt để có hiệu quả tính toán. Để đơn giản, chúng tôi bỏ qua layer normalization.
+
+## 3 Phương pháp
+
+STABLE MOE có hai giai đoạn huấn luyện như minh họa trong Hình 3. Trong giai đoạn huấn luyện đầu tiên, chúng tôi theo mô hình học-để-định-tuyến và nhằm mục đích học một chiến lược định tuyến cân bằng và gắn kết. Khi chiến lược định tuyến đang được học, chúng tôi đồng thời chưng cất nó thành một bộ định tuyến nhẹ tách biệt khỏi mô hình cốt lõi. Trong giai đoạn huấn luyện thứ hai, chúng tôi sử dụng bộ định tuyến đã chưng cất để xác định phân công token-đến-chuyên gia. Bộ định tuyến đã chưng cất được đóng băng trong giai đoạn này để cung cấp một chiến lược định tuyến ổn định. Trong quá trình suy luận, chúng tôi cũng sử dụng bộ định tuyến đã chưng cất đóng băng để định tuyến nhất quán.
+
+### 3.1 Giai đoạn huấn luyện 1: Học chiến lược định tuyến
+
+Gọi hl-1t ∈ Rd là biểu diễn đầu vào của token t và E ∈ RN×d là trọng tâm của N chuyên gia. Đối với mỗi tầng MoE, chúng tôi gán mỗi token cho một chuyên gia FFN (Fedus et al., 2021; Lewis et al., 2021; Roller et al., 2021). Điểm phân công là:
+
+st,i = ETi hl-1t,                              (5)
+
+trong đó st,i là điểm phân công giữa token t và chuyên gia i, biểu thị mối quan hệ của chúng. Chúng tôi sử dụng thuật toán phân công tham lam, tức là gửi mỗi token đến chuyên gia có mối quan hệ cao nhất. Sau đó, chúng tôi tính đầu ra FFN chuyên gia như:
+
+at = arg max i (st,i),                         (6)
+
+hlt = σ(st,at) FFNat(hl-1t) + hl-1t,          (7)
+
+trong đó at là chỉ số chuyên gia mà token t được gửi đến, và σ là cổng sigmoid (Lewis et al., 2021). Xem xét cổng sigmoid σ(st,at), nếu FFNat có lợi cho token t, việc tối ưu hóa mục tiêu huấn luyện (ví dụ, giảm thiểu cross-entropy loss cho mô hình hóa ngôn ngữ) sẽ thúc đẩy cổng lớn hơn; ngược lại, cổng sẽ có xu hướng nhỏ hơn. Tín hiệu cổng thúc đẩy các token tương tự được gán cho cùng một chuyên gia có lợi cho chúng, do đó tạo ra các phân công token-đến-chuyên gia gắn kết.
+
+**Balance Loss** Chúng tôi thiết kế một balance loss Lbal để tránh các phân công không cân bằng sẽ dẫn đến nghẽn cổ chai tính toán cao trong tầng MoE và do đó hạn chế hiệu quả tính toán:
+
+Lbal = ∑(i=1 to N) α (|Ai| - n)/n ∑(t∈Ai) (st,i),    (8)
+
+trong đó α là một siêu tham số, Ai biểu thị tập hợp các token được gán cho chuyên gia i, và n biểu thị số lượng token trung bình cho mỗi chuyên gia. Trực quan, nếu một chuyên gia bị quá tải, balance loss sẽ thúc đẩy điểm phân công của nó nhỏ hơn. Ngược lại, nếu một chuyên gia không được sử dụng, balance loss sẽ tăng điểm phân công của nó để thu hút nhiều token hơn.
+
+**Distilled Router** Khi chiến lược định tuyến đang được học, chúng tôi đồng thời chưng cất nó thành một bộ định tuyến nhẹ tách biệt khỏi mô hình cốt lõi để bắt chước chiến lược định tuyến ban đầu. Gọi X là chuỗi đầu vào và Ê là trọng tâm chuyên gia đã chưng cất, chúng tôi sử dụng word embedding D() để trích xuất các đặc trưng định tuyến. Chúng tôi sử dụng cross-entropy loss làm distillation loss Ldis:
+
+ĥl-1t = D(Xt); ŝt,i = ÊTi ĥl-1t,              (9)
+
+Ldis = ∑(t=1 to T) log(exp(ŝt,at)/∑(i=1 to N) exp(ŝt,i)),   (10)
+
+trong đó ĥl-1t là đặc trưng định tuyến đã chưng cất của token t, ŝt,i là điểm phân công đã chưng cất giữa token t và chuyên gia i, và at là chỉ số chuyên gia mà token t thực sự được gửi đến. Trong thực tế, D() cũng có thể là các bộ trích xuất đặc trưng khác như CNN hoặc Transformer (chúng tôi điều tra các biến thể khác của bộ định tuyến đã chưng cất trong Mục 4.4.3), nhưng word embedding là nhanh nhất và đạt hiệu suất tốt nhất. Cuối giai đoạn huấn luyện 1, chúng tôi đóng băng tất cả các tham số cho bộ định tuyến đã chưng cất (tức là D() và Ê) để chuẩn bị một chiến lược định tuyến ổn định cho giai đoạn huấn luyện 2 và giai đoạn suy luận.
+
+**Training Objective** Trong giai đoạn huấn luyện 1, training loss bao gồm task loss, balance loss, và distillation loss:
+
+LS1 = Ltask + Lbal + Ldis.                     (11)
+
+### 3.2 Giai đoạn huấn luyện 2: Học với chiến lược định tuyến ổn định
+
+Với D() và Ê đã đóng băng, trong giai đoạn huấn luyện 2, chúng tôi sử dụng trực tiếp chúng cho một chiến lược định tuyến ổn định. Giữ nguyên các quy trình khác như trong giai đoạn huấn luyện 1, chúng tôi tính đầu ra của tầng MoE như sau:
+
+ĥl-1t = D(Xt); ŝt,i = ÊTi ĥl-1t,              (12)
+
+ât = arg max i (ŝt,i),                         (13)
+
+hlt = σ(st,ât) FFNât(hl-1t) + hl-1t.          (14)
+
+Lưu ý rằng cổng sigmoid σ() vẫn sử dụng điểm phân công ban đầu st,ât làm đầu vào, vì vậy tín hiệu cổng cũng có thể được học trong giai đoạn huấn luyện 2. Vì chiến lược định tuyến đã được cố định trong giai đoạn huấn luyện 2, chúng tôi không còn cần balance loss và distillation loss nữa. Do đó, training loss cho giai đoạn huấn luyện 2 chỉ chứa task loss:
+
+LS2 = Ltask.                                   (15)
+
+### 3.3 Suy luận
+
+Trong quá trình suy luận, chúng tôi cũng sử dụng bộ định tuyến đã chưng cất đóng băng để định tuyến. Chiến lược định tuyến cố định, nhất quán với giai đoạn huấn luyện 2, làm cho thông tin được học trong các tầng MoE được sử dụng triệt để hơn và do đó dẫn đến hiệu suất tốt hơn.
+
+### 3.4 So sánh với các phương pháp MoE hiện có
+
+Chúng tôi so sánh ba yếu tố cốt lõi, bao gồm thuật toán phân công, hàm gating, và balance loss, giữa STABLE MOE và các Transformer dựa trên MoE hiện có. Trong Bảng 1, chúng tôi tóm tắt sự khác biệt của chúng.
+
+**Thuật toán phân công** Switch Transformer và giai đoạn huấn luyện 1 trong STABLE MOE đơn giản gán mỗi token cho chuyên gia có mối quan hệ cao nhất. BASE Layer áp dụng thuật toán đấu giá (Bertsekas, 1992) để tìm một phân công cân bằng toàn cục với tổng mối quan hệ tối đa. Hash layer và giai đoạn huấn luyện 2 trong STABLE MOE có chiến lược định tuyến cố định cấp token, có tính ổn định tốt.
+
+**Hàm gating** Hash Layer sử dụng hàm gating cứng, có nghĩa là một chuyên gia hoàn toàn được kích hoạt hoặc không được kích hoạt, không có trạng thái trung gian nào. Switch Layer, BASE Layer, và STABLE MOE có hàm gating mềm, có thể đánh giá mối quan hệ giữa token và chuyên gia đích của nó và xác định tỷ lệ phù hợp để sử dụng chuyên gia. Cơ chế gating mềm cũng thúc đẩy mô hình học một phân công token-đến-chuyên gia gắn kết hơn.
+
+**Balance Loss** BASE Layer và Hash Layer không áp dụng bất kỳ balance loss nào. Ngược lại, Switch Transformer và giai đoạn huấn luyện 1 trong STABLE MOE thiết kế balance loss để điều khiển sự cân bằng của phân công token-đến-chuyên gia.
+
+Tóm lại, kết hợp hai giai đoạn huấn luyện, STABLE MOE có chiến lược định tuyến ổn định, gắn kết và cân bằng, trong khi ba phương pháp MoE khác không thể đáp ứng tất cả chúng đồng thời.
+
+## 4 Thí nghiệm
+
+### 4.1 Nhiệm vụ và tập dữ liệu
+
+**Mô hình hóa ngôn ngữ** Theo (Lewis et al., 2021) và Roller et al. (2021), chúng tôi sử dụng sự kết hợp các corpus trong RoBERTa (Liu et al., 2019) và tập con tiếng Anh của corpus CC100 (Conneau et al., 2020). Corpus chứa khoảng 100B token, và chúng tôi lấy mẫu ngẫu nhiên 5M token cho validation và 20M token cho test.
+
+**Dịch máy đa ngôn ngữ** Chúng tôi theo Wang et al. (2020) và Ma et al. (2020) để sử dụng một tập hợp dữ liệu song song trong các ngôn ngữ khác nhau từ các tập dữ liệu WMT. Tập dữ liệu chứa 32,5 triệu dữ liệu song song cho các cặp ngôn ngữ giữa tiếng Anh và 9 ngôn ngữ khác, bao gồm tiếng Pháp (Fr), tiếng Séc (Cs), tiếng Đức (De), tiếng Phần Lan (Fi), tiếng Latvia (Lv), tiếng Estonia (Et), tiếng Romania (Ro), tiếng Hindi (Hi), và tiếng Thổ Nhĩ Kỳ (Tr). Trong các thí nghiệm của chúng tôi, chúng tôi kết hợp dữ liệu song song ban đầu với 180 triệu dữ liệu back-translation như mô tả trong (Ma et al., 2020) và gọi tập dữ liệu tăng cường là WMT để ngắn gọn.
+
+### 4.2 Thiết lập thí nghiệm
+
+Chúng tôi tiến hành thí nghiệm dựa trên fairseq. Tất cả thí nghiệm được thực hiện trên GPU NVIDIA V100 với bộ nhớ 32 GB.
+
+**Mô hình hóa ngôn ngữ** Chúng tôi áp dụng tokenizer của GPT-2 (Radford et al., 2019), sử dụng byte-pair encoding (Sennrich et al., 2016) với kích thước từ vựng 50,257. Chúng tôi thiết lập hai cài đặt cho STABLE MOE, một cài đặt base và một cài đặt large. Đối với cả hai cài đặt, chúng tôi chèn một tầng MoE sau khối Transformer giữa. Chúng tôi huấn luyện mô hình tổng cộng 60K bước (6K cho giai đoạn huấn luyện 1 và 54K cho giai đoạn huấn luyện 2). Chiều của các đặc trưng định tuyến đã chưng cất là 50, mang lại 2.51M tham số bổ sung cho việc định tuyến. Hệ số cân bằng được đặt thành 0.3. Chúng tôi sử dụng Adam (Kingma và Ba, 2015) với β1 = 0.9 và β2 = 0.98 làm optimizer. Các siêu tham số còn lại được tóm tắt trong Phụ lục A.
+
+**Dịch máy đa ngôn ngữ** Theo (Ma et al., 2020), chúng tôi sử dụng mô hình SentencePiece (Kudo và Richardson, 2018) để tokenize câu. Từ vựng được học từ tập huấn luyện và bao gồm 64,000 token. Chúng tôi chèn hai tầng MoE, một sau khối encoder thứ ba và một sau khối decoder thứ ba. Chúng tôi huấn luyện mô hình tổng cộng 352K bước (30K cho giai đoạn huấn luyện 1 và 322K cho giai đoạn huấn luyện 2). Chiều của các đặc trưng định tuyến đã chưng cất cũng được đặt thành 50. Hệ số cân bằng được đặt thành 0.3. Chúng tôi sử dụng Adam với β1 = 0.9 và β2 = 0.98 làm optimizer. Các siêu tham số còn lại được tóm tắt trong Phụ lục B.
+
+### 4.3 Kết quả
+
+#### 4.3.1 Mô hình hóa ngôn ngữ
+
+Chúng tôi so sánh STABLE MOE với Switch Transformer, BASE Layer, Hash Layer, và Transformer tiêu chuẩn. Tất cả các mô hình MoE có cùng số lượng tham số chia sẻ như Transformer tiêu chuẩn. Dưới cài đặt base, ngoài ra, chúng tôi so sánh hai Transformer dense lớn hơn thêm FFN theo cách dense để đạt được cùng số lượng tham số tổng như các mô hình MoE. Mô hình sâu hơn xếp chồng nhiều FFN hơn, trong khi mô hình rộng hơn sử dụng FFN với kích thước ẩn lớn hơn. Các phép toán dấu phẩy động (FLOP) trên mỗi chuỗi được định hình bởi bộ công cụ torchprofile.
+
+Chúng tôi thể hiện kết quả chính của mô hình hóa ngôn ngữ trên corpus RoBERTa+cc100en trong Bảng 2. Dưới cài đặt base, STABLE MOE vượt trội hơn các phương pháp MoE hiện có trên cả tập validation và test với 0.3-0.8 perplexity. So với các mô hình dense, STABLE MOE đạt được khoảng 3.7 perplexity thấp hơn Transformer tiêu chuẩn, và khoảng 1.3 perplexity cao hơn mô hình large sâu hơn. Dưới cài đặt large, một cách nhất quán, STABLE MOE vượt trội hơn các phương pháp MoE khác, và đạt được khoảng 2.6 perplexity thấp hơn Transformer tiêu chuẩn.
+
+Chúng tôi cũng so sánh tốc độ hội tụ của các mô hình khác nhau dưới cài đặt base. Kết quả được vẽ trong Hình 4, lấy validation perplexity làm trục y và thời gian huấn luyện thực tế làm trục x. Mặc dù các mô hình dense lớn hơn đạt được validation perplexity tốt hơn cuối cùng, tốc độ huấn luyện của chúng khá chậm. Về tốc độ hội tụ, các Transformer dựa trên MoE thường vượt trội hơn các mô hình dense. Hơn nữa, trong số các phương pháp MoE, STABLE MOE có tốc độ hội tụ nhanh nhất.
+
+#### 4.3.2 Dịch máy đa ngôn ngữ
+
+Chúng tôi so sánh STABLE MOE với Switch Transformer, BASE Layer, Hash Layer, Transformer tiêu chuẩn, và một Transformer lớn hơn. Tất cả các mô hình dựa trên MoE có cùng số lượng tham số chia sẻ như Transformer tiêu chuẩn. Ngoại trừ Transformer tiêu chuẩn, các mô hình khác có cùng FLOP.
+
+Chúng tôi dịch các ngôn ngữ khác sang tiếng Anh (X→En) và báo cáo test BLEU trên WMT trong Bảng 3. STABLE MOE đạt được test BLEU trung bình tốt nhất trong số các phương pháp MoE được so sánh. Giữ nguyên FLOP, STABLE MOE vượt trội hơn mô hình dense với 1.22 test BLEU. Với kỹ thuật MoE, chúng tôi mở rộng số lượng tham số 523% và FLOP chỉ tăng 9.3%.
+
+### 4.4 Phân tích
+
+#### 4.4.1 Tác động của các siêu tham số
+
+Dựa trên cài đặt base của mô hình hóa ngôn ngữ, chúng tôi điều tra các cài đặt khác nhau cho các tầng MoE trong STABLE MOE.
+
+**Số lượng chuyên gia** Hình 5 thể hiện kết quả của BASE Layer, Hash Layer, và STABLE MOE với số lượng chuyên gia khác nhau. Khi số lượng chuyên gia tăng lên, validation perplexity của mỗi mô hình có xu hướng giảm thêm. Một cách nhất quán, STABLE MOE hoạt động tốt nhất với số lượng chuyên gia khác nhau. Ngoài ra, đáng chú ý là STABLE MOE với 16 chuyên gia vượt trội hơn BASE Layer với 32 chuyên gia, và STABLE MOE với 32 chuyên gia đạt được perplexity tương tự BASE Layer với 64 chuyên gia.
+
+**Số lượng tham số chuyên gia** Chúng tôi so sánh các mô hình MoE với số lượng tham số chuyên gia khác nhau bằng cách thiết lập các sublayer chuyên gia khác nhau. Các mô hình với 3 và 10 sublayer chuyên gia có 454M và 1.51B tham số chuyên gia, tương ứng. Từ Hình 6, chúng tôi quan sát thấy rằng nhiều tham số chuyên gia hơn mang lại hiệu suất tốt hơn, và STABLE MOE luôn hoạt động tốt nhất dưới cả hai cài đặt.
+
+**Vị trí của các tầng MoE** Chúng tôi điều tra tác động của vị trí chèn tầng MoE. Theo mặc định, tầng MoE xếp chồng 3 sublayer MoE và được chèn sau khối Transformer thứ L/2 (giữa). Chúng tôi cũng thử chèn tầng MoE trước khối Transformer đầu tiên (dưới), và sau khối Transformer cuối cùng (trên). Ngoài ra, chúng tôi cũng điều tra tác động nếu chúng tôi rải 3 sublayer MoE đồng đều vào Transformer tiêu chuẩn, tức là sau các khối thứ L/4, 2L/4, và 3L/4, tương ứng. Như thể hiện trong Bảng 4, trong số bốn cài đặt trên, chèn các sublayer MoE xếp chồng vào vị trí giữa cho phép STABLE MOE đạt được hiệu suất tốt nhất.
+
+**Tỷ lệ giữa hai giai đoạn huấn luyện** Chúng tôi điều tra điểm cân bằng của tỷ lệ giữa hai giai đoạn huấn luyện trong STABLE MOE. Với số lượng bước tổng cố định, phân bổ nhiều bước hơn cho giai đoạn huấn luyện 1 có thể giúp học và chưng cất chiến lược định tuyến tốt hơn. Mặt khác, tỷ lệ lớn hơn của giai đoạn huấn luyện 2 có nghĩa là huấn luyện ổn định lâu hơn. Dưới cài đặt base của mô hình hóa ngôn ngữ, chúng tôi thử phân bổ 6K, 15K, và 30K bước cho giai đoạn huấn luyện 1 và thể hiện kết quả trong Bảng 6. Chúng tôi thấy rằng nếu chúng tôi sử dụng word embedding làm bộ định tuyến đã chưng cất, phân bổ 6K bước (10% tổng số bước) cho giai đoạn huấn luyện 1 là một điểm cân bằng tốt. Chúng tôi suy đoán rằng word embedding đơn giản đủ để được học nhanh, vì vậy huấn luyện ổn định lâu hơn quan trọng hơn để đạt được hiệu suất tốt hơn.
+
+#### 4.4.2 Tác động của chiến lược định tuyến cố định
+
+Dựa trên cài đặt base của mô hình hóa ngôn ngữ, chúng tôi thiết kế hai thí nghiệm để điều tra chiến lược định tuyến cố định có thể mang lại bao nhiêu cải thiện hiệu suất. Một mặt, chúng tôi trang bị BASE Layer với một chiến lược định tuyến ổn định để giải quyết vấn đề dao động định tuyến của nó. Cụ thể, như trong STABLE MOE, chúng tôi sử dụng word embedding để chưng cất chiến lược định tuyến của BASE Layer trong 6K bước huấn luyện đầu tiên, và đóng băng bộ định tuyến đã chưng cất cho định tuyến ổn định trong phần huấn luyện còn lại. Như thể hiện trong Bảng 5, chiến lược định tuyến cố định giảm validation perplexity của BASE Layer xuống 0.63. Mặt khác, chúng tôi thử vô hiệu hóa giai đoạn huấn luyện 2 trong STABLE MOE và luôn huấn luyện mô hình như trong giai đoạn huấn luyện 1. Kết quả là, validation perplexity của STABLE MOE trở nên cao hơn 0.20 so với phiên bản đầy đủ có chiến lược định tuyến cố định. Hai trường hợp này hỗ trợ rằng chiến lược định tuyến cố định, giải quyết vấn đề dao động định tuyến, có thể mang lại hiệu suất tốt hơn cho các Transformer dựa trên MoE.
+
+Ngoài ra, chúng tôi trực quan hóa chiến lược định tuyến cố định của STABLE MOE trong Phụ lục C để tham khảo.
+
+#### 4.4.3 Các biến thể của bộ định tuyến đã chưng cất
+
+Trong Bảng 6, ngoài word embedding, chúng tôi cũng điều tra bốn biến thể của bộ định tuyến đã chưng cất bao gồm CNN và ba Transformer với số lượng tầng khác nhau. Chúng tôi phân bổ 15K bước cho giai đoạn huấn luyện 1 cho tất cả chúng. Từ bảng, chúng tôi thấy rằng sử dụng word embedding đạt được hiệu suất tốt nhất, trong khi Transformer 3 tầng không hoạt động tốt. Đối với chưng cất chiến lược định tuyến, tín hiệu chưng cất từ một mục tiêu phân loại 32 danh mục có thể không đủ thông tin để học một bộ định tuyến phức tạp. Ngược lại, nó phù hợp hơn cho các bộ định tuyến đơn giản hơn. Do đó, chúng tôi khuyến nghị sử dụng word embedding, đơn giản và hiệu quả, làm bộ định tuyến đã chưng cất trong STABLE MOE.
+
+#### 4.4.4 Phân tích dao động định tuyến
+
+Chúng tôi so sánh mức độ dao động định tuyến giữa STABLE MOE và BASE Layer để thể hiện ưu điểm về tính ổn định định tuyến. Trong 60K bước huấn luyện, chúng tôi kiểm tra phân công token-đến-chuyên gia cho các token trong tập validation mỗi 500 bước. Đối với mỗi token, chúng tôi định nghĩa bước dao động cuối cùng là bước cuối cùng mà chuyên gia đích của nó khác với bước cuối cùng. Chúng tôi vẽ biểu đồ phần trăm token tích lũy về bước dao động cuối cùng trong Hình 7. Để dễ đọc, chúng tôi chú thích trục x là phần trăm nó chiếm trong tất cả các bước huấn luyện. Từ hình, chúng tôi thấy rằng vấn đề dao động định tuyến đáng chú ý đối với BASE Layer. Ngược lại, đối với STABLE MOE, không có dao động định tuyến trong giai đoạn huấn luyện 2 vì chúng tôi áp dụng chiến lược định tuyến cố định.
+
+## 5 Công trình liên quan
+
+Jacobs et al. (1991); Jordan và Jacobs (1994) đề xuất Hỗn hợp các Chuyên gia (MoE) để tính toán các ví dụ khác nhau với các mô-đun chuyên gia độc lập. Shazeer et al. (2017) giới thiệu MoE để xây dựng các mô hình ngôn ngữ quy mô lớn dựa trên LSTM (Hochreiter và Schmidhuber, 1997). Gần đây, khi Transformer trở nên phổ biến, nhiều công trình thiết kế FFN phiên bản MoE để xây dựng các Transformer dựa trên MoE. GShard (Lepikhin et al., 2021), Switch Transformer (Fedus et al., 2021), và BASE Layer (Lewis et al., 2021) theo mô hình học-để-định-tuyến và học động cách định tuyến mỗi token đầu vào đến các chuyên gia. Tuy nhiên, chúng tôi chỉ ra rằng các phương pháp học-để-định-tuyến này phải đối mặt với vấn đề dao động định tuyến. Hash Layer (Roller et al., 2021) đề xuất một chiến lược định tuyến phi tham số, sử dụng một bảng băm cấp token được thiết kế trước để xác định phân công token-đến-chuyên gia. Chiến lược định tuyến tĩnh sẽ không dao động, nhưng bảng băm được xác định ngẫu nhiên hạn chế giới hạn trên của hiệu suất của nó. Công trình của chúng tôi bao gồm các ưu điểm của các phương pháp học-để-định-tuyến để học một chiến lược định tuyến cân bằng và gắn kết, và tiếp tục giải quyết vấn đề dao động định tuyến thông qua việc áp dụng một bộ định tuyến nhẹ đóng băng bắt chước chiến lược định tuyến ban đầu.
+
+## 6 Kết luận
+
+Trong bài báo này, chúng tôi chỉ ra vấn đề dao động định tuyến tồn tại trong các phương pháp MoE học-để-định-tuyến trước đây. Để giải quyết vấn đề này, chúng tôi đề xuất STABLE MOE với hai giai đoạn huấn luyện. Trước tiên, chúng tôi học một chiến lược định tuyến cân bằng và gắn kết và đồng thời chưng cất nó thành một bộ định tuyến nhẹ tách biệt khỏi mô hình cốt lõi. Sau đó, chúng tôi đóng băng bộ định tuyến đã chưng cất cho một chiến lược định tuyến ổn định trong phần huấn luyện còn lại. Chúng tôi xác thực STABLE MOE trên mô hình hóa ngôn ngữ và dịch máy đa ngôn ngữ. Kết quả cho thấy STABLE MOE vượt trội hơn các phương pháp MoE hiện có về cả tốc độ hội tụ và hiệu suất.
+
+## Tài liệu tham khảo
+
+[Danh sách tài liệu tham khảo được duy trì như bản gốc]
+
+## Phụ lục
+
+### A Siêu tham số cho mô hình hóa ngôn ngữ
+
+Các siêu tham số của STABLE MOE dưới cài đặt base và large cho mô hình hóa ngôn ngữ được tóm tắt trong Bảng 7.
+
+### B Siêu tham số cho dịch máy đa ngôn ngữ
+
+Các siêu tham số của STABLE MOE cho dịch máy đa ngôn ngữ được tóm tắt trong Bảng 8.
+
+### C Trực quan hóa chiến lược định tuyến cố định của STABLE MOE
+
+Chúng tôi trực quan hóa chiến lược định tuyến cố định của STABLE MOE trong Bảng 9. Trên tập validation, đối với mỗi chuyên gia, chúng tôi thể hiện các token thường xuyên nhất được gán cho nó cùng với một văn bản mô tả các đặc điểm chung của chúng. Chúng tôi thấy rằng các token được gán cho cùng một chuyên gia thường chia sẻ một số đặc điểm chung, ví dụ, Chuyên gia 22 nắm bắt các tính từ và Chuyên gia 31 nắm bắt các liên từ. Những trường hợp này thể hiện sự gắn kết tốt của phân công token-đến-chuyên gia trong STABLE MOE.

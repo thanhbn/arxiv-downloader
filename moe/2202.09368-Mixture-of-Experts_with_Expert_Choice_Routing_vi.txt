@@ -1,0 +1,153 @@
+# Mixture-of-Experts với Expert Choice Routing
+
+Yanqi Zhou, Tao Lei, Hanxiao Liu, Nan Du, Yanping Huang, Vincent Zhao, Andrew Dai, Zhifeng Chen, Quoc Le, và James Laudon
+Google, Mountain View, CA, USA
+{yanqiz, taole, hanxiaol, dunan, huangyp, vzhao, adai, zhifengc, qvl, jlaudon}@google.com
+
+## Tóm tắt
+
+Các mô hình Mixture-of-experts (MoE) kích hoạt thưa thớt cho phép số lượng tham số tăng lên đáng kể trong khi giữ nguyên lượng tính toán cho một token hoặc một mẫu nhất định. Tuy nhiên, một chiến lược định tuyến chuyên gia kém có thể khiến một số chuyên gia bị đào tạo thiếu, dẫn đến một chuyên gia bị chuyên môn hóa dưới mức hoặc quá mức. Các nghiên cứu trước đây phân bổ một số lượng cố định các chuyên gia cho mỗi token bằng cách sử dụng hàm top-k bất kể tầm quan trọng tương đối của các token khác nhau. Để giải quyết vấn đề này, chúng tôi đề xuất một mixture-of-experts không đồng nhất sử dụng phương pháp expert choice. Thay vì để các token chọn top-k chuyên gia, chúng tôi để các chuyên gia chọn top-k token. Kết quả là, mỗi token có thể được định tuyến đến một số lượng chuyên gia thay đổi và mỗi chuyên gia có thể có kích thước bucket cố định. Chúng tôi nghiên cứu có hệ thống về tốc độ tiền huấn luyện sử dụng cùng tài nguyên tính toán của Switch Transformer top-1 và GShard top-2 gating trong các nghiên cứu trước và thấy rằng phương pháp của chúng tôi cải thiện thời gian hội tụ huấn luyện hơn 2 lần. Với cùng chi phí tính toán, phương pháp của chúng tôi thể hiện hiệu suất cao hơn trong việc tinh chỉnh 11 nhiệm vụ được chọn trong các benchmark GLUE và SuperGLUE. Với chi phí kích hoạt nhỏ hơn, phương pháp của chúng tôi vượt trội hơn mô hình dense T5 trong 7 trong số 11 nhiệm vụ.
+
+## 1 Giới thiệu
+
+Việc mở rộng quy mô khả năng mô hình, kích thước tập dữ liệu và thời gian huấn luyện đã chứng minh thành công to lớn trong việc nâng cao hiệu suất của các kiến trúc computer vision [4,11,13,14] cũng như các mô hình ngôn ngữ neural [2,20,26,27]. Chất lượng mô hình cuối cùng được thấy có mối quan hệ power-law với lượng dữ liệu, kích thước mô hình và thời gian tính toán [16,20]. Tuy nhiên, hiệu quả huấn luyện, được định nghĩa là tổng lượng tính toán được sử dụng để đạt được chất lượng mô hình vượt trội hơn hệ thống hiện đại [21], nên được chú ý nhiều hơn khi chúng ta tăng cường nỗ lực hướng tới AI xanh [29].
+
+Mixture-of-experts có cổng thưa thớt [31] (MoE) cung cấp một cách hiệu quả để mở rộng quy mô khả năng mô hình với chi phí tính toán cố định, và gần đây đã đóng vai trò quan trọng trong việc tăng hiệu quả huấn luyện của các mô hình ngôn ngữ quy mô lớn [10,21]. MoE hoạt động bằng cách áp dụng một số chuyên gia, mỗi chuyên gia như một mạng con, và chỉ kích hoạt một hoặc một vài chuyên gia cho mỗi token đầu vào. Một mạng cổng phải được chọn và tối ưu hóa để định tuyến mỗi token đến (các) chuyên gia phù hợp nhất. Ví dụ, các nghiên cứu gần đây đã triển khai định tuyến thưa thớt thông qua phân cụm k-means [12], phân công tuyến tính để tối đa hóa ái lực token-chuyên gia [22], hoặc băm [8,28]. Nhiều nghiên cứu trước đây sử dụng chiến lược định tuyến liên quan đến lựa chọn token, trong đó mỗi token chọn một hoặc hai chuyên gia tốt nhất.
+
+Chúng tôi cho rằng việc lựa chọn token độc lập trong các nghiên cứu trước thường dẫn đến sự mất cân bằng tải của các chuyên gia, gây ra sự không hiệu quả trong huấn luyện và huấn luyện dưới mức tối ưu của mô hình. Để giảm thiểu vấn đề này, các mạng có cổng thưa thớt trước đây giới thiệu các loss phụ trợ bổ sung như regularization để ngăn chặn quá nhiều token được định tuyến đến một chuyên gia duy nhất, nhưng hiệu quả vẫn còn hạn chế. Các phương pháp gần đây [8,22,28] khám phá các chiến lược thay thế cho định tuyến, nhưng chúng tập trung vào tiền huấn luyện mà không chứng minh được lợi ích về hiệu suất trên các nhiệm vụ downstream. Hơn nữa, không có phương pháp nào trước đây xem xét việc phân bổ một số lượng chuyên gia thay đổi cho mỗi token dựa trên tầm quan trọng, điều này có thể có lợi.
+
+Chúng tôi đề xuất một phương pháp định tuyến rất đơn giản nhưng hiệu quả mà chúng tôi gọi là expert choice. Không giống như MoE thông thường trong đó các token chọn một hoặc hai chuyên gia có điểm số cao nhất, phương pháp của chúng tôi để mỗi chuyên gia chọn top-k token. Phương pháp của chúng tôi đảm bảo cân bằng tải hoàn hảo, cho phép số lượng chuyên gia thay đổi cho mỗi token, và đạt được những lợi ích đáng kể về hiệu quả huấn luyện và hiệu suất downstream như được chứng minh trong các thí nghiệm của chúng tôi. Các đóng góp chính của chúng tôi bao gồm:
+
+• Chúng tôi xác định các lỗ hổng phổ biến trong MoE thông thường như mất cân bằng tải như mô tả trong Mục 3.1. Sau đó chúng tôi đề xuất một phương pháp expert choice không đồng nhất để cung cấp phân bổ linh hoạt các tham số mô hình dựa trên tầm quan trọng token-to-expert đã học. Phương pháp này đảm bảo cân bằng tải một cách nội tại mà không áp đặt loss phụ trợ.
+
+• Chúng tôi chỉ ra rằng phương pháp của chúng tôi cung cấp hội tụ huấn luyện nhanh hơn 2 lần trong mô hình 8B/64E (8 tỷ tham số được kích hoạt, 64 chuyên gia), so với các đối tác gating top-1 và top-2 trong Switch Transformer [10] và GShard [21].
+
+• Chúng tôi chỉ ra rằng phương pháp của chúng tôi thể hiện khả năng mở rộng mạnh mẽ khi tăng số lượng chuyên gia từ 16 lên 128, được đánh giá trong perplexity huấn luyện.
+
+• Chúng tôi chỉ ra rằng phương pháp của chúng tôi thể hiện hiệu suất mạnh mẽ trên các nhiệm vụ downstream được chọn từ GLUE và SuperGLUE ở tất cả các quy mô được đánh giá. Cụ thể hơn, mô hình 8B/64E của chúng tôi vượt trội hơn mô hình dense T5 11B trong 7 trong số 11 nhiệm vụ được đánh giá.
+
+## 2 Nghiên cứu liên quan
+
+**Mở rộng quy mô:** Nhiều phương pháp khác nhau đã được đề xuất để mở rộng quy mô khả năng mạng neural nhằm cải thiện hiệu suất. Các nghiên cứu gần đây đã thành công mở rộng quy mô mô hình lên hàng tỷ tham số thông qua các hình thức song song mô hình khác nhau [2,21,26,27,33]. Song song mô hình [30] chia các trọng số và tensor qua nhiều lõi trong khi song song pipeline [18,24] chia các lớp khác nhau qua các thiết bị với micro-batch được pipeline đến các lớp khác nhau. Để cho phép tiếp tục mở rộng quy mô mạng neural, việc cải thiện hiệu quả huấn luyện và phục vụ mô hình đã trở thành một lĩnh vực nghiên cứu quan trọng.
+
+**Tính toán có điều kiện:** Các quyết định tính toán có thể được thực hiện động dựa trên đầu vào [23,25]. Tính toán có điều kiện đã được đề xuất như một cách để tăng khả năng của mạng neural sâu mà không tăng lượng tính toán, bằng cách kích hoạt các tham số và tính toán nhất định theo yêu cầu, trên cơ sở từng ví dụ hoặc từng token [3]. Các lớp tích chập có điều kiện [1] với gating cụ thể cho nhiệm vụ đã được sử dụng để chống lại việc quên thảm khốc khi một chuỗi các vấn đề học tập được tối ưu hóa. Các quyết định gating có thể là nhị phân hoặc thưa thớt và liên tục, ngẫu nhiên hoặc xác định.
+
+**Mixture of Experts:** MoE có cổng thưa thớt [31] là mô hình đầu tiên chứng minh những cải thiện lớn về khả năng mô hình, thời gian huấn luyện, hoặc chất lượng mô hình với gating. Switch Transformer [10] đơn giản hóa gating bằng cách chỉ chọn chuyên gia hàng đầu cho mỗi token bằng cách sử dụng softmax trên trạng thái ẩn và chứng minh khả năng mở rộng tốt hơn so với nghiên cứu trước. Tất cả các nghiên cứu trước đều yêu cầu loss phụ trợ để khuyến khích cân bằng một cách rõ ràng. Hạng mục loss này phải được cân nhắc cẩn thận để không áp đảo loss chính. Tuy nhiên, loss phụ trợ không đảm bảo cân bằng và một yếu tố khả năng cứng phải được áp đặt. Kết quả là, nhiều token vẫn có thể không được xử lý bởi lớp MoE. Hard MoE [12] với một lớp giải mã duy nhất có thể được huấn luyện hiệu quả để đạt hiệu quả tốt trên các nhiệm vụ dự đoán hashtag quy mô lớn. Base Layers [22] công thức hóa một phân công tuyến tính tối đa hóa ái lực token-chuyên gia trong khi đảm bảo mỗi chuyên gia nhận được số lượng token bằng nhau. Hash layers [8,28] đưa ra các kỹ thuật băm trên các token đầu vào. Tuy nhiên, các đánh giá được giới hạn trong perplexity tiền huấn luyện. THOR [?] kích hoạt ngẫu nhiên các chuyên gia trong quá trình huấn luyện và suy luận và được huấn luyện với loss regularization nhất quán. THOR đã chứng minh hiệu suất mạnh mẽ trên các nhiệm vụ dịch thuật. Khác với các nghiên cứu trước đây này, phương pháp của chúng tôi là một phương pháp học cho phép MoE không đồng nhất và cải thiện hiệu quả hiệu suất tinh chỉnh downstream.
+
+## 3 Phương pháp
+
+Chúng tôi trước tiên xác định một số lỗ hổng trong phương pháp định tuyến của các mô hình mixture-of-experts (MoE) thông thường và sau đó trình bày phương pháp của chúng tôi sử dụng expert choice để giải quyết những vấn đề này.
+
+### 3.1 Lỗ hổng của Token-Choice Routing
+
+MoE có thể có lợi thế tính toán so với mô hình dense, một chiến lược định tuyến phải được sử dụng để gán mỗi token cho (các) chuyên gia phù hợp nhất. Các mô hình MoE thông thường sử dụng định tuyến token-choice chọn độc lập top-k chuyên gia cho mỗi token [10,21,31]. Chúng tôi cho rằng chiến lược này có một vài lỗ hổng dẫn đến huấn luyện dưới mức tối ưu.
+
+**Mất cân bằng tải:** Định tuyến token-choice thường dẫn đến cân bằng tải kém giữa các chuyên gia. Tức là, một số chuyên gia có thể được huấn luyện với hầu hết các token, để lại các chuyên gia còn lại bị sử dụng dưới mức. Các chuyên gia có thể bị chuyên môn hóa dưới mức vì rất nhiều khả năng mô hình trong các chuyên gia sử dụng dưới mức bị lãng phí. Mặt khác, một số token sẽ không được xử lý, vì các chuyên gia sử dụng quá mức chỉ có thể nhận số lượng token tối đa ở mỗi bước để tránh hết bộ nhớ. Mất cân bằng tải cũng có thể gây tổn hại đến độ trễ bước, do đó thời gian suy luận, vì độ trễ bước có thể được xác định bởi chuyên gia được tải nhiều nhất. Các phương pháp trước đây thêm loss phụ trợ về cân bằng tải để giảm thiểu vấn đề. Tuy nhiên, loss phụ trợ này không đảm bảo tải cân bằng, đặc biệt là trong các giai đoạn đầu quan trọng của huấn luyện. Thực tế, chúng tôi quan sát thực nghiệm rằng tỷ lệ over-capacity có thể đạt 20%-40% cho một số chuyên gia trong định tuyến token choice, cho thấy rằng một phần đáng kể các token được định tuyến đến những chuyên gia này sẽ bị loại bỏ.
+
+**Chuyên môn hóa dưới mức:** Mỗi lớp MoE sử dụng mạng gating để học ái lực token-to-expert. Lý tưởng nhất, mạng gating đã học nên tạo ra ái lực sao cho các token tương tự hoặc liên quan được định tuyến đến cùng một chuyên gia. Một chiến lược dưới mức tối ưu có thể tạo ra các chuyên gia dư thừa và/hoặc các chuyên gia không được chuyên môn hóa đủ. Chuyên môn hóa dưới mức có thể xảy ra bằng cách áp đặt loss phụ trợ lớn ưu tiên định tuyến cân bằng tải hơn nhưng hiệu quả kém. Việc tìm ra sự cân bằng đúng về loss phụ trợ để thúc đẩy cả cân bằng tải và chuyên môn hóa là thách thức đối với định tuyến token-choice.
+
+**Cùng tính toán cho mọi token:** Cuối cùng, trong chiến lược token-choice, mỗi token nhận chính xác k chuyên gia và do đó chiếm cùng lượng tính toán. Chúng tôi đưa ra giả thuyết rằng điều này không cần thiết cũng như không mong muốn. Thay vào đó, mô hình MoE nên phân bổ linh hoạt tài nguyên tính toán dựa trên độ phức tạp của đầu vào. Được thúc đẩy bởi những quan sát nói trên, chúng tôi tiếp theo mô tả một phương pháp đơn giản nhưng hiệu quả tạo ra các phân công cân bằng tải dựa trên expert choice.
+
+### 3.2 MoE không đồng nhất thông qua Expert Choice
+
+Khác với định tuyến thông thường, phương pháp expert choice chọn độc lập top-k token cho mỗi chuyên gia, trong đó k là khả năng chuyên gia cố định (tức là số lượng token mà mỗi chuyên gia có thể nhận). Mặc dù đơn giản, expert choice đạt được cân bằng tải hoàn hảo theo thiết kế. Nó cũng cho phép phân bổ tính toán mô hình linh hoạt hơn vì các token có thể được nhận bởi số lượng chuyên gia thay đổi.
+
+Trong các thí nghiệm của chúng tôi, chúng tôi đặt k là:
+
+k = n×c/e (1)
+
+trong đó n là tổng số token trong batch đầu vào (như kích thước batch × độ dài chuỗi), c là hệ số khả năng, và e là số lượng chuyên gia. Hệ số khả năng c biểu thị trung bình có bao nhiêu chuyên gia được sử dụng bởi một token. Cho các biểu diễn token đầu vào X∈R^(n×d) trong đó d là chiều ẩn mô hình, phương pháp của chúng tôi tạo ra phân công token-to-expert được biểu thị bởi ba ma trận đầu ra I, G và P. Ma trận I là ma trận chỉ số trong đó I[i,j] chỉ định token được chọn thứ j của chuyên gia thứ i. Ma trận gating G∈R^(e×k) biểu thị trọng số của chuyên gia cho token được chọn, và P∈R^(e×k×n) tham chiếu đến phiên bản one-hot của I sẽ được sử dụng để thu thập token cho mỗi chuyên gia. Những ma trận này được tính toán bằng cách sử dụng hàm gating:
+
+S = Softmax(X·W_g), S∈R^(n×e)
+G,I = TopK(S^T,k), P = Onehot(I) (2)
+
+trong đó S biểu thị điểm số ái lực token-to-expert, W_g∈R^(d×e) biểu thị các embedding chuyên gia, và TopK() chọn k mục lớn nhất cho mỗi hàng của S^T.
+
+Tương tự như Switch Transformer [10] và GShard [21], chúng tôi áp dụng mixture of experts và hàm gating trong lớp feed-forward dense (FFN), vì đây là phần tốn kém tính toán nhất trong mạng dựa trên Transformer. Đầu vào cho FFN có cổng, được ký hiệu là X_in∈R^(e×k×d), được tạo ra bằng cách sử dụng ma trận hoán vị P. Ở đây X_in[i]∈R^(k×d) biểu thị đầu vào của chuyên gia thứ i. Tương tự, để W_1 và W_2 biểu thị các tham số của FFN có cổng trong đó W_1[i] và W_2[i]∈R^(d×d') biểu thị các ma trận tham số của chuyên gia thứ i. Chúng tôi tính toán đầu ra của mỗi chuyên gia X_e[i] như sau:
+
+X_in = P·X
+∀i: X_e[i] = GeLU(X_in[i]·W_1[i])·W_2[i]^T (3)
+
+Chúng tôi bỏ qua các hạng tử bias ở đây cho ngắn gọn. Đầu ra cuối cùng của lớp FFN có cổng X_out∈R^(n×d) có thể được thu được từ X_e, các ma trận hoán vị và gating P và G:
+
+X_out[l,d] = Σ_{i,j} P[i,j,l]G[i,j]X_e[i,j,d] (4)
+
+Cả X_e và X_out đều có thể được tính toán hiệu quả bằng cách sử dụng các phép toán Einstein summation (einsum).
+
+### 3.3 Expert Choice với ràng buộc bổ sung
+
+Chúng tôi cũng xem xét việc regularizing định tuyến expert choice của chúng tôi bằng cách giới hạn số lượng chuyên gia tối đa cho mỗi token. Chúng tôi quan tâm đến việc liệu việc thêm ràng buộc này có cải thiện kết quả tiền huấn luyện và tinh chỉnh hay không. Quan trọng hơn, nó giúp phân tích mức độ việc sử dụng số lượng chuyên gia thay đổi trên mỗi token ảnh hưởng đến hiệu suất mô hình.
+
+Để A∈R^(e×n) là ma trận dương trong đó A[i,j] biểu thị liệu chuyên gia thứ i có chọn token thứ j hay không. Chúng tôi giải quyết vấn đề lập trình tuyến tính có regularization entropy sau:
+
+max_A ⟨S^T,A⟩ + λH(A)
+s.t. ∀i: Σ_j' A[i,j'] = k; ∀j: Σ_i' A[i',j] ≤ b; ∀i,j: 0 ≤ A[i,j] ≤ 1
+
+trong đó ⟨S^T,A⟩ biểu thị tích trong, H(A) là tổng entropy theo từng phần tử¹, và b > 0 là số nguyên giới hạn trên việc chọn lựa cho mỗi token. Việc thêm một hạng tử entropy nhỏ đưa ra một giải pháp gần-số nguyên trong khi cho phép một solver lặp nhanh chúng tôi có thể chạy trên TPU. Cụ thể, không gian giải pháp là giao của ba tập lồi mỗi tập thỏa mãn một trong các ràng buộc tuyến tính. Chúng tôi sử dụng thuật toán Dykstra [9] luân phiên chiếu giải pháp trung gian lên một trong các tập lồi². Sau khi A được tính toán, các chỉ số định tuyến I được chọn bằng cách sử dụng TopK(A,k) thay thế.
+
+¹ H(A) = Σ_{ij} -A[i,j] log A[i,j]
+² Chúng tôi sử dụng λ = 0.001 và tối đa 100 lần lặp.
+
+### 3.4 Kiến trúc mô hình
+
+Ở mức độ cao, chúng tôi áp dụng ý tưởng của Mixture-of-Experts (MoE) kích hoạt thưa thớt [31]. Chúng tôi sử dụng kiến trúc Transformer và thay thế thành phần feed-forward của mỗi lớp Transformer khác bằng lớp MoE, theo thực hành gần đây [10,21]. Việc xen kẽ các lớp Transformer thông thường và các lớp MoE cải thiện hiệu suất mô hình và hiệu quả huấn luyện một cách thực nghiệm, có thể vì việc buộc một số thành phần được chia sẻ giữa các lớp MoE có thể giảm thiểu các tác động tiêu cực của việc bỏ qua token. Một số sửa đổi bổ sung được áp dụng trong nghiên cứu gần đây đã được áp dụng trong các thí nghiệm của chúng tôi. Ví dụ, chúng tôi thay thế positional embedding tiêu chuẩn bằng relative positional bias theo lớp [5]. Trong các lớp con feed-forward không phải MoE (chỉ mỗi lớp khác là lớp MoE), chúng tôi thay thế phép chiếu tuyến tính đầu tiên và hàm kích hoạt bằng Gated Linear Unit [6], tính toán tích component-wise của hai phép biến đổi tuyến tính của đầu vào, theo sau là hàm kích hoạt Gaussian Error Linear Unit [15].
+
+Như mô tả trước đó, mỗi lớp MoE bao gồm một nhóm mạng feed-forward độc lập được ký hiệu là "chuyên gia". Hàm gating trong Eq. (2) sử dụng hàm kích hoạt softmax để mô hình hóa phân phối xác suất trên những chuyên gia này. Phân phối này biểu thị sự ưu tiên của mỗi token đến đối với các chuyên gia, được tính toán tương tự trong mạng gating thông thường [10,21,31].
+
+Trong quá trình huấn luyện, mạng gating có thể học được của mỗi lớp MoE mô tả trong Eq. (2) được huấn luyện để sử dụng đầu vào để kích hoạt tập hợp con tốt nhất của các chuyên gia sử dụng hàm top-k theo chiều token. Một giai đoạn "shuffle" và một giai đoạn "unshuffle" được chèn vào lớp MoE, trong đó giai đoạn đầu thu thập các token đến các chuyên gia được chỉ định của chúng trong khi giai đoạn thứ hai hoán vị các token trở lại thứ tự ban đầu của chúng trong batch đầu vào. Bước này được công thức hóa trong Eq. (3) và Eq. (4).
+
+Tương tự như phương pháp MoE thông thường, có nhiều tham số hơn trong lớp MoE. Tuy nhiên, kích thước mô hình được kích hoạt trên mỗi token có thể so sánh với lớp dense vì trong quá trình huấn luyện hoặc suy luận, chỉ một tập hợp con hạn chế của các chuyên gia được kích hoạt cho bất kỳ token nào. Ví dụ, Switch Transformer [10] chỉ có một chuyên gia được kích hoạt trong khi GShard [21] sử dụng hai chuyên gia trên mỗi token. Trong phương pháp của chúng tôi, số lượng chuyên gia được kích hoạt có thể thay đổi cho mỗi token nhưng tính toán tổng thể được giữ như các kiến trúc baseline bằng cách cố định hệ số khả năng c trong Eq. (1). Trừ khi được chỉ định khác, chúng tôi đặt c = 2 sao cho phương pháp của chúng tôi có thể được so sánh trực tiếp với gating token-choice top-2 trong GShard.
+
+Chúng tôi huấn luyện một số biến thể của kiến trúc của chúng tôi ở quy mô 100M (tức là kích thước chuyên gia 100M) bằng cách tăng số lượng chuyên gia để hiểu các hiệu ứng mở rộng của phương pháp chúng tôi. Chúng tôi cũng huấn luyện một mô hình MoE quy mô 8B. Mô hình MoE lớn được phân vùng với thuật toán sharding 2D như được trình bày trong GSPMD [36], khai thác đầy đủ cấu trúc liên kết 2D của cụm TPU [19]. Qua các quy mô và thiết lập khác nhau, phương pháp của chúng tôi vượt trội hơn nghiên cứu liên quan và thể hiện hiệu suất nhiệm vụ downstream mạnh mẽ trên các nhiệm vụ được chọn trong GLUE và SuperGLUE.
+
+## 4 Thí nghiệm
+
+### 4.1 Thiết lập
+
+Bảng 1 tóm tắt các thiết lập siêu tham số của các mô hình MoE khác nhau. Như một điểm tham chiếu, chúng tôi cũng bao gồm các cấu hình mô hình dense tương ứng với số lượng tham số được kích hoạt trên mỗi token so sánh được trong quá trình suy luận. Để nghiên cứu hiệu ứng của việc mở rộng số lượng chuyên gia, chúng tôi đã nghiên cứu việc thay đổi số lượng chuyên gia nhưng cố định kích thước mỗi chuyên gia thành 100M tham số. Ví dụ, 0.1B/64E đại diện cho kiến trúc của một mô hình dense khoảng 100M tham số với mỗi lớp khác được thay thế bằng lớp MoE 64-chuyên gia. Mô hình MoE thoái hóa thành kiến trúc transformer dense khi mỗi lớp MoE chỉ có một chuyên gia. Trong khi n_params là tổng số tham số có thể huấn luyện được, n_act-params đại diện cho số lượng tham số được kích hoạt trên mỗi token. L là tổng số lớp Transformer, M là chiều mô hình, H là chiều ẩn sau phép chiếu trong mỗi lớp transformer, n_heads là số lượng attention head, và d_head là chiều ẩn của mỗi attention head.
+
+**Tập dữ liệu:** Chúng tôi sử dụng tập dữ liệu chất lượng cao từ GLaM [?] gồm 1.6 nghìn tỷ token đại diện cho một loạt các trường hợp sử dụng ngôn ngữ tự nhiên. Một bộ phân loại in-house được huấn luyện để phân loại giữa một tập hợp văn bản được tuyển chọn và các trang web khác và ước tính chất lượng nội dung của một trang web. Một tập hợp con được lọc chất lượng cao của các trang web được kết hợp với sách, trang Wikipedia, cuộc hội thoại, diễn đàn, và tin tức để tạo ra tập dữ liệu cuối cùng. Dữ liệu và trọng số hỗn hợp có thể tìm thấy trong Bảng 3 trong bài báo GLaM.
+
+**Huấn luyện mô hình:** Việc huấn luyện mô hình của chúng tôi tuân theo các thiết lập của GLaM [?] trong đó độ dài chuỗi tối đa 1024 token được áp dụng. Chúng tôi sử dụng optimizer Adafactor [32] với first-moment decay β₁ = 0 và second-moment decay β₂ = 0.99. Chúng tôi giữ learning rate không đổi trong 10K bước huấn luyện đầu tiên, và sau đó giảm nó với lịch trình inverse square root. Không giống như hầu hết các nghiên cứu liên quan, chúng tôi không áp đặt bất kỳ loss phụ trợ nào cho cân bằng tải, như được mô tả trong Switch Transformer [10] và GShard [21]. Chúng tôi sử dụng tokenizer từ phụ SentencePiece với từ vựng có kích thước 256K. Mô hình lớn nhất (8B/64E) được huấn luyện trên 512 chip TPU V4. Chúng tôi sử dụng tỷ lệ dropout là 0 trong quá trình huấn luyện vì số lượng token trong corpus dữ liệu huấn luyện lớn hơn nhiều so với tổng số token trong quá trình huấn luyện.
+
+**Đánh giá mô hình:** Chúng tôi chủ yếu tập trung vào việc đánh giá hiệu suất tinh chỉnh trên 11 nhiệm vụ được chọn từ các benchmark GLUE và SuperGLUE [34, 35].
+
+### 4.2 Hiệu quả huấn luyện
+
+Chúng tôi trước tiên nghiên cứu hiệu quả huấn luyện và hội tụ. Chúng tôi sử dụng expert choice với hệ số khả năng 2 (EC-CF2) để khớp với kích thước mô hình được kích hoạt và chi phí tính toán trên cơ sở mỗi token trong GShard top-2 gating và chạy cả hai trong một số bước cố định. Kết quả được hiển thị trong Hình 2 (a). So với GShard top-2 gating, đã cho thấy hiệu suất mạnh hơn trong cả perplexity trong tập dữ liệu đánh giá và tinh chỉnh trên các nhiệm vụ downstream so với Switch Transformer top-1 gating, EC-CF2 hội tụ nhanh hơn 2 lần trong quá trình huấn luyện. Cụ thể hơn, EC-CF2 đạt được cùng perplexity như GShard top-2 trong ít hơn một nửa số bước, và với mỗi bước GShard top-2 chậm hơn 20% so với phương pháp của chúng tôi. Như được giải thích trong Mục 3.1, thời gian bước chậm hơn trong top-2 gating là do mất cân bằng tải trong đó một số chuyên gia có thể nhận nhiều token hơn nhiều so với khả năng mong muốn. Kết quả là, độ trễ bước sẽ bị nghẽn cổ chai bởi chuyên gia được tải nhiều nhất.
+
+### 4.3 Mở rộng số lượng chuyên gia
+
+Như trình bày trong Bảng 1, việc tăng số lượng chuyên gia tăng khả năng mô hình một cách hiệu quả mà không tăng kích thước mô hình được kích hoạt. Chúng tôi mở rộng số lượng chuyên gia trong khi cố định kích thước chuyên gia thành 100M tham số cho cả phương pháp expert choice (EC) và GShard (Top-2) và thấy cả hai phương pháp đều hoạt động tốt về mặt perplexity trên tập dữ liệu đánh giá trong quá trình tiền huấn luyện. Như được chứng minh trong Hình 2 (b), việc có nhiều chuyên gia hơn liên tục cải thiện perplexity huấn luyện.
+
+### 4.4 Tinh chỉnh trên GLUE và SuperGLUE
+
+Để xác nhận liệu perplexity cải thiện có trực tiếp chuyển thành hiệu suất tốt hơn trong các nhiệm vụ downstream hay không, chúng tôi thực hiện tinh chỉnh trên 11 nhiệm vụ được chọn từ GLUE và SuperGLUE. Chúng tôi so sánh ba phương pháp MoE bao gồm Switch Transformer top-1 gating (ST Top-1), GShard top-2 gating (GS Top-2) và phương pháp của chúng tôi (EC-CF2) khớp với kích thước bộ nhớ kích hoạt và chi phí tính toán của GS Top-2. Được chỉ ra bởi kết quả trong Bảng 2, phương pháp EC-CF2 của chúng tôi liên tục vượt trội hơn các phương pháp liên quan và mang lại hơn 2% tăng độ chính xác trung bình trong thiết lập 8B/64E lớn. Bảng 3 tiếp tục so sánh mô hình 8B/64E của chúng tôi với đối tác dense của nó. Một lần nữa, phương pháp của chúng tôi đạt được kết quả tinh chỉnh mạnh hơn, tăng điểm số trung bình lên 3.4 điểm.
+
+Thú vị thay, chúng tôi quan sát thấy thiết lập mô hình 100M/32E hoạt động tốt nhất cho cả GS Top-2 và EC-CF2, mặc dù khả năng mô hình hiệu quả nhỏ hơn so với 100M/64E và 100M/128E. Kết quả này chỉ ra rằng perplexity huấn luyện tốt không phải lúc nào cũng chuyển thành hiệu suất tốt hơn của các nhiệm vụ downstream.
+
+### 4.5 Tính không đồng nhất quan trọng
+
+**Expert Choice có giới hạn:** Chúng tôi regularize expert choice bằng cách giới hạn số lượng chuyên gia tối đa cho mỗi token, sử dụng phương pháp được mô tả trong Mục 3.3. Bảng 4 báo cáo độ chính xác trung bình trên 11 tập dữ liệu được chọn. EC-CAP2 là biến thể của phương pháp expert choice của chúng tôi bằng cách giới hạn số lượng chuyên gia của mỗi token thành 2. Điều này làm giảm độ chính xác tinh chỉnh trung bình 0.8 điểm. Ngoài ra, EC-CAP3 cho phép tối đa 3 chuyên gia trên mỗi token và đạt được kết quả ngang bằng so với phương pháp expert choice vanilla. Nghiên cứu ablation này xác nhận rằng việc cho phép số lượng chuyên gia thay đổi trên mỗi token thực sự có ích.
+
+**Chuyên gia thay đổi trên mỗi token:** Chúng tôi tính toán thống kê về định tuyến token-to-expert, đặc biệt là tỷ lệ các token đã được định tuyến đến một số lượng chuyên gia nhất định. Theo Hình 3, phần lớn các token đã được định tuyến đến một hoặc hai chuyên gia trong khi 23% đã được định tuyến đến ba hoặc bốn chuyên gia và chỉ khoảng 3% token đã được định tuyến đến hơn 4 chuyên gia. Biểu đồ này xác minh giả thuyết của chúng tôi rằng phương pháp của chúng tôi học cách phân bổ số lượng chuyên gia thay đổi cho các token, điều này có thể có lợi cho các token quan trọng.
+
+### 4.6 So sánh với Hash Layer
+
+Trong mục này, chúng tôi so sánh phương pháp của chúng tôi với Hash Layers [28]. Chúng tôi sử dụng mod x để ánh xạ ID token thành ID chuyên gia. Điều này đảm bảo cân bằng tải và tạo ra các chuyên gia chuyên môn. Kết quả tinh chỉnh được trình bày trong hàng cuối cùng trong Bảng 4. Định tuyến dựa trên hashing hoạt động kém hơn expert choice về điểm số trung bình và phương sai. Điều này cho thấy rằng chỉ cân bằng tải không tạo ra tất cả lợi ích.
+
+### 4.7 Ablation
+
+**Hệ số khả năng:** Chúng tôi nghiên cứu hệ số khả năng trong phương pháp expert choice của chúng tôi và so sánh perplexity huấn luyện với phương pháp gating top-1 baseline được sử dụng trong Switch Transformer. Như mô tả trong Eq. (1), hệ số khả năng xác định trung bình có bao nhiêu chuyên gia mỗi token có thể được định tuyến đến, do đó kích thước bucket k của mỗi chuyên gia. Trong tất cả các thí nghiệm trước đây của chúng tôi, chúng tôi sử dụng hệ số khả năng là 2, khớp với dấu chân tính toán của gating top-2 được sử dụng trong phương pháp GShard. Để khớp chi phí tính toán trên cơ sở mỗi token một cách công bằng với gating top-1 được sử dụng trong Switch Transformer, chúng tôi giảm hệ số khả năng xuống 1 và vẽ perplexity huấn luyện trong Hình 4 (a). Không bất ngờ, việc sử dụng hệ số khả năng nhỏ hơn mang lại perplexity cao hơn, nhưng phương pháp của chúng tôi vẫn vượt trội đáng kể so với gating top-1. Chúng tôi tiếp tục đẩy hệ số khả năng xuống 0.5, và quan sát thấy rằng nó vẫn vượt trội hơn gating top-1.
+
+**So sánh với mô hình Dense trên tiền huấn luyện:** Chúng tôi so sánh phương pháp của chúng tôi với các mô hình dense trên tiền huấn luyện. Như thể hiện trong Hình 4 (b), phương pháp của chúng tôi liên tục vượt trội hơn phương pháp dense về perplexity và thời gian hội tụ. Đối với kích thước chuyên gia nhỏ 100M tham số, lợi ích của gating thưa thớt thậm chí còn đáng kể hơn. Trực giao với kết quả trình bày trong Hình 2 (b), trong đó việc mở rộng số lượng chuyên gia cải thiện hiệu suất mô hình, Hình 4 (b) cho thấy rằng việc tăng khả năng chuyên gia cũng tăng đáng kể hiệu suất mô hình.
+
+## 5 Kết luận
+
+Chúng tôi đề xuất một phương pháp định tuyến mới cho các mô hình mixture-of-experts (MoE) kích hoạt thưa thớt. Phương pháp này giải quyết mất cân bằng tải và sử dụng dưới mức các chuyên gia trong các phương pháp MoE thông thường, và cho phép chọn số lượng chuyên gia khác nhau cho mỗi token. Mô hình của chúng tôi chứng minh cải thiện hiệu quả huấn luyện hơn 2 lần khi so sánh với các mô hình GShard và Switch Transformer tiên tiến, và cũng đạt được những lợi ích mạnh mẽ khi tinh chỉnh trên 11 tập dữ liệu trong benchmark GLUE và SuperGLUE.
+
+## 6 Hạn chế
+
+Phương pháp expert choice có thể không áp dụng ngay lập tức cho việc tạo văn bản tự hồi quy vì triển khai hiện tại của chúng tôi nhận vào các token quá khứ và tương lai để thực hiện việc chọn lựa top-k. Một giải pháp có thể là thu thập một batch lớn các chuỗi đầu vào, phân phối các token của cùng một chuỗi vào các nhóm riêng biệt, và thực hiện định tuyến expert choice cho mỗi nhóm. Một tình huống khác mà phương pháp expert choice không áp dụng ngay lập tức là khi kích thước batch trở nên rất nhỏ trong quá trình phục vụ hoặc suy luận. Một top-k toàn cục có thể được chọn thay thế và chúng tôi có thể giới hạn số lần mỗi chuyên gia hoặc token được chọn. Chúng tôi để lại những cải tiến có thể này cho nghiên cứu tương lai.
+
+Một vấn đề lâu dài khác với MoE là dấu chân bộ nhớ lớn. Mặc dù chi phí tính toán có thể được giảm bằng cách sử dụng mạng có cổng thưa thớt, tổng số tham số tăng tuyến tính hoặc dưới tuyến tính với số lượng chuyên gia. Việc tăng số lượng chuyên gia yêu cầu dự trữ một số lượng lớn các thiết bị phần cứng. Do đó, năng lượng động (được sử dụng) được tiết kiệm trong khi năng lượng tĩnh (được dự trữ) thì không. Các kỹ thuật tiết kiệm năng lượng như khả năng đưa các thiết bị phần cứng vào trạng thái năng lượng thấp khi không sử dụng [17] có thể giúp giảm yêu cầu năng lượng dự trữ.
