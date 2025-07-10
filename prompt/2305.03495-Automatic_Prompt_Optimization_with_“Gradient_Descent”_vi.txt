@@ -1,0 +1,163 @@
+# Tối ưu hóa Prompt tự động với "Gradient Descent" và Beam Search
+
+Reid Pryzant, Dan Iter, Jerry Li, Yin Tat Lee, Chenguang Zhu, Michael Zeng
+Microsoft Azure AI
+{reidpryzant,iterdan,jerrl,yintatlee,chezhu,nzeng}@microsoft.com
+
+## Tóm tắt
+
+Các Mô hình Ngôn ngữ Lớn (LLM) đã cho thấy hiệu suất ấn tượng như các tác tử đa năng, nhưng khả năng của chúng vẫn phụ thuộc rất nhiều vào các prompt được viết tay với nỗ lực thử-sai tốn kém. Chúng tôi đề xuất một giải pháp đơn giản và không tham số cho vấn đề này, Tối ưu hóa Prompt với Gradient Văn bản (ProTeGi), được lấy cảm hứng từ gradient descent số để tự động cải thiện prompt, giả định có quyền truy cập vào dữ liệu huấn luyện và API LLM. Thuật toán sử dụng các mini-batch dữ liệu để tạo ra các "gradient" ngôn ngữ tự nhiên chỉ trích prompt hiện tại, giống như cách các gradient số chỉ ra hướng tăng lỗi. Các gradient ngôn ngữ tự nhiên sau đó được "lan truyền" vào prompt bằng cách chỉnh sửa prompt theo hướng ngữ nghĩa ngược lại với gradient. Các bước gradient descent này được hướng dẫn bởi một quy trình beam search và bandit selection giúp cải thiện đáng kể hiệu quả thuật toán. Kết quả sơ bộ trên ba nhiệm vụ NLP chuẩn và bài toán mới về phát hiện jailbreak LLM cho thấy Tối ưu hóa Prompt Tự động có thể vượt trội so với các kỹ thuật chỉnh sửa prompt trước đó và cải thiện hiệu suất của prompt ban đầu lên đến 31%, bằng cách sử dụng dữ liệu để viết lại các mô tả nhiệm vụ mơ hồ thành các hướng dẫn chú thích chính xác hơn.
+
+## 1 Giới thiệu
+
+Các Mô hình Ngôn ngữ Lớn (LLM) được huấn luyện trên văn bản quy mô web gần đây đã thể hiện khả năng chưa từng có trên nhiều nhiệm vụ NLP (OpenAI, 2023; Bubeck et al., 2023). Các LLM này sử dụng đầu vào prompt để tuân theo hướng dẫn của con người. Viết prompt bằng ngôn ngữ tự nhiên vẫn là một quá trình thử-sai thủ công đòi hỏi nỗ lực đáng kể của con người (Jiang et al., 2022) và chuyên môn (Reynolds và McDonell, 2021; Zamfirescu-Pereira et al., 2023).
+
+Do đó, có nhu cầu về các quy trình tự động hoặc bán tự động để giúp con người viết những prompt tốt nhất. Điều này sẽ giúp giảm nỗ lực thủ công, cải thiện hiệu suất nhiệm vụ và tạo ra các mô tả có thể diễn giải về quá trình quyết định nhận thức.
+
+Một nhóm nghiên cứu gần đây đã điều tra vấn đề này bằng cách huấn luyện các mô hình phụ trợ hoặc biểu diễn có thể vi phân của prompt (Qin và Eisner, 2021; Deng et al., 2022). Tuy nhiên, các nghiên cứu như vậy giả định có quyền truy cập vào các biến trạng thái nội bộ của LLM (Shin et al., 2020; Lester et al., 2021) trong khi các nhà thực hành thường giao tiếp với LLM thông qua API. Các nghiên cứu khác áp dụng các thao tác rời rạc lên prompt thông qua Học Tăng cường hoặc phản hồi dựa trên LLM (Zhang et al., 2023; Zhou et al., 2022). Các thuật toán này cũng có thể yêu cầu quyền truy cập cấp thấp vào LLM, tạo ra đầu ra không thể hiểu được, hoặc dựa vào tìm kiếm monte-carlo không định hướng trên không gian ngữ nghĩa của các prompt.
+
+Chúng tôi đề xuất Tối ưu hóa Prompt với Gradient Văn bản (ProTeGi), một thuật toán đa năng và không tham số cho việc tối ưu hóa prompt tự động kết nối hai nhóm nghiên cứu này bằng cách áp dụng các cải tiến rời rạc lên prompt theo cách có định hướng.
+
+Khác với các nghiên cứu trước, chúng tôi vượt qua rào cản tối ưu hóa rời rạc bằng cách phản chiếu các bước của gradient descent trong một cuộc đối t화 Socratic dựa trên văn bản (Zeng et al., 2022), thay thế việc lấy đạo hàm bằng phản hồi LLM và lan truyền ngược bằng chỉnh sửa LLM. Cụ thể, chúng tôi sử dụng các minibatch của dữ liệu huấn luyện để tạo ra "gradient" bằng ngôn ngữ tự nhiên, tức là mô tả các lỗi của prompt hiện tại đối với minibatch, sau đó chỉnh sửa prompt hiện tại theo hướng ngữ nghĩa ngược lại với gradient. Các bước này trở thành phần mở rộng của một beam search rộng hơn trên không gian prompt, tăng hiệu quả thuật toán bằng cách coi vấn đề lựa chọn ứng viên beam như một trường hợp của bài toán nhận dạng arm tốt nhất (Audibert et al., 2010).
+
+Sau đó chúng tôi đưa ra một nghiên cứu tình huống sơ bộ về ProTeGi. Chúng tôi đánh giá framework được đề xuất trong nhiều cấu hình trên 4 nhiệm vụ NLP, bao gồm bài toán mới về phát hiện jailbreak LLM. Kết quả cho thấy thuật toán được đề xuất có thể cải thiện hiệu suất của đầu vào prompt ban đầu lên đến 31%, vượt trội so với các baseline học prompt tiên tiến với trung bình 4-8% trong khi dựa vào ít lời gọi API LLM hơn. Chúng tôi cũng chứng minh khả năng diễn giải của quá trình tối ưu hóa và điều tra những thiếu sót của thuật toán.
+
+## 2 Tối ưu hóa Prompt Rời rạc với "Gradient Descent" Không tham số
+
+Thuật toán được đề xuất giả định có quyền truy cập vào một prompt ban đầu p0 và dữ liệu huấn luyện i.i.d. bao gồm các cặp văn bản đầu vào và đầu ra (số, danh mục, tóm tắt, v.v.): Dtr={(x1, y1), ...,(xn, yn)}.
+
+Lưu ý rằng tất cả các prompt p được lấy từ không gian ngôn ngữ tự nhiên gắn kết L. Chúng tôi giả định có quyền truy cập vào API LLM hộp đen LLMp(x)≈ argmaxy∈LPLLM(y|p, x), trả về phần tiếp theo văn bản có khả năng y của prompt được tạo bằng cách nối p và x (ví dụ, prompt few-shot và ví dụ đầu vào, hoặc persona chatbot và lịch sử đối thoại).
+
+Trong bối cảnh này, thuật toán của chúng tôi lặp đi lặp lại tinh chỉnh prompt p0 để tạo ra ˆp, một xấp xỉ của prompt tối ưu p*= argmaxp∈L{m(p,Dte)} cho một số hàm metric m(·) và dữ liệu test hoặc development trong miền Dte.
+
+Trong các phần sau, đầu tiên chúng tôi giới thiệu cách thuật toán thực hiện "gradient descent" văn bản để cải thiện prompt theo cách có định hướng (Phần 2.1). Sau đó thuật toán tận dụng các bước gradient descent này để beam search thông qua không gian ngôn ngữ gắn kết L, được hướng dẫn bởi các gradient trong quá trình mở rộng beam, và nhận dạng arm tốt nhất hiệu quả trong quá trình lựa chọn beam (Phần 2.2).
+
+## 2.1 Gradient descent với Prompt
+
+Trong thiết lập của chúng tôi, gradient descent đề cập đến quá trình (1) đánh giá một prompt với một batch dữ liệu, (2) tạo ra một tín hiệu loss cục bộ chứa thông tin về cách cải thiện prompt hiện tại, sau đó (3) chỉnh sửa prompt theo hướng ngữ nghĩa ngược lại với gradient trước khi bắt đầu lần lặp tiếp theo.
+
+Chúng tôi thực hiện quá trình này với một cặp prompt LLM tĩnh, như được mô tả trong Hình 2. Prompt đầu tiên dùng để tạo ra các tín hiệu loss ("gradient") và được gọi là ∇. Trong khi nội dung cụ thể có thể thay đổi và có thể là task-specific hoặc task-agnostic, ∇ phải luôn xem xét prompt hiện tại p0, cộng với hành vi của p0 trên một minibatch dữ liệu (đặc biệt là các lỗi), và tạo ra một tóm tắt ngôn ngữ tự nhiên về các lỗi của p0. Tóm tắt này trở thành gradient g. Tương tự như cách các gradient truyền thống biểu diễn một hướng trong không gian tham số sẽ làm cho mô hình tệ hơn, các "gradient" văn bản g biểu diễn các hướng trong không gian ngữ nghĩa đang làm cho prompt tệ hơn.
+
+Prompt thứ hai được gọi là δ và trong khi prompt này cũng có thể thay đổi, nó phải luôn lấy gradient g và prompt hiện tại p0, sau đó thực hiện một chỉnh sửa trên p0 theo hướng ngữ nghĩa ngược lại với g, tức là sửa các vấn đề với p0 được chỉ ra bởi g.
+
+Khác với thiết lập học máy truyền thống, chúng tôi không tạo ra một gradient hoặc chỉnh sửa duy nhất, mà là một số hướng có thể cải thiện prompt hiện tại. Phần 2.2 mô tả chi tiết quá trình tạo ra và lựa chọn các prompt ứng viên.
+
+## 2.2 Beam Search trên Prompt
+
+Các bước gradient descent được mô tả trong Phần 2.1 được sử dụng để hướng dẫn một beam search trên không gian prompt. Beam search này là vòng lặp ngoài của thuật toán huấn luyện prompt của chúng tôi và được mô tả trong Thuật toán 1.
+
+Beam search là một quá trình tối ưu hóa lặp đi lặp lại trong đó mỗi lần lặp prompt hiện tại được sử dụng để tạo ra nhiều prompt ứng viên mới (mở rộng). Tiếp theo, một quá trình lựa chọn được sử dụng để quyết định những prompt nào đáng để chuyển tiếp đến lần lặp tiếp theo. Vòng lặp này cho phép cải thiện từng bước và khám phá trên nhiều ứng viên prompt.
+
+### 2.2.1 Bước Mở rộng
+
+Bước mở rộng được sử dụng để tạo ra nhiều prompt ứng viên mới từ một prompt hiện tại (Thuật toán 2). Nó tận dụng framework "gradient descent" khái niệm của Phần 2.1, và các prompt cụ thể của chúng tôi có thể được tìm thấy trong Phụ lục.
+
+Đầu tiên chúng tôi lấy mẫu một minibatch dữ liệu, chạy prompt ban đầu trên các dữ liệu này với LLMp0, và thu thập lỗi. Thứ hai, chúng tôi đưa các lỗi này vào một template prompt ∆, hướng dẫn LLM mô tả các vấn đề với p0 có thể đã dẫn đến những sai lầm này. Các thế hệ tiếp theo là các gradient ngôn ngữ tự nhiên của chúng tôi; xem Hình 1 cho một ví dụ.
+
+Thứ hai, các gradient được cung cấp cho một prompt LLM khác gọi là δ, hướng dẫn LLM chỉnh sửa prompt hiện tại p0 để sửa các vấn đề được mô tả bởi gradient. Theo cách này, chúng tôi thu hút các LLM vào một vòng lặp phản hồi đệ quy tương tự như các cuộc đối thoại Socratic được đề xuất bởi Zeng et al. (2022).
+
+Cuối cùng, các ứng viên bổ sung được tạo ra bằng cách chạy các ứng viên hiện có thông qua một LLM paraphrasing gọi là LLMmc, để khám phá không gian tìm kiếm monte carlo cục bộ xung quanh các prompt ứng viên mới. Prompt này đơn giản chỉ yêu cầu LLM tạo ra các ứng viên mới được diễn đạt khác nhau nhưng tương tự về ngữ nghĩa với đầu vào của chúng.
+
+### 2.2.2 Bước Lựa chọn
+
+Một khi quá trình mở rộng đã bước mỗi prompt ứng viên thành nhiều ứng viên kế nhiệm có thể, bước lựa chọn chọn ra b ứng viên hứa hẹn nhất để ở lại trên beam cho lần lặp tiếp theo.
+
+Việc đánh giá mỗi prompt ứng viên trên toàn bộ dataset huấn luyện rất tốn kém (Prasad et al., 2022), vì vậy chúng tôi muốn giảm thiểu số lượng truy vấn như vậy. Lưu ý rằng điều này gần như tương ứng chính xác với bài toán được nghiên cứu kỹ về nhận dạng arm tốt nhất trong tối ưu hóa bandit (Audibert et al., 2010). n arm tương ứng với n prompt ứng viên, hiệu suất của chúng trên dataset cơ bản là giá trị ẩn của arm, và hành động "kéo" một arm tương ứng với việc đánh giá prompt trên một điểm dữ liệu được chọn ngẫu nhiên. Mục tiêu sau đó là tìm b arm tốt nhất với càng ít lần kéo càng tốt, và chúng tôi xem xét các thuật toán sau.
+
+**UCB Bandits.** Được thúc đẩy bởi các nghiên cứu khác nhanh chóng ước lượng hiệu suất LLM (Li et al., 2022; Zhou et al., 2022), chúng tôi lấy mẫu một tập con prompt theo phân phối đề xuất về hiệu suất prompt, đánh giá những prompt đó trên một tập con ngẫu nhiên của dữ liệu, sau đó cập nhật phân phối đề xuất dựa trên hiệu suất quan sát được. Cuối cùng, chúng tôi chọn b prompt có trọng số cao nhất trong phân phối đề xuất. Xem Thuật toán 3 để biết chi tiết, trong đó Qt(pi) là hiệu suất ước lượng của prompt pi tại bước thời gian t, Nt(pi) là tổng số truy vấn cho prompt i cho đến nay tại thời gian t, và c là một tham số khám phá.
+
+Trong khi là một lựa chọn tự nhiên, UCB được thiết kế chủ yếu cho việc giảm thiểu hối tiếc (Kuleshov và Precup, 2014), trong khi chúng ta muốn thực hiện nhiệm vụ liên quan nhưng khác biệt là nhận dạng arm tốt nhất. Hơn nữa, UCB có thể hoạt động kém nếu tham số khám phá c không được điều chỉnh phù hợp (Bubeck et al., 2012).
+
+**UCB-E** là một biến thể của UCB sửa một số vấn đề này bằng cách ưu tiên khám phá, dẫn đến các tính chất hội tụ lý thuyết tốt hơn (Audibert et al., 2010). Tuy nhiên, UCB-E vẫn bị mắc kẹt với các siêu tham số như T, c, và |Dsample|.
+
+**Successive Rejects** (Thuật toán 4) có thể chứng minh là tối ưu cho nhận dạng arm tốt nhất (Audibert et al., 2010), không yêu cầu siêu tham số khác với các lựa chọn thay thế UCB của nó, và đáng ngạc nhiên là đơn giản. Thuật toán tiến hành trong n−1 giai đoạn, và trong mỗi giai đoạn, duy trì một tập hợp các prompt ứng viên sống sót Sk⊆ {p1, . . . , pn}. Trong giai đoạn thứ t, chúng tôi đánh giá mỗi ứng viên trong St−1 trên tổng cộng nt điểm dữ liệu ngẫu nhiên để tạo thành một ước lượng thực nghiệm của điểm số m(pi,Dtr). Sau đó, để tạo thành St, chúng tôi loại bỏ prompt có điểm số thấp nhất trong giai đoạn này. Lưu ý rằng nt được tính theo Phương trình 1 dưới đây sao cho nó tăng dần với T:
+
+nt = ⌈1/(0.5 + ∑T_i=2 1/i) * (B-T)/(T+1-t)⌉
+
+trong đó B là tổng ngân sách truy vấn.
+
+Ngoài thuật toán successive rejects thông thường, chúng tôi thử nghiệm với Successive Halving (SH) tích cực hơn vì ở cuối mỗi cụm từ nó từ chối nửa dưới của các prompt theo điểm số của chúng, với nk=B/(|Sk−1|log2k) (Karnin et al., 2013).
+
+## 3 Thử nghiệm
+
+Chúng tôi trình bày một nghiên cứu tình huống hạn chế và sơ bộ để chứng minh thuật toán ProTeGi được đề xuất trên 4 nhiệm vụ NLP chuẩn, phát hiện rằng nó có thể vượt trội so với các baseline học prompt tiên tiến về hiệu quả và hiệu suất.
+
+### 3.1 Dữ liệu
+
+Trong khi ProTeGi có thể được áp dụng cho bất kỳ vấn đề nào như phân tích cú pháp, thiết kế chatbot hoặc tóm tắt chỉ bằng cách chọn các hàm metric m khác nhau, chúng tôi thử nghiệm trên bốn nhiệm vụ phân loại NLP chuẩn cho nghiên cứu tình huống ban đầu này. Các nhiệm vụ bao gồm một phạm vi rộng các miền vấn đề và ngôn ngữ, và như sau:
+
+**Jailbreak**: một nhiệm vụ mới trong đó mục tiêu là xác định xem đầu vào của người dùng cho API tiếp tục LLM (tức là một prompt để tiếp tục được gửi bởi người dùng) có tạo thành một cuộc tấn công jailbreak hay không. Chúng tôi định nghĩa tấn công jailbreak như một chiến lược tương tác của người dùng nhằm khiến AI phá vỡ các quy tắc của chính nó. Điều này có thể bao gồm tạo ra nội dung có hại hoặc tiết lộ metaprompt của LLM. Dataset này có 452 ví dụ đa ngôn ngữ và các nhãn jailbreak được chú thích bằng tay.
+
+**Ethos** (Mollas et al., 2020) là một dataset phát hiện hate speech tiếng Anh trực tuyến với 997 bình luận trực tuyến và nhãn hate speech.
+
+**Liar** (Wang, 2017) là một dataset phát hiện tin giả tiếng Anh với 4000 tuyên bố, bối cảnh, và nhãn nói dối.
+
+**Sarcasm** (Farha và Magdy, 2020) là một dataset phát hiện châm biếm tiếng Ả Rập với 10.000 bình luận trực tuyến và nhãn châm biếm.
+
+### 3.2 Thiết lập
+
+Cho mỗi nhiệm vụ, chúng tôi lấy mẫu ngẫu nhiên 50 ví dụ cho development và 150 cho test. Tất cả các kết quả được báo cáo là trung bình của 3 thử nghiệm thực nghiệm. Chúng tôi báo cáo điểm F1 nhị phân của tập test xuyên suốt, dựa trên maxpooling trên beam cuối cùng của các ứng viên. Trừ khi được nêu khác, các thử nghiệm được thực hiện với phiên bản gpt-3.5-turbo tháng 1 năm 2023, sử dụng dịch vụ API LLM Azure OpenAI với nhiệt độ 0.0 trong phân loại few-shot và 1.0 trong tất cả các bối cảnh khác.
+
+Vì trọng tâm của bài báo này là các thuật toán không tham số với khả năng áp dụng rộng rãi, chúng tôi không tiến hành bất kỳ tìm kiếm siêu tham số nào cho các thuật toán baseline hoặc được đề xuất, thay vào đó áp dụng các giá trị mặc định và sau đó sử dụng cùng các tham số xuyên suốt. Trừ khi được nêu khác, cho Thuật toán Tối ưu hóa Prompt Tự động được đề xuất, chúng tôi sử dụng kích thước minibatch |Dmini|= 64, kích thước beam b= 4, và chạy thuật toán trong 6 bước tối ưu hóa. Trong mỗi bước, chúng tôi lấy mẫu các nhóm 4 lỗi cùng một lúc để tạo ra các gradient. Chúng tôi tạo ra m= 4 gradient mỗi nhóm lỗi, và chỉnh sửa prompt một lần mỗi gradient trước khi tạo ra p= 2 mẫu monte carlo bổ sung mỗi prompt ứng viên mới. Để tránh vượt quá tính toán, chúng tôi lấy mẫu ngẫu nhiên 8 ứng viên kế nhiệm mỗi prompt cha trước khi lựa chọn bandit.
+
+Chúng tôi sử dụng cùng hàm metric m như mục tiêu tối ưu hóa trên tất cả các nhiệm vụ: điểm F1. Trong khi các nghiên cứu gần đây đã chọn sử dụng log-likelihood của mô hình để đánh giá prompt thay vì một metric liên quan đến độ chính xác (Lu et al., 2021; Prasad et al., 2022; Zhou et al., 2022), các thử nghiệm sơ bộ cho thấy kỹ thuật này không giúp ích cho thuật toán của chúng tôi, và nhiều API LLM mạnh nhất như ChatGPT và GPT4 không cung cấp log likelihood tại thời điểm viết.
+
+Thuật toán được đề xuất là về việc tối ưu hóa ngôn ngữ của prompt, trái ngược với việc lựa chọn các ví dụ tốt nhất cho few-shot learning. Tuy nhiên, thuật toán của chúng tôi tận dụng dữ liệu huấn luyện và vì vậy hầu hết các thiết lập thực tế cũng sẽ bao gồm một số ví dụ huấn luyện này như các ví dụ few-shot cho prompt. Theo đó, tất cả các thử nghiệm của Phần 3.4 được tiến hành với một cặp ví dụ few-shot được chọn ngẫu nhiên được giữ không đổi khi chúng tôi tối ưu hóa các phần khác của prompt.
+
+### 3.3 Baseline
+
+Chúng tôi so sánh framework ProTeGi được đề xuất với các baseline sau. Lưu ý rằng cho nghiên cứu tình huống sơ bộ này, chúng tôi hạn chế trọng tâm của mình vào các thuật toán không tham số có thể so sánh trực tiếp với ProTeGi.
+
+**Monte-Carlo (MC).** Thuật toán Automatic Prompt Engineering được đề xuất bởi Zhou et al. (2022) đề xuất một tìm kiếm monte carlo lặp đi lặp lại nhưng không có hướng trên không gian prompt. Để so sánh công bằng, chúng tôi khớp số lượng mẫu monte carlo mỗi ứng viên với số lượng kế nhiệm được tạo ra bởi ProTeGi.
+
+**Reinforcement Learning (RL).** Các nghiên cứu được đề xuất gần đây, đồng thời như GrIPS (Prasad et al., 2022) và TEMPERA (Zhang et al., 2023) dựa vào các hoạt động cấp cụm từ trên văn bản prompt: prompt được chia thành các cụm từ với ví dụ nltk (Bird, 2006), sau đó không gian tìm kiếm bao gồm các hoạt động thêm, diễn đạt lại, hoán đổi, và xóa trên các cụm từ.
+
+**AutoGPT.** Đây là một tác tử AI mã nguồn mở dựa vào một vòng lặp phản hồi được kiểm soát bởi tác tử để cải thiện phản hồi của nó. Thử nghiệm với baseline này cho phép chúng tôi so sánh vòng lặp phản hồi có mục tiêu của các bước gradient descent của chúng tôi, với một framework phản hồi được quyết định bởi chính AI. Chúng tôi cung cấp cùng số lượng ví dụ và lỗi cho AutoGPT trong 6 lượt, giống như số bước tối ưu hóa trong ProTeGi.
+
+Cuối cùng, vì các nghiên cứu đồng thời đã đề xuất tìm kiếm tiến hóa thông qua không gian prompt (Xu et al., 2022), baseline chính của chúng tôi cho quy trình lựa chọn bandit được đề xuất là một tìm kiếm tiến hóa tận dụng một bước lựa chọn đồng nhất đơn giản, trong đó ngân sách truy vấn được phân bổ đều giữa các ứng viên prompt (Prasad et al., 2022).
+
+### 3.4 Kết quả Thử nghiệm
+
+**Kết quả Tổng thể.** Hình 3 trình bày kết quả chính của chúng tôi. Kết quả cho thấy ProTeGi có thể vượt trội so với các thuật toán tiên tiến khác trên tất cả bốn dataset được xem xét trong nghiên cứu. Trung bình, ProTeGi cải thiện so với các baseline MC và RL với biên độ đáng kể lần lượt là 3.9% và 8.2%, đồng thời cũng cải thiện so với prompt gốc p0 15.3% và AutoGPT 15.2%. Biên độ này vẫn tương đối nhất quán khi chúng tôi thay đổi ngân sách truy vấn tìm kiếm từ 12 đến 50 đánh giá mỗi ứng viên prompt, mặc dù tất cả thuật toán bắt đầu mất hiệu quả khi ít đánh giá hơn làm tăng phương sai của quá trình. Chúng tôi điều tra thêm về phương sai của quá trình tối ưu hóa trong Phụ lục.
+
+Đối với các baseline, kết quả của chúng tôi cho thấy trong khi MC có thể cải thiện hiệu suất prompt một cách nhất quán, các hoạt động cấp cụm từ của RL và các thay đổi được hướng dẫn bởi AI của AutoPrompt đôi khi có thể không đạt được. Đối với Ethos và Sarcasm, hiệu suất của baseline RL vẫn gần với prompt bắt đầu p0. Đối với Jailbreak và Sarcasm, 6 vòng phản hồi AutoGPT thực sự đã làm giảm hiệu suất của prompt bắt đầu. Những phát hiện này cho thấy các kỹ thuật tối ưu hóa khác nhau có thể phù hợp hơn cho các loại nhiệm vụ xử lý ngôn ngữ tự nhiên khác nhau, và một cách tiếp cận thích ứng hơn như ProTeGi có thể cần thiết để đạt được hiệu suất tối ưu.
+
+Cuối cùng, hầu hết các thuật toán đều cải thiện khi ngân sách tăng, xác nhận giả thuyết của chúng tôi rằng các ước lượng điểm số phương sai thấp hơn sẽ mang lại một chuỗi tìm kiếm chính xác hơn.
+
+**Ablation Beam Search.** Để xác định lợi ích của quy trình beam search được nêu trong Phần 2.2, chúng tôi đã ablation bước beam search và thay thế nó bằng một bước liệt kê-sau đó-chọn phẳng đơn lẻ (Gao et al., 2020) và một tìm kiếm theo chiều sâu đầu tiên tham lam trên prompt (Deng et al., 2022), khớp số lượng ứng viên được xem xét ở mỗi bước sao cho mỗi biến thể có cùng ngân sách truy vấn API tổng thể.
+
+Kết quả trong Bảng 1 cho thấy thuật toán beam search có thể vượt trội so với các baseline phẳng và tham lam trên tất cả các nhiệm vụ, với cải thiện đáng kể trong phát hiện Jailbreak và Liar. Không có người chiến thắng rõ ràng giữa các baseline tham lam và phẳng, có thể do tính ngẫu nhiên phương sai cao của tìm kiếm.
+
+**Thuật toán Bandit** Chúng tôi thử nghiệm với các thuật toán nhận dạng arm tốt nhất được mô tả trong 2.2.2, hoán đổi các thuật toán lựa chọn xấp xỉ khác nhau để đánh giá hiệu suất tương đối của chúng. Để khớp ngân sách truy vấn giữa các biến thể, chúng tôi đặt tham số ngân sách B cho các thuật toán kiểu Successive Rejects thành T∗ |Dsample| ∗n sử dụng các giá trị từ các thuật toán kiểu UCB.
+
+Kết quả trong Bảng 2. Tất cả các thuật toán nhận dạng arm tốt nhất xấp xỉ đều vượt trội so với baseline đồng nhất, chỉ đơn giản phân bổ ngân sách đều giữa các ứng viên. Thú vị là, các thuật toán kiểu UCB liên tục vượt trội so với các thuật toán kiểu successive rejects, trái với giả thuyết được mô tả trong Phần 2.2.2. Điều này có thể là do trong thực tế các thuật toán kiểu UCB có thể tốt hơn trong việc cân bằng khám phá và khai thác (chúng tôi đặt tham số khám phá c thành 2.0 cho tất cả các thử nghiệm, một giá trị tương đối cao), vì các thuật toán kiểu successive rejects tập trung hơn vào việc khám phá các arm có khả năng là tốt nhất, với chi phí khám phá các tùy chọn ít hứa hẹn hơn.
+
+**Đường cong Học** Để điều tra thêm về động lực học của ProTeGi, chúng tôi chạy thuật toán cho cùng số bước trên mỗi dataset, vẽ hiệu suất test sau mỗi bước trong Hình 4. Kết quả cho thấy quá trình có thể bắt đầu overfit trên dữ liệu train, hoặc bị mắc kẹt trong một cực tiểu cục bộ chỉ sau một vài bước tối ưu hóa; tất cả dataset đạt đỉnh ở khoảng 3 bước. Có vẻ như có hai mẫu khác trong dữ liệu, với Jailbreak và Liar nhanh chóng cải thiện và duy trì các cải thiện cho prompt của chúng, trong khi Ethos và Sarcasm vẫn tương đối ổn định xuyên suốt, có thể do sự phù hợp ban đầu tốt hơn giữa prompt bắt đầu và nhiệm vụ.
+
+**Mô hình Cơ sở** Chúng tôi thử nghiệm với việc hoán đổi các mô hình cơ sở khác nhau để cung cấp năng lượng cho thuật toán ProTeGi bằng cách thực hiện lời gọi API đến các API LLM khác nhau (Bảng 3). Các mô hình được điều chỉnh RLHF vượt trội hơn đáng kể so với GPT-3, với GPT-4 cung cấp hiệu suất tốt nhất. Điều này có thể do khả năng suy luận nâng cao của các LLM được điều chỉnh RLHF, đặc biệt cho các vấn đề mới hoặc được định nghĩa kém như phát hiện Jailbreak.
+
+**Phân tích Định tính.** Chúng tôi cung cấp một số ví dụ so sánh về một bước tối ưu hóa, cho mỗi dataset và prompt bắt đầu p0, trong Bảng 4. Nhiều ví dụ hơn có thể được tìm thấy trong Phụ lục. Chúng ta có thể quan sát một số mẫu. Đối với Ethos, các gradient thành công phản ánh bất kỳ sự không nhất quán nào giữa prompt hiện tại và điểm dữ liệu cụ thể đó, với gradient chỉ ra rằng không phải tất cả bình luận về người Hồi giáo đều là hate speech, và Liar chỉ ra rằng chương trình nghị sự hoặc thiên vị của người nói, không chỉ bối cảnh có thể ảnh hưởng mạnh mẽ đến xu hướng nói dối của họ. Tuy nhiên, gradient Jailbreak có vẻ ít hữu ích hơn; gradient Jailbreak muốn chuyển trọng tâm của prompt sang vấn đề cụ thể về dụ dỗ trẻ em, trong khi gradient Sarcasm có cách tiếp cận ngược lại bằng cách đưa ra một tuyên bố rất chung.
+
+Tương tự, hiệu ứng của mỗi thuật toán trên prompt ứng viên kết quả p′ khác nhau. Các ứng viên xuất phát từ MC chỉ đơn giản diễn đạt lại prompt bắt đầu và các ứng viên xuất phát từ RL có vẻ bị xáo trộn và không mạch lạc. Các prompt ProTeGi có sự đa dạng cú pháp và ngữ nghĩa nhiều hơn. Trong một số trường hợp, điều này có thể làm hại nhiều hơn là giúp ích, ví dụ prompt APO Jailbreak mới p′ yêu cầu LLM giải quyết một nhiệm vụ mới. Trong các trường hợp khác, ProTeGi không tận dụng gradient đúng cách, và thay vào đó chỉ đơn giản sử dụng kiến thức nội bộ của nó để định nghĩa lại một khái niệm (Ethos).
+
+## 4 Nghiên cứu Liên quan
+
+Nghiên cứu của chúng tôi rút ra từ một số lĩnh vực nghiên cứu liên quan về prompt LLM.
+
+Phần lớn các nghiên cứu cố gắng cải thiện prompt LLM thông qua việc điều chỉnh có thể vi phân của soft prompt (Lester et al., 2021; Qin và Eisner, 2021) hoặc huấn luyện các mô hình phụ trợ tham gia vào các thao tác prompt (Hao et al., 2022; Deng et al., 2022; Zhou et al., 2022) hoặc trực tiếp huấn luyện chính bộ tạo prompt (Hao et al., 2022; Wang et al., 2022). Tuy nhiên, nhiều nhà thực hành giao tiếp với LLM thông qua API, mà không có quyền truy cập vào các biến trạng thái nội bộ cần thiết cho việc huấn luyện mô hình, và ngôn ngữ của các prompt được tối ưu hóa trực tiếp là không mạch lạc (Hambardzumyan et al., 2021).
+
+Một nhóm nghiên cứu khác có ý định cải thiện prompt thông qua các thao tác rời rạc được hướng dẫn bởi Học Tăng cường. Nghiên cứu trong không gian này xây dựng prompt trên cơ sở từng token (Shin et al., 2020) hoặc từng cụm từ (Zhang et al., 2023; Deng et al., 2022). Tuy nhiên, các phương pháp này dựa vào các hoạt động nguyên thủy trên văn bản, là tham số vì chúng dựa vào ít nhất một mô hình reward phụ trợ khác, và bị ràng buộc với các hàm reward số, trong khi hàm điểm số của chúng tôi có thể là bất cứ thứ gì, thậm chí là một bình luận văn bản từ người dùng (chúng tôi sử dụng chính GPT cho điều này).
+
+Một nhóm nghiên cứu khác trong không gian thao tác rời rạc tận dụng phản hồi dựa trên LLM, ví dụ Zhou et al. (2022); Guo et al. (2023) đã đề xuất phương pháp lấy mẫu monte-carlo do LLM tạo ra được đại diện bởi baseline MC của chúng tôi, và Prasad et al. (2022) có một tìm kiếm tiến hóa thông qua prompt được tạo ra bởi các đoạn được diễn đạt lại và hoán đổi bởi LLM của prompt gốc. Đồng thời với nghiên cứu của chúng tôi, Chen et al. (2023) đề xuất chỉnh sửa prompt tạo SQL dựa trên phản hồi đầu ra. Mặc dù hứa hẹn và tương tự như bài báo này, các nghiên cứu này dựa vào một tìm kiếm cục bộ cụ thể nhiệm vụ hoặc không có hướng trên không gian prompt mà không có hướng ngữ nghĩa có ý nghĩa. Hơn nữa, các nghiên cứu như vậy thường tập trung vào việc tạo ra prompt từ đầu (Honovich et al., 2022) trong khi việc con người viết một bản nháp đầu tiên nhanh chóng là tầm thường (với ví dụ một mô tả mơ hồ về hành vi mong muốn). Của chúng tôi là một phương pháp chung, có thể được áp dụng cho bất kỳ nhiệm vụ nào để giới thiệu các cải thiện ngữ nghĩa có ý nghĩa cho các prompt.
+
+## 5 Kết luận
+
+Trong bài báo này, chúng tôi đã đề xuất Tối ưu hóa Prompt với Gradient Văn bản (ProTeGi), một framework đơn giản và đa mục đích cho việc tối ưu hóa tự động các prompt LLM. Chúng tôi sử dụng một kỹ thuật mới để vượt qua rào cản tối ưu hóa rời rạc phản chiếu các bước của gradient descent trong một cuộc đối thoại dựa trên văn bản, và beam searching trên không gian prompt với một bước lựa chọn bandit hiệu quả. Kết quả của chúng tôi trải rộng bốn nhiệm vụ phân loại chuẩn và cho thấy ProTeGi có thể cải thiện đáng kể các prompt mà không cần điều chỉnh siêu tham số hoặc huấn luyện mô hình.
+
+Có nhiều hướng cho nghiên cứu tương lai, bao gồm tổng quát hóa kỹ thuật cho nhiều nhiệm vụ hơn với các hàm metric mới, kết hợp kích thước bước vào quá trình học, và mở rộng framework khái niệm của gradient descent văn bản.
+
+## Hạn chế
+
+Mặc dù có kết quả hứa hẹn, nghiên cứu của chúng tôi có một số hạn chế. Thứ nhất, hiệu quả của framework ProTeGi bị hạn chế về mặt thực tế bởi việc giới hạn tỷ lệ trên API LLM, dịch thành hiệu quả giảm. Mặc dù ProTeGi tương đối hiệu quả về mặt lựa chọn ứng viên, có nhiều bước bao gồm tạo gradient và đánh giá đầy đủ các ứng viên beam được chọn sau mỗi vòng yêu cầu nhiều lời gọi API, đôi khi với prompt dài, có thể đẩy thời gian chạy của chương trình tối ưu hóa quá 1 giờ ngay cả với ngân sách truy vấn nhỏ. Đối với các không gian prompt rất lớn hoặc các ứng dụng khẩn cấp, có thể không khả thi để sử dụng ProTeGi mà không có tài nguyên tính toán đáng kể.
+
+Thứ hai, framework ProTeGi chỉ được thử nghiệm trên bốn nhiệm vụ phân loại chuẩn. Mặc dù các nhiệm vụ này trải rộng nhiều miền khác nhau, chúng không có nghĩa là toàn diện. Có thể cần thêm thử nghiệm và tinh chỉnh cho các loại nhiệm vụ khác nhau, đặc biệt là những nhiệm vụ có yêu cầu mô hình hóa phức tạp hơn.
