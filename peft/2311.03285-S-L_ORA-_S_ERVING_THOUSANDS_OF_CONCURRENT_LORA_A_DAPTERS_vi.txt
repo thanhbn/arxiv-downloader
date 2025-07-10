@@ -1,0 +1,210 @@
+S-LoRA: PHỤC VỤ HÀNG NGHÌN ADAPTER LORA ĐỒNG THỜI
+Ying Sheng* 1 2Shiyi Cao* 1Dacheng Li1Coleman Hooper1Nicholas Lee1Shuo Yang1 3
+Christopher Chou1Banghua Zhu1Lianmin Zheng1Kurt Keutzer1Joseph E. Gonzalez1Ion Stoica1
+
+TÓM TẮT
+Mô hình "pretrain-rồi-finetune" được áp dụng phổ biến trong việc triển khai các mô hình ngôn ngữ lớn. Low-Rank Adaptation (LoRA), một phương pháp fine-tuning tiết kiệm tham số, thường được sử dụng để điều chỉnh mô hình cơ sở cho nhiều tác vụ, tạo ra một bộ sưu tập đáng kể các adapter LoRA được tạo ra từ một mô hình cơ sở. Chúng tôi quan sát thấy rằng mô hình này mang lại những cơ hội đáng kể cho việc suy luận theo batch trong quá trình phục vụ. Để tận dụng những cơ hội này, chúng tôi giới thiệu S-LoRA, một hệ thống được thiết kế để phục vụ nhiều adapter LoRA một cách có thể mở rộng. S-LoRA lưu trữ tất cả các adapter trong bộ nhớ chính và lấy các adapter được sử dụng bởi các truy vấn đang chạy hiện tại vào bộ nhớ GPU. Để sử dụng hiệu quả bộ nhớ GPU và giảm phân mảnh, S-LoRA đề xuất Unified Paging. Unified Paging sử dụng một pool bộ nhớ thống nhất để quản lý trọng số adapter động với các rank khác nhau và tensor KV cache với độ dài chuỗi thay đổi. Ngoài ra, S-LoRA sử dụng một chiến lược tensor parallelism mới và các kernel CUDA tùy chỉnh được tối ưu hóa cao để batching không đồng nhất của tính toán LoRA. Tổng hợp lại, các tính năng này cho phép S-LoRA phục vụ hàng nghìn adapter LoRA trên một GPU hoặc trên nhiều GPU với overhead nhỏ. So với các thư viện hiện đại như HuggingFace PEFT và vLLM (với hỗ trợ naïve cho phục vụ LoRA), S-LoRA có thể cải thiện throughput lên đến 4 lần và tăng số lượng adapter được phục vụ lên nhiều bậc độ lớn. Kết quả là, S-LoRA cho phép phục vụ có thể mở rộng của nhiều mô hình fine-tuned theo tác vụ cụ thể và cung cấp tiềm năng cho các dịch vụ fine-tuning tùy chỉnh quy mô lớn. Mã nguồn có sẵn tại https://github.com/S-LoRA/S-LoRA.
+
+1 GIỚI THIỆU
+Các mô hình ngôn ngữ lớn (LLM) đã trở nên phổ biến trong các ứng dụng hiện đại, từ xử lý ngôn ngữ tự nhiên đến các tác vụ tổng quát hơn (OpenAI, 2023; Touvron et al., 2023b; Alayrac et al., 2022). Trong các lĩnh vực này, LLM đã liên tục thể hiện hiệu suất vượt trội, đặc biệt là khi được fine-tuned cho các tác vụ cụ thể (Kenton & Toutanova, 2019; Houlsby et al., 2019; Ouyang et al., 2022). Mô hình "pretrain-rồi-finetune" này đã dẫn đến sự phát triển của nhiều biến thể fine-tuned của một LLM cơ sở duy nhất, mỗi biến thể được điều chỉnh cho một tác vụ hoặc lĩnh vực cụ thể.
+
+Khi mở rộng fine-tuning của mô hình cơ sở cho nhiều tác vụ, chẳng hạn như trợ lý cá nhân, có thể liên quan đến hàng nghìn hoặc hàng triệu người dùng, chi phí đào tạo và phục vụ liên quan có thể trở nên đáng kể. Để giải quyết vấn đề này, một số phương pháp fine-tuning tiết kiệm tham số đã được phát triển. Một ví dụ tiêu biểu là Low-Rank Adaptation (LoRA) (Hu et al., 2021), cho phép fine-tuning hiệu quả bằng cách chỉ cập nhật các ma trận cộng thêm low-rank. Các ma trận này bao gồm một số lượng nhỏ tham số, được gọi là trọng số adapter. LoRA đã chỉ ra rằng bằng cách fine-tuning chỉ các trọng số adapter này, có thể đạt được hiệu suất ngang bằng với fine-tuning toàn bộ trọng số. Tuy nhiên, mặc dù có nghiên cứu đáng kể về fine-tuning, câu hỏi về cách phục vụ các biến thể fine-tuned này ở quy mô lớn vẫn chưa được khám phá.
+
+Một trong những đổi mới quan trọng trong bài báo LoRA là việc loại bỏ độ trễ suy luận adapter bằng cách trực tiếp hợp nhất adapter với các tham số mô hình. Ngoài ra, để hỗ trợ nhiều mô hình trên một máy duy nhất, cùng một bài báo đề xuất việc hoán đổi adapter bằng cách cộng và trừ trọng số LoRA từ mô hình cơ sở. Trong khi cách tiếp cận này cho phép suy luận độ trễ thấp cho một adapter duy nhất và thực thi tuần tự trên các adapter, nó làm giảm đáng kể throughput phục vụ tổng thể và tăng tổng độ trễ khi phục vụ nhiều adapter đồng thời. Hơn nữa, bài báo không xem xét cơ hội tận dụng bộ nhớ host để tăng số lượng adapter được lưu trữ bởi một máy duy nhất.
+
+Trong bài báo này, chúng tôi nghiên cứu cách phục vụ có thể mở rộng hàng nghìn adapter LoRA trên một máy duy nhất. Chúng tôi quan sát thấy rằng mô hình cơ sở được chia sẻ, làm nền tảng cho nhiều adapter LoRA, mang lại cơ hội đáng kể cho suy luận theo batch. Để đạt được phục vụ multi-adapter throughput cao, việc tách tính toán mô hình cơ sở có thể batch được khỏi các tính toán LoRA riêng lẻ là có lợi.
+
+Trong khi việc tận dụng batching trong mô hình cơ sở là đơn giản (vì tất cả truy vấn đều chia sẻ mô hình cơ sở), việc mở rộng batching cho các adapter là thách thức. Đầu tiên, phục vụ nhiều adapter LoRA đồng thời đòi hỏi quản lý bộ nhớ hiệu quả. Vì bộ nhớ GPU bị giới hạn, chúng ta phải lưu trữ trọng số adapter bên ngoài GPU và tải động chúng khi cần thiết. Tuy nhiên, việc tải và bỏ tải động các adapter có kích thước khác nhau, kết hợp với việc cấp phát và giải phóng động các tensor KV cache cho các yêu cầu có độ dài chuỗi khác nhau, có thể dẫn đến phân mảnh bộ nhớ đáng kể và overhead I/O. Thứ hai, ngoài tính toán mô hình cơ sở dễ dàng batch được, tính toán riêng biệt của nhiều adapter với các rank khác biệt trong bộ nhớ không liền kề là thách thức để batch và đòi hỏi phát triển các kernel tính toán mới. Thứ ba, tận dụng nhiều GPU trên một máy duy nhất đòi hỏi các chiến lược parallelism mới để phù hợp với các trọng số và tính toán LoRA được thêm vào. Điều quan trọng là phải thiết kế cẩn thận chiến lược này để giảm thiểu overhead giao tiếp và bộ nhớ.
+
+Để đạt được mục tiêu này, chúng tôi giới thiệu S-LoRA, một hệ thống phục vụ LoRA có thể mở rộng. S-LoRA khai thác các cơ hội batching, quản lý hiệu quả cả bộ nhớ host và GPU, và điều phối parallelism trên nhiều GPU. Các đóng góp chính của S-LoRA được tóm tắt như sau:
+
+•Unified Paging: Để giảm phân mảnh bộ nhớ và tăng kích thước batch, S-LoRA giới thiệu một pool bộ nhớ thống nhất. Pool này quản lý trọng số adapter động và tensor KV cache bằng một cơ chế paging thống nhất.
+
+•Heterogeneous Batching: Để giảm thiểu overhead độ trễ khi batching các adapter khác nhau với rank khác nhau, S-LoRA sử dụng các kernel CUDA tùy chỉnh được tối ưu hóa cao. Các kernel này hoạt động trực tiếp trên bộ nhớ không liền kề và phù hợp với thiết kế pool bộ nhớ, tạo điều kiện cho suy luận batch hiệu quả cho LoRA.
+
+•S-LoRA TP: Để đảm bảo parallelization hiệu quả trên nhiều GPU, S-LoRA giới thiệu một chiến lược tensor parallelism mới. Cách tiếp cận này tạo ra chi phí giao tiếp tối thiểu cho tính toán LoRA được thêm vào so với mô hình cơ sở. Điều này được thực hiện bằng cách lên lịch giao tiếp trên các tensor trung gian nhỏ và hợp nhất các tensor lớn với các giao tiếp của mô hình cơ sở.
+
+Chúng tôi đánh giá S-LoRA bằng cách phục vụ Llama-7B/13B/30B/70B. Kết quả cho thấy S-LoRA có thể phục vụ hàng nghìn adapter LoRA trên một GPU hoặc trên nhiều GPU với overhead nhỏ. Khi so sánh với thư viện fine-tuning tiết kiệm tham số hiện đại, Huggingface PEFT, S-LoRA có thể tăng throughput lên đến 30×. So với hệ thống phục vụ throughput cao vLLM sử dụng hỗ trợ naïve cho phục vụ LoRA, S-LoRA có thể cải thiện throughput lên đến 4× và tăng số lượng adapter được phục vụ lên nhiều bậc độ lớn.
+
+2 KIẾN THỨC NỀN TẢNG
+
+Low-Rank Adaptation (LoRA) (Hu et al., 2021) là một phương pháp fine-tuning tiết kiệm tham số được thiết kế để điều chỉnh các mô hình ngôn ngữ lớn được pre-trained cho các tác vụ mới. Động lực đằng sau LoRA xuất phát từ tính chiều thấp nội tại của các cập nhật mô hình trong quá trình điều chỉnh. Trong giai đoạn đào tạo, LoRA đóng băng các trọng số của mô hình cơ sở được pre-trained và thêm các ma trận low-rank có thể đào tạo vào mỗi lớp. Cách tiếp cận này làm giảm đáng kể số lượng tham số có thể đào tạo và tiêu thụ bộ nhớ. Khi so sánh với fine-tuning tham số đầy đủ, LoRA thường có thể giảm số lượng tham số có thể đào tạo theo bậc độ lớn (ví dụ, 10000×) trong khi vẫn duy trì độ chính xác tương đương. Đối với giai đoạn suy luận, bài báo gốc đề xuất hợp nhất các ma trận low-rank với trọng số của mô hình cơ sở. Kết quả là, không có overhead bổ sung trong quá trình suy luận, làm cho nó khác biệt so với các adapter trước đó như (Houlsby et al., 2019) hoặc các phương pháp prompt tuning như (Lester et al., 2021).
+
+Chính thức, đối với ma trận trọng số được pre-trained W∈Rh×d, LoRA giới thiệu cập nhật là W′=W+AB, trong đó A∈Rh×r, B∈Rr×d, và rank r≪min(h, d). Nếu forward pass của mô hình cơ sở được định nghĩa bởi h=xW, thì sau khi áp dụng LoRA, forward pass trở thành
+
+h=xW′=x(W+AB) (1)
+=xW+xAB. (2)
+
+Thông thường, điều chỉnh này chỉ được áp dụng cho các ma trận projection query, key, value, và output trong module self-attention, không bao gồm module feed-forward.
+
+Vì LoRA làm giảm đáng kể chi phí đào tạo và lưu trữ trọng số, nó đã được cộng đồng áp dụng rộng rãi, và mọi người đã tạo ra hàng trăm nghìn adapter LoRA cho các mô hình ngôn ngữ lớn được pre-trained và các mô hình diffusion (Mangrulkar et al., 2022).
+
+2.1 Phục vụ Các Mô hình Ngôn ngữ Lớn
+
+Hầu hết các mô hình ngôn ngữ lớn (LLM) đều dựa trên kiến trúc transformer (Vaswani et al., 2017). Số lượng tham số trong một LLM dao động từ vài tỷ đến vài nghìn tỷ (Brown et al., 2020; Chowdhery et al., 2022; Fedus et al., 2022), tương ứng với kích thước đĩa từ vài gigabyte đến thậm chí terabyte. Quy mô này dẫn đến việc phục vụ LLM có yêu cầu tính toán và bộ nhớ đáng kể.
+
+Ngoài ra, quá trình suy luận cho LLM đòi hỏi giải mã tự hồi quy lặp lại. Ban đầu, mô hình thực hiện một forward pass để mã hóa prompt. Sau đó, nó giải mã đầu ra từng token một. Quá trình tuần tự này làm cho việc giải mã chậm. Vì mỗi token chú ý đến các trạng thái ẩn của tất cả các token trước đó, việc lưu trữ các trạng thái ẩn của tất cả các token trước đó trở nên cần thiết. Việc lưu trữ này được gọi là "KV cache". Cơ chế như vậy làm tăng overhead bộ nhớ và khiến quá trình giải mã tốn nhiều bộ nhớ hơn là tính toán.
+
+Các thách thức trở nên rõ ràng hơn trong môi trường trực tuyến, nơi các yêu cầu có độ dài chuỗi khác nhau đến động. Để phù hợp với các yêu cầu đến động như vậy, Orca (Yu et al., 2022) giới thiệu một phương pháp lập lịch fine-grained, cấp độ lặp lại. Thay vì lập lịch ở cấp độ yêu cầu, Orca batch ở cấp độ token. Cách tiếp cận này cho phép việc bổ sung liên tục các yêu cầu mới vào batch đang chạy, dẫn đến throughput cao hơn đáng kể. vLLM (Kwon et al., 2023) tiếp tục tối ưu hóa hiệu quả bộ nhớ của Orca bằng cách sử dụng PagedAttention. PagedAttention áp dụng các khái niệm từ bộ nhớ ảo và paging trong hệ điều hành và quản lý việc lưu trữ và truy cập các tensor KV cache động theo cách paged. Phương pháp này hiệu quả làm giảm phân mảnh, tạo điều kiện cho kích thước batch lớn hơn và throughput cao hơn.
+
+Khi phục vụ các mô hình rất lớn vượt quá khả năng bộ nhớ của một GPU duy nhất, hoặc khi có yêu cầu độ trễ nghiêm ngặt, việc parallelization mô hình trên nhiều GPU là cần thiết. Một số phương pháp model parallelism đã được đề xuất, chẳng hạn như tensor parallelism (Shoeybi et al., 2019), sequence parallelism (Korthikanti et al., 2023), pipeline parallelism (Huang et al., 2019), và các kết hợp của chúng (Narayanan et al., 2021; Zheng et al., 2022).
+
+3 TỔNG QUAN VỀ S-LORA
+
+S-LoRA bao gồm ba thành phần đổi mới chính. Trong Mục 4, chúng tôi giới thiệu chiến lược batching của mình, phân tách tính toán giữa mô hình cơ sở và các adapter LoRA. Ngoài ra, chúng tôi thảo luận về adapter clustering và admission control khi lập lịch các yêu cầu. Khả năng batch trên các adapter đồng thời giới thiệu những thách thức mới xung quanh quản lý bộ nhớ. Trong Mục 5, chúng tôi tổng quát hóa PagedAttention (Kwon et al., 2023) thành Unified Paging, hỗ trợ tải động các adapter LoRA. Cách tiếp cận này sử dụng một pool bộ nhớ thống nhất để lưu trữ KV cache và trọng số adapter theo cách paged, có thể giảm phân mảnh và cân bằng kích thước thay đổi động của KV cache và trọng số adapter. Trong Mục 6, chúng tôi giới thiệu chiến lược tensor parallelism mới cho phép chúng tôi tách hiệu quả mô hình cơ sở và các adapter LoRA.
+
+4 BATCHING VÀ SCHEDULING
+
+4.1 Batching
+
+Chiến lược batching của chúng tôi nhằm hỗ trợ phục vụ trực tuyến và throughput cao của nhiều adapter LoRA đồng thời.
+
+Đối với một adapter duy nhất, phương pháp được khuyến nghị bởi (Hu et al., 2021) là hợp nhất trọng số adapter vào trọng số mô hình cơ sở, tạo ra một mô hình mới (xem Eq. 1). Điều này có lợi thế là không có overhead adapter bổ sung trong quá trình suy luận, vì mô hình mới có cùng số lượng tham số với mô hình cơ sở. Thực tế, đây là một tính năng nổi bật của công trình LoRA gốc.
+
+Tuy nhiên, khi có nhiều adapter, việc hợp nhất trọng số vào mô hình cơ sở dẫn đến nhiều bản sao trọng số và mất cơ hội batching. Việc hợp nhất trực tiếp các mô hình đòi hỏi duy trì nhiều bản sao của mô hình ngôn ngữ đầy đủ. Trong bài báo LoRA gốc, các tác giả đề xuất cộng và trừ trọng số LoRA một cách linh hoạt để cho phép phục vụ nhiều mô hình mà không tăng overhead bộ nhớ. Tuy nhiên, cách tiếp cận này không hỗ trợ suy luận đồng thời trên các adapter LoRA riêng biệt và do đó hạn chế các cơ hội batching.
+
+Trong bài báo này, chúng tôi chỉ ra rằng việc hợp nhất các adapter LoRA vào mô hình cơ sở là không hiệu quả cho môi trường phục vụ multi-LoRA throughput cao. Thay vào đó, chúng tôi đề xuất tính toán tính toán LoRA xAB một cách linh hoạt như được hiển thị trong Eq. 2. Điều này tránh trùng lặp trọng số và cho phép batching của phép toán xW tốn kém hơn. Nhưng cách tiếp cận này cũng tăng overhead tính toán. Tuy nhiên, vì chi phí của xAB thấp hơn đáng kể so với xW và có tiết kiệm đáng kể từ việc batching xW trên các adapter khác nhau, chúng tôi chỉ ra rằng tiết kiệm vượt xa overhead bổ sung.
+
+Thật không may, việc triển khai trực tiếp tính toán phân tách của mô hình cơ sở và các adapter LoRA riêng lẻ bằng cách sử dụng kernel batch GEMM từ các thư viện BLAS hiện có sẽ đòi hỏi padding đáng kể và dẫn đến việc sử dụng phần cứng kém. Điều này là do tính không đồng nhất của độ dài chuỗi và rank adapter.
+
+Trong S-LoRA, chúng tôi batch tính toán của mô hình cơ sở và sau đó sử dụng các kernel CUDA tùy chỉnh để thực hiện xAB bổ sung cho tất cả các adapter riêng biệt. Quá trình này được minh họa bởi Hình 1. Thay vì sử dụng padding một cách naïve và sử dụng kernel batch GEMM từ thư viện BLAS cho tính toán LoRA, chúng tôi triển khai các kernel CUDA tùy chỉnh để tính toán hiệu quả hơn mà không cần padding. Trong Mục 5.3, chúng tôi thảo luận về chi tiết triển khai.
+
+Trong khi số lượng adapter LoRA có thể lớn nếu chúng ta lưu trữ chúng trong bộ nhớ chính, số lượng adapter LoRA cần thiết cho batch hiện tại đang chạy là có thể quản lý được, vì kích thước batch bị giới hạn bởi bộ nhớ GPU. Để tận dụng điều này, chúng tôi lưu trữ tất cả adapter LoRA trong bộ nhớ chính và chỉ lấy các adapter LoRA cần thiết cho batch hiện tại đang chạy vào RAM GPU khi chạy suy luận cho batch đó. Trong trường hợp này, số lượng adapter tối đa có thể được phục vụ bị giới hạn bởi kích thước bộ nhớ chính. Quá trình này được minh họa bởi Hình 2. Để đạt được phục vụ throughput cao, chúng tôi áp dụng chiến lược batching lập lịch cấp độ lặp lại từ Orca (Yu et al., 2022). Trong cách tiếp cận này, các yêu cầu được lập lịch ở cấp độ token. Chúng tôi ngay lập tức kết hợp một yêu cầu mới vào batch đang chạy nếu có không gian. Yêu cầu sẽ thoát khỏi batch khi nó đạt đến số lượng token được tạo tối đa hoặc đáp ứng các tiêu chí dừng khác. Quá trình này làm giảm việc sử dụng bộ nhớ GPU nhưng giới thiệu những thách thức quản lý bộ nhớ mới. Trong Mục 5, chúng tôi sẽ thảo luận về các kỹ thuật của mình để quản lý bộ nhớ hiệu quả.
+
+4.2 Adapter Clustering
+
+Để tăng hiệu quả batching, một chiến lược tiềm năng là giảm số lượng adapter hoạt động trong một batch đang chạy. Bằng cách sử dụng ít adapter hơn, có cơ hội cấp phát nhiều bộ nhớ hơn cho KV cache, từ đó có thể tạo điều kiện cho kích thước batch lớn hơn. Với khả năng bộ nhớ thông thường của GPU, chúng thường không được sử dụng đầy đủ trong khi giải mã. Do đó, việc tăng kích thước batch có thể dẫn đến throughput cao hơn. Một cách tiếp cận trực tiếp để giảm số lượng adapter trong một batch đang chạy là ưu tiên batching các yêu cầu sử dụng cùng một adapter, một chiến lược mà chúng tôi gọi là "adapter clustering". Tuy nhiên, adapter clustering có những đánh đổi riêng. Ví dụ, nó có thể làm tổn hại đến độ trễ trung bình hoặc công bằng giữa các adapter. Chúng tôi cung cấp một nghiên cứu ablation trong Phụ lục A để minh họa cách throughput và độ trễ thay đổi theo kích thước cluster.
+
+4.3 Admission Control
+
+Trong S-LoRA, chúng tôi cũng áp dụng một chiến lược admission control để duy trì thành tựu tốt khi lưu lượng cao hơn khả năng của hệ thống phục vụ. Một hệ thống phục vụ thường được đặc trưng bởi một mục tiêu mức dịch vụ (SLO) chỉ định độ trễ mong muốn của việc xử lý yêu cầu. Nếu hệ thống phục vụ có khả năng cố định, nó phải triển khai một cơ chế admission control, loại bỏ một yêu cầu, nếu hệ thống không thể đáp ứng SLO của nó. Nếu không, nếu không có yêu cầu nào bị loại bỏ, và số lượng yêu cầu đến lớn hơn khả năng hệ thống trong thời gian đủ dài, hệ thống phục vụ chắc chắn sẽ vi phạm SLO. Chúng tôi đã triển khai một chiến lược abort để mô phỏng admission control trong S-LoRA, gọi là chiến lược early abort. Một cách trực quan, chúng tôi ước tính tập hợp các yêu cầu mới nhất mà chúng tôi có thể phục vụ trong SLO, và sau đó phục vụ chúng theo thứ tự thời gian đến. Các chi tiết triển khai và biện minh toán học được hoãn lại đến Phụ lục B.
+
+5 QUẢN LÝ BỘ NHỚ
+
+So với việc phục vụ một mô hình cơ sở duy nhất, việc phục vụ nhiều adapter LoRA đồng thời mang lại những thách thức quản lý bộ nhớ mới. Để hỗ trợ nhiều adapter, S-LoRA lưu trữ chúng trong bộ nhớ chính và tải động các trọng số adapter cần thiết cho batch hiện tại đang chạy vào RAM GPU. Trong quá trình này, có hai thách thức đáng chú ý. Thứ nhất là phân mảnh bộ nhớ, do việc tải và bỏ tải động các trọng số adapter có kích thước khác nhau. Thứ hai là overhead độ trễ được giới thiệu bởi việc tải và bỏ tải adapter. Để giải quyết những thách thức này một cách hiệu quả, chúng tôi đề xuất Unified Paging và chồng chéo I/O với tính toán bằng cách prefetch trọng số adapter.
+
+5.1 Unified Paging
+
+Hiểu bản chất của trọng số adapter là cần thiết để tối ưu hóa việc sử dụng bộ nhớ. Quan sát chính của chúng tôi là những trọng số adapter động này tương tự như KV cache động theo nhiều cách:
+
+•Kích thước và hoạt động biến đổi: Giống như kích thước KV cache dao động theo độ dài chuỗi, các rank của adapter hoạt động cũng có thể phụ thuộc vào việc lựa chọn adapter liên kết với mỗi yêu cầu. KV cache được cấp phát khi yêu cầu đến và được giải phóng khi yêu cầu hoàn thành. Tương tự, trọng số adapter được tải và xóa với mỗi yêu cầu. Nếu không được quản lý đúng cách, sự biến đổi này có thể dẫn đến phân mảnh.
+
+•Tính chiều: Một tensor KV cache cho một yêu cầu trong một lớp có hình dạng (S, H), trong đó S biểu thị độ dài chuỗi và H đại diện cho chiều ẩn. Trong khi đó, hình dạng của trọng số LoRA là (R, H), với R đại diện cho rank và H là chiều ẩn. Cả hai đều chia sẻ một kích thước chiều H có thể được tận dụng để giảm phân mảnh.
+
+Được thúc đẩy bởi những điểm tương đồng này, chúng tôi mở rộng ý tưởng của PagedAttention (Kwon et al., 2023) thành Unified Paging quản lý trọng số adapter ngoài KV cache. Unified Paging sử dụng một pool bộ nhớ thống nhất để quản lý chung cả KV cache và trọng số adapter. Để triển khai điều này, trước tiên chúng tôi cấp phát một buffer lớn một cách tĩnh cho pool bộ nhớ. Buffer này sử dụng tất cả không gian có sẵn trừ không gian bị chiếm bởi trọng số mô hình cơ sở và tensor activation tạm thời. Cả KV cache và trọng số adapter đều được lưu trữ trong pool bộ nhớ này theo cách paged, với mỗi page tương ứng với một vector của H. Do đó, một tensor KV cache có độ dài chuỗi S sử dụng hết S page, trong khi một tensor trọng số LoRA có rank R chiếm R page. Hình 3 minh họa bố cục của pool bộ nhớ của chúng tôi, nơi KV cache và trọng số adapter được lưu trữ xen kẽ và không liền kề. Cách tiếp cận này làm giảm đáng kể phân mảnh, đảm bảo rằng trọng số adapter với các rank khác nhau có thể cùng tồn tại với KV cache động một cách có cấu trúc và hệ thống.
+
+5.2 Prefetching và Overlapping
+
+Mặc dù pool bộ nhớ thống nhất giảm thiểu phân mảnh, overhead I/O từ việc tải và bỏ tải vẫn là một mối quan tâm—đặc biệt là khi xử lý nhiều hoặc adapter lớn. Độ trễ được giới thiệu bởi việc chờ tải những adapter này có thể làm tổn hại đến hiệu quả của hệ thống.
+
+Để giải quyết vấn đề này một cách chủ động, chúng tôi giới thiệu một cơ chế dự đoán động. Trong khi chạy batch giải mã hiện tại, chúng tôi dự đoán các adapter cần thiết cho batch tiếp theo dựa trên hàng đợi chờ hiện tại. Dự đoán này cho phép chúng tôi prefetch và lưu trữ chúng trong bộ nhớ có sẵn. Chiến lược nhìn về phía trước như vậy giữ hầu hết các adapter cần thiết cho batch tiếp theo đã sẵn sàng trước khi chạy nó, giảm thời gian I/O cho việc hoán đổi adapter.
+
+5.3 Kernel Tùy chỉnh cho Batching LoRA Không đồng nhất trên Bộ nhớ Không liền kề
+
+Do thiết kế của pool bộ nhớ thống nhất, trọng số adapter được lưu trữ trong bộ nhớ không liền kề. Để chạy tính toán hiệu quả dưới thiết kế này, chúng tôi triển khai các kernel CUDA tùy chỉnh hỗ trợ batching tính toán LoRA với rank và độ dài chuỗi khác nhau trong bố cục bộ nhớ không liền kề.
+
+Trong giai đoạn prefill, kernel xử lý một chuỗi token và thu thập trọng số adapter với rank khác nhau từ pool bộ nhớ. Chúng tôi gọi kernel này là Multi-size Batched Gather Matrix-Matrix Multiplication (MBGMM). Nó được triển khai trong Triton (Tillet et al., 2019) với tiling.
+
+Trong giai đoạn decode, kernel xử lý một token duy nhất và thu thập trọng số adapter với rank khác nhau từ pool bộ nhớ. Chúng tôi gọi kernel này là Multi-size Batched Gather Matrix-Vector Multiplication (MBGMV). Chúng tôi triển khai hai phiên bản của kernel này: một trong Triton và một khác bằng cách sửa đổi phiên bản trước của kernel Punica (Chen, 2023) để mở rộng hỗ trợ cho bộ nhớ không liền kề, nhiều rank trong một batch, và thu thập bộ nhớ fine-grained hơn. Chúng tôi thấy phiên bản sau nhanh hơn, nên chúng tôi sử dụng nó trong các thí nghiệm.
+
+Punica (Chen et al., 2023) là công trình đồng thời về phục vụ nhiều adapter LoRA, sẽ được thảo luận trong Mục 8. Ngoài kernel Triton và Punica, NVIDIA CUTLASS cũng cung cấp kernel hiệu suất cao cho grouped GEMM (NVIDIA) có thể được sử dụng cho batching không đồng nhất.
+
+6 TENSOR PARALLELISM
+
+Chúng tôi thiết kế các chiến lược tensor parallelism mới cho suy luận LoRA batch để hỗ trợ suy luận multi-GPU của các mô hình transformer lớn. Tensor parallelism là phương pháp parallelism được sử dụng rộng rãi nhất vì pattern single-program multiple-data của nó đơn giản hóa việc triển khai và tích hợp với các hệ thống hiện có. Tensor parallelism có thể giảm việc sử dụng bộ nhớ per-GPU và độ trễ khi phục vụ các mô hình lớn. Trong môi trường của chúng tôi, các adapter LoRA bổ sung giới thiệu các ma trận trọng số mới và phép nhân ma trận, đòi hỏi các chiến lược phân vùng mới cho những mục được thêm vào này.
+
+6.1 Chiến lược Phân vùng
+
+Vì mô hình cơ sở sử dụng chiến lược tensor parallelism Megatron-LM (Shoeybi et al., 2019), cách tiếp cận của chúng tôi nhằm mục đích căn chỉnh các chiến lược phân vùng của đầu vào và đầu ra của tính toán LoRA được thêm vào với những chiến lược của mô hình cơ sở. Bằng cách này, chúng tôi có thể giảm thiểu chi phí giao tiếp bằng cách tránh các giao tiếp không cần thiết và hợp nhất một số giao tiếp.
+
+Chúng tôi sử dụng module feed-forward (MLP 2 lớp) để minh họa chiến lược phân vùng của mình. Chúng tôi sẽ giải thích sau cách chiến lược này có thể dễ dàng được điều chỉnh cho lớp self-attention.
+
+Như được mô tả trong Hình 4, hộp trên minh họa chiến lược phân vùng Megatron-LM của mô hình cơ sở: ma trận trọng số đầu tiên (W1) được phân vùng theo cột, và ma trận thứ hai (W2) được phân vùng theo hàng. Một giao tiếp all-reduce được yêu cầu để tích lũy tổng một phần từ các thiết bị phân tán.
+
+Hộp dưới minh họa chiến lược phân vùng cho tính toán LoRA được thêm vào. Các ma trận A1 và B1 cho adapter của ma trận trọng số đầu tiên (W1) được phân vùng theo cột. Một phép toán all-gather được sử dụng để thu thập kết quả trung gian. Các ma trận A2 và B2 cho adapter của trọng số thứ hai (W2) được phân vùng theo hàng và cột, tương ứng. Một phép toán all-reduce được sử dụng để tổng hợp kết quả trung gian. Cuối cùng, kết quả từ tính toán LoRA được thêm vào kết quả từ mô hình cơ sở (add2). Một phép toán all-reduce duy nhất là đủ để tích lũy kết quả cuối cùng. Đáng chú ý là chúng tôi về bản chất đang hợp nhất một phép toán all-gather cho matmul 4 với all-reduce cuối cùng. Theo hiểu biết của chúng tôi, chiến lược parallelization này chưa được nghiên cứu trước đây.
+
+Tiếp theo, chúng tôi thảo luận về việc điều chỉnh chiến lược từ MLP 2 lớp sang lớp self-attention. Tương tự như chiến lược Megatron-LM, chúng tôi phân vùng chiều head của lớp self-attention. Ma trận trọng số projection query-key-value có thể được xem là W1 trong ví dụ của chúng tôi và ma trận trọng số projection output có thể được xem là W2 trong ví dụ của chúng tôi.
+
+6.2 Phân tích Chi phí Giao tiếp và Bộ nhớ
+
+Gọi N là số lượng thiết bị, B là số lượng token, h là kích thước ẩn, và r là rank adapter. Chi phí giao tiếp của mô hình cơ sở là một all-reduce, hoặc 2(N−1)Bh/N. Chi phí giao tiếp của tính toán LoRA được thêm vào là ba all-gather cho query, key, và value projection, và một all-reduce cho output projection. Chính thức, nó là 3(N−1)Br/N+2(N−1)Br/N=5(N−1)Br/N.
+
+Dưới chiến lược của chúng tôi, chi phí giao tiếp bổ sung được giới thiệu bởi LoRA là không đáng kể khi so sánh với chi phí giao tiếp của mô hình cơ sở, vì r≪h. Một cách trực quan, điều này đạt được bằng cách lên lịch cẩn thận các giao tiếp trên các tensor trung gian nhỏ của tính toán LoRA và hợp nhất các giao tiếp với mô hình cơ sở.
+
+Về mặt sử dụng bộ nhớ, chiến lược của chúng tôi là tối ưu vì chúng tôi phân vùng tất cả ma trận trọng số giữa tất cả thiết bị và không có ma trận trọng số được nhân bản.
+
+7 ĐÁNH GIÁ
+
+Chúng tôi đánh giá hiệu suất của S-LoRA trên cả workload tổng hợp và workload sản xuất thực tế. S-LoRA được xây dựng trên LightLLM (ModelTC, 2023), một hệ thống phục vụ LLM mô hình đơn dựa trên PyTorch (Paszke et al., 2019) và Triton (Tillet et al., 2019). Chúng tôi đánh giá khả năng mở rộng của S-LoRA bằng cách phục vụ lên đến hai nghìn adapter LoRA đồng thời và so sánh với các baseline mạnh khác. Sau đó chúng tôi thực hiện các nghiên cứu ablation để xác minh hiệu quả của các thành phần riêng lẻ.
+
+7.1 Thiết lập
+
+Mô hình. Chúng tôi thử nghiệm dòng mô hình Llama (Touvron et al., 2023a;b), một trong những mô hình ngôn ngữ lớn mở phổ biến nhất. Chúng tôi xem xét 5 cấu hình mô hình và adapter khác nhau, được liệt kê trong Bảng 1. Các tối ưu hóa của chúng tôi có thể dễ dàng điều chỉnh cho các kiến trúc dựa trên transformer khác, chẳng hạn như GPT-3 (Brown et al., 2020) và PaLM (Chowdhery et al., 2022; Anil et al., 2023).
+
+Phần cứng. Chúng tôi tiến hành thử nghiệm trên các cài đặt phần cứng khác nhau, bao gồm một GPU NVIDIA A10G duy nhất (24GB), một GPU A100 duy nhất (40GB), một GPU A100 duy nhất (80GB), và nhiều GPU A100 (40GB/80GB). Bộ nhớ chính của host thay đổi dựa trên thiết lập GPU, từ 64 GB đến 670 GB. Chúng tôi sẽ chỉ ra rằng S-LoRA có thể mở rộng hiệu quả số lượng adapter, chỉ bị giới hạn bởi bộ nhớ chính có sẵn.
+
+Baseline. Chúng tôi benchmark một số biến thể của S-LoRA, HuggingFace PEFT (Mangrulkar et al., 2022), và vLLM (Kwon et al., 2023).
+
+•"HuggingFace PEFT" là một thư viện để đào tạo và chạy các mô hình fine-tuning tiết kiệm tham số. Nó thiếu batching và quản lý bộ nhớ tiên tiến. Chúng tôi xây dựng một server sử dụng nó để batch các yêu cầu adapter đơn và chuyển đổi trọng số adapter giữa các batch.
+
+•"vLLM m-packed" là một giải pháp phục vụ multi-model đơn giản dựa trên vLLM, một hệ thống phục vụ throughput cao. Vì vLLM không hỗ trợ LoRA, chúng tôi hợp nhất trọng số LoRA vào mô hình cơ sở và phục vụ nhiều phiên bản của trọng số được hợp nhất riêng biệt. Để phục vụ m adapter LoRA, chúng tôi chạy m worker vLLM trên một GPU duy nhất, nơi nhiều worker là các tiến trình riêng biệt được quản lý bởi NVIDIA MPS. Chúng tôi cấp phát bộ nhớ GPU một cách thống kê tỷ lệ thuận với tỷ lệ yêu cầu trung bình cho mỗi tiến trình.
+
+•"S-LoRA" là S-LoRA với tất cả các tối ưu hóa và nó đang sử dụng chiến lược lập lịch first-come-first-serve.
+
+•"S-LoRA-no-unify-mem" là S-LoRA không có quản lý bộ nhớ thống nhất.
+
+•"S-LoRA-bmm" là S-LoRA không có quản lý bộ nhớ thống nhất và kernel tùy chỉnh. Nó sao chép trọng số adapter sang không gian bộ nhớ liên tục và thực hiện phép nhân ma trận batch với padding.
+
+Chỉ số. Có một số chỉ số để đo lường hiệu suất của hệ thống phục vụ, bao gồm độ trễ và throughput. Theo thực tiễn thông thường, chúng tôi báo cáo throughput, độ trễ yêu cầu trung bình, độ trễ token đầu tiên trung bình, và SLO attainment. SLO attainment được định nghĩa là phần trăm yêu cầu trả về token đầu tiên trong 6 giây. Ngoài ra, chúng tôi giới thiệu một chỉ số mới gọi là user satisfaction (xem Phụ lục B), cung cấp phân tích fine-grained hơn về độ trễ token đầu tiên. Một cách trực quan, độ trễ token đầu tiên ngắn hơn mang lại sự hài lòng cao hơn. Sự hài lòng trở thành 0 nếu độ trễ token đầu tiên vượt quá SLO.
+
+7.2 Kết quả End-to-End trên Workload Tổng hợp
+
+Trace workload. Chúng tôi tạo ra các trace workload tổng hợp sử dụng quá trình Gamma, thường được sử dụng trong tài liệu phục vụ machine learning (Crankshaw et al., 2020; Li et al., 2023). Cho n adapter, các yêu cầu cho adapter i được mô hình hóa bằng quá trình Gamma arrival với tỷ lệ trung bình λi và hệ số biến thiên (CV) là cv. Tỷ lệ trung bình, λi, tuân theo phân phối power-law với số mũ α. Tổng tỷ lệ yêu cầu cho tất cả adapter là R yêu cầu mỗi giây. Đối với n adapter, chúng tôi đặt rank của chúng dựa trên danh sách được cung cấp trong Bảng 1 với phương pháp round-robin. Các thử nghiệm của chúng tôi bao gồm các kết hợp khác nhau của n, α, R, và cv. Đối với mỗi yêu cầu, độ dài đầu vào và đầu ra được lấy mẫu từ các phân phối đều U[Il, Iu] và U[Ol, Ou] tương ứng. Thời gian mặc định của một trace là 5 phút. Để tiến hành thí nghiệm toàn diện, trước tiên chúng tôi chọn một tập hợp tham số mặc định để tạo workload, như được hiển thị trong Bảng 2. Sau đó chúng tôi thay đổi một trong các n, α, R, và cv để xem mỗi yếu tố ảnh hưởng đến hiệu suất như thế nào.
+
+So sánh với các hệ thống khác. Chúng tôi so sánh S-LoRA với cả vLLM-packed và HuggingFace PEFT để phục vụ nhiều adapter LoRA. Kết quả được hiển thị trong Bảng 3. Đáng chú ý, S-LoRA có thể phục vụ 2.000 adapter đồng thời, duy trì overhead tối thiểu cho tính toán LoRA được thêm vào. Ngược lại, vLLM-packed cần duy trì nhiều bản sao trọng số và chỉ có thể phục vụ ít hơn 5 adapter do hạn chế bộ nhớ GPU. Throughput của vLLM-packed cũng thấp hơn nhiều do mất cơ hội batching. Mặc dù PEFT có thể hoán đổi adapter giữa các batch, cho phép nó xử lý số lượng lớn adapter, việc thiếu các phương pháp batching tiên tiến và quản lý bộ nhớ dẫn đến hiệu suất kém hơn đáng kể. Nhìn chung, S-LoRA đạt được throughput cao hơn lên đến 4x so với vLLM-packed khi phục vụ số lượng nhỏ adapter, và cao hơn lên đến 30x so với PEFT, trong khi hỗ trợ số lượng adapter lớn hơn đáng kể.
+
+So sánh với các biến thể riêng. Vì không có hệ thống baseline nào có thể mở rộng hiệu quả đến số lượng lớn adapter, bây giờ chúng tôi tập trung vào việc so sánh S-LoRA với các biến thể riêng của nó. Hình 5 minh họa cách chúng mở rộng với số lượng adapter. S-LoRA đạt được throughput cao hơn đáng kể và độ trễ thấp hơn so với S-LoRA-bmm và S-LoRA-no-unify-mem. Điều này ngụ ý rằng pool bộ nhớ và kernel tùy chỉnh của chúng tôi có hiệu quả. Khi số lượng adapter tăng, throughput của S-LoRA ban đầu trải qua một sự giảm nhẹ do overhead được giới thiệu bởi LoRA. Tuy nhiên, một khi số lượng adapter đạt đến một ngưỡng nhất định (ví dụ, 100 trong hầu hết các thí nghiệm), throughput của S-LoRA không còn giảm. Tính ổn định này có thể được quy cho thực tế là khi số lượng adapter tăng, số lượng adapter được kích hoạt cho batch hiện tại đang chạy vẫn không thay đổi, duy trì overhead không đổi. Do đó, S-LoRA có thể mở rộng đến số lượng adapter lớn hơn nhiều mà không phát sinh overhead bổ sung, chỉ bị hạn chế bởi bộ nhớ chính có sẵn.
+
+Hình 6 thể hiện sự biến thiên trong throughput, độ trễ token đầu tiên, và SLO attainment tương đối với tổng tỷ lệ yêu cầu, tiết lộ một mô hình nhất quán với các quan sát nêu trên và nhấn mạnh hiệu quả của thiết kế của chúng tôi.
+
+7.3 Kết quả End-to-End trên Workload Thực tế
+
+Trace workload thực tế. Chúng tôi xây dựng các trace phục vụ thực tế bằng cách downsampling từ các trace của LMSYS Chatbot Arena (Zheng et al., 2023b;a), một trang web phục vụ nhiều LLM. Log thô từ Arena không quan tâm đến adapter LoRA; nó tập trung vào các mô hình cơ sở khác nhau. Tuy nhiên, chúng tôi coi phân phối của các mô hình cơ sở khác nhau như thể chúng là phân phối của các adapter khác nhau của một mô hình cơ sở duy nhất. Log thô có thể được lấy mẫu thành các trace thể hiện các tỷ lệ yêu cầu khác nhau, được biểu thị là R, và thời gian, được đại diện bởi D. Để đạt được điều này, chúng tôi lấy mẫu R·D yêu cầu từ log thô và rescale time stamp để phù hợp với phạm vi [0, D]. Số lượng mô hình n tương ứng với số lượng adapter. Hơn nữa, chúng tôi đặt rank adapter dựa trên Bảng 1 với phương pháp round-robin.
+
+Vì chúng tôi đang sử dụng trace workload thực tế, không có tham số như α, λi, hoặc cv. Để nhất quán, chúng tôi đặt thời gian là 5 phút. Chúng tôi điều chỉnh tỷ lệ yêu cầu R để nghiên cứu tác động của nó đến các chỉ số hiệu suất. Trong trace được lấy mẫu, độ dài đầu vào trung bình là 85 token, độ dài đầu ra trung bình là 165 token, và số lượng adapter là khoảng 26.
+
+Kết quả. Hình 7 hiển thị kết quả throughput và attainment, cho thấy một mô hình tương tự với workload tổng hợp. Điều này có nghĩa là hiệu suất mạnh mẽ của S-LoRA cũng có hiệu lực đối với workload thực tế.
+
+7.4 Multi-GPU Tensor Parallelism
+
+Chúng tôi thử nghiệm khả năng mở rộng của chiến lược tensor parallelism bằng cách chạy 1) Llama-30B trên hai A100 (40GB) và bốn A100 (40GB) GPU với 10 đến 100 adapter; và 2) Llama-70B trên hai A100 (80GB) và bốn A100 (80GB) GPU với 10 adapter. Sau đó chúng tôi báo cáo throughput phục vụ.
+
+Như được mô tả trong Hình 8, sự khác biệt giữa S-LoRA có và không có giao tiếp LoRA là nhỏ. Điều này cho thấy rằng giao tiếp LoRA được thêm vào trong chiến lược của chúng tôi có overhead rất nhỏ. Hình tiếp tục tiết lộ rằng overhead giao tiếp do LoRA ít hơn overhead tính toán mà nó giới thiệu. Hơn nữa, khi chuyển từ 2 GPU sang 4 GPU, throughput phục vụ tăng hơn 2 lần. Sự tăng đáng kể này có thể được quy cho thực tế là hệ thống chủ yếu bị giới hạn bởi bộ nhớ trong bối cảnh này. Việc thêm nhiều GPU giảm bớt các hạn chế bộ nhớ, dẫn đến scaling superlinear. Kết luận, kết quả xác minh cả overhead tối thiểu và khả năng mở rộng của chiến lược tensor parallelism của chúng tôi.
+
+7.5 Nghiên cứu Ablation
+
+Hợp nhất trọng số adapter so với tính toán linh hoạt. Trong khi S-LoRA không hợp nhất trọng số adapter và tính toán ma trận LoRA linh hoạt mỗi lần, chúng tôi so sánh nó với thiết kế thay thế hợp nhất adapter với mô hình cơ sở, được biểu thị là x(W+AB), như đề xuất trong bài báo LoRA. Cách tiếp cận này bao gồm: 1) Cập nhật mô hình cơ sở với trọng số adapter hiện tại trước mỗi batch mới; và 2) Chuyển sang adapter mới nếu có quá nhiều yêu cầu đang chờ. Phương pháp này hiệu quả cho số lượng nhỏ adapter do overhead tính toán LoRA giảm.
+
+Kết quả trong Hình 9 chứng minh rằng với chỉ một adapter, cách tiếp cận hợp nhất vượt trội so với tính toán linh hoạt do chi phí hợp nhất một lần. Tuy nhiên, hiệu suất của nó giảm với hơn 2 adapter, chủ yếu là do việc chuyển đổi tốn thời gian giữa các adapter. Việc chuyển đổi như vậy dẫn đến các giai đoạn GPU không được sử dụng đầy đủ. Hơn nữa, giá trị α nhỏ hơn khiến yêu cầu được phân phối không đều trên các adapter, từ đó giảm kích thước batch và hiệu suất tổng thể.
+
+Thí nghiệm chiến lược early abort. Chúng tôi so sánh chiến lược early abort của S-LoRA với First Come First Serve (FCFS) và Last Come First Serve (LCFS) để tối ưu hóa sự hài lòng của người dùng và SLO attainment. Như được hiển thị trong Hình 10, S-LoRA-Abort vượt trội so với cả hai, đặc biệt khi cv mở rộng. FCFS ít hiệu quả nhất, thường xử lý các yêu cầu đã bỏ lỡ SLO. LCFS, tương tự như thuật toán tham lam chỉ ưu tiên các yêu cầu mới nhất, hoạt động tốt cho cv nhỏ, nhưng hiệu suất giảm với cv lớn hơn. S-LoRA-Abort xuất sắc vì nó tránh chỉ ưu tiên các yêu cầu mới nhất, như được chi tiết trong Phụ lục B.
+
+8 CÔNG TRÌNH LIÊN QUAN
+
+Tối ưu hóa phục vụ LLM với kỹ thuật hệ thống. Tầm quan trọng của kiến trúc transformer đã dẫn đến việc phát triển nhiều hệ thống phục vụ chuyên biệt cho nó. Những hệ thống này sử dụng các cơ chế batching tiên tiến (Fang et al., 2021; Yu et al., 2022), tối ưu hóa bộ nhớ (Sheng et al., 2023; Kwon et al., 2023), tối ưu hóa kernel GPU (Wang et al., 2021; Aminabadi et al., 2022; NVIDIA, 2023; Dao, 2023), model parallelism (Pope et al., 2022; Aminabadi et al., 2022), parameter sharing (Zhou et al., 2022), và speculative execution (Stern et al., 2018; Miao et al., 2023) để phục vụ hiệu quả. Trong số đó, PetS (Zhou et al., 2022) có liên quan nhất đến của chúng tôi. Tuy nhiên, PetS chỉ xem xét phục vụ cho các mô hình BERT encoder-only nhỏ. Nó không xem xét suy luận tạo sinh, số lượng adapter rất lớn hoặc các mô hình lớn vượt quá một GPU duy nhất, vì vậy nó không giải quyết các vấn đề trong môi trường của chúng tôi.
+
+Trong công trình đồng thời, Punica (Chen et al., 2023) khám phá khái niệm tính toán phân tách cho mô hình cơ sở và adapter. Một số kernel CUDA của chúng tôi được phát triển dựa trên việc triển khai được trình bày trong một bài blog trước đây của Punica, với hỗ trợ bổ sung cho batching các rank khác nhau và bộ nhớ không liền kề. Việc phân tích hiệu suất kernel không phải là trọng tâm của bài báo này, nhưng nó được thảo luận trong Punica. Công trình của chúng tôi khác với Punica ở các kỹ thuật quản lý bộ nhớ và tensor parallelism mới, chưa được đề cập trong bất kỳ công trình nào trước đây.
+
+Tối ưu hóa phục vụ LLM với kỹ thuật thuật toán. Ngoài các cải tiến cấp hệ thống, hiệu quả suy luận có thể được tăng cường bằng các kỹ thuật thuật toán như quantization (Yao et al., 2022; Dettmers et al., 2022; Frantar et al., 2022; Xiao et al., 2023; Lin et al., 2023), sparsification (Frantar & Alistarh, 2023; Zhang et al., 2023b) và cải tiến kiến trúc mô hình (Shazeer, 2019). Những cách tiếp cận này có thể giảm tiêu thụ bộ nhớ và tăng tốc tính toán, với sự thỏa hiệp nhỏ trong chất lượng mô hình. Chúng bổ sung cho các kỹ thuật trong bài báo này.
+
+Fine-tuning tiết kiệm tham số. Nghiên cứu gần đây đã phát triển các phương pháp fine-tuning tiết kiệm tham số của các mô hình ngôn ngữ lớn được pre-trained. Những phương pháp này cho thấy fine-tuning có thể thực hiện với chỉ một phần nhỏ tham số được điều chỉnh. Các phương pháp hiện đại bao gồm LoRA (Hu et al., 2021), Prefix-tuning (Li & Liang, 2021), P-Tuning (Liu et al., 2021), Prompt tuning (Liu et al., 2023; Lester et al., 2021), AdaLoRA (Zhang et al., 2022), và (IA)³(Liu et al., 2022). Trong khi bài báo của chúng tôi tập trung vào LoRA do việc áp dụng rộng rãi của nó, hầu hết các kỹ thuật có thể dễ dàng áp dụng cho các phương pháp fine-tuning tiết kiệm tham số khác.
+
+Hệ thống phục vụ mô hình mục đích chung. Trong những năm qua, lĩnh vực phục vụ mô hình chung đã chứng kiến những tiến bộ đáng kể. Các hệ thống đáng chú ý từ nghiên cứu trước đây bao gồm Clipper (Crankshaw et al., 2017), TensorFlow Serving (Olston et al., 2017), Nexus (Shen et al., 2019), InferLine (Crankshaw et al., 2020), và Clockwork (Gujarati et al., 2020). Những hệ thống này đi sâu vào các chủ đề như batching, caching, và model placement, phục vụ cả triển khai mô hình đơn lẻ và nhiều mô hình. Trong các phát triển gần đây hơn, DVABatch (Cui et al., 2022), REEF (Han et al., 2022), Shepherd (Zhang et al., 2023a) và AlpaServe (Li et al., 2023) đã khám phá các ý tưởng về multi-entry multi-exit batching, preemption, và statistical multiplexing với model parallelism. Mặc dù những hệ thống này đã có những đóng góp đáng kể, chúng bỏ qua các đặc tính tự hồi quy và parameter-efficient adapter trong phục vụ LLM, dẫn đến các khoảng trống tối ưu hóa tiềm năng.
+
+9 KẾT LUẬN
+
+Chúng tôi trình bày S-LoRA, một hệ thống có khả năng phục vụ hàng nghìn adapter LoRA từ một máy duy nhất với throughput cao hơn nhiều so với các hệ thống hiện có. S-LoRA được tạo ra bởi thiết kế đổi mới của chúng tôi về pool bộ nhớ thống nhất, chiến lược tensor parallelism, adapter batching, và kernel CUDA. S-LoRA cho phép các dịch vụ fine-tuning tùy chỉnh quy mô lớn cần thiết để triển khai các mô hình được điều chỉnh cho các yêu cầu đa dạng. Các mở rộng tương lai của S-LoRA sẽ bao gồm hỗ trợ cho các phương pháp adapter bổ sung, kernel fused được tăng cường, và việc sử dụng nhiều CUDA stream để parallelization tính toán mô hình cơ sở và LoRA.
+
+LỜI CẢM ƠN
+
+Nghiên cứu này được hỗ trợ bởi các tài trợ từ Anyscale, Astronomer, Google, IBM, Intel, Lacework, Microsoft, Mohamed Bin Zayed University of Artificial Intelligence, Samsung SDS, Uber, và VMware. Ying được hỗ trợ một phần bởi Stanford Center for Automated Reasoning. Chúng tôi cảm ơn Clark Barrett về tư vấn học thuật và hỗ trợ tài trợ. Chúng tôi cũng cảm ơn Yonghao Zhuang và Lisa Dunlap về các cuộc thảo luận hữu ích và phản hồi của họ.
