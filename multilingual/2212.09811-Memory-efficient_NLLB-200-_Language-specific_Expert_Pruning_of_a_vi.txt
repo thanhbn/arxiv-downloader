@@ -1,0 +1,181 @@
+# NLLB-200 hiệu quả bộ nhớ: Cắt tỉa chuyên gia đặc thù ngôn ngữ của một mô hình dịch máy đa ngôn ngữ khổng lồ
+
+Yeskendir Koishekenov∗1,2Alexandre Berard1Vassilina Nikoulina1
+1NAVER LABS Europe
+2Đại học Amsterdam
+{first.last}@naverlabs.com
+yeskendir.koishekenov@student.uva.nl
+
+## Tóm tắt
+
+NLLB-200 được phát hành gần đây là một bộ các mô hình Dịch máy thần kinh đa ngôn ngữ bao phủ 202 ngôn ngữ. Mô hình lớn nhất dựa trên kiến trúc Mixture of Experts và đạt được kết quả SoTA trên nhiều cặp ngôn ngữ. Nó chứa 54,5B tham số và yêu cầu ít nhất bốn GPU 32GB chỉ để suy luận. Trong nghiên cứu này, chúng tôi đề xuất một phương pháp cắt tỉa cho phép loại bỏ tới 80% chuyên gia mà không cần tinh chỉnh thêm và với mất mát chất lượng dịch không đáng kể, điều này làm cho việc chạy mô hình trên một GPU 32GB duy nhất trở nên khả thi. Phân tích sâu hơn cho thấy các chỉ số cắt tỉa của chúng tôi có thể xác định các chuyên gia đặc thù ngôn ngữ.
+
+## 1 Giới thiệu
+
+Transformer (Vaswani et al., 2017) đã trở thành mô hình chiếm ưu thế trong các nhiệm vụ Xử lý Ngôn ngữ Tự nhiên. Nhiều tiến bộ tiếp theo trong lĩnh vực này đến từ việc tăng ngân sách tính toán, dữ liệu huấn luyện và kích thước mô hình. Dịch máy thần kinh không phải là ngoại lệ, nơi NMT đa ngôn ngữ khổng lồ (Aharoni et al., 2019; Fan et al., 2021; Tang et al., 2020; Zhang et al., 2020) đã chứng minh kết quả hứa hẹn, trong khi cố gắng vượt qua lời nguyền của tính đa ngôn ngữ (Conneau et al., 2019) bằng cách mở rộng kích thước mô hình.
+
+Tuy nhiên, việc tăng kích thước tham số làm trầm trọng thêm chi phí huấn luyện (Yang et al., 2019; Strubell et al., 2019; Patterson et al., 2021) và làm tổn hại dung lượng bộ nhớ cũng như độ trễ suy luận (Dai et al., 2019; Fan et al., 2021; Wang et al., 2022). Các mô hình Mixture-of-Experts (MoE) gated thưa thớt là một giải pháp thay thế hiệu quả cho các mô hình dày đặc (Lepikhin et al., 2020; Fedus et al., 2021; Riquelme et al., 2021). Ví dụ, Du et al. (2022) chứng minh rằng một mô hình ngôn ngữ MoE tạo ra một mô hình lớn gấp 7 lần so với GPT-3, nhưng chỉ yêu cầu 30% năng lượng để huấn luyện và một nửa FLOPs khi suy luận.
+
+Các mô hình Mixture-of-Experts là các mạng thần kinh có tập tham số được phân chia thành các chuyên gia. Trái ngược với các mô hình dày đặc, nơi tất cả các tham số mạng được sử dụng cho mọi đầu vào, một mô hình MoE kích hoạt các phần khác nhau của mạng, các chuyên gia, tùy thuộc vào đầu vào, điều này thường được thực hiện bởi một cơ chế gating ở cấp độ token. Các mô hình MoE có hiệu quả tính toán do song song hóa chuyên gia (Fedus et al., 2021) trên một số lượng lớn GPU, bằng cách để mỗi GPU giữ một tập con của tất cả các chuyên gia và giao tiếp với các GPU khác khi nó cần đầu ra chuyên gia cho batch cục bộ của nó.
+
+Trong NLLB-200 (Costa-jussà et al., 2022), một bộ điều chỉnh cân bằng tải trong hàm mục tiêu (Shazeer et al., 2017) thúc đẩy phân phối đều các token trên các chuyên gia. Điều này khuyến khích mô hình sử dụng tất cả các chuyên gia và đảm bảo rằng tất cả các GPU được sử dụng đều nhau vì hiệu quả tính toán. Tuy nhiên, xem xét một số lượng lớn chuyên gia, nó không đảm bảo rằng tất cả các chuyên gia sẽ được kích hoạt đều nhau cho một cặp ngôn ngữ cụ thể khi suy luận. Điều này đặt ra một câu hỏi nghiên cứu: có tồn tại các chuyên gia đặc thù ngôn ngữ trong các mô hình MoE đa ngôn ngữ không? Nếu đúng như vậy, chúng ta có thể cắt tỉa các mô hình như vậy mà không mất chất lượng dịch cho các cặp ngôn ngữ mà chúng ta quan tâm. Việc giảm sử dụng bộ nhớ sẽ rất hữu ích cho một mô hình như NLLB-200, thường yêu cầu ít nhất bốn GPU 32GB khi suy luận.
+
+Trong nghiên cứu này, chúng tôi định nghĩa các chỉ số để đánh giá tầm quan trọng của mỗi chuyên gia và cắt tỉa các chuyên gia ít quan trọng nhất khi suy luận. Chúng tôi nhằm tránh tinh chỉnh vì chi phí tính toán của nó. Trong một kịch bản lý tưởng, chúng tôi muốn có thể xác định các chuyên gia quan trọng trong một mô hình MoE để các nhà thực hành có thể triển khai các mô hình lớn, chẳng hạn như NLLB-200, trên một GPU duy nhất. Chúng tôi tóm tắt các đóng góp chính của mình như sau:
+
+• Chúng tôi đề xuất một chiến lược cắt tỉa có thể loại bỏ 80% chuyên gia trong mô hình NLLB-200 mà không cần tinh chỉnh thêm và với mất mát chất lượng dịch không đáng kể;
+
+• Chúng tôi thấy rằng các chuyên gia decoder có thể được cắt tỉa mạnh mẽ hơn các chuyên gia encoder;
+
+• Chúng tôi cho thấy sự xuất hiện của các chuyên gia đặc thù ngôn ngữ trong mô hình NLLB-200;
+
+• Chúng tôi chứng minh rằng các chuyên gia đặc thù ngôn ngữ quan trọng trong decoder được chia sẻ giữa các ngôn ngữ có liên quan về mặt ngôn ngữ học;
+
+• Chúng tôi phát hành id của các chuyên gia đã cắt tỉa, cùng với thống kê thu thập của các chuyên gia khác để bất kỳ ai có một GPU 32GB duy nhất đều có thể sử dụng NLLB-200 khi suy luận.
+
+## 2 Nghiên cứu liên quan
+
+Khái niệm về các mô hình Mixture-of-Experts trong machine learning có từ các nghiên cứu của Jacobs et al. (1991); Jordan và Jacobs (1994). Các phiên bản gần đây nhất được lấy cảm hứng từ Shazeer et al. (2017), người đã đạt được kết quả state-of-the-art trong mô hình ngôn ngữ và dịch thuật với mô hình lớn nhất tại thời điểm đó. Kết hợp với mô hình Transformer, các mô hình MoE trở nên phổ biến (Lepikhin et al., 2020; Fedus et al., 2021). Ngoài xử lý ngôn ngữ tự nhiên, các mô hình MoE đã cho thấy thành công lớn trong thị giác máy tính (Puigcerver et al., 2020), nhận dạng giọng nói (You et al., 2021), học đa phương thức (Mustafa et al., 2022), và các mô hình diffusion (Feng et al., 2022; Balaji et al., 2022) để kể tên một vài. Để có một khảo sát chi tiết hơn về các mô hình MoE, chúng tôi giới thiệu độc giả đến Yuksel et al. (2012) và Fedus et al. (2022).
+
+Bất chấp những thành công gần đây, các mô hình MoE lớn yêu cầu rất nhiều bộ nhớ và đóng góp (hoặc vai trò) của các chuyên gia còn chưa được khám phá đầy đủ. Chen et al. (2022) đã chỉ ra rằng đóng góp của các chuyên gia của một mô hình MoE được huấn luyện trước trong các nhiệm vụ khác nhau như MNLI, CoLA, và SQuAD khá khác nhau. Hơn nữa, họ đã chuyển đổi một mô hình MoE thưa lớn được huấn luyện trước trên một nhiệm vụ tổng quát thành một mô hình dày đặc chuyên gia duy nhất bằng cách tinh chỉnh chuyên gia "chuyên nghiệp" nhất và loại bỏ các chuyên gia khác. Điều này chứng minh rằng các chuyên gia không đóng góp đều vào hiệu suất và một số quan trọng hơn những chuyên gia khác. Zoph et al. (2022) cũng đã nghiên cứu các chuyên môn hóa chuyên gia khác nhau như sentinel tokens, dấu câu, liên từ và mạo từ, và thậm chí cả ngôn ngữ. Họ kết luận rằng các chuyên gia trong encoder thể hiện chuyên môn hóa, trái ngược với decoder, nhưng không theo ngôn ngữ. Theo các tác giả, cơ chế routing token và cân bằng tải của họ ngăn chặn chuyên môn hóa ngôn ngữ.
+
+Kudugunta et al. (2021) nghiên cứu các cơ chế routing ở các mức độ chi tiết khác nhau và cho thấy rằng các chuyên gia cấp nhiệm vụ (tức là, mỗi ngôn ngữ) có thể đạt được hiệu suất tương tự như các chuyên gia cấp token. Tuy nhiên, nghiên cứu này giả định rằng mô hình được huấn luyện theo cách đó, trong khi nghiên cứu của chúng tôi cố gắng cắt tỉa một mô hình MoE cấp token hiện có khi suy luận mà không huấn luyện lại nó.
+
+Đã có một số nỗ lực nén các mô hình NMT đa ngôn ngữ khổng lồ hiện có (Costa-jussà et al., 2022; Mohammadshahi et al., 2022b,a). Tuy nhiên, theo hiểu biết tốt nhất của chúng tôi, không có nghiên cứu nào trong số họ nghiên cứu rõ ràng về cắt tỉa chuyên gia và sự xuất hiện của các chuyên gia đặc thù ngôn ngữ trong một mô hình MoE lớn như chúng tôi làm. Đã có một dòng nghiên cứu liên quan về cắt tỉa attention heads trong các mô hình transformer (Michel et al., 2019; Voita et al., 2019), chứng minh vai trò có thể diễn giải về mặt ngôn ngữ học của attention heads (Voita et al., 2019; Jo và Myaeng, 2020) và sự xuất hiện của attention heads đặc thù ngôn ngữ (Kim et al., 2021b; Held và Yang, 2022). Hiểu vai trò của attention heads giúp loại bỏ cẩn thận những cái ít quan trọng nhất mà không làm tổn hại chất lượng dịch.
+
+Gần nhất với nghiên cứu của chúng tôi, Kim et al. (2021a) đã cố gắng cắt tỉa một mô hình MoE dịch máy bằng cách giữ lại các chuyên gia được kích hoạt nhiều nhất, nhưng không thể bảo tồn hiệu suất mà không tinh chỉnh thêm. Mặc dù đã được chỉ ra rằng các mô hình NMT đa ngôn ngữ hưởng lợi từ một số lượng lớn hơn các chuyên gia (Costa-jussà et al., 2022), theo hiểu biết tốt nhất của chúng tôi, nghiên cứu của chúng tôi là nghiên cứu đầu tiên khám phá liệu có bất kỳ chuyên gia đặc thù ngôn ngữ nào xuất hiện trong một mô hình Mixture-of-Expert đa ngôn ngữ khổng lồ cho NMT hay không, và làm thế nào các chuyên gia dư thừa (hoặc không liên quan) có thể được cắt tỉa.
+
+## 3 Kiến thức nền tảng
+
+### 3.1 Các mô hình Mixture-of-Experts
+
+Các mô hình Mixture-of-Experts (MoE) gated thưa thớt kích hoạt một tập con tham số của chúng cho mỗi token đầu vào, trái ngược với các mô hình dày đặc, nơi toàn bộ mạng được sử dụng cho mỗi token đầu vào. Do đó, tổng số lượng tham số có thể được tăng lên đáng kể vì chi phí tính toán mỗi token chỉ tỷ lệ thuận với kích thước của mạng con được kích hoạt, không phải tổng kích thước mô hình. Số lượng tham số tăng lên mở khóa khả năng biểu diễn đáng kể. Phân bổ các thiết bị khác nhau cho các chuyên gia khác nhau và chạy chúng song song (tức là, song song hóa chuyên gia, Fedus et al., 2021), kết hợp với song song hóa dữ liệu làm cho MoE hiệu quả về mặt tính toán và có khả năng mở rộng cao (Fedus et al., 2021; Lepikhin et al., 2020).
+
+Trong các mô hình MoE Transformer được đề xuất bởi Lepikhin et al. (2020), các sublayers FFN trong mô hình dày đặc được thay thế bằng các layers MoE. Một layer MoE nhận một biểu diễn token đầu vào xt và sau đó định tuyến nó đến k chuyên gia hàng đầu được chọn từ một tập {Ei}N i=1 của N chuyên gia nhờ một mạng gating:
+
+Gt=softmax (Wg·xt) (1)
+
+Trong đó Wg∈RN×d là một tham số đã học. Đầu ra của layer MoE là một tổng có trọng số của các đầu ra của k chuyên gia E được chọn:
+
+yt=1/∑i∈E Gt,i × ∑i∈E Gt,i Ei(xt) (2)
+
+### 3.2 NLLB-200
+
+No Language Left Behind (NLLB-200) là một bộ các mô hình NMT đa ngôn ngữ khổng lồ có thể dịch từ và sang 202 ngôn ngữ (Costa-jussà et al., 2022), bao gồm nhiều ngôn ngữ có nguồn tài nguyên rất thấp. Các mô hình có kích thước khác nhau đã được phát hành. Mô hình lớn nhất là một mô hình Mixture-of-Experts và có 54,5B tham số. Một mô hình dày đặc 3,3B cũng có sẵn, có cùng kiến trúc với mô hình MoE 54,5B nhưng không có các chuyên gia. Trong nghiên cứu này, chúng tôi sẽ cố gắng cắt tỉa các chuyên gia từ mô hình 54,5B trong khi sử dụng biến thể 3,3B làm baseline ngưỡng dưới.
+
+Trong mô hình MoE 54,5B, mỗi sublayer FFN thứ 4 – trong cả encoder và decoder – được thay thế bằng một layer MoE, bắt đầu từ layer thứ 4 (điều này tạo ra 12 layers có chuyên gia). Mỗi layer MoE bao gồm 128 chuyên gia (1536 chuyên gia tổng cộng) với cùng kiến trúc như một sublayer FFN, và có mạng gating riêng, theo thuật toán top-k gating của Lepikhin et al. (2020) và chọn 2 chuyên gia hàng đầu mỗi token mà không có bất kỳ ngẫu nhiên hóa nào. Mô hình được huấn luyện với một kết hợp tuyến tính của label-smoothed cross-entropy (Szegedy et al., 2016) với một auxiliary load balancing loss (Shazeer et al., 2017), điều này khuyến khích các token được phân phối đều trên các chuyên gia.
+
+Sử dụng bộ nhớ. Các mô hình 3,3B và 54,5B là Transformers với embedding dimension là 2048, FFN dimension là 8192, 16 attention heads, 24 encoder layers, và 24 decoder layers. Khi lưu trữ các tham số của chúng trong độ chính xác một nửa, mô hình dày đặc 3,3B và mô hình MoE 54,5B lần lượt chiếm 6,2GiB và 101,5GiB bộ nhớ. Mỗi chuyên gia có 33,6M tham số, đại diện cho 51,6B tham số tổng cộng hoặc 96GiB bộ nhớ. Trong khi mô hình 3,3B có thể dễ dàng chạy trên một GPU duy nhất, mô hình 54,5B yêu cầu ít nhất 4 GPU 32GB để chạy. Để tối đa hóa hiệu quả, giải mã với mô hình MoE phải được thực hiện với song song hóa chuyên gia (Fedus et al., 2021), với mỗi GPU giữ một bản sao đầy đủ của các tham số "dày đặc" (2,9B hoặc 5,5GiB) và 1/N của các chuyên gia mỗi layer, trong đó N là số GPU. Do sử dụng bộ nhớ của beam search decoding và phân mảnh bộ nhớ, batched decoding thực sự yêu cầu nhiều GPU hơn trong thực tế (ví dụ, 6 hoặc 8), hoặc phải offload encoder và decoder lên CPU khi chúng không được sử dụng.
+
+## 4 Phương pháp của chúng tôi
+
+Chúng tôi thử nghiệm với các chỉ số và chiến lược cắt tỉa chuyên gia khác nhau cho phép chúng tôi chọn các chuyên gia có liên quan nhất cho mỗi ngôn ngữ hoặc cặp ngôn ngữ, và do đó giảm đáng kể việc sử dụng bộ nhớ khi suy luận của NLLB-200.
+
+### 4.1 Chỉ số cắt tỉa chuyên gia
+
+Chỉ số cắt tỉa nên định lượng đóng góp của một chuyên gia nhất định đối với bản dịch. Theo trực giác, các chuyên gia tham gia nhiều hơn vào dịch thuật nên được coi là quan trọng hơn.
+
+Hoạt động. Chúng tôi định nghĩa hoạt động Top 1, top1(e), của một chuyên gia e là tỷ lệ các token được định tuyến đến chuyên gia này như là lựa chọn đầu tiên (tức là, tần suất mà chuyên gia này được xếp hạng đầu tiên bởi cơ chế gating). Chúng tôi cũng xem xét biến thể hoạt động Top 2, top2(e), với tỷ lệ các token được định tuyến đến chuyên gia này như là lựa chọn đầu tiên hoặc thứ hai của chúng.
+
+Việc chỉ sử dụng hoạt động làm chỉ số quan trọng có thể không tối ưu vì nó không tính đến giá trị gating được gán cho chuyên gia này bởi mô hình.
+
+Cân bằng tải. Chúng tôi thử nghiệm với chỉ số cắt tỉa cân bằng tải, tương tự như load balancing loss được sử dụng bởi Costa-jussà et al. (2022) để huấn luyện mô hình MoE. Nó được định nghĩa là tích của hoạt động và giá trị gate trung bình: LB(e) = top1(e) × mean(e).
+
+Tầm quan trọng. Theo định nghĩa về độ tin cậy attention head của Voita et al. (2019), chúng tôi định nghĩa độ tin cậy của một chuyên gia, conf(e), là giá trị gate trung bình của nó khi nó được xếp hạng đầu tiên. Sau đó, chúng tôi có thể định nghĩa tầm quan trọng "vanilla" của một chuyên gia là tích của hoạt động và độ tin cậy của nó.
+
+impvanilla(e) = top1(e) × conf(e) (3)
+
+Chúng tôi định nghĩa tầm quan trọng là một phiên bản cải tiến của tầm quan trọng vanilla với một hàm mũ để làm mịn các giá trị độ tin cậy:
+
+imp(e) = top1(e) × exp(conf(e)) (4)
+
+### 4.2 Mức độ chi tiết thống kê chuyên gia
+
+Để tính toán các chỉ số cắt tỉa được định nghĩa ở trên, đối với mỗi chuyên gia e ∈ {1, . . . , 1536} chúng tôi thu thập thống kê gate, top1(e), top2(e), mean(e) và conf(e), bằng cách giải mã các bộ validation cho tất cả các hướng ngôn ngữ. Tuy nhiên, các thống kê này có thể được tổng hợp ở các mức độ chi tiết khác nhau. Tùy thuộc vào cách các thống kê này được tổng hợp, chúng tôi hy vọng sẽ thấy các chuyên gia đặc thù ngôn ngữ xuất hiện. Trong các thí nghiệm của chúng tôi, chúng tôi xem xét ba mức độ chi tiết khác nhau:
+
+• toàn cục: chúng tôi tổng hợp thống kê trên tất cả các cặp ngôn ngữ để giữ lại các chuyên gia tốt nhất tổng thể;
+
+• cặp ngôn ngữ: chúng tôi thu thập thống kê gate cho mỗi cặp ngôn ngữ và do đó giữ lại một tập các chuyên gia (có thể) khác nhau cho mỗi cặp ngôn ngữ;
+
+• đặc thù ngôn ngữ: chúng tôi tổng hợp thống kê phía encoder theo ngôn ngữ nguồn và thống kê phía decoder theo ngôn ngữ đích, điều này sẽ cho phép chúng tôi giữ lại một tập chuyên gia encoder/decoder duy nhất cho mỗi ngôn ngữ nguồn/đích.
+
+### 4.3 Thuật toán cắt tỉa chuyên gia
+
+Sử dụng các chỉ số cắt tỉa được định nghĩa trong Mục 4.1, có những chiến lược cắt tỉa chuyên gia khác nhau mà chúng tôi có thể áp dụng. Các giá trị chỉ số cắt tỉa được chuẩn hóa để tổng bằng một trong mỗi layer, và các chuyên gia được sắp xếp từ quan trọng nhất đến ít quan trọng nhất.
+
+Cố định mỗi layer. Đầu tiên, cách đơn giản nhất là giữ lại một số lượng cố định các chuyên gia hàng đầu trong mỗi layer. Ví dụ, cắt tỉa 75% giữ lại 384 trong số 1536 chuyên gia, tương ứng với 32 chuyên gia mỗi layer. Trong cài đặt cân bằng, số lượng chuyên gia mỗi layer là như nhau trong encoder và decoder (ví dụ, 32 mỗi layer). Trong cài đặt không cân bằng, chúng tôi giữ một số lượng chuyên gia khác nhau trong encoder và decoder (ví dụ, 40 mỗi encoder layer và 24 mỗi decoder layer).
+
+Ngưỡng toàn cục. Các chỉ số cắt tỉa mà chúng tôi định nghĩa cho phép chúng tôi dễ dàng cắt tỉa chuyên gia mỗi layer, nhưng không phải toàn cục. Để chọn các chuyên gia tốt nhất toàn cục (không có tiên nghiệm về số lượng chuyên gia mỗi layer) chúng tôi tìm kiếm một ngưỡng toàn cục θ sao cho:
+
+∑k=1^12 min(nk|∑i=1^nk φ(eki) ≥ θ) = count (5)
+
+Trong đó φ là chỉ số cắt tỉa; k là id layer (trong số 12 layers có chuyên gia); eki là chuyên gia thứ i trong danh sách các chuyên gia được sắp xếp cho layer đó; và count là tổng số chuyên gia mong muốn giữ lại (ví dụ, 384 cho cắt tỉa 75%). Các chuyên gia {eki}i=1^nk sau đó được giữ lại và phần còn lại được cắt tỉa. Trong các thí nghiệm của chúng tôi, chúng tôi đảm bảo giữ lại ít nhất 4 chuyên gia mỗi layer.
+
+Trực giác của chúng tôi đằng sau phương pháp cắt tỉa này là để định nghĩa một khối lượng xác suất không đổi (hoặc khối lượng "tầm quan trọng") mà mỗi layer nên có. Việc chỉ giữ lại một vài chuyên gia trong một layer là tốt nếu chúng được sử dụng chung phần lớn thời gian. Ngược lại, một số layers có thể cần nhiều chuyên gia hơn nếu việc sử dụng chuyên gia được phân phối đều hơn.
+
+Hình 1 minh họa cách các chuyên gia được phân phối giữa các layers với phương pháp này ở mức cắt tỉa 75% và với chỉ số top1. Chúng ta thấy rằng decoder yêu cầu ít chuyên gia hơn nhiều mỗi layer so với encoder để đạt được cùng ngưỡng hoạt động.
+
+Chúng tôi cũng thử nghiệm với một biến thể của phương pháp này, mà chúng tôi gọi là Ngưỡng Enc/Dec, với một số lượng cố định trong encoder và decoder (ví dụ, 192 và 192) và các ngưỡng được định nghĩa độc lập trong encoder và decoder.
+
+## 5 Thí nghiệm
+
+### 5.1 Cài đặt đánh giá
+
+Trong các thí nghiệm của chúng tôi, chúng tôi sử dụng benchmark FLORES-200 (Costa-jussà et al., 2022), bao gồm các bản dịch của 3001 câu tiếng Anh (từ 842 bài báo Wikipedia riêng biệt) sang tất cả 201 ngôn ngữ khác. Bản chất đa song song của bộ dữ liệu này làm cho việc đánh giá hiệu suất trong tất cả 40.602 hướng ngôn ngữ trở nên khả thi. Như benchmark kiểm tra cuối cùng của chúng tôi, chúng tôi lấy một mẫu con đại diện gồm 53 ngôn ngữ trong số 202, cũng được sử dụng như một bộ dữ liệu ablation bởi Costa-jussà et al. (2022). Trong các thí nghiệm trung gian của chúng tôi, chúng tôi làm việc với một tập con nhỏ hơn gồm 30 trong số 53 ngôn ngữ, với 10 ngôn ngữ cho mỗi loại tài nguyên (cao, thấp, rất thấp) và bao phủ cùng mười bốn họ ngôn ngữ như tập con đầy đủ gồm 53 ngôn ngữ. Chi tiết thêm về các ngôn ngữ được xem xét trong các thí nghiệm của chúng tôi cũng như lượng tài nguyên có sẵn cho mỗi danh mục được cung cấp trong Bảng 8 và 14 trong Phụ lục.
+
+Để đánh giá chất lượng dịch, chúng tôi sử dụng hai chỉ số: chrF++ (Popović, 2015) và spBLEU (Costa-jussà et al., 2022). BLEU phụ thuộc nhiều vào tokenization và các triển khai của nó không bao gồm tokenizers cho hầu hết các ngôn ngữ NLLB-200. spBLEU khắc phục vấn đề này bằng cách tokenize các tham chiếu và đầu ra mô hình với một tokenizer SentencePiece đa ngôn ngữ (SPM-200, Costa-jussà et al., 2022). Chúng tôi báo cáo kết quả chrF++ trong bài báo chính và kết quả spBLEU trong Phụ lục. Chúng tôi sử dụng FLORES-200 dev (mà chúng tôi gọi là valid) để thu thập thống kê gate MoE và so sánh các thuật toán và tỷ lệ cắt tỉa khác nhau, và FLORES-200 devtest (mà chúng tôi gọi là test) để báo cáo kết quả cuối cùng và so sánh với các baseline 3,3B và 54,5B.
+
+### 5.2 Kết quả
+
+Trong tập thí nghiệm đầu tiên, chúng tôi làm việc với một tập con gồm 30 ngôn ngữ. Bảng 1 so sánh các chỉ số và chiến lược cắt tỉa chuyên gia khác nhau dưới tỷ lệ cắt tỉa 75%. Các chuyên gia được chọn theo cặp ngôn ngữ, và điểm số được tính trung bình theo loại tài nguyên (cao, thấp, rất thấp). Phần đầu tiên của bảng báo cáo hai baselines: một upper bound tương ứng với mô hình MoE 54,5B đầy đủ (chưa cắt tỉa), và một lower bound là mô hình dày đặc 3,3B (cùng kiến trúc nhưng không có chuyên gia).
+
+Chỉ số cắt tỉa. Phần thứ hai của Bảng 1 so sánh hiệu suất chrF++ của các chỉ số cắt tỉa khác nhau (điểm spBLEU được báo cáo trong Phụ lục Bảng 9). Từ những kết quả này, chúng ta có thể thấy rằng các chỉ số hoạt động top-1 và tầm quan trọng là hiệu quả nhất trong việc xác định các chuyên gia quan trọng. Các thí nghiệm tiếp theo với cắt tỉa ngưỡng toàn cục (phần thứ ba của Bảng 1) xác nhận hiệu suất tốt hơn một chút của chỉ số tầm quan trọng mà chúng tôi giữ làm mặc định cho các thí nghiệm tiếp theo.
+
+Thuật toán cắt tỉa. Bảng 1 cũng so sánh các thuật toán cắt tỉa được mô tả trong Mục 4.3 (cố định mỗi layer và ngưỡng toàn cục). Lưu ý rằng với cố định mỗi layer, chúng ta có thể phân bổ cùng ngân sách chuyên gia trong encoder và decoder (cài đặt cân bằng) hoặc có nhiều chuyên gia hơn trong encoder (cài đặt không cân bằng).
+
+Đầu tiên, chúng ta thấy rằng chiến lược ngưỡng toàn cục cho kết quả tốt nhất tổng thể, với cùng chrF++ trung bình như mô hình đầy đủ chưa cắt tỉa. Tuy nhiên, ngưỡng toàn cục không thực tế lắm vì nhiều lý do. Đầu tiên, nó xác định một số lượng chuyên gia khác nhau mỗi layer cho mỗi cặp ngôn ngữ, dẫn đến việc sử dụng bộ nhớ biến đổi trên các cặp ngôn ngữ. Nó cũng yêu cầu tạo lại và tải lại mô hình khi giải mã nhiều hướng, điều này rất chậm. Cuối cùng, chúng tôi thấy rằng nó nhạy cảm hơn với over-generation và hallucinations (mà chúng tôi trình bày chi tiết trong Mục A trong Phụ lục) ở tỷ lệ cắt tỉa cao hơn. Phương pháp ngưỡng enc/dec không gặp phải tất cả các hạn chế của ngưỡng toàn cục, nhưng nó cũng không tốt hơn cố định mỗi layer. Do đó, để đơn giản, chúng tôi chọn phương pháp cố định mỗi layer cho các thí nghiệm tiếp theo.
+
+Cắt tỉa cân bằng so với không cân bằng. Khi giữ lại 25% chuyên gia (384 trong số 12 × 128), ngưỡng toàn cục giữ trung bình 335 chuyên gia encoder và 49 chuyên gia decoder. Số lượng chuyên gia được chọn trong encoder và decoder cho các loại tài nguyên ngôn ngữ khác nhau được hiển thị trong Bảng 16 trong Phụ lục. Theo quan sát này rằng các chuyên gia encoder dường như quan trọng hơn các chuyên gia decoder, chúng tôi thử nghiệm với các tỷ lệ encoder/decoder khác nhau. 1:1 là cài đặt cân bằng. 2:1 và 3:1 là không cân bằng với lần lượt gấp đôi và gấp ba số chuyên gia encoder so với chuyên gia decoder. Hình 2 cho thấy rằng 3:1 hoạt động tốt nhất trên hầu như tất cả các tỷ lệ cắt tỉa và loại tài nguyên.
+
+Cắt tỉa với thống kê toàn cục. Hình 2 và Hình 4 trong Phụ lục cũng cho thấy rằng cùng các chuyên gia có thể được cắt tỉa trên tất cả các cặp ngôn ngữ (với thống kê được tổng hợp trên tất cả các hướng) mà không mất hiệu suất ở mức cắt tỉa 50%. Thống kê ở mức độ chi tiết hướng ngôn ngữ cho phép chúng ta cắt tỉa an toàn tới 80% chuyên gia (trong cài đặt không cân bằng), điều này làm cho mô hình đủ nhỏ để vừa trên một GPU duy nhất.
+
+Kết quả kiểm tra và cắt tỉa đặc thù ngôn ngữ. Cuối cùng, chúng tôi xác thực kết quả của mình trên tập kiểm tra với 53 ngôn ngữ (2.756 hướng). Chúng tôi sử dụng phương pháp cố định mỗi layer với tỷ lệ 3:1, đã cho thấy kết quả tốt nhất trên tập validation ở mức 80% (tỷ lệ tối thiểu cho giải mã 1-GPU). Bảng 2 và 11 báo cáo những điểm kiểm tra này với ba mức độ chi tiết khác nhau: toàn cục, đặc thù cặp ngôn ngữ hoặc đặc thù ngôn ngữ (như được mô tả trong Mục 4.2). Bảng 10 trong Phụ lục báo cáo điểm valid với cùng cài đặt.
+
+Cắt tỉa các chuyên gia quan trọng được chọn theo cặp ngôn ngữ cho nhiều hơn 0,8 chrF++ trung bình so với mô hình dày đặc 3,3B, và ít hơn 0,2 chrF++ so với mô hình MoE đầy đủ. Mặt khác, cắt tỉa toàn cục hoạt động tệ hơn cả mô hình MoE và dày đặc, điều này xác nhận tầm quan trọng của việc có một chiến lược cắt tỉa đặc thù ngôn ngữ.
+
+Trong khi việc chọn các chuyên gia quan trọng cho mỗi cặp ngôn ngữ là hiệu quả, nó không thực tế lắm: với L ngôn ngữ, điều này tạo ra L×(L−1) cấu hình khác nhau. Một phương pháp thực tế hơn là cắt tỉa các chuyên gia encoder theo ngôn ngữ nguồn và các chuyên gia decoder theo ngôn ngữ đích (tức là, cắt tỉa đặc thù ngôn ngữ). Chiến lược cắt tỉa này hoạt động chính xác như cắt tỉa theo hướng ngôn ngữ và thuận tiện hơn. Theo quan sát này, chúng tôi trích xuất thống kê gate theo ngôn ngữ trên tất cả 202 ngôn ngữ. Sau đó, chúng tôi áp dụng cắt tỉa 80% theo layer với chỉ số tầm quan trọng (ở mức độ chi tiết ngôn ngữ) và giải mã tập kiểm tra trong tất cả 40.602 hướng. Bảng 3 và 12 báo cáo điểm chrF++ và spBLEU. Bảng 13 báo cáo delta điểm trung bình với mô hình chưa cắt tỉa (và độ lệch chuẩn theo loại tài nguyên). Để tạo điều kiện cho nghiên cứu tương lai và tạo cơ hội cho bất kỳ ai có GPU 32GB để chạy mô hình NLLB-200, chúng tôi phát hành thống kê gate chi tiết và id của các chuyên gia được chọn. Chúng tôi cũng chia sẻ điểm số cho mỗi hướng và đầu ra giải mã của các phương pháp cắt tỉa tốt nhất của chúng tôi.
+
+## 6 Thảo luận
+
+### 6.1 Tốc độ suy luận và ngân sách tính toán
+
+Bảng 5 báo cáo tốc độ suy luận của các mô hình khác nhau: mô hình dày đặc 3,3B, mô hình MoE đầy đủ, và mô hình MoE với cắt tỉa 80%. Chúng ta thấy rằng với cắt tỉa 80%, mô hình MoE yêu cầu một V100 32GB duy nhất và hoạt động xấp xỉ nhanh như mô hình đầy đủ trên 4 GPU. Nếu có 4 GPU, cắt tỉa 80% có thể tăng gấp đôi tốc độ suy luận của mô hình MoE.
+
+Bảng 15 trong Phụ lục cung cấp phân tích số giờ GPU được sử dụng cho nghiên cứu này.
+
+### 6.2 Sự tương đồng của các chuyên gia được chọn
+
+Mục 5.2 cho thấy rằng chỉ một phần của tất cả các chuyên gia là cần thiết để dịch giữa hai ngôn ngữ nhất định. Chúng tôi phân tích các chuyên gia được chọn bởi phương pháp cắt tỉa của chúng tôi, để xác minh liệu chúng tôi có thể tuyên bố rằng thực sự có các chuyên gia đặc thù ngôn ngữ hay không. Để làm điều đó, chúng tôi chọn các chuyên gia với chỉ số tầm quan trọng được đề xuất và cắt tỉa chúng theo cặp ngôn ngữ ở tỷ lệ 75% với phương pháp ngưỡng Enc/dec, để cả encoder và decoder có cùng số lượng chuyên gia. Sau đó chúng tôi tính toán độ tương đồng Jaccard của các chuyên gia encoder/decoder được chọn giữa các cặp ngôn ngữ khác nhau có chung cùng ngôn ngữ nguồn hoặc đích. Tam giác dưới và trên của Bảng 4 lần lượt hiển thị độ tương đồng này trong encoder và decoder. Chúng ta thấy rằng các chuyên gia encoder độc lập với ngôn ngữ đích (mặc dù cắt tỉa dựa trên thống kê được thu thập ở mức độ chi tiết cặp ngôn ngữ). Đây là kết quả dự kiến, và nó do thiết kế mô hình, nơi mã ngôn ngữ đích chỉ được giới thiệu ở phía decoder: biểu diễn encoder không bị ảnh hưởng bởi ngôn ngữ đích. Chúng tôi lưu ý rằng độ tương đồng giữa các ngôn ngữ nguồn khác nhau cũng khá cao (30-50%). Độ tương đồng giữa các chuyên gia decoder quan trọng cho cùng ngôn ngữ đích nằm trong khoảng 68-87%; và trong khoảng 13-39% cho các ngôn ngữ đích khác nhau. Những quan sát này kết hợp với kết quả trong Mục 5.2 cho thấy sự xuất hiện của các chuyên gia đặc thù ngôn ngữ trong mô hình NLLB-200.
+
+### 6.3 Sự tương đồng của các ngôn ngữ dựa trên chỉ số tầm quan trọng
+
+Cuối cùng, chúng tôi so sánh thống kê chuyên gia trên các ngôn ngữ khác nhau, để hiểu rõ hơn liệu việc chuyển giao kiến thức có xảy ra ở cấp độ chuyên gia giữa các ngôn ngữ tương tự hay không. Chúng tôi thu thập các chỉ số tầm quan trọng cho mỗi chuyên gia trong decoder cho mỗi ngôn ngữ và nối các giá trị của tất cả các layer MoE để có một vector đặc trưng với chiều 768. Sau đó chúng tôi thực hiện phân cụm phân cấp và hiển thị nó như một dendrogram trong Hình 3, nơi chúng tôi làm nổi bật các nhóm phụ ngôn ngữ khác nhau với các màu khác nhau. Chúng ta có thể thấy rằng một số cụm chứa các ngôn ngữ có liên quan về mặt ngôn ngữ học, chẳng hạn như tiếng Trung Quảng Đông, tiếng Hàn và tiếng Nhật; tiếng Nga và tiếng Belarus; hoặc tiếng Bồ Đào Nha, tiếng Asturian, và tiếng Pháp. Chúng tôi chạy một phân tích tương tự trên các chuyên gia encoder và cũng quan sát được phân cụm ngôn ngữ có ý nghĩa, nhưng ít rõ ràng hơn (Phụ lục Hình 7).
+
+### 6.4 Sự khác biệt giữa điểm chrF++ và spBLEU
+
+Chúng tôi quan sát thấy rằng phương pháp cắt tỉa của chúng tôi dẫn đến sự sụt giảm hiệu suất cao hơn một chút theo spBLEU, so với chrF++. Chúng tôi giả thuyết rằng điều này do một hiện tượng hiếm nhưng có thể nhìn thấy của over-generation (và đôi khi hallucinations). Trong phần lớn các trường hợp, bản dịch ban đầu chính xác nhưng sau đó bao gồm các lặp lại, diễn giải lại, hoặc hallucinations nhẹ. Chỉ số spBLEU phạt hành vi này nhiều hơn chrF++, điều này có thể giải thích cho sự khác biệt trong điểm số được quan sát. Chi tiết thêm về điều này có trong Mục A trong Phụ lục.
+
+## 7 Kết luận
+
+Trong bài báo này, chúng tôi nghiên cứu cắt tỉa chuyên gia trong mô hình MT Mixture-of-Experts NLLB-200. Chúng tôi đề xuất các chỉ số cắt tỉa chuyên gia dựa trên thống kê gate được thu thập trong khi giải mã. Chúng tôi nghiên cứu một số chiến lược cắt tỉa và chứng minh rằng có thể cắt tỉa tới 80% chuyên gia với mất mát hiệu suất không đáng kể, điều này làm cho việc giải mã trên một GPU 32GB duy nhất trở nên khả thi. Chúng tôi so sánh cắt tỉa ở ba mức độ chi tiết: theo hướng ngôn ngữ, theo ngôn ngữ, hoặc toàn cục. Cắt tỉa đặc thù ngôn ngữ và theo cặp ngôn ngữ hoạt động như nhau nhưng cái trước thuận tiện nhất. Cắt tỉa toàn cục (tức là, luôn cắt tỉa cùng các chuyên gia bất kể ngôn ngữ nguồn và đích) hoạt động tốt một cách đáng ngạc nhiên nhưng tệ hơn cắt tỉa đặc thù ngôn ngữ, điều này cho thấy rằng thực sự có một số chuyên gia đặc thù ngôn ngữ. Giả thuyết sau này được xác nhận bởi phân tích các chuyên gia được chọn của chúng tôi.
+
+## 8 Rủi ro và hạn chế
+
+Trong nghiên cứu của chúng tôi, chúng tôi dựa vào một mô hình NMT Mixture-of-Experts duy nhất là NLLB-200. Có nguy cơ rằng các kết luận của chúng tôi có thể chỉ đúng cho mô hình cụ thể này và đặc thù cho cách mô hình này được huấn luyện. Chúng tôi tin rằng các phát hiện của chúng tôi vẫn có thể hữu ích cho bất kỳ ai muốn sử dụng mô hình NLLB-200 vì: (1) Đây là mô hình MoE NMT công khai duy nhất tại thời điểm nộp bài; (2) Đây là mô hình duy nhất bao phủ 202 ngôn ngữ và đạt được kết quả SoTA cho hầu hết các ngôn ngữ đó.
+
+Hơn nữa, chúng tôi không thử tinh chỉnh mô hình đã cắt tỉa, điều này có thể cải thiện kết quả (nhưng yêu cầu một số lượng lớn GPU) và do đó thay đổi một số kết luận của chúng tôi.
+
+Nghiên cứu này có những rủi ro tương tự như các mô hình NLLB-200 gốc liên quan đến việc sử dụng sai các bản dịch có thể sai. Lưu ý rằng, như được quan sát bởi Mohammadshahi et al. (2022b), cắt tỉa có thể khuếch đại các thiên lệch đã có trong mô hình đầy đủ.
+
+## Lời cảm ơn
+
+Nghiên cứu này được hoàn thành trong một thực tập nghiên cứu tại NAVER LABS Europe. Yeskendir Koishekenov cũng được hỗ trợ bởi ELLIS Amsterdam và Qualcomm AI Research.
