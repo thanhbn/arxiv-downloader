@@ -1,0 +1,143 @@
+BBTv2: Hướng tới một tương lai không cần gradient với các mô hình ngôn ngữ lớn
+
+Tianxiang Sun, Zhengfu He, Hong Qian, Yunhua Zhou, Xuanjing Huang, Xipeng Qiu
+
+Trường Khoa học Máy tính, Đại học Fudan
+Phòng thí nghiệm Xử lý Thông tin Thông minh thành phố Thượng Hải, Đại học Fudan
+Trường Khoa học Máy tính và Công nghệ, Đại học Sư phạm Đông Trung Quốc
+
+Tóm tắt
+
+Hầu hết các phương pháp thích ứng downstream điều chỉnh tất cả hoặc một phần tham số của các mô hình được tiền huấn luyện (PTMs) thông qua gradient descent, trong đó chi phí điều chỉnh tăng tuyến tính với sự phát triển của kích thước mô hình. Ngược lại, các phương pháp không cần gradient chỉ yêu cầu tính toán truyền thẳng của PTM để điều chỉnh prompt, giữ lại lợi ích của việc điều chỉnh và triển khai hiệu quả. Tuy nhiên, các công trình trước đây về điều chỉnh không cần gradient thường giới thiệu gradient descent để tìm kiếm một khởi tạo tốt cho prompt và thiếu tính linh hoạt qua các tác vụ và PTMs. Trong bài báo này, chúng tôi trình bày BBTv2, một phiên bản cải tiến của Black-Box Tuning (Sun et al., 2022b), để điều khiển PTMs cho học few-shot. Chúng tôi đặt trước các prompts liên tục vào mọi tầng của PTM và đề xuất một thuật toán chia để trị không cần gradient để tối ưu hóa các prompts ở các tầng khác nhau một cách xen kẽ. Các thí nghiệm rộng rãi qua nhiều tác vụ và PTMs khác nhau cho thấy BBTv2 có thể đạt được hiệu suất có thể so sánh với việc điều chỉnh mô hình đầy đủ và các phương pháp hiệu quả tham số tiên tiến (ví dụ: Adapter, LoRA, BitFit, v.v.) trong các cài đặt few-shot trong khi duy trì ít tham số có thể điều chỉnh hơn nhiều.
+
+1 Giới thiệu
+
+Những năm gần đây đã chứng kiến sự tiến bộ đáng kể của các mô hình ngôn ngữ lớn (LLMs) (Devlin et al., 2019; Raffel et al., 2020; Brown et al., 2020). Đã được chứng minh nhiều lần rằng việc mở rộng quy mô mô hình là hứa hẹn để đạt được hiệu suất tốt hơn. Tuy nhiên, kích thước mô hình ngày càng lớn cũng dẫn đến sự tăng tuyến tính trong chi phí điều chỉnh. Việc tinh chỉnh và triển khai một bản sao riêng của LLM cho mỗi tác vụ downstream trở nên cực kỳ đắt đỏ. Vì vậy, nhiều nỗ lực đã được dành cho việc điều chỉnh hiệu quả tham số (PET) (He et al., 2021; Ding et al., 2022), chỉ điều chỉnh một phần nhỏ tham số trong khi giữ hầu hết các tham số của LLM không thay đổi. Bằng PET, LLMs có thể được chuyên biệt hóa cho một tác vụ downstream tại thời điểm suy luận bằng cách kích hoạt một số lượng nhỏ các tham số cụ thể theo tác vụ. Mặc dù nó hiệu quả trong triển khai, việc điều chỉnh phần nhỏ tham số vẫn yêu cầu lan truyền ngược qua toàn bộ LLM, điều này tốn kém hoặc thậm chí không khả thi đối với nhiều người thực hành.
+
+Để làm cho LLMs có lợi cho một phạm vi rộng hơn của khán giả, một thực hành phổ biến là phát hành LLMs như một dịch vụ và cho phép người dùng truy cập các LLMs mạnh mẽ thông qua các API suy luận của chúng (Brown et al., 2020). Trong kịch bản như vậy, được gọi là Language-Model-as-a-Service (LMaaS) (Sun et al., 2022b), người dùng không thể truy cập hoặc điều chỉnh các tham số mô hình mà chỉ có thể điều chỉnh các prompts của họ để hoàn thành các tác vụ ngôn ngữ quan tâm. Brown et al. (2020) đề xuất chuyển đổi các tác vụ downstream thành một tác vụ mô hình hóa ngôn ngữ và thực hiện các tác vụ khác nhau bằng cách điều kiện hóa trên các text prompts cụ thể theo tác vụ. Hơn nữa, họ chứng minh rằng LLMs thể hiện một khả năng nổi lên của học trong ngữ cảnh, tức là LLMs có thể học cách thực hiện các tác vụ với một vài minh chứng được cung cấp trong ngữ cảnh đầu vào mà không cần cập nhật tham số. Tuy nhiên, hiệu suất của nó đã được chứng minh là phụ thuộc rất nhiều vào việc lựa chọn prompt hoặc các minh chứng (Zhao et al., 2021; Liu et al., 2022) và vẫn tụt hậu xa so với việc điều chỉnh mô hình đầy đủ.
+
+Gần đây, Sun et al. (2022b) đã đề xuất Black-Box Tuning (BBT), tối ưu hóa prompt liên tục bằng cách chỉ truy cập các API suy luận mô hình. Trái ngược với điều chỉnh dựa trên gradient yêu cầu lan truyền ngược đắt đỏ, BBT chỉ yêu cầu tính toán truyền thẳng mô hình, có thể được tối ưu hóa cao bởi các framework tăng tốc như ONNX Runtime và TensorRT. Ngoài ra, chi phí tối ưu hóa của BBT được tách rời khỏi quy mô của mô hình. Thay vào đó, các mô hình lớn hơn có thể thuận lợi hơn cho BBT do chiều nội tại thấp hơn (Aghajanyan et al., 2021). Mặc dù có ưu thế về hiệu quả và hiệu suất có thể so sánh với gradient descent, các thí nghiệm thử nghiệm của chúng tôi (§3) cho thấy BBT thiếu tính linh hoạt qua các tác vụ và PTMs.
+
+Trong bài báo này, chúng tôi trình bày BBTv2, một phiên bản cải tiến của BBT, để giải quyết những vấn đề này. Thay vì chỉ tiêm các token prompt liên tục vào tầng đầu vào, BBTv2 đặt trước prompts vào các trạng thái ẩn ở mọi tầng của PTM (được gọi là prompts sâu), kết hợp một bậc độ lớn nhiều tham số hơn để xử lý các tác vụ khó khăn hơn. Tuy nhiên, số lượng tham số tăng lên cũng đặt ra thách thức cho tối ưu hóa không phái sinh tự do chiều cao (DFO, Shahriari et al. (2016); Qian và Yu (2021)). May mắn thay, chúng tôi cho thấy rằng tính toán truyền thẳng của các PTMs hiện đại có thể được phân tích thành dạng cộng w.r.t. các trạng thái ẩn của mỗi tầng nhờ vào các kết nối dư (He et al., 2016). Do đó, việc tối ưu hóa các prompts sâu có thể được phân tích thành nhiều bài toán con chiều thấp, mỗi bài toán tương ứng với việc tối ưu hóa prompt tại một tầng. Dựa trên cái nhìn này, chúng tôi đề xuất một thuật toán chia để trị để tối ưu hóa xen kẽ prompt tại mỗi tầng. Đối với việc tối ưu hóa tại mỗi tầng, chúng tôi duy trì một phép biến đổi tuyến tính ngẫu nhiên chiếu các tham số prompt vào một không gian con chiều thấp và thực hiện DFO trong không gian con được tạo ra.
+
+Để tổng quát hóa BBTv2 cho nhiều PTMs khác nhau, chúng tôi tạo ra các phép chiếu ngẫu nhiên sử dụng các phân phối chuẩn với các độ lệch chuẩn liên quan đến PTM.
+
+Kết quả thí nghiệm cho thấy BBTv2 cải thiện đáng kể BBT về hiệu suất trung bình qua 7 tác vụ hiểu ngôn ngữ. Như được thể hiện trong Hình 1, BBTv2 đạt được hiệu suất có thể so sánh với việc điều chỉnh mô hình đầy đủ và các phương pháp PET tiên tiến bao gồm Adapter (Houlsby et al., 2019), BitFit (Zaken et al., 2022), LoRA (Hu et al., 2021), và P-Tuning v2 (Liu et al., 2021b) trong khi có ít tham số có thể điều chỉnh hơn nhiều. Mã nguồn được công bố tại https://github.com/txsun1997/Black-Box-Tuning.
+
+2 Black-Box Tuning
+
+Black-Box Tuning (BBT) (Sun et al., 2022b) là một framework không phái sinh để điều khiển PTMs cho học few-shot. Cụ thể, đối với một batch dữ liệu huấn luyện (X;Y), trước tiên chúng tôi chuyển đổi các văn bản X với một số templates được định nghĩa trước (ví dụ: "It was [MASK]") thành ~X, và các nhãn Y với một ánh xạ được định nghĩa trước thành các từ nhãn ~Y (ví dụ: "great" và "terrible"). Bằng cách này, chúng tôi có thể công thức hóa các tác vụ downstream khác nhau thành một tác vụ mô hình hóa ngôn ngữ (có mặt nạ) có mục đích chung và sử dụng đầu mô hình hóa ngôn ngữ (có mặt nạ) được tiền huấn luyện để giải quyết chúng. Giả sử API suy luận PTM f nhận một prompt liên tục p và một batch các văn bản đã chuyển đổi ~X làm đầu vào, và xuất ra các logits của các tokens quan tâm (ví dụ: token [MASK]). BBT tìm kiếm prompt tối ưu p* = arg min p∈P L(f(p,~X),~Y), trong đó P là không gian prompt và L là một hàm mất mát nào đó như cross entropy. Dạng đóng và gradient của f không thể truy cập được với BBT.
+
+Prompt p ∈ R^D thường có hàng chục nghìn chiều, làm cho nó không khả thi để được tối ưu hóa với các thuật toán tối ưu hóa không phái sinh (DFO). Do đó, BBT áp dụng một phép chiếu ngẫu nhiên A ∈ R^{D×d} để tạo ra một không gian con chiều thấp Z ∈ R^d và thực hiện tối ưu hóa trong không gian con được tạo ra, tức là
+
+z* = arg min_{z∈Z} L(f(Az+p_0,~X),~Y), (1)
+
+trong đó p_0 là embedding prompt ban đầu. Nếu không sử dụng embedding prompt được tiền huấn luyện, p_0 là embedding từ được rút ngẫu nhiên từ từ vựng. BBT áp dụng Covariance Matrix Adaptation Evolution Strategy (CMA-ES) (Hansen và Ostermeier, 2001; Hansen et al., 2003) để tối ưu hóa Phương trình (1) và có được prompt mong muốn p* = Az*. Phép chiếu ngẫu nhiên A được đóng băng trong quá trình tối ưu hóa.
+
+3 Thí nghiệm thử nghiệm
+
+3.1 Hạn chế của BBT qua các tác vụ
+
+Hiệu suất không thỏa mãn trên các tác vụ suy luận. Như được chứng minh bởi Sun et al. (2022b), BBT có thể vượt trội so với việc điều chỉnh mô hình trên các tác vụ suy luận khi sử dụng embedding prompt được tiền huấn luyện để khởi tạo. Tuy nhiên, embedding prompt được tiền huấn luyện không phải lúc nào cũng có sẵn cho nhiều ngôn ngữ và PTMs. Không có embedding prompt được tiền huấn luyện, BBT vẫn tụt hậu xa so với việc điều chỉnh mô hình trên các tác vụ suy luận. Nói cách khác, BBT không hoàn toàn thoát khỏi sự phụ thuộc vào gradients để vượt qua việc điều chỉnh mô hình. Ngược lại, như được mô tả trong Hình 2, BBTv2 có thể khớp với hiệu suất của việc điều chỉnh mô hình trên ba tác vụ suy luận, cụ thể là MRPC (Dolan và Brockett, 2005), SNLI (Bowman et al., 2015), và RTE (Wang et al., 2019) mà không sử dụng embedding prompt được tiền huấn luyện.
+
+Hội tụ chậm trên các tác vụ phân loại nhiều nhãn. BBT gặp khó khăn với tốc độ hội tụ chậm khi số lượng nhãn trở nên lớn. Như được báo cáo bởi Sun et al. (2022b), BBT không thể hội tụ trong ngân sách 8.000 lệnh gọi API, đủ cho các tác vụ thông thường để hội tụ, trên DBPedia (Zhang et al., 2015), một tác vụ phân loại chủ đề với 14 nhãn. Hình 3 cho thấy mất mát cross entropy và độ chính xác huấn luyện trong quá trình tối ưu hóa. So với BBT, BBTv2 được đề xuất tăng tốc đáng kể việc hội tụ trên DBPedia.
+
+3.2 Hạn chế của BBT qua các PTMs
+
+Quá khớp trên dữ liệu huấn luyện. Khi chuyển đổi mô hình backbone từ RoBERTa (Liu et al., 2019) sang các PTMs khác, chúng tôi thấy rằng BBT có xu hướng quá khớp dữ liệu huấn luyện. Như được thể hiện trong Hình 4, BBT ban đầu với BERT LARGE (Devlin et al., 2019) và BART LARGE (Lewis et al., 2020) có thể đạt được 100% độ chính xác trên tập huấn luyện SST-2, nhưng đạt được ít cải thiện trên tập phát triển. Chúng tôi đoán rằng phép chiếu ngẫu nhiên được áp dụng bởi BBT ban đầu cản trở khả năng tổng quát hóa của nó. Bằng cách tạo ra các phép chiếu ngẫu nhiên sử dụng các phân phối chuẩn với các độ lệch chuẩn liên quan đến mô hình (§4.2), BBT và BBTv2 đã sửa đổi của chúng tôi thể hiện khả năng tổng quát hóa mạnh mẽ hơn.
+
+4 BBTv2
+
+4.1 Deep Black-Box Tuning
+
+Mặc dù BBT đã đạt được hiệu suất có thể so sánh với việc điều chỉnh mô hình trên các tác vụ phân loại đơn giản (ví dụ: SST-2), các thí nghiệm thử nghiệm của chúng tôi (§3) cho thấy nó thiếu tính linh hoạt qua các tác vụ và PTMs. Như một biến thể cải tiến của BBT, BBTv2 tìm cách tổng quát hóa BBT qua các tác vụ và PTMs.
+
+Lấy cảm hứng từ thành công gần đây của deep prompt tuning (Li và Liang, 2021; Qin và Eisner, 2021; Liu et al., 2021b), chúng tôi quản lý để tiêm các token prompt liên tục vào mọi tầng của PTM và tối ưu hóa chúng bằng các phương pháp không phái sinh. So với BBT tối ưu hóa prompt chỉ trong tầng đầu vào, BBTv2 có một bậc độ lớn nhiều tham số hơn. Đối với một PTM có L tầng, BBTv2 tìm cách tối ưu hóa p = ⟨p_1,...,p_L⟩, trong đó p_i ∈ R^D. Do đó, số lượng tham số cần tối ưu hóa trở thành L×D. Giả sử chúng tôi sử dụng RoBERTa LARGE với 24 tầng và chèn 50 token prompt tại mỗi tầng, tổng số tham số cần tối ưu hóa là 1.2M, đặt ra thách thức về DFO chiều cao. Thay vì đơn giản mở rộng chiều của ma trận phép chiếu ngẫu nhiên A thành R^{L×D×d}, chúng tôi đề xuất một thuật toán chia để trị (DC) để xử lý các tham số tăng lên.
+
+Thực tế, DC đã được khám phá kỹ trong các công trình trước (Kandasamy et al., 2015; Mei et al., 2016) để đối phó với các vấn đề DFO chiều cao bằng cách phân tích vấn đề chiều cao ban đầu thành nhiều bài toán con chiều thấp, và giải quyết chúng riêng biệt. Giả định chính của việc áp dụng DC là, hàm mục tiêu f có thể được phân tích thành một dạng cộng nào đó. May mắn thay, tính toán truyền thẳng của các PTMs hiện đại có thể được mở rộng thành dạng cộng do các kết nối dư (He et al., 2016). Ví dụ, tính toán truyền thẳng của một PTM ba tầng có thể được phân tích như sau:
+
+f(x_1) = f_3(x_3) + x_3 (2)
+= f_3(x_3) + f_2(x_2) + x_2 (3)
+= f_3(x_3) + f_2(x_2) + f_1(x_1) + x_1, (4)
+
+trong đó f_i là hàm biến đổi của tầng thứ i, x_i là đầu vào của tầng thứ i, và x_1 là embedding đầu vào. Do đó, việc tối ưu hóa các prompts liên tục {p_i}_{i=1}^L được đính kèm với các trạng thái ẩn tại mọi tầng {x_i}_{i=1}^L có thể được coi là các bài toán con độc lập. Vì giả định được thỏa mãn, chúng tôi đề xuất một thuật toán dựa trên DC, được mô tả trong Thuật toán 1, để triển khai BBTv2.
+
+Các prompts tại các tầng khác nhau được tối ưu hóa xen kẽ từ dưới lên trên. Đối với việc tối ưu hóa tại mỗi tầng, chúng tôi duy trì một phép chiếu ngẫu nhiên cụ thể A_j và một trình tối ưu hóa CMA-ES M_j. Khi xen kẽ đến tầng j (Dòng 6-8 trong Thuật toán 1), một lần lặp CMA-ES đơn được thực hiện theo cách thức tương tự như BBT, tức là một z_j mới được tạo ra bởi M_j và sau đó được chiếu lên p_j bằng A_j. Một minh họa đồ họa được thể hiện trong Hình 5.
+
+Trong quá trình suy luận PTM, p_j = A_j z_j trước tiên được cộng với một embedding prompt ban đầu p_0^j và sau đó được nối với các trạng thái ẩn x_j. Do đó, theo Phương trình (4), tính toán truyền thẳng của một PTM L tầng có thể được xem như
+
+f(x_1; p_{1:L}) = [A_1 z_1 + p_0^1; x_1] + ∑_{j=1}^L f_j([A_j z_j + p_0^j; x_j]), (5)
+
+trong đó [;] có nghĩa là nối. Các tham số có thể điều chỉnh được làm nổi bật bằng màu. Chúng tôi đặt p_0^1 là embedding từ được rút ngẫu nhiên từ từ vựng PTM cho tất cả các tác vụ. p_0^j (1 < j ≤ L) là các trạng thái ẩn của các token prompt tại tầng thứ j.
+
+4.2 Xem xét lại phép chiếu ngẫu nhiên
+
+Trong BBT ban đầu, mỗi mục trong phép chiếu ngẫu nhiên A được lấy mẫu từ một phân phối đều (He et al., 2015). Trong các thí nghiệm của họ, việc sử dụng phân phối chuẩn N(0, 1/d) để tạo ra phép chiếu ngẫu nhiên dẫn đến hội tụ chậm và hiệu suất kém. Tuy nhiên, chúng tôi cho thấy trong các thí nghiệm thử nghiệm rằng phân phối đều thể hiện khả năng tổng quát hóa kém trên các PTMs khác ngoài RoBERTa.
+
+Trong phần này, chúng tôi làm sáng tỏ hiệu ứng của phép chiếu ngẫu nhiên, và đề xuất sử dụng các phân phối chuẩn với các độ lệch chuẩn liên quan đến mô hình để tạo ra các phép chiếu ngẫu nhiên. Thực tế, hầu hết các công trình trước trong DFO chiều cao (Wang et al., 2016; Qian et al., 2016) cũng áp dụng các phân phối chuẩn để tạo ra các phép chiếu ngẫu nhiên. Tuy nhiên, họ thường đơn giản sử dụng N(0,1) hoặc N(0,1/d), cả hai đều hoạt động kém trong kịch bản của chúng tôi.
+
+Để xem xét kỹ hơn về hiệu ứng của phép chiếu ngẫu nhiên, chúng tôi vẽ phân phối của prompt ban đầu p được chiếu từ z bởi ma trận chiếu A. Ở đây, z được lấy mẫu từ phân phối chuẩn được duy trì bởi CMA-ES, ban đầu được đặt thành N(0, 0.5) trong BBT. Bằng cách tạo ra A từ các phân phối khác nhau, chúng tôi mô phỏng phân phối của prompt được chiếu p và so sánh với phân phối của RoBERTa LARGE word embeddings. Như được tiết lộ bởi Hình 6, khi A được lấy mẫu từ phân phối chuẩn được sử dụng trong BBT ban đầu, tức là N(0, 1/d), prompt được chiếu p không thể bao phủ phạm vi của word embeddings, và do đó gặp khó khăn với hội tụ chậm. Ngược lại, việc sử dụng phân phối đều có thể bao phủ phạm vi của word embeddings, điều này giải thích tại sao nó hoạt động tốt trên RoBERTa LARGE.
+
+Do đó, để tổng quát hóa BBT (và BBTv2) qua các PTMs khác nhau, chúng tôi phải tính đến phân phối của word embeddings (và các trạng thái ẩn cho BBTv2) của PTM để tạo ra các phép chiếu ngẫu nhiên. Cụ thể, chúng tôi sử dụng phân phối chuẩn với độ lệch chuẩn như sau:
+
+σ_A = (ξ σ̂)/(√d σ_z), (6)
+
+trong đó σ̂ là độ lệch chuẩn quan sát được của word embeddings (hoặc trạng thái ẩn cho BBTv2), σ_z là độ lệch chuẩn của phân phối chuẩn được duy trì bởi CMA-ES, ξ là một vô hướng hằng số để kéo dài phân phối. Ban đầu, chúng tôi đặt μ_z = μ_A = 0 để không có kiến thức tiên nghiệm về hướng tối ưu hóa được kết hợp. Ý tưởng chính đằng sau tính toán trên là để khớp phân phối (cụ thể hơn là phương sai) giữa prompt được chiếu và word embeddings (hoặc trạng thái ẩn).
+
+Khi ξ = 1, như chúng ta có thể thấy trong Hình 6, phân phối của prompt được chiếu có thể khớp hoàn hảo với phân phối của word embeddings. Tính toán chi tiết của Phương trình (6) được cung cấp trong Phụ lục A.
+
+5 Thí nghiệm
+
+5.1 Tập dữ liệu và tác vụ
+
+Để so sánh, chúng tôi đánh giá BBTv2 trên các tập dữ liệu tương tự như BBT, tức là SST-2 (Socher et al., 2013), Yelp (Zhang et al., 2015), AG's News (Zhang et al., 2015), DBPedia (Zhang et al., 2015), SNLI (Bowman et al., 2015), RTE (Wang et al., 2019), và MRPC (Dolan và Brockett, 2005). SST-2 và Yelp là các tác vụ phân tích tình cảm, AG's News và DBPedia là các tác vụ phân loại chủ đề, SNLI và RTE là các tác vụ suy luận ngôn ngữ tự nhiên (NLI), và MRPC là một tác vụ diễn giải lại. Ngoài ra, chúng tôi bao gồm hai tác vụ tiếng Trung, ChnSent và LCQMC (Liu et al., 2018), để đánh giá trên CPM-2 (Zhang et al., 2021b), một PTM tiếng Trung với 11B tham số. ChnSent là một tác vụ phân tích tình cảm trong khi LCQMC là một tác vụ khớp câu hỏi.
+
+Chúng tôi tuân theo quy trình tương tự như Zhang et al. (2021a); Gu et al. (2021); Sun et al. (2022b) để xây dựng các cài đặt học few-shot thực sự (Perez et al., 2021). Cụ thể, chúng tôi ngẫu nhiên rút k mẫu cho mỗi lớp để xây dựng một tập huấn luyện k-shot D_train, và xây dựng một tập phát triển D_dev bằng cách ngẫu nhiên chọn k mẫu khác từ tập huấn luyện ban đầu sao cho |D_train| = |D_dev|. Chúng tôi sử dụng các tập phát triển ban đầu làm tập kiểm tra. Đối với các tập dữ liệu không có tập phát triển, chúng tôi sử dụng các tập kiểm tra ban đầu. Do đó, trong các thí nghiệm của chúng tôi, chúng tôi có |D_test| ≫ |D_train| = |D_dev|.
+
+5.2 Baseline
+
+Chúng tôi xem xét hai loại phương pháp làm baseline: phương pháp dựa trên gradient và phương pháp không cần gradient.
+
+Đối với các phương pháp dựa trên gradient, chúng tôi so sánh với (1) Model Tuning và các phương pháp hiệu quả tham số tiên tiến bao gồm (2) Adapter (Houlsby et al., 2019), (3) BitFit (Zaken et al., 2022), (4) LoRA (Hu et al., 2021), (5) Prompt Tuning (Lester et al., 2021), và (6) P-Tuning v2 (Liu et al., 2021b). Chúng tôi triển khai Adapter, BitFit, và LoRA sử dụng OpenDelta, và đánh giá P-Tuning v2 trong các cài đặt thí nghiệm của chúng tôi dựa trên triển khai chính thức. Kết quả của Model Tuning và Prompt Tuning được lấy từ Sun et al. (2022b).
+
+Đối với các phương pháp không cần gradient, chúng tôi so sánh với hai phương pháp prompt-based không học: (1) Manual Prompt và (2) In-Context Learning (Brown et al., 2020); hai phương pháp dựa trên đặc trưng: (3) Feature-MLP và (4) Feature-BiLSTM, là việc huấn luyện một bộ phân loại MLP/BiLSTM trên các đặc trưng được trích xuất bởi PTM; và (5) BBT (Sun et al., 2022b). Kết quả của các baseline không cần gradient này được lấy từ Sun et al. (2022b). Một ngoại lệ là hiệu suất của BBT trên DBPedia. Trong bài báo ban đầu, BBT được thực hiện với một ngân sách lớn hơn (20.000 lệnh gọi API) trên DBPedia để hội tụ. Trong công trình này, chúng tôi triển khai lại BBT trên DBPedia với cùng ngân sách (8.000 lệnh gọi API) như các tác vụ khác để so sánh công bằng.
+
+5.3 Chi tiết triển khai
+
+Backbone. Để so sánh với BBT, chúng tôi chủ yếu sử dụng RoBERTa LARGE (Liu et al., 2019) làm mô hình backbone. Để xác minh tính linh hoạt, chúng tôi cũng đánh giá trên các PTMs khác bao gồm BERT LARGE (Devlin et al., 2019), GPT-2 LARGE, BART LARGE (Lewis et al., 2020), và T5 LARGE (Raffel et al., 2020). Ngoài ra, chúng tôi cũng đánh giá BBTv2 trên một PTM tiếng Trung siêu lớn, CPM-2 (Zhang et al., 2021b), có 11B tham số.
+
+Siêu tham số. Hầu hết các siêu tham số vẫn giống như BBT. Chúng tôi chèn 50 token prompt liên tục tại mỗi tầng. Chiều không gian con được đặt thành 500. CMA-ES với kích thước quần thể là 20 và ngân sách 8.000 lệnh gọi API được áp dụng cho tất cả các tác vụ. Chúng tôi áp dụng cross entropy làm hàm mất mát. Để tạo ra các phép chiếu ngẫu nhiên, chúng tôi sử dụng các phân phối chuẩn với các độ lệch chuẩn được tính toán bởi Phương trình (6) thay vì các phân phối đều.
+
+5.4 Kết quả
+
+So sánh tổng thể. Như được thể hiện trong Bảng 1, BBTv2 vượt trội hơn BBT và các phương pháp không cần gradient khác trên 6/7 tác vụ. Ngược lại với BBT, sự cải thiện của BBTv2 chủ yếu đến từ DBPedia, có 14 lớp, và các tác vụ suy luận khó, cụ thể là MRPC và SNLI. Trên các tác vụ đơn giản như SST-2 và Yelp, BBT có thể thực hiện tương đương với BBTv2. Khi so sánh với các phương pháp dựa trên gradient, BBTv2 đạt được kết quả tốt nhất về trung bình qua 7 tác vụ trong khi duy trì ít tham số có thể điều chỉnh hơn nhiều. Đáng chú ý là BBTv2, không có bất kỳ thành phần dựa trên gradient nào (ví dụ: embedding prompt được tiền huấn luyện được sử dụng trong BBT trên các tác vụ suy luận (Sun et al., 2022b) hoặc tối ưu hóa prompt white-box được yêu cầu bởi Diao et al. (2022)), là phương pháp black-box thuần túy đầu tiên khớp với hiệu suất của việc điều chỉnh mô hình đầy đủ trên các tác vụ hiểu khác nhau.
+
+So sánh chi tiết. Trong Bảng 2, chúng tôi so sánh BBTv2 với BBT trong các chiều khác ngoài độ chính xác. Ngoài sự cải thiện về độ chính xác, BBTv2 cũng mang lại hội tụ nhanh hơn so với BBT. Để so sánh công bằng về thời gian huấn luyện, chúng tôi thực hiện dừng sớm nếu độ chính xác phát triển không tăng sau 1.000 bước. Chúng tôi báo cáo thời gian huấn luyện dưới hai triển khai, PyTorch (Paszke et al., 2019) và ONNX Runtime, trên một GPU NVIDIA GTX 3090 duy nhất. Về dấu chân bộ nhớ và tải mạng, BBTv2 tăng nhẹ việc sử dụng bộ nhớ ở phía người dùng và lượng dữ liệu cần tải lên.
+
+BBTv2 qua các PTMs. Để xác minh tính phổ quát của BBTv2 qua các PTMs, chúng tôi cũng đánh giá trên BERT, GPT-2, BART, T5, và CPM-2. Như được thể hiện trong Bảng 3, BBTv2 đạt được hiệu suất vượt trội so với BBT trên các PTMs với các kiến trúc khác nhau, tức là PTMs chỉ encoder, chỉ decoder, và encoder-decoder. Ngoài ra, chúng tôi cũng xác minh hiệu quả của BBTv2 trên một PTM tiếng Trung siêu lớn, CPM-2, có 11B tham số. Như được thể hiện trong Bảng 4, khi sử dụng CPM-2 làm backbone, BBTv2 vượt trội hơn việc điều chỉnh mô hình đầy đủ trên hai tác vụ tiếng Trung. Kết quả của Vanilla PT, Hybrid PT, và LM Adaption, là ba biến thể của prompt tuning, được lấy từ Gu et al. (2021).
+
+5.5 Phân tích loại bỏ
+
+Ảnh hưởng của chiều không gian con. Chúng tôi khám phá chiều không gian con d từ 10 đến 1000 sử dụng cả BBT và BBTv2. Kích thước quần thể được đặt thành λ = 4 + 3 log(d) tương ứng. Kết quả thí nghiệm trên SST-2 và SNLI được chứng minh trong Hình 7, từ đó chúng tôi quan sát thấy: (1) Tăng chiều không gian con d thường mang lại hiệu suất cải thiện cho cả BBT và BBTv2, nhưng hiệu ứng biên cũng được quan sát khi d > 100; (2) BBTv2 hầu như luôn thực hiện tốt hơn BBT với cùng chiều không gian con.
+
+Ảnh hưởng của độ dài prompt. Như được báo cáo trong các công trình trước (Lester et al., 2021; Sun et al., 2022b), độ dài prompt có thể là một siêu tham số nhạy cảm với hiệu suất mô hình. Do đó, chúng tôi khám phá độ dài prompt từ 5 đến 100 sử dụng BBT và BBTv2. Như được thể hiện trong Hình 7: (1) Độ dài prompt tối ưu nằm trong khoảng từ 5 đến 100 và khác nhau qua các tác vụ; (2) Ảnh hưởng của độ dài prompt có phần nhất quán giữa BBT và BBTv2.
+
+Ảnh hưởng của quy mô mô hình. Đã được chứng minh rằng các PTMs lớn hơn có chiều nội tại thấp hơn (Aghajanyan et al., 2021) và do đó, BBT và BBTv2 nên thuận lợi hơn cho các PTMs lớn hơn. Để xác minh điều này, chúng tôi tiến hành thí nghiệm trên AG's News sử dụng T5 (Raffel et al., 2020) với các quy mô khác nhau, tức là T5 SMALL, T5 BASE, T5 LARGE, và T5 XL, tương ứng với 60M, 220M, 740M, và 3B tham số. Như được thể hiện trong Hình 8, trong cài đặt học 16-shot AG's News, đối tác dựa trên gradient, cụ thể là deep prompt tuning (DPT, Li và Liang (2021); Liu et al. (2021b); Qin và Eisner (2021)), thực hiện tốt hơn BBT và BBTv2 trên T5 SMALL và T5 BASE. Khi sử dụng T5 LARGE và T5 XL, black-box tuning vượt trội hơn DPT, chứng minh sức mạnh của quy mô.
+
+6 Công trình liên quan
+
+Điều chỉnh hiệu quả tham số (PET). PET là tối ưu hóa chỉ một phần nhỏ tham số trong khi giữ phần thân chính của mô hình không thay đổi. PET đã đạt được hiệu suất có thể so sánh với việc điều chỉnh mô hình đầy đủ khi dữ liệu huấn luyện đủ (He et al., 2021). Các tham số có thể điều chỉnh có thể được tiêm vào các vị trí khác nhau của PTM. Houlsby et al. (2019) chèn các adapter nhẹ vào mỗi tầng PTM; Lester et al. (2021) đặt trước các token prompt liên tục vào tầng đầu vào; Li và Liang (2021); Liu et al. (2021b) tiêm các token prompt có thể điều chỉnh vào các trạng thái ẩn của mọi tầng; Zaken et al. (2022) chỉ tối ưu hóa các bias-terms trong PTM; Hu et al. (2021) học cách thích ứng trọng số attention thông qua các ma trận low-rank. Mặc dù số lượng tham số có thể điều chỉnh được giảm, lan truyền ngược qua toàn bộ mô hình vẫn được yêu cầu để tính toán gradient để cập nhật phần nhỏ tham số. Vì vậy, các phương pháp không cần gradient cũng được đề xuất để tối ưu hóa prompt liên tục (Sun et al., 2022b; Diao et al., 2022) hoặc prompt rời rạc (Prasad et al., 2022; Deng et al., 2022).
+
+Học dựa trên prompt. Học dựa trên prompt là công thức hóa các tác vụ downstream thành một tác vụ mô hình hóa ngôn ngữ (có mặt nạ), và do đó giảm khoảng cách giữa tiền huấn luyện PTM và tinh chỉnh (Liu et al., 2021a; Sun et al., 2022a). Prompt có thể được thiết kế thủ công (Brown et al., 2020; Schick et al., 2020; Schick và Schütze, 2021), khai thác từ corpora (Jiang et al., 2020), tạo ra bởi các PTMs tạo sinh (Gao et al., 2021), hoặc được xây dựng sử dụng tìm kiếm hướng dẫn gradient (Shin et al., 2020). Trong công trình này, chúng tôi cũng chèn các prompts văn bản được chế tạo thủ công vào các mẫu đầu vào nhưng chỉ tối ưu hóa các token prompt liên tục được đặt trước.
+
+7 Kết luận
+
+Trong công trình này, chúng tôi trình bày BBTv2, một phiên bản cải tiến của BBT (Sun et al., 2022b) với các prompts sâu được đính kèm vào mọi tầng của PTM. Để tối ưu hóa các tham số prompt chiều cao, chúng tôi đề xuất một thuật toán chia để trị (DC) kết hợp với các phép chiếu ngẫu nhiên để tối ưu hóa xen kẽ prompt liên tục tại mỗi tầng. Kết quả thí nghiệm chứng minh rằng BBTv2, không có bất kỳ thành phần dựa trên gradient nào, có thể đạt được hiệu suất có thể so sánh với các phương pháp PET tiên tiến và việc điều chỉnh mô hình đầy đủ trong khi duy trì ít tham số có thể điều chỉnh hơn nhiều.
+
+Hạn chế
+
+Chúng tôi tóm tắt các hạn chế của công trình này như sau: (1) BBTv2 áp dụng một thuật toán chia để trị để tối ưu hóa xen kẽ prompt tại mỗi tầng PTM. Chúng tôi sử dụng một trình tối ưu hóa CMA-ES duy nhất, có hai siêu tham số μ_z và σ_z, cho việc tối ưu hóa tại mỗi tầng. Như đã đề cập trước đó, chúng tôi đặt μ_z = 0 để không kết hợp bất kỳ tiền đề nào vào hướng tối ưu hóa. Do đó, chúng tôi có tổng cộng L (số lượng tầng) siêu tham số cho việc tối ưu hóa, tức là [σ_z^(1), ..., σ_z^(L)]. Để đơn giản, chúng tôi ràng buộc σ_z tại các tầng khác nhau để giống nhau, tức là σ_z^(1) = σ_z^(2) = ... = σ_z^(L). Ngoài ra, Phương trình (6) giới thiệu một siêu tham số khác ξ, cũng có thể khác nhau qua các tầng khác nhau. Tương tự, chúng tôi ràng buộc ξ tại tất cả các tầng để giống nhau. Do đó, ngược lại với BBT chỉ có một siêu tham số cho việc tối ưu hóa, BBTv2 giới thiệu một siêu tham số bổ sung và do đó tăng chi phí cho việc tìm kiếm siêu tham số. (2) Chúng tôi tiến hành thí nghiệm trên 9 tác vụ hiểu ngôn ngữ qua 4 loại (tức là phân tích tình cảm, phân loại chủ đề, diễn giải lại, và suy luận ngôn ngữ tự nhiên) và 2 ngôn ngữ (tức là tiếng Anh và tiếng Trung). Tuy nhiên, hiệu suất của BBTv2 trên một phạm vi rộng hơn các tác vụ hiểu và các tác vụ tạo sinh vẫn chưa được khám phá. (3) Chúng tôi giới hạn công trình của mình vào học few-shot vì dữ liệu huấn luyện có thể được gói vào một batch duy nhất để đưa vào PTM sao cho API suy luận mô hình là một hàm xác định có đầu ra chỉ phụ thuộc vào prompt. Trong kịch bản nhiễu thấp như vậy, chúng tôi có thể áp dụng CMA-ES để thành công thực hiện tối ưu hóa. Trong cài đặt dữ liệu đầy đủ nơi các mẫu huấn luyện được chia thành các mini-batch, chúng tôi cần khám phá các trình tối ưu hóa không phái sinh khác để xử lý việc tối ưu hóa ngẫu nhiên (nhiễu). Chúng tôi để việc điều tra thích ứng BBTv2 cho một phạm vi rộng hơn các tác vụ và các cài đặt dữ liệu đầy đủ là công việc tương lai, tiếp tục loại bỏ các rào cản còn lại đối với một tương lai không cần gradient.
+
+Lời cảm ơn
+
+Công trình này được hỗ trợ bởi Quỹ Khoa học Tự nhiên Quốc gia Trung Quốc (Số 62106076), Quỹ Khoa học Tự nhiên Thượng Hải (Số 21ZR1420300), và Quỹ Khoa học Tự nhiên Quốc gia Trung Quốc (Số 62022027).

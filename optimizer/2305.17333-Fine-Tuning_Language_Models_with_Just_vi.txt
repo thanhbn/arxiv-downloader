@@ -1,0 +1,175 @@
+# Tinh chỉnh mô hình ngôn ngữ chỉ với truyền tiến
+
+Fine-tuning các mô hình ngôn ngữ (LM) đã mang lại thành công trên nhiều tác vụ downstream đa dạng, nhưng khi LM phát triển về quy mô, backpropagation yêu cầu một lượng bộ nhớ lớn một cách cấm đoán. Các phương pháp bậc không (ZO) về nguyên tắc có thể ước tính gradient chỉ sử dụng hai lần truyền tiến nhưng về mặt lý thuyết được cho là chậm một cách thảm khốc để tối ưu hóa các mô hình lớn. Trong nghiên cứu này, chúng tôi đề xuất một bộ tối ưu hóa bậc không tiết kiệm bộ nhớ (MeZO), điều chỉnh phương pháp ZO-SGD cổ điển để hoạt động tại chỗ, từ đó fine-tuning các LM với cùng dung lượng bộ nhớ như suy luận. Ví dụ, với một GPU A100 80GB duy nhất, MeZO có thể huấn luyện một mô hình 30 tỷ tham số, trong khi fine-tuning với backpropagation chỉ có thể huấn luyện một LM 2.7B với cùng ngân sách. Chúng tôi tiến hành các thí nghiệm toàn diện trên các loại mô hình (LM có mặt nạ và tự hồi quy), quy mô mô hình (lên tới 66B), và các tác vụ downstream (phân loại, lựa chọn đa phương án và sinh). Kết quả của chúng tôi chứng minh rằng (1) MeZO vượt trội đáng kể so với học trong ngữ cảnh và linear probing; (2) MeZO đạt được hiệu suất tương đương với fine-tuning bằng backpropagation trên nhiều tác vụ, với mức giảm bộ nhớ lên tới 12× và giảm GPU-giờ lên tới 2× trong triển khai của chúng tôi; (3) MeZO tương thích với cả kỹ thuật tinh chỉnh đầy đủ tham số và tiết kiệm tham số như LoRA và prefix tuning; (4) MeZO có thể tối ưu hóa hiệu quả các mục tiêu không khả vi (ví dụ, tối đa hóa độ chính xác hoặc F1). Chúng tôi hỗ trợ các phát hiện thực nghiệm bằng những hiểu biết lý thuyết, làm nổi bật cách pre-training đầy đủ và prompt tác vụ cho phép MeZO fine-tune các mô hình khổng lồ, bất chấp các phân tích ZO cổ điển gợi ý ngược lại.
+
+## 1 Giới thiệu
+
+Fine-tuning các mô hình ngôn ngữ được huấn luyện trước (LM) đã trở thành phương pháp luận thống trị để giải quyết nhiều tác vụ ngôn ngữ, thích ứng với các miền chuyên biệt, hoặc tích hợp hướng dẫn và sở thích của con người. Tuy nhiên, khi LM được mở rộng quy mô, việc tính toán gradient cho backpropagation yêu cầu một lượng bộ nhớ cấm đoán – trong thử nghiệm của chúng tôi, lên tới 12× lượng bộ nhớ cần thiết cho suy luận – bởi vì nó cần lưu trữ các kích hoạt trong quá trình truyền tiến, gradient trong quá trình truyền ngược, và trong trường hợp Adam, cũng lưu trữ lịch sử gradient (xem Phần 3.4 để phân tích chi tiết). Kết quả là, trong khi có thể chạy suy luận với LM 30 tỷ tham số trên một GPU Nvidia A100 duy nhất (với bộ nhớ 80GB), backpropagation với Adam chỉ khả thi với LM 2.7B.
+
+Các phương pháp fine-tuning tiết kiệm tham số (PEFT) cập nhật chỉ một phần của mạng, nhưng vẫn cần lưu trữ nhiều kích hoạt, bởi vì các tham số được điều chỉnh được phân tán khắp mô hình. Trong các thử nghiệm của chúng tôi, fine-tuning mô hình OPT-13B với full parameter tuning hoặc PEFT yêu cầu 12× và 6× nhiều bộ nhớ hơn suy luận tương ứng.
+
+Học trong ngữ cảnh (ICL) đã cho phép giải quyết nhiều tác vụ với một lần truyền suy luận duy nhất, trong đó mô hình xử lý các ví dụ có nhãn (demonstrations) trong ngữ cảnh của nó và sau đó đưa ra dự đoán về một ví dụ thử nghiệm. Mặc dù điều này cho phép thích ứng nhanh chóng mô hình với các trường hợp sử dụng cụ thể, các mô hình hiện tại cho phép kích thước ngữ cảnh hạn chế (và do đó, demonstrations hạn chế) và hiệu suất nhạy cảm với định dạng và lựa chọn demonstrations. ICL có thể chậm với số lượng demonstrations, và nó thường hoạt động tệ hơn fine-tuning của các mô hình kích thước trung bình.
+
+Backpropagation cũng không thể tối ưu hóa các tiêu chí không khả vi, những tiêu chí đã trở nên phổ biến trong fine-tuning LM theo điểm số sở thích của con người hoặc thiết lập các tiêu chuẩn an toàn. Thông thường, những thích ứng này bao gồm việc học tăng cường từ phản hồi của con người (RLHF) đắt đỏ.
+
+Một phương pháp tối ưu hóa bậc không cổ điển, ZO-SGD, chỉ sử dụng sự khác biệt của các giá trị loss để ước tính gradient. Do đó, về nguyên tắc, phương pháp có thể cập nhật mạng neural chỉ với các lần truyền tiến, mặc dù việc triển khai ngây thơ vẫn tăng gấp đôi overhead bộ nhớ và các cận dưới cổ điển gợi ý rằng sự hội tụ chậm tuyến tính với kích thước mô hình. Như vậy, các phương pháp ZO đã được áp dụng trong các cài đặt deep learning để tìm ví dụ adversarial hoặc điều chỉnh input embeddings nhưng không để tối ưu hóa trực tiếp các mô hình quy mô lớn (xem Liu et al. để có một khảo sát).
+
+Trong nghiên cứu này, chúng tôi đề xuất một bộ tối ưu hóa bậc không tiết kiệm bộ nhớ (MeZO), điều chỉnh thuật toán ZO-SGD cổ điển và giảm tiêu thụ bộ nhớ của nó xuống bằng với suy luận. Chúng tôi áp dụng MeZO để fine-tune các LM lớn và chỉ ra rằng, cả về mặt thực nghiệm và lý thuyết, MeZO có thể tối ưu hóa thành công các LM với hàng tỷ tham số. Cụ thể, các đóng góp của chúng tôi là:
+
+1. Trong MeZO, chúng tôi điều chỉnh thuật toán ZO-SGD và một số biến thể để hoạt động tại chỗ trên các mô hình lớn tùy ý với gần như không có overhead bộ nhớ (xem Thuật toán 1 và Phần 2).
+
+2. Chúng tôi tiến hành các thí nghiệm toàn diện trên các loại mô hình (masked LM và autoregressive LM), quy mô mô hình (từ 350M đến 66B), và các tác vụ downstream (phân loại, lựa chọn đa phương án và sinh). MeZO luôn vượt trội so với zero-shot, ICL và linear probing. Hơn nữa, với RoBERTa-large, MeZO đạt được hiệu suất gần với fine-tuning tiêu chuẩn trong khoảng cách 5%; với OPT-13B, MeZO vượt trội hoặc hoạt động tương đương với fine-tuning trên 7 trong 11 tác vụ, mặc dù yêu cầu khoảng 12× ít bộ nhớ hơn (Hình 1 và Phần 3). Trong triển khai của chúng tôi, MeZO chỉ yêu cầu một nửa số GPU-giờ so với fine-tuning Adam cho mô hình 30B (xem Phụ lục F.6).
+
+3. Chúng tôi chứng minh khả năng tương thích của MeZO với full-parameter tuning và PEFT (ví dụ, LoRA và prefix-tuning) trong Phần 3.
+
+4. Khám phá thêm cho thấy MeZO có thể tối ưu hóa các mục tiêu không khả vi như độ chính xác hoặc điểm F1, trong khi vẫn yêu cầu chỉ cùng bộ nhớ như suy luận (Phần 3.3).
+
+5. Lý thuyết của chúng tôi gợi ý rằng pre-training đầy đủ đảm bảo tỷ lệ tối ưu hóa mỗi bước (Định lý 1) và tỷ lệ hội tụ toàn cục (Bổ đề 3) của MeZO phụ thuộc vào một condition number nhất định của landscape (tức là, effective rank cục bộ, xem Giả định 1) thay vì số lượng tham số. Kết quả này trái ngược hoàn toàn với các cận dưới ZO hiện có gợi ý rằng tỷ lệ hội tụ có thể chậm tỷ lệ thuận với số lượng tham số (Phần 4).
+
+## 2 Tối ưu hóa bậc không
+
+Các bộ tối ưu hóa bậc không (ZO) đã được nghiên cứu lâu đời trong ngữ cảnh của các mục tiêu lồi và lồi mạnh. Trong phần sau, chúng tôi trước tiên giới thiệu một ước tính gradient ZO cổ điển, SPSA (Định nghĩa 1) và thuật toán SGD tương ứng, ZO-SGD (Định nghĩa 2). Sau đó chúng tôi mô tả MeZO, triển khai tại chỗ của chúng tôi yêu cầu cùng bộ nhớ như suy luận trong Phần 2.1 và Thuật toán 1. Chúng tôi nhấn mạnh rằng SPSA cũng có thể được sử dụng trong các bộ tối ưu hóa phức tạp hơn, chẳng hạn như Adam, và chúng tôi cung cấp các triển khai tiết kiệm bộ nhớ cho những thuật toán đó (Phần 2.2).
+
+Xét một tập dữ liệu có nhãn D={(xi,yi)}i∈[|D|] và một minibatch B ⊂ D có kích thước B, chúng tôi để L(θ;B) ký hiệu loss trên minibatch. Chúng tôi giới thiệu một ước tính gradient ZO cổ điển trong cài đặt này.
+
+**Định nghĩa 1 (Simultaneous Perturbation Stochastic Approximation hoặc SPSA).** Cho một mô hình với tham số θ∈Rd và một hàm loss L, SPSA ước tính gradient trên một minibatch B như
+
+b∇L(θ;B) = [L(θ+εz;B) - L(θ-εz;B)]/(2ε) z ≈ zz⊤∇L(θ;B)
+
+trong đó z∈Rd với z∼N(0,Id) và ε là quy mô nhiễu. Ước tính gradient n-SPSA lấy trung bình b∇L(θ;B) trên n z được lấy mẫu ngẫu nhiên.
+
+SPSA yêu cầu chỉ hai lần truyền tiến qua mô hình để tính toán ước tính gradient (đối với n-SPSA, mỗi ước tính yêu cầu 2n lần truyền tiến). Khi ε→0, ước tính SPSA có thể được hiểu như một tái tạo rank-1 của gradient. Trong quá trình huấn luyện, n có thể được coi như một siêu tham số và theo một lịch trình, mặc dù trong các thí nghiệm sơ bộ (Phụ lục A), n=1 là hiệu quả nhất.
+
+Chúng tôi sử dụng n=1 làm mặc định. Được biết rộng rãi rằng ước tính SPSA có thể được sử dụng để thay thế gradient backpropagation trong bất kỳ bộ tối ưu hóa nào như SGD.
+
+**Định nghĩa 2 (ZO-SGD).** ZO-SGD là một bộ tối ưu hóa với tỷ lệ học η cập nhật tham số như θt+1=θt-ηb∇L(θ;Bt) trong đó Bt là minibatch tại thời điểm t và b∇L là ước tính gradient SPSA.
+
+### 2.1 ZO-SGD tiết kiệm bộ nhớ (MeZO)
+
+Thuật toán ZO-SGD vanilla tiêu tốn gấp đôi bộ nhớ suy luận, vì nó cần lưu trữ z∈Rd. Chúng tôi đề xuất một triển khai tiết kiệm bộ nhớ của ZO-SGD được gọi là MeZO, như được minh họa trong Thuật toán 1. Tại mỗi bước, chúng tôi trước tiên lấy mẫu một seed ngẫu nhiên s, và sau đó cho mỗi lần sử dụng z trong Thuật toán 1, chúng tôi reset bộ sinh số ngẫu nhiên bằng s và lấy mẫu lại mục liên quan của z. Sử dụng triển khai tại chỗ này, MeZO có dung lượng bộ nhớ tương đương với chi phí bộ nhớ suy luận.
+
+Chúng tôi lưu ý rằng Thuật toán 1 mô tả việc nhiễu từng tham số riêng biệt, điều này có thể tốn thời gian đối với các mô hình lớn. Trên thực tế, chúng tôi có thể tiết kiệm thời gian bằng cách nhiễu toàn bộ ma trận trọng số thay vì từng scalar độc lập. Điều này phát sinh chi phí bộ nhớ bổ sung lớn bằng ma trận trọng số lớn nhất; thường là ma trận word embedding (ví dụ, 0.86GB cho OPT-66B).
+
+**Hiệu quả lưu trữ của MeZO.** Các kỹ thuật fine-tuning tiết kiệm tham số (PEFT) fine-tune chỉ một phần của tham số mạng và do đó đã được đề xuất như một cách để giảm chi phí lưu trữ của các checkpoint mô hình fine-tuned. Fine-tuning với MeZO giảm chi phí lưu trữ của checkpoint kết quả nhiều hơn so với các kỹ thuật PEFT phổ biến (ví dụ, LoRA và prefix tuning). Chúng tôi tái tạo quỹ đạo MeZO sử dụng một seed duy nhất, sinh ra các seed theo bước để lấy mẫu z, và projected_grad tại mỗi bước. Như vậy, để fine-tuning mô hình 66B, MeZO yêu cầu lưu seed cộng 20,000 (bước) × 2 bytes, ít hơn 0.1MB. LoRA fine-tunes 19M tham số và yêu cầu lưu trữ 38MB, và prefix tuning fine-tunes 6M tham số và yêu cầu lưu trữ 12MB.
+
+### 2.2 Mở rộng MeZO
+
+Chúng tôi lưu ý rằng SPSA là một ước tính gradient ZO phổ biến nhưng không phải là duy nhất. Nhiều ước tính gradient một điểm đã được đề xuất trong các nghiên cứu trước, và sử dụng các ước tính như vậy thay cho SPSA sẽ giảm một nửa thời gian huấn luyện. Tuy nhiên, các thí nghiệm sơ bộ với một ước tính đầy hứa hẹn cho thấy rằng những ước tính này không hiệu quả bằng SPSA khi cố định số lần truyền tiến (Phụ lục B.5). Như vậy, chúng tôi triển khai MeZO với ước tính SPSA.
+
+MeZO cũng có thể được kết hợp với các bộ tối ưu hóa dựa trên gradient khác, bao gồm SGD với momentum hoặc Adam. Mặc dù triển khai ngây thơ sẽ yêu cầu bộ nhớ bổ sung để lưu trữ các ước tính moment gradient, MeZO-momentum và MeZO-Adam giảm nhẹ overhead như vậy bằng cách tính toán lại trung bình động của gradient sử dụng các loss và z đã lưu trong quá khứ (xem Phụ lục B để thảo luận đầy đủ).
+
+Chúng tôi cũng lưu ý rằng tất cả các tọa độ của ước tính gradient SPSA có cùng quy mô, nhưng các Transformer sâu có thể có gradient với quy mô khác nhau cho từng layer. Như vậy, chúng tôi rút cảm hứng từ các bộ tối ưu hóa thích ứng theo layer để thiết kế một số biến thể MeZO. Các thí nghiệm sơ bộ cho thấy rằng những thuật toán này không hiệu quả hơn (về mặt lần truyền tiến), nhưng chúng tôi vẫn trình bày chúng như các bộ tối ưu hóa tiềm năng cho các mục tiêu phức tạp hơn. Xem Phụ lục B.
+
+**Forward Auto-Differentiation** Lưu ý rằng z⊤∇L(θ;B) là một tích Jacobian-vector (JVP), có thể được tính toán song song với một lần truyền suy luận với tiêu thụ bộ nhớ vượt quá tương đương với kích hoạt lớn nhất trong mạng. Trong trường hợp này, z phải được lưu trữ trên GPU để tạo ra ước tính gradient, vì vậy quy trình này yêu cầu hơi nhiều hơn hai lần bộ nhớ cần thiết cho suy luận. Chúng tôi phân tích thuật toán này chi tiết trong Phụ lục D. Lưu ý rằng sử dụng ε khác không trong SPSA, điều không thể thông qua phương pháp JVP, có thể thúc đẩy khái quát hóa bằng cách thúc đẩy một thuật ngữ tối thiểu hóa sharpness. Các nghiên cứu trước (ví dụ, Baydin et al.) cũng đã nghiên cứu huấn luyện dựa trên JVP nhưng đạt được thành công thực nghiệm hạn chế.
+
+## 3 Thí nghiệm
+
+Các thí nghiệm sơ bộ (Phụ lục A) cho thấy rằng MeZO chỉ hoạt động khi sử dụng prompt. Các nghiên cứu trước đã chứng minh cách việc bao gồm một prompt phù hợp đảm bảo mục tiêu fine-tuning liên quan chặt chẽ đến mục tiêu pre-training. Trong Phần 4, chúng tôi mở rộng những ý tưởng này để chỉ ra cách sử dụng một prompt đơn giản đơn giản hóa quy trình tối ưu hóa fine-tuning, từ đó cho phép các phương pháp bậc không hoạt động hiệu quả. Tất cả các thí nghiệm dưới đây sử dụng prompt được chi tiết trong Phụ lục E.2. Tất cả các thí nghiệm fine-tuning với backpropagation (FT) theo quy ước và sử dụng Adam, mặc dù chúng tôi cũng báo cáo kết quả khi thực hiện FT với SGD trong Phụ lục F.
+
+Chúng tôi tiến hành các thí nghiệm toàn diện trên cả masked LM kích thước trung bình (RoBERTa-large, 350M) và autoregressive LM lớn (OPT-13B, 30B, 66B) trong cài đặt few-shot và many-shot với prompt. Chúng tôi cũng khám phá cả full-parameter tuning và PEFT bao gồm LoRA và prefix-tuning (xem Phụ lục E.5 để biết chi tiết). Chúng tôi so sánh MeZO với zero-shot, in-context learning (ICL), linear-probing (LP), và fine-tuning với Adam (FT). MeZO sử dụng ít bộ nhớ hơn đáng kể so với FT nhưng yêu cầu nhiều bước huấn luyện hơn đáng kể.
+
+Chúng tôi trước tiên chỉ ra rằng MeZO cải thiện đáng kể so với zero-shot, ICL và LP trên các loại mô hình, kích thước và loại tác vụ. Hơn nữa, MeZO hoạt động tương đương với FT trên một số tác vụ, trong khi giảm drastically chi phí bộ nhớ, ví dụ 12× trên OPT-13B. Các thí nghiệm thêm chứng minh rằng MeZO có thể tối ưu hóa các mục tiêu không khả vi, chẳng hạn như độ chính xác và điểm F1 (Phần 3.3). Chúng tôi so sánh tiêu thụ bộ nhớ của ICL, FT, LP và MeZO trong Hình 3 và 4.
+
+### 3.1 Mô hình ngôn ngữ có mặt nạ kích thước trung bình
+
+Chúng tôi tiến hành thí nghiệm với RoBERTa-large trên các tác vụ phân loại cảm xúc, suy luận ngôn ngữ tự nhiên và phân loại chủ đề. Chúng tôi theo các nghiên cứu trước trong việc nghiên cứu cài đặt few-shot và many-shot, lấy mẫu k ví dụ mỗi lớp cho k=16 và k=512 (chi tiết trong Phụ lục E). Chúng tôi chạy MeZO cho 100K bước và fine-tuning cho 1000 bước, lưu ý rằng một bước MeZO nhanh hơn đáng kể so với một bước fine-tuning (xem Phụ lục F.6 để so sánh). Chúng tôi tóm tắt kết quả từ Hình 2 và Bảng 18 dưới đây.
+
+**MeZO hoạt động tốt hơn đáng kể so với zero-shot, linear probing và các phương pháp tương đương bộ nhớ khác.** Trên tất cả sáu tác vụ đa dạng, MeZO có thể tối ưu hóa mô hình được huấn luyện trước và luôn hoạt động tốt hơn zero-shot và linear probing. Chúng tôi cũng chỉ ra cho một số tác vụ rằng MeZO có thể vượt trội so với một thuật toán ZO khác, BBTv2, lên tới 11% tuyệt đối (Phụ lục F.4).
+
+**Với đủ dữ liệu, MeZO đạt hiệu suất tương đương (lên tới 5% khoảng cách) với FT.** MeZO đạt hiệu suất gần với fine-tuning trên k=16, với một số tác vụ chỉ có khoảng cách 2%. Khi sử dụng dữ liệu k=512, khoảng cách giữa MeZO và FT giảm thêm xuống trong vòng 5% trên tất cả các tác vụ.
+
+**MeZO hoạt động tốt trên cả full-parameter tuning và PEFT.** Full-parameter tuning (MeZO) và PEFT (MeZO với LoRA và prefix-tuning) đạt hiệu suất tương đương, trong khi MeZO (prefix) đôi khi vượt trội so với MeZO. Chúng tôi cũng chỉ ra trong Phụ lục F.3 rằng ba biến thể hội tụ với tốc độ tương tự, phù hợp với lý thuyết của chúng tôi trong Phần 4, cho thấy rằng MeZO hội tụ với tốc độ độc lập với số lượng tham số được tối ưu hóa.
+
+Chúng tôi hiển thị kết quả bổ sung với nhiều biến thể FT và MeZO hơn trong Phụ lục F.1. Chúng tôi thấy rằng (1) ZO-Adam đôi khi vượt trội so với ZO-SGD nhưng không nhất quán trên các tác vụ; (2) LP và sau đó MeZO, như được đề xuất cho fine-tuning, đôi khi có thể cải thiện hiệu suất.
+
+### 3.2 Mô hình ngôn ngữ tự hồi quy lớn
+
+Với những kết quả đầy hứa hẹn từ RoBERTa-large, chúng tôi mở rộng MeZO sang họ OPT, trên quy mô 13B (Bảng 1), 30B và 66B (Bảng 2). Chúng tôi chọn cả các tác vụ SuperGLUE (bao gồm phân loại và lựa chọn đa phương án) và các tác vụ sinh. Chúng tôi ngẫu nhiên lấy mẫu 1000, 500 và 1000 ví dụ để huấn luyện, validation và test tương ứng cho mỗi tập dữ liệu. Chúng tôi chạy MeZO cho 20K bước và fine-tuning cho 5 epoch, hoặc 625 bước, lưu ý rằng mỗi bước MeZO nhanh hơn đáng kể so với fine-tuning (xem Phụ lục F.6 để so sánh). Vui lòng tham khảo Phụ lục E để biết chi tiết. Bảng 1 mang lại những quan sát sau.
+
+**MeZO vượt trội so với các phương pháp tương đương bộ nhớ và tiếp cận gần kết quả fine-tuning.** Chúng tôi thấy rằng ở quy mô 13B tham số, MeZO và các biến thể PEFT của nó vượt trội so với zero-shot, ICL và LP trên hầu hết tất cả các tác vụ. Khi so sánh với FT, tiêu tốn 12× nhiều bộ nhớ hơn (Phần 3.4), MeZO đạt hiệu suất tương đương (trong vòng 1%) hoặc tốt hơn trên 7 trong 11 tác vụ.
+
+**MeZO thể hiện hiệu suất mạnh mẽ trên các tác vụ phân loại, lựa chọn đa phương án và sinh.** Chúng tôi nghiên cứu MeZO trên các tác vụ sinh, được coi là phức tạp hơn so với các tác vụ phân loại hoặc lựa chọn đa phương án. Chúng tôi đánh giá trên hai tập dữ liệu hỏi đáp, SQuAD và DROP. Chúng tôi sử dụng teacher forcing để huấn luyện và greedy decoding để suy luận (chi tiết trong Phụ lục E). Bảng 1 chỉ ra rằng, trên tất cả các tác vụ sinh, MeZO vượt trội so với zero-shot, ICL và LP, và đạt hiệu suất tương đương với FT. Xem xét rằng nhiều ứng dụng của fine-tuning LM – bao gồm instruction tuning hoặc thích ứng miền – nhắm vào các tác vụ sinh, kết quả của chúng tôi nhấn mạnh tiềm năng của MeZO như một kỹ thuật tiết kiệm bộ nhớ để tối ưu hóa các LM lớn cho các ứng dụng thực tế và thú vị.
+
+**MeZO mở rộng quy mô lên đến các mô hình 66 tỷ tham số.** Chúng tôi chứng minh hiệu quả của MeZO trên các mô hình thậm chí lớn hơn, lên tới 66B, trong Bảng 2. Trong khi fine-tuning trực tiếp các mô hình ở quy mô như vậy cực kỳ tốn kém (Phần 3.4), MeZO có thể tối ưu hóa hiệu quả những mô hình này và vượt trội so với zero-shot và ICL.
+
+### 3.3 Huấn luyện với các mục tiêu không khả vi
+
+Chúng tôi chứng minh hiệu quả của MeZO để tối ưu hóa các mục tiêu không khả vi thông qua các thí nghiệm ban đầu. Độ chính xác và F1 được sử dụng làm các mục tiêu tương ứng (chi tiết trong Phụ lục E.6). Bảng 3 tiết lộ rằng MeZO với accuracy/F1 tối ưu hóa thành công các LM với hiệu suất vượt trội so với zero-shot. Mặc dù tối thiểu hóa cross entropy dẫn đến hiệu suất mạnh hơn, những phát hiện sơ bộ này làm nổi bật tiềm năng đầy hứa hẹn của việc áp dụng MeZO để tối ưu hóa các mục tiêu không khả vi mà không có surrogates khả vi rõ ràng, chẳng hạn như sở thích của con người.
+
+### 3.4 Phân tích sử dụng bộ nhớ và thời gian wall-clock
+
+Trong phần này, chúng tôi profile việc sử dụng bộ nhớ của zero-shot, ICL, FT, FT (prefix) và MeZO. Chúng tôi thử nghiệm các mô hình OPT với kích thước khác nhau với GPU Nvidia A100 (bộ nhớ 80GB) trên MultiRC (trung bình #tokens=400), và báo cáo tiêu thụ bộ nhớ GPU đỉnh (chi tiết trong Phụ lục E.7).
+
+Như được hiển thị trong Hình 3 (tham khảo Phụ lục F.5 để biết số liệu chi tiết), MeZO thể hiện tiêu thụ bộ nhớ giống như zero-shot trong khi cung cấp tiết kiệm bộ nhớ lên tới 12 lần so với FT tiêu chuẩn và 6 lần so với FT (prefix). Lợi thế này cho phép huấn luyện các mô hình lớn hơn trong ngân sách phần cứng cố định, như được minh họa trong Hình 4. Cụ thể, sử dụng một GPU A100 duy nhất, MeZO cho phép điều chỉnh một mô hình lớn hơn 11 lần so với những gì khả thi với FT.
+
+Trong Phụ lục F.6, chúng tôi so sánh hiệu quả thời gian wall-clock của các triển khai MeZO và fine-tuning Adam của chúng tôi. MeZO đạt được tăng tốc 7.74× mỗi bước và yêu cầu 8× ít GPU hơn với mô hình 30B, nhưng cần nhiều bước hơn để hội tụ. Nhìn chung, MeZO chỉ yêu cầu một nửa số GPU-giờ để fine-tune mô hình 30B so với full-parameter fine-tuning. Lợi ích wall-clock của MeZO không có sẵn trong thuật toán và phụ thuộc rất nhiều vào triển khai. Chúng tôi chủ yếu cung cấp thông tin này như một minh chứng rằng MeZO không mất thời gian quá lâu để chạy.
+
+Các phép đo trên phụ thuộc vào cơ sở hạ tầng tính toán. Trong Phụ lục C, chúng tôi so sánh sự cân bằng thời gian-bộ nhớ lý thuyết của MeZO và backpropagation và thấy rằng MeZO luôn tiết kiệm bộ nhớ hơn backpropagation và thường hiệu quả về thời gian hơn. Các phân tích trên cũng không xem xét những tiến bộ gần đây (ví dụ, gradient checkpointing, FlashAttention và quantization). Chúng tôi để việc nghiên cứu cách MeZO hoạt động với những phương pháp này cho nghiên cứu tương lai.
+
+## 4 Lý thuyết
+
+Phân tích lý thuyết của chúng tôi làm nổi bật lý do tại sao MeZO có thể tối ưu hóa các LM lớn, mặc dù một số kết quả cổ điển gợi ý rằng tối ưu hóa nên chậm một cách thảm khốc khi huấn luyện rất nhiều tham số. Việc bao gồm một prompt đơn giản là rất quan trọng để MeZO thành công (Phụ lục A). Các nghiên cứu trước đã gợi ý rằng việc bao gồm một prompt như vậy đảm bảo rằng mục tiêu fine-tuning liên quan chặt chẽ đến mục tiêu pre-training. Như vậy, ở đây, chúng tôi đưa ra giả định rằng mô hình đã được huấn luyện trong nhiều bước trên mục tiêu fine-tuning, điều này ngụ ý rằng landscape loss thể hiện các điều kiện thuận lợi (Giả định 1). Sau đó, chúng tôi rút ra một tỷ lệ hội tụ độc lập với số lượng tham số. Chúng tôi chỉ ra rằng loss giảm mỗi bước với tỷ lệ độc lập với số chiều tham số d (Định lý 1), và rằng, dưới các điều kiện mạnh hơn, thuật toán hội tụ trong thời gian độc lập với d (Bổ đề 3). Cùng với nhau, những kết quả này ngụ ý rằng MeZO không chậm một cách thảm khốc hơn SGD khi fine-tuning. Để dễ minh họa, chúng tôi giả định rằng z được lấy mẫu từ một hình cầu có bán kính √d, và trong Phụ lục G.2, chúng tôi rút ra tỷ lệ cho một z Gaussian tổng quát, được sử dụng trong các thí nghiệm.
+
+Chúng tôi theo các phân tích cổ điển của SGD và thay thế ước tính gradient minibatch bằng SPSA (Định nghĩa 1). Xem xét cập nhật minibatch SGD θt+1←θt-η∇L(θ;Bt) trong đó Bt là một minibatch được rút đều từ D. Quan trọng, ước tính gradient minibatch SGD là không thiên vị.
+
+**Định nghĩa 3 (Ước tính Gradient Không thiên vị).** Bất kỳ ước tính gradient minibatch g(θ,B) nào được gọi là không thiên vị nếu E[g(θ,B)] = ∇L(θ).
+
+### 4.1 Phân tích mỗi bước
+
+Bổ đề descent cổ điển sử dụng khai triển Taylor để nghiên cứu cách SGD giảm loss tại mỗi bước tối ưu hóa. Nó làm nổi bật rằng khi covariance gradient lớn, mức giảm loss tối đa có thể có tại mỗi bước tối ưu hóa là nhỏ, từ đó dẫn đến tối ưu hóa chậm hơn.
+
+**Bổ đề 1 (Descent Lemma).** Để L(θ) là ℓ-smooth. Đối với bất kỳ ước tính gradient không thiên vị g(θ,B), E[L(θt+1)|θt] - L(θt) ≤ -η∥∇L(θt)∥² + (1/2)η²ℓ·E[∥g(θ,Bt)∥²].
+
+Descent lemma làm nổi bật tầm quan trọng của gradient norm, mà chúng tôi rút ra cho MeZO dưới đây.
+
+**Bổ đề 2.** Để B là một minibatch ngẫu nhiên có kích thước B. Sau đó, gradient norm của MeZO là Ex[∥b∇L(θ;B)∥²] = (d+n-1)/n · E[∥∇L(θ;B)∥²] trong đó n là số lượng z được lấy mẫu trong n-SPSA (Định nghĩa 1) và d là số lượng tham số.
+
+Do đó, trong trường hợp thông thường khi n≪d, MeZO có gradient norm lớn hơn nhiều so với SGD. Descent lemma cũng chỉ ra rằng để đảm bảo giảm loss, người ta cần chọn tỷ lệ học như η ≤ 2∥∇L(θt)∥²/[ℓ·E[∥g(θ,B)∥²]] ⇒ ηZO = (n/(d+n-1))ηSGD trong đó ηZO và ηSGD là tỷ lệ học tối đa cho phép cho MeZO và SGD tương ứng.
+
+Do đó chúng ta thấy rằng không có bất kỳ giả định nào thêm, MeZO có thể làm chậm tối ưu hóa bằng cách giảm tỷ lệ học lớn nhất cho phép bởi một yếu tố của d. Hơn nữa, MeZO giảm mức giảm loss có thể đạt được tại mỗi bước và, như một hệ quả, làm chậm hội tụ bởi một yếu tố của d.
+
+Đáng ngạc nhiên, các thí nghiệm của chúng tôi chỉ ra rằng MeZO có thể nhanh chóng tối ưu hóa các mô hình được huấn luyện trước với hàng tỷ tham số, và việc giảm số lượng tham số được điều chỉnh thông qua các kỹ thuật PEFT không tăng tốc đáng kể tối ưu hóa (Phụ lục F.3). Chúng tôi quy những hiện tượng này cho Hessian của loss thể hiện effective rank cục bộ nhỏ. Rất tốn kém để đo trực tiếp effective rank của Hessian của một LM lớn trên một tập dữ liệu có kích thước hợp lý. Tuy nhiên, nhiều nghiên cứu trước đã chỉ ra rằng Hessian của loss cho các mạng neural sâu được huấn luyện bởi SGD có effective rank thấp một cách đáng kể. Đặc biệt, phần lớn của phổ tập trung xung quanh 0 với chỉ một số lượng nhỏ các outlier, và số lượng những outlier này là một cận trên của effective rank. Ngoài ra, các nghiên cứu trước đã chứng minh rằng fine-tuning LM có thể xảy ra trong một không gian con chiều rất thấp (<200 tham số), điều này hỗ trợ thêm giả định dưới đây.
+
+Chúng tôi chính thức hóa giả định về effective rank dưới đây. Đặc biệt, chúng tôi yêu cầu một cận trên trên Hessian trong một lân cận xung quanh iterate hiện tại có effective rank nhiều nhất là r.
+
+**Giả định 1 (r-effective rank cục bộ).** Để G(θt) = max(x,y)∈D∥∇L(θt;{(x,y)})∥. Tồn tại một ma trận H(θt) ⪯ ℓ·Id sao cho:
+1. Đối với tất cả θ sao cho ∥θ-θt∥ ≤ ηdG(θt), chúng ta có ∇²L(θ) ⪯ H(θt).
+2. Effective rank của H(θt), tức là tr(H(θt))/∥H(θt)∥op, nhiều nhất là r.
+
+Dưới giả định này, chúng tôi chỉ ra rằng tỷ lệ hội tụ của ZO-SGD không phụ thuộc vào số lượng tham số. Thay vào đó, yếu tố làm chậm chỉ phụ thuộc vào effective rank của Hessian.
+
+**Định lý 1 (Tỷ lệ Không phụ thuộc Chiều).** Giả sử loss thể hiện r-effective rank cục bộ (Giả định 1). Nếu θt+1=θt-ηZOb∇L(θt;B) là một bước duy nhất của ZO-SGD sử dụng ước tính n-SPSA với một minibatch có kích thước B, thì tồn tại một γ= Θ(r/n) sao cho mức giảm loss mong đợi có thể được giới hạn như E[L(θt+1)|θt] - L(θt) ≤ -ηZO∥∇L(θt)∥² + (1/2)η²ZOℓ·γ·E[∥∇L(θ;B)∥²]
+
+Bằng cách áp dụng Phương trình (3), chúng ta có thể so sánh trực tiếp với descent lemma SGD.
+
+**Hệ quả 1.** Chọn tỷ lệ học ηZO=γ⁻¹·ηSGD, ZO-SGD thu được mức giảm loss là E[L(θt+1)|θt] - L(θt) ≤ (1/γ)·[-ηSGD∥∇L(θt)∥² + (1/2)η²SGDℓ·E[∥∇L(θ;B)∥²]].
+
+Ở đây chúng ta thấy rằng so với SGD, yếu tố làm chậm của ZO-SGD tỷ lệ với effective rank cục bộ r, mà chúng tôi cho rằng nhỏ hơn nhiều so với số lượng tham số d. Phân tích trên tập trung vào mức độ ZO-SGD và SGD giảm loss tại mỗi bước. Dưới đây, chúng tôi chỉ ra rằng dưới những giả định mạnh hơn về landscape loss, chúng ta có thể thu được tỷ lệ cho việc thuật toán ZO-SGD hội tụ nhanh như thế nào đến một giá trị tối ưu.
+
+### 4.2 Phân tích hội tụ toàn cục
+
+Chúng tôi chỉ ra rằng tỷ lệ hội tụ toàn cục cũng chậm bởi một yếu tố tỷ lệ thuận với effective rank cục bộ dưới những giả định mạnh hơn về landscape loss. Chúng tôi giả định rằng landscape tuân theo bất đẳng thức PL cổ điển: gradient norm phát triển bậc hai với suboptimality của iterate.
+
+**Định nghĩa 4 (Bất đẳng thức PL).** Để L* = minθ L(θ). Loss L là μ-PL nếu, đối với tất cả θ, (1/2)∥∇L(θ)∥² ≥ μ(L(θ) - L*).
+
+Bất đẳng thức PL không mạnh bằng việc giả định rằng tối ưu hóa thể hiện động lực giống kernel, nhưng nó đảm bảo rằng landscape thuận lợi cho phân tích. Ngoài bất đẳng thức PL, chúng tôi giả định trace của gradient covariance bị giới hạn, vì vậy nhiễu không làm gián đoạn quỹ đạo quá drastically.
+
+**Định nghĩa 5 (Gradient Covariance).** Ước tính gradient SGD trên một minibatch có kích thước B có covariance Σ(θ) = B(E[∇L(θ;B)∇L(θ;B)⊤] - ∇L(θ)∇L(θ)⊤).
+
+Như chúng tôi chỉ ra trong Phụ lục G.1, giả định này giữ cho các hàm loss thông thường như square loss hoặc binary cross entropy cho một số cài đặt (ví dụ, hành vi kernel). Với hai giả định này, chúng tôi chỉ ra rằng ZO-SGD có một sự chậm lại tỷ lệ thuận với effective rank r, không phải số chiều tham số.
+
+**Bổ đề 3 (Hội tụ Toàn cục của ZO-SGD).** Để L(θ) là μ-PL và để tồn tại α sao cho tr(Σ(θ)) ≤ α(L(θ) - L*) đối với tất cả θ. Sau đó sau t = O[(r/n + 1)·(ℓ/μ + ℓα/(μ²B))log((L(θ0) - L*)/ε)] lần lặp của ZO-SGD chúng ta có E[L(θt)] ≤ L* + ε.
+
+## 5 Nghiên cứu liên quan
+
+**Tối ưu hóa bậc không** Nhiều cận dưới cổ điển đã được rút ra cho ZO-SGD trong các cài đặt lồi mạnh và lồi cũng như phi lồi. Những cận này thường phụ thuộc vào số lượng tham số d. Gần đây hơn, đã chỉ ra rằng nếu gradient có cấu trúc chiều thấp, thì độ phức tạp truy vấn tỷ lệ tuyến tính với chiều nội tại và logarit với số lượng tham số, mặc dù việc ước tính có ít nhất chi phí bộ nhớ Ω(sd log d). Các thủ thuật bổ sung như lịch trình lấy mẫu và các phương pháp giảm phương sai khác có thể được thêm vào ZO-SGD. ZO đã truyền cảm hứng cho các phương pháp phân tán và tạo ví dụ adversarial black-box trong deep learning. Ye et al., Balasubramanian và Ghadimi ước tính Hessian để thực hiện tối ưu hóa ZO theo các hướng quan trọng. Cũng có các phương pháp ZO tối ưu hóa mà không ước tính gradient.
+
+**Backpropagation tiết kiệm bộ nhớ** Một số thuật toán đã được đề xuất để xấp xỉ hiệu quả backpropagation bằng cách sparsifying gradient, xấp xỉ Jacobian, và subsampling đồ thị tính toán. Tuy nhiên, những phương pháp này có thể tích lũy lỗi xấp xỉ lớn cho các mạng sâu. Gradient checkpointing giảm chi phí bộ nhớ của backpropagation với chi phí tính toán lại một số kích hoạt. FlashAttention cũng giảm chi phí bộ nhớ bằng cách tính toán lại các ma trận attention. Dettmers et al. khám phá việc quantization trọng số và trạng thái optimizer của các LM lớn, dẫn đến giảm bộ nhớ trong cả huấn luyện và suy luận.
+
+**Thích ứng không gradient của các mô hình ngôn ngữ lớn** BBT và BBTv2 sử dụng thuật toán tiến hóa để đạt được tối ưu hóa không gradient; tuy nhiên, do tính nhạy cảm của nó với chiều cao, BBT bị giới hạn chỉ tối ưu hóa một hình chiếu chiều thấp của prefix và họ tập trung vào các mô hình kích thước RoBERTa-large và cài đặt few-shot. Các nghiên cứu khác trong "black-box tuning" của LM tập trung vào tối ưu hóa prompt rời rạc mà không cập nhật mô hình, thông qua reinforcement learning, ensemble, hoặc tìm kiếm lặp. Nghiên cứu đồng thời trong sử dụng các lần truyền tiến lặp để cải thiện hiệu suất in-context learning.
+
+## 6 Kết luận
+
+Chúng tôi đã chỉ ra rằng MeZO có thể tối ưu hóa hiệu quả các LM lớn trên nhiều tác vụ và quy mô. Các thí nghiệm thêm gợi ý rằng MeZO có thể tối ưu hóa các mục tiêu không khả vi, mà backpropagation thường không thể làm. Lý thuyết của chúng tôi minh họa tại sao MeZO không chậm một cách thảm khốc khi điều chỉnh hàng tỷ tham số. Như một hạn chế, MeZO cần nhiều bước để đạt được hiệu suất mạnh mẽ, mặc dù chúng tôi chỉ ra rằng tăng tốc mỗi bước trong MeZO thường có thể làm cho fine-tuning với MeZO chạy nhanh hơn so với triển khai tiêu chuẩn của fine-tuning với backpropagation. Chúng tôi không khám phá việc kết hợp MeZO với các phương pháp tiết kiệm bộ nhớ khác, chẳng hạn như FlashAttention và quantization, mặc dù chúng tôi hy vọng sẽ nghiên cứu điều này trong tương lai.
+
+Chúng tôi rất hào hứng khám phá khả năng áp dụng của MeZO cho một số lĩnh vực, bao gồm nhưng không giới hạn ở: pruning, distillation, saliency, interpretability, và lựa chọn tập dữ liệu cho fine-tuning. Các mục tiêu không khả vi là một lĩnh vực đặc biệt thú vị, cho những tiến bộ gần đây trong việc điều chỉnh các LM lớn để thích ứng với phản hồi của con người. Tiến hành phân tích lý thuyết cho cách những ước tính gradient hiệu quả này tác động đến hiệu suất của các ứng dụng khác nhau cũng đáng quan tâm.
