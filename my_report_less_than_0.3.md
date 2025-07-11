@@ -5,11 +5,11 @@
 
 ## Summary Statistics
 
-- **Total Translation Pairs:** 1122
-- **Complete Translations:** 681 (60.7%)
-- **Incomplete Translations:** 60 (5.3%)
-- **Over-translated:** 381 (34.0%)
-- **Average Completion Ratio:** 95.0%
+- **Total Translation Pairs:** 1267
+- **Complete Translations:** 777 (61.3%)
+- **Incomplete Translations:** 77 (6.1%)
+- **Over-translated:** 413 (32.6%)
+- **Average Completion Ratio:** 93.4%
 
 ## Incomplete Translations
 
@@ -18,7 +18,8 @@ Papers with completion ratio below threshold:
 | ArXiv ID | Collection | EN Tokens | VI Tokens | Ratio | Status |
 |----------|------------|-----------|-----------|-------|--------|
 | 2211.04661 | automl-nas | 26,001 | 41 | 0.2% | Incomplete |
-| 2203.16697 | coding | 23,218 | 85 | 0.4% | Incomplete |
+| 2309.13075 | math | 14,454 | 35 | 0.2% | Incomplete |
+| 2305.18619 | diffusion | 22,357 | 109 | 0.5% | Incomplete |
 | 2101.03961 | moe | 20,957 | 123 | 0.6% | Incomplete |
 | 2204.08358 | benchmark | 22,595 | 137 | 0.6% | Incomplete |
 | 2302.14838 | automl-nas | 17,907 | 115 | 0.6% | Incomplete |
@@ -50,19 +51,34 @@ Papers with completion ratio below threshold:
 | 2309.13567 | mental-health | 15,252 | 785 | 5.1% | Incomplete |
 | 2305.07185 | llm-architecture | 11,996 | 635 | 5.3% | Incomplete |
 | 2307.14995 | attention | 14,232 | 965 | 6.8% | Incomplete |
+| 2210.01293 | icl | 16,451 | 1,166 | 7.1% | Incomplete |
+| 2309.10814 | math | 36,639 | 2,661 | 7.3% | Incomplete |
+| 2305.01610 | emergent | 24,701 | 1,985 | 8.0% | Incomplete |
 | 2309.10687 | icl | 31,671 | 2,934 | 9.3% | Incomplete |
+| 2402.19173 | datasets | 36,751 | 3,443 | 9.4% | Incomplete |
+| 2307.05300 | prompt | 16,954 | 1,699 | 10.0% | Incomplete |
 | 2309.14345 | bias | 23,801 | 2,503 | 10.5% | Incomplete |
+| 2407.03040 | instruct | 9,687 | 1,046 | 10.8% | Incomplete |
 | 2207.14358 | knowledge-graph | 26,995 | 2,930 | 10.9% | Incomplete |
 | 2304.04675 | multilingual | 17,511 | 2,223 | 12.7% | Incomplete |
+| 2303.17125 | coding | 15,193 | 2,038 | 13.4% | Incomplete |
 | 2401.10225 | datasets | 25,316 | 3,432 | 13.6% | Incomplete |
+| 2310.03710 | planning | 70,621 | 9,874 | 14.0% | Incomplete |
 | 2009.01797 | continual-learning | 32,800 | 4,595 | 14.0% | Incomplete |
 | 2310.00035 | peft | 10,108 | 1,430 | 14.1% | Incomplete |
 | 2307.12008 | icl-papers | 8,595 | 1,220 | 14.2% | Incomplete |
 | 2312.04474 | icl | 15,555 | 2,219 | 14.3% | Incomplete |
+| 2309.12499 | planning | 23,858 | 3,568 | 15.0% | Incomplete |
 | 2311.03301 | continual-learning | 12,628 | 1,937 | 15.3% | Incomplete |
+| 2311.08263 | cot | 8,457 | 1,306 | 15.4% | Incomplete |
+| 2305.14909 | planning | 35,115 | 5,861 | 16.7% | Incomplete |
+| 2311.13110 | interpretability | 61,231 | 10,676 | 17.4% | Incomplete |
 | 2310.03188 | knowledge-distillation | 13,340 | 2,483 | 18.6% | Incomplete |
 | 2311.13171 | peft | 17,076 | 3,279 | 19.2% | Incomplete |
 | 2308.10379 | icl-papers | 57,713 | 11,102 | 19.2% | Incomplete |
+| 2108.04384 | ffn-mlp | 12,088 | 2,475 | 20.5% | Incomplete |
+| 2205.13522 | positional-embeddings | 14,036 | 2,889 | 20.6% | Incomplete |
+| 2311.05661 | prompt | 29,231 | 6,028 | 20.6% | Incomplete |
 | 2406.11794 | dataset-pruning-cleaning-dedup | 55,503 | 12,010 | 21.6% | Incomplete |
 | 2309.01479 | peft | 10,423 | 2,379 | 22.8% | Incomplete |
 | 2311.08760 | interpretability | 14,757 | 3,621 | 24.5% | Incomplete |
@@ -70,6 +86,7 @@ Papers with completion ratio below threshold:
 | 2312.08618 | long-context | 18,959 | 4,790 | 25.3% | Incomplete |
 | 2310.14188 | moe | 20,412 | 5,223 | 25.6% | Incomplete |
 | 2402.18668 | attention | 40,739 | 10,592 | 26.0% | Incomplete |
+| 2312.04927 | convolution | 38,655 | 10,307 | 26.7% | Incomplete |
 | 2402.00159 | datasets | 46,884 | 12,530 | 26.7% | Incomplete |
 | 2401.06066 | moe | 17,977 | 4,855 | 27.0% | Incomplete |
 | 2307.15337 | batched-decoding | 37,252 | 10,115 | 27.2% | Incomplete |
@@ -85,6 +102,7 @@ Papers with significantly more Vietnamese content than English:
 | ArXiv ID | Collection | EN Tokens | VI Tokens | Ratio | Status |
 |----------|------------|-----------|-----------|-------|--------|
 | 2309.10447 | instruct | 11,706 | 14,050 | 120.0% | Over-translated |
+| 2309.04269 | prompt | 5,795 | 6,960 | 120.1% | Over-translated |
 | 2107.11442 | approximation | 20,784 | 25,002 | 120.3% | Over-translated |
 | 2206.00277 | moe | 7,572 | 9,109 | 120.3% | Over-translated |
 | 2212.13345 | backpropagation | 13,126 | 15,797 | 120.3% | Over-translated |
@@ -103,6 +121,7 @@ Papers with significantly more Vietnamese content than English:
 | 2402.14261 | benchmark | 12,253 | 14,846 | 121.2% | Over-translated |
 | 2306.08568 | instruct | 12,025 | 14,602 | 121.4% | Over-translated |
 | 2305.15083 | multilingual | 11,141 | 13,530 | 121.4% | Over-translated |
+| 2310.05424 | early-stopping | 12,035 | 14,638 | 121.6% | Over-translated |
 | 2308.10438 | pruning | 8,615 | 10,485 | 121.7% | Over-translated |
 | 2309.11439 | grammar | 5,150 | 6,275 | 121.8% | Over-translated |
 | 2310.16787 | datasets | 14,636 | 17,850 | 122.0% | Over-translated |
@@ -112,8 +131,10 @@ Papers with significantly more Vietnamese content than English:
 | 1905.10650 | pruning | 7,702 | 9,419 | 122.3% | Over-translated |
 | 2305.11685 | multimodal | 5,843 | 7,147 | 122.3% | Over-translated |
 | 2403.12468 | dataset-generation | 10,461 | 12,798 | 122.3% | Over-translated |
+| 2305.11554 | planning | 17,712 | 21,685 | 122.4% | Over-translated |
 | 2408.08696 | speculative | 11,939 | 14,632 | 122.6% | Over-translated |
 | 2204.05229 | multimodal | 2,282 | 2,797 | 122.6% | Over-translated |
+| 1905.04226 | positional-embeddings | 7,052 | 8,646 | 122.6% | Over-translated |
 | 2211.11315 | pruning | 8,232 | 10,101 | 122.7% | Over-translated |
 | 2310.01119 | icl | 7,956 | 9,766 | 122.8% | Over-translated |
 | 2312.02179 | cot | 15,991 | 19,630 | 122.8% | Over-translated |
@@ -144,6 +165,7 @@ Papers with significantly more Vietnamese content than English:
 | 2008.03901 | automl-nas | 12,626 | 15,731 | 124.6% | Over-translated |
 | 2306.12659 | finance | 6,117 | 7,625 | 124.7% | Over-translated |
 | 2107.05768 | long-context | 10,557 | 13,162 | 124.7% | Over-translated |
+| 2309.17224 | quantization | 14,387 | 17,940 | 124.7% | Over-translated |
 | 2309.05444 | peft | 13,078 | 16,318 | 124.8% | Over-translated |
 | 2211.12588 | long-context | 10,979 | 13,709 | 124.9% | Over-translated |
 | 2207.05987 | rag | 13,399 | 16,731 | 124.9% | Over-translated |
@@ -152,6 +174,7 @@ Papers with significantly more Vietnamese content than English:
 | 2310.02556 | peft | 13,491 | 16,863 | 125.0% | Over-translated |
 | 2209.01667 | moe | 17,147 | 21,434 | 125.0% | Over-translated |
 | 2305.11462 | memory | 11,728 | 14,664 | 125.0% | Over-translated |
+| 2305.10601 | planning | 10,541 | 13,187 | 125.1% | Over-translated |
 | 2404.14662 | coding | 22,461 | 28,135 | 125.3% | Over-translated |
 | 1701.06538 | moe | 13,253 | 16,606 | 125.3% | Over-translated |
 | 2310.05869 | attention | 9,864 | 12,360 | 125.3% | Over-translated |
@@ -204,12 +227,14 @@ Papers with significantly more Vietnamese content than English:
 | 2309.03883 | contrastive | 17,100 | 21,739 | 127.1% | Over-translated |
 | 2402.10644 | attention | 7,367 | 9,367 | 127.1% | Over-translated |
 | 2405.02842 | inference | 10,739 | 13,655 | 127.2% | Over-translated |
+| 2302.10899 | quantization | 7,902 | 10,049 | 127.2% | Over-translated |
 | 2409.03512 | education | 13,859 | 17,629 | 127.2% | Over-translated |
 | 2303.18116 | coding | 14,652 | 18,638 | 127.2% | Over-translated |
 | 2311.10642 | attention | 4,102 | 5,220 | 127.3% | Over-translated |
 | 2108.06552 | contrastive | 7,386 | 9,402 | 127.3% | Over-translated |
 | 2309.01252 | icl-papers | 4,412 | 5,617 | 127.3% | Over-translated |
 | 2208.02169 | long-context | 11,737 | 14,946 | 127.3% | Over-translated |
+| 2309.05210 | quantization | 7,004 | 8,920 | 127.4% | Over-translated |
 | 2305.04241 | long-context | 18,148 | 23,128 | 127.4% | Over-translated |
 | 2308.14508 | multilingual | 13,308 | 16,961 | 127.4% | Over-translated |
 | 1905.09717 | automl-nas | 8,966 | 11,428 | 127.5% | Over-translated |
@@ -222,8 +247,10 @@ Papers with significantly more Vietnamese content than English:
 | 2404.17651 | activation | 5,063 | 6,466 | 127.7% | Over-translated |
 | 2312.09571 | long-context | 7,839 | 10,012 | 127.7% | Over-translated |
 | 2309.16119 | peft | 10,734 | 13,711 | 127.7% | Over-translated |
+| 2308.07939 | quantization | 10,955 | 13,995 | 127.7% | Over-translated |
 | 2408.15766 | speculative | 12,846 | 16,420 | 127.8% | Over-translated |
 | 2405.16498 | continual-learning | 8,043 | 10,292 | 128.0% | Over-translated |
+| 2311.03739 | math | 6,142 | 7,861 | 128.0% | Over-translated |
 | 2311.02849 | knowledge-distillation | 7,902 | 10,116 | 128.0% | Over-translated |
 | 2310.01427 | long-context | 7,969 | 10,202 | 128.0% | Over-translated |
 | 2303.05668 | multimodal | 4,299 | 5,508 | 128.1% | Over-translated |
@@ -248,6 +275,7 @@ Papers with significantly more Vietnamese content than English:
 | 2310.13988 | multilingual | 6,106 | 7,883 | 129.1% | Over-translated |
 | 2310.09832 | moe | 5,562 | 7,181 | 129.1% | Over-translated |
 | 2308.14831 | pruning | 9,066 | 11,707 | 129.1% | Over-translated |
+| 2308.12066 | moe | 15,992 | 20,651 | 129.1% | Over-translated |
 | 2312.11462 | speculative | 9,192 | 11,870 | 129.1% | Over-translated |
 | 2405.17755 | long-context | 7,081 | 9,146 | 129.2% | Over-translated |
 | 2301.01828 | continual-learning | 17,212 | 22,249 | 129.3% | Over-translated |
@@ -261,6 +289,7 @@ Papers with significantly more Vietnamese content than English:
 | 2309.14509 | long-context | 6,388 | 8,292 | 129.8% | Over-translated |
 | 2305.17328 | pruning | 14,521 | 18,852 | 129.8% | Over-translated |
 | 2310.01334 | moe | 15,267 | 19,827 | 129.9% | Over-translated |
+| 2305.08339 | grammar | 14,125 | 18,348 | 129.9% | Over-translated |
 | 2309.04646 | multilingual | 5,665 | 7,361 | 129.9% | Over-translated |
 | 2306.14096 | multilingual | 6,858 | 8,912 | 130.0% | Over-translated |
 | 2310.17876 | dataset-generation | 20,306 | 26,403 | 130.0% | Over-translated |
@@ -274,10 +303,12 @@ Papers with significantly more Vietnamese content than English:
 | 2309.04255 | speculative | 15,143 | 19,722 | 130.2% | Over-translated |
 | 2311.06720 | evaluation | 10,468 | 13,634 | 130.2% | Over-translated |
 | 2311.12537 | dataset-curation | 6,903 | 8,992 | 130.3% | Over-translated |
+| 2308.01421 | icl-papers | 16,829 | 21,929 | 130.3% | Over-translated |
 | 2406.16330 | merging | 13,495 | 17,585 | 130.3% | Over-translated |
 | 2404.09163 | multilingual | 7,368 | 9,603 | 130.3% | Over-translated |
 | 2301.02494 | multi-task | 10,561 | 13,770 | 130.4% | Over-translated |
 | 2403.04706 | math | 11,785 | 15,367 | 130.4% | Over-translated |
+| 2311.03033 | prompt | 9,092 | 11,857 | 130.4% | Over-translated |
 | 2009.10622 | moe | 16,516 | 21,543 | 130.4% | Over-translated |
 | 1811.09021 | byte-level | 6,652 | 8,680 | 130.5% | Over-translated |
 | 2306.01708 | merging | 16,567 | 21,630 | 130.6% | Over-translated |
@@ -286,11 +317,13 @@ Papers with significantly more Vietnamese content than English:
 | 2312.14187 | instruct | 10,125 | 13,224 | 130.6% | Over-translated |
 | 2211.00789 | knowledge-distillation | 12,717 | 16,611 | 130.6% | Over-translated |
 | 2305.14314 | phase1 | 18,374 | 24,009 | 130.7% | Over-translated |
+| 2204.04215 | quantization | 6,314 | 8,251 | 130.7% | Over-translated |
 | 2402.13720 | speculative | 11,563 | 15,113 | 130.7% | Over-translated |
 | 2210.08933 | diffusion | 11,577 | 15,143 | 130.8% | Over-translated |
 | 2210.10209 | continual-learning | 14,699 | 19,236 | 130.9% | Over-translated |
 | 2204.12184 | moe | 5,029 | 6,584 | 130.9% | Over-translated |
 | 2405.06067 | long-context | 14,887 | 19,493 | 130.9% | Over-translated |
+| 2309.01131 | document-parsing | 11,544 | 15,121 | 131.0% | Over-translated |
 | 2310.16270 | attention | 3,546 | 4,647 | 131.0% | Over-translated |
 | 2410.02271 | audio | 4,761 | 6,242 | 131.1% | Over-translated |
 | 2105.00157 | continual-learning | 15,030 | 19,710 | 131.1% | Over-translated |
@@ -300,14 +333,15 @@ Papers with significantly more Vietnamese content than English:
 | 2203.13474 | coding | 15,368 | 20,173 | 131.3% | Over-translated |
 | 2212.13180 | knowledge-distillation | 12,181 | 16,000 | 131.4% | Over-translated |
 | 2106.02914 | pruning | 8,476 | 11,134 | 131.4% | Over-translated |
-| 2212.10017 | coding | 20,400 | 26,804 | 131.4% | Over-translated |
 | 2407.15892 | long-context | 18,385 | 24,160 | 131.4% | Over-translated |
 | 2103.00112 | attention | 8,664 | 11,386 | 131.4% | Over-translated |
+| 2308.15987 | quantization | 8,674 | 11,403 | 131.5% | Over-translated |
 | 2403.09919 | speculative | 9,379 | 12,333 | 131.5% | Over-translated |
 | 2306.01220 | attention | 18,826 | 24,770 | 131.6% | Over-translated |
 | 2411.08307 | audio | 10,232 | 13,473 | 131.7% | Over-translated |
 | 2011.12216 | continual-learning | 17,648 | 23,247 | 131.7% | Over-translated |
 | 2402.06332 | math | 15,427 | 20,345 | 131.9% | Over-translated |
+| 2309.00964 | quantization | 4,200 | 5,540 | 131.9% | Over-translated |
 | 2402.12374 | speculative | 16,221 | 21,404 | 132.0% | Over-translated |
 | 2305.18170 | math | 6,264 | 8,269 | 132.0% | Over-translated |
 | 2310.05824 | multilingual | 5,470 | 7,226 | 132.1% | Over-translated |
@@ -318,6 +352,7 @@ Papers with significantly more Vietnamese content than English:
 | 2308.12219 | diffusion | 15,342 | 20,319 | 132.4% | Over-translated |
 | 1909.10364 | pruning | 6,802 | 9,009 | 132.4% | Over-translated |
 | 2305.04160 | multilingual | 13,919 | 18,437 | 132.5% | Over-translated |
+| 1802.07569 | continual-learning | 24,137 | 31,987 | 132.5% | Over-translated |
 | 2310.10638 | long-context | 10,705 | 14,190 | 132.6% | Over-translated |
 | 2308.01825 | math | 12,985 | 17,223 | 132.6% | Over-translated |
 | 2308.01240 | benchmark | 16,139 | 21,407 | 132.6% | Over-translated |
@@ -329,6 +364,8 @@ Papers with significantly more Vietnamese content than English:
 | 2309.07990 | llm-architecture | 10,198 | 13,548 | 132.8% | Over-translated |
 | 2006.09916 | continual-learning | 5,874 | 7,805 | 132.9% | Over-translated |
 | 2310.05499 | knowledge-graph | 3,775 | 5,018 | 132.9% | Over-translated |
+| 2306.03900 | moe | 17,187 | 22,851 | 133.0% | Over-translated |
+| 2306.03604 | planning | 10,908 | 14,506 | 133.0% | Over-translated |
 | 2304.11384 | coding | 16,168 | 21,515 | 133.1% | Over-translated |
 | 2305.14975 | confidence | 7,749 | 10,319 | 133.2% | Over-translated |
 | 2112.05005 | adversarial | 7,446 | 9,920 | 133.2% | Over-translated |
@@ -338,10 +375,12 @@ Papers with significantly more Vietnamese content than English:
 | 2306.03805 | pruning | 10,297 | 13,747 | 133.5% | Over-translated |
 | 2406.10670 | dataset-pruning-cleaning-dedup | 16,135 | 21,551 | 133.6% | Over-translated |
 | 2308.03873 | coding | 12,580 | 16,815 | 133.7% | Over-translated |
+| 2211.01452 | federated-learning | 10,864 | 14,522 | 133.7% | Over-translated |
 | 2306.10209 | distributed | 13,067 | 17,482 | 133.8% | Over-translated |
 | 2304.13276 | icl | 8,015 | 10,726 | 133.8% | Over-translated |
 | 2401.07950 | instruct | 20,224 | 27,071 | 133.9% | Over-translated |
 | 2207.03677 | automl-nas | 11,776 | 15,769 | 133.9% | Over-translated |
+| 2312.05180 | planning | 9,781 | 13,098 | 133.9% | Over-translated |
 | 2306.16913 | automl-nas | 20,181 | 27,029 | 133.9% | Over-translated |
 | 2407.12866 | attention | 6,978 | 9,347 | 133.9% | Over-translated |
 | 2202.13169 | coding | 8,775 | 11,757 | 134.0% | Over-translated |
@@ -350,6 +389,7 @@ Papers with significantly more Vietnamese content than English:
 | 2209.15176 | multimodal | 8,088 | 10,852 | 134.2% | Over-translated |
 | 2308.12018 | icl-papers | 5,865 | 7,870 | 134.2% | Over-translated |
 | 2305.08379 | diffusion | 12,516 | 16,805 | 134.3% | Over-translated |
+| 2210.15042 | privacy | 7,488 | 10,056 | 134.3% | Over-translated |
 | 2309.09958 | peft | 5,317 | 7,144 | 134.4% | Over-translated |
 | 2306.05087 | hyperparameters | 14,314 | 19,242 | 134.4% | Over-translated |
 | 2310.02207 | icl-papers | 10,723 | 14,418 | 134.5% | Over-translated |
@@ -358,6 +398,7 @@ Papers with significantly more Vietnamese content than English:
 | 2208.11271 | autoencoder | 8,617 | 11,612 | 134.8% | Over-translated |
 | 2306.04897 | context-compression | 5,987 | 8,075 | 134.9% | Over-translated |
 | 2312.13558 | approximation | 13,133 | 17,726 | 135.0% | Over-translated |
+| 2309.10878 | quantization | 6,800 | 9,180 | 135.0% | Over-translated |
 | 2310.12962 | knowledge-distillation | 10,615 | 14,331 | 135.0% | Over-translated |
 | 2105.15082 | moe | 8,650 | 11,681 | 135.0% | Over-translated |
 | 2311.08968 | concept | 9,033 | 12,204 | 135.1% | Over-translated |
@@ -372,6 +413,7 @@ Papers with significantly more Vietnamese content than English:
 | 2402.10176 | math | 19,822 | 26,858 | 135.5% | Over-translated |
 | 2307.02053 | instruct | 6,966 | 9,443 | 135.6% | Over-translated |
 | 2005.00944 | instruct | 18,008 | 24,453 | 135.8% | Over-translated |
+| 2304.06815 | coding | 15,897 | 21,609 | 135.9% | Over-translated |
 | 2309.08600 | autoencoder | 10,020 | 13,622 | 135.9% | Over-translated |
 | 2402.05608 | diffusion | 7,883 | 10,721 | 136.0% | Over-translated |
 | 2211.00251 | interpretability | 9,908 | 13,477 | 136.0% | Over-translated |
@@ -379,10 +421,12 @@ Papers with significantly more Vietnamese content than English:
 | 2303.17764 | adversarial | 4,527 | 6,164 | 136.2% | Over-translated |
 | 2305.13655 | diffusion | 17,937 | 24,443 | 136.3% | Over-translated |
 | 2310.08797 | knowledge-distillation | 11,219 | 15,293 | 136.3% | Over-translated |
+| 2207.09078 | privacy | 11,577 | 15,793 | 136.4% | Over-translated |
 | 2308.14267 | icl-papers | 9,219 | 12,577 | 136.4% | Over-translated |
 | 2301.05816 | ffn-mlp | 8,387 | 11,445 | 136.5% | Over-translated |
 | 2305.06223 | math | 5,431 | 7,413 | 136.5% | Over-translated |
 | 2305.18563 | pruning | 17,143 | 23,414 | 136.6% | Over-translated |
+| 2308.07411 | prompt | 5,619 | 7,675 | 136.6% | Over-translated |
 | 2004.14765 | pruning | 5,985 | 8,201 | 137.0% | Over-translated |
 | 2210.04995 | moe | 13,091 | 17,947 | 137.1% | Over-translated |
 | 2212.12770 | pruning | 17,110 | 23,475 | 137.2% | Over-translated |
@@ -391,6 +435,7 @@ Papers with significantly more Vietnamese content than English:
 | 2306.01707 | math | 6,506 | 8,933 | 137.3% | Over-translated |
 | 2007.15353 | pruning | 12,355 | 16,967 | 137.3% | Over-translated |
 | 2203.07259 | pruning | 13,572 | 18,642 | 137.4% | Over-translated |
+| 2111.05754 | pruning | 7,654 | 10,517 | 137.4% | Over-translated |
 | 2209.13569 | approximation | 5,426 | 7,456 | 137.4% | Over-translated |
 | 2312.17244 | pruning | 13,117 | 18,029 | 137.4% | Over-translated |
 | 2306.01102 | automl-nas | 9,454 | 13,003 | 137.5% | Over-translated |
@@ -405,6 +450,7 @@ Papers with significantly more Vietnamese content than English:
 | 2306.00029 | coding | 10,723 | 14,805 | 138.1% | Over-translated |
 | 2211.11559 | multimodal | 9,821 | 13,560 | 138.1% | Over-translated |
 | 2405.13216 | long-context | 7,532 | 10,401 | 138.1% | Over-translated |
+| 2309.11998 | dataset-generation | 16,290 | 22,496 | 138.1% | Over-translated |
 | 2307.13923 | multilingual | 5,938 | 8,206 | 138.2% | Over-translated |
 | 2106.03760 | moe | 15,133 | 20,963 | 138.5% | Over-translated |
 | 2310.17653 | knowledge-distillation | 18,008 | 24,965 | 138.6% | Over-translated |
@@ -443,6 +489,7 @@ Papers with significantly more Vietnamese content than English:
 | 2310.09049 | automl-nas | 3,985 | 5,792 | 145.3% | Over-translated |
 | 2309.01125 | automl-nas | 2,211 | 3,214 | 145.4% | Over-translated |
 | 2311.01927 | attention | 6,076 | 8,842 | 145.5% | Over-translated |
+| 2305.04032 | instruct | 12,673 | 18,444 | 145.5% | Over-translated |
 | 2209.11883 | hebbian | 14,709 | 21,459 | 145.9% | Over-translated |
 | 2312.06585 | math | 9,050 | 13,258 | 146.5% | Over-translated |
 | 2309.01552 | automl-nas | 5,939 | 8,795 | 148.1% | Over-translated |
@@ -453,6 +500,8 @@ Papers with significantly more Vietnamese content than English:
 | 2109.02008 | multimodal | 6,953 | 10,420 | 149.9% | Over-translated |
 | 2212.05561 | multimodal | 6,445 | 9,774 | 151.7% | Over-translated |
 | 2002.10957 | attention | 13,124 | 19,966 | 152.1% | Over-translated |
+| 2204.08142 | positional-embeddings | 6,537 | 9,955 | 152.3% | Over-translated |
+| 2302.09582 | emotion | 15,572 | 23,784 | 152.7% | Over-translated |
 | 2406.13923 | multilingual | 10,578 | 16,203 | 153.2% | Over-translated |
 | 2210.03869 | moe | 9,444 | 14,623 | 154.8% | Over-translated |
 | 2310.18628 | knowledge-distillation | 10,504 | 16,277 | 155.0% | Over-translated |
@@ -476,7 +525,7 @@ Papers with significantly more Vietnamese content than English:
 | annotation | 5 | 2 | 0 | 3 | 40.0% |
 | approximation | 5 | 1 | 0 | 4 | 20.0% |
 | asr | 1 | 1 | 0 | 0 | 100.0% |
-| attention | 63 | 33 | 8 | 22 | 52.4% |
+| attention | 64 | 34 | 8 | 22 | 53.1% |
 | audio | 7 | 1 | 2 | 4 | 14.3% |
 | autoencoder | 5 | 2 | 0 | 3 | 40.0% |
 | automl-nas | 34 | 10 | 6 | 18 | 29.4% |
@@ -486,64 +535,73 @@ Papers with significantly more Vietnamese content than English:
 | bias | 4 | 3 | 1 | 0 | 75.0% |
 | byte-level | 5 | 2 | 0 | 3 | 40.0% |
 | clarify | 1 | 0 | 0 | 1 | 0.0% |
-| coding | 74 | 48 | 3 | 23 | 64.9% |
+| coding | 75 | 49 | 3 | 23 | 65.3% |
 | concept | 1 | 0 | 0 | 1 | 0.0% |
 | conditional | 1 | 0 | 0 | 1 | 0.0% |
 | confidence | 2 | 1 | 0 | 1 | 50.0% |
 | constrained-decoding | 2 | 2 | 0 | 0 | 100.0% |
 | context-compression | 13 | 10 | 0 | 3 | 76.9% |
-| continual-learning | 48 | 35 | 3 | 10 | 72.9% |
+| continual-learning | 49 | 35 | 3 | 11 | 71.4% |
 | contrastive | 15 | 12 | 0 | 3 | 80.0% |
-| convolution | 12 | 11 | 0 | 1 | 91.7% |
-| cot | 7 | 6 | 0 | 1 | 85.7% |
+| convolution | 13 | 11 | 1 | 1 | 84.6% |
+| cot | 9 | 7 | 1 | 1 | 77.8% |
 | data-augmentation | 25 | 24 | 0 | 1 | 96.0% |
+| data-processing | 1 | 1 | 0 | 0 | 100.0% |
 | dataset-curation | 3 | 1 | 0 | 2 | 33.3% |
-| dataset-generation | 10 | 8 | 0 | 2 | 80.0% |
-| dataset-pruning-cleaning-dedup | 5 | 3 | 1 | 1 | 60.0% |
-| datasets | 13 | 9 | 2 | 2 | 69.2% |
-| diffusion | 21 | 13 | 0 | 8 | 61.9% |
+| dataset-generation | 12 | 9 | 0 | 3 | 75.0% |
+| dataset-pruning-cleaning-dedup | 6 | 4 | 1 | 1 | 66.7% |
+| datasets | 17 | 12 | 3 | 2 | 70.6% |
+| diffusion | 24 | 15 | 1 | 8 | 62.5% |
 | distributed | 6 | 4 | 0 | 2 | 66.7% |
-| document-parsing | 4 | 3 | 0 | 1 | 75.0% |
-| early-stopping | 1 | 1 | 0 | 0 | 100.0% |
+| document-parsing | 6 | 4 | 0 | 2 | 66.7% |
+| early-stopping | 3 | 2 | 0 | 1 | 66.7% |
 | education | 1 | 0 | 0 | 1 | 0.0% |
 | embeddings | 8 | 6 | 0 | 2 | 75.0% |
+| emergent | 1 | 0 | 1 | 0 | 0.0% |
+| emotion | 1 | 0 | 0 | 1 | 0.0% |
 | ensemble | 2 | 1 | 0 | 1 | 50.0% |
 | evaluation | 4 | 1 | 0 | 3 | 25.0% |
-| evolutionary-algorithms | 1 | 1 | 0 | 0 | 100.0% |
-| ffn-mlp | 6 | 2 | 1 | 3 | 33.3% |
-| finance | 6 | 2 | 0 | 4 | 33.3% |
-| grammar | 2 | 1 | 0 | 1 | 50.0% |
+| evolutionary-algorithms | 2 | 2 | 0 | 0 | 100.0% |
+| federated-learning | 4 | 3 | 0 | 1 | 75.0% |
+| ffn-mlp | 7 | 2 | 2 | 3 | 28.6% |
+| finance | 9 | 5 | 0 | 4 | 55.6% |
+| grammar | 3 | 1 | 0 | 2 | 33.3% |
 | grounding | 1 | 0 | 0 | 1 | 0.0% |
 | hallucination | 2 | 2 | 0 | 0 | 100.0% |
 | hebbian | 1 | 0 | 0 | 1 | 0.0% |
 | hypercomplex | 2 | 0 | 0 | 2 | 0.0% |
-| hypernetwork | 12 | 12 | 0 | 0 | 100.0% |
-| hyperparameters | 1 | 0 | 0 | 1 | 0.0% |
-| icl | 29 | 20 | 4 | 5 | 69.0% |
-| icl-papers | 19 | 8 | 3 | 8 | 42.1% |
+| hypernetwork | 13 | 13 | 0 | 0 | 100.0% |
+| hyperparameters | 2 | 1 | 0 | 1 | 50.0% |
+| icl | 33 | 23 | 5 | 5 | 69.7% |
+| icl-papers | 22 | 10 | 3 | 9 | 45.5% |
 | inference | 11 | 5 | 0 | 6 | 45.5% |
 | initialization | 4 | 2 | 1 | 1 | 50.0% |
-| instruct | 28 | 17 | 0 | 11 | 60.7% |
-| interpretability | 10 | 5 | 1 | 4 | 50.0% |
+| instruct | 31 | 18 | 1 | 12 | 58.1% |
+| interpretability | 11 | 5 | 2 | 4 | 45.5% |
 | knowledge-distillation | 26 | 11 | 2 | 13 | 42.3% |
-| knowledge-graph | 9 | 4 | 1 | 4 | 44.4% |
+| knowledge-graph | 10 | 5 | 1 | 4 | 50.0% |
 | kv-cache | 6 | 5 | 0 | 1 | 83.3% |
 | legal | 2 | 1 | 0 | 1 | 50.0% |
 | llm-architecture | 10 | 5 | 1 | 4 | 50.0% |
-| long-context | 66 | 32 | 5 | 29 | 48.5% |
-| math | 34 | 20 | 1 | 13 | 58.8% |
+| long-context | 67 | 33 | 5 | 29 | 49.3% |
+| math | 38 | 21 | 3 | 14 | 55.3% |
 | memory | 2 | 1 | 0 | 1 | 50.0% |
 | mental-health | 2 | 1 | 1 | 0 | 50.0% |
 | merging | 3 | 1 | 0 | 2 | 33.3% |
 | modular | 1 | 1 | 0 | 0 | 100.0% |
-| moe | 61 | 39 | 3 | 19 | 63.9% |
+| moe | 65 | 41 | 3 | 21 | 63.1% |
 | multi-task | 6 | 3 | 0 | 3 | 50.0% |
 | multilingual | 106 | 82 | 3 | 21 | 77.4% |
 | multimodal | 36 | 20 | 0 | 16 | 55.6% |
 | normalization | 1 | 0 | 0 | 1 | 0.0% |
-| peft | 48 | 31 | 3 | 14 | 64.6% |
+| peft | 68 | 51 | 3 | 14 | 75.0% |
 | phase1 | 5 | 2 | 0 | 3 | 40.0% |
-| pruning | 71 | 38 | 0 | 33 | 53.5% |
+| planning | 16 | 9 | 3 | 4 | 56.2% |
+| positional-embeddings | 6 | 3 | 1 | 2 | 50.0% |
+| privacy | 2 | 0 | 0 | 2 | 0.0% |
+| prompt | 18 | 13 | 2 | 3 | 72.2% |
+| pruning | 78 | 44 | 0 | 34 | 56.4% |
+| quantization | 20 | 12 | 0 | 8 | 60.0% |
 | rag | 3 | 1 | 0 | 2 | 33.3% |
 | speculative | 29 | 18 | 0 | 11 | 62.1% |
 | survey | 2 | 1 | 0 | 1 | 50.0% |
@@ -556,7 +614,8 @@ Complete listing of all translation pairs:
 | ArXiv ID | Collection | EN Tokens | VI Tokens | Ratio | Status |
 |----------|------------|-----------|-----------|-------|--------|
 | 2211.04661 | automl-nas | 26,001 | 41 | 0.2% | Incomplete |
-| 2203.16697 | coding | 23,218 | 85 | 0.4% | Incomplete |
+| 2309.13075 | math | 14,454 | 35 | 0.2% | Incomplete |
+| 2305.18619 | diffusion | 22,357 | 109 | 0.5% | Incomplete |
 | 2101.03961 | moe | 20,957 | 123 | 0.6% | Incomplete |
 | 2204.08358 | benchmark | 22,595 | 137 | 0.6% | Incomplete |
 | 2302.14838 | automl-nas | 17,907 | 115 | 0.6% | Incomplete |
@@ -588,19 +647,34 @@ Complete listing of all translation pairs:
 | 2309.13567 | mental-health | 15,252 | 785 | 5.1% | Incomplete |
 | 2305.07185 | llm-architecture | 11,996 | 635 | 5.3% | Incomplete |
 | 2307.14995 | attention | 14,232 | 965 | 6.8% | Incomplete |
+| 2210.01293 | icl | 16,451 | 1,166 | 7.1% | Incomplete |
+| 2309.10814 | math | 36,639 | 2,661 | 7.3% | Incomplete |
+| 2305.01610 | emergent | 24,701 | 1,985 | 8.0% | Incomplete |
 | 2309.10687 | icl | 31,671 | 2,934 | 9.3% | Incomplete |
+| 2402.19173 | datasets | 36,751 | 3,443 | 9.4% | Incomplete |
+| 2307.05300 | prompt | 16,954 | 1,699 | 10.0% | Incomplete |
 | 2309.14345 | bias | 23,801 | 2,503 | 10.5% | Incomplete |
+| 2407.03040 | instruct | 9,687 | 1,046 | 10.8% | Incomplete |
 | 2207.14358 | knowledge-graph | 26,995 | 2,930 | 10.9% | Incomplete |
 | 2304.04675 | multilingual | 17,511 | 2,223 | 12.7% | Incomplete |
+| 2303.17125 | coding | 15,193 | 2,038 | 13.4% | Incomplete |
 | 2401.10225 | datasets | 25,316 | 3,432 | 13.6% | Incomplete |
+| 2310.03710 | planning | 70,621 | 9,874 | 14.0% | Incomplete |
 | 2009.01797 | continual-learning | 32,800 | 4,595 | 14.0% | Incomplete |
 | 2310.00035 | peft | 10,108 | 1,430 | 14.1% | Incomplete |
 | 2307.12008 | icl-papers | 8,595 | 1,220 | 14.2% | Incomplete |
 | 2312.04474 | icl | 15,555 | 2,219 | 14.3% | Incomplete |
+| 2309.12499 | planning | 23,858 | 3,568 | 15.0% | Incomplete |
 | 2311.03301 | continual-learning | 12,628 | 1,937 | 15.3% | Incomplete |
+| 2311.08263 | cot | 8,457 | 1,306 | 15.4% | Incomplete |
+| 2305.14909 | planning | 35,115 | 5,861 | 16.7% | Incomplete |
+| 2311.13110 | interpretability | 61,231 | 10,676 | 17.4% | Incomplete |
 | 2310.03188 | knowledge-distillation | 13,340 | 2,483 | 18.6% | Incomplete |
 | 2311.13171 | peft | 17,076 | 3,279 | 19.2% | Incomplete |
 | 2308.10379 | icl-papers | 57,713 | 11,102 | 19.2% | Incomplete |
+| 2108.04384 | ffn-mlp | 12,088 | 2,475 | 20.5% | Incomplete |
+| 2205.13522 | positional-embeddings | 14,036 | 2,889 | 20.6% | Incomplete |
+| 2311.05661 | prompt | 29,231 | 6,028 | 20.6% | Incomplete |
 | 2406.11794 | dataset-pruning-cleaning-dedup | 55,503 | 12,010 | 21.6% | Incomplete |
 | 2309.01479 | peft | 10,423 | 2,379 | 22.8% | Incomplete |
 | 2311.08760 | interpretability | 14,757 | 3,621 | 24.5% | Incomplete |
@@ -608,6 +682,7 @@ Complete listing of all translation pairs:
 | 2312.08618 | long-context | 18,959 | 4,790 | 25.3% | Incomplete |
 | 2310.14188 | moe | 20,412 | 5,223 | 25.6% | Incomplete |
 | 2402.18668 | attention | 40,739 | 10,592 | 26.0% | Incomplete |
+| 2312.04927 | convolution | 38,655 | 10,307 | 26.7% | Incomplete |
 | 2402.00159 | datasets | 46,884 | 12,530 | 26.7% | Incomplete |
 | 2401.06066 | moe | 17,977 | 4,855 | 27.0% | Incomplete |
 | 2307.15337 | batched-decoding | 37,252 | 10,115 | 27.2% | Incomplete |
@@ -617,7 +692,9 @@ Complete listing of all translation pairs:
 | 2402.08015 | multilingual | 8,867 | 2,657 | 30.0% | Incomplete |
 | 2308.10848 | agent | 28,640 | 8,764 | 30.6% | Complete |
 | 2302.14229 | multilingual | 11,138 | 3,421 | 30.7% | Complete |
+| 2311.06158 | datasets | 10,116 | 3,143 | 31.1% | Complete |
 | 2404.07549 | coding | 8,186 | 2,550 | 31.2% | Complete |
+| 2309.14681 | planning | 25,318 | 7,945 | 31.4% | Complete |
 | 2212.08061 | cot | 11,200 | 3,539 | 31.6% | Complete |
 | 2401.14242 | llm-architecture | 10,809 | 3,417 | 31.6% | Complete |
 | 2401.13303 | multilingual | 27,227 | 8,703 | 32.0% | Complete |
@@ -625,9 +702,12 @@ Complete listing of all translation pairs:
 | 2402.18334 | data-augmentation | 18,818 | 6,123 | 32.5% | Complete |
 | 2403.08763 | continual-learning | 33,215 | 11,194 | 33.7% | Complete |
 | 2312.17120 | math | 29,317 | 10,159 | 34.7% | Complete |
+| 2310.00533 | planning | 12,881 | 4,474 | 34.7% | Complete |
+| 2304.12484 | document-parsing | 9,111 | 3,174 | 34.8% | Complete |
 | 2308.12032 | instruct | 17,444 | 6,104 | 35.0% | Complete |
 | 2111.05498 | attention | 30,630 | 10,730 | 35.0% | Complete |
 | 2309.16797 | icl-papers | 31,488 | 11,052 | 35.1% | Complete |
+| 2307.15780 | prompt | 25,931 | 9,123 | 35.2% | Complete |
 | 2311.07463 | multilingual | 28,509 | 10,052 | 35.3% | Complete |
 | 2209.07529 | pruning | 17,420 | 6,158 | 35.4% | Complete |
 | 2211.14963 | continual-learning | 8,442 | 3,032 | 35.9% | Complete |
@@ -635,6 +715,7 @@ Complete listing of all translation pairs:
 | 2401.01325 | long-context | 13,890 | 5,079 | 36.6% | Complete |
 | 2206.12131 | datasets | 27,675 | 10,156 | 36.7% | Complete |
 | 2310.11685 | attention | 21,703 | 7,996 | 36.8% | Complete |
+| 2308.15421 | icl-papers | 67,936 | 25,126 | 37.0% | Complete |
 | 2308.09583 | math | 24,804 | 9,204 | 37.1% | Complete |
 | 2206.04046 | moe | 22,920 | 8,595 | 37.5% | Complete |
 | 2311.16534 | knowledge-graph | 23,461 | 8,851 | 37.7% | Complete |
@@ -647,7 +728,10 @@ Complete listing of all translation pairs:
 | 2310.13448 | multilingual | 11,941 | 4,605 | 38.6% | Complete |
 | 2310.18780 | convolution | 24,627 | 9,518 | 38.6% | Complete |
 | 2309.17061 | multilingual | 11,181 | 4,323 | 38.7% | Complete |
+| 2301.11093 | diffusion | 12,589 | 4,964 | 39.4% | Complete |
 | 2303.16854 | annotation | 22,842 | 9,037 | 39.6% | Complete |
+| 2305.14825 | icl | 29,149 | 11,545 | 39.6% | Complete |
+| 2309.10818 | dataset-pruning-cleaning-dedup | 12,673 | 5,060 | 39.9% | Complete |
 | 2112.00980 | ffn-mlp | 21,599 | 8,667 | 40.1% | Complete |
 | 2402.04578 | agent | 14,831 | 6,008 | 40.5% | Complete |
 | 2210.11416 | instruct | 27,290 | 11,206 | 41.1% | Complete |
@@ -658,8 +742,10 @@ Complete listing of all translation pairs:
 | 2401.18058 | long-context | 13,860 | 5,839 | 42.1% | Complete |
 | 2110.08207 | instruct | 56,020 | 23,866 | 42.6% | Complete |
 | 2210.07839 | multimodal | 17,014 | 7,260 | 42.7% | Complete |
+| 2308.07921 | math | 13,330 | 5,742 | 43.1% | Complete |
 | 2409.04431 | attention | 35,198 | 15,211 | 43.2% | Complete |
 | 2309.10661 | multilingual | 20,720 | 8,970 | 43.3% | Complete |
+| 2205.11916 | cot | 28,490 | 12,355 | 43.4% | Complete |
 | 2205.05368 | data-augmentation | 47,013 | 20,651 | 43.9% | Complete |
 | 2305.06156 | multilingual | 17,583 | 7,758 | 44.1% | Complete |
 | 2305.18403 | pruning | 10,194 | 4,544 | 44.6% | Complete |
@@ -668,14 +754,18 @@ Complete listing of all translation pairs:
 | 2402.12659 | finance | 18,549 | 8,346 | 45.0% | Complete |
 | 2112.00029 | attention | 23,635 | 10,728 | 45.4% | Complete |
 | 2205.14135 | attention | 21,074 | 9,579 | 45.5% | Complete |
+| 2304.09797 | icl | 27,656 | 12,585 | 45.5% | Complete |
 | 2402.06619 | multilingual | 55,364 | 25,295 | 45.7% | Complete |
 | 2304.04370 | agent | 20,876 | 9,540 | 45.7% | Complete |
+| 2305.19466 | prompt | 20,033 | 9,157 | 45.7% | Complete |
 | 2310.03693 | adversarial | 33,599 | 15,536 | 46.2% | Complete |
 | 2306.01116 | dataset-pruning-cleaning-dedup | 23,297 | 10,784 | 46.3% | Complete |
 | 2403.15042 | data-augmentation | 19,121 | 8,912 | 46.6% | Complete |
 | 2310.09342 | contrastive | 8,949 | 4,230 | 47.3% | Complete |
+| 2309.05516 | quantization | 14,933 | 7,085 | 47.4% | Complete |
 | 2202.01169 | moe | 20,919 | 9,926 | 47.4% | Complete |
 | 2310.03052 | long-context | 18,986 | 9,009 | 47.5% | Complete |
+| 2305.11790 | prompt | 17,136 | 8,164 | 47.6% | Complete |
 | 2312.00968 | peft | 11,683 | 5,573 | 47.7% | Complete |
 | 2401.00741 | benchmark | 17,004 | 8,132 | 47.8% | Complete |
 | 2312.02120 | dataset-pruning-cleaning-dedup | 16,842 | 8,067 | 47.9% | Complete |
@@ -686,6 +776,7 @@ Complete listing of all translation pairs:
 | 2310.10908 | moe | 16,759 | 8,247 | 49.2% | Complete |
 | 2305.13048 | llm-architecture | 17,876 | 8,804 | 49.3% | Complete |
 | 2303.03915 | multilingual | 22,042 | 10,901 | 49.5% | Complete |
+| 2306.06427 | icl | 20,901 | 10,411 | 49.8% | Complete |
 | 2310.03716 | long-context | 14,293 | 7,120 | 49.8% | Complete |
 | 2111.13445 | pruning | 21,517 | 10,751 | 50.0% | Complete |
 | 2405.17381 | attention | 14,770 | 7,399 | 50.1% | Complete |
@@ -696,14 +787,18 @@ Complete listing of all translation pairs:
 | 2212.09420 | coding | 15,481 | 7,849 | 50.7% | Complete |
 | 2405.17399 | math | 18,415 | 9,417 | 51.1% | Complete |
 | 2307.11088 | long-context | 17,997 | 9,224 | 51.3% | Complete |
-| 2304.06815 | coding | 15,897 | 8,158 | 51.3% | Complete |
+| 2310.02107 | prompt | 21,113 | 10,849 | 51.4% | Complete |
 | 2304.02051 | diffusion | 16,251 | 8,361 | 51.4% | Complete |
 | 1906.00695 | hypernetwork | 18,943 | 9,747 | 51.5% | Complete |
+| 2310.03720 | planning | 19,620 | 10,110 | 51.5% | Complete |
 | 2305.04769 | continual-learning | 14,547 | 7,521 | 51.7% | Complete |
 | 2312.04985 | attention | 15,961 | 8,325 | 52.2% | Complete |
 | 2205.12701 | moe | 25,646 | 13,382 | 52.2% | Complete |
+| 2405.20271 | peft | 15,493 | 8,108 | 52.3% | Complete |
 | 2302.08468 | coding | 16,935 | 8,899 | 52.5% | Complete |
+| 2207.07611 | positional-embeddings | 13,989 | 7,352 | 52.6% | Complete |
 | 2308.16884 | icl-papers | 18,639 | 9,817 | 52.7% | Complete |
+| 2310.08582 | planning | 17,378 | 9,161 | 52.7% | Complete |
 | 2305.18507 | icl | 19,315 | 10,185 | 52.7% | Complete |
 | 2310.06839 | long-context | 15,073 | 7,967 | 52.9% | Complete |
 | 2401.06102 | interpretability | 21,697 | 11,533 | 53.2% | Complete |
@@ -713,10 +808,15 @@ Complete listing of all translation pairs:
 | 2210.02412 | pruning | 22,236 | 11,904 | 53.5% | Complete |
 | 2211.13723 | multi-task | 15,770 | 8,468 | 53.7% | Complete |
 | 2405.15444 | hypernetwork | 17,274 | 9,278 | 53.7% | Complete |
+| 2310.08992 | planning | 18,851 | 10,133 | 53.8% | Complete |
 | 2312.12683 | multilingual | 20,499 | 11,066 | 54.0% | Complete |
+| 2310.02304 | prompt | 29,074 | 15,704 | 54.0% | Complete |
 | 2112.10684 | moe | 14,827 | 8,021 | 54.1% | Complete |
 | 2311.12908 | diffusion | 13,533 | 7,360 | 54.4% | Complete |
 | 2310.06389 | diffusion | 16,318 | 8,895 | 54.5% | Complete |
+| 2310.04861 | positional-embeddings | 13,808 | 7,559 | 54.7% | Complete |
+| 2306.12929 | quantization | 15,453 | 8,465 | 54.8% | Complete |
+| 2311.04954 | prompt | 17,880 | 9,805 | 54.8% | Complete |
 | 2310.17631 | benchmark | 17,839 | 9,839 | 55.2% | Complete |
 | 2207.03341 | attention | 15,624 | 8,633 | 55.3% | Complete |
 | 2309.11674 | multilingual | 15,518 | 8,646 | 55.7% | Complete |
@@ -725,11 +825,13 @@ Complete listing of all translation pairs:
 | 2305.17476 | data-augmentation | 17,625 | 9,882 | 56.1% | Complete |
 | 2305.13971 | constrained-decoding | 16,725 | 9,378 | 56.1% | Complete |
 | 2309.01775 | icl | 15,866 | 8,910 | 56.2% | Complete |
+| 2312.06635 | long-context | 17,655 | 9,959 | 56.4% | Complete |
 | 2402.10379 | dataset-generation | 12,385 | 7,023 | 56.7% | Complete |
 | 2310.20587 | peft | 16,552 | 9,402 | 56.8% | Complete |
 | 2305.03288 | moe | 17,114 | 9,738 | 56.9% | Complete |
 | 2112.06905 | moe | 19,726 | 11,234 | 57.0% | Complete |
 | 2311.12983 | benchmark | 16,599 | 9,479 | 57.1% | Complete |
+| 2309.14322 | hyperparameters | 14,011 | 8,017 | 57.2% | Complete |
 | 2405.19327 | multilingual | 31,727 | 18,159 | 57.2% | Complete |
 | 2407.15176 | long-context | 16,770 | 9,609 | 57.3% | Complete |
 | 2307.14430 | datasets | 22,425 | 12,875 | 57.4% | Complete |
@@ -744,6 +846,8 @@ Complete listing of all translation pairs:
 | 2305.09857 | grammar | 16,251 | 9,512 | 58.5% | Complete |
 | 2106.06842 | hypernetwork | 16,520 | 9,709 | 58.8% | Complete |
 | 2402.14086 | multilingual | 16,482 | 9,703 | 58.9% | Complete |
+| 2402.10986 | finance | 18,183 | 10,731 | 59.0% | Complete |
+| 2210.04092 | pruning | 17,748 | 10,494 | 59.1% | Complete |
 | 2309.12284 | math | 16,348 | 9,673 | 59.2% | Complete |
 | 2305.02299 | pruning | 16,703 | 9,887 | 59.2% | Complete |
 | 2109.14545 | activation | 19,182 | 11,359 | 59.2% | Complete |
@@ -756,6 +860,7 @@ Complete listing of all translation pairs:
 | 2401.00788 | peft | 14,976 | 8,979 | 60.0% | Complete |
 | 2406.19759 | multilingual | 13,319 | 8,005 | 60.1% | Complete |
 | 2110.03215 | continual-learning | 19,324 | 11,622 | 60.1% | Complete |
+| 2211.01910 | prompt | 20,364 | 12,285 | 60.3% | Complete |
 | 2310.09716 | data-augmentation | 16,430 | 9,938 | 60.5% | Complete |
 | 2401.01335 | peft | 17,178 | 10,407 | 60.6% | Complete |
 | 2111.15667 | context-compression | 15,243 | 9,240 | 60.6% | Complete |
@@ -771,17 +876,21 @@ Complete listing of all translation pairs:
 | 2305.06408 | continual-learning | 18,099 | 11,137 | 61.5% | Complete |
 | 2402.08073 | coding | 15,900 | 9,786 | 61.5% | Complete |
 | 2404.02078 | math | 13,091 | 8,065 | 61.6% | Complete |
+| 2302.07350 | planning | 16,426 | 10,123 | 61.6% | Complete |
 | 2309.06706 | multilingual | 13,224 | 8,162 | 61.7% | Complete |
 | 2204.02329 | icl | 20,885 | 12,906 | 61.8% | Complete |
 | 2309.17452 | math | 18,136 | 11,234 | 61.9% | Complete |
 | 2312.00752 | convolution | 26,455 | 16,399 | 62.0% | Complete |
 | 2305.15805 | context-compression | 14,745 | 9,142 | 62.0% | Complete |
+| 2405.17604 | peft | 18,261 | 11,424 | 62.6% | Complete |
 | 2310.07911 | attention | 14,392 | 9,016 | 62.6% | Complete |
 | 2304.08823 | multilingual | 8,828 | 5,560 | 63.0% | Complete |
 | 2309.17382 | icl | 40,673 | 25,712 | 63.2% | Complete |
 | 2305.06324 | multimodal | 14,553 | 9,205 | 63.3% | Complete |
 | 2410.01215 | coding | 14,202 | 8,984 | 63.3% | Complete |
+| 2305.18513 | pruning | 14,233 | 9,011 | 63.3% | Complete |
 | 2310.08166 | multilingual | 11,289 | 7,177 | 63.6% | Complete |
+| 2309.14592 | quantization | 11,096 | 7,057 | 63.6% | Complete |
 | 2407.12021 | speculative | 14,943 | 9,505 | 63.6% | Complete |
 | 2402.19155 | byte-level | 15,641 | 9,952 | 63.6% | Complete |
 | 2406.10594 | pruning | 12,426 | 7,907 | 63.6% | Complete |
@@ -797,9 +906,11 @@ Complete listing of all translation pairs:
 | 2211.15457 | hypernetwork | 12,897 | 8,342 | 64.7% | Complete |
 | 2110.06920 | multilingual | 10,844 | 7,018 | 64.7% | Complete |
 | 2303.10475 | instruct | 29,130 | 18,868 | 64.8% | Complete |
+| 2403.03507 | peft | 14,881 | 9,640 | 64.8% | Complete |
 | 2211.02206 | pruning | 14,012 | 9,081 | 64.8% | Complete |
 | 1909.06035 | early-stopping | 12,485 | 8,092 | 64.8% | Complete |
 | 2304.04385 | multimodal | 14,800 | 9,596 | 64.8% | Complete |
+| 2403.13372 | peft | 11,453 | 7,442 | 65.0% | Complete |
 | 2203.06850 | moe | 11,230 | 7,300 | 65.0% | Complete |
 | 2306.01690 | continual-learning | 19,288 | 12,558 | 65.1% | Complete |
 | 2402.03131 | multilingual | 16,422 | 10,803 | 65.8% | Complete |
@@ -807,6 +918,8 @@ Complete listing of all translation pairs:
 | 2306.01709 | multilingual | 14,170 | 9,331 | 65.9% | Complete |
 | 2311.03366 | coding | 13,087 | 8,656 | 66.1% | Complete |
 | 2304.07645 | hypernetwork | 12,486 | 8,266 | 66.2% | Complete |
+| 2405.00732 | peft | 14,878 | 9,883 | 66.4% | Complete |
+| 2406.02214 | peft | 13,728 | 9,137 | 66.6% | Complete |
 | 2304.06461 | multimodal | 11,183 | 7,447 | 66.6% | Complete |
 | 2308.10168 | knowledge-graph | 13,351 | 8,912 | 66.8% | Complete |
 | 2310.07849 | dataset-generation | 14,782 | 9,880 | 66.8% | Complete |
@@ -822,12 +935,16 @@ Complete listing of all translation pairs:
 | 2211.11586 | context-compression | 13,041 | 8,776 | 67.3% | Complete |
 | 1909.03341 | multilingual | 6,342 | 4,271 | 67.3% | Complete |
 | 2309.13308 | icl-papers | 16,560 | 11,161 | 67.4% | Complete |
+| 2405.17357 | peft | 9,972 | 6,735 | 67.5% | Complete |
 | 2309.01940 | multilingual | 22,861 | 15,462 | 67.6% | Complete |
 | 2403.18058 | multilingual | 11,512 | 7,801 | 67.8% | Complete |
 | 2305.18444 | pruning | 12,818 | 8,729 | 68.1% | Complete |
 | 2306.04387 | multilingual | 12,013 | 8,200 | 68.3% | Complete |
+| 2207.07061 | early-stopping | 16,004 | 10,929 | 68.3% | Complete |
 | 2402.18508 | convolution | 13,484 | 9,217 | 68.4% | Complete |
+| 2405.03003 | peft | 14,341 | 9,811 | 68.4% | Complete |
 | 2209.09476 | pruning | 13,267 | 9,077 | 68.4% | Complete |
+| 2309.06805 | federated-learning | 10,719 | 7,334 | 68.4% | Complete |
 | 2304.05362 | continual-learning | 12,469 | 8,559 | 68.6% | Complete |
 | 2211.08253 | moe | 13,750 | 9,441 | 68.7% | Complete |
 | 2402.02113 | multilingual | 17,963 | 12,335 | 68.7% | Complete |
@@ -846,6 +963,7 @@ Complete listing of all translation pairs:
 | 2306.05101 | contrastive | 14,062 | 9,831 | 69.9% | Complete |
 | 2210.03945 | coding | 13,702 | 9,587 | 70.0% | Complete |
 | 2310.11976 | diffusion | 10,843 | 7,599 | 70.1% | Complete |
+| 2305.05862 | finance | 9,969 | 7,004 | 70.3% | Complete |
 | 2307.01163 | continual-learning | 12,611 | 8,866 | 70.3% | Complete |
 | 1702.08359 | embeddings | 12,331 | 8,674 | 70.3% | Complete |
 | 2309.06922 | peft | 12,772 | 8,997 | 70.4% | Complete |
@@ -857,6 +975,7 @@ Complete listing of all translation pairs:
 | 2205.12399 | moe | 15,285 | 10,830 | 70.9% | Complete |
 | 2301.09595 | multimodal | 13,327 | 9,444 | 70.9% | Complete |
 | 2305.15074 | benchmark | 11,397 | 8,089 | 71.0% | Complete |
+| 2305.03268 | prompt | 13,122 | 9,344 | 71.2% | Complete |
 | 2112.05364 | attention | 13,508 | 9,623 | 71.2% | Complete |
 | 2106.03027 | continual-learning | 15,785 | 11,287 | 71.5% | Complete |
 | 2205.06126 | multimodal | 8,911 | 6,386 | 71.7% | Complete |
@@ -867,12 +986,15 @@ Complete listing of all translation pairs:
 | 2103.03541 | multilingual | 12,513 | 9,005 | 72.0% | Complete |
 | 2401.12522 | speculative | 11,759 | 8,498 | 72.3% | Complete |
 | 2306.06624 | coding | 14,181 | 10,288 | 72.5% | Complete |
+| 2405.16325 | peft | 16,684 | 12,116 | 72.6% | Complete |
 | 2305.06161 | coding | 33,914 | 24,687 | 72.8% | Complete |
 | 2401.10660 | multilingual | 11,397 | 8,300 | 72.8% | Complete |
 | 2305.17179 | multilingual | 14,457 | 10,533 | 72.9% | Complete |
+| 2203.16697 | coding | 23,218 | 16,936 | 72.9% | Complete |
 | 2312.17238 | inference | 10,065 | 7,380 | 73.3% | Complete |
 | 2107.00910 | pruning | 11,147 | 8,191 | 73.5% | Complete |
 | 2107.00135 | multimodal | 12,925 | 9,517 | 73.6% | Complete |
+| 2405.15179 | peft | 13,826 | 10,181 | 73.6% | Complete |
 | 2404.11912 | speculative | 10,284 | 7,593 | 73.8% | Complete |
 | 2404.18911 | speculative | 5,491 | 4,056 | 73.9% | Complete |
 | 2309.16039 | long-context | 14,552 | 10,757 | 73.9% | Complete |
@@ -880,6 +1002,7 @@ Complete listing of all translation pairs:
 | 2010.12730 | embeddings | 10,316 | 7,638 | 74.0% | Complete |
 | 2309.13850 | moe | 22,942 | 16,991 | 74.1% | Complete |
 | 2311.11696 | peft | 10,007 | 7,423 | 74.2% | Complete |
+| 2406.10785 | peft | 10,232 | 7,595 | 74.2% | Complete |
 | 2404.05875 | dataset-generation | 14,899 | 11,070 | 74.3% | Complete |
 | 2210.02871 | knowledge-distillation | 13,343 | 9,921 | 74.4% | Complete |
 | 2310.08395 | cot | 11,728 | 8,729 | 74.4% | Complete |
@@ -887,6 +1010,8 @@ Complete listing of all translation pairs:
 | 2309.11165 | multilingual | 11,982 | 8,924 | 74.5% | Complete |
 | 2211.13491 | moe | 15,568 | 11,612 | 74.6% | Complete |
 | 2309.09506 | coding | 10,346 | 7,722 | 74.6% | Complete |
+| 2304.07619 | finance | 38,598 | 28,862 | 74.8% | Complete |
+| 2402.01093 | hypernetwork | 13,179 | 9,868 | 74.9% | Complete |
 | 2011.00241 | survey | 26,124 | 19,585 | 75.0% | Complete |
 | 2310.12236 | multilingual | 9,894 | 7,436 | 75.2% | Complete |
 | 2308.16692 | audio | 10,778 | 8,126 | 75.4% | Complete |
@@ -912,13 +1037,17 @@ Complete listing of all translation pairs:
 | 2212.05102 | multimodal | 13,557 | 10,374 | 76.5% | Complete |
 | 2210.07535 | multilingual | 10,618 | 8,130 | 76.6% | Complete |
 | 2303.14177 | moe | 19,623 | 15,057 | 76.7% | Complete |
+| 2405.13952 | peft | 12,876 | 9,889 | 76.8% | Complete |
 | 2307.05399 | continual-learning | 8,351 | 6,414 | 76.8% | Complete |
+| 2204.07705 | datasets | 18,080 | 13,916 | 77.0% | Complete |
 | 2502.05609 | speculative | 14,332 | 11,068 | 77.2% | Complete |
 | 2304.07880 | multilingual | 9,111 | 7,051 | 77.4% | Complete |
 | 2307.10943 | continual-learning | 10,999 | 8,535 | 77.6% | Complete |
 | 2305.17701 | datasets | 12,672 | 9,873 | 77.9% | Complete |
 | 2310.11248 | benchmark | 13,683 | 10,661 | 77.9% | Complete |
 | 2310.06927 | peft | 7,030 | 5,478 | 77.9% | Complete |
+| 2405.16057 | peft | 11,352 | 8,875 | 78.2% | Complete |
+| 2209.14624 | pruning | 11,434 | 8,950 | 78.3% | Complete |
 | 2402.11131 | speculative | 11,118 | 8,706 | 78.3% | Complete |
 | 2404.17642 | data-augmentation | 10,526 | 8,265 | 78.5% | Complete |
 | 2402.05109 | speculative | 10,921 | 8,585 | 78.6% | Complete |
@@ -942,6 +1071,7 @@ Complete listing of all translation pairs:
 | 2311.05640 | multilingual | 11,659 | 9,406 | 80.7% | Complete |
 | 2305.10964 | pruning | 10,519 | 8,489 | 80.7% | Complete |
 | 2401.16380 | data-augmentation | 20,553 | 16,602 | 80.8% | Complete |
+| 2404.11916 | peft | 7,976 | 6,444 | 80.8% | Complete |
 | 2309.14174 | multilingual | 8,899 | 7,191 | 80.8% | Complete |
 | 2103.03404 | attention | 11,364 | 9,209 | 81.0% | Complete |
 | 2310.11454 | peft | 12,663 | 10,268 | 81.1% | Complete |
@@ -966,11 +1096,13 @@ Complete listing of all translation pairs:
 | 2109.10282 | document-parsing | 10,362 | 8,560 | 82.6% | Complete |
 | 2009.11997 | hypernetwork | 9,297 | 7,701 | 82.8% | Complete |
 | 2210.04311 | pruning | 10,758 | 8,920 | 82.9% | Complete |
+| 2211.16056 | quantization | 10,298 | 8,548 | 83.0% | Complete |
 | 2311.08252 | speculative | 10,526 | 8,738 | 83.0% | Complete |
 | 2404.04478 | diffusion | 10,332 | 8,581 | 83.1% | Complete |
 | 2303.13405 | contrastive | 6,865 | 5,717 | 83.3% | Complete |
 | 2211.12485 | hypernetwork | 12,251 | 10,205 | 83.3% | Complete |
 | 2402.12376 | diffusion | 9,900 | 8,252 | 83.4% | Complete |
+| 2305.03495 | prompt | 9,157 | 7,642 | 83.5% | Complete |
 | 2312.16218 | hypernetwork | 9,982 | 8,336 | 83.5% | Complete |
 | 2209.11035 | multilingual | 5,924 | 4,949 | 83.5% | Complete |
 | 2204.00408 | knowledge-distillation | 11,835 | 9,889 | 83.6% | Complete |
@@ -985,10 +1117,13 @@ Complete listing of all translation pairs:
 | 2311.09198 | long-context | 10,987 | 9,261 | 84.3% | Complete |
 | 2302.06527 | coding | 26,144 | 22,046 | 84.3% | Complete |
 | 2309.01826 | ffn-mlp | 11,165 | 9,421 | 84.4% | Complete |
+| 2309.13536 | federated-learning | 14,574 | 12,299 | 84.4% | Complete |
+| 2310.01405 | icl-papers | 36,089 | 30,457 | 84.4% | Complete |
 | 2310.11670 | peft | 10,441 | 8,820 | 84.5% | Complete |
 | 2303.07616 | continual-learning | 22,924 | 19,424 | 84.7% | Complete |
 | 2203.09391 | data-augmentation | 11,163 | 9,462 | 84.8% | Complete |
 | 2310.08659 | peft | 9,291 | 7,894 | 85.0% | Complete |
+| 2308.10792 | instruct | 29,962 | 25,460 | 85.0% | Complete |
 | 2305.01157 | knowledge-graph | 12,680 | 10,778 | 85.0% | Complete |
 | 2210.10253 | adversarial | 12,190 | 10,363 | 85.0% | Complete |
 | 2404.08698 | speculative | 6,997 | 5,951 | 85.1% | Complete |
@@ -1000,16 +1135,22 @@ Complete listing of all translation pairs:
 | 2307.05956 | multilingual | 5,664 | 4,864 | 85.9% | Complete |
 | 2204.08396 | moe | 8,197 | 7,060 | 86.1% | Complete |
 | 2111.00160 | pruning | 9,756 | 8,408 | 86.2% | Complete |
+| 2110.04260 | moe | 11,195 | 9,683 | 86.5% | Complete |
+| 2309.01729 | quantization | 4,825 | 4,183 | 86.7% | Complete |
 | 2407.15891 | long-context | 8,793 | 7,638 | 86.9% | Complete |
 | 2210.15037 | multimodal | 10,596 | 9,237 | 87.2% | Complete |
 | 2402.03628 | agent | 13,347 | 11,638 | 87.2% | Complete |
 | 1906.06784 | adversarial | 14,894 | 12,989 | 87.2% | Complete |
 | 2401.09003 | math | 8,906 | 7,792 | 87.5% | Complete |
+| 2305.07759 | datasets | 23,979 | 21,034 | 87.7% | Complete |
 | 2301.13688 | datasets | 9,948 | 8,732 | 87.8% | Complete |
+| 2406.00302 | federated-learning | 23,605 | 20,727 | 87.8% | Complete |
+| 2309.02033 | data-processing | 22,118 | 19,448 | 87.9% | Complete |
 | 2302.14220 | multilingual | 14,446 | 12,717 | 88.0% | Complete |
 | 2407.21118 | attention | 14,695 | 12,953 | 88.1% | Complete |
 | 2309.13182 | knowledge-distillation | 8,942 | 7,896 | 88.3% | Complete |
 | 2208.01018 | multilingual | 10,966 | 9,687 | 88.3% | Complete |
+| 2312.04410 | diffusion | 11,525 | 10,188 | 88.4% | Complete |
 | 2306.13812 | continual-learning | 24,655 | 21,821 | 88.5% | Complete |
 | 2201.03327 | attention | 14,979 | 13,300 | 88.8% | Complete |
 | 2303.06318 | distributed | 14,015 | 12,452 | 88.8% | Complete |
@@ -1023,20 +1164,24 @@ Complete listing of all translation pairs:
 | 2111.03842 | knowledge-distillation | 11,154 | 10,020 | 89.8% | Complete |
 | 2307.07924 | coding | 9,893 | 8,889 | 89.9% | Complete |
 | 2404.00415 | data-augmentation | 13,182 | 11,861 | 90.0% | Complete |
+| 2402.12851 | peft | 8,161 | 7,359 | 90.2% | Complete |
 | 2308.01944 | context-compression | 8,342 | 7,532 | 90.3% | Complete |
 | 2305.11626 | multilingual | 9,530 | 8,608 | 90.3% | Complete |
 | 2306.10098 | instruct | 10,289 | 9,319 | 90.6% | Complete |
 | 2307.08364 | automl-nas | 22,571 | 20,481 | 90.7% | Complete |
 | 2106.13302 | embeddings | 7,547 | 6,853 | 90.8% | Complete |
+| 1912.08881 | pruning | 18,253 | 16,615 | 91.0% | Complete |
 | 2201.10890 | moe | 10,277 | 9,356 | 91.0% | Complete |
 | 2401.02072 | icl | 12,734 | 11,611 | 91.2% | Complete |
 | 2308.04948 | multilingual | 8,266 | 7,540 | 91.2% | Complete |
 | 2308.03983 | phase1 | 8,248 | 7,540 | 91.4% | Complete |
 | 2204.11406 | data-augmentation | 9,157 | 8,374 | 91.4% | Complete |
 | 2311.09204 | evaluation | 9,233 | 8,444 | 91.5% | Complete |
+| 2107.13490 | quantization | 12,236 | 11,191 | 91.5% | Complete |
 | 2305.18607 | coding | 16,355 | 14,965 | 91.5% | Complete |
 | 2311.02303 | peft | 18,727 | 17,144 | 91.5% | Complete |
 | 2406.15486 | attention | 12,312 | 11,285 | 91.7% | Complete |
+| 2310.15123 | planning | 15,821 | 14,515 | 91.7% | Complete |
 | 2310.19956 | automl-nas | 10,747 | 9,868 | 91.8% | Complete |
 | 2306.06000 | attention | 9,324 | 8,563 | 91.8% | Complete |
 | 2311.02262 | attention | 15,363 | 14,114 | 91.9% | Complete |
@@ -1059,12 +1204,14 @@ Complete listing of all translation pairs:
 | 2308.11396 | coding | 23,947 | 22,305 | 93.1% | Complete |
 | 2306.12643 | coding | 17,774 | 16,562 | 93.2% | Complete |
 | 2305.03648 | continual-learning | 8,726 | 8,140 | 93.3% | Complete |
+| 2405.12130 | peft | 8,521 | 7,958 | 93.4% | Complete |
 | 2403.05527 | kv-cache | 13,664 | 12,771 | 93.5% | Complete |
 | 2308.02357 | benchmark | 11,427 | 10,686 | 93.5% | Complete |
 | 2204.10598 | moe | 9,542 | 8,924 | 93.5% | Complete |
 | 2405.07526 | datasets | 9,946 | 9,311 | 93.6% | Complete |
 | 2310.13127 | instruct | 13,868 | 12,984 | 93.6% | Complete |
 | 2405.00263 | speculative | 7,840 | 7,350 | 93.8% | Complete |
+| 2406.05678 | peft | 11,579 | 10,882 | 94.0% | Complete |
 | 2305.14739 | hallucination | 5,787 | 5,440 | 94.0% | Complete |
 | 2309.05270 | multilingual | 7,967 | 7,494 | 94.1% | Complete |
 | 2309.00608 | coding | 17,296 | 16,270 | 94.1% | Complete |
@@ -1078,8 +1225,10 @@ Complete listing of all translation pairs:
 | 2309.02429 | ensemble | 14,311 | 13,548 | 94.7% | Complete |
 | 2308.16753 | icl | 16,845 | 15,952 | 94.7% | Complete |
 | 2308.01285 | modular | 21,396 | 20,270 | 94.7% | Complete |
+| 2210.15523 | pruning | 8,616 | 8,167 | 94.8% | Complete |
 | 2308.08739 | diffusion | 9,070 | 8,607 | 94.9% | Complete |
 | 2303.00501 | automl-nas | 30,875 | 29,308 | 94.9% | Complete |
+| 1909.12778 | pruning | 9,374 | 8,903 | 95.0% | Complete |
 | 2307.07099 | cot | 12,045 | 11,454 | 95.1% | Complete |
 | 2309.09400 | multilingual | 9,998 | 9,510 | 95.1% | Complete |
 | 2401.03038 | dataset-generation | 18,855 | 17,968 | 95.3% | Complete |
@@ -1098,6 +1247,7 @@ Complete listing of all translation pairs:
 | 2209.15207 | moe | 14,049 | 13,644 | 97.1% | Complete |
 | 2402.14818 | multilingual | 7,241 | 7,034 | 97.1% | Complete |
 | 2404.07979 | long-context | 11,819 | 11,489 | 97.2% | Complete |
+| 2406.00605 | peft | 8,759 | 8,515 | 97.2% | Complete |
 | 2405.16287 | hypernetwork | 9,137 | 8,886 | 97.3% | Complete |
 | 2212.10481 | coding | 16,153 | 15,776 | 97.7% | Complete |
 | 2112.08560 | context-compression | 9,945 | 9,713 | 97.7% | Complete |
@@ -1123,6 +1273,7 @@ Complete listing of all translation pairs:
 | 2309.14402 | icl-papers | 22,766 | 22,768 | 100.0% | Complete |
 | 2309.02654 | hallucination | 10,406 | 10,407 | 100.0% | Complete |
 | 2401.00243 | peft | 8,113 | 8,143 | 100.4% | Complete |
+| 2211.11014 | quantization | 9,457 | 9,496 | 100.4% | Complete |
 | 2203.03312 | moe | 8,114 | 8,166 | 100.6% | Complete |
 | 2007.02432 | moe | 24,937 | 25,104 | 100.7% | Complete |
 | 2307.10780 | context-compression | 8,412 | 8,477 | 100.8% | Complete |
@@ -1135,6 +1286,7 @@ Complete listing of all translation pairs:
 | 2306.06955 | hypernetwork | 18,231 | 18,697 | 102.6% | Complete |
 | 2002.08232 | contrastive | 10,671 | 10,966 | 102.8% | Complete |
 | 2310.18547 | peft | 11,755 | 12,080 | 102.8% | Complete |
+| 2307.10638 | quantization | 9,210 | 9,467 | 102.8% | Complete |
 | 2309.07462 | multilingual | 13,058 | 13,440 | 102.9% | Complete |
 | 2309.06180 | attention | 16,378 | 16,861 | 102.9% | Complete |
 | 2306.15604 | multilingual | 5,502 | 5,669 | 103.0% | Complete |
@@ -1158,11 +1310,15 @@ Complete listing of all translation pairs:
 | 2309.11054 | math | 10,340 | 10,821 | 104.7% | Complete |
 | 2405.05329 | kv-cache | 10,478 | 10,982 | 104.8% | Complete |
 | 2207.09074 | pruning | 9,183 | 9,638 | 105.0% | Complete |
+| 2309.06358 | dataset-generation | 5,864 | 6,155 | 105.0% | Complete |
 | 2309.09308 | coding | 15,174 | 15,935 | 105.0% | Complete |
 | 2403.19930 | multilingual | 4,192 | 4,404 | 105.1% | Complete |
 | 2303.07864 | data-augmentation | 9,323 | 9,800 | 105.1% | Complete |
 | 2205.10034 | distributed | 15,800 | 16,642 | 105.3% | Complete |
+| 2306.04845 | moe | 13,659 | 14,393 | 105.4% | Complete |
+| 2212.10017 | coding | 20,400 | 21,569 | 105.7% | Complete |
 | 2311.03658 | interpretability | 14,999 | 15,865 | 105.8% | Complete |
+| 2309.02784 | quantization | 9,409 | 9,956 | 105.8% | Complete |
 | 2310.17752 | pruning | 14,775 | 15,657 | 106.0% | Complete |
 | 2305.13622 | continual-learning | 11,616 | 12,318 | 106.0% | Complete |
 | 2311.10770 | moe | 4,958 | 5,258 | 106.1% | Complete |
@@ -1181,9 +1337,12 @@ Complete listing of all translation pairs:
 | 2406.17276 | speculative | 6,871 | 7,417 | 107.9% | Complete |
 | 2312.01279 | long-context | 18,541 | 20,022 | 108.0% | Complete |
 | 2309.13192 | backpropagation | 12,766 | 13,819 | 108.2% | Complete |
+| 2403.06504 | peft | 17,959 | 19,451 | 108.3% | Complete |
 | 2210.04633 | attention | 5,733 | 6,219 | 108.5% | Complete |
+| 2308.09723 | quantization | 9,795 | 10,637 | 108.6% | Complete |
 | 1812.09111 | continual-learning | 8,430 | 9,163 | 108.7% | Complete |
 | 2004.12406 | pruning | 12,959 | 14,097 | 108.8% | Complete |
+| 2310.08740 | planning | 10,338 | 11,261 | 108.9% | Complete |
 | 2111.00083 | automl-nas | 14,420 | 15,728 | 109.1% | Complete |
 | 2306.16170 | adversarial | 16,655 | 18,174 | 109.1% | Complete |
 | 2401.05738 | convolution | 10,964 | 11,979 | 109.3% | Complete |
@@ -1201,6 +1360,7 @@ Complete listing of all translation pairs:
 | 2310.13961 | instruct | 8,999 | 9,932 | 110.4% | Complete |
 | 2305.04940 | coding | 16,133 | 17,852 | 110.7% | Complete |
 | 2210.04513 | contrastive | 8,167 | 9,051 | 110.8% | Complete |
+| 2211.11397 | quantization | 7,884 | 8,741 | 110.9% | Complete |
 | 2402.14034 | agent | 23,240 | 25,789 | 111.0% | Complete |
 | 2306.15766 | data-augmentation | 11,749 | 13,068 | 111.2% | Complete |
 | 2210.05144 | attention | 9,107 | 10,138 | 111.3% | Complete |
@@ -1214,7 +1374,9 @@ Complete listing of all translation pairs:
 | 2311.02772 | convolution | 4,706 | 5,285 | 112.3% | Complete |
 | 2312.14862 | multilingual | 10,513 | 11,807 | 112.3% | Complete |
 | 2311.09758 | knowledge-distillation | 9,634 | 10,822 | 112.3% | Complete |
+| 2305.13571 | positional-embeddings | 5,595 | 6,289 | 112.4% | Complete |
 | 2308.12682 | long-context | 10,686 | 12,039 | 112.7% | Complete |
+| 2304.07840 | prompt | 13,409 | 15,115 | 112.7% | Complete |
 | 2305.17559 | initialization | 11,507 | 12,983 | 112.8% | Complete |
 | 2406.02376 | kv-cache | 8,178 | 9,240 | 113.0% | Complete |
 | 2312.07305 | attention | 5,285 | 5,973 | 113.0% | Complete |
@@ -1226,15 +1388,18 @@ Complete listing of all translation pairs:
 | 2311.05908 | convolution | 17,897 | 20,372 | 113.8% | Complete |
 | 2308.16557 | coding | 14,478 | 16,484 | 113.9% | Complete |
 | 2305.13627 | multilingual | 17,119 | 19,501 | 113.9% | Complete |
+| 2312.10332 | planning | 11,376 | 12,961 | 113.9% | Complete |
 | 2304.03464 | multimodal | 9,493 | 10,817 | 113.9% | Complete |
 | 2303.08033 | coding | 10,493 | 11,984 | 114.2% | Complete |
 | 2205.01848 | moe | 11,129 | 12,712 | 114.2% | Complete |
 | 2109.00084 | coding | 14,708 | 16,803 | 114.2% | Complete |
 | 2309.10654 | multilingual | 11,663 | 13,326 | 114.3% | Complete |
 | 2306.09539 | llm-architecture | 13,132 | 15,008 | 114.3% | Complete |
+| 2405.15525 | peft | 9,103 | 10,411 | 114.4% | Complete |
 | 2309.06526 | peft | 4,539 | 5,193 | 114.4% | Complete |
 | 2310.19470 | pruning | 15,698 | 17,985 | 114.6% | Complete |
 | 2211.13218 | multimodal | 12,990 | 14,888 | 114.6% | Complete |
+| 2405.17976 | attention | 7,107 | 8,147 | 114.6% | Complete |
 | 2308.09267 | knowledge-graph | 9,233 | 10,609 | 114.9% | Complete |
 | 2309.07804 | coding | 13,378 | 15,372 | 114.9% | Complete |
 | 2201.05596 | moe | 18,673 | 21,457 | 114.9% | Complete |
@@ -1246,6 +1411,7 @@ Complete listing of all translation pairs:
 | 2207.10739 | benchmark | 20,073 | 23,189 | 115.5% | Complete |
 | 2104.08700 | pruning | 15,310 | 17,715 | 115.7% | Complete |
 | 2310.16713 | math | 7,137 | 8,260 | 115.7% | Complete |
+| 2304.01483 | quantization | 4,971 | 5,756 | 115.8% | Complete |
 | 2110.08232 | pruning | 9,438 | 10,940 | 115.9% | Complete |
 | 2309.14021 | peft | 9,982 | 11,571 | 115.9% | Complete |
 | 2401.10032 | diffusion | 4,904 | 5,686 | 115.9% | Complete |
@@ -1259,6 +1425,8 @@ Complete listing of all translation pairs:
 | 2307.10156 | long-context | 9,253 | 10,792 | 116.6% | Complete |
 | 2309.08958 | multilingual | 7,888 | 9,206 | 116.7% | Complete |
 | 2305.13245 | attention | 4,651 | 5,432 | 116.8% | Complete |
+| 2206.08896 | evolutionary-algorithms | 25,539 | 29,833 | 116.8% | Complete |
+| 2212.09597 | prompt | 22,057 | 25,772 | 116.8% | Complete |
 | 2311.10638 | autoencoder | 12,057 | 14,092 | 116.9% | Complete |
 | 2304.03816 | instruct | 14,424 | 16,889 | 117.1% | Complete |
 | 2311.14904 | coding | 18,096 | 21,203 | 117.2% | Complete |
@@ -1266,15 +1434,18 @@ Complete listing of all translation pairs:
 | 1904.10921 | pruning | 8,054 | 9,453 | 117.4% | Complete |
 | 2309.12938 | coding | 14,448 | 16,970 | 117.5% | Complete |
 | 2409.00729 | long-context | 23,260 | 27,322 | 117.5% | Complete |
+| 2110.12679 | knowledge-graph | 19,294 | 22,666 | 117.5% | Complete |
 | 2212.01977 | pruning | 11,620 | 13,655 | 117.5% | Complete |
 | 2305.11129 | multilingual | 5,272 | 6,203 | 117.7% | Complete |
 | 2303.09752 | long-context | 11,350 | 13,358 | 117.7% | Complete |
 | 2310.08152 | long-context | 5,638 | 6,636 | 117.7% | Complete |
 | 2309.10285 | inference | 16,547 | 19,507 | 117.9% | Complete |
+| 2304.06962 | prompt | 3,929 | 4,639 | 118.1% | Complete |
 | 2309.05447 | instruct | 9,149 | 10,818 | 118.2% | Complete |
 | 2305.14890 | data-augmentation | 11,003 | 13,032 | 118.4% | Complete |
 | 2305.11862 | context-compression | 10,617 | 12,577 | 118.5% | Complete |
 | 2305.03653 | icl | 6,429 | 7,616 | 118.5% | Complete |
+| 2206.12839 | prompt | 18,088 | 21,433 | 118.5% | Complete |
 | 2110.15248 | multilingual | 7,884 | 9,347 | 118.6% | Complete |
 | 2306.07487 | coding | 14,124 | 16,746 | 118.6% | Complete |
 | 2211.14058 | knowledge-distillation | 10,933 | 12,971 | 118.6% | Complete |
@@ -1297,6 +1468,7 @@ Complete listing of all translation pairs:
 | 2408.07092 | attention | 12,929 | 15,505 | 119.9% | Complete |
 | 2209.07634 | memory | 9,852 | 11,820 | 120.0% | Complete |
 | 2309.10447 | instruct | 11,706 | 14,050 | 120.0% | Over-translated |
+| 2309.04269 | prompt | 5,795 | 6,960 | 120.1% | Over-translated |
 | 2107.11442 | approximation | 20,784 | 25,002 | 120.3% | Over-translated |
 | 2206.00277 | moe | 7,572 | 9,109 | 120.3% | Over-translated |
 | 2212.13345 | backpropagation | 13,126 | 15,797 | 120.3% | Over-translated |
@@ -1315,6 +1487,7 @@ Complete listing of all translation pairs:
 | 2402.14261 | benchmark | 12,253 | 14,846 | 121.2% | Over-translated |
 | 2306.08568 | instruct | 12,025 | 14,602 | 121.4% | Over-translated |
 | 2305.15083 | multilingual | 11,141 | 13,530 | 121.4% | Over-translated |
+| 2310.05424 | early-stopping | 12,035 | 14,638 | 121.6% | Over-translated |
 | 2308.10438 | pruning | 8,615 | 10,485 | 121.7% | Over-translated |
 | 2309.11439 | grammar | 5,150 | 6,275 | 121.8% | Over-translated |
 | 2310.16787 | datasets | 14,636 | 17,850 | 122.0% | Over-translated |
@@ -1324,8 +1497,10 @@ Complete listing of all translation pairs:
 | 1905.10650 | pruning | 7,702 | 9,419 | 122.3% | Over-translated |
 | 2305.11685 | multimodal | 5,843 | 7,147 | 122.3% | Over-translated |
 | 2403.12468 | dataset-generation | 10,461 | 12,798 | 122.3% | Over-translated |
+| 2305.11554 | planning | 17,712 | 21,685 | 122.4% | Over-translated |
 | 2408.08696 | speculative | 11,939 | 14,632 | 122.6% | Over-translated |
 | 2204.05229 | multimodal | 2,282 | 2,797 | 122.6% | Over-translated |
+| 1905.04226 | positional-embeddings | 7,052 | 8,646 | 122.6% | Over-translated |
 | 2211.11315 | pruning | 8,232 | 10,101 | 122.7% | Over-translated |
 | 2310.01119 | icl | 7,956 | 9,766 | 122.8% | Over-translated |
 | 2312.02179 | cot | 15,991 | 19,630 | 122.8% | Over-translated |
@@ -1356,6 +1531,7 @@ Complete listing of all translation pairs:
 | 2008.03901 | automl-nas | 12,626 | 15,731 | 124.6% | Over-translated |
 | 2306.12659 | finance | 6,117 | 7,625 | 124.7% | Over-translated |
 | 2107.05768 | long-context | 10,557 | 13,162 | 124.7% | Over-translated |
+| 2309.17224 | quantization | 14,387 | 17,940 | 124.7% | Over-translated |
 | 2309.05444 | peft | 13,078 | 16,318 | 124.8% | Over-translated |
 | 2211.12588 | long-context | 10,979 | 13,709 | 124.9% | Over-translated |
 | 2207.05987 | rag | 13,399 | 16,731 | 124.9% | Over-translated |
@@ -1364,6 +1540,7 @@ Complete listing of all translation pairs:
 | 2310.02556 | peft | 13,491 | 16,863 | 125.0% | Over-translated |
 | 2209.01667 | moe | 17,147 | 21,434 | 125.0% | Over-translated |
 | 2305.11462 | memory | 11,728 | 14,664 | 125.0% | Over-translated |
+| 2305.10601 | planning | 10,541 | 13,187 | 125.1% | Over-translated |
 | 2404.14662 | coding | 22,461 | 28,135 | 125.3% | Over-translated |
 | 1701.06538 | moe | 13,253 | 16,606 | 125.3% | Over-translated |
 | 2310.05869 | attention | 9,864 | 12,360 | 125.3% | Over-translated |
@@ -1416,12 +1593,14 @@ Complete listing of all translation pairs:
 | 2309.03883 | contrastive | 17,100 | 21,739 | 127.1% | Over-translated |
 | 2402.10644 | attention | 7,367 | 9,367 | 127.1% | Over-translated |
 | 2405.02842 | inference | 10,739 | 13,655 | 127.2% | Over-translated |
+| 2302.10899 | quantization | 7,902 | 10,049 | 127.2% | Over-translated |
 | 2409.03512 | education | 13,859 | 17,629 | 127.2% | Over-translated |
 | 2303.18116 | coding | 14,652 | 18,638 | 127.2% | Over-translated |
 | 2311.10642 | attention | 4,102 | 5,220 | 127.3% | Over-translated |
 | 2108.06552 | contrastive | 7,386 | 9,402 | 127.3% | Over-translated |
 | 2309.01252 | icl-papers | 4,412 | 5,617 | 127.3% | Over-translated |
 | 2208.02169 | long-context | 11,737 | 14,946 | 127.3% | Over-translated |
+| 2309.05210 | quantization | 7,004 | 8,920 | 127.4% | Over-translated |
 | 2305.04241 | long-context | 18,148 | 23,128 | 127.4% | Over-translated |
 | 2308.14508 | multilingual | 13,308 | 16,961 | 127.4% | Over-translated |
 | 1905.09717 | automl-nas | 8,966 | 11,428 | 127.5% | Over-translated |
@@ -1434,8 +1613,10 @@ Complete listing of all translation pairs:
 | 2404.17651 | activation | 5,063 | 6,466 | 127.7% | Over-translated |
 | 2312.09571 | long-context | 7,839 | 10,012 | 127.7% | Over-translated |
 | 2309.16119 | peft | 10,734 | 13,711 | 127.7% | Over-translated |
+| 2308.07939 | quantization | 10,955 | 13,995 | 127.7% | Over-translated |
 | 2408.15766 | speculative | 12,846 | 16,420 | 127.8% | Over-translated |
 | 2405.16498 | continual-learning | 8,043 | 10,292 | 128.0% | Over-translated |
+| 2311.03739 | math | 6,142 | 7,861 | 128.0% | Over-translated |
 | 2311.02849 | knowledge-distillation | 7,902 | 10,116 | 128.0% | Over-translated |
 | 2310.01427 | long-context | 7,969 | 10,202 | 128.0% | Over-translated |
 | 2303.05668 | multimodal | 4,299 | 5,508 | 128.1% | Over-translated |
@@ -1460,6 +1641,7 @@ Complete listing of all translation pairs:
 | 2310.13988 | multilingual | 6,106 | 7,883 | 129.1% | Over-translated |
 | 2310.09832 | moe | 5,562 | 7,181 | 129.1% | Over-translated |
 | 2308.14831 | pruning | 9,066 | 11,707 | 129.1% | Over-translated |
+| 2308.12066 | moe | 15,992 | 20,651 | 129.1% | Over-translated |
 | 2312.11462 | speculative | 9,192 | 11,870 | 129.1% | Over-translated |
 | 2405.17755 | long-context | 7,081 | 9,146 | 129.2% | Over-translated |
 | 2301.01828 | continual-learning | 17,212 | 22,249 | 129.3% | Over-translated |
@@ -1473,6 +1655,7 @@ Complete listing of all translation pairs:
 | 2309.14509 | long-context | 6,388 | 8,292 | 129.8% | Over-translated |
 | 2305.17328 | pruning | 14,521 | 18,852 | 129.8% | Over-translated |
 | 2310.01334 | moe | 15,267 | 19,827 | 129.9% | Over-translated |
+| 2305.08339 | grammar | 14,125 | 18,348 | 129.9% | Over-translated |
 | 2309.04646 | multilingual | 5,665 | 7,361 | 129.9% | Over-translated |
 | 2306.14096 | multilingual | 6,858 | 8,912 | 130.0% | Over-translated |
 | 2310.17876 | dataset-generation | 20,306 | 26,403 | 130.0% | Over-translated |
@@ -1486,10 +1669,12 @@ Complete listing of all translation pairs:
 | 2309.04255 | speculative | 15,143 | 19,722 | 130.2% | Over-translated |
 | 2311.06720 | evaluation | 10,468 | 13,634 | 130.2% | Over-translated |
 | 2311.12537 | dataset-curation | 6,903 | 8,992 | 130.3% | Over-translated |
+| 2308.01421 | icl-papers | 16,829 | 21,929 | 130.3% | Over-translated |
 | 2406.16330 | merging | 13,495 | 17,585 | 130.3% | Over-translated |
 | 2404.09163 | multilingual | 7,368 | 9,603 | 130.3% | Over-translated |
 | 2301.02494 | multi-task | 10,561 | 13,770 | 130.4% | Over-translated |
 | 2403.04706 | math | 11,785 | 15,367 | 130.4% | Over-translated |
+| 2311.03033 | prompt | 9,092 | 11,857 | 130.4% | Over-translated |
 | 2009.10622 | moe | 16,516 | 21,543 | 130.4% | Over-translated |
 | 1811.09021 | byte-level | 6,652 | 8,680 | 130.5% | Over-translated |
 | 2306.01708 | merging | 16,567 | 21,630 | 130.6% | Over-translated |
@@ -1498,11 +1683,13 @@ Complete listing of all translation pairs:
 | 2312.14187 | instruct | 10,125 | 13,224 | 130.6% | Over-translated |
 | 2211.00789 | knowledge-distillation | 12,717 | 16,611 | 130.6% | Over-translated |
 | 2305.14314 | phase1 | 18,374 | 24,009 | 130.7% | Over-translated |
+| 2204.04215 | quantization | 6,314 | 8,251 | 130.7% | Over-translated |
 | 2402.13720 | speculative | 11,563 | 15,113 | 130.7% | Over-translated |
 | 2210.08933 | diffusion | 11,577 | 15,143 | 130.8% | Over-translated |
 | 2210.10209 | continual-learning | 14,699 | 19,236 | 130.9% | Over-translated |
 | 2204.12184 | moe | 5,029 | 6,584 | 130.9% | Over-translated |
 | 2405.06067 | long-context | 14,887 | 19,493 | 130.9% | Over-translated |
+| 2309.01131 | document-parsing | 11,544 | 15,121 | 131.0% | Over-translated |
 | 2310.16270 | attention | 3,546 | 4,647 | 131.0% | Over-translated |
 | 2410.02271 | audio | 4,761 | 6,242 | 131.1% | Over-translated |
 | 2105.00157 | continual-learning | 15,030 | 19,710 | 131.1% | Over-translated |
@@ -1512,14 +1699,15 @@ Complete listing of all translation pairs:
 | 2203.13474 | coding | 15,368 | 20,173 | 131.3% | Over-translated |
 | 2212.13180 | knowledge-distillation | 12,181 | 16,000 | 131.4% | Over-translated |
 | 2106.02914 | pruning | 8,476 | 11,134 | 131.4% | Over-translated |
-| 2212.10017 | coding | 20,400 | 26,804 | 131.4% | Over-translated |
 | 2407.15892 | long-context | 18,385 | 24,160 | 131.4% | Over-translated |
 | 2103.00112 | attention | 8,664 | 11,386 | 131.4% | Over-translated |
+| 2308.15987 | quantization | 8,674 | 11,403 | 131.5% | Over-translated |
 | 2403.09919 | speculative | 9,379 | 12,333 | 131.5% | Over-translated |
 | 2306.01220 | attention | 18,826 | 24,770 | 131.6% | Over-translated |
 | 2411.08307 | audio | 10,232 | 13,473 | 131.7% | Over-translated |
 | 2011.12216 | continual-learning | 17,648 | 23,247 | 131.7% | Over-translated |
 | 2402.06332 | math | 15,427 | 20,345 | 131.9% | Over-translated |
+| 2309.00964 | quantization | 4,200 | 5,540 | 131.9% | Over-translated |
 | 2402.12374 | speculative | 16,221 | 21,404 | 132.0% | Over-translated |
 | 2305.18170 | math | 6,264 | 8,269 | 132.0% | Over-translated |
 | 2310.05824 | multilingual | 5,470 | 7,226 | 132.1% | Over-translated |
@@ -1530,6 +1718,7 @@ Complete listing of all translation pairs:
 | 2308.12219 | diffusion | 15,342 | 20,319 | 132.4% | Over-translated |
 | 1909.10364 | pruning | 6,802 | 9,009 | 132.4% | Over-translated |
 | 2305.04160 | multilingual | 13,919 | 18,437 | 132.5% | Over-translated |
+| 1802.07569 | continual-learning | 24,137 | 31,987 | 132.5% | Over-translated |
 | 2310.10638 | long-context | 10,705 | 14,190 | 132.6% | Over-translated |
 | 2308.01825 | math | 12,985 | 17,223 | 132.6% | Over-translated |
 | 2308.01240 | benchmark | 16,139 | 21,407 | 132.6% | Over-translated |
@@ -1541,6 +1730,8 @@ Complete listing of all translation pairs:
 | 2309.07990 | llm-architecture | 10,198 | 13,548 | 132.8% | Over-translated |
 | 2006.09916 | continual-learning | 5,874 | 7,805 | 132.9% | Over-translated |
 | 2310.05499 | knowledge-graph | 3,775 | 5,018 | 132.9% | Over-translated |
+| 2306.03900 | moe | 17,187 | 22,851 | 133.0% | Over-translated |
+| 2306.03604 | planning | 10,908 | 14,506 | 133.0% | Over-translated |
 | 2304.11384 | coding | 16,168 | 21,515 | 133.1% | Over-translated |
 | 2305.14975 | confidence | 7,749 | 10,319 | 133.2% | Over-translated |
 | 2112.05005 | adversarial | 7,446 | 9,920 | 133.2% | Over-translated |
@@ -1550,10 +1741,12 @@ Complete listing of all translation pairs:
 | 2306.03805 | pruning | 10,297 | 13,747 | 133.5% | Over-translated |
 | 2406.10670 | dataset-pruning-cleaning-dedup | 16,135 | 21,551 | 133.6% | Over-translated |
 | 2308.03873 | coding | 12,580 | 16,815 | 133.7% | Over-translated |
+| 2211.01452 | federated-learning | 10,864 | 14,522 | 133.7% | Over-translated |
 | 2306.10209 | distributed | 13,067 | 17,482 | 133.8% | Over-translated |
 | 2304.13276 | icl | 8,015 | 10,726 | 133.8% | Over-translated |
 | 2401.07950 | instruct | 20,224 | 27,071 | 133.9% | Over-translated |
 | 2207.03677 | automl-nas | 11,776 | 15,769 | 133.9% | Over-translated |
+| 2312.05180 | planning | 9,781 | 13,098 | 133.9% | Over-translated |
 | 2306.16913 | automl-nas | 20,181 | 27,029 | 133.9% | Over-translated |
 | 2407.12866 | attention | 6,978 | 9,347 | 133.9% | Over-translated |
 | 2202.13169 | coding | 8,775 | 11,757 | 134.0% | Over-translated |
@@ -1562,6 +1755,7 @@ Complete listing of all translation pairs:
 | 2209.15176 | multimodal | 8,088 | 10,852 | 134.2% | Over-translated |
 | 2308.12018 | icl-papers | 5,865 | 7,870 | 134.2% | Over-translated |
 | 2305.08379 | diffusion | 12,516 | 16,805 | 134.3% | Over-translated |
+| 2210.15042 | privacy | 7,488 | 10,056 | 134.3% | Over-translated |
 | 2309.09958 | peft | 5,317 | 7,144 | 134.4% | Over-translated |
 | 2306.05087 | hyperparameters | 14,314 | 19,242 | 134.4% | Over-translated |
 | 2310.02207 | icl-papers | 10,723 | 14,418 | 134.5% | Over-translated |
@@ -1570,6 +1764,7 @@ Complete listing of all translation pairs:
 | 2208.11271 | autoencoder | 8,617 | 11,612 | 134.8% | Over-translated |
 | 2306.04897 | context-compression | 5,987 | 8,075 | 134.9% | Over-translated |
 | 2312.13558 | approximation | 13,133 | 17,726 | 135.0% | Over-translated |
+| 2309.10878 | quantization | 6,800 | 9,180 | 135.0% | Over-translated |
 | 2310.12962 | knowledge-distillation | 10,615 | 14,331 | 135.0% | Over-translated |
 | 2105.15082 | moe | 8,650 | 11,681 | 135.0% | Over-translated |
 | 2311.08968 | concept | 9,033 | 12,204 | 135.1% | Over-translated |
@@ -1584,6 +1779,7 @@ Complete listing of all translation pairs:
 | 2402.10176 | math | 19,822 | 26,858 | 135.5% | Over-translated |
 | 2307.02053 | instruct | 6,966 | 9,443 | 135.6% | Over-translated |
 | 2005.00944 | instruct | 18,008 | 24,453 | 135.8% | Over-translated |
+| 2304.06815 | coding | 15,897 | 21,609 | 135.9% | Over-translated |
 | 2309.08600 | autoencoder | 10,020 | 13,622 | 135.9% | Over-translated |
 | 2402.05608 | diffusion | 7,883 | 10,721 | 136.0% | Over-translated |
 | 2211.00251 | interpretability | 9,908 | 13,477 | 136.0% | Over-translated |
@@ -1591,10 +1787,12 @@ Complete listing of all translation pairs:
 | 2303.17764 | adversarial | 4,527 | 6,164 | 136.2% | Over-translated |
 | 2305.13655 | diffusion | 17,937 | 24,443 | 136.3% | Over-translated |
 | 2310.08797 | knowledge-distillation | 11,219 | 15,293 | 136.3% | Over-translated |
+| 2207.09078 | privacy | 11,577 | 15,793 | 136.4% | Over-translated |
 | 2308.14267 | icl-papers | 9,219 | 12,577 | 136.4% | Over-translated |
 | 2301.05816 | ffn-mlp | 8,387 | 11,445 | 136.5% | Over-translated |
 | 2305.06223 | math | 5,431 | 7,413 | 136.5% | Over-translated |
 | 2305.18563 | pruning | 17,143 | 23,414 | 136.6% | Over-translated |
+| 2308.07411 | prompt | 5,619 | 7,675 | 136.6% | Over-translated |
 | 2004.14765 | pruning | 5,985 | 8,201 | 137.0% | Over-translated |
 | 2210.04995 | moe | 13,091 | 17,947 | 137.1% | Over-translated |
 | 2212.12770 | pruning | 17,110 | 23,475 | 137.2% | Over-translated |
@@ -1603,6 +1801,7 @@ Complete listing of all translation pairs:
 | 2306.01707 | math | 6,506 | 8,933 | 137.3% | Over-translated |
 | 2007.15353 | pruning | 12,355 | 16,967 | 137.3% | Over-translated |
 | 2203.07259 | pruning | 13,572 | 18,642 | 137.4% | Over-translated |
+| 2111.05754 | pruning | 7,654 | 10,517 | 137.4% | Over-translated |
 | 2209.13569 | approximation | 5,426 | 7,456 | 137.4% | Over-translated |
 | 2312.17244 | pruning | 13,117 | 18,029 | 137.4% | Over-translated |
 | 2306.01102 | automl-nas | 9,454 | 13,003 | 137.5% | Over-translated |
@@ -1617,6 +1816,7 @@ Complete listing of all translation pairs:
 | 2306.00029 | coding | 10,723 | 14,805 | 138.1% | Over-translated |
 | 2211.11559 | multimodal | 9,821 | 13,560 | 138.1% | Over-translated |
 | 2405.13216 | long-context | 7,532 | 10,401 | 138.1% | Over-translated |
+| 2309.11998 | dataset-generation | 16,290 | 22,496 | 138.1% | Over-translated |
 | 2307.13923 | multilingual | 5,938 | 8,206 | 138.2% | Over-translated |
 | 2106.03760 | moe | 15,133 | 20,963 | 138.5% | Over-translated |
 | 2310.17653 | knowledge-distillation | 18,008 | 24,965 | 138.6% | Over-translated |
@@ -1655,6 +1855,7 @@ Complete listing of all translation pairs:
 | 2310.09049 | automl-nas | 3,985 | 5,792 | 145.3% | Over-translated |
 | 2309.01125 | automl-nas | 2,211 | 3,214 | 145.4% | Over-translated |
 | 2311.01927 | attention | 6,076 | 8,842 | 145.5% | Over-translated |
+| 2305.04032 | instruct | 12,673 | 18,444 | 145.5% | Over-translated |
 | 2209.11883 | hebbian | 14,709 | 21,459 | 145.9% | Over-translated |
 | 2312.06585 | math | 9,050 | 13,258 | 146.5% | Over-translated |
 | 2309.01552 | automl-nas | 5,939 | 8,795 | 148.1% | Over-translated |
@@ -1665,6 +1866,8 @@ Complete listing of all translation pairs:
 | 2109.02008 | multimodal | 6,953 | 10,420 | 149.9% | Over-translated |
 | 2212.05561 | multimodal | 6,445 | 9,774 | 151.7% | Over-translated |
 | 2002.10957 | attention | 13,124 | 19,966 | 152.1% | Over-translated |
+| 2204.08142 | positional-embeddings | 6,537 | 9,955 | 152.3% | Over-translated |
+| 2302.09582 | emotion | 15,572 | 23,784 | 152.7% | Over-translated |
 | 2406.13923 | multilingual | 10,578 | 16,203 | 153.2% | Over-translated |
 | 2210.03869 | moe | 9,444 | 14,623 | 154.8% | Over-translated |
 | 2310.18628 | knowledge-distillation | 10,504 | 16,277 | 155.0% | Over-translated |
@@ -1688,11 +1891,17 @@ Complete listing of all translation pairs:
 - **Token Counts:** 26,001 EN → 41 VI
 - **Completion Ratio:** 0.2%
 
-#### 2203.16697 (coding)
-- **English File:** `2203.16697-Type-Directed_Program_Synthesis_for_RESTful_APIs.txt`
-- **Vietnamese File:** `2203.16697-Type-Directed_Program_Synthesis_for_RESTful_APIs_vi.txt`
-- **Token Counts:** 23,218 EN → 85 VI
-- **Completion Ratio:** 0.4%
+#### 2309.13075 (math)
+- **English File:** `2309.13075-SCREWS.txt`
+- **Vietnamese File:** `2309.13075-SCREWS_vi.txt`
+- **Token Counts:** 14,454 EN → 35 VI
+- **Completion Ratio:** 0.2%
+
+#### 2305.18619 (diffusion)
+- **English File:** `2305.18619-Likelihood-Based_Diffusion_Language_Models.txt`
+- **Vietnamese File:** `2305.18619-Likelihood-Based_Diffusion_Language_Models_vi.txt`
+- **Token Counts:** 22,357 EN → 109 VI
+- **Completion Ratio:** 0.5%
 
 #### 2101.03961 (moe)
 - **English File:** `2101.03961-Journal_of_Machine_Learning_Research_23_(2022)_1-40_Submitted_8-21;_Revised_3-22;_Published_4-22.txt`
@@ -1880,17 +2089,53 @@ Complete listing of all translation pairs:
 - **Token Counts:** 14,232 EN → 965 VI
 - **Completion Ratio:** 6.8%
 
+#### 2210.01293 (icl)
+- **English File:** `2210.01293-ThinkSum-_Probabilistic_reasoning_over_sets_using_large_language_models.txt`
+- **Vietnamese File:** `2210.01293-ThinkSum-_Probabilistic_reasoning_over_sets_using_large_language_models_vi.txt`
+- **Token Counts:** 16,451 EN → 1,166 VI
+- **Completion Ratio:** 7.1%
+
+#### 2309.10814 (math)
+- **English File:** `2309.10814-Natural_Language_Embedded_Programs_for.txt`
+- **Vietnamese File:** `2309.10814-Natural_Language_Embedded_Programs_for_vi.txt`
+- **Token Counts:** 36,639 EN → 2,661 VI
+- **Completion Ratio:** 7.3%
+
+#### 2305.01610 (emergent)
+- **English File:** `2305.01610-FINDING_NEURONS_IN_A_HAYSTACK.txt`
+- **Vietnamese File:** `2305.01610-FINDING_NEURONS_IN_A_HAYSTACK_vi.txt`
+- **Token Counts:** 24,701 EN → 1,985 VI
+- **Completion Ratio:** 8.0%
+
 #### 2309.10687 (icl)
 - **English File:** `2309.10687-EchoPrompt-_Instructing_the_Model_to_Rephrase_Queries.txt`
 - **Vietnamese File:** `2309.10687-EchoPrompt-_Instructing_the_Model_to_Rephrase_Queries_vi.txt`
 - **Token Counts:** 31,671 EN → 2,934 VI
 - **Completion Ratio:** 9.3%
 
+#### 2402.19173 (datasets)
+- **English File:** `2402.19173-Under_review_as_submission_to_TMLR.txt`
+- **Vietnamese File:** `2402.19173-Under_review_as_submission_to_TMLR_vi.txt`
+- **Token Counts:** 36,751 EN → 3,443 VI
+- **Completion Ratio:** 9.4%
+
+#### 2307.05300 (prompt)
+- **English File:** `2307.05300-Unleashing_the_Emergent_Cognitive_Synergy_in_Large_Language_Models.txt`
+- **Vietnamese File:** `2307.05300-Unleashing_the_Emergent_Cognitive_Synergy_in_Large_Language_Models_vi.txt`
+- **Token Counts:** 16,954 EN → 1,699 VI
+- **Completion Ratio:** 10.0%
+
 #### 2309.14345 (bias)
 - **English File:** `2309.14345-Bias_Testing_and_Mitigation_in_LLM-based_Code_Generation.txt`
 - **Vietnamese File:** `2309.14345-Bias_Testing_and_Mitigation_in_LLM-based_Code_Generation_vi.txt`
 - **Token Counts:** 23,801 EN → 2,503 VI
 - **Completion Ratio:** 10.5%
+
+#### 2407.03040 (instruct)
+- **English File:** `2407.03040-Raw_Text_is_All_you_Need-_Knowledge-intensive_Multi-turn_Instruction.txt`
+- **Vietnamese File:** `2407.03040-Raw_Text_is_All_you_Need-_Knowledge-intensive_Multi-turn_Instruction_vi.txt`
+- **Token Counts:** 9,687 EN → 1,046 VI
+- **Completion Ratio:** 10.8%
 
 #### 2207.14358 (knowledge-graph)
 - **English File:** `2207.14358-Topological_structure_of_complex_predictions.txt`
@@ -1904,11 +2149,23 @@ Complete listing of all translation pairs:
 - **Token Counts:** 17,511 EN → 2,223 VI
 - **Completion Ratio:** 12.7%
 
+#### 2303.17125 (coding)
+- **English File:** `2303.17125-A_Large-Scale_Survey_on_the_Usability_of_AI_Programming.txt`
+- **Vietnamese File:** `2303.17125-A_Large-Scale_Survey_on_the_Usability_of_AI_Programming_vi.txt`
+- **Token Counts:** 15,193 EN → 2,038 VI
+- **Completion Ratio:** 13.4%
+
 #### 2401.10225 (datasets)
 - **English File:** `2401.10225-ChatQA-_Surpassing_GPT-4_on_Conversational_QA.txt`
 - **Vietnamese File:** `2401.10225-ChatQA-_Surpassing_GPT-4_on_Conversational_QA_vi.txt`
 - **Token Counts:** 25,316 EN → 3,432 VI
 - **Completion Ratio:** 13.6%
+
+#### 2310.03710 (planning)
+- **English File:** `2310.03710-Agent_Instructs_Large_Language_Models_to_be_General_Zero-Shot_Reasoners.txt`
+- **Vietnamese File:** `2310.03710-Agent_Instructs_Large_Language_Models_to_be_General_Zero-Shot_Reasoners_vi.txt`
+- **Token Counts:** 70,621 EN → 9,874 VI
+- **Completion Ratio:** 14.0%
 
 #### 2009.01797 (continual-learning)
 - **English File:** `2009.01797-A_Wholistic_View_of_Continual_Learning_with_Deep_Neural_Networks.txt`
@@ -1934,11 +2191,35 @@ Complete listing of all translation pairs:
 - **Token Counts:** 15,555 EN → 2,219 VI
 - **Completion Ratio:** 14.3%
 
+#### 2309.12499 (planning)
+- **English File:** `2309.12499-CodePlan_-_Repository-level_Coding_using_LLMs_and_Planning.txt`
+- **Vietnamese File:** `2309.12499-CodePlan_-_Repository-level_Coding_using_LLMs_and_Planning_vi.txt`
+- **Token Counts:** 23,858 EN → 3,568 VI
+- **Completion Ratio:** 15.0%
+
 #### 2311.03301 (continual-learning)
 - **English File:** `2311.03301-Ziya2-_Data-centric_Learning_is_All_LLMs_Need.txt`
 - **Vietnamese File:** `2311.03301-Ziya2-_Data-centric_Learning_is_All_LLMs_Need_vi.txt`
 - **Token Counts:** 12,628 EN → 1,937 VI
 - **Completion Ratio:** 15.3%
+
+#### 2311.08263 (cot)
+- **English File:** `2311.08263-Fast_Chain-of-Thought-_A_Glimpse_of_Future_From_Jacobi_Decoding_Leads.txt`
+- **Vietnamese File:** `2311.08263-Fast_Chain-of-Thought-_A_Glimpse_of_Future_From_Jacobi_Decoding_Leads_vi.txt`
+- **Token Counts:** 8,457 EN → 1,306 VI
+- **Completion Ratio:** 15.4%
+
+#### 2305.14909 (planning)
+- **English File:** `2305.14909-Leveraging_Pre-trained_Large_Language_Models_to.txt`
+- **Vietnamese File:** `2305.14909-Leveraging_Pre-trained_Large_Language_Models_to_vi.txt`
+- **Token Counts:** 35,115 EN → 5,861 VI
+- **Completion Ratio:** 16.7%
+
+#### 2311.13110 (interpretability)
+- **English File:** `2311.13110-White-Box_Transformers_via_Sparse_Rate_Reduction.txt`
+- **Vietnamese File:** `2311.13110-White-Box_Transformers_via_Sparse_Rate_Reduction_vi.txt`
+- **Token Counts:** 61,231 EN → 10,676 VI
+- **Completion Ratio:** 17.4%
 
 #### 2310.03188 (knowledge-distillation)
 - **English File:** `2310.03188-Talking_Models-_Distill_Pre-trained_Knowledge_to.txt`
@@ -1957,6 +2238,24 @@ Complete listing of all translation pairs:
 - **Vietnamese File:** `2308.10379-Algorithm_of_Thoughts_vi.txt`
 - **Token Counts:** 57,713 EN → 11,102 VI
 - **Completion Ratio:** 19.2%
+
+#### 2108.04384 (ffn-mlp)
+- **English File:** `2108.04384-RaftMLP-_How_Much_Can_Be_Done_Without.txt`
+- **Vietnamese File:** `2108.04384-RaftMLP-_How_Much_Can_Be_Done_Without_vi.txt`
+- **Token Counts:** 12,088 EN → 2,475 VI
+- **Completion Ratio:** 20.5%
+
+#### 2205.13522 (positional-embeddings)
+- **English File:** `2205.13522-JOURNAL_OF_L_ATEX_CLASS_FILES,_VOL._14,_NO._8,_AUGUST_2015_1.txt`
+- **Vietnamese File:** `2205.13522-JOURNAL_OF_L_ATEX_CLASS_FILES,_VOL._14,_NO._8,_AUGUST_2015_1_vi.txt`
+- **Token Counts:** 14,036 EN → 2,889 VI
+- **Completion Ratio:** 20.6%
+
+#### 2311.05661 (prompt)
+- **English File:** `2311.05661-Prompt_Engineering_a_Prompt_Engineer.txt`
+- **Vietnamese File:** `2311.05661-Prompt_Engineering_a_Prompt_Engineer_vi.txt`
+- **Token Counts:** 29,231 EN → 6,028 VI
+- **Completion Ratio:** 20.6%
 
 #### 2406.11794 (dataset-pruning-cleaning-dedup)
 - **English File:** `2406.11794-DataComp-LM-_In_search_of_the_next_generation_of.txt`
@@ -1999,6 +2298,12 @@ Complete listing of all translation pairs:
 - **Vietnamese File:** `2402.18668-Simple_linear_attention_language_models_balance_the_recall-throughput_tradeoff_vi.txt`
 - **Token Counts:** 40,739 EN → 10,592 VI
 - **Completion Ratio:** 26.0%
+
+#### 2312.04927 (convolution)
+- **English File:** `2312.04927-Zoology-_Measuring_and_Improving_Recall_in_Efficient_Language.txt`
+- **Vietnamese File:** `2312.04927-Zoology-_Measuring_and_Improving_Recall_in_Efficient_Language_vi.txt`
+- **Token Counts:** 38,655 EN → 10,307 VI
+- **Completion Ratio:** 26.7%
 
 #### 2402.00159 (datasets)
 - **English File:** `2402.00159-Dolma.txt`

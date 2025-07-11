@@ -10,13 +10,15 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 import random
+import glob
 
 
 class ArxivDownloader:
-    def __init__(self, max_workers=1, min_delay=3.0, max_delay=3.5):
+    def __init__(self, max_workers=1, min_delay=3.0, max_delay=3.5, check_existing_txt=True):
         self.max_workers = max_workers
         self.min_delay = min_delay
         self.max_delay = max_delay
+        self.check_existing_txt = check_existing_txt
         self.stats_lock = Lock()
         self.successful = 0
         self.failed = 0
@@ -30,6 +32,22 @@ class ArxivDownloader:
         """Extract paper ID from ArXiv URL."""
         match = re.search(r'(\d{4}\.\d{4,5})', url)
         return match.group(1) if match else None
+    
+    def check_existing_txt_files(self, paper_id, project_root="."):
+        """Check if any TXT file with the same arXiv ID exists anywhere in the project."""
+        # Search for TXT files starting with the arXiv ID
+        search_pattern = os.path.join(project_root, "**", f"{paper_id}*.txt")
+        existing_files = glob.glob(search_pattern, recursive=True)
+        
+        # Filter out files that don't actually start with the arXiv ID
+        # (in case glob matches partial matches)
+        valid_files = []
+        for file_path in existing_files:
+            filename = os.path.basename(file_path)
+            if filename.startswith(paper_id):
+                valid_files.append(file_path)
+        
+        return valid_files
 
     def download_pdf(self, url, output_dir):
         """Download PDF from URL to output directory."""
@@ -42,11 +60,24 @@ class ArxivDownloader:
             filename = f"{paper_id}.pdf"
             filepath = output_dir / filename
             
+            # Check if PDF already exists in target directory
             if filepath.exists():
                 print(f"✓ Already exists: {filename}")
                 with self.stats_lock:
                     self.skipped += 1
                 return True
+            
+            # Check if any TXT file with this arXiv ID exists anywhere in the project
+            if self.check_existing_txt:
+                project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                existing_txt_files = self.check_existing_txt_files(paper_id, project_root)
+                
+                if existing_txt_files:
+                    print(f"📝 TXT file already exists for {paper_id}: {os.path.basename(existing_txt_files[0])}")
+                    print(f"⏭️  Skipping download of {filename}")
+                    with self.stats_lock:
+                        self.skipped += 1
+                    return True
             
             print(f"📥 Downloading {filename}...")
             

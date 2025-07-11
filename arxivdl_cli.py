@@ -41,7 +41,7 @@ class ArXivCLI:
     """Unified CLI for ArXiv downloader tools."""
     
     def __init__(self):
-        self.script_dir = Path(__file__).parent
+        self.script_dir = Path(__file__).parent / "scripts"
         self.commands = self._discover_commands()
         self.samples = self._load_samples()
     
@@ -69,15 +69,10 @@ class ArXivCLI:
             'translate': {
                 'description': 'Translate papers to Vietnamese',
                 'scripts': {
-                    'openai': 'translate_papers.py',
-                    'claude': 'translate_manager.py',
-                    'check': 'check_translation_completeness.py',
-                    'add-queue': 'add_to_translation_queue.py',
-                    'cleanup': 'cleanup_translations.py',
-                    'process-stalled': 'process_stalled_translations.py'
+                    'claude': 'translate_manager.py'
                 },
                 'default': 'translate_manager.py',
-                'help': 'Translate papers using OpenAI or Claude with quality checking'
+                'help': 'Translate papers using Claude API'
             },
             'organize': {
                 'description': 'Organize papers across collections',
@@ -95,7 +90,7 @@ class ArXivCLI:
                     'duplicates': 'arxiv_duplicate_analyzer.py',
                     'translations': 'check_bad_translations.py',
                     'monitor': 'monitor_translation.py',
-                    'status': 'check_status.py'
+                    'status': 'simple_status_checker.py'
                 },
                 'default': 'arxiv_duplicate_analyzer.py',
                 'help': 'Analyze paper collections for duplicates and translation quality'
@@ -518,7 +513,12 @@ class ArXivCLI:
         
         # Prepare command
         if script.endswith('.py'):
-            cmd = ['python3', str(script_path)]
+            # Use virtual environment Python if available
+            venv_python = self.script_dir.parent / '.venv' / 'bin' / 'python'
+            if venv_python.exists():
+                cmd = [str(venv_python), str(script_path)]
+            else:
+                cmd = ['python3', str(script_path)]
         else:
             cmd = [str(script_path)]
         
@@ -528,7 +528,8 @@ class ArXivCLI:
         print(f"🚀 Running: {' '.join(cmd)}")
         
         try:
-            result = subprocess.run(cmd, cwd=self.script_dir)
+            # Run scripts from the parent directory (project root)
+            result = subprocess.run(cmd, cwd=self.script_dir.parent)
             return result.returncode
         except KeyboardInterrupt:
             print("\n⏹️  Command interrupted")
@@ -566,6 +567,12 @@ class ArXivCLI:
                 run_choice = input("🔧 Run this command? (y/N): ").strip().lower()
                 if run_choice == 'y':
                     # Parse and run the command
+                    # Check if it's a compound command with &&
+                    if '&&' in sample_cmd:
+                        # Run as shell command
+                        result = subprocess.run(sample_cmd, shell=True, cwd=self.script_dir.parent)
+                        return result.returncode
+                    
                     parts = sample_cmd.split()
                     if parts[0] in ['python', 'python3'] and len(parts) > 1:
                         script_name = parts[1]
@@ -575,10 +582,21 @@ class ArXivCLI:
                         for cmd, info in self.commands.items():
                             if script_name in info['scripts'].values():
                                 return self.run_command(cmd, None, script_args)
+                        
+                        # If script not found in commands, try to run it directly
+                        script_path = self.script_dir / script_name
+                        if script_path.exists():
+                            venv_python = self.script_dir.parent / '.venv' / 'bin' / 'python'
+                            if venv_python.exists():
+                                cmd = [str(venv_python), str(script_path)] + script_args
+                            else:
+                                cmd = ['python3', str(script_path)] + script_args
+                            result = subprocess.run(cmd, cwd=self.script_dir.parent)
+                            return result.returncode
                     else:
                         # Shell script
                         cmd = parts
-                        result = subprocess.run(cmd, cwd=self.script_dir)
+                        result = subprocess.run(cmd, cwd=self.script_dir.parent)
                         return result.returncode
                 else:
                     print("📋 Command copied to clipboard (if available)")
