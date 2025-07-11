@@ -1,0 +1,227 @@
+# LongRoPE: Mở rộng Cửa sổ Ngữ cảnh của LLM vượt quá 2 Triệu Token
+
+Yiran Ding*Li Lyna Zhang†Chengruidong Zhang Yuanyuan Xu*Ning Shang Jiahang Xu
+Fan Yang Mao Yang
+Microsoft Research
+
+## Tóm tắt
+
+Cửa sổ ngữ cảnh lớn là một tính năng mong muốn trong các mô hình ngôn ngữ lớn (LLM). Tuy nhiên, do chi phí tinh chỉnh cao, sự khan hiếm của các văn bản dài và các giá trị thảm khốc được đưa ra bởi các vị trí token mới, các cửa sổ ngữ cảnh mở rộng hiện tại bị giới hạn ở khoảng 128k token.
+
+Bài báo này giới thiệu LongRoPE, lần đầu tiên mở rộng cửa sổ ngữ cảnh của các LLM được huấn luyện trước lên con số ấn tượng 2048k token, chỉ với tối đa 1k bước tinh chỉnh trong độ dài huấn luyện 256k, đồng thời duy trì hiệu suất tại cửa sổ ngữ cảnh ngắn gốc. Điều này đạt được thông qua ba đổi mới chính: (i) chúng tôi xác định và khai thác hai dạng không đồng nhất trong phép nội suy vị trí thông qua tìm kiếm hiệu quả, cung cấp khởi tạo tốt hơn cho tinh chỉnh và cho phép mở rộng 8× trong các kịch bản không tinh chỉnh; (ii) chúng tôi giới thiệu chiến lược mở rộng tiệm tiến đầu tiên tinh chỉnh LLM độ dài 256k và sau đó thực hiện nội suy vị trí thứ hai trên LLM mở rộng đã tinh chỉnh để đạt được cửa sổ ngữ cảnh 2048k; (iii) chúng tôi điều chỉnh lại LongRoPE ở độ dài 8k để khôi phục hiệu suất cửa sổ ngữ cảnh ngắn. Các thí nghiệm rộng rãi trên LLaMA2 và Mistral qua các nhiệm vụ khác nhau chứng minh hiệu quả của phương pháp chúng tôi. Các mô hình được mở rộng qua LongRoPE giữ nguyên kiến trúc gốc với các sửa đổi nhỏ đối với nhúng vị trí, và có thể tái sử dụng hầu hết các tối ưu hóa có sẵn. Mã nguồn sẽ có sẵn tại https://github.com/microsoft/LongRoPE
+
+## 1. Giới thiệu
+
+Các Mô hình Ngôn ngữ Lớn (LLM), mặc dù thành công đáng kể trên các nhiệm vụ khác nhau (OpenAI et al., 2023; Touvron et al., 2023), thường gặp phải giới hạn về kích thước cửa sổ ngữ cảnh, ví dụ, giới hạn 4096 token của LLaMA2 (Touvron et al., 2023). Vượt ra ngoài cửa sổ ngữ cảnh, hiệu suất của LLM giảm do các vị trí bổ sung mà mô hình chưa được huấn luyện. Điều này gây ra thách thức trong các kịch bản quan trọng như học trong ngữ cảnh với nhiều ví dụ (Huang et al., 2023) và các tác nhân LLM (Park et al., 2023; Madaan et al., 2023).
+
+Các nghiên cứu gần đây cho thấy rằng cửa sổ ngữ cảnh của LLM được huấn luyện trước có thể được mở rộng lên khoảng 128k bằng cách tinh chỉnh trên các văn bản dài hơn (Chen et al., 2023b;a; Peng et al., 2023; Zhang et al., 2024; Liu et al., 2023). Có ba trở ngại chính để mở rộng thêm cửa sổ ngữ cảnh. Đầu tiên, các chỉ số vị trí mới chưa được huấn luyện đưa ra nhiều giá trị thảm khốc, dẫn đến các vấn đề ngoài phân phối và làm cho việc tinh chỉnh khó hội tụ (Chen et al., 2023a). Điều này đặc biệt thách thức khi một sự mở rộng từ 4k lên >1000k đưa ra hơn 90% vị trí mới. Thứ hai, tinh chỉnh thường yêu cầu các văn bản có độ dài tương ứng. Tuy nhiên, các văn bản dài trong các bộ dữ liệu hiện tại, đặc biệt là những văn bản vượt quá 1000k, là có hạn. Hơn nữa, huấn luyện trên các văn bản cực dài rất tốn kém về tính toán, yêu cầu thời gian huấn luyện và tài nguyên GPU cực kỳ lớn. Thứ ba, khi mở rộng đến cửa sổ ngữ cảnh cực dài, sự chú ý trở nên phân tán khi được trải mỏng qua nhiều vị trí token, làm giảm hiệu suất trên ngữ cảnh ngắn gốc (Chen et al., 2023a).
+
+Một cách tiếp cận để giảm thiểu thách thức đầu tiên là nội suy nhúng vị trí RoPE (Su et al., 2021; Chen et al., 2023a), điều này thu nhỏ các chỉ số vị trí mới về phạm vi được huấn luyện trước, như thể hiện trong Hình 2. Nội suy Vị trí (PI) (Chen et al., 2023a) nội suy tuyến tính các góc quay của RoPE theo tỷ lệ mở rộng. NTK (LocalLLaMA, 2023b;a) ủng hộ nội suy và ngoại suy không đồng đều qua các chiều RoPE. YaRN (Peng et al., 2023) phân loại các chiều RoPE thành ba nhóm dựa trên tần số và áp dụng ngoại suy, NTK và nội suy tuyến tính tương ứng. Tuy nhiên, nhúng vị trí thể hiện entropy thông tin không đồng nhất phức tạp trong kiến trúc Transformer. Sự không đồng nhất tinh tế như vậy không được tận dụng hiệu quả bởi các phương pháp hiện tại, dẫn đến mất thông tin và do đó giới hạn kích thước cửa sổ ngữ cảnh.
+
+Phần 2 tiết lộ hai phát hiện chính theo kinh nghiệm: (1) Nội suy vị trí hiệu quả nên xem xét hai dạng không đồng nhất: các chiều RoPE khác nhau và vị trí token. Các chiều RoPE thấp hơn và vị trí token bắt đầu ban đầu có lợi từ việc nội suy ít hơn, nhưng các giải pháp tối ưu phụ thuộc vào độ dài mở rộng mục tiêu. (2) Bằng cách xem xét những không đồng nhất này vào nội suy vị trí, chúng ta có thể giữ lại thông tin hiệu quả trong RoPE gốc, đặc biệt là các chiều và vị trí token chính. Điều này giảm thiểu tổn thất do nội suy vị trí gây ra, và do đó cung cấp khởi tạo tốt hơn cho tinh chỉnh. Hơn nữa, nó cho phép mở rộng 8× trong các kịch bản không tinh chỉnh.
+
+Được thúc đẩy bởi các phát hiện này, chúng tôi giới thiệu LongRoPE, một phương pháp hiệu quả mở rộng cửa sổ ngữ cảnh LLM vượt quá 2 triệu token. LongRoPE dựa trên ba đổi mới chính. Đầu tiên, LongRoPE khai thác hoàn toàn sự không đồng nhất đa chiều trong nội suy vị trí. Nó xác định các yếu tố tái tỷ lệ hiệu quả cho các góc quay của RoPE cho mỗi chiều RoPE, dựa trên vị trí token. Vì không gian tìm kiếm xác định các yếu tố tái tỷ lệ mở rộng theo cấp số nhân với tỷ lệ mở rộng mục tiêu, LongRoPE giới thiệu một thuật toán tìm kiếm tiến hóa với hai kỹ thuật tối ưu hóa để tăng hiệu quả tìm kiếm. Hình 2 cho thấy một ví dụ về RoPE tái tỷ lệ được tìm kiếm.
+
+Sau đó, LongRoPE tận dụng chiến lược mở rộng tiệm tiến hiệu quả để đạt được cửa sổ ngữ cảnh 2048k mà không cần tinh chỉnh trực tiếp trên các văn bản có độ dài cực dài, vốn khan hiếm và khó có được. Chiến lược bắt đầu bằng cách tìm kiếm độ dài 256k trên LLM được huấn luyện trước và tinh chỉnh nó dưới độ dài này. Sau đó, vì nội suy vị trí không đồng nhất của chúng tôi cho phép mở rộng 8× trong các cài đặt không tinh chỉnh, chúng tôi thực hiện tìm kiếm thứ hai cho các yếu tố tái tỷ lệ RoPE mới trên LLM mở rộng đã tinh chỉnh. Điều này cuối cùng đạt được cửa sổ ngữ cảnh 2048k cho LLaMA2 và Mistral (Jiang et al., 2023).
+
+Cuối cùng, để giảm thiểu sự suy giảm hiệu suất trên cửa sổ ngữ cảnh (ngắn hơn) gốc, LongRoPE tiếp tục điều chỉnh các yếu tố tái tỷ lệ RoPE trên LLM mở rộng. Tương tự như việc mở rộng từ 256k lên 2048k, chúng tôi thu nhỏ xuống cửa sổ ngữ cảnh 4k và 8k trên LLM tinh chỉnh 256k sử dụng thuật toán tìm kiếm của chúng tôi để khuyến khích ít nội suy vị trí hơn. Trong quá trình suy luận, nếu độ dài chuỗi nhỏ hơn 8k, chúng tôi cập nhật RoPE với các yếu tố tái tỷ lệ được tìm kiếm.
+
+Các thí nghiệm rộng rãi trên các LLM khác nhau và các nhiệm vụ ngữ cảnh dài khác nhau chứng minh hiệu quả của phương pháp chúng tôi. Chúng tôi cho thấy rằng LongRoPE rất hiệu quả trong việc duy trì độ phức tạp thấp từ 4k đến 2048k độ dài đánh giá, đạt được độ chính xác truy xuất passkey trên 90%, và mang lại độ chính xác tương đương trên các benchmark tiêu chuẩn được thiết kế trong cửa sổ ngữ cảnh 4096. LongRoPE có thể được áp dụng cho bất kỳ LLM nào dựa trên nhúng RoPE. Chúng tôi sẽ phát hành mã nguồn và các mô hình LongRoPE-2048k.
+
+## 2. Sự không đồng nhất trong Nội suy Vị trí
+
+### 2.1. Kiến thức cơ bản
+
+Các mô hình Transformer yêu cầu thông tin vị trí rõ ràng, thường dưới dạng nhúng vị trí, để biểu diễn thứ tự của các token đầu vào. Công việc của chúng tôi tập trung vào nhúng vị trí RoPE (Su et al., 2021), được sử dụng rộng rãi trong các LLM gần đây. Đối với một token tại chỉ số vị trí n, mã hóa RoPE tương ứng có thể được đơn giản hóa như sau:
+
+[cos(nθ₀), sin(nθ₀), cos(nθ₁),···, cos(nθ_{d/2−1}), sin(nθ_{d/2−1})]  (1)
+
+trong đó d là chiều nhúng, nθᵢ là góc quay của token tại vị trí n, θᵢ = θ^{−2i/d} biểu thị các tần số quay. Trong RoPE, giá trị cơ sở mặc định của θ là 10000.
+
+**Tỷ lệ mở rộng cửa sổ ngữ cảnh s và nội suy vị trí**. Chúng tôi định nghĩa s là tỷ lệ của độ dài ngữ cảnh mở rộng L' so với độ dài gốc L: s = L'/L.
+
+Để mở rộng cửa sổ ngữ cảnh từ L đến L', các phương pháp nội suy vị trí hiện tại đề xuất thu nhỏ các tần số quay θᵢ dựa trên tỷ lệ mở rộng s. Đặt β = θ^{2/d}, và λ biểu thị yếu tố tái tỷ lệ thực tế liên quan đến s, chúng tôi thống nhất các phương pháp nội suy vị trí này như sau:
+
+[cos(n/(λ(β)₀)), sin(n/(λ(β)₀)), cos(n/(λ(β)₁)),···, sin(n/(λ(β)_{d/2−1}))]  (2)
+
+**Nội suy vị trí tuyến tính (PI)**. PI (Chen et al., 2023a) đề xuất nội suy tuyến tính của các chỉ số vị trí trong giới hạn độ dài được huấn luyện trước. Đối với tỷ lệ mở rộng mục tiêu s, các góc quay của tất cả các vị trí được giảm tuyến tính bởi λ = s qua tất cả các chiều RoPE. Tuy nhiên, điều này làm cho thông tin vị trí rất "đông đúc", cản trở khả năng phân biệt các token có vị trí gần nhau của mô hình. Do đó, PI có xu hướng hoạt động kém ở tỷ lệ mở rộng cao.
+
+**Nội suy và ngoại suy dựa trên NTK**. (LocalLLaMA, 2023b;a) xem xét RoPE từ góc độ mã hóa thông tin và áp dụng lý thuyết Neural Tangent Kernel (NTK) (Jacot et al., 2018; Tancik et al., 2020). Để giảm thiểu vấn đề vị trí đông đúc trong PI, họ đề xuất phân phối áp lực nội suy qua các chiều RoPE. Nó tỷ lệ các chiều thấp hơn (tần số cao) ít hơn và các chiều cao hơn (tần số thấp) nhiều hơn, dẫn đến cả nội suy và ngoại suy vị trí, trong đó λ = s^i. Dynamic NTK cải tiến (LocalLLaMA, 2023a) điều chỉnh tỷ lệ mở rộng tại mỗi vị trí dựa trên độ dài chuỗi hiện tại. Không giống như PI, yêu cầu tinh chỉnh, các phương pháp NTK-aware có thể mở rộng cửa sổ ngữ cảnh trong các kịch bản không tinh chỉnh, nhưng thường với tỷ lệ mở rộng tối đa 4×.
+
+**YaRN** (Peng et al., 2023) giới thiệu một cải tiến đáng kể cho hiệu suất nội suy vị trí. Nó chia các chiều RoPE thành ba nhóm dựa trên tần số, mỗi nhóm với một chiến lược nội suy khác nhau. Các chiều tần số cao trải qua ngoại suy (λ = 1), trong khi các chiều tần số thấp sử dụng nội suy tuyến tính (PI). Các chiều RoPE nằm giữa sử dụng NTK. Chìa khóa của YaRN nằm ở việc nhóm các chiều RoPE, hiện tại phụ thuộc vào các thí nghiệm kinh nghiệm do con người dẫn dắt. Điều này có thể dẫn đến hiệu suất dưới mức tối ưu cho các LLM mới.
+
+### 2.2. Nghiên cứu về Nội suy Vị trí không đồng nhất
+
+Được truyền cảm hứng từ NTK và YaRN, chúng tôi nhận thấy lợi ích của họ từ tính phi tuyến, cụ thể là trong việc xem xét các tần số khác nhau qua các chiều RoPE cho nội suy và ngoại suy chuyên biệt. Tuy nhiên, các tính phi tuyến hiện tại phụ thuộc nhiều vào các quy tắc thiết kế của con người. Điều này tự nhiên đặt ra hai câu hỏi: (1) Nội suy vị trí hiện tại có tối ưu không? (2) Có những tính phi tuyến chưa được khám phá nào không?
+
+Để trả lời những câu hỏi này, chúng tôi sử dụng tìm kiếm tiến hóa (xem Phần 3) để khám phá nội suy vị trí không đồng nhất tốt hơn cho LLaMA2-7B. Tìm kiếm được hướng dẫn bởi độ phức tạp, sử dụng 5 mẫu ngẫu nhiên từ bộ validation PG19 (Rae et al., 2019). Thông qua phân tích kinh nghiệm của chúng tôi, chúng tôi tiết lộ các phát hiện chính sau đây.
+
+**Phát hiện 1**: Các chiều RoPE thể hiện sự không đồng nhất đáng kể, không được xử lý hiệu quả bởi các phương pháp nội suy vị trí hiện tại.
+
+Chúng tôi tìm kiếm λ tối ưu cho mỗi chiều RoPE trong Phương trình 2. Bảng 1 so sánh độ phức tạp của LLaMA2-7B dưới các phương pháp khác nhau trên bộ test PG19 và Proof-pile (Azerbayev et al., 2022), mà không cần tinh chỉnh. Giải pháp tìm kiếm của chúng tôi cho thấy cải tiến đáng kể, cho thấy rằng các phương pháp nội suy tuyến tính (PI) và không đồng nhất (Dynamic-NTK và YaRN) hiện tại là dưới mức tối ưu. Đáng chú ý, YaRN hoạt động kém hơn PI và NTK trên PG19, vì nó không đạt được độ dài cửa sổ ngữ cảnh mục tiêu cho LLM không tinh chỉnh. Ví dụ, độ phức tạp của YaRN tăng vọt sau 7k trong kích thước ngữ cảnh 8k.
+
+Thông qua tìm kiếm của chúng tôi, các yếu tố tái tỷ lệ λ trong Phương trình 2 trở thành không đồng nhất, khác với tỷ lệ cố định s trong PI, tính toán công thức của NTK và tính toán theo nhóm của YaRN. Những yếu tố không đồng nhất này cải thiện đáng kể hiệu suất mô hình hóa ngôn ngữ của LLaMA2 (tức là độ phức tạp) cho cửa sổ ngữ cảnh 8k và 16k mà không cần tinh chỉnh. Điều này là do nhúng vị trí kết quả bảo tồn hiệu quả RoPE gốc, đặc biệt là các chiều chính, do đó giảm khó khăn của LLM trong việc phân biệt các vị trí token gần nhau.
+
+**Phát hiện 2**: RoPE cho các token ban đầu trong chuỗi đầu vào nên được ngoại suy với ít nội suy hơn.
+
+Đối với n̂ token ban đầu trong chuỗi đầu vào, chúng tôi giả thuyết rằng RoPE của chúng nên thực hiện ít nội suy hơn. Điều này là do chúng nhận được điểm attention lớn, làm cho chúng trở nên quan trọng đối với các lớp attention, như được quan sát trong Streaming LLM (Xiao et al., 2023) và LM-Infinite (Han et al., 2023). Để xác minh điều này, chúng tôi mở rộng cửa sổ ngữ cảnh lên 8k và 16k bằng PI và NTK, giữ n̂ token đầu tiên (0, 2, ..., 256) mà không nội suy. Khi n̂ = 0, nó trở về PI và NTK gốc. Bảng 2 nêu bật hai quan sát chính: (1) giữ lại các token bắt đầu mà không nội suy vị trí thực sự cải thiện hiệu suất. (2) Số lượng token bắt đầu tối ưu, n̂, phụ thuộc vào độ dài mở rộng mục tiêu.
+
+**Phát hiện 3**: Nội suy vị trí không đồng nhất hiệu quả mở rộng cửa sổ ngữ cảnh LLM trong cả cài đặt tinh chỉnh và không tinh chỉnh.
+
+Trong khi chúng tôi đã chỉ ra rằng nội suy vị trí không đồng nhất được tìm kiếm của chúng tôi cải thiện đáng kể hiệu suất mở rộng ở 8k và 16k mà không cần tinh chỉnh, các mở rộng dài hơn yêu cầu tinh chỉnh. Vì vậy, chúng tôi tinh chỉnh LLaMA2-7B với RoPE đã tìm kiếm cho kích thước cửa sổ ngữ cảnh 64k (xem Phụ lục cho cài đặt). Như Bảng 3 cho thấy, phương pháp của chúng tôi vượt trội hơn đáng kể so với PI và YaRN, cả trước và sau khi tinh chỉnh LLaMA2-7B. Điều này là do việc sử dụng hiệu quả nội suy vị trí không đồng nhất, giảm thiểu mất thông tin và cung cấp khởi tạo tốt hơn cho tinh chỉnh.
+
+**Tóm tắt**. Nghiên cứu của chúng tôi khám phá hai sự không đồng nhất: các chiều RoPE khác nhau và vị trí token. Việc sử dụng hiệu quả những không đồng nhất này trong nội suy vị trí cải thiện đáng kể hiệu suất mở rộng ngữ cảnh LLM.
+
+## 3. LongRoPE
+
+Được thúc đẩy bởi các phát hiện, chúng tôi trình bày LongRoPE, đầu tiên giới thiệu thuật toán tìm kiếm hiệu quả để khai thác hoàn toàn hai sự không đồng nhất, và sau đó sử dụng nó để mở rộng cửa sổ ngữ cảnh LLM vượt quá 2 triệu token.
+
+### 3.1. Công thức hóa Vấn đề
+
+Hai sự không đồng nhất có thể dẫn đến không gian giải pháp rộng lớn và đưa ra sự phức tạp trong tối ưu hóa. Để giải quyết vấn đề này, chúng tôi đóng khung vấn đề tối ưu hóa nội suy vị trí không đồng nhất đa chiều như một vấn đề tìm kiếm.
+
+Đối với một LLM nhắm mục tiêu kích thước cửa sổ ngữ cảnh L' và các tài liệu đầu vào dài X, trong đó mỗi x ∈ X vượt quá L' về độ dài token, chúng tôi ký hiệu góc quay gốc của chiều thứ i trong nhúng RoPE tại vị trí token n là n/βᵢ.
+
+Vấn đề tối ưu hóa sau đó được công thức hóa như sau:
+
+arg min_{x∈X;|x|≥L'} L(LLM(RoPE,X)), trong đó
+
+RoPE(n)_{i=0,···,d/2-1; n∈[0,|x|)} = [···, cos(I(λ̂ᵢ,n̂)×n/βᵢ), sin(I(λ̂ᵢ,n̂)×n/βᵢ), ···]
+
+trong đó I(λ̂ᵢ,n̂) = {1 nếu n < n̂, 1/λᵢ nếu n ≥ n̂}  (3)
+
+trong đó chúng tôi giới thiệu một tập hợp các yếu tố tái tỷ lệ, I(λ̂ᵢ,n̂), để bao phủ hai dạng không đồng nhất. λ̂ᵢ và n̂ biểu thị sự không đồng nhất của các chiều RoPE và vị trí token tương ứng. Cụ thể, chúng tôi sử dụng I(λ̂ᵢ,n̂) để tái tỷ lệ góc quay cho chiều RoPE thứ i, trong đó λ̂ᵢ là yếu tố tái tỷ lệ và n̂ là ngưỡng vị trí token. Đối với n̂-1 vị trí token ban đầu, yếu tố tái tỷ lệ λ̂ᵢ sẽ không có hiệu lực, và góc quay RoPE gốc n/βᵢ được sử dụng. Đối với các token tại vị trí n ≥ n̂, yếu tố tái tỷ lệ được áp dụng.
+
+Cho kích thước cửa sổ ngữ cảnh mục tiêu L', mục tiêu của chúng tôi là tìm các yếu tố tái tỷ lệ tối ưu (I(λ̂₀,n̂), I(λ̂₁,n̂), ..., I(λ̂ᵢ,n̂)...) từ chiều RoPE thứ 1 đến thứ d. Kết quả là, LLM mục tiêu, với RoPE đã tái tỷ lệ, có thể đạt được tổn thất dự đoán token tiếp theo tối thiểu, L (tức là độ phức tạp), cho các mẫu đầu vào X có độ dài token L'.
+
+### 3.2. Tìm kiếm Nội suy Vị trí không đồng nhất
+
+Để giải quyết vấn đề trong Phương trình 3, chúng tôi giới thiệu phương pháp đơn giản nhưng hiệu quả cao, tìm kiếm các yếu tố tái tỷ lệ RoPE tối ưu để khai thác hoàn toàn sự không đồng nhất đa chiều trong nhúng vị trí.
+
+**Không gian tìm kiếm**. Chúng tôi thiết kế không gian tìm kiếm lớn để bao gồm hai sự không đồng nhất. Bảng 4 minh họa không gian tìm kiếm. Cụ thể, chúng tôi cho phép tìm kiếm yếu tố tái tỷ lệ chuyên biệt cho mỗi chiều trong nhúng RoPE. Để đơn giản hóa thiết kế không gian tìm kiếm, chúng tôi tìm kiếm λᵢ và n̂ thay vì tìm kiếm I(λ̂ᵢ,n̂), trong đó λ̂ᵢ = 1/λᵢ. Như thể hiện trong Bảng 4, λᵢ được phép tìm kiếm từ giá trị tối thiểu 1.0 (tức là ngoại suy trực tiếp) đến giá trị tối đa s×1.25 (tức là nội suy lớn hơn PI) với bước nhảy 0.01, trong đó s là tỷ lệ mở rộng cửa sổ ngữ cảnh mục tiêu.
+
+n̂ kiểm soát số lượng vị trí token ban đầu được giữ lại mà không nội suy vị trí (tức là sử dụng nhúng RoPE gốc). Theo kinh nghiệm, chúng tôi cho phép n̂ tìm kiếm từ {0, 1, 2, 4, 8, 12, 16, 20, 24, 28, 32, 64, 128, 256}. Khi n̂ = 0, tất cả các vị trí token sử dụng các yếu tố tái tỷ lệ được tìm kiếm.
+
+**Tìm kiếm dựa trên tiến hóa**. Không gian tìm kiếm của chúng tôi trong Bảng 4 bao trùm nhiều giải pháp nội suy vị trí, gây ra thách thức đáng kể cho việc khám phá hiệu quả. Ví dụ, mở rộng s = 4× dẫn đến 400^{128/2} × 14 = 4×10^{167} lựa chọn. Với tỷ lệ mở rộng lớn hơn, không gian tìm kiếm mở rộng theo cấp số nhân. Để giải quyết vấn đề này, chúng tôi sử dụng tìm kiếm tiến hóa (Guo et al., 2020) và giới thiệu hai kỹ thuật tối ưu hóa để tăng cường hiệu quả tìm kiếm đáng kể. Thuật toán 1 minh họa quy trình tìm kiếm tổng thể.
+
+**Tạo quần thể ban đầu được tối ưu hóa**. Thay vì khởi tạo quần thể P yếu tố tái tỷ lệ ngẫu nhiên, chúng tôi thêm ba yếu tố tái tỷ lệ RoPE tương ứng với PI, NTK và YaRN như các cá thể vào quần thể ban đầu. Đối với P-3 cá thể còn lại, chúng tôi ngẫu nhiên đột biến ba yếu tố tái tỷ lệ với xác suất p.
+
+**Ràng buộc không giảm đơn điệu**. Sau khi tạo quần thể ban đầu, chúng tôi tính toán độ phức tạp LLM cho mỗi cá thể. Cụ thể, chúng tôi áp dụng các yếu tố tái tỷ lệ RoPE tương ứng cho LLM mục tiêu và tính toán độ phức tạp của đầu vào X. Top-k cá thể trở thành cha mẹ cho tiến hóa. Tuy nhiên, không gian tìm kiếm rộng lớn có thể khiến đột biến và lai tạo ngây thơ khám phá các giải pháp kém, dẫn đến các tính toán độ phức tạp không cần thiết. Điều này đặc biệt không hiệu quả khi L' lớn, cho thời gian suy luận tốn kém của mỗi tính toán độ phức tạp.
+
+Để giải quyết vấn đề này, chúng tôi áp đặt ràng buộc đơn điệu không giảm trên các yếu tố tái tỷ lệ RoPE được lấy mẫu: λᵢ ≤ λᵢ₊₁. Chỉ RoPE thỏa mãn ràng buộc này mới được áp dụng cho LLM để đánh giá độ phức tạp, giảm đáng kể chi phí tìm kiếm. Cụ thể, chúng tôi yêu cầu λᵢ tăng đơn điệu với chiều RoPE (tức là i = 0, ..., 63). Tính đơn điệu chiều này dựa trên lý thuyết NTK (Jacot et al., 2018; Tancik et al., 2020; LocalLLaMA, 2023b), cho thấy rằng các chiều thấp hơn với tần số cao hơn yêu cầu ít nội suy hơn (tức là λᵢ nhỏ hơn), và các chiều cao hơn với tần số thấp hơn có thể thực hiện nhiều nội suy hơn (tức là λᵢ lớn hơn).
+
+**Mở rộng 8× mà không cần tinh chỉnh**. Tìm kiếm tiến hóa của chúng tôi xác định hiệu quả các yếu tố tái tỷ lệ RoPE không đồng nhất, bảo tồn các chiều và vị trí chính để giảm thiểu mất thông tin do nội suy gây ra. Như mô tả trong Hình 3, phương pháp của chúng tôi có thể mở rộng cửa sổ ngữ cảnh của LLaMA2 từ 4k lên 32k mà không cần tinh chỉnh. Ngược lại, các phương pháp hiện tại như PI, và NTK và YaRN không đồng nhất gây ra độ phức tạp tăng vọt sau mở rộng 2×.
+
+### 3.3. Mở rộng Cửa sổ Ngữ cảnh LLM lên 2048K
+
+**Mở rộng tiệm tiến lên 2048k**. Chúng tôi giới thiệu phương pháp mở rộng cửa sổ ngữ cảnh của các LLM được huấn luyện trước từ 4k truyền thống lên hơn 2048k. Như đã chứng minh, nội suy vị trí không đồng nhất của chúng tôi có thể đạt được mở rộng 8× mà không cần tinh chỉnh. Đối với các mở rộng lớn hơn (tức là 512×), tinh chỉnh là cần thiết. Một phương pháp là tìm kiếm các yếu tố tái tỷ lệ RoPE dưới kích thước 2048k mục tiêu và sau đó tinh chỉnh. Tuy nhiên, điều này gặp thách thức do tài nguyên huấn luyện cực kỳ đắt đỏ. Hơn nữa, dựa trên kinh nghiệm của chúng tôi, việc tinh chỉnh tốt các LLM dưới tỷ lệ mở rộng lớn là thách thức (xem Phụ lục).
+
+May mắn thay, LongRoPE hiệu quả cho cả LLM gốc và mở rộng đã tinh chỉnh. Do đó, chúng tôi giới thiệu phương pháp tiệm tiến hiệu quả đạt được 2048k mục tiêu chỉ với 1k bước tinh chỉnh trong độ dài huấn luyện 256k.
+
+♢ **Mở rộng LLM được huấn luyện trước lên 256k với tìm kiếm LongRoPE**. Lấy LLaMA2 làm ví dụ, chúng tôi thực hiện tìm kiếm cho kích thước cửa sổ ngữ cảnh mục tiêu 128k và 256k. Tỷ lệ mở rộng ở giai đoạn này là 32× và 64× tương ứng.
+
+♢ **Tinh chỉnh lên 256k**. Sau đó, chúng tôi tinh chỉnh LLM được huấn luyện trước để đạt được kích thước cửa sổ ngữ cảnh 256k. Cụ thể, chúng tôi tinh chỉnh LLaMA2 trong 400 bước sử dụng các yếu tố tái tỷ lệ RoPE cho 128k. Sau đó, chúng tôi thay thế các yếu tố tái tỷ lệ RoPE thành 256k trên checkpoint hoàn thành và thực hiện thêm 600 bước tinh chỉnh. Phương pháp này hiệu quả hơn việc tinh chỉnh trực tiếp lên 256k.
+
+♢ **Mở rộng LLM mở rộng đã tinh chỉnh lên 2048k với tìm kiếm LongRoPE**. Cuối cùng, chúng tôi thực hiện tìm kiếm thứ hai trên LLM độ dài 256k đã tinh chỉnh. Điều này cuối cùng dẫn đến kích thước cửa sổ ngữ cảnh cực lớn 2048k mà không cần tinh chỉnh thêm. Tỷ lệ mở rộng cuối cùng là 512×.
+
+**Khôi phục cửa sổ ngữ cảnh ngắn hơn**. Sau khi mở rộng lên cửa sổ ngữ cảnh 2048k cực dài, chúng tôi nhận thấy sự suy giảm hiệu suất trong cửa sổ ngữ cảnh gốc. Đây là vấn đề đã biết của nội suy vị trí (Chen et al., 2023a), vì nó buộc nhúng vị trí trong các chiều cao hơn trong cửa sổ ngữ cảnh gốc phải nằm trong vùng hẹp hơn nhiều, ảnh hưởng tiêu cực đến hiệu suất của mô hình ngôn ngữ. Với tỷ lệ mở rộng 512×, các vị trí trong cửa sổ ngữ cảnh 4k gốc trở nên đặc biệt đông đúc.
+
+Để giảm thiểu điều này, chúng tôi thực hiện tìm kiếm tiến hóa bổ sung trên LLM mở rộng để điều chỉnh các yếu tố tái tỷ lệ RoPE cho độ dài ngữ cảnh ngắn (ví dụ, 4k và 8k). Chúng tôi giảm λ tối đa được phép tìm kiếm do yêu cầu ít nội suy vị trí hơn cho độ dài ngắn hơn. Trong quá trình suy luận, LLM động điều chỉnh các yếu tố tái tỷ lệ RoPE tương ứng.
+
+## 4. Thí nghiệm
+
+### 4.1. Thiết lập
+
+**Nhiệm vụ đánh giá và mô hình**. Chúng tôi áp dụng LongRoPE trên LLaMA2-7B và Mistral-7B, và đánh giá hiệu suất trên ba khía cạnh: (1) độ phức tạp của các LLM ngữ cảnh mở rộng trên các tài liệu dài; (2) Nhiệm vụ truy xuất passkey đo lường khả năng của mô hình trong việc truy xuất passkey đơn giản từ biển văn bản không liên quan; và (3) Các benchmark LLM tiêu chuẩn trong kích thước cửa sổ ngữ cảnh ngắn 4096.
+
+**Tinh chỉnh**. Đối với LLaMA2, chúng tôi sử dụng tốc độ học 2e-5 với suy giảm tuyến tính và kích thước batch toàn cục 32. Chúng tôi tinh chỉnh trong 400 bước trên bộ dữ liệu Redpajama (Computer, 2023), được chia thành các đoạn 128k được bao quanh bởi các token BOS và EOS. Sau đó, dựa trên checkpoint hoàn thành, chúng tôi huấn luyện thêm 600 bước để đạt được cửa sổ ngữ cảnh 256k. Kích thước ngữ cảnh 128k được huấn luyện trên 8 GPU A100 với hệ thống huấn luyện phân tán (Lin et al., 2023), trong khi 256k yêu cầu 16 GPU A100. Trong trường hợp Mistral, tốc độ học không đổi 1e-6 và kích thước batch toàn cục 64 được sử dụng. Đối với cả mô hình 128k và 256k, chúng tôi làm theo cài đặt trong YaRN (Peng et al., 2023), với 400 bước trên Bộ sưu tập Dữ liệu Dài của Together Computer (mis, 2024) sử dụng độ dài chuỗi 16k. Chúng tôi sử dụng 4 GPU A100 để huấn luyện.
+
+**Tìm kiếm**. Đối với kích thước cửa sổ mục tiêu trong 256k, chúng tôi sử dụng: P = 64, N₁ = N₂ = 16, p = 0.3, T = 40, và chọn top-32 cho đột biến/lai tạo trong mỗi lần lặp. Độ phức tạp được tính toán sử dụng 5 mẫu ngẫu nhiên từ bộ validation PG19, với yêu cầu độ dài tối thiểu của độ dài ngữ cảnh mục tiêu. Đối với cửa sổ trên 512k, chúng tôi giảm một nửa kích thước quần thể, đột biến và lai tạo. Độ phức tạp được đo trên 3 mẫu ngẫu nhiên từ bộ validation Pile-Books3 (Gao et al., 2020).
+
+**Baseline**. Để đạt 2048k, chúng tôi tinh chỉnh các mô hình với cửa sổ ngữ cảnh 128k và 256k. Điều này tạo ra LongRoPE-2048k (ft=128k) và LongRoPE-2048k (ft=256k) cho LLaMA2 và Mistral tương ứng. Chúng tôi so sánh bốn mô hình với các baseline mở rộng cửa sổ ngữ cảnh hiện đại, cụ thể là các LLM mã nguồn mở được tinh chỉnh sau nội suy vị trí sử dụng PI, NTK và YaRN. Điều này bao gồm Together-32k (Together, 2023), Code LLaMA (Rozière et al., 2023), LongLoRA-full-FT-100k (Chen et al., 2023b), YaRN-LLaMA và YaRN-Mistral (Peng et al., 2023).
+
+### 4.2. Kết quả Chính
+
+**Mô hình hóa ngôn ngữ chuỗi dài trong 256k**. Chúng tôi bắt đầu bằng cách so sánh với các LLM mở rộng hiện đại trong độ dài đánh giá 256k. Chúng tôi sử dụng hai bộ dữ liệu để chứng minh khả năng tổng quát: Proof-pile (Rae et al., 2019) và PG19 (Gao et al., 2020) test splits. Chúng tôi đánh giá độ phức tạp ở các độ dài ngữ cảnh khác nhau sử dụng cửa sổ trượt 256. Đối với PG19, chúng tôi sử dụng toàn bộ test split của 100 tài liệu. Đối với Proof-pile, chúng tôi làm theo YaRN (Peng et al., 2023) để ngẫu nhiên chọn 10 mẫu, mỗi mẫu có ít nhất 128k độ dài.
+
+Bảng 5 và Bảng 7 so sánh độ phức tạp của LLaMA2 và Mistral được mở rộng qua các phương pháp nội suy khác nhau trên Proof-pile và PG19 tương ứng. Chúng tôi nêu bật hai quan sát chính: (1) các mô hình mở rộng của chúng tôi cho thấy xu hướng độ phức tạp giảm tổng thể từ 4k đến 256k độ dài đánh giá, chứng minh khả năng tận dụng ngữ cảnh dài hơn. (2) Ngay cả với cửa sổ ngữ cảnh dài hơn 16×, điều kiện thường thách thức để duy trì hiệu suất ở độ dài ngắn hơn, các mô hình LongRoPE-2048k của chúng tôi vượt trội hơn các baseline hiện đại trong độ dài ngữ cảnh 256k.
+
+**Mô hình hóa ngôn ngữ chuỗi dài vượt quá 2000k**. Để đánh giá hiệu quả trên các tài liệu cực dài, chúng tôi sử dụng bộ dữ liệu Books3 (Gao et al., 2020). Để hiệu quả đánh giá, chúng tôi ngẫu nhiên chọn 20 cuốn sách, mỗi cuốn vượt quá 2048k độ dài, và sử dụng cửa sổ trượt 256k.
+
+Như thể hiện trong Bảng 6, LongRoPE thành công mở rộng cửa sổ ngữ cảnh của LLaMA2-7B và Mistral-7B lên 2048k, đồng thời đạt được độ phức tạp tương đương hoặc vượt trội so với các baseline trong độ dài ngắn hơn 8k-128k. Chúng tôi cũng quan sát sự khác biệt hiệu suất đáng chú ý giữa LLaMA2 và Mistral 2048k. Mistral vượt trội hơn các baseline ở độ dài ngắn hơn, nhưng độ phức tạp vượt quá 7 sau 256k. Hiệu suất LLaMA2 phù hợp với kỳ vọng: độ phức tạp giảm một cách đáng kể với ngữ cảnh dài hơn, với tăng nhẹ ở 1024k và 2048k. Hơn nữa, trên LLaMA2, LongRoPE-2048k hoạt động tốt hơn ở độ dài tinh chỉnh 256k so với 128k, do tỷ lệ mở rộng thứ cấp nhỏ hơn (tức là 8× vs. 16×). Ngược lại, Mistral hoạt động tốt hơn ở kích thước cửa sổ tinh chỉnh 128k. Lý do chính là đối với tinh chỉnh 128k và 256k của Mistral, chúng tôi làm theo cài đặt của YaRN để sử dụng độ dài huấn luyện 16k, điều này ảnh hưởng đến khả năng mở rộng ngữ cảnh thêm của Mistral sau tinh chỉnh.
+
+**Truy xuất passkey**. Chúng tôi nghiên cứu kích thước cửa sổ ngữ cảnh hiệu quả trong các nhiệm vụ tạo sinh. Chúng tôi làm theo nhiệm vụ đánh giá tổng hợp truy xuất passkey được đề xuất bởi (Mohtashami & Jaggi, 2023). Trong nhiệm vụ này, mô hình được yêu cầu truy xuất passkey ngẫu nhiên (tức là số năm chữ số) được ẩn trong tài liệu dài. Mẫu prompt được chi tiết trong phụ lục. Chúng tôi thực hiện 10 lần lặp nhiệm vụ truy xuất passkey với passkey được đặt tại vị trí ngẫu nhiên phân phối đều qua độ dài ngữ cảnh đánh giá.
+
+Hình 4 cho thấy so sánh độ chính xác truy xuất với các baseline. Độ chính xác của các mô hình hiện tại giảm nhanh xuống 0 sau 128k. Ngược lại, mặc dù nhiệm vụ rất thách thức trong việc truy xuất passkey từ hàng triệu token, LongRoPE-LLaMA2-2048k (ft=256k) của chúng tôi vẫn duy trì độ chính xác truy xuất cao (≥90%) từ 4k đến 2048k. LongRoPE-Mistral-2048k (ft=128k) giữ độ chính xác 100% lên đến 1800k, giảm xuống 60% ở 2048k, phù hợp với kỳ vọng từ Bảng 6, nơi độ phức tạp tăng nhẹ ở 2048k.
+
+**Các benchmark tiêu chuẩn trong cửa sổ ngữ cảnh gốc**. Chúng tôi đánh giá các mô hình LongRoPE-2048k trên cửa sổ ngữ cảnh gốc sử dụng Hugging Face Open LLM Leaderboard (Face, 2024) trong cài đặt zero-shot và few-shot. Chúng tôi sử dụng 25-shot ARC-Challenge (Clark et al., 2018), 10-shot HellaSwag (Zellers et al., 2019), 5-shot MMLU (Hendrycks et al., 2020), và 0-shot TruthfulQA (Lin et al., 2021).
+
+Như Bảng 8 cho thấy, các mô hình của chúng tôi đạt được kết quả tương đương trên benchmark gốc được thiết kế cho cửa sổ ngữ cảnh nhỏ hơn, và thậm chí vượt trội hơn Mistral gốc trên TruthfulQA với +0.5%. LongRoPE-LLaMA2-2048k, được tinh chỉnh ở 256k, cho thấy sự suy giảm hiệu suất nhiều hơn một chút, nhưng vẫn nằm trong phạm vi hợp lý cho hầu hết các nhiệm vụ.
+
+### 4.3. Kết quả Phân tích
+
+**Hiệu quả của nội suy vị trí thứ hai**. Trong chiến lược mở rộng tiệm tiến của chúng tôi, chúng tôi sử dụng thuật toán tìm kiếm để thực hiện nội suy vị trí không đồng nhất thứ hai trên các LLM mở rộng đã tinh chỉnh. Chúng tôi xác nhận hiệu quả của nó bằng cách chạy thí nghiệm trên mô hình LLaMA2-256k đã tinh chỉnh. Chúng tôi mở rộng nó lên 512k, 1024k và 2048k sử dụng PI và YaRN. Như Bảng 9 cho thấy, nội suy vị trí không đồng nhất của chúng tôi duy trì mức độ phức tạp nhất quán. Ngược lại, độ phức tạp dưới PI và YaRN nhanh chóng tăng với tỷ lệ mở rộng.
+
+**Hiệu quả của khôi phục ở độ dài ngữ cảnh ngắn hơn**. Để giảm thiểu mất hiệu suất ở độ dài ngữ cảnh ngắn hơn, chúng tôi điều chỉnh lại các yếu tố RoPE cho LongRoPE-2048k qua thuật toán tìm kiếm. Cụ thể, chúng tôi giảm các yếu tố tỷ lệ tối đa cho phép cho tìm kiếm để khuyến khích ít nội suy hơn ở độ dài 4k và 8k ngắn. Bảng 10 cho thấy so sánh độ phức tạp của LongRoPE-LLaMA2-2048k trên Proof-pile ở độ dài 4k và 8k, cùng với độ chính xác benchmark LLM trung bình. Kết quả rõ ràng chứng minh cải thiện hiệu suất đáng kể ở độ dài ngữ cảnh ngắn.
+
+**Phân tích về hai dạng không đồng nhất**. Cuối cùng, chúng tôi phân tích hai sự không đồng nhất để xem mỗi phần đóng góp như thế nào vào hiệu suất. Chúng tôi thiết lập hai thí nghiệm: (i) mở rộng LLaMA2-7B lên 16k và 32k ngắn sử dụng các phương pháp khác nhau—PI, tìm kiếm chỉ cho chiều RoPE, và tìm kiếm cho cả hai sự không đồng nhất; (ii) mở rộng LLaMA2 độ dài 256k đã tinh chỉnh lên 2048k theo cùng quy trình. Độ phức tạp được đánh giá mà không cần tinh chỉnh.
+
+Như Bảng 11 cho thấy, sự không đồng nhất trong chiều RoPE giảm đáng kể độ phức tạp so với nội suy tuyến tính của PI. Sự không đồng nhất trong vị trí token rõ ràng cải thiện hiệu suất ở độ dài 16k và 32k nhưng không thể hiện tác động tương tự ở 2048k, có thể do độ dài cực dài. Việc bảo tồn chỉ các token ban đầu mà không nội suy trở nên không hữu ích, và chúng tôi để lại điều này như công việc tương lai.
+
+## 5. Công trình Liên quan
+
+Ngoài các phương pháp dựa trên nội suy vị trí, phần này thảo luận các công trình liên quan của các phương pháp khác.
+
+**Các phương pháp dựa trên truy xuất** sử dụng mô-đun bộ nhớ bên ngoài để ghi nhớ ngữ cảnh quá khứ dài và các mô-đun truy xuất cho việc lấy tài liệu liên quan tại thời điểm suy luận (Tworkowski et al., 2023; Wang et al., 2023; Borgeaud et al., 2022). Những thiết kế này thường cần sửa đổi rõ ràng trên kiến trúc LLM. Công việc của chúng tôi, ngược lại, nhẹ hơn, với các sửa đổi nhỏ về nhúng vị trí. Chúng tôi cũng có thể xử lý nhiều nhiệm vụ ngữ cảnh dài hơn ngoài truy xuất, như tóm tắt tài liệu dài và học few-shot.
+
+**Mở rộng cửa sổ ngữ cảnh dựa trên attention**. Ngoài nội suy nhúng vị trí, một số nghiên cứu đạt được mở rộng ngữ cảnh đầu vào sử dụng độ dài cửa sổ ngữ cảnh LLM gốc bằng cách thao tác các cơ chế attention (Han et al., 2023; Xiao et al., 2023; Ratner et al., 2022). Ý tưởng chính là giảm thiểu vấn đề bùng nổ attention do các vị trí mới gây ra bằng cách sử dụng các mặt nạ attention mới. Những nỗ lực này và các phương pháp nội suy vị trí là bổ sung.
+
+**Các phương pháp dựa trên tinh chỉnh** tập trung vào cách tinh chỉnh hiệu quả các LLM được huấn luyện trước với nhúng vị trí đã sửa đổi cho ngữ cảnh dài hơn. Các công trình như Code LLaMA (Rozière et al., 2023), LLaMA2 Long (Xiong et al., 2023) và ScaledRoPE (Liu et al., 2023) chọn giá trị cơ sở rất lớn cho RoPE và tinh chỉnh trên độ dài mục tiêu. Phương pháp của chúng tôi cung cấp tính linh hoạt cho các độ dài mục tiêu khác nhau và có thể đạt được vượt quá 2M độ dài. Gần đây hơn, vì tinh chỉnh cho độ dài ngữ cảnh dài (tức là trên 128k) đòi hỏi tài nguyên GPU đáng kể, LongLoRA (Chen et al., 2023b) và PoSE (Zhu et al., 2023) được đề xuất để giảm thiểu chi phí này. Phương pháp của chúng tôi trực giao với những công trình tinh chỉnh hiệu quả này.
+
+## 6. Kết luận
+
+Trong công trình này, chúng tôi trình bày LongRoPE, một phương pháp mở rộng đáng chú ý độ dài ngữ cảnh của các LLM lên 2048k chưa từng có, đồng thời duy trì khả năng của chúng trong cửa sổ ngữ cảnh ngắn gốc. Chúng tôi khai thác hai dạng không đồng nhất trong nhúng vị trí RoPE sử dụng tìm kiếm tiến hóa hiệu quả. Điều này mang lại lợi ích kép: nó cung cấp khởi tạo tốt cho tinh chỉnh và cho phép mở rộng cửa sổ ngữ cảnh 8× mà không cần tinh chỉnh. Dựa trên điều này, chúng tôi đề xuất chiến lược mở rộng tiệm tiến sử dụng các LLM tinh chỉnh độ dài 256k để đạt đến kích thước cửa sổ ngữ cảnh 2048k mà không cần tinh chỉnh bổ sung. Các thí nghiệm rộng rãi xác nhận hiệu quả của LongRoPE. Chúng tôi hình dung rằng các mô hình LongRoPE-2048k của chúng tôi sẽ cho phép nhiều ứng dụng ngữ cảnh dài mới và truyền cảm hứng cho nghiên cứu thêm.
+
+## Tác động Rộng rãi
+
+Bài báo này trình bày công trình có mục tiêu thúc đẩy lĩnh vực Học máy. Có nhiều hậu quả xã hội tiềm năng của công trình chúng tôi, không có điều nào chúng tôi cảm thấy phải được nêu bật cụ thể ở đây.
+
+## Tài liệu tham khảo
+
+[Phần tài liệu tham khảo giữ nguyên như bản gốc do tính chất kỹ thuật và để duy trì tính chính xác của trích dẫn]
+
+## A. Phụ lục
+
+### A.1. Cài đặt
+
+**Môi trường**. Tất cả thí nghiệm của chúng tôi được thực hiện trên 16 GPU A100. Chúng tôi sử dụng Flash Attention-2 (Dao, 2023) để tăng tốc cả huấn luyện và suy luận. Vì bộ nhớ GPU và thời gian tính toán tăng theo cấp số nhân với độ dài chuỗi, việc phục vụ tinh chỉnh và suy luận với độ dài ngữ cảnh vượt quá 512k rất thách thức. Kết quả là, chúng tôi sử dụng một nền tảng nội bộ, CUBE - phiên bản nội bộ của (Lin et al., 2023), để giảm cả chi phí huấn luyện và suy luận.
+
+**Prompt passkey**. Chúng tôi làm theo các tài liệu hiện có (Mohtashami & Jaggi, 2023; Chen et al., 2023a; Peng et al., 2023; Chen et al., 2023b; Zhu et al., 2023) cho định dạng tài liệu của truy xuất passkey. Chúng tôi hiển thị mẫu prompt như sau:
+
+```
+Có một thông tin quan trọng được ẩn trong rất nhiều văn bản không liên quan. Hãy tìm và ghi nhớ chúng. Tôi sẽ hỏi bạn về thông tin quan trọng đó.
+Cỏ có màu xanh lá cây. Bầu trời có màu xanh dương. Mặt trời có màu vàng. Chúng ta bắt đầu nào. Đi và quay lại. (lặp lại x lần)
+Pass key là 17865. Hãy nhớ nó. 17865 là pass key.
+Cỏ có màu xanh lá cây. Bầu trời có màu xanh dương. Mặt trời có màu vàng. Chúng ta bắt đầu nào. Đi và quay lại. (lặp lại y lần)
+Pass key là gì? Pass key là
+```
+
+Độ dài tài liệu thay đổi với giá trị của x và y. 17865 là số passkey cần truy xuất. Nó được lấy mẫu ngẫu nhiên và thay đổi ở mỗi lần kiểm tra.
+
+### A.2. Chi tiết bổ sung về tinh chỉnh
+
+Như giới thiệu trong Phần 4.2, chúng tôi tinh chỉnh hai độ dài cửa sổ ngữ cảnh, cụ thể là 128k và 256k, cho cả LLaMA2 và Mistral. Cụ thể, mô hình với cửa sổ ngữ cảnh 256k bắt đầu tinh chỉnh từ checkpoint 128k.
+
+Hình 5(ab) minh họa loss huấn luyện cho LLaMA2 và Mistral trong quá trình tinh chỉnh này. Chúng tôi nêu bật ba quan sát chính: (1) Mô hình với cửa sổ ngữ cảnh 128k trải qua loss ban đầu lớn do mở rộng 32×. Tuy nhiên, loss giảm nhanh chóng sau vài bước. (2) LLaMA2 và Mistral sử dụng các cài đặt tinh chỉnh khác nhau. Mistral đạt được cửa sổ ngữ cảnh dài mong muốn bằng cách tinh chỉnh trên dữ liệu độ dài 16k, trong khi LLaMA2 cần độ dài văn bản phù hợp với kích thước cửa sổ ngữ cảnh. Hơn nữa, chúng tôi áp dụng chiến lược của YaRN là sử dụng tốc độ học không đổi. Kết quả là, có thể quan sát thấy rằng loss của Mistral bắt đầu dao động sau khi giảm xuống khoảng 2.2. (3) Đối với cả Mistral và LLaMA2, mô hình với cửa sổ ngữ cảnh 256k, bắt đầu tinh chỉnh từ checkpoint 128k, thể hiện loss huấn luyện ban đầu thấp. Điều này cho thấy rằng tinh chỉnh từ các checkpoint độ dài 128k là hiệu quả và tạo điều kiện thuận lợi đáng kể cho sự hội tụ.
+
+Chúng tôi cũng khám phá các cài đặt khác nhau để tinh chỉnh LLaMA2 với cửa sổ ngữ cảnh 256k. Như thể hiện trong Hình 5(c), chúng tôi thử nghiệm với hai cài đặt bổ sung: (i) sử dụng các yếu tố tái tỷ lệ RoPE tương ứng với 256k, chúng tôi tinh chỉnh trực tiếp trên LLaMA2-7B, và (ii) sử dụng các yếu tố tái tỷ lệ RoPE cho 256k, chúng tôi tinh chỉnh trên LLaMA2-7B, nhưng cắt bớt độ dài văn bản xuống 128k. Các đường cong loss được hiển thị trong Hình 5(c). Chúng tôi quan sát thấy rằng sử dụng độ dài văn bản 128k để tinh chỉnh mô hình với cửa sổ ngữ cảnh 256k dẫn đến sự gia tăng mạnh trong loss ban đầu. Tinh chỉnh trực tiếp từ LLaMA2-7B để đạt 256k dẫn đến sự giảm tương đối chậm trong loss. Bảng 12 cho thấy độ phức tạp test trên Proof-Pile cho các checkpoint từ ba cài đặt khác nhau. Điều này chỉ ra rằng phương pháp hiện tại của chúng tôi về tinh chỉnh từ checkpoint 128k là hiệu quả nhất.
+
+**Chi phí tinh chỉnh**. LLaMA2-128k sử dụng 8 GPU A100 trong một tuần để tinh chỉnh 400 bước. LLaMA2-256k gấp đôi tài nguyên lên 16 GPU A100 trong hai tuần để tinh chỉnh 600 bước. Đối với Mistral-128k và 256k, với độ dài huấn luyện 16k, chúng tôi sử dụng 4 GPU A100 trong khoảng thời gian tinh chỉnh 2 ngày.
+
+### A.3. Chi tiết bổ sung về tìm kiếm
+
+Hình 6 minh họa độ phức tạp trên các mẫu validation tại mỗi lần lặp tìm kiếm tiến hóa. Chúng ta có thể thấy rằng thuật toán tìm kiếm của chúng tôi có thể tìm thấy hiệu quả các yếu tố tái tỷ lệ RoPE không đồng nhất chất lượng cao. Cụ thể, trong tìm kiếm cửa sổ ngữ cảnh 256k (Hình 6(a)), sau lần lặp đầu tiên, chúng tôi có thể tìm thấy các giải pháp tốt hơn đáng kể so với PI và YaRN. Khi tìm kiếm nhiều lần lặp hơn, chúng tôi có thể giảm đáng kể độ phức tạp validation từ 273.27 xuống 118.47. Hơn nữa, chúng tôi có thể quan sát thấy rằng YaRN, như phương pháp nội suy không đồng nhất hiện đại trước đây, thậm chí hoạt động tệ hơn PI (nội suy tuyến tính) ở mở rộng 64×. Điều này cũng chỉ ra rằng nội suy không đồng nhất dựa trên heuristic của con người rất khó hoạt động tốt trong tất cả các kịch bản.
+
+Đối với cửa sổ ngữ cảnh cực dài ở 2048k, chúng tôi sử dụng LLaMA2-7B với cửa sổ ngữ cảnh 128k và 256k đã tinh chỉnh cho mở rộng 16× và 8× tương ứng. Như thể hiện trong Hình 6(bc), như mong đợi, độ phức tạp của mở rộng 16× lớn hơn so với mở rộng 8×. Ngoài ra, do thời gian cần thiết cho một lần đánh giá độ phức tạp duy nhất ở 2048k là khoảng 50 phút, các lần lặp tìm kiếm bị hạn chế. Nếu được phép thời gian tìm kiếm nhiều hơn, rất có thể tìm kiếm được kết quả tốt hơn.
+
+**Chi phí tìm kiếm**. Chi phí tìm kiếm chủ yếu phụ thuộc vào thời gian cần thiết để đánh giá độ phức tạp của ngữ cảnh đầu vào tại kích thước cửa sổ ngữ cảnh nhất định. Đối với độ dài cửa sổ ngữ cảnh lên đến 256k, tổng thời gian tìm kiếm tương đối nhanh, có thể đạt được trong vòng 3 ngày sử dụng một GPU A100 duy nhất. Đối với cửa sổ ngữ cảnh 512k, chúng tôi sử dụng 2 GPU A100. Đối với các cửa sổ ngữ cảnh lớn hơn 1024k và 2048k, chúng tôi sử dụng 4 và 8 GPU A100 tương ứng, quản lý để giữ tổng thời gian tìm kiếm trong giới hạn 5 ngày.
