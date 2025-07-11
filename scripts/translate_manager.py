@@ -547,7 +547,7 @@ IMPORTANT: Output only the Vietnamese translation. Do not explain what you did. 
                         input=full_prompt,
                         capture_output=True,
                         text=True,
-                        timeout=1200  # 20 minute timeout
+                        timeout=1800  # 30 minute timeout
                     )
                     
                     stdout = result.stdout
@@ -592,7 +592,7 @@ IMPORTANT: Output only the Vietnamese translation. Do not explain what you did. 
                                 # Try once more with simpler command using stdin
                                 simple_cmd = [self.claude_path, "--print", "--dangerously-skip-permissions"]
                                 try:
-                                    retry_result = subprocess.run(simple_cmd, input=full_prompt, capture_output=True, text=True, timeout=1200)
+                                    retry_result = subprocess.run(simple_cmd, input=full_prompt, capture_output=True, text=True, timeout=1800)
                                     if retry_result.returncode == 0 and retry_result.stdout and len(retry_result.stdout.strip()) > 50:
                                         output_path.write_text(retry_result.stdout, encoding='utf-8')
                                         worker_logger.info(f"Retry successful: Translation saved to {output_path} ({len(retry_result.stdout)} chars)")
@@ -609,7 +609,7 @@ IMPORTANT: Output only the Vietnamese translation. Do not explain what you did. 
                         return False
                         
                 except subprocess.TimeoutExpired:
-                    worker_logger.error(f"Translation timeout (1200s) for {input_file}")
+                    worker_logger.error(f"Translation timeout (1800s) for {input_file}")
                     worker_logger.info(f"Claude CLI process timed out")
                     return False
                     
