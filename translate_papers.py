@@ -74,7 +74,7 @@ Văn bản cần dịch:
             with open(file_path, 'r', encoding='latin-1') as f:
                 return f.read()
 
-    def translate_text_chunks(self, text, max_chunk_size=4000):
+    def translate_text_chunks(self, text, max_chunk_size=15000):
         """Chia text thành chunks nhỏ để dịch"""
         chunks = []
         current_chunk = ""
@@ -116,7 +116,7 @@ Văn bản cần dịch:
                     {"role": "user", "content": chunk}
                 ],
                 temperature=0.1,
-                max_tokens=4000
+                max_tokens=50000
             )
             return response.choices[0].message.content.strip()
         except Exception as e:

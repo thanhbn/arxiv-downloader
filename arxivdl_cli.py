@@ -73,7 +73,8 @@ class ArXivCLI:
                     'claude': 'translate_manager.py',
                     'check': 'check_translation_completeness.py',
                     'add-queue': 'add_to_translation_queue.py',
-                    'cleanup': 'cleanup_translations.py'
+                    'cleanup': 'cleanup_translations.py',
+                    'process-stalled': 'process_stalled_translations.py'
                 },
                 'default': 'translate_manager.py',
                 'help': 'Translate papers using OpenAI or Claude with quality checking'
@@ -112,12 +113,14 @@ class ArXivCLI:
             'setup': {
                 'description': 'Setup and configuration tools',
                 'scripts': {
+                    'init': 'init_project.py',
                     'env': 'setup_env.sh',
                     'simple': 'setup_simple.sh',
                     'test': 'test_setup.py',
-                    'direnv': 'setup_direnv_fixed.sh'
+                    'direnv': 'setup_direnv_fixed.sh',
+                    'completion': 'setup_autocompletion.py'
                 },
-                'default': 'setup_env.sh',
+                'default': 'init_project.py',
                 'help': 'Setup development environment, dependencies, and direnv configuration'
             },
             'workflow': {
@@ -220,6 +223,14 @@ class ArXivCLI:
                 'python3 cleanup_translations.py --threshold 0.2 --backup',
                 'python3 cleanup_translations.py --threshold 0.1 --requeue',
                 
+                # Process stalled translations (uses 0.4 threshold by default)
+                'python3 process_stalled_translations.py',
+                'python3 process_stalled_translations.py --execute',
+                'python3 process_stalled_translations.py --max-age 24',
+                'python3 process_stalled_translations.py --execute --max-age 48',
+                'python3 process_stalled_translations.py --score 0.3',
+                'python3 process_stalled_translations.py --execute --score 0.5',
+                
                 # Test translation setup
                 'python3 test_translation.py'
             ],
@@ -299,12 +310,21 @@ class ArXivCLI:
                 'python3 inventory_expected_papers.py --format markdown'
             ],
             'setup': [
+                # First-time setup (recommended for newbies)
+                'python3 init_project.py',
+                'python3 init_project.py --quick',
+                'python3 init_project.py --full',
+                
                 # Environment setup
                 './setup_env.sh',
                 './setup_simple.sh',
                 
                 # Direnv configuration
                 './setup_direnv_fixed.sh',
+                
+                # Autocompletion setup
+                'python3 setup_autocompletion.py',
+                'python3 setup_autocompletion.py --install',
                 
                 # Test setup
                 'python3 test_setup.py',
