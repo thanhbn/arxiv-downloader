@@ -1,0 +1,395 @@
+arXiv:2106.02679v1 [cs.LG] 4 Jun 2021
+
+Tích lũy gradient theo lớp và song song pipeline mô-đun: huấn luyện nhanh và hiệu quả các mô hình ngôn ngữ lớn
+
+Joel Lamy-Poirier∗
+8 tháng 6, 2021
+
+Tóm tắt
+
+Sự ra đời của transformer đã tạo ra một sự tăng trưởng nhanh chóng trong quy mô của các mô hình ngôn ngữ, vượt xa những cải tiến phần cứng. Các transformer (dày đặc) được kỳ vọng sẽ đạt đến quy mô nghìn tỷ tham số trong tương lai gần, việc huấn luyện đòi hỏi hàng nghìn hoặc thậm chí hàng chục nghìn GPU. Chúng tôi nghiên cứu những thách thức của việc huấn luyện ở quy mô này và xa hơn nữa trên phần cứng thương mại có sẵn. Đặc biệt, chúng tôi phân tích thời gian huấn luyện ngắn nhất có thể cho các cấu hình khác nhau của huấn luyện phân tán, tận dụng các quy luật tỷ lệ thực nghiệm cho mô hình ngôn ngữ để ước tính kích thước lô tối ưu (quan trọng). Trái với niềm tin phổ biến, chúng tôi không tìm thấy bằng chứng cho một rào cản bộ nhớ, và thay vào đó lập luận rằng giới hạn thực sự — ngoài chi phí — nằm ở thời gian huấn luyện.
+
+Ngoài phân tích này, chúng tôi giới thiệu hai phương pháp mới, tích lũy gradient theo lớp và song song pipeline mô-đun, cùng nhau cắt giảm thời gian huấn luyện ngắn nhất đi một nửa. Các phương pháp này cũng giảm thiểu việc di chuyển dữ liệu, hạ thấp yêu cầu mạng đến mức không cần thiết kết nối InfiniBand nhanh. Hiệu quả mạng tăng này cũng cải thiện các phương pháp được giới thiệu với bộ tối ưu ZeRO, giảm việc sử dụng bộ nhớ xuống một phần nhỏ của bộ nhớ GPU có sẵn.
+
+1 Giới thiệu
+
+Các mô hình ngôn ngữ quy mô lớn đang nhanh chóng thay đổi lĩnh vực xử lý ngôn ngữ tự nhiên. Transformers [31] đã trở thành kiến trúc được ưa chuộng cho các mô hình ngôn ngữ, đơn giản hơn, có thể mở rộng hơn và hiệu quả hơn so với các lựa chọn thay thế dựa trên mạng nơ-ron hồi quy. Mặc dù transformers có nhiều biến thể và phiên bản khác nhau [2,6,8,14,21,22,32, ...], một lượng lớn công trình nghiên cứu cho thấy rằng hiệu suất mô hình chủ yếu được thúc đẩy bởi quy mô. Hơn nữa, khả năng học vài mẫu đã được quan sát thấy trong GPT-3 (175 tỷ tham số) [2]. Điều này mở ra lĩnh vực xử lý ngôn ngữ tự nhiên cho một loạt ứng dụng mới trong đó việc tinh chỉnh là không thể hoặc không thực tế. Những khả năng học vài mẫu này chưa được quan sát thấy trong các mô hình nhỏ hơn, vì vậy chúng được tin là chỉ xuất hiện ở quy mô của GPT-3, củng cố nhu cầu cho các mô hình ngôn ngữ cực kỳ lớn.
+
+Trong khi các mô hình ngôn ngữ lớn mang lại những khả năng mới thú vị, chúng cũng đặt ra một thách thức kỹ thuật khó khăn và tốn kém. Ví dụ, việc chỉ lưu trữ trạng thái huấn luyện của GPT-3 chiếm khoảng 2 terabyte bộ nhớ, và việc lưu trữ các kích hoạt trung gian và gradient chiếm thêm vài terabyte nữa. Điều này gấp hàng chục lần bộ nhớ có sẵn trên GPU lớn nhất hiện tại, NVIDIA A100 80GB. Ngoài bộ nhớ, việc huấn luyện cũng đòi hỏi một lượng sức mạnh tính toán khổng lồ. GPT-3 cần khoảng 3600 petaflop-day để huấn luyện, hoặc 30 năm trên cùng một thiết bị.
+
+Để tăng tốc việc huấn luyện các mô hình lớn, cần thiết phải song song hóa quá trình huấn luyện bằng cách phân phối tải trên nhiều GPU. Phương pháp hàng đầu là song song 3d (xem ví dụ [27]), kết hợp ba dạng song song phổ biến: dữ liệu, pipeline và tensor. Cùng với các phương pháp như huấn luyện độ chính xác hỗn hợp và kiểm tra điểm kích hoạt, song song 3d cho phép huấn luyện nhanh chóng các mô hình lớn với hàng trăm tỷ tham số nhưng không quá nhanh vượt qua quy mô đó. Ví dụ, GPT-3 được huấn luyện trong vài ngày, trong khi phiên bản nghìn tỷ tham số của Megatron-LM sẽ cần hơn ba tháng để huấn luyện [18]. Đối với các mô hình lớn hơn, thời gian huấn luyện tính theo năm hoặc tệ hơn.
+
+Gần đây, một số tối ưu hóa bộ nhớ đã được đề xuất cho các mô hình lớn, nhắm đặc biệt vào việc đơn giản hóa tinh chỉnh. Khi so sánh với huấn luyện từ đầu, tinh chỉnh đòi hỏi ít sức mạnh tính toán hơn nhiều và có thể được thực hiện với số lượng GPU hạn chế, nhưng việc làm như vậy tạo ra một nút thắt cổ chai bộ nhớ. Họ phương pháp ZeRO giải quyết nút thắt cổ chai này bằng cách phân chia trạng thái huấn luyện [23], tích cực chuyển tải bộ nhớ [25, 24], và chia nhỏ các phép toán riêng lẻ [24]. Những phương pháp này cùng nhau phá vỡ mọi ràng buộc về bộ nhớ.
+
+Trong khi nhiều sự chú ý đã được dành cho việc sử dụng bộ nhớ, ít nỗ lực hơn đã được dành cho việc giảm thời gian huấn luyện. Vì mục đích này, chúng tôi nghiên cứu các cấu hình và chiến lược huấn luyện song song khác nhau cho các transformer lớn và dày đặc, với mục tiêu tối thiểu hóa thời gian huấn luyện trên phần cứng hiện có. Chúng tôi tích hợp rõ ràng khái niệm kích thước lô quan trọng [9, 15, 26] trong phân tích của mình, tận dụng các quy luật tỷ lệ thực nghiệm được tìm thấy trong [12]. Kích thước lô quan trọng cung cấp giới hạn trên cho việc mở rộng hiệu quả của kích thước lô, và bằng cách mở rộng quy định có bao nhiêu GPU có thể được sử dụng để huấn luyện. Theo hiểu biết của chúng tôi, phân tích của chúng tôi là đầu tiên tích hợp trực tiếp kích thước lô quan trọng và các giới hạn song song kết quả cho các mô hình ngôn ngữ lớn. Phân tích của chúng tôi có thể được áp dụng cho một loạt quy mô rộng, từ những transformer nhỏ nhất hàng nghìn tham số đến quy mô triệu tỷ tham số và xa hơn.
+
+Phân tích của chúng tôi cho thấy bộ nhớ không phải là yếu tố hạn chế ngay cả vượt qua quy mô nghìn tỷ tham số. Thay vào đó, chúng tôi tìm thấy một nút thắt cổ chai tính toán gây ra bởi các hạn chế của huấn luyện phân tán. Do các ràng buộc từ kích thước lô quan trọng và kết nối mạng, song song 3d có thể sử dụng hiệu quả một số lượng GPU hạn chế, và giới hạn trên này không tăng gần như nhanh so với lượng tính toán cần thiết để huấn luyện các mô hình lớn hơn. Chúng tôi tìm thấy thời gian huấn luyện tối thiểu khoảng hai tuần cho mô hình nghìn tỷ tham số, và giới hạn này mở rộng tệ hơn tuyến tính so với kích thước mô hình. Kết quả là, thời gian huấn luyện tính theo tháng hoặc năm trên quy mô nghìn tỷ tham số. Chúng tôi cũng tìm thấy rằng họ phương pháp ZeRO phản tác dụng cho thời gian huấn luyện, phần lớn vì các chuyển giao dữ liệu thường xuyên trong các phương pháp tiếp cận vi lô — bao gồm song song pipeline — ngăn cản song song 3d hiệu quả.
+
+Chúng tôi giới thiệu hai phương pháp có liên quan chặt chẽ cải thiện đáng kể hiệu quả huấn luyện, đồng thời cũng giảm việc sử dụng bộ nhớ và yêu cầu mạng. Phương pháp đầu tiên, tích lũy gradient theo lớp, sử dụng lịch trình hiệu quả băng thông cho tích lũy gradient, làm cho việc chồng chéo giảm gradient với tính toán dễ dàng hơn. Nó cũng hòa giải tích lũy gradient với các phương pháp được giới thiệu trong bộ tối ưu ZeRO, tránh các chuyển giao dữ liệu thường xuyên khi phân chia trạng thái huấn luyện hoặc khi chuyển tải nó vào bộ nhớ CPU. Phương pháp thứ hai, song song pipeline mô-đun, sử dụng phân chia mô-đun của các lớp để cải thiện hiệu quả của huấn luyện song song pipeline bằng cách tối thiểu hóa "bong bóng" pipeline, điều này hạn chế hiệu quả của song song pipeline. Nó cũng xây dựng dựa trên tích lũy gradient theo lớp, cho phép các lợi ích của nó trong trường hợp song song pipeline. Đặc biệt, nó cho phép phân chia trạng thái huấn luyện trong cài đặt song song 3d nhanh nhất, giảm việc sử dụng bộ nhớ xuống mức tối thiểu và ngăn cản sự đánh đổi giữa việc sử dụng bộ nhớ và giảm bong bóng của song song pipeline mô-đun. Những phương pháp này cùng nhau cho phép huấn luyện ít nhất nhanh gấp đôi so với các phương pháp trước đây, ví dụ giảm thời gian huấn luyện tối thiểu xuống một tuần cho mô hình nghìn tỷ tham số. Trong khi chúng tôi tập trung vào các transformer lớn, tích lũy gradient theo lớp và song song pipeline mô-đun không chỉ dành riêng cho transformer hoặc thậm chí các mô hình lớn. Trên thực tế, việc cải thiện chồng chéo giao tiếp đặc biệt hữu ích cho các mô hình nhỏ hơn, đặc biệt là trên các mạng chậm hơn.
+
+Đồng thời với công việc của chúng tôi, hai bài báo xuất hiện cho thấy sự chồng chéo với kết quả của chúng tôi. Phiên bản mới nhất của Megatron-LM [18] đề xuất phân chia các lớp tương tự như song song pipeline mô-đun, tuy nhiên các tác giả đề xuất lịch trình khác nhau nhằm giảm bộ nhớ kích hoạt. Thay vào đó, phương pháp của chúng tôi tập trung vào phương pháp hiệu quả mạng, dẫn đến lợi ích hiệu quả tăng từ phân chia lớp mới và khi kết hợp với phân chia trạng thái huấn luyện cũng dẫn đến việc sử dụng bộ nhớ thấp hơn. Trong phần 8.2, chúng tôi nghiên cứu chuyển tải đĩa theo cách tương tự như ZeRO-Infinity [24]. Các phương pháp của chúng tôi cho thấy kết quả cải thiện, giảm thêm yêu cầu cho việc chuyển tải và cho phép chuyển tải ngay cả trên ổ cứng chậm. Tuy nhiên, chúng tôi cũng thấy ít việc sử dụng cho không gian bổ sung này, vì việc sử dụng bộ nhớ có xu hướng vẫn hợp lý trong hầu hết các tình huống. Thay vào đó, chúng tôi đề xuất tận dụng các kết quả để cải thiện các phương pháp tạo điểm kiểm tra.
+
+Bài báo này được cấu trúc như sau. Trong phần 2 chúng tôi mô tả các phương pháp hiện có và cung cấp một số bối cảnh bổ sung cho bài báo. Trong phần 3 và 4 chúng tôi giới thiệu các phương pháp mới chính. Trong phần 5, 6 và 7, chúng tôi phân tích tác động của phương pháp chúng tôi lên tốc độ huấn luyện và việc sử dụng bộ nhớ, sau đó tổng quát hóa cho một loạt quy mô rộng. Trong phần 8 chúng tôi nghiên cứu một số mối quan tâm bổ sung phát sinh trong các tình huống huấn luyện thực tế. Cuối cùng, trong phần 9 chúng tôi thảo luận về các hàm ý và hạn chế của kết quả chúng tôi.
+
+2 Bối cảnh và công việc liên quan
+
+Trong phần này chúng tôi mô tả các tối ưu hóa và phương pháp huấn luyện phân tán có liên quan đến phân tích của chúng tôi.
+
+2.1 Kích thước lô quan trọng
+
+Trong phương pháp gradient descent ngẫu nhiên, gradient của loss so với các tham số mô hình được ước tính từ một vi-lô. Khi vi-lô nhỏ, việc thêm nhiều mẫu cải thiện ước tính này và cho phép huấn luyện với số bước tỷ lệ thấp hơn, giữ tổng lượng tính toán không đổi. Tuy nhiên, vượt qua một điểm nhất định, ước tính trở nên đủ chính xác và việc thêm nhiều mẫu không còn giảm số bước cần thiết. Kích thước lô quan trọng [9, 15, 26] cung cấp giới hạn trên cho chế độ vi-lô nhỏ, và có thể thu được bằng cách ước tính biến thiên (nhiễu) của gradient giữa các mẫu riêng lẻ, tương đối với gradient thực [15].
+
+2.2 Huấn luyện độ chính xác hỗn hợp
+
+Mạng nơ-ron sâu không đòi hỏi độ chính xác số học cao, và ở một mức độ nào đó có thể được huấn luyện chỉ với 16 bit độ chính xác. Phương pháp tiên tiến trong lĩnh vực đó là huấn luyện độ chính xác hỗn hợp [16], trong đó phần lớn tính toán được thực hiện ở độ chính xác nửa, trong khi trọng số được lưu trữ và cập nhật ở độ chính xác đơn. Tuy nhiên, độ chính xác nửa có phạm vi số mũ hạn chế, và gradient cần được chia tỷ lệ động để hạn chế rủi ro tràn dưới và tràn trên. Vấn đề cũng có thể được giải quyết với định dạng dữ liệu bfloat16, có phạm vi số mũ rộng hơn và có sẵn trong các thiết bị gần đây như NVIDIA A100.
+
+2.3 Chồng chéo giao tiếp
+
+Ngoài chính tính toán, việc chuyển giao dữ liệu mang lại thách thức tối ưu hóa đáng kể. Chúng nên được thực hiện song song với phần lớn tính toán, nếu không các lõi tính toán sẽ nhàn rỗi trong quá trình chuyển giao. Vì tính toán và giao tiếp mạng chủ yếu sử dụng các tài nguyên riêng biệt, về nguyên tắc chúng có thể được chồng chéo với hiệu quả gần như hoàn hảo, vì vậy thời gian chạy được xác định bởi phép toán chậm nhất. Phép toán được cho là bị ràng buộc tính toán hoặc bị ràng buộc dữ liệu tùy thuộc vào phép toán nào hoàn thành cuối cùng, với tình huống đầu tiên được ưa chuộng ở đây. Trong thực tế, có một overhead nhỏ khi chồng chéo các phép toán, nhưng chúng tôi bỏ qua nó cho mục đích của bài báo này.
+
+Ngưỡng cho một phép toán bị ràng buộc tính toán được mô tả thông qua khái niệm cường độ số học. Đối với một phép toán đòi hỏi cả tính toán và chuyển giao dữ liệu, cường độ số học được định nghĩa là tỷ lệ giữa lượng tính toán và chuyển giao dữ liệu. Trong trường hợp chồng chéo hoàn hảo, phép toán bị ràng buộc tính toán nếu cường độ số học cao hơn mức phần cứng có thể hỗ trợ. Ví dụ, NVIDIA A100 có công suất tính toán đỉnh 312 teraflops cho độ chính xác nửa và băng thông bộ nhớ 2039 GB/s, cho ngưỡng cường độ số học 143 flops/B. Phép cộng nhị phân với cường độ số học 1/6 nằm sâu trong vùng bị ràng buộc bộ nhớ, trong khi phép nhân hai ma trận 1024x1024 có cường độ số học 341 và bị ràng buộc tính toán.
+
+2.4 Huấn luyện phân tán
+
+Có hai dạng song song chính, song song dữ liệu trong đó mỗi thiết bị thực hiện cùng một tính toán trên một tập con của dữ liệu, và song song mô hình trong đó mô hình và tính toán được chia giữa các thiết bị.
+
+Trong song song dữ liệu, lô đầu vào được chia giữa nb thiết bị. Mỗi thiết bị độc lập xử lý đầu vào được gán, sau đó gradient kết quả được giảm (tổng) giữa các thiết bị, và cuối cùng mỗi thiết bị độc lập cập nhật tất cả trọng số. Tất cả giao tiếp mạng xảy ra trong việc giảm gradient, phần lớn có thể được chồng chéo với lượt truyền ngược, và sự chồng chéo này có thể được làm cho bị ràng buộc tính toán với vi-lô đủ lớn. Song song dữ liệu là phương pháp được sử dụng nhiều nhất cho huấn luyện song song, vì tính đơn giản và khả năng có sẵn rộng rãi. Tuy nhiên, vì mỗi thiết bị cần lưu trữ một bản sao của mô hình, việc sử dụng bộ nhớ là quá mức đối với các mô hình lớn hơn. Điều này có thể được giải quyết bằng cách phân chia mô hình, như được đề xuất trong [23]. Trong trường hợp phân chia này, mô hình được chia giữa các thiết bị, mỗi thiết bị chịu trách nhiệm lưu trữ và cập nhật một phần bằng nhau của trọng số. Các tensor trọng số được tái tạo trên mỗi thiết bị khi cần thiết, và gradient đã giảm chỉ được giữ lại khi cần thiết. Việc phân chia tăng giao tiếp mạng 50%. Song song dữ liệu mở rộng lên đến kích thước lô quan trọng bc, nhưng nói chung cần có kích thước vi-lô tối thiểu để chồng chéo giao tiếp hiệu quả, giảm giới hạn xuống một phần của bc.
+
+Song song mô hình có hai dạng chính, tùy thuộc vào cách mô hình được chia. Dạng đầu tiên là song song pipeline, trong đó mỗi thiết bị trong nl thiết bị chịu trách nhiệm cho một tập con của các lớp. Đầu vào được pipeline qua các thiết bị, và tính toán song song đạt được bằng cách cung cấp vi-lô tuần tự cho mô hình [11]. Mỗi thiết bị xử lý tất cả vi-lô cho một lô nhất định, sau đó cập nhật trọng số. Tuy nhiên, điều này dẫn đến hiệu ứng "bong bóng" trong đó một số thiết bị nhàn rỗi do thiếu đầu vào (xem phần trên của hình 3). Đối với đầu vào được chia thành nµ vi-lô, bong bóng này tăng thời gian huấn luyện bởi hệ số (nl-1)/nµ. Song song pipeline cũng bị hạn chế về độ lớn, vì nó không thể phát triển vượt quá số lượng lớp trong mô hình.
+
+Dạng khác của song song mô hình, song song tensor, bao gồm việc cắt tensor sao cho mỗi thiết bị chịu trách nhiệm đánh giá một lát của kích hoạt sử dụng lát tương ứng của trọng số. Song song tensor phức tạp hơn hai dạng song song khác và thường phụ thuộc vào chi tiết nội bộ của mô hình. Nó cũng đòi hỏi giao tiếp mạng nhiều hơn và nói chung chỉ khả thi với các kết nối nhanh nhất như NVLink. Trong thực tế, điều này giới hạn song song tensor đến 16 GPU, số lượng tối đa có thể được kết nối với NVLink.
+
+Mặc dù song song dữ liệu, pipeline và tensor đều bị hạn chế riêng lẻ, chúng có thể được kết hợp cùng nhau thành song song 3d (lên đến). Các chiều kết hợp theo cách nhân, với tổng số ngpu=nb×nl×na thiết bị. Trong song song 3d, kích thước lô đầu vào được chia cả giữa các instance song song dữ liệu, và giữa nµ≥nl vi-lô tuần tự. Đối với lô có kích thước b, điều này ngụ ý kích thước vi-lô bµ=b/(nb×nµ).
+
+Do hạn chế từ kích thước lô quan trọng (xem phần 2), điều này ngụ ý sự cạnh tranh giữa song song dữ liệu và pipeline, nhưng phương pháp kết hợp thường cho phép mức độ song song cao hơn so với bất kỳ phương pháp nào riêng lẻ. Điều này là do song song pipeline tăng cường độ số học cho việc giảm gradient, giảm kích thước vi-lô tối thiểu. Tuy nhiên, song song pipeline không mang lại lợi ích như vậy với trạng thái huấn luyện phân chia, trong đó các phép toán mạng cần được lặp lại cho mỗi vi-lô.
+
+2.5 Tối ưu hóa bộ nhớ
+
+Khi mô hình tăng kích thước, việc sử dụng bộ nhớ của nó cũng tăng theo, và cần có các tối ưu hóa bộ nhớ đáng kể để tránh hết bộ nhớ. Phần lớn việc sử dụng bộ nhớ rơi vào hai danh mục: trạng thái huấn luyện và bộ nhớ kích hoạt. Trạng thái huấn luyện bao gồm các tham số mô hình và trạng thái bộ tối ưu, đối với Adam bao gồm trung bình chạy và phương sai của các tham số. Với mục đích của bài báo này, gradient tham số cũng được bao gồm trong trạng thái huấn luyện. Bộ nhớ kích hoạt bao gồm các kích hoạt lớp và gradient của chúng. Cả hai danh mục đều có thể sử dụng lượng bộ nhớ đáng kể cho các mô hình lớn hơn, nhưng các kỹ thuật khác nhau đã được phát triển để giảm tiêu thụ bộ nhớ.
+
+Trạng thái huấn luyện tỷ lệ với kích thước mô hình. Ở 80 GB, NVIDIA A100 có thể lưu trữ tối đa 20 tỷ tham số ở độ chính xác đơn, hoặc 6.7 tỷ với ADAM. Vì kích thước huấn luyện cố định, cần bộ nhớ bổ sung để phù hợp với các mô hình lớn hơn, và huấn luyện phân tán cung cấp bộ nhớ như vậy. Như được mô tả trong phần 2.4, trạng thái huấn luyện được chia theo cấu trúc trong các hướng song song mô hình và có thể được phân chia trong hướng song song dữ liệu. Trạng thái huấn luyện cũng có thể được chuyển tải vào bộ nhớ CPU; tuy nhiên, điều này đòi hỏi các chuyển giao dữ liệu bổ sung và có thể tạo ra nút thắt cổ chai giao tiếp.
+
+Với việc phân chia trạng thái huấn luyện hoặc chuyển tải, trọng số mô hình được lưu trữ trong thiết bị khác và phải được khôi phục trước khi sử dụng, vì vậy cần các bộ đệm bổ sung. Tương tự, gradient cần được tạo trên bộ đệm trước khi được chuyển đến nơi thích hợp. Trong khi những bộ đệm tham số và gradient này nhỏ so với toàn bộ trạng thái huấn luyện, chúng chi phối việc sử dụng bộ nhớ GPU cho các mô hình lớn hơn một khi tất cả các tối ưu hóa được tính đến. Những bộ đệm này ở một mức độ nào đó cũng được yêu cầu khi không có phân chia hoặc chuyển tải, vì ví dụ các tham số cần được chuyển đổi sang 16 bit trước khi sử dụng.
+
+Bộ nhớ kích hoạt cũng là một mối quan tâm, và các triển khai ngây thơ có thể dễ dàng đòi hỏi hàng trăm gigabyte ngay cả ở quy mô tỷ tham số. Việc giảm đáng kể nhất trong bộ nhớ kích hoạt đạt được với kiểm tra điểm kích hoạt, trong đó phần lớn kích hoạt được bỏ trong lượt truyền xuôi [3]. Một tập con của kích hoạt được giữ làm điểm kiểm tra và được sử dụng để tính toán lại các kích hoạt còn lại trong lượt truyền ngược. Điều này giảm bộ nhớ kích hoạt bằng một hệ số đáng kể, giảm nó xuống kích hoạt lớp, tức là, bộ nhớ kích hoạt cần thiết giữa các điểm kiểm tra kích hoạt, và chính các điểm kiểm tra kích hoạt, trong nhiều trường hợp có thể được chuyển tải vào bộ nhớ CPU. Phương pháp đi kèm với chi phí tăng 33% trong tính toán, nhưng không có lựa chọn thay thế cho các mô hình lớn hơn.
+
+Vì bộ nhớ kích hoạt tỷ lệ với kích thước vi-lô, một tối ưu hóa bộ nhớ rõ ràng là giảm nó xuống, xuống một mẫu đơn nếu có thể. Trong khi vi-lô mẫu đơn thường không được khuyến nghị, chúng có thể chạy hiệu quả cho các mô hình lớn hơn mà các kernel tính toán đủ lớn. Tuy nhiên, vi-lô nhỏ đi kèm với cường độ số học thấp hơn so với trọng số mô hình, có thể tạo ra nút thắt cổ chai trong trường hợp song song dữ liệu hoặc chuyển tải bộ nhớ. Các phương pháp tích lũy gradient theo lớp và song song pipeline mô-đun được giới thiệu trong bài báo này được thiết kế để ngăn chặn những nút thắt cổ chai như vậy, và cho phép chạy hiệu quả với kích thước vi-lô là một.
+
+Về một ghi chú bên lề, tích lũy gradient cho phép tăng kích thước lô mà không hết bộ nhớ, bằng cách xử lý nhiều vi-lô tuần tự giữa các cập nhật trọng số. Điều này đặc biệt hữu ích với song song dữ liệu qua mạng chậm, vì các lô lớn hơn giảm tần suất của việc giảm gradient. Tuy nhiên, điều này dẫn đến chồng chéo giao tiếp không hiệu quả vì việc giảm gradient được tập trung trong vi-lô cuối cùng. Phương pháp này cũng phản tác dụng cho việc tối ưu hóa thời gian huấn luyện, vì các vi-lô được xử lý tuần tự thay vì song song. Tích lũy gradient theo lớp được thiết kế để cải thiện chồng chéo giao tiếp, trong khi song song pipeline cho phép xử lý các vi-lô song song.
+
+Ngoài trạng thái huấn luyện và bộ nhớ kích hoạt, có thể có một số việc sử dụng bộ nhớ bổ sung hoặc chi phí bộ nhớ ẩn. Nhiều thư viện cho huấn luyện phân tán, bao gồm Pytorch DistributedDataParallel, sử dụng chiến lược đóng gói cho các phép toán mạng, kết hợp nhiều tensor trong bộ đệm mạng tạm thời. Điều này ưu tiên cho các tensor nhỏ, vì nó tránh overhead hoặc chạy các phép toán riêng lẻ tuần tự, nhưng đi kèm với chi phí sử dụng bộ nhớ và di chuyển dữ liệu bổ sung. Trong ZeRO-R, được đề xuất sử dụng bộ đệm kích thước không đổi để giữ overhead bộ nhớ bị giới hạn [23]. Tuy nhiên, trong trường hợp hiện tại, các bộ đệm tham số và gradient đã đóng vai trò tương tự như bucket, và các phép toán mạng tại chỗ có thể được thực hiện mà không có chi phí bộ nhớ thêm.
+
+Ngay cả khi có đủ bộ nhớ, phân mảnh bộ nhớ vẫn có thể khiến thiết bị hết bộ nhớ. Đối với các mô hình lớn hơn, phân mảnh bộ nhớ trở thành vấn đề vì việc phân bổ liên quan đến các khối bộ nhớ liền kề rất lớn, và có sự chồng chéo giữa các kích hoạt sống ngắn và gradient của chúng, và các tensor sống lâu hơn như điểm kiểm tra kích hoạt và gradient tham số. Giải pháp cho điều này là tiền phân bổ các bộ đệm liền kề cho bộ nhớ bất cứ khi nào có thể. Tiền phân bổ cũng cho phép kết hợp tensor thành một khối bộ nhớ liền kề (hợp nhất) duy nhất, không chỉ đảm bảo phân bổ tối ưu mà còn cho phép chạy các phép toán dữ liệu trên tensor hợp nhất. Trong [23], được đề xuất tiền phân bổ các điểm kiểm tra kích hoạt và gradient tham số. Điều này để lại các kích hoạt lớp và gradient làm nguồn chính của phân mảnh, vẫn có thể đáng kể vì sự mất cân bằng kích thước giữa các kích hoạt khác nhau, tạo ra các khoảng trống bộ nhớ lớn. Ví dụ, chúng tôi đã quan sát thấy overhead lên đến 40% cho một lớp transformer duy nhất trong triển khai PyTorch. Tuy nhiên, có thể giảm overhead này xuống gần như bằng không với triển khai hiệu quả bộ nhớ, vì vậy trong bài báo này chúng tôi giả định chi phí phân mảnh bộ nhớ là tối thiểu.
+
+3 Tích lũy gradient theo lớp
+
+Trong tích lũy gradient theo lớp, chúng tôi chia đầu vào thành các vi-lô giống hệt như trong tích lũy gradient tiêu chuẩn, nhưng chúng tôi xử lý tất cả vi-lô cho một lớp nhất định trước khi chuyển sang lớp tiếp theo. Chúng tôi lấy những lớp như vậy làm khoảng giữa các điểm kiểm tra kích hoạt, để chúng tôi có thể bỏ các kích hoạt trung gian giữa các vi-lô.
+
+Phương pháp tích lũy gradient theo lớp có lợi từ góc độ dữ liệu. Với song song dữ liệu, nó cho phép chồng chéo hiệu quả của việc giảm gradient với lượt truyền ngược, không như tích lũy gradient truyền thống chỉ cho phép chồng chéo với vi-lô cuối cùng. Điều này được minh họa trong hình 1. Với phân chia trạng thái, tích lũy gradient theo lớp giảm đáng kể yêu cầu băng thông bằng cách loại bỏ sự dư thừa trong các phép toán khôi phục tham số và giảm gradient, như được minh họa trong hình 2. Tương tự, tích lũy gradient theo lớp giúp với chuyển tải bằng cách giảm lượng di chuyển dữ liệu. Tất cả các điểm kiểm tra kích hoạt phải được giữ, trong sự hiện diện của song song pipeline đã là một yêu cầu, nhưng nếu không có thể gây ra tăng trong bộ nhớ điểm kiểm tra kích hoạt.
+
+Lưu ý rằng tích lũy gradient theo lớp thường không thể được kết hợp hiệu quả với song song pipeline tiêu chuẩn. Thật vậy, một instance song song pipeline nhất định phải xử lý mọi vi-lô cho mọi lớp khác ngoài lớp cuối cùng trước khi nó có thể chuyển đầu ra cho instance tiếp theo. Điều này được giải quyết với song song pipeline mô-đun.
+
+4 Song song pipeline mô-đun
+
+Trong song song pipeline, các lớp thường được chia thành các khối liền kề. Đối với mạng có dl lớp được chia thành nl thiết bị, instance đầu tiên nhận các lớp 1 đến dl/nl, instance thứ hai nhận các lớp dl/nl+1 đến 2dl/nl, v.v. Tuy nhiên, trong khi việc chia "ngây thơ" này tối thiểu hóa các phép toán mạng song song pipeline, nó cũng tối đa hóa hiệu ứng bong bóng. Trong song song pipeline mô-đun, các lớp thay vào đó được chia theo cách mô-đun, để instance đầu tiên nhận các lớp 1, nl+1, v.v., instance thứ hai nhận các lớp 2, nl+2, v.v., và cứ như vậy.
+
+Tính toán được lên lịch như với tích lũy gradient theo lớp, tức là, một instance nhất định xử lý tất cả vi-lô cho một lớp nhất định, sau đó chuyển sang lớp tiếp theo mà đầu vào nên sẵn sàng, v.v. Trong công thức mô-đun, một vi-lô đạt đến instance cuối cùng sau khi được xử lý trên nl-1 lớp thay vì dl(1-1/nl), giảm overhead bong bóng bằng hệ số dl/nl. Điều này làm cho có thể giảm bong bóng xuống gần như bằng không mà không tăng số lượng vi-lô nµ. Ngoài ra, việc giảm gradient được phân bổ đều hơn qua lượt truyền ngược, chia overhead mạng bằng hệ số dl/nl.
+
+Song song pipeline mô-đun đi kèm với tăng chi phí mạng song song pipeline vì dữ liệu cần được chuyển giao sau mỗi lớp, nhưng đối với các mô hình lớn chi phí này vẫn còn xa dưới việc sử dụng mạng song song dữ liệu. Việc chuyển giao dữ liệu này có thể được chồng chéo với tính toán miễn là có nhiều vi-lô hơn một chút so với các instance song song pipeline.
+
+5 Phương pháp luận
+
+Trong các phần sau, chúng tôi phân tích việc sử dụng tài nguyên và thời gian huấn luyện cho các mô hình ngôn ngữ lớn, tập trung vào tác động của các phương pháp được giới thiệu trong bài báo này, cũng như song song 3d và phân chia trạng thái huấn luyện. Chúng tôi trình bày một số ví dụ và kết quả có liên quan, để lại tính toán chi tiết cho phụ lục C.
+
+Chúng tôi giả định tính toán được thực hiện với một cụm có thể mở rộng với lên đến 16 GPU A100 mỗi nút, hỗ trợ cả InfiniBand và NVLink. Xem phụ lục A để biết chi tiết bổ sung về phần cứng.
+
+Mô hình Chúng tôi xem xét một bộ mã hóa transformer theo cách tiếp cận ban đầu [31], lên đến các sửa đổi không quan trọng về tính toán. Bộ mã hóa transformer được sử dụng ví dụ trong mô hình BERT [6] và các dẫn xuất của nó, và kết quả của chúng tôi tổng quát hóa một cách đơn giản cho các mô hình dựa trên bộ giải mã như họ GPT [20, 21, 2]. Để đơn giản, chúng tôi hạn chế vào phần transformer của mô hình, và bỏ qua các thành phần khác như tokenizer, lớp nhúng và đầu mô hình ngôn ngữ.
+
+Một bộ mã hóa transformer bao gồm dl lớp giống hệt nhau, mỗi lớp bao gồm một mô-đun attention đa đầu theo sau bởi một tính phi tuyến. Mô-đun đầu tiên bao gồm da đầu attention có kích thước dh, cho chiều rộng lớp dm=da×dh, trong khi mô-đun sau bao gồm mạng feedforward dày đặc hai lớp với kích thước trung gian dI=nI×dm. Mỗi lớp giữ pl≈(4+2nI)d²m tham số, với tổng số p≈(4+2nI)d²m×dl tham số.
+
+Để cụ thể, chúng tôi xem xét họ mô hình X[x] được mô tả trong phụ lục B, cho phép ngoại suy đến một loạt quy mô rộng. Tuy nhiên, cấu hình chính xác ít tạo ra sự khác biệt, vì vậy kết quả của chúng tôi tổng quát hóa đơn giản cho hầu hết các cấu hình.
+
+Huấn luyện Chúng tôi sử dụng huấn luyện độ chính xác hỗn hợp, và điểm kiểm tra kích hoạt tại đầu ra của mỗi lớp transformer. Chúng tôi chồng chéo giao tiếp khi có thể và chuyển tải trạng thái huấn luyện và điểm kiểm tra kích hoạt khi cần thiết (và có thể). Chúng tôi sử dụng phương pháp đệm gradient hỗn hợp cho các bộ đệm tham số và gradient, như được mô tả trong phụ lục C.2. Phương pháp này không nhất thiết hiệu quả bộ nhớ nhất nhưng kết hợp tốt với các phương pháp hiệu quả băng thông được giới thiệu ở đây và đủ cho tất cả mục đích thực tế. Bộ tối ưu Adam được giả định.
+
+Chúng tôi xem xét huấn luyện phân tán với lên đến ba chiều song song. Đối với song song tensor, chúng tôi tuân theo phương pháp cụ thể transformer được đề xuất trong [27]. Cách tiếp cận này tối thiểu hóa giao tiếp mạng, tuy nhiên không thể được chồng chéo với tính toán.
+
+Chúng tôi nghiên cứu ba chiến lược huấn luyện. Trong baseline, chúng tôi sử dụng song song dữ liệu và pipeline tiêu chuẩn (không có phân chia), như được mô tả trong phần 2.4. Trong phương pháp phân chia, chúng tôi cũng phân chia trạng thái huấn luyện trong hướng song song dữ liệu. Trong phương pháp cải tiến, chúng tôi triển khai tích lũy gradient theo lớp và song song pipeline mô-đun. Trừ khi được chỉ định khác, chúng tôi phân chia trạng thái huấn luyện trong phương pháp cải tiến, vì nó ưu tiên hơn trong hầu hết các trường hợp.
+
+Cấu hình tối ưu Chúng tôi chọn cấu hình huấn luyện phân tán như sau, với mục tiêu tối ưu hóa tốc độ huấn luyện mà không lãng phí quá nhiều sức mạnh tính toán. Chúng tôi huấn luyện tại hoặc hơi dưới kích thước lô quan trọng, vì huấn luyện trên nó là không hiệu quả. Việc lựa chọn dựa trên việc sử dụng tài nguyên được mô tả trong phụ lục C.
+
+Trong baseline, chúng tôi chọn song song pipeline cao nhất có thể (nếu áp dụng), vì nó giảm việc sử dụng bộ nhớ đồng thời cũng tăng hiệu quả do việc giảm gradient nhanh hơn. Chúng tôi chọn số lượng vi-lô hơi trên nl để đảm bảo chồng chéo của tính toán song song pipeline và kích thước vi-lô nhỏ nhất không gây ra nút thắt cổ chai giao tiếp. Với song song pipeline, chúng tôi áp đặt overhead tối đa 25% từ việc giảm gradient, mặc dù nó chỉ hạn chế cho các mô hình nhỏ hơn và mạng chậm. Khi cần chuyển tải, kích thước vi-lô cũng bị hạn chế bởi tỷ lệ chuyển giao CPU-GPU, và có thể có nút thắt cổ chai bổ sung trong kết nối PCI-express được chia sẻ giữa các chuyển giao CPU và InfiniBand.
+
+Trong phương pháp phân chia, chúng tôi không xem xét song song pipeline vì nó dẫn đến kết quả tệ hơn. Thay vào đó, chúng tôi tối đa hóa mức độ song song dữ liệu nb. Do tăng giao tiếp mạng, việc giảm gradient hạn chế hơn trên kích thước vi-lô so với phương pháp baseline, nhưng chuyển tải nói chung không hạn chế chút nào do kích thước nhỏ của trạng thái được chuyển tải.
+
+Trong phương pháp cải tiến, chúng tôi có thể đặt kích thước vi-lô là một, và tránh nút thắt cổ chai giao tiếp với số lượng nµ đủ cao. Chúng tôi tối đa hóa nb, sau đó nl dưới những cân nhắc này, để overhead bong bóng được tối thiểu hóa. Nói chung, tốt hơn là không chồng chéo giao tiếp song song pipeline, vì nµ và nl đều nhỏ và làm tròn lên thành một vi-lô thêm duy nhất sẽ giảm đáng kể tốc độ huấn luyện.
+
+Trong tất cả các trường hợp, song song tensor cho phép chia gần như hoàn hảo cả bộ nhớ và tính toán. Chúng tôi áp đặt overhead tối đa 25%, đối với các mô hình lớn (trên ~50 tỷ tham số) cho phép giới hạn thực tế na=16. Ở quy mô cực đoan (~25 nghìn tỷ tham số), có thể sử dụng hiệu quả song song tensor qua InfiniBand với na>16.
+
+Việc sử dụng tài nguyên Các yêu cầu tính toán, bộ nhớ và băng thông được đánh giá trong phụ lục C. Để có được ước tính thời gian huấn luyện, chúng tôi so sánh sức mạnh tính toán có sẵn và cần thiết, tính đến các overhead đo được từ bong bóng pipeline và chuyển giao dữ liệu không chồng chéo. Tuy nhiên, chúng tôi không xem xét hiệu quả của các kernel tính toán, chuyển giao dữ liệu và chồng chéo giao tiếp, vì vậy thời gian huấn luyện có thể được ước tính thấp. Mặt khác, việc sử dụng bộ nhớ được kỳ vọng chính xác cho các cấu hình huấn luyện đã cho.
+
+6 Ví dụ nghìn tỷ tham số
+
+Để nghiên cứu các yêu cầu cho huấn luyện ở quy mô nghìn tỷ tham số, chúng tôi xem xét mô hình 1.26 nghìn tỷ tham số X 160. Mô hình này bao gồm 160 lớp transformer với 80 đầu có kích thước 320, cho chiều rộng 25600. Độ dài chuỗi là 2560, và kích thước lô quan trọng được ước tính khoảng 2420. Huấn luyện cho 100k bước đòi hỏi 6.24×10²⁴ phép toán dấu phẩy động, hoặc 72 exaflop/s·ngày, tương ứng với 231k GPU-ngày trên A100 với hiệu quả hoàn hảo.
+
+Mặc dù yêu cầu tính toán mạnh mẽ gợi ý rằng cần một cụm lớn, để so sánh chúng tôi nghiên cứu các tình huống huấn luyện phân tán khác nhau, với cấu hình huấn luyện được chọn như sau. Các cấu hình kết quả được tóm tắt trong bảng 6.1, cùng với hiệu quả tính toán dự kiến và thời gian huấn luyện. Chúng tôi thấy cả song song dữ liệu và tensor đều cần thiết (và cùng nhau đủ) để huấn luyện trong thời gian hợp lý. Tuy nhiên, song song pipeline mô-đun nổi bật với cả số lượng GPU cao và hiệu quả gần tối ưu, cho phép huấn luyện mô hình trong một tuần. Nó cũng vượt trội so với baseline khi không có song song tensor, nhưng thời gian huấn luyện vẫn trên ba tháng.
+
+Một phân tích việc sử dụng bộ nhớ cho mỗi cấu hình được hiển thị trong bảng 6.2. Tất cả các phương pháp đều có thể từ góc độ bộ nhớ, giả định overhead phân mảnh bộ nhớ tối thiểu. Tuy nhiên, phương pháp baseline đòi hỏi lượng bộ nhớ chuyển tải không thực tế mà không có song song pipeline. Phương pháp cải tiến có dấu chân bộ nhớ thấp nhất là 4.72 GB, ít hơn 17 lần so với bộ nhớ có sẵn trong A100 80 GB.
+
+Các cụm nhỏ hơn Mặc dù huấn luyện mở rộng lên gần 40000 GPU, có thể khó tìm được cụm có kích thước đó, vì vậy có lý do mạnh mẽ cho huấn luyện với ít GPU hơn trong thời gian dài hơn. Có nhiều chiến lược khả thi cho các cụm nhỏ hơn, cho phép đánh đổi giữa hiệu quả, việc sử dụng bộ nhớ và lựa chọn phương pháp song song. Trong bảng 6.3, chúng tôi cung cấp một số cấu hình ví dụ với hiệu quả cao cho thời gian huấn luyện mục tiêu một và sáu tháng. Với những ràng buộc thời gian này, có thể huấn luyện với các cụm có kích thước 7400 và 1300 tương ứng, làm cho huấn luyện có sẵn cho một cộng đồng rộng rãi hơn một chút. Việc sử dụng bộ nhớ tăng khi so sánh với các cụm lớn hơn nhưng vẫn xa dưới mức có sẵn. Trong số các phương pháp được xem xét, phương pháp của chúng tôi hiệu quả nhất, mặc dù lề trở nên không đáng kể cho thời gian huấn luyện dài hơn. Nó cũng linh hoạt hơn nhiều, như được hiển thị ví dụ trong hai mục cuối cùng. Đối với huấn luyện sáu tháng, nó là phương pháp duy nhất có thể huấn luyện mà không có song song tensor (với chuyển tải). Nó cũng có thể huấn luyện với kích thước lô thấp hơn nhiều, tương đương với tăng hiệu quả thêm vì có chi phí ẩn khi huấn luyện với kích thước lô cao.
+
+7 Phân tích tỷ lệ và giới hạn thực tế
+
+Chúng tôi phân tích việc sử dụng bộ nhớ và thời gian huấn luyện tỷ lệ như thế nào với kích thước mô hình, sử dụng họ mô hình X[x] được mô tả trong phụ lục C.2. Chúng tôi xem xét ba chiến lược huấn luyện giống như trước — baseline, phân chia và cải tiến — nhưng hạn chế vào cấu hình nhanh nhất cho mỗi cấu hình.
+
+Hình 4 hiển thị việc sử dụng bộ nhớ và thời gian huấn luyện như một hàm của kích thước mô hình ở các quy mô khác nhau. Phương pháp cải tiến vượt trội so với những phương pháp khác ở hầu hết các quy mô, mặc dù nó trở nên giống hệt với phương pháp phân chia trên quy mô triệu tỷ tham số, vì song song pipeline không còn cần thiết.
+
+Tập trung vào phương pháp cải tiến, chúng tôi thấy rằng 80 GB đủ để huấn luyện các mô hình lên đến 280 nghìn tỷ tham số, với chuyển tải được yêu cầu trên 90 nghìn tỷ. Tuy nhiên, mô hình như vậy sẽ mất đến bốn năm để huấn luyện (và hơn nữa khi tính đến hiệu quả tính toán thực), điều này quá dài vì ví dụ chờ đợi thế hệ phần cứng tiếp theo có thể sẽ nhanh hơn. Để có được giới hạn tỷ lệ tốt hơn, chúng tôi xem xét ngưỡng hợp lý một tháng, và ngưỡng hào phóng hơn một năm. Những ngưỡng này tương ứng dẫn đến giới hạn khoảng 4.5 và 50 nghìn tỷ tham số, với tổng việc sử dụng bộ nhớ 13 và 62 GB.
+
+Kết quả trên cho thấy hạn chế mạnh mẽ về kích thước mô hình do thời gian huấn luyện. Tuy nhiên, có thể làm tốt hơn với GPU hiện có. Trong khi song song dữ liệu và pipeline bị hạn chế cơ bản bởi kích thước lô quan trọng, song song tensor bị hạn chế bởi lựa chọn thiết kế máy tính hạn chế kích thước nút đến 16. Cấu trúc NVSwitch kết nối đầy đủ trong các nút DGX và HGX thuận tiện trong trường hợp tổng quát, nhưng song song tensor chỉ đòi hỏi cấu trúc vòng, dễ dàng mở rộng đến kích thước tùy ý. Điều này có nghĩa là các nút lớn hơn (hoặc các nút riêng biệt được kết nối với NVLink) nên có thể, mặc dù có thể đòi hỏi một lượng kỹ thuật nhất định. Vì lý do này, chúng tôi xem xét tình huống trong đó hạn chế kích thước nút được loại bỏ, với kết quả được hiển thị trong hình 5. Trong trường hợp này, có đủ bộ nhớ cho các mô hình lên đến 100 triệu tỷ tham số, trong khi thời gian huấn luyện giảm giới hạn xuống 40 nghìn tỷ (một tháng) hoặc 900 nghìn tỷ tham số (một năm).
+
+Không có rào cản bộ nhớ Trong khi việc sử dụng bộ nhớ không phải là vấn đề cho đến quy mô thiên văn, chúng tôi có thể đi xa hơn và cho thấy bộ nhớ không bao giờ là vấn đề. Đối với điều này, chúng tôi giả định tại một thời điểm nào đó trong tương lai, có thể huấn luyện một mô hình nhất định trong thời gian cố định một tháng, sử dụng thiết bị nhanh hơn hoặc kết nối mạng nhanh hơn. Sau đó chúng tôi đo lường cần bao nhiêu bộ nhớ, liên quan đến sức mạnh tính toán. Để đơn giản, chúng tôi giả định rằng cấu hình vẫn sử dụng nhiều song song dữ liệu và pipeline nhất có thể, và chỉ mở rộng với song song tensor. Kết quả được hiển thị trong hình 6, cho thấy yêu cầu bộ nhớ giảm với kích thước mô hình. Trên thực tế, bộ nhớ chỉ là vấn đề ở quy mô nhỏ hơn, điều này có thể giải thích một phần vấn đề bộ nhớ được cảm nhận, nhưng đã có thể huấn luyện những mô hình đó nhanh hơn nhiều với lượng bộ nhớ tối thiểu (đường chấm). Những kết quả này không đặc biệt đáng ngạc nhiên, vì tỷ lệ bộ nhớ cao nhất đến từ trạng thái tỷ lệ với kích thước mô hình, trong khi tính toán có tỷ lệ tệ hơn do tăng kích thước đầu vào.
+
+8 Cân nhắc huấn luyện bổ sung
+
+Trong khi chúng tôi giả định cho đến nay sự tồn tại của một siêu máy tính đủ lớn, trong thực tế điều này có thể khó đạt được. Huấn luyện một mô hình ngôn ngữ lớn rất tốn kém, và thiết lập siêu máy tính như vậy dành riêng cho mục đích này tăng đáng kể chi phí. Vì lý do này, tốt hơn là tận dụng các trung tâm dữ liệu nơi các nút có thể nhanh chóng chuyển đổi và từ các tải công việc khác để chúng được sử dụng mà không bị gián đoạn. Trong tình huống này, số lượng nút có sẵn có thể thay đổi trong quá trình huấn luyện, ví dụ nếu cần chạy các tải công việc ưu tiên cao hơn hoặc một số nút cần được loại bỏ để bảo trì. Điều này có nghĩa là huấn luyện nên tốt hơn là đàn hồi, tức là, nó nên hỗ trợ các biến thể trong kích thước cụm. Ngay cả trong cụm cố định, rủi ro lỗi phần cứng cao do số lượng lớn các thành phần, và xử lý những lỗi này đòi hỏi một hình thức đàn hồi nào đó. Trong khi phân tích hoàn chỉnh về huấn luyện đàn hồi nằm ngoài phạm vi của bài báo này, trong phần này chúng tôi nghiên cứu một số mối quan tâm và tối ưu hóa tiềm năng liên quan đến các tối ưu hóa được trình bày trong bài báo này.
+
+Chúng tôi giả định các nút nằm trong cùng một trung tâm dữ liệu và tốt hơn là được kết nối qua InfiniBand, mặc dù trong phần 8.3 chúng tôi nghiên cứu hiệu ứng của huấn luyện qua kết nối Ethernet chậm hơn. Chúng tôi cũng giả định các giới hạn song song và mạng khác nhau được trình bày trong bài báo này được tôn trọng, điều này có thể được thực hiện bằng cách giảm mức độ song song dữ liệu từ giá trị tối đa được phép. Khi trạng thái được phân chia, điều này mang lại thách thức bổ sung vì việc phân chia thay đổi trong quá trình huấn luyện, nhưng chúng tôi cho thấy trong phần 8.3 rằng phân chia thực sự giúp với tính đàn hồi. Việc phân chia thay đổi cũng có thể tăng việc sử dụng bộ nhớ, nhưng có nhiều chỗ cho nó.
+
+8.1 Đừng giảm tỷ lệ học, tăng kích thước cụm
+
+Phân tích cho đến nay giả định sai rằng kích thước lô quan trọng không đổi trong quá trình huấn luyện. Trong quá trình huấn luyện sớm, gradient chứa tín hiệu cải thiện mô hình mạnh mẽ, nhưng khi mô hình được huấn luyện, tín hiệu này trở nên ít quan trọng hơn so với nhiễu, làm tăng số lượng mẫu cần thiết để có được ước tính chính xác, tức là, kích thước lô quan trọng. Kích thước lô quan trọng "duy nhất" được xem xét cho đến nay tương ứng với giá trị trong quá trình huấn luyện muộn, và sử dụng nó ngụ ý huấn luyện lãng phí trên kích thước lô quan trọng trong quá trình huấn luyện. Thay vào đó, kích thước lô quan trọng có thể được đánh giá động trong quá trình huấn luyện, và kích thước lô được điều chỉnh tương ứng [15, 28]. Trong bối cảnh hiện tại, điều này có nghĩa là kích thước cụm tối đa thay đổi trong quá trình huấn luyện, và khi huấn luyện đàn hồi có thể, nó nên được điều chỉnh động. Làm như vậy giảm chi phí huấn luyện mà không ảnh hưởng đáng kể đến thời gian huấn luyện.
+
+8.2 Xem xét lại chuyển tải: điểm kiểm tra thời gian thực
+
+Trong các phần trước, chúng tôi thấy chuyển tải có thể, nhưng hiếm khi cần thiết từ góc độ bộ nhớ. Ở đây chúng tôi xem xét lại chuyển tải, lần này với mục tiêu giữ một bản sao của trọng số trong một vị trí an toàn và có thể truy cập, một thực hành cũng được biết đến là "lưu điểm kiểm tra". Lưu điểm kiểm tra thường mất thời gian dài trong đó cụm nhàn rỗi, thường mất thời gian hơn huấn luyện nhiều lô. Điều này có nghĩa là điểm kiểm tra không thể được lưu thường xuyên, và lỗi dẫn đến mất đáng kể tiến độ. Cũng có thời gian chết đáng kể trong huấn luyện đàn hồi, vì sự thay đổi của cụm có nghĩa là điểm kiểm tra phải được lưu, sau đó tải trong các nút mới. Thời gian chết này có vấn đề khi chạy trong trung tâm dữ liệu có nhiều hoạt động, nơi các nút được thêm và loại bỏ thường xuyên.
+
+Hình 7 hiển thị cường độ số học và yêu cầu băng thông để chuyển tải mô hình. Trong trường hợp phân chia, chúng tôi thấy rằng trạng thái không chỉ có thể được chuyển tải vào CPU, mà nó cũng có thể dễ dàng được chuyển tải trên SSD nhanh (như được đề xuất trong [24]), có thể trên một vị trí từ xa qua Ethernet, và đối với các mô hình lớn hơn, thậm chí ổ cứng cũng đủ nhanh. Điều này cho phép giữ một bản sao cập nhật của trọng số trong một vị trí bên ngoài an toàn có thể truy cập bởi tất cả các nút với chi phí không đáng kể, giảm chi phí tiềm năng của lỗi xuống một lô duy nhất. Overhead của việc sửa đổi kích thước cụm cũng có thể được giảm xuống gần như bằng không bằng cách tải trọng số trên đường bay, ngay cả khi cần tạo phân chia mới.
+
+Chúng tôi có thể đi xa hơn bằng cách xem xét điểm kiểm tra kích hoạt, mà như hình 7 cho thấy cần băng thông cao hơn trạng thái, nhưng đối với các mô hình lớn hơn cũng có thể được lưu vào bộ lưu trữ từ xa nhanh. Điều này giảm mất tiềm năng từ sự cố xuống một lớp duy nhất và cho phép hoán đổi nút giữa lô với chi phí gần như bằng không.
+
+8.3 Ethernet đã đủ
+
+Vì các trung tâm dữ liệu có thể không được trang bị kết nối InfiniBand nhanh, chúng tôi đánh giá khả năng huấn luyện qua Ethernet. Chúng tôi giả định các nút được trang bị kết nối Ethernet 400 Gb/s, tương đương với 25 Gb/s mỗi GPU. Phân tích được hiển thị trong hình 8. Đối với các mô hình lớn hơn, kết nối chậm hơn ít tạo ra sự khác biệt, miễn là song song pipeline được sử dụng. Tuy nhiên, đối với các mô hình nhỏ hơn, cần mức độ song song pipeline cao hơn để giảm việc sử dụng mạng, làm cho việc giảm thiểu bong bóng trong trường hợp cải tiến khó khăn hơn. Đối với mô hình nghìn tỷ tham số, điều này làm chậm huấn luyện khoảng 4%, nhưng hiệu ứng quan trọng hơn ở quy mô nhỏ hơn. Bất chấp điều này và overhead giao tiếp từ phân chia trạng thái, phương pháp cải tiến vượt trội so với baseline ở quy mô nhỏ hơn vì chồng chéo giao tiếp cải thiện. Đối với các mô hình nhỏ nhất, việc phân chia có thể được tránh để giảm thêm thời gian huấn luyện với chi phí bộ nhớ tối thiểu (đường chấm).
+
+9 Kết luận và công việc tương lai
+
+Chúng tôi cho thấy rằng song song 3d là cần thiết để huấn luyện các mô hình ngôn ngữ lớn, mặc dù nó vẫn bị hạn chế bởi các giới hạn cơ bản và thực tế ảnh hưởng đến thời gian huấn luyện. Với sự kết hợp của tích lũy gradient theo lớp, song song pipeline mô-đun và phân chia trạng thái huấn luyện, có thể gần như đạt được những giới hạn này trong khi chỉ sử dụng một phần nhỏ bộ nhớ có sẵn. Được cung cấp một cụm đủ lớn, điều này cho phép huấn luyện hiệu quả các mô hình trên quy mô nghìn tỷ tham số trong thời gian hợp lý.
+
+Cách tiếp cận của chúng tôi cũng không đặc biệt đòi hỏi trên mạng (liên nút), có thể hoạt động tương đối tốt chỉ với kết nối Ethernet. Nó cũng giúp với việc huấn luyện các mô hình nhỏ hơn, được hưởng lợi từ chồng chéo giao tiếp cải thiện. Chúng tôi kỳ vọng các phương pháp của chúng tôi cho phép huấn luyện các mô hình như BERT nhanh hơn đáng kể so với các phương pháp tiên tiến hiện có, trong vài phút. Tuy nhiên, cần nghiên cứu thêm để đưa ra dự đoán chính xác cho các mô hình có kích thước đó, vì có thể có overhead bổ sung do kích thước nhỏ của các kernel tính toán.
+
+9.1 Tinh chỉnh và suy luận
+
+Sự quan tâm gần đây đến các mô hình cực kỳ lớn đã được thúc đẩy phần lớn bởi tiềm năng của chúng để học các nhiệm vụ mới một cách nhanh chóng, có thể loại bỏ nhu cầu tinh chỉnh. Khi vẫn cần tinh chỉnh, nó đòi hỏi ít sức mạnh tính toán hơn nhiều so với huấn luyện từ đầu, nhưng thách thức tính toán vẫn tồn tại ở một mức độ nào đó. Ví dụ, tinh chỉnh mô hình nghìn tỷ tham số cho 1000 bước đòi hỏi hơn 2000 GPU-ngày, vẫn còn quá cao cho nhiều nhà nghiên cứu. Tinh chỉnh có thể được thực hiện trên các cụm nhỏ hơn so với những gì được xem xét trong bài báo này, có thể mang lại nhu cầu chuyển tải trạng thái huấn luyện trở lại. Trong khía cạnh đó, phương pháp của chúng tôi cải thiện so với phương pháp hiện có như họ ZeRO. Việc giảm nhu cầu chuyển giao dữ liệu cho phép chuyển tải dễ dàng hơn, đồng thời cũng giảm bộ nhớ kích hoạt và yêu cầu mạng. Lưu ý rằng tinh chỉnh các mô hình trên quy mô nghìn tỷ tham số mang lại nhu cầu song song 3d và các cụm lớn trở lại, giả định có một mô hình được huấn luyện trước để bắt đầu.
+
+Suy luận đại diện cho một thách thức bổ sung, vì nó cũng cần được tối ưu hóa cho độ trễ thấp. Song song dữ liệu và pipeline không giúp trong khía cạnh đó, và song song tensor bị hạn chế bởi kích thước nút. Điều này đặt ra giới hạn dưới vài giây cho mỗi nghìn tỷ tham số, tùy thuộc vào độ dài chuỗi và độ chính xác tính toán. Do đó, các mô hình ngôn ngữ lớn nhất có thể không phù hợp cho các ứng dụng thời gian thực cho đến với phần cứng hiện tại. Như với tinh chỉnh, chuyển tải cũng có thể cần thiết cho suy luận, có thể chạy với số lượng thiết bị tối thiểu.
+
+9.2 Rào cản tính toán
+
+Vượt qua quy mô nghìn tỷ tham số, kết quả của chúng tôi cho thấy giới hạn dưới ngày càng cao về thời gian huấn luyện làm cho không thể huấn luyện các mô hình lớn tùy ý. Ví dụ, mô hình 50 nghìn tỷ tham số mất ít nhất một năm để huấn luyện, trong khi mô hình triệu tỷ tham số sẽ cần hàng thập kỷ. Vì tốc độ phần cứng hiện tại tăng với tốc độ chậm hơn nhiều so với kích thước mô hình (và yêu cầu tính toán), rào cản tính toán này sẽ không được giải quyết chỉ bằng tốc độ phần cứng. Thay vào đó, cần nỗ lực chuyên dụng để giảm yêu cầu tính toán hoặc cung cấp thêm sức mạnh tính toán thông qua cải tiến huấn luyện phân tán.
+
+Mô hình thưa thớt Có nỗ lực nghiên cứu đáng kể dành cho việc giảm yêu cầu tính toán của mô hình ngôn ngữ thông qua độ thưa thớt, với một số kết quả đầy hứa hẹn. Ví dụ, các phương pháp hỗn hợp chuyên gia đã được chứng minh cải thiện hiệu suất mô hình cho ngân sách tính toán cố định [8, 13], trong khi phép nhân ma trận thưa thớt cho phép huấn luyện trên các chuỗi lớn hơn nhiều [1, 4, 33]. Trong khi chúng tôi để lại phân tích chi tiết cho công việc tương lai, chúng tôi kỳ vọng độ thưa thớt tăng việc sử dụng mạng và bộ nhớ do cường độ số học giảm, điều này không nên có vấn đề trừ khi đẩy đến cực đoan.
+
+Hàm ý phần cứng Xu hướng gần đây trong phần cứng đã tập trung vào GPU lớn với nhiều bộ nhớ nhất có thể. Điều này được thúc đẩy phần lớn bởi yêu cầu của các mô hình nhỏ hơn cũng như cân nhắc đơn giản, vì các thiết bị lớn giảm nhu cầu cho các phương pháp song song phức tạp và tối ưu hóa bộ nhớ tích cực. Tuy nhiên, việc tập trung vào kích thước này tăng chi phí, và chia băng thông bộ nhớ hạn chế giữa số lượng lớn các lõi tính toán, gây ra nút thắt cổ chai bộ nhớ.
+
+Tình huống khác đối với các mô hình lớn hơn, mà sự đơn giản không phải là lựa chọn. Trong trường hợp này, song song 3d trở nên cần thiết, và các tối ưu hóa bộ nhớ không thể tránh khỏi mang việc sử dụng bộ nhớ xuống tối thiểu. Thay vào đó, thách thức thực sự cho các mô hình lớn nằm ở chi phí và thời gian huấn luyện. Như được nhấn mạnh bởi kết quả của chúng tôi, chìa khóa để huấn luyện nhanh hơn nằm ở song song tensor quy mô lớn, cần nhiều GPU được kết nối thông qua kết nối băng thông cao, độ trễ thấp. Kích thước của GPU không đặc biệt quan trọng, và trên thực tế, (nhiều) thiết bị nhỏ hơn có thể ưu tiên hơn vì chúng ít bị ảnh hưởng bởi hạn chế băng thông. GPU chỉ cần một lượng nhỏ bộ nhớ nhanh, miễn là có lượng lớn bộ lưu trữ bên ngoài cho tinh chỉnh và suy luận.
+
+9.3 Mối quan tâm về tỷ lệ
+
+Trong khi chúng tôi tập trung vào cách huấn luyện một transformer rất lớn, chúng tôi không cố gắng xác định liệu người ta có nên làm điều đó, hoặc thậm chí có thể đủ khả năng. Huấn luyện các mô hình ở quy mô nghìn tỷ tham số đòi hỏi hàng nghìn hoặc tốt hơn là hàng chục nghìn GPU, ngụ ý chi phí thiên văn xa vượt quá khả năng của hầu hết các nhà nghiên cứu. Huấn luyện ở quy mô này cũng có tác động môi trường đáng kể, cả từ việc sử dụng điện và lượng phần cứng được sử dụng.
+
+Ngoài chi phí, các mô hình ngôn ngữ thách thức từ quan điểm đạo đức, và quy mô của mô hình không giúp ích trong khía cạnh đó (xem ví dụ [2]). Các mô hình ngôn ngữ có xu hướng rất thiên vị và bất công, hành vi học được từ dữ liệu huấn luyện. Do hiệu suất của chúng, chúng cũng có thể được sử dụng để mạo danh con người thực, cho phép một loạt ứng dụng phi đạo đức. Trong khi không thể ngăn chặn việc lạm dụng như vậy trong dài hạn, chúng tôi hy vọng rằng các mô hình ngôn ngữ lớn trở nên dễ tiếp cận hơn với cộng đồng nghiên cứu trong tương lai gần, để các giải pháp giảm thiểu có thể được tìm thấy sớm nhất có thể.
+
+Lời cảm ơn
+
+Chúng tôi muốn cảm ơn Harm de Vries vì đã cung cấp hỗ trợ rộng rãi trong khi viết bài báo, Eric Robert và Simon Bélanger vì đã hỗ trợ dự án nghiên cứu, và Nathan Schucher vì đã cung cấp phản hồi bổ sung.
+
+Tài liệu tham khảo
+
+[1] Iz Beltagy, Matthew E. Peters, và Arman Cohan. Longformer: The long-document transformer, 2020.
+
+[2] Tom B. Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared Kaplan, Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, Sandhini Agarwal, Ariel Herbert-Voss, Gretchen Krueger, Tom Henighan, Rewon Child, Aditya Ramesh, Daniel M. Ziegler, Jeffrey Wu, Clemens Winter, Christopher Hesse, Mark Chen, Eric Sigler, Mateusz Litwin, Scott Gray, Benjamin Chess, Jack Clark, Christopher Berner, Sam McCandlish, Alec Radford, Ilya Sutskever, và Dario Amodei. Language models are few-shot learners, 2020.
+
+[3] Tianqi Chen, Bing Xu, Chiyuan Zhang, và Carlos Guestrin. Training deep nets with sublinear memory cost, 2016.
+
+[4] Rewon Child, Scott Gray, Alec Radford, và Ilya Sutskever. Generating long sequences with sparse transformers, 2019.
+
+[5] NVIDIA Corporation. https://www.nvidia.com/en-us/data-center/. Truy cập: 2020-04-01.
+
+[6] Jacob Devlin, Ming-Wei Chang, Kenton Lee, và Kristina Toutanova. Bert: Pre-training of deep bidirectional transformers for language understanding, 2019.
+
+[7] John C. Duchi, Sorathan Chaturapruek, và Christopher Ré. Asynchronous stochastic convex optimization, 2015.
+
+[8] William Fedus, Barret Zoph, và Noam Shazeer. Switch transformers: Scaling to trillion parameter models with simple and efficient sparsity, 2021.
+
+[9] Noah Golmant, Nikita Vemuri, Zhewei Yao, Vladimir Feinberg, Amir Gholami, Kai Rothauge, Michael W. Mahoney, và Joseph Gonzalez. On the computational inefficiency of large batch sizes for stochastic gradient descent, 2018.
+
+[10] Robert Hannah và Wotao Yin. On unbounded delays in asynchronous parallel fixed-point algorithms, 2017.
+
+[11] Yanping Huang, Youlong Cheng, Ankur Bapna, Orhan Firat, Mia Xu Chen, Dehao Chen, HyoukJoong Lee, Jiquan Ngiam, Quoc V. Le, Yonghui Wu, và Zhifeng Chen. Gpipe: Efficient training of giant neural networks using pipeline parallelism, 2019.
+
+[12] Jared Kaplan, Sam McCandlish, Tom Henighan, Tom B. Brown, Benjamin Chess, Rewon Child, Scott Gray, Alec Radford, Jeffrey Wu, và Dario Amodei. Scaling laws for neural language models, 2020.
+
+[13] Dmitry Lepikhin, HyoukJoong Lee, Yuanzhong Xu, Dehao Chen, Orhan Firat, Yanping Huang, Maxim Krikun, Noam Shazeer, và Zhifeng Chen. Gshard: Scaling giant models with conditional computation and automatic sharding, 2020.
+
+[14] Mike Lewis, Yinhan Liu, Naman Goyal, Marjan Ghazvininejad, Abdelrahman Mohamed, Omer Levy, Ves Stoyanov, và Luke Zettlemoyer. Bart: Denoising sequence-to-sequence pre-training for natural language generation, translation, and comprehension, 2019.
+
+[15] Sam McCandlish, Jared Kaplan, Dario Amodei, và OpenAI Dota Team. An empirical model of large-batch training, 2018.
+
+[16] Paulius Micikevicius, Sharan Narang, Jonah Alben, Gregory Diamos, Erich Elsen, David Garcia, Boris Ginsburg, Michael Houston, Oleksii Kuchaiev, Ganesh Venkatesh, và Hao Wu. Mixed precision training, 2018.
+
+[17] Deepak Narayanan, Amar Phanishayee, Kaiyu Shi, Xie Chen, và Matei Zaharia. Memory-efficient pipeline-parallel dnn training, 2021.
+
+[18] Deepak Narayanan, Mohammad Shoeybi, Jared Casper, Patrick LeGresley, Mostofa Patwary, Vijay Korthikanti, Dmitri Vainbrand, Prethvi Kashinkunti, Julie Bernauer, Bryan Catanzaro, Amar Phanishayee, và Matei Zaharia. Efficient large-scale language model training on gpu clusters, 2021.
+
+[19] Feng Niu, Benjamin Recht, Christopher Re, và Stephen J. Wright. Hogwild!: A lock-free approach to parallelizing stochastic gradient descent, 2011.
+
+[20] Alec Radford, Karthik Narasimhan, Tim Salimans, và Ilya Sutskever. Improving language understanding by generative pre-training, 2018.
+
+[21] Alec Radford, Jeff Wu, Rewon Child, David Luan, Dario Amodei, và Ilya Sutskever. Language models are unsupervised multitask learners, 2019.
+
+[22] Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan Narang, Michael Matena, Yanqi Zhou, Wei Li, và Peter J. Liu. Exploring the limits of transfer learning with a unified text-to-text transformer, 2020.
+
+[23] Samyam Rajbhandari, Jeff Rasley, Olatunji Ruwase, và Yuxiong He. Zero: Memory optimizations toward training trillion parameter models, 2020.
+
+[24] Samyam Rajbhandari, Olatunji Ruwase, Jeff Rasley, Shaden Smith, và Yuxiong He. Zero-infinity: Breaking the gpu memory wall for extreme scale deep learning, 2021.
+
+[25] Jie Ren, Samyam Rajbhandari, Reza Yazdani Aminabadi, Olatunji Ruwase, Shuangyan Yang, Minjia Zhang, Dong Li, và Yuxiong He. Zero-offload: Democratizing billion-scale model training, 2021.
+
+[26] Christopher J. Shallue, Jaehoon Lee, Joseph Antognini, Jascha Sohl-Dickstein, Roy Frostig, và George E. Dahl. Measuring the effects of data parallelism on neural network training, 2019.
+
+[27] Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper, và Bryan Catanzaro. Megatron-lm: Training multi-billion parameter language models using model parallelism, 2020.
+
+[28] Samuel L. Smith, Pieter-Jan Kindermans, Chris Ying, và Quoc V. Le. Don't decay the learning rate, increase the batch size, 2018.
+
+[29] Sebastian U. Stich, Amirkeivan Mohtashami, và Martin Jaggi. Critical parameters for scalable distributed learning with large batches and asynchronous updates, 2021.
+
+[30] Hanlin Tang, Shaoduo Gan, Ammar Ahmad Awan, Samyam Rajbhandari, Conglong Li, Xiangru Lian, Ji Liu, Ce Zhang, và Yuxiong He. 1-bit adam: Communication efficient large-scale training with adam's convergence speed, 2021.
+
+[31] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez, Lukasz Kaiser, và Illia Polosukhin. Attention is all you need, 2017.
+
+[32] Zhilin Yang, Zihang Dai, Yiming Yang, Jaime Carbonell, Ruslan Salakhutdinov, và Quoc V. Le. Xlnet: Generalized autoregressive pretraining for language understanding, 2020.
+
+[33] Manzil Zaheer, Guru Guruganesh, Avinava Dubey, Joshua Ainslie, Chris Alberti, Santiago Ontanon, Philip Pham, Anirudh Ravula, Qifan Wang, Li Yang, và Amr Ahmed. Big bird: Transformers for longer sequences, 2021.
+
+A Chi tiết phần cứng
+
+Phụ lục này tóm tắt các thông số kỹ thuật phần cứng có liên quan đến bài báo này. Để biết chi tiết hơn, xem tài liệu chính thức [5]
+
+Với mục đích của bài báo này, tính toán được giả định được thực hiện trên GPU NVIDIA A100 80 GB. Thiết bị như vậy có công suất tính toán fp16 lý thuyết cgpu = 312 Tflop/s, mặc dù giá trị này khó đạt được trong thực tế. Thiết bị có mgpu = 80 GB bộ nhớ, với băng thông đỉnh βgpu = 2039 GB/s. Mỗi GPU được kết nối với phần còn lại của máy tính bằng kết nối PCIe 4.0 x16 và có thể được kết nối với các GPU khác với lên đến 12 kết nối NVLink, với tổng băng thông 300 GB/s theo mỗi hướng. Khi kết hợp với NVSwitch, NVLink cho phép lên đến 16 GPU được kết nối đầy đủ, mỗi kết nối cặp có thể sử dụng đầy đủ băng thông NVLink.
+
+Mặc dù chúng tôi không giả định kiến trúc máy tính cụ thể, chúng tôi sử dụng DGX hoặc HGX A100 16-GPU làm tham chiếu. Các GPU được kết nối đầy đủ thông qua NVSwitch, và mỗi cặp được kết nối với switch PCI-express cũng kết nối với một cặp kết nối InfiniBand 200 Gb/s và với một trong các CPU. Trong khi có tổng cộng 16 kết nối InfiniBand, mỗi GPU chỉ có thể sử dụng hiệu quả một kết nối do nút thắt cổ chai PCI-express. Các CPU được đóng gói với một lượng lớn bộ nhớ, kết nối Ethernet, các kết nối InfiniBand tùy chọn bổ sung, và các thành phần máy tính tiêu chuẩn khác. Kết nối Ethernet mở rộng lên ít nhất 400 Gb/s, tương đương với 25 Gb/s mỗi GPU.
+
+Cấu hình PCI-express của máy chủ HGX tạo ra nút thắt cổ chai ở phía CPU, vì một PCIe 4.0 x16 duy nhất kết nối CPU với hai GPU và hai kết nối InfiniBand, chia hiệu quả thông lượng CPU-GPU tối đa đi một nửa và ngăn cản CPU kết nối hiệu quả với InfiniBand. Điều này có vấn đề trong các tình huống chuyển tải nơi dữ liệu được chuyển qua CPU. Vấn đề có thể được khắc phục với thiết kế máy tính cải tiến nhưng vẫn là một hạn chế thực tế quan trọng.
+
+Các băng thông và cường độ số học khác nhau được tóm tắt trong bảng A.1.
+
+B Tỷ lệ Transformer
+
+Transformers phần lớn không nhạy cảm với các giá trị chính xác của các siêu tham số [12], giả định chúng nằm trong phạm vi hợp lý, vì vậy yếu tố thúc đẩy khi mở rộng mô hình là hiệu quả tính toán. Hệ số kích thước trung gian nI nên được giữ không đổi, và chúng tôi sử dụng giá trị phổ biến nI = 4. Độ dài chuỗi và kích thước đầu nên tỷ lệ để giữ cân bằng kích hoạt trung gian. Số lượng đầu có thể mở rộng độc lập nhưng có tác động đến song song và các giá trị cho phép của độ dài chuỗi. Trong bài báo này, chúng tôi giả định mở rộng nhẹ ds∼d¹/²m, mà chúng tôi đạt được với tỷ lệ tương đối hợp lý ds = 8dh = 32da. Những tỷ lệ này dẫn đến các giá trị tương đương với những gì được tìm thấy trong tài liệu, và khớp BERT cho da = 16, nhưng khác một chút so với GPT-3 cho trọng lượng nhiều hơn cho số lượng đầu.
+
+Việc mở rộng số lượng lớp có liên quan đến song song, vì mạng sâu hơn phù hợp với song song pipeline, trong khi mạng rộng hơn cho phép song song tensor nhiều hơn. Tác động là tối thiểu cho rằng cả hai đều bị hạn chế bởi các yếu tố khác, nhưng mạng rộng hơn hơi ưu tiên hơn vì chúng dẫn đến song song tensor hiệu quả hơn. Về mặt bộ nhớ, mạng sâu và mỏng giảm kích thước của bộ đệm và kích hoạt, với chi phí là các điểm kiểm tra kích hoạt lớn hơn.
+
+Vì song song quan trọng hơn nhiều so với bộ nhớ, chúng tôi chọn mở rộng nhẹ dl = √dm.
+
+Họ mô hình kết quả X[x] được tham số hóa bởi một biến duy nhất x:
+
+da = ½x, dh = 2x, dl = x,
+ds = 16x, dm = x², dI = 4x². (1)
+
+Bảng B.1 hiển thị một số ví dụ về mô hình X[x] và so sánh với các mô hình ngôn ngữ lớn khác.
+
+Trong [12], được tìm thấy thực nghiệm rằng kích thước lô quan trọng tỷ lệ xấp xỉ p^(1/3), khi đo bằng token. Để có được giá trị số, chúng tôi giả định rằng GPT-3 được huấn luyện ở kích thước lô quan trọng (3.2 M token). Điều này dẫn đến công thức thực nghiệm
+
+bc ≈ 573p^(1/3)/ds ≈ 82.0x^(2/3). (2)
+
+Mặc dù phương trình 2 là gần đúng và không được chứng minh tỷ lệ cho toàn bộ phạm vi tham số được nghiên cứu trong bài báo này, chúng tôi lấy nó làm giá trị thực của kích thước lô quan trọng cho các ước tính số.
+
+C Sử dụng tài nguyên
+
+C.1 Tính toán
+
+Trong một transformer, như với gần như tất cả các mô hình học sâu, phần lớn tính toán được thực hiện trong phép nhân ma trận. Chúng xuất hiện trong phép nhân trọng số trong các lớp dày đặc, và trong cơ chế self-attention, nhưng phép nhân ma trận self-attention nói chung nhỏ hơn nhiều và có thể được bỏ qua. Đối với lượt truyền xuôi, điều này dẫn đến chi phí tính toán hai phép toán dấu phẩy động cho mỗi token đầu vào và tham số, hoặc 2bdsp flops mỗi lô. Trong lượt truyền ngược, tính toán gradient tham số và lớp mỗi cái đòi hỏi lượng tính toán tương tự, thêm vào đó là tính toán lại kích hoạt, với tổng cộng ba lần tính toán lượt truyền xuôi. Tổng hợp, mỗi lô đòi hỏi 8bdsp flops tính toán, hoặc 8bdsp/ngpu cho mỗi thiết bị.
+
+C.2 Đệm tham số và gradient
+
+Để xác định việc sử dụng bộ nhớ, chúng tôi cần xác định kích thước và thời gian sống của bộ đệm tham số và gradient. Mỗi tham số được sử dụng trong cả lượt truyền xuôi và ngược, vì vậy nên được khôi phục ít nhất hai lần. Một lựa chọn thuận tiện là định nghĩa bộ đệm cho tất cả các tham số trong một lớp, tức là, giữa hai điểm kiểm tra kích hoạt, và tương tự cho gradient. Để cho phép chồng chéo giao tiếp, cần hai bộ đệm tham số, nhưng một bộ đệm gradient là đủ. Phương pháp đệm hỗn hợp này (trái ngược với đệm đơn hoặc đôi nghiêm ngặt) được tóm tắt trong bảng C.1.
+
+Lưu ý rằng khi không có tích lũy gradient, có thể đạt được việc sử dụng bộ nhớ thấp hơn với các bộ đệm được định nghĩa ở mức sub-layer, có thể thậm chí chia tham số trong một phép toán duy nhất như được đề xuất trong [24]. Làm như vậy đòi hỏi khôi phục tham số thêm một lần trong lượt truyền ngược, nhưng điều này có thể được thực hiện mà không tăng yêu cầu mạng bằng cách tận dụng mất cân bằng cường độ số học (xem bảng C.1). Tuy nhiên, với tích lũy gradient, các phép toán mạng cần xảy ra cho mỗi vi-lô, dẫn đến yêu cầu mạng quá mức và đánh bại mục đích của tích lũy gradient theo lớp. Trong mọi trường hợp, chúng tôi thấy đệm hỗn hợp đủ cho tất cả các tình huống thực tế.
+
+C.3 Bộ nhớ
+
+Như được mô tả trong phần 2.5, việc sử dụng bộ nhớ chia thành bốn danh mục: trạng thái huấn luyện, điểm kiểm tra kích hoạt, bộ đệm tham số và gradient, và kích hoạt lớp. Hai cái đầu tiên có thể được chuyển tải vào bộ nhớ CPU, nhưng không phải hai cái sau cùng cuối cùng xác định mô hình có thể lớn đến mức nào từ góc độ bộ nhớ.
+
+Với bộ tối ưu Adam, trạng thái huấn luyện bao gồm các tham số mô hình cũng như trung bình chạy và phương sai của chúng, tất cả được lưu trữ với độ chính xác đơn, với tổng cộng 12p byte. Gradient sẽ chiếm thêm 2p byte, nhưng chúng tôi có thể giảm điều này xuống một lượng không đáng kể bằng cách cập nhật trọng số sớm nhất có thể. Trong trường hợp không phân chia, trạng thái được chia trên các instance song song mô hình (12p/(nl×na) byte mỗi thiết bị), trong khi trong trường hợp phân chia nó được chia trên tất cả các thiết bị (12p/ngpu byte mỗi cái).
+
+Trong phương pháp đệm hỗn hợp, cần hai bộ đệm tham số và một bộ đệm gradient, mỗi cái có kích thước của một lớp transformer duy nhất. Các bộ đệm được chia trong chiều song song tensor với tổng cộng 6pl/na byte mỗi GPU. Lưu ý rằng trong khi các bộ đệm nhỏ hơn nhiều so với trạng thái huấn luyện, chúng không thu nhỏ nhiều với song song vì vậy vẫn có thể quan trọng.
+
+Các điểm kiểm tra được giả định khớp với đầu ra của mỗi transformer, hoạt động tương đối tốt trong thực tế, với tổng cộng 2bdsdmdl. Chúng chia tự nhiên trên các chiều song song dữ liệu và pipeline và cũng có thể được phân chia trong chiều song song tensor, cho việc sử dụng bộ nhớ 2bdsdmdl/ngpu byte mỗi thiết bị. Công thức này không tối ưu, vì ví dụ một số tính toán trung gian có thể được kết hợp cùng nhau thành kernel hợp nhất, nhưng nó đủ cho mục đích của bài báo này vì bộ nhớ kích hoạt vẫn đủ thấp. Bộ nhớ kích hoạt được chia giữa các vi-lô và các instance song song tensor, với tổng cộng bdsdm0/(nb×nµ×na).
+
+C.4 Mạng
+
+Song song 3d bao gồm ba loại giao tiếp mạng, một cho mỗi chiều song song. Phần này nhằm đánh giá yêu cầu băng thông cho mỗi loại, cũng như cường độ số học liên quan.
+
+Để giao tiếp được chồng chéo hoàn hảo, cường độ số học νop cho tính toán so với chuyển giao mạng cần cao hơn cường độ số học νnet được ngụ ý bởi GPU và mạng, hoặc
+
+νop ≥ νnet, (3)
+
+Khi chồng chéo hiệu quả không thể, có overhead tương đối νnet/νop. Overhead này được kỳ vọng vẫn trong ngưỡng được chọn ε, dẫn đến điều kiện
+
+εν op ≥ νnet. (4)
+
+C.4.1 Song song dữ liệu
+
+Trong trường hợp không phân chia, việc giảm gradient bao gồm scatter-reduce và all-gather, cả hai đều giống hệt nhau từ góc độ tính toán và thường được triển khai với các phương pháp vòng tối ưu băng thông. Trong all-gather chẳng hạn, mỗi thiết bị nhận tất cả gradient ngoại trừ những cái nó đã có và gửi cùng lượng dữ liệu. Đối với việc giảm gradient, điều này dẫn đến việc sử dụng băng thông 8(nb-1)p/ngpu ≈ 8p/(nl×na). Việc giảm được chồng chéo với lượt truyền ngược cho vi-lô cuối cùng, ngoại trừ hiệu ứng biên ở các lớp đầu tiên và cuối cùng. Khi so sánh với tính toán lượt truyền ngược 6bdsp/(nµ×nb×nl×na) dẫn đến cường độ số học
+
+νbase_b ≈ 3bds/(4nb×nµ), (5)
+
+giả định dl/nl đủ lớn. Điều này có nghĩa là chồng chéo trở nên tệ hơn với song song dữ liệu và vi-lô, và bằng cách mở rộng với song song pipeline. Trong trường hợp sau, điều này do chồng chéo giao tiếp kém, và cho dl = nl không có chồng chéo nào cả. Vì vậy, tình huống không chồng chéo phù hợp hơn, với
+
+νpipe_b ≈ bds/nb. (6)
+
+Trong trường hợp phân chia, có all-gather thêm trong lượt truyền xuôi, và các phép toán mạng cần được thực hiện cho mỗi vi-lô, dẫn đến 3/2×nµ lần băng thông mạng khi so sánh với trường hợp không phân chia. Cường độ số học thấp nhất trong lượt truyền xuôi, với giá trị
+
+νbase-part_b ≈ bds/(2nb×nµ). (7)
+
+Điều này chỉ thấp hơn 33% so với không có phân chia, nhưng trong trường hợp vi-lô, chồng chéo với tất cả vi-lô thay vì chỉ cái cuối cùng, vì vậy tình huống không chồng chéo không áp dụng.
+
+Với tích lũy gradient theo lớp, việc sử dụng mạng vẫn giữ nguyên, nhưng có thể được chồng chéo với toàn bộ lượt truyền ngược ngay cả trong trường hợp vi-lô (một lần nữa loại trừ hiệu ứng biên). Điều này vẫn đúng với song song pipeline, trong cài đặt được khuyến nghị nơi dl/nl không quá nhỏ. Điều này dẫn đến cường độ số học
+
+νimpr_b ≈ 3bds/(4nb), (8)
+
+hoặc
+
+νimpr-part_b ≈ bds/(2nb), (9)
+
+tùy thuộc vào việc trạng thái có được phân chia hay không.
+
+C.4.2 Song song Pipeline
+
+Với song song pipeline, mỗi instance cần nhận đầu vào và gửi đầu ra, và nút thắt cổ chai tiềm năng trong lượt truyền xuôi. Trong baseline, mỗi vi-lô lượt truyền xuôi bao gồm 4bdsdm/(nb×na) byte giao tiếp và 2bdsp/ngpu flops tính toán, cho cường độ số học
+
+νbase_l ≈ (2+nI)dmdl/nl. (10)
+
+Với song song pipeline mô-đun, số lượng chuyển giao được nhân với dl/nl, cho cường độ
+
+νimpr_l ≈ (2+nI)dm, (11)
+
+đủ cao cho các mô hình lớn.
+
+Việc chuyển giao dữ liệu có thể được chồng chéo với tính toán, nhưng khó làm như vậy với số lượng vi-lô tối thiểu nµ = nl. Điều này có thể được giải quyết bằng cách thêm một số lượng nhỏ vi-lô thêm, xấp xỉ được cho bởi νl/νnet×nµ, hoặc nhiều hơn nếu tốc độ mạng dao động.
+
+C.4.3 Song song Tensor
+
+Theo cách tiếp cận của [27], song song tensor đòi hỏi hai phép toán all-reduce cho mỗi lớp transformer trong lượt truyền xuôi, không được chồng chéo với tính toán. Thêm hai all-reduce cần thiết trong tính toán gradient, với tổng cộng sáu (khi bao gồm tính toán lại kích hoạt). Đối với một lớp nhất định, điều này ngụ ý việc sử dụng mạng 24bdsdm(na-1)/(nb×na) byte so với tính toán 8bdspl/(nb×na) flop, cho cường độ
+
+νa ≈ (4+2nI)dm/(3(na-1)). (12)
+
+C.5 Chuyển giao CPU-GPU
+
+Chuyển tải trạng thái huấn luyện và điểm kiểm tra kích hoạt đòi hỏi chuyển giao dữ liệu lớn giữa bộ nhớ CPU và GPU. Đối với chuyển tải trạng thái, tính toán cho một lớp nhất định được chồng chéo với việc chuyển giao tham số và gradient cho một lớp nhất định hoặc phân chia của nó. Trong baseline, việc chuyển giao cần xảy ra cho mỗi vi-lô, trong khi với tích lũy gradient theo lớp nó xảy ra một lần cho tất cả vi-lô. Nút thắt cổ chai trong lượt truyền xuôi, với bốn giá trị có thể tùy thuộc vào tình huống:
+
+νbase_s ≈ bds/(nµ×nb), νbase-part_s ≈ bds/nµ, νimpr_s ≈ bds/nb, νimpr-part_s ≈ bds (13)
+
+Đối với chuyển tải điểm kiểm tra, tính toán tương tự như chuyển giao mạng song song pipeline, với một nửa tính toán, cho cường độ
+
+νc ≈ (4+2nI)dm (14)

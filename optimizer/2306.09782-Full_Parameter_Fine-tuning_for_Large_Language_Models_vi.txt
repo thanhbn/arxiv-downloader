@@ -1,0 +1,215 @@
+# Tinh chỉnh Tham số Đầy đủ cho Mô hình Ngôn ngữ Lớn
+với Tài nguyên Hạn chế
+
+Kai Lv1,2, Yuqing Yang1, Tengxiao Liu1, Qinghui Gao1, Qipeng Guo2*, Xipeng Qiu1
+1Trường Khoa học Máy tính, Đại học Fudan  
+2Phòng thí nghiệm AI Thượng Hải
+{klv21, yuqingyang21, txliu21}@m.fudan.edu.cn
+guoqipeng@pjlab.org.cn ,xpqiu@fudan.edu.cn
+
+## Tóm tắt
+
+Các Mô hình Ngôn ngữ Lớn (LLMs) đã cách mạng hóa Xử lý Ngôn ngữ Tự nhiên (NLP) nhưng đòi hỏi tài nguyên GPU khổng lồ để huấn luyện. Giảm ngưỡng cho việc huấn luyện LLMs sẽ khuyến khích sự tham gia lớn hơn từ các nhà nghiên cứu, có lợi cho cả học thuật và xã hội. Trong khi các phương pháp hiện tại đã tập trung vào tinh chỉnh hiệu quả tham số, chỉ tinh chỉnh hoặc thêm một số lượng nhỏ tham số, ít ai giải quyết thách thức tinh chỉnh toàn bộ tham số của LLMs với tài nguyên hạn chế. Trong công trình này, chúng tôi đề xuất một bộ tối ưu mới, Tối ưu hóa Bộ nhớ Thấp (LOMO), kết hợp tính toán gradient và cập nhật tham số trong một bước để giảm sử dụng bộ nhớ. Bằng cách tích hợp LOMO với các kỹ thuật tiết kiệm bộ nhớ hiện có, chúng tôi giảm sử dụng bộ nhớ xuống 10.8% so với phương pháp tiêu chuẩn (giải pháp DeepSpeed). Do đó, phương pháp của chúng tôi cho phép tinh chỉnh tham số đầy đủ của một mô hình 65B trên một máy duy nhất với 8 × RTX 3090, mỗi cái có bộ nhớ 24GB.
+
+## 1 Giới thiệu
+
+Các Mô hình Ngôn ngữ Lớn (LLMs) đã cách mạng hóa Xử lý Ngôn ngữ Tự nhiên (NLP), thể hiện khả năng đáng chú ý như sự nổi lên và hiểu biết sâu sắc (Wei et al., 2022), đẩy kích thước mô hình ngày càng lớn hơn. Tuy nhiên, việc huấn luyện những mô hình này với hàng tỷ tham số, như những mô hình có từ 30B đến 175B tham số, đã nâng cao tiêu chuẩn cho nghiên cứu NLP. Việc tinh chỉnh LLMs thường đòi hỏi tài nguyên GPU đắt tiền, như 8 × thiết bị 80GB, khiến việc này trở nên khó khăn cho các phòng thí nghiệm nhỏ và công ty tham gia vào lĩnh vực nghiên cứu này.
+
+Gần đây, các phương pháp tinh chỉnh hiệu quả tham số (Ding et al., 2022), như LoRA (Hu et al., 2022) và Prefix-tuning (Li and Liang, 2021), cung cấp giải pháp để tinh chỉnh LLMs với tài nguyên hạn chế. Tuy nhiên, những phương pháp này không đưa ra giải pháp thực tế cho việc tinh chỉnh tham số đầy đủ, điều đã được thừa nhận là một phương pháp mạnh mẽ hơn so với tinh chỉnh hiệu quả tham số (Ding et al., 2022; Sun et al., 2023). Trong công trình này, chúng tôi nhằm khám phá các kỹ thuật để thực hiện tinh chỉnh tham số đầy đủ trong các tình huống hạn chế tài nguyên.
+
+Chúng tôi phân tích bốn khía cạnh của việc sử dụng bộ nhớ trong LLMs, đó là kích hoạt, trạng thái bộ tối ưu, tensor gradient và tham số, và tối ưu hóa quá trình huấn luyện theo ba hướng: 1) Chúng tôi xem xét lại chức năng của bộ tối ưu từ góc độ thuật toán và thấy rằng SGD là một sự thay thế tốt về mặt tinh chỉnh tham số đầy đủ cho LLMs. Điều này cho phép chúng tôi loại bỏ hoàn toàn phần trạng thái bộ tối ưu vì SGD không lưu trữ bất kỳ trạng thái trung gian nào (Mục 3.1). 2) Bộ tối ưu đề xuất của chúng tôi, LOMO như minh họa trong Hình 1, giảm sử dụng bộ nhớ của các tensor gradient xuống O(1), tương đương với việc sử dụng bộ nhớ của tensor gradient lớn nhất (Mục 3.2). 3) Để ổn định huấn luyện độ chính xác hỗn hợp với LOMO, chúng tôi tích hợp chuẩn hóa gradient, thu phóng mất mát, và chuyển đổi một số tính toán sang độ chính xác đầy đủ trong quá trình huấn luyện (Mục 3.3).
+
+Kỹ thuật của chúng tôi dẫn đến việc sử dụng bộ nhớ bằng với việc sử dụng tham số cộng với kích hoạt và tensor gradient lớn nhất. Chúng tôi đẩy việc sử dụng bộ nhớ của tinh chỉnh tham số đầy đủ đến mức cực đoan, làm cho nó chỉ tương đương với việc sử dụng suy luận. Điều này là do việc sử dụng bộ nhớ của quá trình forward + backward không nên ít hơn quá trình forward một mình. Điều đáng chú ý là, khi sử dụng LOMO để tiết kiệm bộ nhớ, chúng tôi đảm bảo rằng quá trình tinh chỉnh vẫn không bị ảnh hưởng, vì quá trình cập nhật tham số vẫn tương đương với SGD.
+
+Chúng tôi đánh giá thực nghiệm hiệu suất bộ nhớ và thông lượng của LOMO và cho thấy rằng việc sử dụng LOMO cho phép huấn luyện thành công một mô hình 65B chỉ với 8 GPU RTX 3090. Ngoài ra, để xác nhận hiệu suất downstream của kỹ thuật đề xuất, chúng tôi áp dụng LOMO để tinh chỉnh toàn bộ tham số của LLMs trên bộ sưu tập dữ liệu SuperGLUE (Wang et al., 2019). Kết quả thực nghiệm chứng minh hiệu quả và tính hiệu quả của LOMO trong việc tối ưu hóa LLMs với hàng tỷ tham số. Tổng thể, những đóng góp của chúng tôi như sau:
+
+• Chúng tôi cung cấp một phân tích lý thuyết cho thấy SGD có thể tinh chỉnh thành công toàn bộ tham số của LLMs. Những vấn đề trước đây cản trở việc sử dụng rộng rãi SGD có thể không còn là vấn đề nghiêm trọng đối với việc tinh chỉnh LLMs.
+
+• Chúng tôi đề xuất Tối ưu hóa Bộ nhớ Thấp, gọi là LOMO, để tiết kiệm đáng kể việc sử dụng bộ nhớ GPU mà không làm hại quá trình tinh chỉnh.
+
+• Thông qua đánh giá kỹ lưỡng về việc sử dụng bộ nhớ và hiệu suất thông lượng, chúng tôi xác nhận thực nghiệm hiệu quả của LOMO trong việc tối ưu hóa LLMs dưới các tình huống hạn chế tài nguyên. Điều này được hỗ trợ thêm bởi các đánh giá hiệu suất trên các nhiệm vụ downstream.
+
+## 2 Nghiên cứu Liên quan
+
+Trong phần này, chúng tôi trình bày nghiên cứu liên quan về các kỹ thuật tiết kiệm bộ nhớ trong quá trình tinh chỉnh tham số đầy đủ. Những kỹ thuật này có thể được kết hợp hiệu quả với LOMO để giảm thêm tiêu thụ bộ nhớ.
+
+**Checkpointing Kích hoạt** Trong quá trình lan truyền ngược vanilla, tất cả các kích hoạt từ lần đi tiến được lưu trữ trong bộ nhớ để tính toán gradient. Điều này có thể là một chi phí bộ nhớ đáng kể, đặc biệt đối với các mô hình ngôn ngữ lớn. Thay vào đó, người ta có thể loại bỏ tất cả các kích hoạt và tính toán lại chúng khi cần thiết để tính toán gradient nhằm tiết kiệm bộ nhớ. Tuy nhiên, điều này có thể dẫn đến chi phí tính toán bổ sung đáng kể. Checkpointing kích hoạt (hoặc checkpointing gradient) tính đến cả việc sử dụng bộ nhớ và chi phí tính toán, cung cấp một giải pháp thỏa hiệp (Chen et al., 2016). Các kích hoạt của các nút checkpoint được chọn chiến lược trong đồ thị tính toán được giữ trong bộ nhớ sau lần đi tiến, trong khi các kích hoạt của các nút còn lại được tính toán lại tối đa một lần. Bộ nhớ kích hoạt có thể được giảm xuống căn bậc hai của lượng ban đầu với chi phí của một lần đi tiến bổ sung.
+
+**Huấn luyện Độ chính xác Hỗn hợp** Huấn luyện độ chính xác hỗn hợp đã trở thành một phương pháp phổ biến để huấn luyện các mô hình ngôn ngữ lớn do khả năng tăng tốc độ huấn luyện và giảm dung lượng bộ nhớ (Narayanan et al., 2021; Rajbhandari et al., 2020). Bằng cách sử dụng lưu trữ nửa độ chính xác cho tham số, kích hoạt và gradient, huấn luyện độ chính xác hỗn hợp cho phép các tính toán thông lượng cao. Để duy trì tính ổn định và độ chính xác của mô hình, Micikevicius et al. (2018) đề xuất ba kỹ thuật bao gồm việc sử dụng bản sao đầy đủ độ chính xác của trọng số, thu phóng mất mát, và thực hiện các hoạt động số học cụ thể ở độ chính xác đầy đủ.
+
+**Hệ thống Huấn luyện Dị thể** Nhiều nghiên cứu (Rhu et al., 2016; Wang et al., 2018; Ren et al., 2021a) đã cố gắng giảm tiêu thụ bộ nhớ GPU bằng cách tận dụng bộ nhớ dị thể, như bộ nhớ CPU và NVMe. L2L (Pudipeddi et al., 2020) sử dụng chiến lược từng lớp, nơi chỉ các tensor cần thiết cho việc tính toán của một lớp cụ thể được chuyển đến bộ nhớ GPU, trong khi các tensor còn lại được giữ lại trong bộ nhớ CPU. ZeRO-Offload (Ren et al., 2021b), một phần mở rộng của ZeRO-2 (Rajbhandari et al., 2020), dành riêng gradient và trạng thái bộ tối ưu trong bộ nhớ CPU và cập nhật tham số thông qua tính toán CPU. ZeRO-Infinity (Rajbhandari et al., 2021), một tiến bộ tiếp theo của ZeRO-Offload trên ZeRO-3 (Rajbhandari et al., 2020), cho phép mở rộng thêm kích thước mô hình.
+
+Ngoài các phương pháp trực giao với LOMO được đề cập ở trên, các phát triển gần đây đã giới thiệu một số kỹ thuật tối ưu hóa hiệu quả bộ nhớ. MeZO (Malladi et al., 2023) sử dụng phương pháp tối ưu hóa bậc không, ước tính gradient bằng hai lần đi tiến và cập nhật tham số tại chỗ. GaLore (Zhao et al., 2024) thực hiện phân tích low-rank trên gradient và sử dụng các gradient được xấp xỉ này để cập nhật tham số. Các phương pháp khác giảm sử dụng bộ nhớ bằng cách lượng tử hóa trạng thái bộ tối ưu (Dettmers et al., 2022; Sun et al., 2020b). So với những phương pháp này, LOMO không xấp xỉ gradient cũng không yêu cầu lượng tử hóa bit thấp.
+
+## 3 Phương pháp
+
+### 3.1 Xem xét lại Chức năng của Bộ tối ưu
+
+Các trạng thái bộ tối ưu chiếm một phần lớn bộ nhớ được sử dụng để huấn luyện LLMs. Bộ tối ưu hiện đại như Adam (Kingma and Ba, 2015) lưu trữ các trạng thái trung gian gấp đôi kích thước tham số. Khi kích thước tham số tăng lên, các trạng thái bộ tối ưu trở thành số hạng chi phối của việc sử dụng bộ nhớ.
+
+#### 3.1.1 Sử dụng SGD
+
+Mặc dù Adam đã đạt được thành công lớn trong việc huấn luyện các mô hình sâu, chúng tôi đặt câu hỏi "Chúng ta có thể sử dụng một bộ tối ưu rẻ hơn để tinh chỉnh LLMs không?" Câu trả lời của chúng tôi là SGD, bộ tối ưu cơ bản nhất. May mắn thay, chúng tôi thấy rằng đó là một giải pháp chấp nhận được cho việc tinh chỉnh LLMs khi chúng tôi giới hạn phạm vi.
+
+Các công trình trước đây thường thảo luận về ba thách thức của SGD: 1) bề mặt mất mát có độ cong lớn, 2) tối ưu cục bộ, và 3) điểm yên ngựa (Ruder, 2016; Sun et al., 2020a). Các bộ tối ưu hiện đại đã cho thấy hiệu quả trong việc giải quyết vấn đề 1) và có thể giảm thiểu 2) và 3) trong một số trường hợp. Tuy nhiên, khi chúng tôi giới hạn phạm vi cho việc tinh chỉnh LLMs, ba thách thức này có thể khác biệt.
+
+**Bề mặt mất mát mượt mà hơn** Một giả định quan trọng là không gian tham số của LLMs khá mượt mà và những nhiễu động nhỏ trên các tham số sẽ không thay đổi mất mát quá nhiều. Có kết quả thực nghiệm và phân tích lý thuyết hỗ trợ giả định này (Hao et al., 2019). Nếu chúng ta tin rằng các mô hình lớn hơn có bề mặt mất mát mượt mà hơn, chúng ta có thể kết luận rằng vấn đề 1) không phải là vấn đề vì bề mặt mất mát của LLMs không nên có độ cong lớn. Lưu ý rằng điều này chỉ đúng khi chúng ta dạy LLMs các nhiệm vụ dựa trên ngôn ngữ tự nhiên (hoặc dựa trên mã nếu được huấn luyện trước với mã). Một hàm mất mát tổng hợp không liên quan đến các nhiệm vụ huấn luyện trước thực sự sẽ phải đối mặt với vấn đề độ cong lớn.
+
+**Tối ưu cục bộ là đủ tốt** Mục tiêu của tinh chỉnh là thích ứng LLMs với các nhiệm vụ và miền mới mà không thay đổi đáng kể bản thân mô hình. Do đó, một tối ưu cục bộ thường là một giải pháp đủ tốt (Kawaguchi et al., 2019), và dữ liệu huấn luyện hạn chế (so với kho ngữ liệu huấn luyện trước) khiến việc đẩy mô hình đến một tối ưu toàn cục xa xôi trở nên khó khăn.
+
+**Các điểm yên ngựa xa xôi** Tương tự, đối với một nhiệm vụ NLP thông thường, điểm khởi đầu của LLMs nên ở trong một thung lũng. Nếu mô hình được huấn luyện trước với các hướng dẫn (nhiệm vụ), hiện tượng này có thể rõ ràng hơn nhiều vì chúng ta có nhiều cơ hội hơn để tìm các nhiệm vụ được huấn luyện trước tương tự với nhiệm vụ mới. Các điểm yên ngựa thường xuất hiện trên các đỉnh núi và có khoảng cách từ các thung lũng, vì vậy chúng ta có thể không gặp phải vấn đề điểm yên ngựa nếu chúng ta không thay đổi tham số quá xa so với giá trị được huấn luyện trước.
+
+Tuy nhiên, không có gì đảm bảo rằng SGD là một bộ tối ưu mạnh mẽ so với các bộ tối ưu hiện đại. Trực giác của chúng tôi là tạo ra một giải pháp đơn giản và thực tế cho việc tinh chỉnh LLMs và xác định các khiếm khuyết của nó để liên tục cải thiện.
+
+#### 3.1.2 Kích thước Batch Ngầm
+
+Bên cạnh cuộc thảo luận định tính ở trên, chúng tôi muốn cung cấp một phân tích sâu hơn về tính ổn định của việc tinh chỉnh LLMs với SGD. Giả sử chúng ta có một mô hình được huấn luyện trước f(·) với tham số θ, một tập huấn luyện D={d1, d2,···, dn}, và một hàm mất mát L.
+
+Một bước cập nhật của SGD trên một batch với hai điểm dữ liệu có thể là:
+θ′=θ−α[∇L(di, f(di,θ)) +∇L(dj, f(dj,θ))], (1)
+
+nơi α là tỷ lệ học, và di, dj là hai mẫu huấn luyện khác nhau.
+
+Tiếp theo, hai bước cập nhật của SGD trên hai mẫu huấn luyện này di, dj tuần tự có thể là:
+θ1=θ−α∇L(di, f(di,θ)), (2)
+θ2=θ1−α∇L(dj, f(dj,θ1)). (3)
+
+Theo định lý giá trị trung bình vi phân, chúng ta có:
+L(dj, f(dj,θ1)) =L(dj, f(dj,θ)) +∇L(dj, ξ)(f(dj,θ1)−f(dj,θ)), (4)
+
+θ2=θ−α∇L(di, f(di,θ)) −α∇L(dj, f(dj,θ)) −α∇[∇L(dj, ξ)(f(dj,θ1)−f(dj,θ))], (5)
+
+θ2=θ−α[∇L(di, f(di,θ)) +∇L(dj, f(dj,θ))] −α∇[∇L(dj, ξ)(f(dj,θ1)−f(dj,θ))], (6)
+
+nơi ξ là một điểm giữa f(dj,θ) và f(dj,θ1), và chúng ta có thể thấy rằng (6) trừ (1) bằng α∇[∇L(dj, ξ)(f(dj,θ1)−f(dj,θ))]. Giả sử bề mặt mất mát đủ mượt mà, số hạng này trở nên không đáng kể. Nó gợi ý rằng việc sử dụng bộ tối ưu SGD trên một bề mặt mất mát mượt mà có thể ngụ ý một kích thước batch lớn hơn.
+
+Như chúng tôi đã đề cập ở trên, việc giả định rằng bề mặt mất mát của LLMs là mượt mà là hợp lý, và kích thước batch lớn hơn cho thấy tính ổn định huấn luyện mạnh hơn, vì vậy chúng tôi tin rằng quá trình tinh chỉnh LLMs với bộ tối ưu SGD là ổn định. Điều này cũng giải thích tại sao SGD thất bại trên các mô hình nhỏ nhưng hoạt động tốt cho các mô hình lớn.
+
+### 3.2 LOMO: Tối ưu hóa Bộ nhớ Thấp
+
+Tensor gradient đại diện cho gradient của một tensor tham số và có cùng kích thước với tham số, dẫn đến chi phí bộ nhớ lớn. Các framework huấn luyện học sâu hiện đại như PyTorch (Paszke et al., 2017) lưu trữ tensor gradient cho tất cả các tham số. Có hai lý do để lưu trữ tensor gradient: tính toán trạng thái bộ tối ưu và chuẩn hóa gradient.
+
+Vì chúng tôi lấy SGD làm bộ tối ưu, không có trạng thái bộ tối ưu nào dựa vào gradient, và chúng tôi có một số phương án thay thế cho chuẩn hóa gradient. Do đó, chúng tôi đề xuất Tối ưu hóa Bộ nhớ Thấp (LOMO) như minh họa trong Thuật toán 1, kết hợp tính toán gradient và cập nhật tham số trong một bước để tránh lưu trữ bất kỳ tensor gradient nào.
+
+Chi tiết, chúng ta có thể biểu diễn gradient descent vanilla như grad =∂L/∂p, p=p−lr∗grad, đây là một quá trình hai bước, tính toán gradient trước và cập nhật nó vào tham số. Phiên bản fusion là p=p−lr∗∂L/∂p.
+
+Ý tưởng chính là cập nhật tham số ngay lập tức khi gradient của nó được tính toán để chúng ta không lưu trữ tensor gradient trong bộ nhớ. Điều này có thể đạt được bằng cách tiêm các hàm hook vào quá trình lan truyền ngược. PyTorch cung cấp các API liên quan để tiêm hàm hook, nhưng chúng tôi không thể triển khai cập nhật ngay lập tức chính xác với các API hiện tại. Thay vào đó, chúng tôi lưu trữ tối đa gradient của một tham số trong bộ nhớ và cập nhật từng tham số một cùng với quá trình lan truyền ngược. Phương pháp của chúng tôi giảm việc sử dụng bộ nhớ của gradient từ lưu trữ gradient của tất cả tham số xuống chỉ lưu trữ gradient của một tham số.
+
+**Thuật toán 1** Fusion Update trong LOMO
+**Yêu cầu:** mô hình f(·) với L lớp và p tham số, tham số θ∈Rp, tỷ lệ học α, bước tối đa T, tập dữ liệu huấn luyện D, hàm mất mát L
+1: **for** t= 1, . . . , T **do**
+2:     Sample batch B= (x,y)⊂ D
+3:     ŷ←f(x,θ) ▷ Forward pass
+4:     ℓ← L(y,ŷ)
+5:     **for** l=L, . . . , 1 **do** ▷ Backward
+6:         θl←[θi for θi∈layer l]
+7:         gl←∂ℓ/∂θl
+8:         θl←θl−α∗gl
+9:         gl←None ▷ Clear gradients
+10:    **end for**
+11: **end for**
+
+Phần lớn việc sử dụng bộ nhớ của LOMO trùng khớp với các phương pháp tinh chỉnh hiệu quả tham số (PEFT), cho thấy rằng việc kết hợp LOMO với các phương pháp này chỉ gây ra sự gia tăng nhỏ trong bộ nhớ chiếm bởi gradient. Điều này cho phép tinh chỉnh nhiều tham số hơn cho các phương pháp PEFT.
+
+### 3.3 Ổn định Huấn luyện với LOMO
+
+#### 3.3.1 Phương án Thay thế cho Chuẩn hóa và Cắt Gradient
+
+Chuẩn hóa và cắt gradient là những công cụ thiết yếu để giải quyết vấn đề bùng nổ và biến mất gradient (Chen et al., 2018), nhưng quá trình tính toán của chúng đòi hỏi sử dụng tensor gradient của tất cả tham số. Chúng tôi đề xuất hai phương án thay thế ở đây:
+
+• Cắt tensor gradient theo giá trị của chúng thay vì theo chuẩn.
+• Tính toán chuẩn gradient trong một lần đi ngược bổ sung.
+
+Cắt tensor gradient theo giá trị của chúng là một giải pháp đơn giản nhưng hiệu quả cho bùng nổ gradient trước khi tiếp cận chuẩn gradient. Mối quan tâm chính của việc cắt theo giá trị là việc cắt bớt một số phần tử gradient có thể thay đổi hướng của tensor gradient. Ví dụ, một vector hai chiều [1.3,0.8] và phiên bản được cắt của nó [1.0,0.8] (được cắt thành 1.0) chỉ ra các hướng khác nhau. Kinh nghiệm của chúng tôi là việc cắt theo giá trị hoạt động kém hơn khi tỷ lệ học cao vì việc cắt bớt xảy ra thường xuyên hơn trong trường hợp đó. Tuy nhiên, việc cắt theo giá trị hoạt động tốt cho tỷ lệ học trung bình và nhỏ. Lưu ý rằng quy mô của tỷ lệ học phụ thuộc phần lớn vào nhiệm vụ và dữ liệu, nhưng nói chung, chúng tôi đề xuất sử dụng cắt theo giá trị cho tỷ lệ học nhỏ hơn 1e−3.
+
+Phương pháp của chúng tôi không thể tính toán trực tiếp chuẩn gradient vì chúng tôi cập nhật tham số cùng với quá trình lan truyền ngược, vì vậy chúng tôi không biết chuẩn của các tham số còn lại khi cập nhật một tham số nhất định. Tuy nhiên, chúng tôi có thể giới thiệu một lần đi bổ sung để tính toán và tích lũy chuẩn gradient của mỗi tham số, dẫn đến hai lần đi ngược, một để tính toán chuẩn gradient và một để cập nhật tham số. Việc sử dụng bộ nhớ không thay đổi nhưng hy sinh tốc độ.
+
+**Một giải pháp gây tranh cãi** Framework huấn luyện hiện tại của chúng tôi tính toán chuẩn gradient dựa trên tất cả tham số và yêu cầu hai lần đi ngược. Một giải pháp để tiết kiệm lần đi ngược bổ sung là xấp xỉ chuẩn của tensor gradient với một nhóm tham số, ví dụ như các lớp liền kề. Phương pháp này thực sự có thiên lệch, vì nó dẫn đến các kích thước bước cập nhật khác nhau cho các tham số khác nhau. Khi cập nhật, các tham số được nhân với một hệ số tỷ lệ theo chuẩn gradient. Vì chuẩn gradient khác nhau giữa các nhóm tham số, việc xấp xỉ như vậy dẫn đến sự khác biệt trong các hệ số tỷ lệ. Phương pháp cắt gradient theo nhóm này có thể được coi là áp dụng một tỷ lệ học động cho các nhóm tham số khác nhau dựa trên chuẩn gradient của chúng. Sun et al. (2020a) gợi ý rằng việc sử dụng cùng một tỷ lệ học cho tất cả tham số trong SGD không phải lúc nào cũng phù hợp, do đó chúng tôi tin rằng phương pháp của chúng tôi cũng có tiềm năng mang lại lợi ích thêm cho SGD. Chúng tôi để lại việc khám phá như một hướng tương lai hấp dẫn.
+
+#### 3.3.2 Giảm thiểu Suy giảm Độ chính xác
+
+Huấn luyện độ chính xác hỗn hợp thường được sử dụng để tăng tốc quá trình huấn luyện. Để giảm thiểu suy giảm độ chính xác, chúng tôi sử dụng thu phóng mất mát động và chuyển đổi một số tính toán sang độ chính xác đầy đủ. Phương pháp thu phóng mất mát là quan trọng trong việc ngăn chặn underflow trong quá trình huấn luyện FP16, phóng to mất mát với một hệ số cụ thể trước lần đi ngược và giảm gradient theo cùng một hệ số.
+
+Trong bối cảnh này, chúng tôi tích hợp một trình thu phóng mất mát động với LOMO, điều chỉnh động hệ số thu phóng trong suốt quá trình huấn luyện. Nếu không có overflow xảy ra trong một số lần đi ngược được chỉ định, hệ số thu phóng được tăng gấp đôi. Ngược lại, bước này bị bỏ qua và hệ số thu phóng được giảm một nửa. Quá trình này phản ánh tình huống gặp phải trong quá trình chuẩn hóa gradient. Không thể biết liệu sẽ có overflow hay không cho đến khi quá trình đi ngược hoàn tất. Do đó, chúng tôi thực hiện hai lần đi ngược: lần đi đầu tiên để xác định bất kỳ overflow nào, và lần đi thứ hai để cập nhật tham số nếu không phát hiện overflow. Hai lần đi ngược này cho thu phóng mất mát động có thể được thực hiện đồng thời với chuẩn hóa gradient. Để cập nhật tham số hiệu quả và xử lý gradient cho các hoạt động như chuẩn hóa và thu phóng, gradient và tham số liên quan của nó được chuyển đổi sang độ chính xác đầy đủ trong các tính toán này.
+
+## 4 Thực nghiệm
+
+Trong phần này, chúng tôi đánh giá phương pháp đề xuất từ ba khía cạnh: cấu hình bộ nhớ, thông lượng và hiệu suất downstream. Nếu không được giải thích thêm, tất cả thực nghiệm của chúng tôi được thực hiện với các mô hình LLaMA (Touvron et al., 2023), từ 7B đến 65B.
+
+### 4.1 Cấu hình Bộ nhớ
+
+Đầu tiên, chúng tôi lập hồ sơ việc sử dụng bộ nhớ của các trạng thái mô hình và kích hoạt trong quá trình huấn luyện dưới các cài đặt khác nhau. Như thể hiện trong Bảng 1, việc sử dụng bộ tối ưu LOMO dẫn đến giảm đáng kể dung lượng bộ nhớ từ 102.20GB xuống 14.58GB, khi so sánh với bộ tối ưu AdamW (Loshchilov và Hutter, 2019), và từ 51.99GB xuống 14.58GB, khi so sánh với SGD, trong bối cảnh huấn luyện mô hình LLaMA-7B. Sự giảm đáng kể này trong việc sử dụng bộ nhớ có thể được quy cho chủ yếu vào việc giảm yêu cầu bộ nhớ của gradient và trạng thái bộ tối ưu. Kết quả là, bộ nhớ chủ yếu được chiếm bởi tham số trong quá trình huấn luyện, tương đương với việc sử dụng bộ nhớ trong quá trình suy luận.
+
+**Trạng thái Bộ tối ưu** Hình 2 minh họa rằng việc sử dụng bộ tối ưu AdamW cho huấn luyện LLaMA-7B, một cấu hình được áp dụng rộng rãi, cho ra một tỷ lệ đáng kể bộ nhớ (73.7%) được phân bổ cho trạng thái bộ tối ưu. Kết quả này là hệ quả của phương pháp huấn luyện độ chính xác hỗn hợp, nơi các bản sao độ chính xác đầy đủ của trọng số, momentum, và phương sai được duy trì trong các trạng thái bộ tối ưu để cập nhật trọng số. Thay thế bộ tối ưu AdamW bằng bộ tối ưu SGD có thể giảm hiệu quả tỷ lệ phần trăm của trạng thái bộ tối ưu trong bộ nhớ, và do đó giảm thiểu việc sử dụng bộ nhớ GPU (từ 102.20GB xuống 51.99GB). Việc giảm này là do bộ tối ưu SGD không yêu cầu lưu trữ momentum và phương sai độ chính xác đầy đủ. Đối với LOMO, cập nhật tham số và đi ngược được kết hợp thành một bước, loại bỏ thêm nhu cầu bộ nhớ trạng thái bộ tối ưu.
+
+**Gradient** Trong quá trình huấn luyện sử dụng LOMO, tham số được cập nhật ngay lập tức khi nhận gradient, sau đó gradient được loại bỏ khỏi bộ nhớ. Kết quả là, giới hạn trên của việc tiêu thụ bộ nhớ gradient được xác định bởi gradient liên quan đến ma trận tham số có độ lớn lớn nhất. Phương pháp này giảm đáng kể việc sử dụng bộ nhớ gần như bằng kích thước tham số.
+
+**Kích hoạt** Việc huấn luyện một mô hình 7B với 512×8 token trong một batch đòi hỏi một lượng bộ nhớ đáng kể cho kích hoạt. LOMO tương thích với các kỹ thuật giảm bộ nhớ kích hoạt như checkpointing kích hoạt. Bằng cách tích hợp checkpointing kích hoạt với LOMO, dung lượng bộ nhớ do kích hoạt có thể được giảm từ 45.61GB xuống 1.79GB.
+
+### 4.2 Thông lượng
+
+Chúng tôi đánh giá hiệu suất thông lượng của LOMO so với AdamW và SGD. Các thực nghiệm được thực hiện trên một máy chủ được trang bị 8 GPU RTX 3090, được kết nối qua bo mạch chủ PCIe. Độ dài chuỗi và kích thước batch được đặt lần lượt là 1024 và 1. Thông lượng được đo bằng số token được xử lý mỗi GPU mỗi giây (TGS), và việc phân vùng tham số được thực hiện bằng ZeRO-3 (Rajbhandari et al., 2020).
+
+Đối với mô hình 7B, LOMO thể hiện thông lượng đáng chú ý, vượt trội AdamW và SGD khoảng 11 lần. Cải thiện đáng kể này có thể được quy cho khả năng của LOMO trong việc huấn luyện mô hình 7B trên một GPU duy nhất, do đó giảm chi phí giao tiếp giữa các GPU. Thông lượng hơi cao hơn của SGD so với AdamW có thể được quy cho việc SGD loại trừ các tính toán momentum và phương sai.
+
+Đối với mô hình 13B, nó không thể được huấn luyện với AdamW trên 8 GPU RTX 3090 có sẵn do hạn chế bộ nhớ. Trong tình huống này nơi song song mô hình là cần thiết cho LOMO, LOMO vẫn vượt trội SGD về mặt thông lượng. Lợi thế này được quy cho các đặc tính hiệu quả bộ nhớ của LOMO và yêu cầu chỉ hai GPU để huấn luyện mô hình với các cài đặt tương tự, dẫn đến chi phí giao tiếp giảm và thông lượng lớn hơn. Hơn nữa, khi huấn luyện mô hình 30B, SGD gặp phải vấn đề hết bộ nhớ (OOM) với 8 GPU RTX 3090, trong khi LOMO hoạt động tốt chỉ với 4 GPU.
+
+Cuối cùng, chúng tôi huấn luyện thành công mô hình 65B sử dụng 8 GPU RTX 3090, đạt được thông lượng 4.93 TGS. Sử dụng cấu hình máy chủ như vậy và LOMO, quá trình huấn luyện trên 1000 mẫu, mỗi mẫu chứa 512 token, mất khoảng 3.6 giờ.
+
+### 4.3 Hiệu suất Downstream
+
+Để đánh giá hiệu quả của LOMO trong việc tinh chỉnh các mô hình ngôn ngữ lớn, chúng tôi tiến hành một loạt thực nghiệm rộng rãi. Chúng tôi so sánh LOMO với hai phương pháp khác, Zero-shot, không yêu cầu tinh chỉnh, và LoRA, hiện đang là một trong những kỹ thuật tinh chỉnh hiệu quả tham số phổ biến nhất. Như mô tả trong (Hu et al., 2022), LoRA tái tham số hóa các lớp dày đặc và chỉ cập nhật các ma trận rank thấp trong khi không gây ra độ trễ trong quá trình suy luận.
+
+Chúng tôi sử dụng bộ sưu tập dữ liệu SuperGLUE để đánh giá hiệu suất mô hình, tập trung cụ thể vào RTE (Dagan et al., 2005), BoolQ (Clark et al., 2019), WSC (Levesque et al., 2012), WIC (Pilehvar và Camacho-Collados, 2019), MultiRC (Khashabi et al., 2018), và COPA (Roemmele et al., 2011).
+
+Với chi phí tính toán cao liên quan đến việc chạy các mô hình ngôn ngữ lớn, chúng tôi theo MeZO (Malladi et al., 2023) để lấy mẫu ngẫu nhiên 1000 dữ liệu huấn luyện từ tập huấn luyện và 1000 dữ liệu kiểm tra từ tập xác thực, và báo cáo kết quả tốt nhất thu được bằng cùng một seed ngẫu nhiên. Các prompt được sử dụng trong thực nghiệm của chúng tôi giống như MeZO, và các siêu tham số được chi tiết trong Phụ lục A.
+
+Trong quá trình suy luận, chúng tôi chèn các nhãn hoặc ứng viên khác nhau vào prompt và tính toán log-likelihood trung bình cho mỗi nhãn. Nhãn có điểm cao nhất được chọn là câu trả lời của mô hình. Để đánh giá hiệu suất, chúng tôi sử dụng Accuracy làm chỉ số đánh giá.
+
+#### 4.3.1 Kết quả chính
+
+Hiệu suất downstream của LOMO so với Zero-shot và LoRA được trình bày trong Bảng 3. Dựa trên kết quả, chúng tôi đạt được những quan sát sau đây.
+
+**LOMO hoạt động tốt hơn đáng kể so với Zero-shot.** Trên tất cả sáu bộ dữ liệu và kích thước mô hình, LOMO liên tục đạt được kết quả vượt trội so với Zero-shot, với mức tăng trung bình hơn 20 điểm sử dụng LLaMA-13B. Trong khi nghiên cứu trước đây đã thể hiện khả năng ấn tượng của các mô hình ngôn ngữ lớn trong cài đặt zero-shot, tinh chỉnh vẫn mang lại cải thiện hiệu suất đáng kể cho các nhiệm vụ downstream cụ thể. Kết quả thực nghiệm xác nhận hiệu quả của LOMO trong việc tối ưu hóa các mô hình ngôn ngữ lớn có kích thước khác nhau.
+
+**LOMO nói chung vượt trội LoRA trong hầu hết các thực nghiệm.** Chúng tôi cho thấy rằng LOMO mang lại hiệu suất mạnh mẽ so với LoRA, ví dụ, dẫn đến mức tăng trung bình 2.8 điểm sử dụng LLaMA-13B. Điều này cho thấy rằng hiệu suất mô hình được hưởng lợi nhiều hơn từ tinh chỉnh tham số đầy đủ so với tinh chỉnh hiệu quả tham số, vì cách tiếp cận trước điều chỉnh nhiều tham số hơn. LOMO tạo ra một sự cân bằng tốt giữa hiệu suất và hiệu quả, làm cho nó trở thành một lựa chọn cạnh tranh cho tinh chỉnh.
+
+**Trong một số trường hợp, LOMO hoạt động kém hơn LoRA.** Một lý do có thể là tập huấn luyện tương đối nhỏ mà chúng tôi sử dụng, có thể không đủ cho việc tinh chỉnh tham số đầy đủ của các mô hình lớn. Ngoài ra, LoRA và LOMO sử dụng các kiến trúc mô hình khác nhau. Cụ thể, LoRA cung cấp một lối tắt cho việc tinh chỉnh mô hình, điều này có thể có lợi trong một số tình huống nhất định. Thực tế, hai phương pháp này không xung đột hoặc loại trừ lẫn nhau. Trong phần tiếp theo, chúng tôi xác nhận rằng việc kết hợp LoRA với LOMO không làm hại hiệu suất mô hình và, trong hầu hết các trường hợp, dẫn đến cải thiện hiệu suất.
+
+**LOMO mở rộng hiệu quả lên các mô hình 65 tỷ tham số.** Mặc dù tiến hành tất cả thực nghiệm trên một máy duy nhất được trang bị 8 × RTX 3090, LOMO liên tục thể hiện hiệu suất mạnh mẽ ngay cả ở quy mô 65 tham số. Điều này hỗ trợ thêm hiệu quả của LOMO trong việc tối ưu hóa LLMs dưới các tình huống hạn chế tài nguyên.
+
+#### 4.3.2 LoRA với LOMO
+
+LOMO và LoRA về cơ bản độc lập với nhau. Để xác minh tuyên bố này, chúng tôi thực hiện thực nghiệm sử dụng LLaMA-13B trên bộ dữ liệu BoolQ và MultiRC. Kết quả được hiển thị trong Hình 3. Chúng tôi thấy rằng LOMO liên tục nâng cao hiệu suất của LoRA bất kể kết quả cao hơn mà LoRA đạt được. Điều này cho thấy rằng các phương pháp tinh chỉnh khác nhau được sử dụng bởi LOMO và LoRA là bổ sung. Cụ thể, LOMO tập trung vào việc tinh chỉnh trọng số mô hình được huấn luyện trước, trong khi LoRA tinh chỉnh các mô-đun bổ sung. Kết quả là, LOMO không làm tổn hại hiệu suất của LoRA; thay vào đó, nó tạo điều kiện cho việc tinh chỉnh mô hình tốt hơn cho các nhiệm vụ downstream.
+
+## 5 Kết luận
+
+Trong bài báo này, chúng tôi giới thiệu Tối ưu hóa Bộ nhớ Thấp (LOMO), một bộ tối ưu mới được thiết kế để tạo điều kiện thuận lợi cho việc tinh chỉnh tham số đầy đủ cho các mô hình ngôn ngữ lớn với tài nguyên hạn chế. Chúng tôi đã chứng minh tính khả thi của việc tinh chỉnh một mô hình 65B trên một máy chủ được trang bị GPU tiêu dùng như RTX 3090. Bằng cách phân tích việc sử dụng bộ nhớ của LOMO, tiến hành kiểm tra thông lượng, và thực hiện thực nghiệm trên SuperGLUE, chúng tôi đã thể hiện hiệu quả và tác động tiềm năng của nó.
+
+Nhìn về tương lai, công việc tương lai của chúng tôi nhằm mục đích giảm thêm ngưỡng tài nguyên cần thiết để huấn luyện các mô hình ngôn ngữ lớn, do đó cho phép truy cập và áp dụng rộng rãi hơn các mô hình này. Phần lớn bộ nhớ hiện đang được chiếm bởi tham số khi huấn luyện với LOMO. Do đó, một hướng đầy hứa hẹn là khám phá các kỹ thuật lượng tử hóa tham số, có thể giảm đáng kể việc sử dụng bộ nhớ. Ngoài ra, chúng tôi dự định điều tra thêm các tình huống có thể áp dụng cho LOMO và đi sâu vào các phân tích lý thuyết để tối ưu hóa các mô hình ngôn ngữ lớn, điều này có giá trị đáng kể để thúc đẩy lĩnh vực này.
+
+## Hạn chế
+
+Để đáp ứng các thách thức liên quan đến chuẩn hóa và cắt gradient, chúng tôi đã phát triển các phương pháp tối ưu hóa thay thế. Mặc dù chuẩn hóa gradient cho LOMO không tăng việc sử dụng bộ nhớ, việc triển khai hiện tại của chúng tôi đòi hỏi một lần đi ngược bổ sung, có thể làm chậm tốc độ huấn luyện trong các tình huống mà chuẩn hóa gradient là thiết yếu.
+
+Do hạn chế về thời gian và tài nguyên, thực nghiệm của chúng tôi bị giới hạn trong một tập con của benchmark SuperGLUE, và chúng tôi không đánh giá thông lượng của LOMO trên GPU tiên tiến như A100.
+
+## Tuyên bố Đạo đức
+
+Bài báo này sử dụng các mô hình mã nguồn mở LLaMA, tuân thủ giấy phép tương ứng của chúng. Các bộ dữ liệu được sử dụng, bao gồm RTE, BoolQ, WSC, WIC, MultiRC và COPA, cho phép sử dụng công cộng và miễn phí.
+
+## Lời cảm ơn
+
+Công trình này được hỗ trợ bởi Chương trình Nghiên cứu và Phát triển Khoa học Kỹ thuật Quốc gia Trung Quốc (Số 2022ZD0160102). Các tính toán trong nghiên cứu này được thực hiện bằng nền tảng CFFF của Đại học Fudan.
+
+## Tài liệu tham khảo
+
+[Danh sách tài liệu tham khảo được giữ nguyên như trong bản gốc]
+
+## A Siêu tham số
+
+Các siêu tham số mà chúng tôi sử dụng trong các thực nghiệm được liệt kê trong Bảng 4. Do tài nguyên tính toán hạn chế, chúng tôi báo cáo kết quả cao nhất của các thực nghiệm được tiến hành với cùng một seed ngẫu nhiên.
+
+## B Động lực Huấn luyện
+
+Để phân tích động lực huấn luyện của LOMO, chúng tôi trình bày đường cong mất mát huấn luyện và độ chính xác xác thực cho LLaMA-7B được huấn luyện trên BoolQ (Clark et al., 2019) sử dụng LOMO và LoRA trong Hình 4 và Hình 5, tương ứng. Trong quá trình huấn luyện với LOMO, mất mát hội tụ nhanh chóng trong giai đoạn ban đầu và sau đó có xu hướng ổn định và giảm dần. Độ chính xác trên tập phát triển nói chung cho thấy xu hướng tăng lên khi số bước huấn luyện tăng lên.

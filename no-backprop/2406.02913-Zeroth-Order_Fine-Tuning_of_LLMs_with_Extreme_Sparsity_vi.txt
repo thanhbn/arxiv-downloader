@@ -1,0 +1,216 @@
+# Tinh chỉnh bậc không của LLM với độ thưa thớt cực đại
+
+Wentao Guo1, Jikai Long2, Yimeng Zeng3, Zirui Liu4, Xinyu Yang5, Yide Ran2,
+Jacob R. Gardner3, Osbert Bastani3, Christopher De Sa6, Xiaodong Yu2,
+Beidi Chen5, và Zhaozhuo Xu2
+
+1wg0420@princeton.edu , Đại học Princeton
+2{jlong1,yran1,xyu38,zxu79}@stevens.edu , Viện Công nghệ Stevens
+3{yimengz,jacobrg,obastani}@seas.upenn.edu , Đại học Pennsylvania
+4zl105@rice.edu , Đại học Rice
+5{xinyuya2,beidic}@andrew.cmu.edu , Đại học Carnegie Mellon
+6cdesa@cs.cornell.edu , Đại học Cornell
+
+## Tóm tắt
+
+Tối ưu hóa bậc không (ZO) là một chiến lược tiết kiệm bộ nhớ để tinh chỉnh các mô hình ngôn ngữ lớn chỉ sử dụng các lượt truyền xuôi. Tuy nhiên, việc áp dụng tinh chỉnh ZO trong các môi trường hạn chế bộ nhớ như điện thoại di động và máy tính xách tay vẫn còn thách thức vì các lượt truyền xuôi độ chính xác đầy đủ là không khả thi. Trong nghiên cứu này, chúng tôi giải quyết hạn chế này bằng cách tích hợp độ thưa thớt và lượng tử hóa vào tinh chỉnh ZO của LLM. Cụ thể, chúng tôi điều tra tính khả thi của việc tinh chỉnh một tập con cực kỳ nhỏ các tham số LLM bằng ZO. Cách tiếp cận này cho phép phần lớn các tham số không được tinh chỉnh được lượng tử hóa để thích ứng với ràng buộc bộ nhớ thiết bị hạn chế. Kết quả của chúng tôi tiết lộ rằng quá trình tiền huấn luyện có thể xác định một tập hợp "tham số nhạy cảm" có thể hướng dẫn tinh chỉnh ZO của LLM trên các tác vụ hạ nguồn. Kết quả của chúng tôi chứng minh rằng tinh chỉnh 0.1% tham số nhạy cảm trong LLM với ZO có thể vượt trội hơn hiệu suất tinh chỉnh ZO đầy đủ, đồng thời cung cấp gia tốc thời gian thực tế. Ngoài ra, chúng tôi cho thấy rằng tinh chỉnh ZO nhắm mục tiêu 0.1% tham số nhạy cảm này, kết hợp với lượng tử hóa 4 bit, cho phép tinh chỉnh ZO hiệu quả của mô hình Llama2-7B trên thiết bị GPU với ít hơn 8GiB bộ nhớ và độ trễ giảm đáng kể.
+
+## 1 Giới thiệu
+
+Các mô hình ngôn ngữ lớn (LLM) đã chứng minh hiệu suất vượt trội trong việc tạo ngôn ngữ đa mục đích [1,35,22]. Mặc dù thành công, vẫn cần thiết phải tinh chỉnh LLM cho các tác vụ cụ thể để đạt được kết quả tối ưu. Tuy nhiên, tinh chỉnh LLM thường đòi hỏi nhiều bộ nhớ hơn so với quá trình suy luận. Cụ thể, có chủ yếu bốn phần chiếm bộ nhớ trong quá trình tinh chỉnh LLM: (1) bản thân tham số trọng số; (2) trạng thái bộ tối ưu, chứa thông tin về gradient quá khứ [16]; (3) gradient trọng số được sử dụng để cập nhật tham số; (4) activation được lưu trữ để tính toán gradient trọng số [25]; Trong các công trình trước đây như QLoRA [7], nó có thể giảm cả (1) và (2) bằng cách kết hợp lượng tử hóa trọng số và thích ứng thứ hạng thấp [12], cho phép tinh chỉnh LLM khổng lồ dưới GPU cấp trung tâm dữ liệu. Tuy nhiên, dưới phần cứng hạn chế bộ nhớ hơn như điện thoại di động, bộ nhớ lưu trữ (3) gradient trọng số và (4) activation được yêu cầu bởi lan truyền ngược vẫn không thể bỏ qua. Sự chênh lệch giữa nhu cầu tinh chỉnh LLM và khả năng phần cứng hạn chế tính thích ứng của LLM, đặc biệt khi cá nhân hóa chúng cho các thiết bị biên.
+
+### Khám phá Tối ưu hóa Bậc không trong Tinh chỉnh LLM
+
+Gần đây, đã có sự quan tâm trở lại đối với các phương pháp tối ưu hóa bậc không (ZO) cho tinh chỉnh LLM [27,23,3]. Phương pháp tối ưu hóa ZO nhiễu loạn các tham số mô hình theo các hướng ngẫu nhiên và sử dụng sự khác biệt giá trị mất mát để tính toán hướng gradient cho việc cập nhật tham số. Một lợi thế của phương pháp ZO trong tinh chỉnh LLM là chúng không yêu cầu quy trình lan truyền ngược, giúp tiết kiệm đáng kể tính toán và bộ nhớ. Theo cách này, ZO không cần lan truyền ngược và không cần lưu trữ (3) gradient trọng số và (4) activation trong quá trình tinh chỉnh. Trong thực tế, các phương pháp ZO đã chứng minh tiềm năng đạt được hiệu suất tương đương với các phương pháp bậc một trong tinh chỉnh LLM, mở ra cánh cửa cho các chiến lược thích ứng LLM hiệu quả khác nhau.
+
+### Tinh chỉnh ZO LLM Hiệu quả với Độ thưa thớt
+
+Mặc dù các phương pháp ZO loại bỏ nhu cầu lan truyền ngược, một nhược điểm đáng kể của những phương pháp này là tốc độ hội tụ chậm [51,23]. Một cách tiếp cận gần đây giải quyết điều này bằng cách tinh chỉnh với một mặt nạ thưa thớt [23,50], đạt được khoảng ~75% độ thưa thớt. Tuy nhiên, mức độ thưa thớt này hầu như không giảm chi phí tính toán, vì độ trễ trong quá trình truyền xuôi với ngay cả ~90% độ thưa thớt vẫn tương đương với các phép toán ma trận dày đặc. Sự gia tăng độ trễ này có thể ảnh hưởng lớn đến trải nghiệm người dùng trên các ứng dụng như trợ lý cá nhân, nơi ngay cả việc tăng độ trễ gấp đôi cũng có thể nhận thấy. Ngoài ra, việc hợp nhất các trọng số thưa thớt trở lại mô hình cơ sở là không thực tế trên những thiết bị này do ràng buộc bộ nhớ ngăn cấm việc khử lượng tử hóa và lượng tử hóa.
+
+Bằng chứng thực nghiệm cho thấy rằng mức độ thưa thớt cao hơn có thể giảm đáng kể thời gian cần thiết cho các phép toán ma trận thưa thớt, như được thể hiện trong Hình 1. Điều này đặt ra câu hỏi:
+
+Liệu có thể tận dụng lợi ích của mức độ thưa thớt cao hơn trong việc giảm độ trễ suy luận trong khi vẫn bảo toàn hiệu suất trên các tác vụ hạ nguồn không? Nếu có, độ thưa thớt có thể được đẩy đến mức nào trong bối cảnh này?
+
+### Đề xuất của chúng tôi: Tinh chỉnh ZO LLM với Độ thưa thớt Có thể Chuyển giao, Được Thông tin bởi Fisher
+
+Trong bài báo này, chúng tôi trả lời câu hỏi nghiên cứu đã nêu bằng cách đề xuất một chiến lược tinh chỉnh ZO LLM thưa thớt hiệu quả. Chúng tôi quan sát một mẫu độ thưa thớt cực đại trong các tham số LLM: một tập con, được xác định bằng cách chọn các mục có độ lớn k hàng đầu từ ma trận thông tin Fisher thực nghiệm, có hiệu quả cho tinh chỉnh ZO. Hơn nữa, chúng tôi thấy rằng mẫu độ thưa thớt này có thể được thu được thông qua quá trình tiền huấn luyện liên tục của LLM và có thể chuyển giao đến các tác vụ hạ nguồn khác nhau mà không cần sửa đổi.
+
+### Tóm tắt Đóng góp
+
+Dựa trên những hiểu biết này, công trình của chúng tôi đề xuất một khung toàn diện cho tinh chỉnh ZO, đưa ra những đóng góp sau:
+
+• Chúng tôi xác định rằng chỉ một phần cực kỳ nhỏ (0.1%) của các tham số LLM nên được cập nhật trong quá trình tinh chỉnh ZO LLM. Hơn nữa, chúng tôi sử dụng hiểu biết này để hướng dẫn việc cá nhân hóa LLM trên thiết bị tiết kiệm bộ nhớ bằng lượng tử hóa bit thấp của các tham số mô hình.
+
+• Chúng tôi quan sát rằng mẫu độ thưa thớt quan sát được trong tiền huấn luyện LLM có thể được chuyển giao qua các tác vụ hạ nguồn khác nhau trong khi vẫn duy trì hiệu suất ZO tốt. Dựa trên quan sát này, chúng tôi phát triển một khung tính toán để thực hiện tinh chỉnh ZO hiệu quả tham số của LLM.
+
+• Chúng tôi tiến hành các thí nghiệm rộng rãi trên nhiều LLM khác nhau và chứng minh rằng phương pháp của chúng tôi đạt được hiệu suất cạnh tranh trên các tác vụ hạ nguồn khác nhau.
+
+## 2 Bối cảnh và Các công trình liên quan
+
+Trong phần này, chúng tôi trình bày công thức cho tối ưu hóa ZO. Chúng tôi cũng thảo luận về các công trình liên quan về độ thưa thớt trong LLM.
+
+### 2.1 Tối ưu hóa Bậc không
+
+**Bộ ước lượng gradient thay thế ZO.** Các bộ tối ưu ZO đã được nghiên cứu rộng rãi trong cộng đồng máy học. Cho một bộ dữ liệu D={(x₁, y₁), . . . , (xₙ, yₙ)} và một hàm mất mát f với các tham số mô hình w∈Rᵈ, bộ tối ưu ZO sẽ ước lượng gradient tại w thông qua bộ ước lượng gradient thay thế ZO.
+
+Xấp xỉ Ngẫu nhiên Nhiễu loạn Đồng thời (SPSA) [39] là một bộ ước lượng như vậy sẽ đầu tiên lấy mẫu một vector ngẫu nhiên z∈Rᵈ và sử dụng sự khác biệt giá trị mất mát để tỷ lệ hướng cập nhật. z thường được lấy mẫu từ phân phối Gaussian N(0,Iᵈ).
+
+**Định nghĩa 1 (Xấp xỉ Ngẫu nhiên Nhiễu loạn Đồng thời (SPSA) [39]).** SPSA ước lượng gradient đối với w với một ví dụ dữ liệu (x, y), một hằng số nhỏ ε∈R, và một vector ngẫu nhiên được lấy mẫu z∈Rᵈ như sau:
+
+ĝ(w,(x, y),z) = [f(w+εz; (x, y))−f(w−εz; (x, y))] / (2εz)     (1)
+
+Có các bộ ước lượng gradient thay thế ZO khác có sẵn [21,31], nhưng trong thực tế SPSA đạt được hiệu suất tốt trong tối ưu hóa ZO, đặc biệt khi tinh chỉnh LLM. Ngoài ra, các thuật toán ZO khác như DeepZero [3] sẽ sử dụng sự khác biệt hữu hạn theo tham số của giá trị mất mát để tính toán hướng cập nhật theo tham số. Điều này sẽ tạo ra chi phí truy vấn O(d) mỗi bước huấn luyện ngay cả khi kết hợp với một số phương pháp che mặt nạ thưa thớt và không thực tế cho các kịch bản tinh chỉnh LLM. Do đó chúng tôi chọn SPSA với nhiễu loạn Gaussian ngẫu nhiên làm bộ ước lượng gradient ZO của chúng tôi.
+
+**Thuật toán ZO-SGD.** ZO-SGD là một bộ tối ưu tương tự như SGD nhưng thay thế gradient FO bằng ước lượng gradient thay thế ZO mỗi bước huấn luyện, như được định nghĩa dưới đây:
+
+**Định nghĩa 2 (Quy tắc cập nhật ZO-SGD).** ZO-SGD là một bộ tối ưu sử dụng gradient thay thế ZO để cập nhật tham số wₜ với tỷ lệ học ηₜ và một ví dụ dữ liệu (xₜ, yₜ) được lấy mẫu tại thời điểm t:
+
+wₜ₊₁ = wₜ - ηₜĝw(wₜ,(xₜ, yₜ),zₜ)     (2)
+
+MeZO [27] là một thuật toán ZO-SGD sử dụng "thủ thuật hạt giống ngẫu nhiên" để tiết kiệm nhu cầu lưu trữ gradient thay thế ZO. Việc lựa chọn bộ tối ưu (SGD) là trực giao với các kỹ thuật tối ưu hóa ZO, nhưng trong các thí nghiệm sơ bộ của chúng tôi, chúng tôi thấy rằng các bộ tối ưu thích ứng như Adam [16] sẽ không nhất thiết tăng tốc hội tụ ZO trong các kịch bản tinh chỉnh LLM. Có các bộ tối ưu ZO khác nhận thức về tính không đồng nhất theo tham số của độ cong mất mát để tăng tốc hội tụ tối ưu [51], và chúng tôi để lại cách kết hợp phương pháp của chúng tôi với của họ như công việc tương lai.
+
+### 2.2 Độ thưa thớt trong LLM
+
+Các kỹ thuật dựa trên độ thưa thớt được áp dụng rộng rãi trong việc cải thiện hiệu quả [42,46,24,33,8] và độ mạnh mẽ [53,52] của mô hình ML. Frankle và Carbin [8] đã chỉ ra rằng trong các mạng nơ-ron lớn, tồn tại một mạng con mà khi được huấn luyện riêng lẻ, có thể đạt được độ chính xác kiểm tra tương đương với mạng gốc. Trong thời đại mô hình nền tảng, Liu et al. [24] chứng minh rằng các mô hình dựa trên transformer, như OPT [49], thể hiện độ thưa thớt lớn (≥95%) trong các activation. Hơn nữa, Panigrahi et al. [32] phát hiện ra rằng đối với RoBERTa [22], tinh chỉnh một tập con rất nhỏ các tham số (~0.01%) có thể mang lại hiệu suất vượt quá 95% so với tinh chỉnh đầy đủ.
+
+Trong bối cảnh tối ưu hóa ZO, Liu et al. [23] và Zhang et al. [50] cũng gợi ý rằng độ thưa thớt có thể tăng tốc hội tụ tối ưu ZO. Chúng tôi tin rằng ZO có nhu cầu nội tại cho huấn luyện thưa thớt, vì quy trình của bộ ước lượng gradient ZO thường yêu cầu nhiễu loạn tỷ lệ theo tọa độ gần như đồng nhất (theo kỳ vọng) mà tăng theo d. Theo truyền thống, người ta thường giải quyết điều này với kiến thức từ tính không đồng nhất độ cong mất mát theo tham số (thay thế z bằng Σ^(1/2)z trong đó Σ^(1/2) phục vụ như một tiền điều kiện được thông tin Hessian) [48,51]. Tuy nhiên, họ không cung cấp một điều tra toàn diện về các mô hình tham số lớn như LLM. Đặc biệt, chúng tôi cũng quan sát rằng trong quá trình tinh chỉnh bậc một (FO) của LLM, gradient FO có thể khá thưa thớt. Chúng tôi sẽ trình bày chi tiết hơn về hiểu biết này trong phần tiếp theo (xem Hình 2 và Hình 7). Chúng tôi muốn khám phá cách độ thưa thớt có thể có lợi cho tinh chỉnh ZO LLM.
+
+## 3 Theo đuổi Độ thưa thớt Cực đại trong Tinh chỉnh ZO LLM
+
+Trong phần này, chúng tôi mô tả mẫu độ thưa thớt cực đại mà chúng tôi quan sát trong LLM và cách chúng tôi sử dụng nó để tinh chỉnh ZO hiệu quả bao gồm cả việc cá nhân hóa LLM trên thiết bị.
+
+### 3.1 Mẫu Độ thưa thớt Cực đại trong LLM
+
+**Tối ưu hóa ZO với tham số nhạy cảm.** Cho các tham số mô hình w, một hàm mất mát f, một ví dụ dữ liệu (x, y), các tham số nhạy cảm được định nghĩa là các tham số có giá trị bình phương gradient FO theo tọa độ tương ứng được tối đa hóa.
+
+**Định nghĩa 3 (Mặt nạ tham số nhạy cảm).** Một mặt nạ thưa thớt nhạy cảm mₖ∈ {0,1}ᵈ với k mục khác không (∑ᵢm(i) = k) được định nghĩa là
+
+mₖ = argmax_m ∥m⊙ ∇f(w; (x, y))∥₂²     (3)
+
+Trong bối cảnh tối ưu hóa ZO, chúng tôi sẽ chỉ cập nhật các tham số nhạy cảm. Ký hiệu rằng z̄ = z⊙mₖ. Chúng tôi sẽ sửa đổi bộ ước lượng gradient SPSA từ ĝ(w,(x, y),z) thành ĝ(w,(x, y),z̄), và tương ứng:
+
+**Định nghĩa 4 (Quy tắc cập nhật ZO-SGD thưa thớt nhạy cảm).**
+
+wₜ₊₁ = wₜ - ηₜĝw(wₜ,(xₜ, yₜ),z̄ₜ)     (4)
+
+Hỗ trợ lý thuyết của các tham số nhạy cảm có thể được suy ra từ góc độ của bộ ước lượng gradient SPSA và ma trận thông tin Fisher như sau:
+
+• **Thay đổi giá trị mất mát bậc không tối đa, từ góc độ bộ ước lượng SPSA.**
+Bình phương (tính đến tính âm) của sự khác biệt giá trị mất mát cho ĝw(wₜ,(xₜ, yₜ),z̄ₜ) như sau:
+
+E_z̄{f(w+εz̄; (x, y))−f(w−εz̄; (x, y))}² ≈ E_z̄{2εz̄ᵀ∇wf(w; (x, y))}²     (5)
+= 4ε²∥mₖ⊙∇wf(w; (x, y))∥²     (6)
+
+Vì theo Định nghĩa 3, mặt nạ nhạy cảm của chúng tôi sẽ tối đa hóa ∥mₖ⊙∇wf(w; (x, y))∥² cho một tỷ lệ thưa thớt cho trước, chúng tôi sẽ kỳ vọng mặt nạ nhạy cảm của chúng tôi tối đa hóa độ lớn của sự khác biệt giá trị mất mát cho bất kỳ tỷ lệ thưa thớt cho trước nào.
+
+• **Bao phủ tối đa đường chéo Hessian, từ góc độ ma trận Fisher.**
+LLM thường được tiền huấn luyện trên corpus văn bản lớn để đạt được độ phức tạp thấp trước khi vào giai đoạn tinh chỉnh. Trong trường hợp này, chúng tôi sẽ giả định p_LLM(y|x) ∼ p_D(y|x), có nghĩa là Fisher thực nghiệm F̂ nên gần với ma trận Fisher (thực) F như sau:
+
+F = E_{x∼p_D,ŷ∼p_LLM(·|x)}∇w log p_LLM(ŷ|x)(∇w log p_LLM(ŷ|x))ᵀ     (7)
+≈ F̂ = E_{(x,y)∼p_D}∇w log p_LLM(y|x)(∇w log p_LLM(y|x))ᵀ     (8)
+
+Vì chúng tôi giả định ma trận Fisher thực nghiệm xấp xỉ Fisher, cái mà cũng xấp xỉ Hessian, và đường chéo Fisher thực nghiệm bằng vector bình phương gradient theo tọa độ khi tính toán với mất mát cụ thể cho tác vụ hạ nguồn, các tham số nhạy cảm của chúng tôi sẽ bao phủ một phần lớn các mục đường chéo Hessian lớn nhất.
+
+Ý tưởng về các tham số nhạy cảm này đã được nghiên cứu trong cộng đồng lượng tử hóa [15,11] và tối ưu hóa FO [40]. Tuy nhiên, chúng tôi là người đầu tiên tận dụng các tham số nhạy cảm cực kỳ thưa thớt trong tinh chỉnh LLM để tăng tốc tinh chỉnh ZO với LLM. Khi chúng tôi có nhiễu loạn và cập nhật ở quy mô hàng tỷ tham số, việc tìm ra tham số nào cần tinh chỉnh sẽ quan trọng để cải thiện hiệu suất ZO. Lưu ý rằng ở đây chúng tôi sử dụng mặt nạ nhạy cảm mₖ để hiểu. Trong Phần 3.4, chúng tôi sẽ thảo luận cách chuyển đổi Định nghĩa 4 thành một pipeline tối ưu hiệu quả tham số bằng cách tối ưu các tham số nhạy cảm cố định.
+
+### 3.2 Tỷ lệ Hội tụ Lý thuyết
+
+Chúng tôi sẽ điều tra hội tụ lý thuyết của ZO-SGD thưa thớt nhạy cảm trên các tham số nhạy cảm dưới các thiết lập tối ưu hóa không lồi. Các giả định của chúng tôi được bao gồm trong Phụ lục B.2.
+
+**Định lý 1 (Tỷ lệ hội tụ của ZO-SGD thưa thớt nhạy cảm (Định nghĩa 4)).** Nếu chúng tôi chọn ηₜ = 1/(L(k+ 2)), dưới Giả định 1 (lỗi gradient bị chặn), 2 (mượt mà Lipschitz), và 4 (tham số nhạy cảm thưa thớt), chúng tôi sẽ có
+
+(1/T)∑_{t=0}^{T-1} E_{z̄,(x,y)}∥∇wF(wₜ)∥² ≤ O(k/c·L/T)(F(w₀)− F*) + 3σ²     (9)
+
+Hơn nữa, nếu chúng tôi vẫn chọn ηₜ = 1/(L(k+ 2)), với một Giả định 3 bổ sung (điều kiện P.L.), chúng tôi sẽ có
+
+E_{z̄,(x,y)}{F(wₜ)− F*} ≤ (1−O(μ/L·c/k))ᵀ(F(w₀)− F*) + 3σ²c/(2L(k+ 2))     (10)
+
+Chứng minh cho Bất đẳng thức 9 trong Phụ lục B.2 và chứng minh cho Bất đẳng thức 10 trong Phụ lục B.3.
+
+Nếu chúng tôi chọn k = d và c = 1, cả hai tỷ lệ hội tụ đều giảm tầm thường về tỷ lệ hội tụ bậc không tiêu chuẩn là O(d/T) + O(hằng số) và O((1/d)ᵀ) + O(hằng số). Vì chúng tôi giả định c ≫ k/d, chúng tôi biết d ≫ k/c và do đó cả O((k/c)(1/T)) và O((c/k)ᵀ) đều thấp hơn nhiều so với O(d/T) + O(hằng số) và O((1/d)ᵀ) + O(hằng số) mà phương pháp bậc không sẽ tạo ra.
+
+Chúng tôi muốn nhấn mạnh rằng các đóng góp của chúng tôi tập trung nhiều hơn vào tinh chỉnh LLM thực nghiệm thay vì các tác vụ máy học tổng quát, và trong Phần 4.1 chúng tôi so sánh rộng rãi các phương pháp ZO thưa thớt của chúng tôi với các phương pháp ZO thưa thớt khác và chúng tôi chứng minh sự vượt trội của nó trong quá trình tinh chỉnh LLM. Chúng tôi không sử dụng giả định "hạng hiệu quả cục bộ r" nghiêm ngặt mà Malladi et al. [27] sử dụng, và Giả định 4 của chúng tôi có thể được quan sát dễ dàng một cách thực nghiệm trong Hình 2. Liu et al. [23] và Ohta et al. [31] cũng cung cấp phân tích tương tự về hội tụ. Tuy nhiên, họ không bao gồm mặt nạ thưa thớt nhạy cảm của chúng tôi trong các nghiên cứu của họ.
+
+### 3.3 Tính Chuyển giao của Mẫu Độ thưa thớt Tiền huấn luyện LLM trong Tinh chỉnh ZO
+
+**Tinh chỉnh thưa thớt với tham số nhạy cảm cố định.** Định lý 1 của chúng tôi tập trung vào tinh chỉnh thưa thớt động. Tuy nhiên, Panigrahi et al. [32] nhận thấy rằng trong kịch bản tinh chỉnh LLM thực tế, hiệu suất tinh chỉnh có thể được quy cho một tập con thưa thớt của trọng số (~0.01%). Malladi et al. [28] cũng thấy rằng một số tác vụ tinh chỉnh sẽ thể hiện hành vi kernel, bao gồm "đặc trưng (gradient) cố định": ∇wf(w_sau FT; (x, y)) ∼ ∇wf(w_trước FT; (x, y)).
+
+Sự tương tự của các đặc trưng gradient trong quá trình tinh chỉnh sẽ ngụ ý rằng chúng tôi không cần chọn lại các tham số nhạy cảm trong quá trình tinh chỉnh tức là chọn một lần trước khi tinh chỉnh sẽ đủ. Giả thuyết này có thể được xác nhận bằng Hình 3 và Hình 5b. Trong Hình 3, thực tế rằng "task grad, static" không biến mất và vẫn có tỷ lệ lớn so với "task grad, dyn." ở cuối quá trình huấn luyện chứng minh rằng chúng tôi có thể chọn tham số trước khi tinh chỉnh. Chúng tôi cũng bao gồm các hình tương tự cho Mistral-7B và OPT-6.7B trong Hình 8 trong Phụ lục C.3. Chúng tôi sẽ mô tả Hình 5b trong Phần 4.3.
+
+**Mặt nạ thưa thớt nhạy cảm thay thế từ bộ dữ liệu tiền huấn luyện.** Một quan sát khác từ Hình 3 là các tham số nhạy cảm được tính từ bộ dữ liệu tiền huấn luyện (C4) vẫn sẽ bao phủ một phần lớn độ nhạy cảm của mô hình. Do đó, chúng tôi có thể sử dụng nó như một mặt nạ thưa thớt nhạy cảm thay thế khi gradient trên các tác vụ hạ nguồn không có sẵn, đặc biệt trong kịch bản cá nhân hóa trên thiết bị¹.
+
+¹ Việc thu được gradient của LLM trên các thiết bị biên là tốn kém, và chúng tôi thường không thể chuyển dữ liệu từ thiết bị biên lên đám mây để tính toán gradient trên các tác vụ hạ nguồn trên đám mây. Trong trường hợp này, chúng tôi sẽ cần một số thông tin gradient thay thế để tính toán mặt nạ thưa thớt nhạy cảm trên đám mây. Chúng tôi sẽ thảo luận về điều này trong Phần 3.5.
+
+### 3.4 Đề xuất của chúng tôi: Tinh chỉnh ZO LLM với Độ thưa thớt Có thể Chuyển giao, Được Thông tin bởi Fisher
+
+Tối ưu hóa thưa thớt trên các tham số cố định có thể được thực hiện như một quy trình tối ưu hiệu quả tham số, sẽ giảm thời gian nhiễu loạn và cập nhật trong quá trình tối ưu ZO. Giả sử chúng tôi đã tính được một mặt nạ thưa thớt nhạy cảm mₖ, và chúng tôi biết nó cố định trong quá trình tinh chỉnh. Thay vì áp dụng mₖ cho z, chúng tôi sẽ áp dụng nó trực tiếp cho w và trích xuất các phần khác không như bên dưới:
+
+w_sparse = w⊙mₖ, w_dense = w⊙(1ᵈ−mₖ)     (11)
+
+Ký hiệu z_{k,t} ∼ N(0ₖ,Iₖ) là nhiễu loạn Gaussian được lấy mẫu trong thời điểm t. Chúng tôi sẽ xác định w_sparse trước khi tinh chỉnh và chỉ tối ưu trên w_sparse và để w_dense đóng băng trong quá trình tinh chỉnh. Trong trường hợp này, quy tắc cập nhật ZO-SGD thưa thớt nhạy cảm của chúng tôi sẽ trở thành:
+
+w_{sparse,t+1} = w_{sparse,t} - ηₜĝ(w_{sparse,t},(xₜ, yₜ),z_{k,t})     (12)
+
+Trong Phần 3.5, chúng tôi mô tả cách việc phân giải này sẽ kết hợp liền mạch với các phương pháp lượng tử hóa sau huấn luyện (PTQ) hiện có, tạo ra cơ hội cho việc cá nhân hóa trên thiết bị. Trong Phụ lục C.6, chúng tôi thảo luận về việc thực hiện hiệu quả các lớp tuyến tính sau khi phân giải của chúng tôi.
+
+### 3.5 Một Cơ hội cho Cá nhân hóa LLM Trên thiết bị
+
+[Hình 4: Quy trình cá nhân hóa LLM trên thiết bị thông qua tích hợp tối ưu ZO thưa thớt nhạy cảm với lượng tử hóa.]
+
+Vì LLM thường được tiền huấn luyện với các bộ dữ liệu công cộng không nhận biết người dùng, việc cá nhân hóa LLM với sở thích cá nhân của người dùng và đáp ứng nhu cầu cụ thể của người dùng trước khi triển khai thực tế là quan trọng. [41,26] Tuy nhiên, việc chuyển dữ liệu cụ thể của người dùng lên đám mây trước khi tinh chỉnh LLM sẽ gây ra lo ngại về quyền riêng tư. [47] Mặt khác, các thiết bị cá nhân thường có ngân sách tính toán ít hơn và bị hạn chế bộ nhớ hơn so với đám mây [54], và việc thực hiện tinh chỉnh đầy đủ sẽ dễ dàng vượt quá ngân sách bộ nhớ thiết bị.
+
+Nếu chúng tôi muốn tinh chỉnh một mô hình cấp 7B (như Llama2-7B) trên các thiết bị hạn chế bộ nhớ, chúng tôi cần giảm mức tiêu thụ bộ nhớ trên trọng số mô hình, gradient, activation truyền xuôi, và trạng thái bộ tối ưu:
+
+• **Trọng số mô hình.** Chúng tôi sẽ lượng tử hóa w_dense xuống 4 bit, giảm kích thước mô hình của một mô hình Llama2-7B từ 13.5 xuống 3.4 GiB.
+
+• **Activation truyền xuôi.** Tối ưu hóa ZO đã tiết kiệm nhu cầu lưu trữ activation.
+
+• **Gradient.** Chúng tôi sẽ sử dụng "thủ thuật hạt giống ngẫu nhiên" giống như MeZO [27] để tái tạo gradient theo lớp thay vì lưu trữ chúng.
+
+• **Trạng thái bộ tối ưu.** Chúng tôi sử dụng SGD. Phương pháp của chúng tôi cũng có thể được thực hiện như một phương pháp tối ưu hiệu quả tham số cũng tiết kiệm bộ nhớ với các bộ tối ưu khác (ngay cả với Adam).
+
+Kết quả là, mức tiêu thụ bộ nhớ của chúng tôi gần như tối thiểu: chúng tôi có thể tinh chỉnh một mô hình Llama2-7B dưới 8 GiB bộ nhớ GPU mà không cần bất kỳ offloading nào. Điều này sẽ thỏa mãn ràng buộc bộ nhớ của một phạm vi rộng các thiết bị biên hoặc di động như được minh họa trong Bảng 3.
+
+**Tích hợp với lượng tử hóa.** Trong Phần 3.4, chúng tôi biết rằng chúng tôi có thể thu được mặt nạ thưa thớt nhạy cảm thay thế trước khi tinh chỉnh. Chúng tôi sẽ đầu tiên phân giải w nhạy cảm thành w_sparse và w_dense. Sau đó chúng tôi sẽ lượng tử hóa w_dense. Trong quá trình này, chúng tôi sẽ sử dụng thông tin gradient thay thế mà nhiều thuật toán PTQ đã có: họ cần gradient để hiệu chuẩn lỗi lượng tử hóa của họ.
+
+Phương pháp của chúng tôi cũng không đặt ra ràng buộc nghiêm ngặt về các lựa chọn cụ thể của thuật toán lượng tử hóa vì bất kỳ thuật toán nào [2,30,9,20,15] nhằm tối thiểu hóa số hạng lỗi lượng tử hóa hoặc biến thể của nó sẽ đủ:
+
+Q(w) = argmin_{Q(w)} E_x∥(w−Q(w))x∥₂²     (13)
+
+**Quy trình cá nhân hóa trên thiết bị.** Quy trình được minh họa trong Hình 4. Tổng quan cấp cao là chúng tôi sử dụng thông tin gradient thay thế từ bộ dữ liệu tiền huấn luyện ∇wp_LLM(y|x) để trích xuất tham số nhạy cảm w_sparse và giữ w_sparse ở 16 bit, trong khi chúng tôi lượng tử hóa các trọng số dày đặc còn lại w_dense (Bước 1-4). Chúng tôi gửi w_sparse và Q(w_dense) đến các thiết bị cá nhân (Bước 5), và chúng tôi thực hiện tinh chỉnh ZO trên thiết bị chỉ trên w_sparse (Bước 6).
+
+## 4 Thí nghiệm
+
+Trong phần này, chúng tôi muốn xác nhận hiệu quả của phương pháp tối ưu ZO thưa thớt nhạy cảm của chúng tôi. Chúng tôi cũng điều tra hiệu quả của công thức cá nhân hóa trên thiết bị của chúng tôi trong Hình 4. Có một số câu hỏi nghiên cứu chúng tôi muốn trả lời:
+
+• **RQ1:** Tối ưu hóa các tham số nhạy cảm có hiệu quả hơn việc tối ưu hóa tập con khác của các tham số trong quá trình tinh chỉnh ZO không? Chúng tôi có thể tối ưu hóa các tham số thưa thớt nhạy cảm thay thế khi thông tin gradient hạ nguồn không có sẵn không?
+
+• **RQ2:** Tối ưu hóa các tham số cực kỳ thưa thớt và cố định (Phương trình 12) có thể dẫn đến tăng tốc thời gian theo lần lặp và tổng thời gian thực tế không?
+
+• **RQ3:** Chúng tôi có thể đạt được hiệu suất đầy đủ của tinh chỉnh ZO đầy đủ bằng cách sử dụng công thức cá nhân hóa trên thiết bị của chúng tôi (Hình 4) không?
+
+Chúng tôi tập trung vào các mô hình LLM 7B (Llama2-7B [43], Mistral-7B [13], OPT-6.7B [49]) vì chúng sẽ phù hợp với các ràng buộc bộ nhớ trên thiết bị phổ biến (8 GiB) được liệt kê trong Bảng 3 sau khi áp dụng lượng tử hóa. Chúng tôi sử dụng các bộ dữ liệu SST-2 [38], RTE [44], CB [6], BoolQ [4], WSC [17], WiC [34], và COPA [37]. Chúng tôi tuân theo các thiết lập tinh chỉnh ZO tiêu chuẩn và sử dụng cùng codebase như trong Malladi et al. [27]. Thêm chi tiết về các thí nghiệm của chúng tôi (siêu tham số, lời nhắc cụ thể cho tác vụ, v.v.) trong Phụ lục C.
+
+### 4.1 RQ1: Hiệu quả của Tinh chỉnh ZO Thưa thớt trên Tham số Nhạy cảm
+
+Đầu tiên chúng tôi điều tra hiệu suất của việc tối ưu hóa các tham số nhạy cảm của chúng tôi so với các tập con khác của tham số. Các phương pháp thưa thớt cơ sở của chúng tôi là tập con ngẫu nhiên và các giá trị ngoại lệ trọng số. Như được minh họa trong Hình 5a, chúng tôi có thể thấy rằng tinh chỉnh ZO sẽ có lợi từ tối ưu hóa thưa thớt, vì tất cả các phương pháp sẽ đạt được cao hơn tinh chỉnh ZO đầy đủ ở 90% thưa thớt. Tuy nhiên, chỉ có các tham số nhạy cảm mới duy trì hiệu suất khi chúng tôi chuyển đến vùng thưa thớt cực đại (>99%). Thực tế, đường cong hiệu suất của các tham số nhạy cảm đối với các mức độ thưa thớt khác nhau gần như là một đường cong phẳng, điều này chỉ ra rằng mất mát hiệu suất bằng cách chuyển từ 90% đến 99.9% là tối thiểu. Do đó, chúng tôi có thể tối ưu hóa ít hơn 100× tham số so với ngẫu nhiên và giá trị ngoại lệ trọng số và vẫn có được hiệu suất tương tự.
+
+Chúng tôi cũng xác nhận liệu tối ưu hóa các tham số nhạy cảm cố định và thay thế vẫn nên mang lại hiệu suất thỏa đáng. Trong Hình 5b, chúng tôi so sánh hiệu suất của việc tối ưu hóa các tham số nhạy cảm với gradient C4 với giới hạn trên lý thuyết của nó: các tham số nhạy cảm cố định được tính từ gradient cụ thể cho tác vụ như đường liền nét và phiên bản động của nó như đường gạch chấm. Chúng tôi cũng bao gồm các tham số tập con ngẫu nhiên cố định và động như một cơ sở. Chúng tôi có thể thấy rằng khoảng cách của các tham số nhạy cảm giữa việc tính từ gradient C4 và gradient cụ thể cho tác vụ ở mức độ thưa thớt 99.9% là nhỏ và đường xanh vẫn cao hơn nhiều so với cơ sở ngẫu nhiên và tinh chỉnh đầy đủ. Chúng tôi cũng trình bày một tóm tắt về các cách tiếp cận của chúng tôi với 99.9% thưa thớt trên nhiều bộ dữ liệu và mô hình khác nhau trong Bảng 1.
+
+### 4.2 RQ2: Hiệu quả Thời gian Thực tế
+
+Bằng cách sử dụng tinh chỉnh ZO hiệu quả tham số với thưa thớt cực đại, chúng tôi cũng đạt được tăng tốc hội tụ thời gian thực tế 1.2 - 2.5 × so với tinh chỉnh ZO đầy đủ vì chúng tôi gần như loại bỏ thời gian nhiễu loạn ZO và bước tối ưu, như Hình 6 cho thấy. Điều này cũng tăng tỷ lệ sử dụng GPU vì ZO truyền xuôi lô lớn thường bị giới hạn tính toán trong khi các bước nhiễu loạn và tối ưu hóa thường bị giới hạn bộ nhớ. Hơn nữa, dấu chân bộ nhớ giảm của tinh chỉnh ZO hiệu quả tham số cho phép huấn luyện các mô hình lớn hơn trên cùng một phần cứng, có khả năng dẫn đến hiệu suất tốt hơn nữa. Kết quả là, chúng tôi trả lời câu hỏi này rằng tối ưu hóa các tham số cực kỳ thưa thớt và cố định dẫn đến cải thiện thời gian theo lần lặp và tổng thời gian thực tế đáng kể.
+
+### 4.3 RQ3: Cá nhân hóa Trên thiết bị
+
+Chúng tôi xác nhận liệu phương pháp tối ưu ZO thưa thớt nhạy cảm của chúng tôi có phù hợp với pipeline cá nhân hóa trên thiết bị được mô tả trong Phần 3.5 với Bảng 1. Chúng tôi tuân theo công thức chính xác như được mô tả trong Hình 4 để báo cáo một số là "Sensitive (C4, static)", nơi chúng tôi chỉ tối ưu hóa 0.1% tham số nhạy cảm trên một mô hình lượng tử hóa 4-bit. Vì tinh chỉnh ZO xảy ra sau khi mô hình được lượng tử hóa, việc ablating trên việc trích xuất 0.1% tập con ngẫu nhiên của tham số sẽ tạo ra một mô hình lượng tử hóa khác. Vì vậy chúng tôi chọn báo cáo kết quả cho việc tối ưu hóa với một tập con ngẫu nhiên cố định trên mô hình 16-bit là "Random (static)".
+
+Chúng tôi cũng so sánh với tối ưu hóa với LoRA [12] và Prefix Tuning [19] với bộ tối ưu ZO-SGD trên cùng một mô hình lượng tử hóa. Chúng tôi tuân theo LoRA r và α và độ dài prefix được thể hiện trong Malladi et al. [27], và đối với LoRA, chúng tôi thêm nó vào tất cả các lớp tuyến tính giống như nơi các tham số nhạy cảm của chúng tôi được trích xuất. Chúng tôi thấy rằng việc tích hợp tối ưu ZO thưa thớt nhạy cảm với pipeline cá nhân hóa trên thiết bị vẫn mang lại hiệu suất tốt vượt trội tất cả các cơ sở trên các mô hình và tác vụ. Đặc biệt, hiệu suất cao hơn ICL, và tinh chỉnh ZO đầy đủ trong 16 bit. Ngoài ra, chúng tôi đã vượt qua các phương pháp ZO-PEFT khác và phương pháp tinh chỉnh ZO thưa thớt ngẫu nhiên. Điều này chứng minh sự vượt trội của việc tối ưu hóa chỉ các tham số nhạy cảm trong các công thức tinh chỉnh ZO.
+
+[Bảng 1 và các bảng khác với kết quả thí nghiệm chi tiết]
+
+Chúng tôi cũng nhận thấy rằng tối ưu hóa các tham số nhạy cảm được tính từ gradient C4 vẫn tạo ra kết quả gần như từ gradient cụ thể cho tác vụ (trung bình ít hơn 1% sự khác biệt độ chính xác). Điều này chỉ ra rằng tối ưu hóa các tham số nhạy cảm thay thế vẫn thành công về mặt thực nghiệm.
+
+## 5 Kết luận
+
+Chúng tôi đã chỉ ra rằng các tham số nhạy cảm được cung cấp bởi quá trình tiền huấn luyện có thể hỗ trợ hiệu quả trong tinh chỉnh ZO LLM. Các thí nghiệm của chúng tôi cho thấy rằng tinh chỉnh ZO được hướng dẫn bởi 0.1% tham số nhạy cảm trong LLM thậm chí có thể hoạt động tốt hơn tinh chỉnh ZO tham số đầy đủ. Kết quả thí nghiệm cũng chứng minh rằng việc lượng tử hóa các tham số khác ngoài tham số nhạy cảm cho phép chúng tôi thực hiện tinh chỉnh ZO của một LLM trên các thiết bị bộ nhớ hạn chế.
