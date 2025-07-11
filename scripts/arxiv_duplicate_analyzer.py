@@ -136,7 +136,10 @@ def analyze_arxiv_files(root_dir, verbose=False):
     print(f"Unique arXiv IDs: {total_unique_ids:,}")
     print(f"Duplicate arXiv IDs: {total_duplicates:,}")
     print(f"Total duplicate instances: {total_duplicate_instances:,}")
-    print(f"Deduplication savings: {total_duplicate_instances:,} URLs ({total_duplicate_instances/total_urls*100:.1f}%)")
+    if total_urls > 0:
+        print(f"Deduplication savings: {total_duplicate_instances:,} URLs ({total_duplicate_instances/total_urls*100:.1f}%)")
+    else:
+        print(f"Deduplication savings: 0 URLs (0.0%)")
     
     if failed_extractions:
         print(f"Failed to extract arXiv ID from {len(failed_extractions)} URLs")

@@ -7,37 +7,37 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### Download Papers (Optimized - Parallel Processing)
 ```bash
 # Download papers using optimized Python script (8 workers default)
-python arxiv_downloader.py <url_file>
+python scripts/arxiv_downloader.py <url_file>
 
 # Examples:
-python arxiv_downloader.py CoT.txt
-python arxiv_downloader.py RAG.txt
-python arxiv_downloader.py Benchmark.txt
+python scripts/arxiv_downloader.py CoT.txt
+python scripts/arxiv_downloader.py RAG.txt
+python scripts/arxiv_downloader.py Benchmark.txt
 
 # WARNING: ArXiv allows only 1 concurrent connection and 3 second delays!
 # Only use 1 worker to comply with ArXiv rate limits
-python arxiv_downloader.py CoT.txt 1
+python scripts/arxiv_downloader.py CoT.txt 1
 
 # Download to custom directory (FIXED)
-python arxiv_downloader.py multimodal/arxiv_links.txt 1 multimodal
+python scripts/arxiv_downloader.py multimodal/arxiv_links.txt 1 multimodal
 
 # Orchestrator (respects ArXiv rate limits) - FIXED to save to correct folders
-python arxiv_orchestrator.py
+python scripts/arxiv_orchestrator.py
 
 # CAUTION: Multiple concurrent connections may get blocked by ArXiv
-python arxiv_orchestrator.py 1 1
+python scripts/arxiv_orchestrator.py 1 1
 
 # Download using shell script (fallback option)
-./download_arxiv.sh <links_file> <destination_directory>
+./scripts/download_arxiv.sh <links_file> <destination_directory>
 ```
 
 ### Testing Downloads
 ```bash
 # Test with small collection (fast with parallel processing)
-python arxiv_downloader.py icl.txt
+python scripts/arxiv_downloader.py icl.txt
 
 # Test with custom worker count
-python arxiv_downloader.py icl.txt 4
+python scripts/arxiv_downloader.py icl.txt 4
 
 # Check downloaded files
 ls -la multimodal_papers/
@@ -48,46 +48,46 @@ ls -la RAG/
 ### PDF to TXT Conversion
 ```bash
 # Convert all PDFs in a collection to TXT format with proper naming
-python3 pdf_to_txt_converter.py --all
+python3 scripts/pdf_to_txt_converter.py --all
 
 # Convert PDFs in specific collection
-python3 pdf_to_txt_converter.py --both --collection pruning
+python3 scripts/pdf_to_txt_converter.py --both --collection pruning
 
 # Only convert PDFs to TXT (no renaming)
-python3 pdf_to_txt_converter.py --convert --collection clarify
+python3 scripts/pdf_to_txt_converter.py --convert --collection clarify
 
 # Only rename existing TXT files with paper titles (recheck functionality)
-python3 pdf_to_txt_converter.py --rename --collection pruning
+python3 scripts/pdf_to_txt_converter.py --rename --collection pruning
 
 # Interactive mode - choose options manually
-python3 pdf_to_txt_converter.py
+python3 scripts/pdf_to_txt_converter.py
 
 # Process specific collection with both conversion and renaming
-python3 pdf_to_txt_converter.py --collection multimodal
+python3 scripts/pdf_to_txt_converter.py --collection multimodal
 
 # Get help with all available options
-python3 pdf_to_txt_converter.py --help
+python3 scripts/pdf_to_txt_converter.py --help
 ```
 
 ### Paper Organization & Management
 ```bash
 # Check paper organization against arxiv_links.txt files (dry run)
-python3 check_and_move_papers_enhanced.py
+python3 scripts/check_and_move_papers_enhanced.py
 
 # Actually move misplaced papers to correct collections
-python3 check_and_move_papers_enhanced.py --execute
+python3 scripts/check_and_move_papers_enhanced.py --execute
 
 # Process specific collections only
-python3 check_and_move_papers_enhanced.py --collections multimodal rag peft
+python3 scripts/check_and_move_papers_enhanced.py --collections multimodal rag peft
 
 # Enhanced logging with different levels
-python3 check_and_move_papers_enhanced.py --log-level DEBUG --verbose
+python3 scripts/check_and_move_papers_enhanced.py --log-level DEBUG --verbose
 
 # Save detailed log to file
-python3 check_and_move_papers_enhanced.py --log-file organization.log --execute
+python3 scripts/check_and_move_papers_enhanced.py --log-file organization.log --execute
 
 # Full featured run with comprehensive logging
-python3 check_and_move_papers_enhanced.py --execute --verbose --log-level INFO --log-file full_organization.log
+python3 scripts/check_and_move_papers_enhanced.py --execute --verbose --log-level INFO --log-file full_organization.log
 ```
 
 ### Command Reference & Help
@@ -107,6 +107,18 @@ python3 check_and_move_papers_enhanced.py --execute --verbose --log-level INFO -
 
 # Quick access to any script help (alternative method)
 ./cheatsheet.sh pdf_to_txt_converter.py
+```
+
+### CLI Tool (Easy Access)
+```bash
+# ArXiv Downloader CLI - Direct access from root directory
+python3 arxivdl_cli.py --help
+
+# Use CLI tool for interactive downloading
+python3 arxivdl_cli.py
+
+# CLI tool with specific options
+python3 arxivdl_cli.py --file CoT.txt --workers 1
 ```
 
 ## Architecture Overview
@@ -210,7 +222,7 @@ Text files containing arXiv PDF URLs for batch downloading:
 
 ### Basic Download Workflow
 1. Choose a URL file (e.g., `CoT.txt`)
-2. Run the downloader: `python arxiv_downloader.py CoT.txt`
+2. Run the downloader: `python scripts/arxiv_downloader.py CoT.txt`
 3. Papers are downloaded to a directory named after the input file (e.g., `CoT/`)
 
 ### Command Discovery Workflow
@@ -220,14 +232,14 @@ Text files containing arXiv PDF URLs for batch downloading:
 4. **Get examples**: Check the quick start examples section in the cheatsheet output
 
 ### PDF to TXT Conversion Workflow
-1. **Download papers**: Use arxiv_downloader.py to get PDF files
-2. **Convert to TXT**: Use pdf_to_txt_converter.py to extract text with proper naming
+1. **Download papers**: Use scripts/arxiv_downloader.py to get PDF files
+2. **Convert to TXT**: Use scripts/pdf_to_txt_converter.py to extract text with proper naming
 3. **Recheck existing**: Use --rename option to fix filenames of already converted files
 4. **Batch processing**: Use --all to process all collections automatically
 
 ### Advanced Download with Shell Script
 1. Use the shell script for better error handling and progress tracking
-2. Example: `./download_arxiv.sh RAG.txt ./my_papers`
+2. Example: `./scripts/download_arxiv.sh RAG.txt ./my_papers`
 3. Configure rate limiting by modifying variables at the top of the script
 
 ### Performance & Rate Limiting
@@ -273,16 +285,16 @@ The enhanced organization system ensures papers are placed in the correct collec
 ### Organization Workflow
 ```bash
 # Step 1: Check current organization status
-python3 check_and_move_papers_enhanced.py --verbose
+python3 scripts/check_and_move_papers_enhanced.py --verbose
 
 # Step 2: Review what would be moved (dry run)
-python3 check_and_move_papers_enhanced.py --collections multimodal rag
+python3 scripts/check_and_move_papers_enhanced.py --collections multimodal rag
 
 # Step 3: Execute organization with logging
-python3 check_and_move_papers_enhanced.py --execute --log-file organization.log
+python3 scripts/check_and_move_papers_enhanced.py --execute --log-file organization.log
 
 # Step 4: Verify organization completed successfully
-python3 check_and_move_papers_enhanced.py --log-level WARNING
+python3 scripts/check_and_move_papers_enhanced.py --log-level WARNING
 ```
 
 ### Collection Completeness Tracking

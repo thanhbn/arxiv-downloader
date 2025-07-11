@@ -30,7 +30,7 @@ class ArxivOrchestratorOptimized:
         # Define fixed paths
         self.base_dir = Path(".")
         self.collections_file = self.base_dir / "huggingface_collections_links.txt"
-        self.download_script = self.base_dir / "download_arxiv.sh"
+        self.download_script = self.base_dir / "scripts" / "download_arxiv.sh"
         self.progress_dir = self.base_dir / "progress"
         
         # Configuration

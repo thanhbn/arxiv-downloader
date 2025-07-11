@@ -6,12 +6,12 @@ Quick status checker for all collections
 import sys
 sys.path.append('.')
 
-from arxiv_orchestrator import ArxivOrchestrator
+from arxiv_orchestrator import ArxivOrchestratorOptimized
 
 def check_all_status():
     """Check status of all collections"""
     try:
-        orchestrator = ArxivOrchestrator()
+        orchestrator = ArxivOrchestratorOptimized()
         
         # Get collection URLs
         collection_urls = orchestrator.get_collection_urls()

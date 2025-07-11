@@ -291,6 +291,16 @@ def convert_pdf_to_txt_parallel(pdf_files, working_dir, max_workers=4):
             update_progress('skipped')
             continue
         
+        # Double-check: Don't process if there's already a TXT file for this arXiv ID
+        pdf_arxiv_id = Path(pdf_path).stem
+        # Check for any TXT file that starts with this arXiv ID
+        existing_txt_files = glob.glob(os.path.join(working_dir, f"{pdf_arxiv_id}*.txt"))
+        if existing_txt_files:
+            logger.info(f"TXT file already exists for arXiv ID {pdf_arxiv_id}. Skipping...")
+            skipped += 1
+            update_progress('skipped')
+            continue
+        
         tasks.append((pdf_path, txt_path))
     
     if not tasks:

@@ -139,14 +139,18 @@ EOF
     clear
     print_header "🚀 ArXiv Downloader Toolkit - Command Cheatsheet"
     echo -e "${WHITE}Working Directory:${NC} $(pwd)"
-    echo -e "${WHITE}Total Scripts:${NC} $(find . -maxdepth 1 -type f \( -name "*.py" -o -name "*.sh" \) | wc -l)"
+    echo -e "${WHITE}Total Scripts:${NC} $(($(find scripts/ -maxdepth 1 -type f \( -name "*.py" -o -name "*.sh" \) | wc -l) + $(find . -maxdepth 1 -name "*.py" -o -name "*.sh" | grep -v scripts | wc -l)))"
     echo
 
     # If specific script help requested
     if [[ -n "$show_help_for" ]]; then
         if [[ ! -f "$show_help_for" ]]; then
-            # Try to find the script
-            found_script=$(find . -maxdepth 1 -name "*$show_help_for*" -type f \( -name "*.py" -o -name "*.sh" \) | head -1)
+            # Try to find the script in scripts/ directory first
+            found_script=$(find scripts/ -maxdepth 1 -name "*$show_help_for*" -type f \( -name "*.py" -o -name "*.sh" \) | head -1)
+            # If not found in scripts/, try root directory
+            if [[ -z "$found_script" ]]; then
+                found_script=$(find . -maxdepth 1 -name "*$show_help_for*" -type f \( -name "*.py" -o -name "*.sh" \) | grep -v scripts | head -1)
+            fi
             if [[ -n "$found_script" ]]; then
                 show_help_for="$found_script"
             else
@@ -169,44 +173,65 @@ EOF
         exit 0
     fi
 
+    # CLI Tool (Easy Access)
+    print_header "🖥️  CLI Tool (Easy Access)"
+    
+    # Check for CLI tool in root directory
+    if [[ -f "arxivdl_cli.py" ]]; then
+        desc=$(get_description "arxivdl_cli.py")
+        if [[ "$list_only" == "true" ]]; then
+            echo "arxivdl_cli.py"
+        else
+            # Determine help option
+            help_opt=""
+            for opt in "--help" "-h"; do
+                if supports_help "arxivdl_cli.py" "$opt"; then
+                    help_opt="$opt"
+                    break
+                fi
+            done
+            print_command "python3 arxivdl_cli.py" "$desc" "$help_opt"
+        fi
+    fi
+    
     # Core Download Scripts
     print_header "📥 Core Download Scripts"
     
     # Python scripts
     for script in arxiv_downloader.py arxiv_orchestrator.py; do
-        if [[ -f "$script" ]]; then
-            desc=$(get_description "$script")
+        if [[ -f "scripts/$script" ]]; then
+            desc=$(get_description "scripts/$script")
             if [[ "$list_only" == "true" ]]; then
                 echo "$script"
             else
                 # Determine help option
                 help_opt=""
                 for opt in "--help" "-h"; do
-                    if supports_help "$script" "$opt"; then
+                    if supports_help "scripts/$script" "$opt"; then
                         help_opt="$opt"
                         break
                     fi
                 done
-                print_command "python3 $script" "$desc" "$help_opt"
+                print_command "python3 scripts/$script" "$desc" "$help_opt"
             fi
         fi
     done
     
     # Shell scripts
     for script in download_arxiv.sh; do
-        if [[ -f "$script" ]]; then
-            desc=$(get_description "$script")
+        if [[ -f "scripts/$script" ]]; then
+            desc=$(get_description "scripts/$script")
             if [[ "$list_only" == "true" ]]; then
                 echo "$script"
             else
                 help_opt=""
                 for opt in "--help" "-h" "help"; do
-                    if supports_help "$script" "$opt"; then
+                    if supports_help "scripts/$script" "$opt"; then
                         help_opt="$opt"
                         break
                     fi
                 done
-                print_command "bash $script" "$desc" "$help_opt"
+                print_command "bash scripts/$script" "$desc" "$help_opt"
             fi
         fi
     done
@@ -216,18 +241,18 @@ EOF
     
     for script in pdf_to_txt_converter.py translate_papers.py translate_manager.py; do
         if [[ -f "$script" ]]; then
-            desc=$(get_description "$script")
+            desc=$(get_description "scripts/$script")
             if [[ "$list_only" == "true" ]]; then
                 echo "$script"
             else
                 help_opt=""
                 for opt in "--help" "-h"; do
-                    if supports_help "$script" "$opt"; then
+                    if supports_help "scripts/$script" "$opt"; then
                         help_opt="$opt"
                         break
                     fi
                 done
-                print_command "python3 $script" "$desc" "$help_opt"
+                print_command "python3 scripts/$script" "$desc" "$help_opt"
             fi
         fi
     done
@@ -237,18 +262,18 @@ EOF
     
     for script in check_and_move_papers_enhanced.py check_and_move_papers.py organize_papers.py; do
         if [[ -f "$script" ]]; then
-            desc=$(get_description "$script")
+            desc=$(get_description "scripts/$script")
             if [[ "$list_only" == "true" ]]; then
                 echo "$script"
             else
                 help_opt=""
                 for opt in "--help" "-h"; do
-                    if supports_help "$script" "$opt"; then
+                    if supports_help "scripts/$script" "$opt"; then
                         help_opt="$opt"
                         break
                     fi
                 done
-                print_command "python3 $script" "$desc" "$help_opt"
+                print_command "python3 scripts/$script" "$desc" "$help_opt"
             fi
         fi
     done
@@ -258,18 +283,18 @@ EOF
     
     for script in test_setup.py test_orchestrator.py check_status.py show_rate_limits.py; do
         if [[ -f "$script" ]]; then
-            desc=$(get_description "$script")
+            desc=$(get_description "scripts/$script")
             if [[ "$list_only" == "true" ]]; then
                 echo "$script"
             else
                 help_opt=""
                 for opt in "--help" "-h"; do
-                    if supports_help "$script" "$opt"; then
+                    if supports_help "scripts/$script" "$opt"; then
                         help_opt="$opt"
                         break
                     fi
                 done
-                print_command "python3 $script" "$desc" "$help_opt"
+                print_command "python3 scripts/$script" "$desc" "$help_opt"
             fi
         fi
     done
@@ -279,18 +304,18 @@ EOF
     
     for script in setup_direnv_fixed.sh setup_env.sh setup_simple.sh download_config.sh; do
         if [[ -f "$script" ]]; then
-            desc=$(get_description "$script")
+            desc=$(get_description "scripts/$script")
             if [[ "$list_only" == "true" ]]; then
                 echo "$script"
             else
                 help_opt=""
                 for opt in "--help" "-h" "help"; do
-                    if supports_help "$script" "$opt"; then
+                    if supports_help "scripts/$script" "$opt"; then
                         help_opt="$opt"
                         break
                     fi
                 done
-                print_command "bash $script" "$desc" "$help_opt"
+                print_command "bash scripts/$script" "$desc" "$help_opt"
             fi
         fi
     done
@@ -300,18 +325,18 @@ EOF
     
     for script in huggingface_crawler.py fix_multimodal.py check_multimodal.py; do
         if [[ -f "$script" ]]; then
-            desc=$(get_description "$script")
+            desc=$(get_description "scripts/$script")
             if [[ "$list_only" == "true" ]]; then
                 echo "$script"
             else
                 help_opt=""
                 for opt in "--help" "-h"; do
-                    if supports_help "$script" "$opt"; then
+                    if supports_help "scripts/$script" "$opt"; then
                         help_opt="$opt"
                         break
                     fi
                 done
-                print_command "python3 $script" "$desc" "$help_opt"
+                print_command "python3 scripts/$script" "$desc" "$help_opt"
             fi
         fi
     done
