@@ -1,0 +1,156 @@
+# Xem xét lại Học chuyển giao hiệu quả tham số: Một mô hình hai giai đoạn
+
+Hengyuan Zhao1, Hao Luo2, Yuyang Zhao3, Pichao Wang2, Fan Wang2, Mike Zheng Shou1
+1Show Lab, Đại học Quốc gia Singapore, 2Tập đoàn Alibaba, 3Đại học Quốc gia Singapore
+(hengyuan.z, yuyang.zhao)@u.nus.edu, (michuan.lh, fan.w)@alibaba-inc.com
+(pichaowang, mike.zheng.shou)@gmail.com
+
+Tóm tắt
+Học chuyển giao hiệu quả tham số (PETL) nhằm mục đích thích ứng hiệu quả các mô hình lớn được tiền huấn luyện trên dữ liệu khổng lồ cho các tác vụ hạ nguồn với dữ liệu cụ thể tác vụ hạn chế. Xét tính thực tiễn của PETL, các nghiên cứu trước đây tập trung vào việc điều chỉnh một tập hợp nhỏ các tham số cho mỗi tác vụ hạ nguồn theo cách từ đầu đến cuối mà hiếm khi xem xét vấn đề chuyển dịch phân phối tác vụ giữa tác vụ tiền huấn luyện và tác vụ hạ nguồn. Trong bài báo này, chúng tôi đề xuất một mô hình hai giai đoạn mới, trong đó mô hình tiền huấn luyện trước tiên được căn chỉnh với phân phối đích, sau đó thông tin liên quan đến tác vụ được tận dụng để thích ứng hiệu quả. Cụ thể, giai đoạn đầu tiên là thu hẹp chuyển dịch phân phối tác vụ bằng cách điều chỉnh tỷ lệ và dịch chuyển trong các lớp LayerNorm. Trong giai đoạn thứ hai, để học hiệu quả thông tin liên quan đến tác vụ, chúng tôi đề xuất một điểm quan trọng dựa trên khai triển Taylor để xác định các kênh liên quan đến tác vụ cho tác vụ hạ nguồn và sau đó chỉ điều chỉnh một phần nhỏ như vậy của các kênh, làm cho việc thích ứng trở nên hiệu quả tham số. Nhìn chung, chúng tôi trình bày một hướng mới đầy hứa hẹn cho PETL, và mô hình đề xuất đạt hiệu suất tốt nhất trên độ chính xác trung bình của 19 tác vụ hạ nguồn. Mã nguồn sẽ có sẵn tại đây.
+
+1. Giới thiệu
+
+Các mô hình vision transformer lớn [14, 39, 58] đã thể hiện hiệu suất đặc biệt trên các tác vụ phân loại hình ảnh quy mô lớn [11]. Được truyền cảm hứng từ việc sử dụng thành công các mô hình ngôn ngữ lớn [12, 4, 48, 34], có sự quan tâm ngày càng tăng đến việc tận dụng kiến thức tiền huấn luyện từ các mô hình vision transformer lớn cho các tác vụ hạ nguồn. Cách phổ biến và trực tiếp nhất là tinh chỉnh toàn bộ mô hình trên tập dữ liệu hạ nguồn nhỏ. Tuy nhiên, tinh chỉnh tất cả các tham số (còn gọi là tinh chỉnh đầy đủ) trên một tập dữ liệu nhỏ có thể dẫn đến hai thách thức nghiêm trọng: (1) tinh chỉnh đầy đủ dễ bị overfitting khi các trọng số khổng lồ được điều chỉnh của các mô hình tiền huấn luyện không tương xứng với dữ liệu huấn luyện hạ nguồn hạn chế; (2) chi phí tính toán cao và yêu cầu lưu trữ của một số lượng lớn tham số mô hình (vì mỗi tác vụ yêu cầu lưu trữ một mô hình riêng biệt) khiến nó khó áp dụng hơn cho các thiết bị bị hạn chế lưu trữ nghiêm trọng.
+
+Để giải quyết hai vấn đề trên, các nghiên cứu gần đây tập trung vào học chuyển giao hiệu quả tham số (PETL) [27, 25, 37], nhằm mục đích thích ứng hiệu quả các mô hình lớn cho các tác vụ hạ nguồn với dữ liệu hạn chế. Các phương pháp PETL chính có thể được phân loại thành hai loại: (1) thiết kế các mô-đun bổ sung (adapter [25] hoặc visual prompt [27]) để học thông tin liên quan đến tác vụ; (2) thu hẹp chuyển dịch phân phối tác vụ giữa các tác vụ tiền huấn luyện và hạ nguồn thông qua việc chia tỷ lệ và dịch chuyển đặc trưng [37]. Được truyền cảm hứng từ hiệu quả của hai cách tiếp cận, chúng tôi xem xét lại PETL từ góc độ cả chuyển dịch phân phối tác vụ và thêm mô-đun liên quan đến tác vụ và trình bày một mô hình hai giai đoạn mới gọi là TTC-Tuning trong bài báo này.
+
+Để thu hẹp chuyển dịch phân phối tác vụ, SSF [37] chèn các tham số tỷ lệ và dịch chuyển bổ sung vào các thành phần MLP, MHSA và LayerNorm để điều chỉnh các đặc trưng. Thay vì sử dụng các tham số bổ sung, điều chỉnh các lớp chuẩn hóa là một cách phổ biến để căn chỉnh phân phối trong các tác vụ học chuyển giao [54]. Do đó, chúng tôi theo khái niệm điều chỉnh đặc trưng nhưng đề xuất một kỹ thuật hiệu quả và hiệu suất hơn để căn chỉnh phân phối tác vụ, tức là điều chỉnh các tham số layer normalization (LayerNorm). Như thể hiện trong Hình 2, việc điều chỉnh LayerNorm có thể cải thiện đáng kể khả năng phân biệt của mô hình tiền huấn luyện trên các tác vụ hạ nguồn. So với SSF [37], điều chỉnh LayerNorm sử dụng ít hơn 15% tham số (0.03M so với 0.21M) nhưng vượt trội hơn SSF 0.5% về độ chính xác top-1 tuyệt đối. Do đó, chúng tôi áp dụng điều chỉnh LayerNorm làm bước đầu tiên cho việc căn chỉnh phân phối tác vụ.
+
+Bên cạnh căn chỉnh phân phối tác vụ, TTC-Tuning cũng xem xét việc thêm mô-đun liên quan đến tác vụ đã được chứng minh là quan trọng bởi các nghiên cứu trước đây. Đối với một số tập dữ liệu thách thức, chẳng hạn như hình ảnh y tế (tập dữ liệu Camelyon [53]) và hình ảnh cảnh 3D (Clevr-Count [29]), việc chỉ căn chỉnh phân phối tác vụ dẫn đến cải thiện kém do khoảng cách kiến thức lớn giữa tác vụ hạ nguồn và mô hình tiền huấn luyện. Các phương pháp PETL trước đây [27, 25, 26, 28, 66, 7, 37] chủ yếu đề xuất các mô-đun điều chỉnh hiệu quả tham số để tận dụng gián tiếp thông tin liên quan đến tác vụ bằng cách thêm token hoặc thích ứng toàn bộ đặc trưng. Tuy nhiên, các phương pháp này coi mỗi tham số là tương đương và chỉ chèn một số mô-đun cố định để tự động thích ứng toàn bộ mạng với các tác vụ hạ nguồn. Ở đây, chúng tôi đặt ra một câu hỏi cơ bản: liệu chúng ta có thể xác định các tham số quan trọng cho một tác vụ hạ nguồn cụ thể và sau đó tinh chỉnh chỉ những tham số liên quan đến tác vụ này không?
+
+Được truyền cảm hứng từ độ lệch kênh trong học few-shot [41] và cắt tỉa mô hình [35], chúng tôi đưa ra giả thuyết và xác minh thực nghiệm rằng sự bất đẳng thức kênh tồn tại trong các tác vụ khác nhau. Chúng ta có thể tận dụng rõ ràng thông tin liên quan đến tác vụ như vậy để điều chỉnh chỉ một phần nhỏ các kênh liên quan đến tác vụ, dẫn đến hiệu suất tương đương hoặc thậm chí tốt hơn. Để xác minh giả thuyết này, chúng tôi khảo sát đóng góp của từng kênh trong việc thích ứng hạ nguồn. Các đóng góp được đo bằng điểm quan trọng dựa trên khai triển Taylor được đề xuất. Như thể hiện trong Hình 3, các tác vụ khác nhau có các kênh liên quan đến tác vụ khác nhau trong cùng một lớp. Do đó, chúng ta có thể chọn các kênh liên quan đến tác vụ dựa trên đóng góp và sử dụng một adapter đơn giản để biến đổi các kênh như vậy để thích ứng hiệu quả.
+
+Tóm lại, đóng góp của chúng tôi gồm ba phần:
+• Chúng tôi đề xuất một mô hình hai giai đoạn mới để giải quyết PETL từ góc độ cả chuyển dịch phân phối tác vụ và thêm mô-đun có thể điều chỉnh liên quan đến tác vụ.
+• Chúng tôi xác minh thực nghiệm hiệu quả của việc chỉ điều chỉnh lớp LayerNorm để căn chỉnh phân phối và phát triển một mô-đun điều chỉnh mới trước tiên chọn các kênh liên quan đến tác vụ thông qua điểm quan trọng dựa trên khai triển Taylor được đề xuất. Những thiết kế như vậy dẫn đến một vài tham số bổ sung.
+• Mô hình mới của chúng tôi vượt trội hơn phương pháp tối ưu nhất trước đây SSF [37] với mức tăng 1.7% về độ chính xác trên 19 tác vụ hạ nguồn. Kết quả này làm nổi bật hiệu quả của cách tiếp cận của chúng tôi và tiềm năng tạo ra tác động đáng kể trong các ứng dụng khác nhau.
+
+2. Nghiên cứu liên quan
+
+2.1. Vision Transformers
+
+Transformers [52] đã cho thấy hiệu suất đáng chú ý trên các tác vụ xử lý ngôn ngữ tự nhiên và thị giác máy tính. Nhiều vision transformer [5, 15, 13, 1, 17, 20, 49, 63, 51, 39, 56, 68] đã được đề xuất theo công trình tiên phong ViT [14]. Hầu hết các mô hình này dần dần tăng kích thước để đạt được kết quả tối ưu và học các biểu diễn phong phú thông qua các thiết kế kiến trúc khác nhau. Việc áp dụng các mô hình này cho các tác vụ hạ nguồn làm giảm đáng kể độ phức tạp huấn luyện và mang lại kết quả đầy hứa hẹn một cách nhanh chóng. Với một Vision Transformer (ViT) [14] đơn giản có L lớp và một hình ảnh đầu vào I∈R^(3×H×W) trước tiên được chia thành N patch không chồng lấp và sau đó được truyền vào một lớp nhúng chiếu vào D chiều. Mỗi lớp transformer bao gồm một khối multi-head self-attention (MHSA) và một khối multi-perceptron (MLP).
+
+2.2. Học chuyển giao hiệu quả tham số
+
+PETL tập trung vào việc thích ứng mô hình tiền huấn luyện trên tác vụ hạ nguồn với một vài tham số. Hai hướng tiếp cận PETL đã được đề xuất gần đây. Một mặt, học thông tin liên quan đến tác vụ bằng cách áp dụng prompts [27, 38, 61, 67, 45, 57] cho các token đầu vào hoặc thêm mô-đun có thể huấn luyện [25, 7, 28, 6, 65] để thích ứng thông tin tiền huấn luyện đã có được kết quả đầy hứa hẹn về hiệu suất và hiệu quả. Mặt khác, việc căn chỉnh phân phối giữa các tác vụ tiền huấn luyện và hạ nguồn đã được chứng minh là một đường cơ sở mạnh, như được thể hiện trong [37].
+
+Các mô-đun liên quan đến tác vụ. VPT [27] tiêm các prompts vào các token đầu vào của lớp transformer với một số lượng nhỏ tham số bổ sung. Tuy nhiên, một hạn chế chính của VPT là nó dựa vào việc lựa chọn thủ công để xác định độ dài prompt tối ưu cho mỗi tác vụ. Điều này có thể không linh hoạt khi áp dụng phương pháp cho các tác vụ mới. VPT bao gồm hai biến thể VPT-Shallow và VPT-Deep liên quan đến số lượng lớp được chèn. VPT-Shallow chỉ chèn prompts vào lớp transformer đầu tiên L1 và VPT-Deep chèn tất cả các lớp transformer. Cho các token đầu vào x∈R^((N+1)×D) và các prompts P∈R^(n×D) chứa n prompts với chiều D, chúng ta có thể công thức hóa các token kết hợp x' là:
+
+x' = [x;P];                                                    (1)
+
+trong đó x'∈R^((N+n+1)×D) sẽ được truyền vào các khối MHSA và MLP tiếp theo.
+
+Adapter [25] đề xuất một mô-đun giống MLP, một thiết kế thành công áp dụng đường dẫn dư để giữ thông tin gốc và biến đổi thông tin liên quan đến tác vụ bằng cách học một phép chiếu xuống W_down∈R^(D'×D) (trong đó D'<D) và một phép chiếu lên W_up∈R^(D×D') với một phép kích hoạt phi tuyến σ. Cho các token đầu vào x^l∈R^((N+1)×D) trong lớp thứ l, đầu ra của khối adapter là:
+
+x_out^l = x^l + [W_up^l(σ(W_down^l[x^l]^T))]^T;                 (2)
+
+trong đó []^T biểu thị phép chuyển vị. Tuy nhiên, số lượng tham số có thể huấn luyện trong các phương pháp giống Adapter không nhỏ và tạo ra hiệu suất kém. Bên cạnh đó, LoRA [26] tối ưu hóa một ma trận phân tích thành thừa số hạng thấp với một chiều nội tại thấp để chiếu các ma trận query, key và value được sử dụng trong khối MHSA trong ViT. Hơn nữa, một thuật toán tìm kiếm kiến trúc mạng neural được gọi là NOAH [66] đã được đề xuất, kết hợp Adapter [25], LoRA [26] và VPT [27] vào không gian tìm kiếm mạng của nó.
+
+Thu hẹp chuyển dịch phân phối tác vụ. SSF [37] Ngoài các phương pháp dựa trên prompt và adapter ở trên, một kỹ thuật được giới thiệu gần đây gọi là SSF đã cho thấy kết quả đầy hứa hẹn bao gồm việc chia tỷ lệ và dịch chuyển các đặc trưng của mô hình tiền huấn luyện. SSF [37] tận dụng hai vector có thể học α∈R^D và β∈R^D để chia tỷ lệ và dịch chuyển bản đồ đặc trưng trong mỗi phép toán transformer (tức là phép toán Linear hoặc LayerNorm). Giả sử đầu vào của mô-đun SSF là x∈R^((N+1)×D), đầu ra y∈R^((N+1)×D) có thể được viết như sau:
+
+y = α ⊙ x + β;                                              (3)
+
+trong đó ⊙ là tích Hadamard. Được động lực bởi công trình này, chúng tôi mở rộng phương pháp này để điều chỉnh lớp LayerNorm để giảm chuyển dịch phân phối và chứng minh hiệu quả trên các tác vụ đa hạ nguồn.
+
+3. Phương pháp
+
+Chúng tôi đề xuất một mô hình hai giai đoạn để đạt được học chuyển giao hiệu quả tham số, như thể hiện trong Hình 5. Trong giai đoạn đầu tiên, chúng tôi căn chỉnh phân phối tác vụ bằng cách điều chỉnh lớp LayerNorm trong khi giữ các thành phần khác của backbone gốc bị đóng băng. Trong giai đoạn thứ hai, chúng tôi sử dụng Điểm quan trọng dựa trên khai triển Taylor (TIS) để xác định các kênh liên quan nhất cho tác vụ hạ nguồn, bằng cách tính gradient trên tập huấn luyện với mô hình giai đoạn 1. Sau đó, chúng tôi giới thiệu TTC-Module, một mô-đun có thể điều chỉnh biến đổi các kênh liên quan đến tác vụ trong khi đóng băng các kênh khác.
+
+3.1. Thu hẹp chuyển dịch phân phối tác vụ
+
+Trong phần này, chúng tôi trước tiên xem xét ngắn gọn Layer Normalization (LN) [2]. LN là một kỹ thuật chuẩn hóa được sử dụng rộng rãi trong transformers [52, 14] để giải quyết vấn đề về lượng token đầu vào không nhất quán trong các tác vụ xử lý ngôn ngữ tự nhiên và cung cấp chuẩn hóa hợp lệ trong khối MLP. Chúng tôi khám phá thực nghiệm rằng đối với PETL, việc điều chỉnh lớp LayerNorm có thể thay đổi hiệu quả trung bình và phương sai của phân phối đặc trưng như đã đề cập trong Hình 2. Giả sử đầu vào x∈R^(B×(N+1)×D), đầu ra y∈R^(B×(N+1)×D) có thể được công thức hóa như sau:
+
+y = (x - E[x])/√(Var[x] + ε) × γ + β;                       (4)
+
+trong đó γ và β lần lượt là các yếu tố chia tỷ lệ và độ lệch. E[] và Var[] là kỳ vọng và phương sai sẽ dẫn đến trung bình zero và phương sai đơn vị.
+
+Thứ hai, chúng tôi phân tích thống kê của token [CLS] cuối cùng để so sánh hiệu quả của việc điều chỉnh LN và mô-đun SSF. Cụ thể, chúng tôi giả định đường cơ sở là phân phối mô hình gốc và tính khoảng cách giữa phân phối này với phân phối của điều chỉnh LN và SSF, tương ứng. Xét hai phân phối xác suất là p và q, chúng tôi sử dụng Jensen–Shannon Divergence (JSD) [16] làm thước đo để tính khoảng cách L như:
+
+L = 1/2(KL(log(p);m) + KL(log(q);m));
+m = (p+q)/2;                                                (5)
+
+trong đó KL là phân kỳ Kullback–Leibler [32]. Hình 4 hiển thị phân phối khoảng cách, trong đó biểu đồ màu xanh biểu thị khoảng cách giữa mô hình gốc và mô hình được huấn luyện với SSF, trong khi biểu đồ màu hồng so sánh khoảng cách của mô hình gốc với mô hình LayerNorm. Kiểm tra phân phối JSD, phạm vi và hiệp phương sai của SSF lớn hơn LayerNorm. Đáng chú ý, một số lượng đáng kể mẫu nằm ở số không, cho thấy rằng phân phối giống với mô hình gốc. Mặt khác, một số lượng đáng kể mẫu nằm xa mô hình gốc, gợi ý rằng SSF có thể fit một số mẫu trong khi bỏ qua những mẫu khác. Ngược lại, điều chỉnh LayerNorm của chúng tôi có phân phối compact hơn và dường như không thiên vị đối với bất kỳ mẫu cụ thể nào.
+
+3.2. Lựa chọn kênh liên quan đến tác vụ sử dụng Điểm quan trọng dựa trên khai triển Taylor
+
+Trong khi việc căn chỉnh phân phối giữa các tác vụ tiền huấn luyện và hạ nguồn có thể hiệu quả đối với các chuyển dịch phân phối nhỏ, để xử lý các chuyển dịch phân phối tác vụ khác nhau, chúng ta cần giới thiệu một mô-đun có thể học bổ sung đã được chứng minh quan trọng bởi các phương pháp PETL khác được đề xuất [27, 25, 26, 66]. Tuy nhiên, không giống như các phương pháp này coi mỗi kênh như nhau trong quá trình tinh chỉnh, chúng tôi đưa ra giả thuyết rằng việc chỉ điều chỉnh một phần nhỏ toàn bộ các kênh là đủ cho việc thích ứng. Chúng tôi lưu ý rằng các trọng số mạng có liên quan chặt chẽ đến các nhãn tác vụ như được đề cập trong [36], và do đó chúng tôi nhằm chọn các trọng số liên quan đến tác vụ bằng cách đưa tập huấn luyện hạ nguồn. Các phương pháp khác nhau [40, 35, 21, 59] để chọn trọng số mạng đã được nghiên cứu trong các lĩnh vực cắt tỉa và nén mạng. Vì vậy, chúng tôi đề xuất một Điểm quan trọng dựa trên khai triển Taylor (TIS) để đánh giá tầm quan trọng của mỗi trọng số.
+
+Chúng tôi phỏng đoán rằng các trọng số liên quan đến tác vụ ảnh hưởng mạnh đến đầu ra mạng, và việc loại bỏ các trọng số này sẽ ảnh hưởng mạnh đến giá trị loss. Do đó, tầm quan trọng của trọng số có thể được định lượng bằng sự khác biệt trong loss gây ra bởi việc loại bỏ trọng số này. Cho một tập con {x,y} được lấy mẫu ngẫu nhiên từ tập huấn luyện, điểm quan trọng I_w_i^j của một tham số trọng số w_i^j∈R^(1×1) có thể được công thức hóa bởi:
+
+I_w_i^j = (L(F(x;W)|w_i^j = 0) - L(F(x;W);y))^2;            (6)
+
+trong đó L là loss cụ thể tác vụ (loss cross-entropy trong bài báo này), F là mạng transformer, W là tổng trọng số mô hình và y là nhãn của dữ liệu x. Như các nghiên cứu trước đây [43, 59, 62] chỉ ra rằng điểm này có thể được xấp xỉ bằng khai triển Taylor bậc nhất. Do đó, điểm quan trọng cuối cùng Î_w_i^j của một tham số trọng số w_i^j có thể được viết lại như:
+
+Î_w_i^j = ∂L(x)/∂w_i^j × w_i^j.                            (7)
+
+Do đó điểm quan trọng Î_w_i^j có thể được biểu diễn bằng một số hạng gradient và tham số trọng số w_i^j.
+
+Đến thời điểm này, chúng ta có thể sử dụng điểm trên để đánh giá các trọng số liên quan đến tác vụ. Tuy nhiên, phương pháp của chúng tôi nhằm tìm các kênh liên quan đến tác vụ của một bản đồ đặc trưng đã cho. Do đó, chúng ta cần chuyển đổi các trọng số liên quan đến tác vụ thành các kênh liên quan đến tác vụ. Như thể hiện trong Hình 6, trước tiên chúng tôi phân tích quá trình phép toán tuyến tính. Giả sử một ma trận trọng số W∈R^(D×D) và một bản đồ đặc trưng X∈R^((N+1)×D), chúng ta có thể nhận được đầu ra Y∈R^((N+1)×D) như:
+
+Y = [WX^T]^T.                                               (8)
+
+Chúng tôi định nghĩa mỗi trọng số w_i∈R^(1×D) trong W và mỗi token x_i^T∈R^(D×1) trong X^T∈R^(D×(N+1)). Tính tổng các mục của đầu ra Y theo chiều kênh chúng ta có thể được:
+
+Sum(Y;dim = 1) = [w_1(x_1^T+x_2^T+⋯+x_{N+1}^T);
+                  w_2(x_1^T+x_2^T+⋯+x_{N+1}^T);
+                  ⋯
+                  w_D(x_1^T+x_2^T+⋯+x_{N+1}^T); ].          (9)
+
+Do đó, chúng ta có thể thấy rằng các trọng số liên quan đến tác vụ w_i có thể biểu diễn các kênh liên quan đến tác vụ của một bản đồ đặc trưng Y đã cho. Tính điểm quan trọng của một trọng số w_i có thể được xấp xỉ bằng cách tính tổng trên Phương trình 7 của tất cả các tham số trong w_i, tức là điểm quan trọng cuối cùng S_i có thể được tính như:
+
+S_i = Σ_{j∈J} Î_w_i^j;                                       (10)
+
+trong đó J biểu thị tập chỉ số của một trọng số w_i và w_i^j∈R^(1×1) là một tham số trong w_i.
+
+3.3. Mô-đun liên quan đến tác vụ
+
+Sau khi có được điểm quan trọng dựa trên khai triển Taylor, chúng tôi sẽ chọn top-K kênh liên quan đến tác vụ của mỗi bản đồ đặc trưng trong các lớp transformer. Giả sử một bản đồ đặc trưng là x∈R^((N+1)×D), chúng tôi sẽ chọn K giá trị lớn nhất của vector điểm quan trọng S = [S_1;S_2;⋯;S_i∈R^(1×1);1≤i≤D] trong bản đồ đặc trưng này. Đặc trưng được chọn x'∈R^((N+1)×K) sau đó được đưa vào một lớp tuyến tính có thể huấn luyện và đầu ra đặc trưng được biến đổi:
+
+x'' = x' + Linear(x');                                      (11)
+
+trong đó x''∈R^((N+1)×K) sẽ được truyền vào phép toán tiếp theo trong lớp transformer và Linear() là phép toán lớp tuyến tính mà lớp mới duy nhất có tham số K×K. Ở đây, chúng tôi áp dụng một kết nối tắt để bảo toàn thông tin gốc và ngăn chặn tích lũy lỗi qua các lớp transformer. Chiến lược này giúp giảm bớt khó khăn huấn luyện.
+
+Điều chỉnh kênh so với Điều chỉnh trọng số. Lưu ý rằng nếu chúng ta xem xét K trọng số liên quan đến tác vụ, các tham số bổ sung sẽ là K×D, và FLOPs sẽ là N×K×D. Mặt khác, tập trung vào K kênh liên quan đến tác vụ chỉ yêu cầu một lớp tuyến tính K×K để điều chỉnh, với số lượng FLOPs là N×K×K. Trong bài báo này, chúng tôi đặt các giá trị mặc định là K = 96 và D = 768, và số lượng tham số bổ sung để điều chỉnh trọng số liên quan đến tác vụ lớn hơn 8 lần so với việc điều chỉnh kênh liên quan đến tác vụ. Do đó, để duy trì ít tham số bổ sung hơn để lưu trữ, tốt hơn là điều chỉnh kênh liên quan đến tác vụ thay vì. Chúng tôi cũng đã thử điều chỉnh trực tiếp các trọng số liên quan đến tác vụ, nhưng kết quả cho 19 tác vụ hạ nguồn kém hơn so với việc điều chỉnh các kênh liên quan đến tác vụ như được minh họa trong Bảng 7. Chúng tôi giả thuyết rằng sự kết hợp tuyến tính của các kênh liên quan đến tác vụ sẽ đóng góp nhiều hơn vào hiệu suất tác vụ.
+
+4. Thực nghiệm
+
+4.1. Thực nghiệm trên Benchmark VTAB-1K
+
+Tập dữ liệu. VTAB-1K [64] chứa 19 tác vụ phân loại hình ảnh bao gồm một phổ rộng các miền và ngữ nghĩa trong ba nhóm, tức là Natural, Specialized và Structured. Nhóm Natural chứa 7 tập dữ liệu phân loại cổ điển [31, 18, 9, 46, 47, 44, 60] của hình ảnh tự nhiên. Nhóm Specialized bao gồm 4 tập dữ liệu [53, 22, 8, 30] của hai kịch bản đặc biệt: y tế và viễn thám. Nhóm Structured có 8 tập dữ liệu [29, 3, 19, 42, 33], chủ yếu tập trung vào hiểu cấu trúc của cảnh, chẳng hạn như đếm đối tượng và dự đoán độ sâu. Mỗi tác vụ của VTAB-1K chứa 1000 hình ảnh huấn luyện. Theo [27, 37], chúng tôi sử dụng phân chia 800-200 TRAIN-VAL để xác định các siêu tham số và toàn bộ 1000 dữ liệu huấn luyện để huấn luyện mô hình cuối cùng. Chúng tôi báo cáo độ chính xác top-1 trung bình trên tập TEST.
+
+Đường cơ sở và các phương pháp tối ưu. Chúng tôi so sánh phương pháp của mình với ba đường cơ sở, Full fine-tuning, Linear và Bias, và ba phương pháp tối ưu Adapter [25], VPT [27] và SSF [37]. Phương pháp Bias chỉ cập nhật tất cả các số hạng bias trong backbone tiền huấn luyện.
+
+Hiệu suất với backbone ViT. Chúng tôi so sánh TTC-tuning của mình với 7 đường cơ sở trên trong Bảng 1. Chúng tôi sử dụng ViT-B/16 làm backbone và chèn TTC-Module trong mỗi lớp transformer. K mặc định được đặt là 96, 1/8 tổng số kênh, dẫn đến số lượng tham số có thể huấn luyện chỉ là 0.11M. Đầu tiên, TTC-Tuning của chúng tôi đạt độ chính xác trung bình 74.8% trên 19 tác vụ hạ nguồn, vượt trội hơn full fine-tuning trên 18 trong 19 tác vụ và có được cải thiện 6.2%, 3.3% và 13.9% trong ba nhóm, tương ứng, chỉ với 0.13% tham số bổ sung của backbone. Những kết quả như vậy phản ánh rằng TTC-Tuning có thể giảm đáng kể không gian lưu trữ và giảm bớt vấn đề overfitting thường xảy ra trong full fine-tuning các mô hình lớn. Thứ hai, so với Adapter [25] coi tất cả các kênh như nhau, việc chọn một phần kênh liên quan đến tác vụ cho mỗi tác vụ hạ nguồn hiệu quả và hiệu suất hơn, vượt trội hơn 3.4% về độ chính xác trung bình. Hơn nữa, TTC-Tuning của chúng tôi vượt trội hơn VPT [27] 5.0%, 4.3% và 6.5% trong ba nhóm, tương ứng. Thứ ba, so với phương pháp căn chỉnh phân phối SSF [37], TTC-Tuning của chúng tôi vượt trội hơn 1.7%. Những kết quả này chứng minh rằng thay vì chỉ căn chỉnh phân phối (tức là SSF) hoặc học thông tin liên quan đến tác vụ (tức là VPT, Adapter), việc tận dụng mô hình hai giai đoạn có thể duy trì chi phí tham số cấp thấp hơn và cải thiện hiệu suất.
+
+Hiệu suất với Swin Transformer Backbone. Để xác minh hiệu quả của TTC-Tuning với các backbone khác nhau, chúng tôi áp dụng TTC-Tuning trên các transformer phân cấp, tức là Swin-B [39]. Chúng tôi sử dụng cùng cài đặt chèn TTC-Module như trong backbone ViT. Xét các lớp sâu chứa thông tin ngữ nghĩa nhiều hơn trong cấu trúc phân cấp, thay vì áp dụng TTC-Module trên tất cả các lớp transformer, chúng tôi chèn nó vào nửa cuối các lớp trong stage3 và tất cả các lớp của stage4 của Swin-B để giữ mức độ tương tự của các tham số có thể huấn luyện. Kết quả của Bảng 2 cho thấy TTC-Tuning vượt trội hơn Full fine-tuning trong tất cả ba nhóm chỉ với 0.2% tham số trong khi các phương pháp khác không thể. Ngoài ra, so với phương pháp PETL, TTC-Tuning vượt trội hơn VPT [27] 6.2%, 2.2% và 7.6% trong ba nhóm, tương ứng. Tất cả kết quả trên gợi ý rằng TTC-tuning của chúng tôi cũng áp dụng được cho các transformer phân cấp và có thể mang lại cải thiện nhiều hơn so với các phương pháp PETL khác.
+
+Phân tích độ phức tạp. Trong phân tích của chúng tôi, chúng tôi xem xét một backbone ViT-B với L lớp và D chiều, cùng với N token cho một hình ảnh duy nhất. Chúng tôi cũng giả định rằng chiều trung gian của Adapter [25] là D', độ dài prompt của VPT [27] là n, và tổng số lần chèn của SSF [37] là m trong toàn bộ backbone ViT-B. Cuối cùng, chúng tôi so sánh cách tiếp cận TTC-Module đề xuất của mình với Adapter, VPT và SSF về tham số và FLOPs, như được tóm tắt trong Bảng 4. Đáng chú ý, việc chọn K của chúng tôi là 1/8 D khá nhỏ so với D. Khi chúng tôi so sánh cách tiếp cận của mình với SSF, chúng tôi thấy rằng số lượng tham số cho TTC-Module là 1/64 LD trong khi số lượng tham số cho SSF là mLD. Kiểm tra backbone ViT-B, chúng tôi thấy rằng m = 74 và 1/64 D = 12, tham số và FLOPs của chúng tôi nhỏ hơn SSF. Nhìn chung, phân tích của chúng tôi gợi ý rằng TTC-Module có thể cung cấp một cách tiếp cận hiệu quả và hiệu suất hơn cho học chuyển giao.
+
+4.2. Đánh giá
+
+Nghiên cứu loại bỏ từng phần. Để đánh giá hiệu quả của việc điều chỉnh lớp LayerNorm và TTC-Module đề xuất của chúng tôi, chúng tôi tiến hành các nghiên cứu loại bỏ từng phần về hai thành phần trong mô hình hai giai đoạn của chúng tôi trong Bảng 3. Đầu tiên, trong giai đoạn đầu tiên, chúng tôi tinh chỉnh LayerNorm để căn chỉnh phân phối tác vụ, điều này đã vượt trội hơn mô hình tốt nhất trước đây (73.6% (hàng thứ 2 của Bảng 3) so với 73.1% (SSF). Thứ hai, khi kết hợp giai đoạn thứ hai trên đầu của việc điều chỉnh LayerNorm, TTC-Module có thể mang lại cải thiện 1.2%. Thứ ba, để xác minh thêm hiệu quả của TTC-Module, chúng tôi chèn TTC trực tiếp vào mô hình Linear cơ sở, có được cải thiện 17.1% (hàng thứ 4). Thứ tư, chúng tôi điều chỉnh LayerNorm và TTC-Module cùng nhau trong một giai đoạn (hàng thứ 5), đạt độ chính xác 74.1%, kém hơn mô hình hai giai đoạn 0.7%. Tất cả kết quả trên chứng minh hiệu quả của việc điều chỉnh LayerNorm đề xuất, TTC-Module và sự cần thiết của mô hình hai giai đoạn.
+
+Điều chỉnh kênh so với Điều chỉnh trọng số Như được minh họa trong Phần 3.3, việc điều chỉnh K kênh được chọn thông qua một adapter tuyến tính chỉ sử dụng K/D = 1/8 tham số của việc điều chỉnh trực tiếp trọng số của lớp ViT. Ngoài ra, với ít tham số có thể học hơn, mô hình ít dễ bị overfitting với tập dữ liệu nhỏ. Chúng tôi so sánh hiệu suất của việc điều chỉnh trọng số và điều chỉnh kênh trong Bảng 7. Số lượng tham số của việc điều chỉnh trọng số tương đối cao (0.88M) trong khi điều chỉnh kênh chỉ với 0.11M tham số có thể có được cải thiện 7.8% trong tổng cộng 19 tác vụ hạ nguồn.
+
+Hiệu quả của việc lựa chọn kênh liên quan đến tác vụ. Để xác minh hiệu quả và sự cần thiết của việc lựa chọn kênh Điểm quan trọng dựa trên khai triển Taylor (TIS) đề xuất, chúng tôi so sánh ba chiến lược lựa chọn kênh trong Bảng 5a. Những chiến lược này bao gồm Lựa chọn kênh ngẫu nhiên (RC), L2 Norm và Điểm quan trọng dựa trên khai triển Taylor (TIS). RC chọn K kênh ngẫu nhiên, và để giảm tác động của các giá trị ngoại lai, chúng tôi chọn ngẫu nhiên ba tập kênh (RC-1/2/3). L2 Norm xác định các kênh liên quan đến tác vụ dựa trên L2 Norm của các đặc trưng trong mỗi kênh. Các chiến lược liên quan đến tác vụ đạt hiệu suất tốt hơn và mạnh mẽ hơn so với RC. Ngoài ra, TIS của chúng tôi có thể chọn các kênh quan trọng và đại diện hơn so với L2 Norm, vượt trội hơn 3.0%.
+
+Độ sâu chèn. Độ sâu chèn là một yếu tố quan trọng ảnh hưởng đến hiệu suất. Chúng tôi báo cáo kết quả khi chèn TTC-Module vào l lớp cuối cùng của ViT-B trong Bảng 5b. Không có TTC-Module (chỉ giai đoạn một), độ chính xác là 74.9%, trong khi độ chính xác dần được cải thiện lên 78.4% với sự gia tăng của độ sâu chèn. Khi phân tích kết quả trong Bảng 5b, chúng tôi quan sát thấy rằng việc chèn TTC-Module chỉ trong hai lớp cuối cùng đạt độ chính xác 77.8%, cho thấy rằng các lớp sâu hơn đóng góp nhiều hơn vào kết quả cuối cùng. Đáng chú ý, khi chúng tôi loại bỏ TTC-Module trong bốn lớp đầu tiên, độ chính xác là 77.9%, chỉ có khoảng cách 0.5% so với kết quả tốt nhất 78.4%.
+
+Vị trí chèn. Chúng tôi đánh giá vị trí chèn của TTC-Module của mình, như thể hiện trong Bảng 5c. Cụ thể, chúng tôi chèn mô-đun sau các khối MHSA và MLP, tương ứng. Những phát hiện của chúng tôi cho thấy việc chèn mô-đun sau khối MLP mang lại kết quả tốt hơn, phù hợp với những phát hiện tương tự đối với SSF. Ngoài ra, chúng tôi chèn mô-đun của mình sau cả hai khối, điều này dẫn đến hiệu suất thấp hơn ở mức 77.1% với sự gia tăng tham số. Chúng tôi phỏng đoán rằng chỉ một vị trí là đủ để thích ứng, và việc thích ứng lặp lại sẽ tăng khó khăn tối ưu hóa.
+
+Số lượng kênh được chọn K. Số lượng kênh được chọn (K) là siêu tham số quan trọng nhất liên quan đến thiết kế của TTC-Module, ảnh hưởng đến kiến trúc mô hình và số lượng tham số có thể huấn luyện. Không giống như VPT, chọn độ dài prompt tốt nhất cho mỗi tác vụ, chúng tôi sử dụng cùng K cho tất cả các tác vụ để so sánh công bằng. Trong Bảng 5d, khi chúng tôi tăng giá trị K, hiệu suất được cải thiện và đạt đỉnh ở K = 96. Khi tăng thêm các kênh có thể học, hiệu suất giảm. Chúng tôi giả thuyết rằng giá trị K lớn hơn có thể bao gồm quá nhiều thông tin không liên quan đến tác vụ và có thể làm cho việc điều chỉnh siêu tham số trở nên khó khăn hơn.
+
+Phân tích. Trong Hình 7, chúng tôi phân tích sự dịch chuyển tham số sau khi điều chỉnh lớp LayerNorm (giai đoạn 1) và điều chỉnh cùng lúc LayerNorm và TTC-Module (giai đoạn 2). Những phát hiện của chúng tôi cho thấy rằng các lớp sâu hơn dẫn đến sự dịch chuyển lớn hơn trong trọng số và bias của cả "Norm1" và "Norm2" (hai lớp LayerNorm trong ViT-B). Cụ thể, chúng tôi quan sát thấy các độ lệch rõ ràng trong tham số trọng số của các lớp nông của "Norm2" khác với "Norm1". Chúng tôi cũng đánh giá khả năng biểu diễn để tiến hành điều chỉnh giai đoạn 1 trong Bảng 8 bằng cách sử dụng thuật toán KNN [10] để phân cụm đặc trưng của token [CLS]. Kết quả gợi ý rằng giai đoạn 1 thực sự hiệu quả trong việc cải thiện khả năng biểu diễn.
+
+4.3. Thực nghiệm về khái quát hóa miền
+
+Ngoài việc đánh giá mô hình trên dữ liệu test có cùng phân phối, các mạng neural sâu hiện đại thường gặp vấn đề suy giảm hiệu suất khi phân phối test khác với phân phối tập huấn luyện, tức là chuyển dịch miền, điều này không thể tránh khỏi trong ứng dụng thực tế.
+
+Tập dữ liệu. Chúng tôi sử dụng ImageNet-1K [11] làm miền nguồn với 16-shot mỗi danh mục và đánh giá mô hình của chúng tôi trên ImageNetV2 [50], ImageNet-Sketch [55], ImageNet-A [24] và ImageNet-R [23].
+
+Kết quả. Trong Bảng 6, chúng tôi so sánh TTC-tuning của mình với Adapter [25], VPT [27], LoRA [26] và NOAH [66] trên các tập dữ liệu trên. Chúng tôi có thể đưa ra hai nhận xét. Đầu tiên, TTC-tuning vượt trội hơn phương pháp tốt nhất trước đây (NOAH) trên ba trong bốn tập dữ liệu đích và đạt hiệu suất tương đương trên ImageNetV2. Cụ thể, TTC-tuning mang lại cải thiện 0.9% trên ImageNet-R so với NOAH. Thứ hai, TTC-tuning của chúng tôi đạt độ chính xác 75.5% trên miền nguồn, vượt trội hơn đáng kể các phương pháp trước đây 4%. Vì mô hình backbone được tiền huấn luyện trên ImageNet-21K, kết quả trên ImageNet-1K cho thấy rằng TTC-tuning có thể căn chỉnh tốt hơn phân phối phức tạp của tập cha với phân phối tương đối đơn giản của tập con. Hai nhận xét này chứng minh sự vượt trội của TTC-tuning của chúng tôi so với các kỹ thuật PETL trước đây về khả năng khái quát hóa mạnh mẽ.
+
+5. Kết luận
+
+Vì các phương pháp PETL trước đây có thể được chia thành hai luồng: học thông tin liên quan đến tác vụ và căn chỉnh phân phối giữa các tác vụ tiền huấn luyện và hạ nguồn, trước tiên chúng tôi đề xuất một mô hình hai giai đoạn bằng cách kết hợp hai hướng tiếp cận này. Chúng tôi trước tiên thu hẹp các chuyển dịch phân phối và đề xuất một điểm quan trọng dựa trên khai triển Taylor để chọn các kênh liên quan đến tác vụ để thích ứng hiệu quả. Tóm lại, mô hình mới của chúng tôi đại diện cho một hướng mới nhấn mạnh tầm quan trọng của việc xem xét chuyển dịch phân phối khi tinh chỉnh các tác vụ hạ nguồn.

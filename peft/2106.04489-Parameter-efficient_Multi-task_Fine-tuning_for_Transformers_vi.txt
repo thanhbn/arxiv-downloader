@@ -1,0 +1,193 @@
+# Tinh chỉnh đa nhiệm vụ hiệu quả tham số cho Transformers
+thông qua Hypernetworks chia sẻ
+
+Rabeeh Karimi Mahabadi
+Đại học EPFL, Viện nghiên cứu Idiap
+rabeeh.karimimahabadi@epfl.ch
+
+Sebastian Ruder
+DeepMind
+ruder@google.com
+
+Mostafa Dehghani
+Google Brain
+dehghani@google.com
+
+James Henderson
+Viện nghiên cứu Idiap
+james.henderson@idiap.ch
+
+## Tóm tắt
+
+Các phương pháp tinh chỉnh hiệu quả tham số tiên tiến nhất dựa vào việc đưa các mô-đun adapter vào giữa các lớp của mô hình ngôn ngữ được huấn luyện trước. Tuy nhiên, các mô-đun như vậy được huấn luyện riêng biệt cho từng nhiệm vụ và do đó không cho phép chia sẻ thông tin giữa các nhiệm vụ. Trong bài báo này, chúng tôi chỉ ra rằng chúng ta có thể học các tham số adapter cho tất cả các lớp và nhiệm vụ bằng cách sinh ra chúng sử dụng hypernetworks chia sẻ, điều kiện hóa theo nhiệm vụ, vị trí adapter, và ID lớp trong mô hình transformer. Khung học đa nhiệm vụ hiệu quả tham số này cho phép chúng tôi đạt được tốt nhất của cả hai thế giới bằng cách chia sẻ kiến thức giữa các nhiệm vụ thông qua hypernetworks trong khi cho phép mô hình thích nghi với từng nhiệm vụ cụ thể thông qua các adapter đặc thù nhiệm vụ. Các thí nghiệm trên benchmark GLUE nổi tiếng cho thấy hiệu suất được cải thiện trong học đa nhiệm vụ trong khi chỉ thêm 0,29% tham số mỗi nhiệm vụ. Chúng tôi bổ sung chứng minh những cải thiện hiệu suất đáng kể trong khái quát hóa miền few-shot trên nhiều nhiệm vụ khác nhau. Mã nguồn của chúng tôi được công khai tại https://github.com/rabeehk/hyperformer.
+
+## 1 Giới thiệu
+
+Học chuyển giao từ các mô hình ngôn ngữ quy mô lớn được huấn luyện trước mang lại kết quả tiên tiến nhất trong nhiều nhiệm vụ khác nhau (Devlin et al., 2019; Radford et al., 2018; Liu et al., 2019b). Như một khung biểu cảm cao và trừu tượng, Raffel et al. (2020) đã khám phá bối cảnh học chuyển giao bằng cách chuyển đổi các vấn đề xử lý ngôn ngữ tự nhiên (NLP) dựa trên văn bản thành định dạng sequence-to-sequence để huấn luyện một mô hình thống nhất trên nhiều nhiệm vụ đồng thời. Học đa nhiệm vụ với các mô hình ngôn ngữ được huấn luyện trước (Ruder, 2017) hấp dẫn vì nhiều lý do: 1) Huấn luyện các mô hình riêng lẻ cho mỗi nhiệm vụ dẫn đến chi phí tính toán cao hơn, điều này cản trở việc triển khai và bảo trì. Những chi phí này được giảm đáng kể bằng cách huấn luyện một mô hình duy nhất. 2) Tinh chỉnh mô hình trên nhiều nhiệm vụ cho phép chia sẻ thông tin giữa các nhiệm vụ khác nhau và chuyển giao tích cực đến các nhiệm vụ liên quan khác. Cụ thể, khi các tập dữ liệu đích có dữ liệu huấn luyện hạn chế, học đa nhiệm vụ cải thiện hiệu suất so với các mô hình được huấn luyện riêng lẻ (Liu et al., 2019a; Ratner et al., 2018). Tuy nhiên, tinh chỉnh đa nhiệm vụ có thể dẫn đến các mô hình hoạt động kém trên các nhiệm vụ có tài nguyên cao do khả năng bị hạn chế (Arivazhagan et al., 2019; McCann et al., 2018). Một vấn đề bổ sung với tinh chỉnh đa nhiệm vụ là khả năng can thiệp nhiệm vụ hoặc chuyển giao tiêu cực, trong đó đạt được hiệu suất tốt trên một nhiệm vụ có thể cản trở hiệu suất trên nhiệm vụ khác (Wang et al., 2019c).
+
+Như một thay thế cho tinh chỉnh (Howard và Ruder, 2018), các lớp adapter (Houlsby et al., 2019) chèn một số lượng nhỏ các tham số bổ sung mỗi nhiệm vụ vào mô hình. Trong quá trình tinh chỉnh, chỉ các mô-đun adapter, chuẩn hóa lớp, và các tham số của lớp phân loại cuối cùng được cập nhật, trong khi các tham số mô hình được huấn luyện trước ban đầu vẫn được đóng băng. Các adapter đặc thù nhiệm vụ như vậy loại bỏ sự can thiệp nhiệm vụ tiêu cực bằng cách đóng gói thông tin đặc thù nhiệm vụ (Pfeiffer et al., 2020). Tuy nhiên, cho đến nay chưa có cách hiệu quả và tiết kiệm tham số để chia sẻ thông tin giữa nhiều adapter để cho phép chuyển giao tích cực đến các nhiệm vụ tài nguyên thấp và liên quan.
+
+Để giải quyết vấn đề này và cho phép chia sẻ thông tin giữa các nhiệm vụ trong khi thu hoạch lợi ích của các lớp adapter, như được mô tả trong Hình 1, chúng tôi đề xuất HYPERFORMER++, sử dụng một hypernetwork nhỏ gọn (Ha et al., 2017; Oswald et al., 2020) được chia sẻ giữa các nhiệm vụ và lớp. Hypernetwork học cách sinh ra các tham số adapter đặc thù nhiệm vụ và lớp, được điều kiện hóa theo embeddings ID nhiệm vụ và lớp. Hypernetwork được học chung giữa tất cả các nhiệm vụ và do đó có thể chia sẻ thông tin giữa chúng, trong khi sự can thiệp tiêu cực được giảm thiểu bằng cách sinh ra các lớp adapter riêng biệt cho mỗi nhiệm vụ. Đối với mỗi nhiệm vụ mới, mô hình của chúng tôi chỉ yêu cầu học một embedding nhiệm vụ bổ sung, giảm số lượng tham số được huấn luyện.
+
+Chúng tôi sử dụng mô hình encoder-decoder T5 (Raffel et al., 2020) làm mô hình cơ sở cho các thí nghiệm của mình và đánh giá trên benchmark GLUE tiêu chuẩn (Wang et al., 2019b). Chúng tôi đạt được những cải thiện mạnh mẽ so với cả mô hình T5 BASE cũng như adapters (Houlsby et al., 2019). Theo hiểu biết của chúng tôi, đây là lần đầu tiên adapters được tích hợp thành công vào mô hình encoder-decoder tiên tiến ngoài dịch máy (Bapna và Firat, 2019), chứng minh rằng phương pháp của chúng tôi cân bằng hiệu quả việc chia sẻ thông tin giữa các nhiệm vụ trong khi giảm thiểu chuyển giao tiêu cực.
+
+Tóm lại, chúng tôi đóng góp như sau:
+(1) Chúng tôi đề xuất một phương pháp tiết kiệm tham số cho tinh chỉnh đa nhiệm vụ dựa trên hypernetworks và các lớp adapter. (2) Chúng tôi chứng minh rằng phương pháp của chúng tôi mở rộng hiệu quả hơn so với công trình trước đó. (3) Chúng tôi cung cấp kết quả thực nghiệm trên GLUE chứng minh tính hiệu quả của phương pháp đề xuất trong học đa nhiệm vụ. (4) Chúng tôi thực hiện các thí nghiệm chuyển giao miền few-shot mở rộng, tiết lộ rằng kiến thức chia sẻ được nắm bắt có thể chuyển giao tích cực đến các nhiệm vụ trong miền chưa được thấy. Chúng tôi phát hành mã nguồn để tạo điều kiện cho công việc tương lai.
+
+## 2 HYPERFORMER
+
+Trong phần này, chúng tôi trình bày mô hình HYPERFORMER của chúng tôi, tích hợp các lớp adapter dựa trên hypernetwork vào mô hình transformer đa nhiệm vụ. Trong §2.4, chúng tôi giới thiệu một biến thể tiết kiệm tham số của mô hình này, được gọi là HYPERFORMER++.
+
+Công thức hóa vấn đề: Chúng tôi xem xét một vấn đề học đa nhiệm vụ tổng quát, trong đó chúng ta được cho dữ liệu từ một tập các nhiệm vụ {Dτ}Tτ=1, trong đó T là tổng số nhiệm vụ và Dτ={(xiτ, yiτ)}Nτi=1 cho thấy dữ liệu huấn luyện cho nhiệm vụ thứ τ với Nτ mẫu. Chúng tôi giả sử chúng ta cũng được cho một mô hình ngôn ngữ quy mô lớn được huấn luyện trước f(·) được tham số hóa bởi θ tính toán đầu ra cho đầu vào xiτ. Tinh chỉnh đa nhiệm vụ tiêu chuẩn giảm thiểu loss sau đây trên tập huấn luyện:
+
+L(θ; {Dτ}Tτ=1) = ∑Tτ=1 ∑(xiτ,yiτ)∈Dτ wτ l(f(xiτ; θ), yiτ); (1)
+
+trong đó l thường là loss cross-entropy, và wτ cho thấy trọng số lấy mẫu cho nhiệm vụ thứ τ. Mục tiêu của chúng tôi là tinh chỉnh mô hình được huấn luyện trước trong thiết lập học đa nhiệm vụ một cách hiệu quả, trong khi cho phép chia sẻ thông tin giữa các nhiệm vụ và đồng thời, cho phép mô hình thích nghi với mỗi nhiệm vụ cá nhân.
+
+Ý tưởng chính của cách tiếp cận của chúng tôi, được mô tả trong Hình 1, là học một embedding nhiệm vụ tham số {Iτ}Tτ=1 cho mỗi nhiệm vụ, và sau đó đưa những embedding nhiệm vụ này vào hypernetworks được tham số hóa bởi φ sinh ra các lớp adapter đặc thù nhiệm vụ (Houlsby et al., 2019). Chúng tôi chèn các mô-đun adapter vào trong các lớp của mô hình được huấn luyện trước, làm cho mô hình cuối cùng là fX(xiτ; θ, φ; Iτ) được tham số hóa bởi θ tính toán đầu ra cho đầu vào xiτ. Trong quá trình huấn luyện, chúng tôi chỉ huấn luyện các tham số hypernetwork φ, embeddings nhiệm vụ {Iτ}Tτ=1, và chuẩn hóa lớp trong f(·), trong khi phần còn lại của các tham số mô hình được huấn luyện trước được cố định:
+
+L(φ; {Iτ}Tτ=1; {Dτ}Tτ=1) = ∑Tτ=1 ∑(xiτ,yiτ)∈Dτ wτ l(fX(xiτ; θ, φ; Iτ), yiτ); (2)
+
+Các hypernetworks nắm bắt thông tin chia sẻ giữa các nhiệm vụ trong mô hình học đa nhiệm vụ cho phép chuyển giao tích cực giữa các miền liên quan và các nhiệm vụ có thể chuyển giao, trong khi các adapter giảm sự can thiệp tiêu cực, đóng gói thông tin đặc thù nhiệm vụ.
+
+Mô hình cơ sở: Tất cả các mô hình của chúng tôi được xây dựng trên mô hình transformer T5 tiên tiến (Raffel et al., 2020). Mô hình này đóng khung các nhiệm vụ ngôn ngữ dựa trên văn bản như các vấn đề sequence-to-sequence. T5 bao gồm một Transformer encoder-decoder (Vaswani et al., 2017) với các sửa đổi nhỏ (Raffel et al., 2020). Mô hình được huấn luyện đồng thời trên nhiều nhiệm vụ, đạt được hiệu suất tiên tiến trên một tập nhiệm vụ đa dạng. Chúng tôi sử dụng khung T5 vì nó cho phép huấn luyện một mô hình đa năng giao tiếp với nhiều nhiệm vụ ngôn ngữ. Mô hình của chúng tôi có ba thành phần chính: 1) các lớp adapter có điều kiện nhiệm vụ; 2) chuẩn hóa lớp có điều kiện nhiệm vụ; và 3) hypernetworks sinh ra các tham số đặc thù nhiệm vụ. Chúng tôi mô tả tiếp theo các thành phần này.
+
+### 2.1 Các lớp Adapter có điều kiện nhiệm vụ
+
+Công trình trước đó đã chỉ ra rằng tinh chỉnh tất cả các tham số của mô hình có thể dẫn đến giải pháp không tối ưu, đặc biệt đối với các tập dữ liệu hạn chế tài nguyên (Peters et al., 2019). Như một thay thế cho tinh chỉnh tất cả các tham số của mô hình, công trình trước đó (Houlsby et al., 2019; Rebuffi et al., 2018; Stickland và Murray, 2019) đã chèn các mô-đun nhỏ được gọi là các lớp adapter vào trong các lớp của mô hình được huấn luyện trước, như được hiển thị trong Hình 1. Các adapter không đưa ra thay đổi nào đối với cấu trúc hoặc tham số của mô hình ban đầu.
+
+Trong công trình này, chúng tôi đề xuất các mô-đun adapter có điều kiện, trong đó chúng tôi sinh ra các trọng số adapter dựa trên embeddings nhiệm vụ đầu vào sử dụng hypernetworks chia sẻ (Ha et al., 2017), nắm bắt thông tin giữa các nhiệm vụ có thể được sử dụng để chuyển giao tích cực đến các nhiệm vụ liên quan khác.
+
+Mỗi lớp của mô hình transformer bao gồm một khối attention và một khối feed-forward, mỗi khối được theo sau bởi một skip connection. Theo Houlsby et al. (2019), như được mô tả trong Hình 1, chúng tôi giới thiệu một lớp adapter có điều kiện sau mỗi khối trước skip connection. Lớp adapter có điều kiện Alτ cho lớp l bao gồm một down-projection, Dlτ ∈ Rh×d, phi tuyến GeLU (Hendrycks và Gimpel, 2016), và up-projection Ulτ ∈ Rd×h, trong đó h là chiều đầu vào, và d là chiều nút cổ chai cho lớp adapter, được định nghĩa toán học là:
+
+Alτ(x) = LNlτ(Ulτ(GeLU(Dlτ(x)))) + x; (3)
+
+trong đó x là trạng thái ẩn đầu vào và LNlτ là layer norm có điều kiện được định nghĩa trong phần tiếp theo. Chúng tôi sinh ra các trọng số adapter (Ulτ, Dlτ) thông qua một hypernetwork được mô tả trong §2.3.
+
+### 2.2 Chuẩn hóa lớp có điều kiện nhiệm vụ
+
+Chuẩn hóa lớp thông thường (Ba et al., 2016) được định nghĩa là:
+
+LNlτ(xiτ) = γlτ ⊙ (xiτ - μτ)/στ + βlτ; (4)
+
+trong đó ⊙ là phép nhân theo từng phần tử giữa hai vector, và γlτ và βlτ là các tham số có thể học được có cùng chiều với xiτ. Các giá trị của μτ và στ cho thấy giá trị trung bình và độ lệch chuẩn của dữ liệu huấn luyện cho nhiệm vụ thứ τ.
+
+Để cho phép chuẩn hóa lớp bên trong các adapter thích nghi với mỗi nhiệm vụ, lấy cảm hứng từ Perez et al. (2018); De Vries et al. (2017), chúng tôi sinh ra γlτ, βlτ thông qua một hypernetwork như một hàm của embeddings nhiệm vụ (§2.3).
+
+### 2.3 Hypernetworks có điều kiện nhiệm vụ
+
+Để có một mô hình có thể chia sẻ thông tin trong khi có thể thích nghi với mỗi nhiệm vụ cá nhân, chúng tôi sinh ra các tham số của các lớp adapter có điều kiện nhiệm vụ và chuẩn hóa lớp sử dụng hypernetworks.
+
+Một hypernetwork là một mạng sinh ra các trọng số của mạng khác (Ha et al., 2017). Các hypernetworks nắm bắt thông tin chia sẻ, trong khi các adapter có điều kiện nhiệm vụ và chuẩn hóa lớp được sinh ra cho phép mô hình thích nghi với mỗi nhiệm vụ cá nhân để giảm sự can thiệp nhiệm vụ tiêu cực.
+
+Embedding nhiệm vụ đã học: Chúng tôi đầu tiên tính toán một embedding nhiệm vụ Iτ ∈ Rt cho mỗi nhiệm vụ cá nhân sử dụng một mạng projector nhiệm vụ hI(·), là một perceptron đa lớp bao gồm hai lớp feed-forward và một phi tuyến ReLU:
+
+Iτ = hI(zτ); (5)
+
+trong đó zτ ∈ Rt' có thể là một tham số có thể học được hoặc bất kỳ đặc trung nhiệm vụ được huấn luyện trước nào (Vu et al., 2020), và mạng projector nhiệm vụ hI(·) học một embedding nhiệm vụ nén phù hợp từ các đặc trung nhiệm vụ đầu vào. Trong công trình này, chúng tôi xem xét một zτ tham số để cho phép huấn luyện đầu cuối đến cuối thuận tiện trong thực tế.
+
+Loại bỏ tiền tố nhiệm vụ: Mô hình T5 thêm tiền tố đặc thù nhiệm vụ vào trước chuỗi đầu vào để điều kiện hóa. Ví dụ, khi huấn luyện trên CoLA (Warstadt et al., 2019), "cola sentence:" được thêm vào trước mỗi mẫu. Thay vào đó, chúng tôi loại bỏ tiền tố nhiệm vụ và sử dụng embeddings nhiệm vụ để điều kiện hóa.
+
+Hypernetworks có điều kiện nhiệm vụ: Chúng tôi xem xét các lớp tuyến tính đơn giản làm hypernetworks là hàm của embeddings nhiệm vụ đầu vào Iτ. Chúng tôi đưa ra những hypernetworks này trong mỗi lớp của transformer. Chúng tôi định nghĩa hypernetwork hlA(·) sinh ra các trọng số adapter có điều kiện nhiệm vụ (Ulτ, Dlτ):
+
+(Ulτ, Dlτ) := hlA(Iτ) = [WUl, WDl]Iτ; (6)
+
+trong đó WUl ∈ R(d×h)×t và WDl ∈ R(h×d)×t là các tham số hypernetwork tương ứng. Chúng tôi bổ sung định nghĩa hypernetwork hlLN(·) tính toán các tham số chuẩn hóa lớp:
+
+(γlτ, βlτ) := hlLN(Iτ) = [Wγl, Wβl]Iτ; (7)
+
+trong đó Wγl ∈ Rh×t và Wβl ∈ Rh×t.
+
+### 2.4 HYPERFORMER++
+
+Một nhược điểm của việc đưa ra một hypernetwork riêng biệt trong mỗi lớp của Transformer là nó tăng tổng số tham số. Do đó, chúng tôi đề xuất chia sẻ hypernetworks giữa các lớp transformer. Bằng cách có một hypernetwork chia sẻ có thể tái sử dụng, chiến lược này dẫn đến việc giảm đáng kể số lượng tham số. Tuy nhiên, áp dụng lại cùng một hypernetwork trên tất cả các lớp đưa ra chia sẻ trọng số giữa các tham số đích, điều này có thể không mong muốn. Để cho phép tham số hóa linh hoạt của các adapter/chuẩn hóa lớp có điều kiện nhiệm vụ, đối với một transformer có L lớp, chúng tôi đưa ra một tập embeddings ID lớp I = {li}Li=1, và embeddings vị trí adapter P = {pj}2j=1, chỉ định vị trí của các lớp adapter trong mỗi khối transformer (sau lớp attention hoặc lớp feed-forward), được sử dụng làm đầu vào bổ sung cho hypernetworks. Để đơn giản, chúng tôi xem xét li ∈ Rt, pj ∈ Rt, và zτ ∈ Rt.
+
+Chúng tôi đưa một nối tiếp của (zτ, li, pj) vào một mạng projector nhiệm vụ tương tự h'I như trong Eq. (5):
+
+Iτ = h'I(zτ, li, pj); (8)
+
+sau đó được theo sau bởi một chuẩn hóa lớp chia sẻ để tính toán embeddings nhiệm vụ cuối cùng Iτ ∈ Rt cho hypernetwork. Bằng cách này, hypernetwork có thể tạo ra các trọng số riêng biệt cho mỗi nhiệm vụ, vị trí adapter, và lớp của transformer. Hơn nữa, embeddings ID lớp và vị trí adapter là các tham số được học thông qua lan truyền ngược, cho phép chúng tôi huấn luyện toàn bộ mô hình đầu cuối đến cuối một cách thuận tiện.
+
+## 3 Thí nghiệm
+
+Tập dữ liệu: Theo Raffel et al. (2020), chúng tôi đánh giá hiệu suất của các mô hình trên benchmark GLUE (Wang et al., 2019b). Benchmark này bao gồm nhiều nhiệm vụ phát hiện paraphrase (MRPC, QQP), phân loại cảm xúc (SST-2), suy luận ngôn ngữ tự nhiên (MNLI, RTE, QNLI), và khả năng chấp nhận ngôn ngữ (CoLA). Các tập test ban đầu không được công khai, và theo Zhang et al. (2021), đối với các tập dữ liệu ít hơn 10K mẫu (RTE, MRPC, STS-B, CoLA), chúng tôi chia tập validation ban đầu thành một nửa, sử dụng một nửa cho validation và nửa kia cho test. Đối với các tập dữ liệu lớn hơn khác, chúng tôi tách 1k mẫu từ tập huấn luyện làm dữ liệu validation và test trên tập validation ban đầu.
+
+Chi tiết thí nghiệm: Chúng tôi sử dụng implementation HuggingFace (Wolf et al., 2020a) của mô hình T5 (Raffel et al., 2020). Chúng tôi tinh chỉnh tất cả các mô hình với tỷ lệ học cố định 0.0003 và theo Raffel et al. (2020), chúng tôi sử dụng 2^18 = 262144 bước trong tất cả các thí nghiệm. Chúng tôi lưu một checkpoint mỗi 1000 bước cho tất cả các mô hình (xem thêm §A). Raffel et al. (2020) báo cáo kết quả dựa trên checkpoint tốt nhất cho mỗi nhiệm vụ một cách độc lập. Ngược lại, chúng tôi tập trung vào thiết lập thực tế hơn nơi chúng tôi báo cáo kết quả trên một checkpoint duy nhất với hiệu suất validation trung bình cao nhất trên tất cả các nhiệm vụ. Các siêu tham số được chọn theo cách tương tự. Ngược lại với công trình trước đó (Houlsby et al., 2019), chúng tôi không học một lớp đầu ra riêng biệt cho mỗi nhiệm vụ mà thay vào đó chia sẻ một lớp đầu ra đóng băng cho tất cả các nhiệm vụ, làm cho thiết lập của chúng tôi tiết kiệm tham số hơn so với công trình trước đó và là một lợi thế của học đa nhiệm vụ với các mô hình encoder-decoder.
+
+Baselines: Chúng tôi so sánh với baseline adapter mạnh mẽ (Houlsby et al., 2019). Theo Houlsby et al. (2019), chúng tôi thêm các mô-đun adapters cho mỗi nhiệm vụ sau hai mô-đun feed-forward trong mỗi khối transformer của mô hình T5. Như được đề xuất trong Houlsby et al. (2019), chúng tôi huấn luyện các tham số chuẩn hóa lớp bên trong mô hình T5, mỗi nhiệm vụ. Chúng tôi gọi phương pháp này là Adapters. Chúng tôi bổ sung đề xuất một biến thể của mô hình này, trong đó chúng tôi chia sẻ tất cả các tham số chuẩn hóa lớp (T5 và adapters) giữa tất cả các nhiệm vụ. Chúng tôi gọi mô hình này là Adapters†. Chúng tôi so sánh các mô hình của chúng tôi với mô hình T5 tiên tiến, trong đó chúng tôi tinh chỉnh tất cả các tham số của mô hình trên tất cả các nhiệm vụ. Chúng tôi gọi phương pháp này là T5 SMALL/T5 BASE trong các thí nghiệm.
+
+Lấy mẫu nhiệm vụ: Trong quá trình huấn luyện, chúng tôi lấy mẫu các nhiệm vụ với lấy mẫu dựa trên nhiệt độ thông thường với nhiệt độ T = 10 cho tất cả các phương pháp. Chúng tôi lấy mẫu các nhiệm vụ khác nhau tỷ lệ thuận với p^(1/T)_τ trong đó p_τ = N_τ/∑^T_{i=1} N_i và N_τ là số lượng mẫu huấn luyện cho nhiệm vụ thứ τ. Chúng tôi không thí nghiệm với các chiến lược lấy mẫu phức tạp hơn (Raffel et al., 2020) hoặc điều chỉnh T.
+
+### 3.1 Kết quả trên Benchmark GLUE
+
+Bảng 1 cho thấy kết quả trên GLUE cho huấn luyện đơn nhiệm vụ và đa nhiệm vụ. Chúng tôi thí nghiệm với các yếu tố giảm r = {8, 16, 32} cho tất cả các phương pháp dựa trên adapter, trong đó r = h/d. Chúng tôi báo cáo kết quả cả với T5 SMALL (6 lớp và 60M tham số) và các mô hình T5 BASE (12 lớp và 222M tham số).
+
+Nhìn chung, HYPERFORMER++ đề xuất của chúng tôi đạt được những cải thiện mạnh mẽ so với Adapters (82.51 so với 79.53 cho T5 SMALL và 86.48 so với 84.88 cho T5 BASE) trong khi tiết kiệm tham số hơn.
+
+Biến thể Adapters† của chúng tôi, chia sẻ layer norms giữa các nhiệm vụ, vượt trội hơn công trình trước đó (Houlsby et al., 2019), không chia sẻ thông tin như vậy (80.85 so với 79.53 cho T5 SMALL và 85.83 so với 84.88 cho T5 BASE). Điều này chứng minh rằng trong các mô hình encoder-decoder như T5, việc chia sẻ thông tin nhiều hơn giữa các nhiệm vụ là có lợi.
+
+HYPERFORMER đề xuất của chúng tôi đạt được cải thiện nhất quán so với phương pháp Adapters† đề xuất của chúng tôi. Chúng tôi cho rằng cải thiện này là do khả năng học thông tin chia sẻ giữa các nhiệm vụ thông qua hypernetworks của chúng tôi. Thú vị là, HYPERFORMER++ đạt được hiệu suất tương tự như HYPERFORMER trong khi tiết kiệm tham số hơn hơn một bậc độ lớn. Các mô-đun adapter do đó có vẻ đủ tương tự để phần lớn thông tin của chúng có thể được mô hình hóa bởi một mạng duy nhất, được điều kiện hóa một cách thích hợp.
+
+So với tinh chỉnh đơn nhiệm vụ của tất cả các tham số, các phương pháp của chúng tôi trung bình cải thiện kết quả 0.45 cho T5 SMALL và 1.81 cho T5 BASE với cải thiện đáng kể trên các tập dữ liệu tài nguyên thấp như CoLA (63.73 so với 54.85) và RTE (75.36 so với 67.39) do hypernetworks chia sẻ nắm bắt thông tin chia sẻ và cho phép hiệu ứng chuyển giao tích cực.
+
+Chúng tôi cũng báo cáo tổng số tham số và tham số có thể huấn luyện cho tất cả các phương pháp trong Bảng 1. Đối với các phương pháp dựa trên adapter, số lượng tham số thay đổi dựa trên kích thước adapter (chúng tôi báo cáo tất cả các số với r = 32). Bội số về số lượng tham số của HYPERFORMER++ BASE so với T5 BASE là 1.02 với chỉ 0.29% tham số có thể huấn luyện mỗi nhiệm vụ. Lưu ý rằng bằng cách giữ lớp đầu ra đóng băng cho Adapters SMALL và Adapters BASE, chúng yêu cầu ít tham số hơn 5.51 và 2.53 lần tương ứng so với áp dụng trực tiếp công trình trước đó (Houlsby et al., 2019). Mặc dù sử dụng baselines hiệu quả hơn, so với Adapters BASE, HYPERFORMER++ BASE yêu cầu ít tham số có thể huấn luyện hơn 3 lần.
+
+### 3.2 Chuyển giao miền Few-shot
+
+Cuối cùng, chúng tôi đánh giá mức độ tốt của HYPERFORMER đã huấn luyện có thể khái quát hóa sang các nhiệm vụ mới. Chúng tôi đánh giá hiệu suất trên 5 nhiệm vụ và 7 tập dữ liệu. Cụ thể, chúng tôi xem xét 1) các tập dữ liệu suy luận ngôn ngữ tự nhiên (NLI) SciTail (Khot et al., 2018), và CB (De Marneffe et al., 2019) từ SuperGLUE (Wang et al., 2019a) 2) tập dữ liệu hỏi đáp (QA) BoolQ (Clark et al., 2019a); 3) các tập dữ liệu phân tích cảm xúc IMDB (Maas et al., 2011) và Yelp Polarity (Zhang et al., 2015); và 4) tập dữ liệu phát hiện paraphrase PAWS (Baldridge et al., 2019); 5) tập dữ liệu phân loại câu hỏi TREC (Li và Roth, 2002).
+
+Đối với CB và BoolQ, vì các tập test không khả dụng, chúng tôi chia các tập validation thành một nửa, sử dụng một nửa cho validation và nửa kia cho testing. Đối với Yelp polarity, TREC, và IMDB, vì các tập validation không khả dụng, chúng tôi tương tự chia các tập test để tạo thành các tập validation. Đối với phần còn lại, chúng tôi báo cáo trên các tập test ban đầu.
+
+Chúng tôi xem xét các mô hình được huấn luyện trên GLUE được báo cáo trong Bảng 1 và đánh giá chúng trên tập test sau khi tinh chỉnh few-shot trên mỗi dữ liệu huấn luyện đích. Đối với Adapters† và phương pháp của chúng tôi, chúng tôi sử dụng adapter và embedding nhiệm vụ tương ứng được huấn luyện trên nhiệm vụ GLUE tương tự nhất để khởi tạo, tức là MNLI cho NLI, QNLI cho QA, SST-2 cho phân tích cảm xúc, và QQP cho phát hiện paraphrase. Theo bằng chứng trước đây về chuyển giao tích cực từ NLI sang các nhiệm vụ khác (Conneau và Kiela, 2018; Yin et al., 2020; Phang et al., 2018), chúng tôi khởi tạo TREC ngoài miền từ MNLI.
+
+Chúng tôi hiển thị kết quả của tinh chỉnh đầy đủ tất cả các tham số của mô hình, Adapters†, và HYPERFORMER++ trong Bảng 2. Phương pháp của chúng tôi vượt trội đáng kể so với baselines trong phần lớn các thiết lập.
+
+### 3.3 Tinh chỉnh tài nguyên thấp
+
+Cho rằng mô hình HYPERFORMER++ BASE của chúng tôi có ít tham số có thể huấn luyện hơn đáng kể so với T5 BASE, chúng tôi điều tra xem nó có khái quát hóa tốt hơn trong thiết lập tài nguyên thấp không. Chúng tôi lấy mẫu con mỗi nhiệm vụ cá nhân trong GLUE cho các kích thước huấn luyện khác nhau. Chúng tôi huấn luyện các mô hình trong 15,000 bước, mà chúng tôi thấy là đủ để cho phép chúng hội tụ. Hình 2 hiển thị kết quả. HYPERFORMER++ BASE cải thiện đáng kể kết quả với dữ liệu huấn luyện hạn chế, cho thấy tinh chỉnh hiệu quả hơn trong chế độ này.
+
+## 4 Phân tích
+
+### 4.1 Hiệu quả tham số
+
+Trong phần này, chúng tôi so sánh số lượng tham số của HYPERFORMER++ với Adapters.
+
+Tham số Adapters: Thiết lập tiêu chuẩn (Houlsby et al., 2019) sử dụng hai adapters mỗi lớp cho mỗi nhiệm vụ. Mỗi lớp adapter có 2hd tham số cho các ma trận projection (U^l_τ và D^l_τ) và 2h tham số cho chuẩn hóa lớp. Tổng số tham số cho Adapters cho L lớp Transformer trong cả encoder và decoder trên T nhiệm vụ là, do đó, 4TL(2hd + 2h), tăng tuyến tính với số lượng nhiệm vụ nhân với số lượng lớp.
+
+Tham số HYPERFORMER++: Cách tiếp cận của chúng tôi học một embedding đặc trưng nhiệm vụ mỗi nhiệm vụ, bao gồm Tt tham số. Chúng tôi bổ sung sử dụng embeddings ID lớp và vị trí adapter trong encoder và decoder, yêu cầu 2(2 + L)t tham số, với kích thước embedding cố định t cho tất cả các embedding đặc trưng này. Chúng tôi xem xét các mạng projector nhiệm vụ h'_I riêng biệt cho encoder và decoder, trong cả hai trường hợp là một MLP hai lớp, bao gồm tổng cộng 2(3te + et) tham số, trong đó e = 128 là chiều ẩn cho mạng task-projector. Hypernetwork của chúng tôi cho adapters trong encoder/decoder bao gồm 2(2thd) tham số và hypernetwork chuẩn hóa lớp của chúng tôi bao gồm 2(2th) tham số. Tổng cộng, điều này dẫn đến t(T + 4 + 2L) tham số đặc trưng nhiệm vụ + 8te + 2t(2hd + 2h) tham số Hypernetworks.
+
+Tổng số tham số cho hypernetworks vẫn không đổi, trong khi các tham số đặc trưng nhiệm vụ tăng với số lượng nhiệm vụ hoặc lớp nhân với t, trong đó t = 64 trong các thí nghiệm của chúng tôi.
+
+Trong các thiết lập với số lượng lớp lớn và số lượng nhiệm vụ lớn, vì t ≪ 2hd + 2h và T + L ≪ TL, phương pháp của chúng tôi tiết kiệm tham số hơn nhiều so với Adapters. Trong thiết lập hiện tại, thuật ngữ hd là thuật ngữ lớn nhất, và yếu tố 2TL cho Adapters lớn hơn yếu tố t cho HYPERFORMER++.
+
+### 4.2 Các tham số bổ sung có tạo ra khác biệt không?
+
+Trong khi HYPERFORMER++ của chúng tôi tiết kiệm tham số hơn so với baselines, số lượng tham số của HYPERFORMER mỗi nhiệm vụ cao hơn so với Adapters†. Để xác nhận rằng những cải thiện của HYPERFORMER là do khả năng chia sẻ thông tin giữa các nhiệm vụ chứ không phải số lượng tham số, như một ablation, chúng tôi chạy Adapters† với r = {2, 4} và chọn mô hình hoạt động tốt nhất trên tập validation. Điều này cho phép Adapters† có số lượng tham số cao hơn so với HYPERFORMER. Chúng tôi báo cáo kết quả trong Bảng 3 và so sánh chúng với kết quả của HYPERFORMER trong Bảng 1. Kết quả chứng minh rằng ngay cả với số lượng tham số tăng lên, Adapters† không thể đạt được hiệu suất của HYPERFORMER, và HYPERFORMER hoạt động tốt hơn đáng kể.
+
+### 4.3 Tác động của các thành phần khung
+
+Chúng tôi điều tra tác động của các thành phần của khung của chúng tôi bao gồm: (1) các khối adapter có điều kiện nhiệm vụ; (2) chuẩn hóa lớp có điều kiện nhiệm vụ; (3) mạng projection nhiệm vụ; (4) tinh chỉnh của chuẩn hóa lớp trong mô hình T5; (5) chuẩn hóa lớp có điều kiện nhiệm vụ trong các mô-đun adapter và tinh chỉnh của chuẩn hóa lớp bên trong mô hình T5. Chúng tôi xem xét mô hình nhỏ của chúng tôi từ Bảng 1 và huấn luyện các biến thể khác nhau của nó. Bảng 4 hiển thị kết quả trên GLUE, chứng minh rằng mỗi thành phần của mô hình đóng góp tích cực vào hiệu suất cuối cùng của nó.
+
+### 4.4 Trực quan hóa Embeddings nhiệm vụ
+
+Để phân tích những gì HYPERFORMER++ BASE đã học về mối quan hệ giữa các nhiệm vụ khác nhau, chúng tôi trực quan hóa các embeddings nhiệm vụ đã học cho các mô hình được huấn luyện với số lượng mẫu lớn nhất trong Bảng 1 và 2. Hình 3 minh họa các projection vector 2D của embeddings nhiệm vụ sử dụng PCA (Wold et al., 1987). Thú vị là, các nhóm được quan sát tương ứng với các nhiệm vụ tương tự. Điều này cho thấy rằng các embeddings nhiệm vụ đã học bởi HYPERFORMER++ BASE có ý nghĩa. Đối với CB, một tập dữ liệu NLI mặc dù được khởi tạo từ MNLI, sau khi huấn luyện few-shot, embedding nhiệm vụ gần nhất với RTE, một tập dữ liệu NLI khác. Điều này hợp lý vì các premises và hypotheses trong cả CB dựa trên discourse và RTE dựa trên tin tức và Wikipedia đều phức tạp hơn so với MNLI. Tập dữ liệu độ tương tự câu STS-B được nhóm gần với tập dữ liệu paraphrase MRPC. CoLA, tập trung vào khả năng chấp nhận ngôn ngữ rất khác với các nhiệm vụ khác và không được nhóm với bất kỳ embeddings nhiệm vụ nào được quan sát.
+
+Ngoài ra, các embeddings nhiệm vụ cho 1) tất cả các tập dữ liệu phân tích cảm xúc cụ thể là SST-2, Yelp polarity, và IMDB; 2) hai tập dữ liệu NLI quy mô lớn cụ thể là MNLI và SciTail; 3) các tập dữ liệu hỏi đáp, tức là BoolQ và QNLI; và 4) các tập dữ liệu paraphrase cụ thể là QQP và PAWS mỗi nhóm được nhóm lại với nhau.
+
+## 5 Công trình liên quan
+
+Học đa nhiệm vụ: Học đa nhiệm vụ, tức là học một mô hình thống nhất để hoạt động tốt trên nhiều nhiệm vụ khác nhau, là một vấn đề thách thức trong NLP. Nó đòi hỏi giải quyết nhiều thách thức như quên thảm khốc, và xử lý kích thước nhiệm vụ không cân xứng dẫn đến mô hình overfitting trong các nhiệm vụ tài nguyên thấp trong khi underfitting trong các nhiệm vụ tài nguyên cao (Arivazhagan et al., 2019). Liu et al. (2019a) đề xuất Multi-Task Deep Neural Network (MTDNN) để học từ nhiều nhiệm vụ NLU. Mặc dù MTDNN đạt được kết quả ấn tượng trên GLUE, nó áp dụng học đa nhiệm vụ như một dạng pretraining theo sau bởi tinh chỉnh đặc thù nhiệm vụ. Đồng thời với chúng tôi, Tay et al. (2021) đề xuất một phương pháp học đa nhiệm vụ bằng cách huấn luyện hypernetworks có điều kiện nhiệm vụ; tuy nhiên, phương pháp của họ ít hiệu quả tham số hơn 43 lần so với chúng tôi. Trong một hướng nghiên cứu khác, Clark et al. (2019b) đề xuất học các mô hình đa nhiệm vụ với chưng cất kiến thức. Houlsby et al. (2019) huấn luyện adapters cho mỗi nhiệm vụ riêng biệt, giữ mô hình cố định. Stickland và Murray (2019) chia sẻ các tham số mô hình giữa các nhiệm vụ và đưa ra các tham số adapter đặc thù nhiệm vụ, kém hiệu quả tham số hơn so với phương pháp của chúng tôi.
+
+Hypernetworks và sinh tham số theo ngữ cảnh: Công trình của chúng tôi liên quan chặt chẽ đến hypernetworks (Ha et al., 2017). Trong thiết lập học liên tục, nơi các nhiệm vụ được học tuần tự, Oswald et al. (2020) đề xuất một hypernetwork có điều kiện nhiệm vụ để sinh ra tất cả các trọng số của mô hình đích. Phương pháp của chúng tôi hiệu quả hơn đáng kể vì chúng tôi không sinh ra tất cả các trọng số của mô hình đích mà một số lượng rất nhỏ tham số cho các mô-đun adapter để cho phép mô hình thích nghi với mỗi nhiệm vụ cá nhân một cách hiệu quả. Tương tự, Jin et al. (2020) sinh ra mô hình đầy đủ từ các mô tả đặc thù nhiệm vụ trong các miền khác nhau trong khi chúng tôi chỉ sinh ra các mô-đun adapter nhỏ cho mỗi nhiệm vụ một cách hiệu quả.
+
+Công trình trước đó cũng đề xuất các cách tiếp cận meta-learning hoặc Bayesian để sinh ra các tham số lớp softmax cho các thiết lập mới (Bansal et al., 2020; Ponti et al., 2020). Các cách tiếp cận Meta-learning nổi tiếng chậm để huấn luyện. Ngoài ra, sinh ra các tham số softmax đòi hỏi số lượng tham số cao hơn đáng kể, để lại phương pháp không thể thích nghi các lớp thấp hơn của mô hình, và hạn chế ứng dụng của chúng vào các nhiệm vụ phân loại.
+
+Trong công trình đồng thời, Üstün et al. (2020) đề xuất một phương pháp phân tích cú pháp phụ thuộc đa ngôn ngữ dựa trên adapters và mạng sinh tham số theo ngữ cảnh (Platanios et al., 2018) nơi họ sinh ra các tham số adapter được điều kiện hóa trên các embeddings ngôn ngữ đầu vào đã được huấn luyện. Nghiên cứu của họ giới hạn ở phân tích cú pháp phụ thuộc đa ngôn ngữ, trong khi công trình của chúng tôi nghiên cứu học đa nhiệm vụ và áp dụng cho nhiều nhiệm vụ nhờ bản chất sequence-to-sequence tổng quát của mô hình của chúng tôi. Hơn nữa, số lượng tham số có thể huấn luyện của họ lớn hơn 2.88 lần so với mô hình cơ sở của họ vì họ sử dụng một sinh tham số theo ngữ cảnh trong mỗi lớp. Ngược lại, chúng tôi sử dụng một hypernetwork nhỏ gọn duy nhất cho phép chúng tôi điều kiện hóa hiệu quả trên nhiều nhiệm vụ và lớp của mô hình transformer.
+
+## 6 Kết luận
+
+Chúng tôi đề xuất một phương pháp tiết kiệm tham số cho tinh chỉnh đa nhiệm vụ. Cách tiếp cận của chúng tôi là huấn luyện hypernetworks chia sẻ để sinh ra adapters đặc thù nhiệm vụ được điều kiện hóa trên embeddings nhiệm vụ, ID lớp, và vị trí adapter. Các hypernetworks chia sẻ nắm bắt kiến thức giữa các nhiệm vụ và cho phép chuyển giao tích cực đến các nhiệm vụ tài nguyên thấp và liên quan, trong khi các lớp đặc thù nhiệm vụ cho phép mô hình thích nghi với mỗi nhiệm vụ cá nhân. Các thí nghiệm mở rộng cho thấy phương pháp của chúng tôi đạt được cải thiện mạnh mẽ so với học đa nhiệm vụ trên benchmark GLUE, và cải thiện đáng kể khái quát hóa nhiệm vụ trong miền.
+
+## Lời cảm ơn
+
+Chúng tôi biết ơn Dani Yogatama, Neil Houlsby, và Colin Raffel về phản hồi trên bản nháp của bài báo này. Chúng tôi cũng muốn cảm ơn Adam Paszke, Jamie Kiros, và George Dahl về các bình luận và thảo luận hữu ích.
