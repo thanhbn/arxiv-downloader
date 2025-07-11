@@ -74,32 +74,62 @@ Văn bản cần dịch:
             with open(file_path, 'r', encoding='latin-1') as f:
                 return f.read()
 
-    def translate_text_chunks(self, text, max_chunk_size=15000):
-        """Chia text thành chunks nhỏ để dịch"""
+    def translate_text_chunks(self, text, max_chunk_size=6000):
+        """Chia text thành chunks nhỏ để dịch với chiến lược thông minh"""
         chunks = []
         current_chunk = ""
         
         paragraphs = text.split('\n\n')
+        threshold_size = int(max_chunk_size * 1.5)  # 150% of max chunk size
         
-        for paragraph in paragraphs:
-            if len(current_chunk + paragraph) > max_chunk_size:
+        i = 0
+        while i < len(paragraphs):
+            paragraph = paragraphs[i]
+            
+            # Calculate remaining text size from current paragraph onwards
+            remaining_text = '\n\n'.join(paragraphs[i:])
+            current_plus_paragraph = current_chunk + paragraph
+            
+            # Check if adding this paragraph exceeds max_chunk_size
+            if len(current_plus_paragraph) > max_chunk_size:
                 if current_chunk:
-                    chunks.append(current_chunk.strip())
-                    current_chunk = paragraph
+                    # Smart decision: if remaining text (including current paragraph) is < 150% of max_chunk_size,
+                    # include everything in current chunk instead of creating a small leftover chunk
+                    if len(current_chunk + remaining_text) <= threshold_size:
+                        current_chunk += remaining_text
+                        chunks.append(current_chunk.strip())
+                        break  # All remaining text processed
+                    else:
+                        chunks.append(current_chunk.strip())
+                        current_chunk = paragraph + "\n\n"
                 else:
                     # Paragraph quá dài, chia nhỏ hơn
                     sentences = paragraph.split('. ')
-                    for sentence in sentences:
-                        if len(current_chunk + sentence) > max_chunk_size:
+                    j = 0
+                    while j < len(sentences):
+                        sentence = sentences[j]
+                        remaining_sentences = '. '.join(sentences[j:])
+                        current_plus_sentence = current_chunk + sentence
+                        
+                        if len(current_plus_sentence) > max_chunk_size:
                             if current_chunk:
-                                chunks.append(current_chunk.strip())
-                                current_chunk = sentence
+                                # Smart decision for sentences too
+                                if len(current_chunk + remaining_sentences) <= threshold_size:
+                                    current_chunk += remaining_sentences
+                                    j = len(sentences)  # Exit sentence loop
+                                else:
+                                    chunks.append(current_chunk.strip())
+                                    current_chunk = sentence + ". "
                             else:
                                 chunks.append(sentence)
+                                current_chunk = ""
                         else:
                             current_chunk += sentence + ". "
+                        j += 1
             else:
                 current_chunk += paragraph + "\n\n"
+            
+            i += 1
         
         if current_chunk.strip():
             chunks.append(current_chunk.strip())

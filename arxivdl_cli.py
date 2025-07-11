@@ -69,10 +69,16 @@ class ArXivCLI:
             'translate': {
                 'description': 'Translate papers to Vietnamese',
                 'scripts': {
-                    'claude': 'translate_manager.py'
+                    'claude': 'translate_manager.py',
+                    'openai': 'translate_papers.py',
+                    'check': 'check_translation_completeness.py',
+                    'queue': 'add_to_translation_queue.py',
+                    'cleanup': 'cleanup_translations.py',
+                    'stalled': 'process_stalled_translations.py',
+                    'test': 'test_translation.py'
                 },
                 'default': 'translate_manager.py',
-                'help': 'Translate papers using Claude API'
+                'help': 'Translate papers using Claude API or OpenAI, with quality checking and queue management'
             },
             'organize': {
                 'description': 'Organize papers across collections',
