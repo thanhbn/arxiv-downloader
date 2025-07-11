@@ -1,0 +1,671 @@
+# 2309.17224.pdf
+# Được chuyển đổi từ PDF sang TXT
+# Đường dẫn nguồn: /home/admin88/arxiv-downloader/quantization/2309.17224.pdf
+# Kích thước tệp: 930239 byte
+
+===============================================
+NỘI DUNG TỆP PDF
+===============================================
+
+--- TRANG 1 ---
+Huấn luyện và suy luận các mô hình ngôn ngữ lớn
+sử dụng số thực dấu phẩy động 8-bit
+Sergio P. Perez∗, Yan Zhang∗, James Briggs∗, Charlie Blake,
+Josh Levy-Kramer, Paul Balanca, Carlo Luschi, Stephen Barlow, Andrew Fitzgibbon
+Graphcore, Vương quốc Anh
+Tóm tắt
+Các định dạng FP8 đang trở nên phổ biến để tăng cường hiệu quả tính toán cho huấn luyện
+và suy luận của các mô hình học sâu lớn. Thách thức chính của chúng là cần có sự lựa chọn
+cẩn thận về tỷ lệ để ngăn chặn suy giảm do phạm vi động giảm so với các định dạng độ chính xác cao hơn. Mặc dù đã có nhiều tài liệu về việc chọn các tỷ lệ như vậy cho định dạng INT, khía cạnh quan trọng này vẫn chưa được giải quyết cho FP8. Bài báo này trình bày một phương pháp để chọn các tỷ lệ cho các lớp tuyến tính FP8, dựa trên việc cập nhật động các tỷ lệ cho từng tensor cho trọng số, gradient và kích hoạt. Chúng tôi áp dụng phương pháp này để huấn luyện và xác thực các mô hình ngôn ngữ lớn loại GPT và Llama 2 sử dụng FP8, cho các kích thước mô hình từ 111M đến 70B. Để hỗ trợ hiểu biết về động lực FP8, kết quả của chúng tôi được kèm theo các biểu đồ phân bố tỷ lệ cho từng tensor cho trọng số, kích hoạt và gradient trong cả quá trình huấn luyện và suy luận.
+
+1 Giới thiệu
+Giảm số bit được sử dụng bởi các định dạng số cung cấp lợi ích hiệu quả đáng kể cho huấn luyện và suy luận của các mô hình học sâu. Độ trễ suy luận thường bị nghẽn cổ chai bởi băng thông bộ nhớ và giao tiếp của hệ thống [Pope et al., 2023], kích thước mô hình bởi tổng bộ nhớ khả dụng, và thông lượng cũng như thời gian huấn luyện thường bị giới hạn bởi tốc độ thực hiện các phép toán. Tất cả những yếu tố này được cải thiện đáng kể nếu chúng ta có thể biểu diễn các giá trị sử dụng ít bit hơn, với chi phí thường tỷ lệ tuyến tính với số bit trên mỗi giá trị.
+
+Những lợi ích này đã thúc đẩy việc áp dụng các định dạng số thực dấu phẩy động 16-bit — FP16 [Micikevicius et al., 2017] và BF16 [Kalamkar et al., 2019] — thay cho định dạng FP32 được sử dụng để biểu diễn các giá trị liên tục cho các mô hình học sâu ban đầu. Gần đây hơn, các định dạng số thực dấu phẩy động 8-bit (FP8) đã được đề xuất cùng với phần cứng có hỗ trợ chuyên dụng cho phép tính FP8 [Noune et al., 2022, Micikevicius et al., 2022], mang lại những lợi ích hiệu quả hơn nữa. Việc tiêu chuẩn hóa định dạng FP8 đang được phát triển tích cực bởi nhóm làm việc IEEE P3109 [2023]. Người đọc có thể tìm hiểu về các định dạng số thực dấu phẩy động cho học sâu trong Phụ lục A, và mô tả về các định dạng FP8 khác nhau trong Phụ lục B. Trong công trình này, chúng tôi giả định các định dạng của Noune et al. [2022] khi đề cập đến FP8, ký hiệu FP8 E4 cho định dạng trọng số và kích hoạt và FP8 E5 cho định dạng gradient.
+
+Những nghiên cứu ban đầu này chỉ ra rằng suy luận và huấn luyện FP8 (tức là, độ chính xác hỗn hợp với phép nhân ma trận trong FP8) thực sự là khả thi, nhưng đi kèm với một loạt khó khăn liên quan. Loại bỏ các bit mantissa từ một định dạng giới hạn độ chính xác số, trong khi loại bỏ các bit số mũ giới hạn phạm vi các giá trị có thể được biểu diễn. Vấn đề sau đặt ra một thách thức đặc biệt cho các nhà thực hành: làm thế nào để đảm bảo rằng tập hợp các giá trị được tạo ra khi thực hiện huấn luyện và suy luận mô hình nằm trong tập hợp các giá trị có thể biểu diễn. Tràn trên hoặc tràn dưới phạm vi này có thể nhanh chóng làm giảm độ chính xác của mô hình.
+
+∗Tác giả liên hệ: {sergiop, yanz, jamesbr}@graphcore.ai
+Bản thảo. Đang được xem xét.arXiv:2309.17224v1 [cs.LG] 29 Sep 2023
+
+--- TRANG 2 ---
+class LinearFP8Training:
+# Định dạng FP: fp8e4, fp8e5, fp16, fp32, bf16
+# tensor fp16 có thể được thay thế bằng fp32 hoặc bf16
+fp8e5_max: fp8e5 = 57344
+fp8e4_max: fp8e4 = 240
+def forward(
+w8: fp8e4, w_scale: int, x: fp16
+) -> fp16:
+x_scale: int = compute_bias(x, fp8e4)
+x: fp16 = scale(x, x_scale)
+x8: fp8e4 = cast(x, fp8e4)
+y: fp16 = matmul(x8, w8.T)
+y: fp16 = unscale(y, x_scale + w_scale)
+return y
+def backward(
+dy: fp16, w8: fp8e4, w_scale: int,
+x8: fp8e4, x_scale: int
+) -> fp16, fp16:
+dy_scale: int = compute_bias(dy, fp8e5)
+dy: fp16 = scale(dy, dy_scale)
+dy8: fp8e5 = cast(dy, fp8e5)
+dx: fp16 = matmul(dy8, w8.T)
+dx: fp16 = unscale(dx, dy_scale + w_scale)
+dw: fp16 = matmul(dy8, x8.T)
+dw: fp16 = unscale(dw, dy_scale + x_scale)
+return dx, dwdef weight_update(
+w: fp16, dw: fp16
+) -> fp8e4, int:
+w: fp16 = optimiser(w, dw)
+w_scale: int = compute_bias(w, fp8e4)
+w: fp16 = scale(w, w_scale)
+w8: fp8e4 = cast(w, fp8e4)
+return w8, w_scale
+def compute_bias(
+tensor: fp16,
+cast_to: Union[fp8e4, fp8e5],
+margin: int = 3 # Xem Phần 3.2
+) -> int:
+amax: fp16 = max(abs(tensor))
+if cast_to == fp8e4:
+return floor(log2(fp8e4_max/amax)) - margin
+elif cast_to == fp8e5:
+return floor(log2(fp8e5_max/amax)) - margin
+def scale(
+v: fp16, v_scale: int
+) -> fp16:
+return v * 2**v_scale
+def unscale(
+v: fp16, v_scale: int
+) -> fp16:
+return v * 2**(-v_scale)
+Hình 1: Giai đoạn huấn luyện của một lớp tuyến tính được lượng tử hóa về FP8. Lượt truyền xuôi và ngược minh họa cách các độ lệch tỷ lệ được tính toán và áp dụng cho trọng số, kích hoạt và gradient.
+
+from LinearFP8Training import compute_bias, scale,
+# tensor fp16 có thể được thay thế bằng fp32 hoặc bf16
+class LinearFP8Inference:
+def post_training_quantisation(
+w: fp16 # Checkpoint
+) -> fp8e4, int:
+w_scale: int = compute_bias(w, fp8e4)
+w: fp16 = scale(w, w_scale)
+w8: fp8e4 = cast(w, fp8e4)
+return w8, w_scaleunscale
+def forward(
+w8: fp8e4, w_scale: int, x: fp16
+) -> fp16:
+x_scale: int = compute_bias(x, fp8e4)
+x: fp16 = scale(x, x_scale)
+x8: fp8e4 = cast(x, fp8e4)
+y: fp16 = matmul(x8, w8.T)
+y: fp16 = unscale(y, x_scale + w_scale)
+return y
+Hình 2: Giai đoạn suy luận của một lớp tuyến tính được lượng tử hóa về FP8. Lượng tử hóa sau huấn luyện được áp dụng cho checkpoint. Các độ lệch tỷ lệ được tính toán và áp dụng cho trọng số và kích hoạt.
+
+Để chống lại điều này cho huấn luyện FP16, phương pháp tiêu chuẩn là dịch chuyển toàn cục gradient bằng một tỷ lệ mất mát duy nhất [Micikevicius et al., 2017, Noune et al., 2022, Perez, 2022], mặc dù điều này không phải lúc nào cũng đủ [Zhang et al., 2022, Scao et al., 2022]. Đối với suy luận, một kỹ thuật phổ biến là lượng tử hóa về định dạng số nguyên 8-bit (INT8). Các thế hệ phần cứng AI trước đây đã cung cấp phép tính gia tốc cho INT8 nhưng không phải FP8, hạn chế việc áp dụng FP8 mặc dù tiềm năng của nó như một định dạng 8-bit áp dụng rộng hơn trong bối cảnh học máy (xem Phụ lục C để thảo luận thêm). Các sơ đồ lượng tử hóa nhóm phức tạp hơn cũng đã được đề xuất cho suy luận cho phép một số giá trị được lưu trữ trong ít hơn 8 bit [Dettmers và Zettlemoyer, 2022]. Tuy nhiên, điều này tạo thêm độ phức tạp và phép tính vẫn phải được thực hiện trong độ chính xác cao hơn.
+
+Để giải quyết vấn đề phạm vi giảm đáng kể cho các định dạng FP8, đã được đề xuất dựa vào độ lệch số mũ liên quan đến các tensor FP8. Độ lệch số mũ là một phần của định nghĩa của mọi
+
+--- TRANG 3 ---
+định dạng số thực dấu phẩy động. Bằng cách cộng hoặc trừ một số nguyên vào độ lệch số mũ, người ta có thể dịch chuyển hiệu quả phạm vi có thể biểu diễn trên cơ sở từng tensor, tạo ra việc tỷ lệ hóa chi tiết hơn so với tỷ lệ mất mát tiêu chuẩn và áp dụng cho cả lượt truyền xuôi và ngược. Số nguyên này, được ký hiệu là độ lệch tỷ lệ, được cung cấp bởi người dùng và có thể được hỗ trợ trong phần mềm hoặc trực tiếp trong phần cứng.
+
+Quá trình xác định các tỷ lệ này và cách chúng được áp dụng thực tế là rất quan trọng để tận dụng lợi ích của FP8 cho huấn luyện và suy luận. Tài liệu FP8 hiện có chưa đề cập rộng rãi chủ đề này, khiến người dùng phải dựa vào các quyết định tỷ lệ hóa được thực hiện trong các triển khai phần mềm có thể không được biện minh rõ ràng [Nvidia, 2022b]. Chúng tôi tìm cách hỗ trợ khía cạnh thiết kế quan trọng này thông qua các đóng góp sau:
+
+1. Chúng tôi trình bày một phương pháp để chọn các độ lệch tỷ lệ cho từng tensor trong các lớp tuyến tính có trong các mô hình ngôn ngữ lớn loại GPT [Brown et al., 2020] và Llama [Touvron et al., 2023]. Phương pháp như vậy được minh họa trong Hình 1 cho giai đoạn huấn luyện và trong Hình 2 cho giai đoạn suy luận. Những chi tiết cụ thể này hữu ích cho các nhà thực hành nhằm tận dụng FP8 và đã bị thiếu trong tài liệu FP8, thường sử dụng quét các giá trị [Noune et al., 2022] hoặc không xác định cách tính toán các độ lệch tỷ lệ [Micikevicius et al., 2022].
+
+2. Chúng tôi trình bày cách phương pháp FP8 của chúng tôi dẫn đến sự hội tụ của các mô hình GPT và Llama từ 111M đến 70B tham số, cho cả suy luận và huấn luyện.
+
+3. Đối với suy luận, chúng tôi chi tiết cách phương pháp của chúng tôi có thể được sử dụng như lượng tử hóa sau huấn luyện để đưa checkpoint độ chính xác cao về FP8 và thực hiện suy luận không có suy giảm.
+
+4. Đối với huấn luyện, chúng tôi chứng minh rằng phương pháp của chúng tôi có thể cập nhật động các độ lệch tỷ lệ cho từng tensor và ngăn chặn suy giảm sử dụng FP8 trong các mô hình ngôn ngữ lớn. Chúng tôi cung cấp các biểu đồ về cách các độ lệch tỷ lệ phát triển và rút ra các hiểu biết từ chúng.
+
+2 Lớp tuyến tính được điều chỉnh cho FP8
+
+Thực hiện phép nhân ma trận trong FP8 đòi hỏi việc sử dụng các tỷ lệ để ngăn chặn tràn dưới và tràn trên. Bằng tỷ lệ, chúng tôi có nghĩa là các yếu tố khi nhân với tensor, tạo ra tensor tỷ lệ có thể biểu diễn trong phạm vi động FP8. Không có tỷ lệ như vậy, tensor sẽ tràn dưới hoặc tràn trên. Các tỷ lệ như vậy cần thiết cho các phép nhân ma trận được tìm thấy trong cả lượt truyền xuôi (để tính toán kích hoạt) và trong lượt truyền ngược (để tính toán gradient trọng số và kích hoạt). Sử dụng tỷ lệ cho độ chính xác thấp hơn không phải là mới và đã là một chiến lược phổ biến cho huấn luyện FP16, với phương pháp tỷ lệ mất mát [Noune et al., 2022, Perez, 2022, Micikevicius et al., 2017] bao gồm việc nhân hàm mất mát với một hằng số để ngăn chặn tràn dưới của gradient. Mặc dù tỷ lệ mất mát hoạt động tốt cho các mô hình FP16 có kích thước hợp lý, khi số lượng tham số tăng, phạm vi giới hạn của FP16 trở thành vấn đề. Các mô hình hơn 100 tỷ tham số như Bloom [Scao et al., 2022] hoặc OPT [Zhang et al., 2022] gặp khó khăn trong việc tìm tỷ lệ mất mát ổn định cho FP16 và cuối cùng sử dụng BF16.
+
+Do đó, không chắc chắn liệu ngay cả với FP16 có đủ để có một tỷ lệ chung cho tất cả gradient. Câu hỏi tương tự đã được khám phá cho FP8: không rõ liệu một tỷ lệ có đủ [Noune et al., 2022] hay cần tỷ lệ cho từng tensor [Micikevicius et al., 2022]. Ngoài ra, đối với FP8 E4, trọng số và kích hoạt cũng cần tỷ lệ do phạm vi động giảm so với FP16.
+
+Hình 3 minh họa cách các tỷ lệ được triển khai cho lượt truyền xuôi của lớp tuyến tính FP8. Đầu tiên, tập trung vào độ chính xác FP16 đầy đủ, Hình 3a hiển thị cả trọng số và kích hoạt trong FP16 và không cần tỷ lệ trước phép nhân ma trận, việc tích lũy có thể được thực hiện trong FP16 cũng vậy. Kịch bản này giống hệt cho các định dạng khác như FP32 hoặc BF16. Ngược lại, Hình 3b cho thấy cách các khối tỷ lệ và ép kiểu khác nhau cần thiết để tận dụng phép nhân ma trận FP8 trong độ chính xác hỗn hợp. Đầu vào là FP8 nhưng đầu ra là FP16: sự đối lập này xuất phát từ nhu cầu tích lũy các kết quả từng phần của các phép toán FP8 trong FP16 để ngăn chặn tràn trên. Vì việc tích lũy trong FP16, các nhà cung cấp phần cứng [Graphcore, 2022b, Nvidia, 2022a] xuất ra kết quả FP16 nội bộ và để người dùng quyết định có ép kiểu trở lại FP8 hay không.
+
+Trọng số Đối với huấn luyện và suy luận, lớp tuyến tính cần được sửa đổi để bao gồm việc ép kiểu về FP8 E4 từ định dạng độ chính xác cao hơn như FP16. Trong huấn luyện, việc ép kiểu này cần thiết sau mỗi lần cập nhật trọng số, diễn ra trong định dạng độ chính xác cao hơn như FP16 hoặc FP32. Trong suy luận, nếu trọng số được lưu trữ trong FP8 thì không cần ép kiểu. Ngược lại, nếu trọng số ở định dạng độ chính xác cao hơn
+
+--- TRANG 4 ---
+Kích hoạt
+FP16Trọng số
+FP16
+Phép nhân ma trận
+FP16×FP16→FP16Kích hoạt
+đầu ra
+FP16(a) Lượt truyền xuôi cho suy luận FP16.
+
+Trọng số
+FP16Tính toán
+độ lệch tỷ lệĐộ lệch tỷ lệ
+trọng số
+Tỷ lệ
+tensorTrọng số
+tỷ lệ
+FP16Ép kiểu
+FP16→FP8
+Trọng số
+tỷ lệ
+FP8Lượng tử hóa sau huấn luyện
+
+Kích hoạt
+FP16Tính toán
+độ lệch tỷ lệĐộ lệch tỷ lệ
+kích hoạt
+Tỷ lệ
+tensorKích hoạt
+tỷ lệ
+FP16Ép kiểu
+FP16→FP8Kích hoạt
+tỷ lệ
+FP8Phép nhân ma trận
+FP8×FP8→FP16Kích hoạt
+tỷ lệ
+FP16Hủy tỷ lệ
+tensorKích hoạt
+đầu ra
+FP16
+
+Tensor FP16
+Tensor FP8
+Độ lệch tỷ lệ INT
+Toán tử
+
+(b) Lượt truyền xuôi cho suy luận FP8.
+
+Hình 3: So sánh lượt truyền xuôi cho lớp tuyến tính FP16 và FP8.
+
+như FP16, BF16 hoặc FP32, cần ép kiểu về FP8 E4 chỉ một lần trước khi sử dụng các trọng số đó trong phép nhân ma trận. Đối với cả hai trường hợp, trước khi ép kiểu về FP8 E4, cần có tỷ lệ của trọng số để ngăn chặn tràn dưới hoặc tràn trên khi thực hiện việc ép kiểu đó. Việc tỷ lệ hóa dịch chuyển phân bố trọng số và làm cho nó chồng lắp càng nhiều càng tốt với phạm vi động của FP8 E4. Các tỷ lệ tối ưu có thể thay đổi trong quá trình huấn luyện nên cần tính toán lại tỷ lệ sau một số bước nhất định. Trong suy luận, các tỷ lệ không thay đổi vì trọng số không được cập nhật.
+
+Kích hoạt Do việc tích lũy phép nhân ma trận được thực hiện ở độ chính xác cao hơn, cần thiết phải ép kiểu trở lại FP8 E4 trước phép nhân ma trận tiếp theo. Khi ép kiểu về FP8 E4, chúng ta cần một yếu tố tỷ lệ để giảm thiểu tràn dưới/tràn trên vì phạm vi động của FP8 E4 hẹp hơn so với các định dạng độ chính xác cao hơn như FP16. Sau khi thực hiện phép nhân ma trận, các kích hoạt đầu ra được hủy tỷ lệ có tính đến các yếu tố tỷ lệ được tính toán cho trọng số và kích hoạt trước phép nhân ma trận.
+
+2.1 Áp dụng độ lệch tỷ lệ trước khi ép kiểu về FP8
+
+Ép kiểu trọng số và kích hoạt từ FP16 sang FP8 E4 dẫn đến phạm vi động hẹp hơn có thể dẫn đến tràn dưới hoặc tràn trên. Để ngăn chặn điều này, chúng tôi giới thiệu các tỷ lệ cho từng tensor dịch chuyển phân bố FP16 trước khi ép kiểu về FP8 E4. Loại tỷ lệ được sử dụng trong công trình này là độ lệch tỷ lệ.
+
+Bắt đầu từ biểu diễn số thực dấu phẩy động được định nghĩa trong Phương trình 4, chúng tôi thêm độ lệch tỷ lệ số nguyên bscale vào số mũ sao cho
+
+số mũ tỷ lệ = bexp−bias + bscale, (1)
+
+tương đương với việc nhân số FP16 với 2bscale. Cả trọng số và kích hoạt trong Hình 3b đều yêu cầu độ lệch tỷ lệ trước khi được ép kiểu từ FP16 sang FP8 E4. Hãy ký hiệu bw,scale
+
+--- TRANG 5 ---
+và bx,scale là các độ lệch tỷ lệ cho trọng số và kích hoạt, tương ứng. Sau đó, một khi phép nhân ma trận được thực hiện trong tích lũy độ chính xác cao hơn như FP16, các kích hoạt kết quả cần được hủy tỷ lệ bằng cách áp dụng độ lệch tỷ lệ bằng −(bw,scale+bx,scale):
+
+số mũ hủy tỷ lệ = bexp−bias−(bw,scale+bx,scale). (2)
+
+Chúng tôi đề cập người đọc đến các hàm scale và unscale trong Hình 1, được sử dụng trong mã cho các giai đoạn huấn luyện và suy luận trong Hình 1 và 2.
+
+2.2 FP8 cho gradient trong quá trình huấn luyện
+
+Lượt truyền ngược cho lớp tuyến tính chứa hai phép nhân ma trận: một để tính toán gradient trọng số và một cho gradient kích hoạt đầu vào. Cả hai phép nhân ma trận đều có thể được gia tốc với FP8. Quá trình tương tự như phép nhân ma trận trong lượt truyền xuôi: các đầu vào của phép nhân ma trận cần được tỷ lệ hóa và sau đó ép kiểu về FP8 trước khi được chuyển đến phép nhân ma trận. Tiếp theo, đầu ra phép nhân ma trận (tức là gradient trọng số hoặc gradient kích hoạt) được hủy tỷ lệ có tính đến các tỷ lệ của các đầu vào phép nhân ma trận FP8. Điều quan trọng cần nhớ là loại FP8 khác nhau cho trọng số và kích hoạt so với gradient: trong khi trọng số và kích hoạt được ép kiểu về FP8 E4, gradient cần được ép kiểu về FP8 E5 để bảo toàn phạm vi động rộng hơn (xem Phụ lục B về sự khác biệt giữa hai định dạng).
+
+Chúng tôi đề cập người đọc đến mã giả trong Hình 1 để biết chi tiết về lượt truyền ngược trong FP8.
+
+2.3 Chọn độ lệch tỷ lệ phù hợp
+
+Có nhiều phương pháp khác nhau để lượng tử hóa từ định dạng độ chính xác cao hơn thành định dạng thấp hơn. Một số phương pháp phổ biến để ép kiểu từ định dạng số thực dấu phẩy động như FP32 thành định dạng điểm cố định như INT8 bao gồm việc ánh xạ giá trị tuyệt đối lớn nhất đến ±127, là số nguyên tối đa có thể biểu diễn trong INT8. Điều này đảm bảo rằng các ngoại lệ phù hợp trong phạm vi động của INT8, nhưng có thể không tận dụng hết phạm vi động nếu các ngoại lệ lớn hơn nhiều so với các giá trị khác. Các phương pháp khác xem xét phân vị hoặc toàn bộ phân bố giá trị và tính toán sai số bình phương trung bình hoặc phân kỳ KL để giảm thiểu mất mát thông tin giữa phân bố độ chính xác cao hơn và phân bố đã lượng tử hóa.
+
+Trong công trình này, chúng tôi đề xuất một phương pháp dựa trên việc thiết lập các tỷ lệ động cho từng tensor, được tính toán qua phương pháp giá trị tuyệt đối tối đa. Chiến lược của chúng tôi có những điểm tương đồng với thư viện Nvidia [2022b]; tuy nhiên một số chi tiết tinh vi và biện minh của triển khai này không được làm rõ. Chúng tôi hy vọng rằng bằng cách mở phương pháp của chúng tôi và thử nghiệm nó trong các thí nghiệm ở Phần 4, các nhà nghiên cứu FP8 khác có thể xây dựng dựa trên nó.
+
+Phương pháp của chúng tôi phụ thuộc vào số tối đa có thể biểu diễn của định dạng FP8, khác nhau đối với định dạng FP8 E4 và FP8 E5 (xem Phụ lục B). Ký hiệu số tối đa đó là max_num, việc tính toán độ lệch tỷ lệ cho mỗi tensor theo công thức:
+
+amax = max ( |tensor |),
+scaling_bias = floor (log2(max_num/amax)) ,(3)
+
+trong đó floor(a) trả về số nguyên lớn nhất không vượt quá a. Hàm compute_bias trong Hình 1 dịch thuật toán này thành mã. Đối với huấn luyện (xem Hình 1), ba độ lệch tỷ lệ được tính toán trong mỗi lớp tuyến tính, tương ứng với trọng số, kích hoạt đầu vào và gradient kích hoạt đầu ra. Đối với suy luận (xem Hình 2), chỉ trọng số và kích hoạt đầu vào cần độ lệch tỷ lệ.
+
+2.4 Tỷ lệ mất mát thêm vào độ lệch tỷ lệ khi tích lũy trong FP16
+
+Tỷ lệ mất mát là một kỹ thuật phổ biến để cho phép huấn luyện FP16 [Noune et al., 2022, Perez, 2022, Micikevicius et al., 2017]. Tỷ lệ mất mát cần thiết trong FP16 vì gradient tràn dưới do phạm vi động hẹp hơn của FP16, so với các định dạng khác như FP32 hoặc BF16. Lý do tại sao tỷ lệ mất mát cũng có liên quan đến lượng tử hóa FP8 liên quan đến việc tích lũy độ chính xác cao hơn của phép nhân ma trận FP8. Việc tích lũy như vậy thường được thực hiện trong FP16, BF16 hoặc FP32 [Graphcore, 2022b, Nvidia, 2022a]. Nếu nó được thực hiện trong FP8, nó sẽ không hoạt động do phạm vi động giới hạn cho FP8 E4 hoặc thiếu độ chính xác trong FP8 E5. Kết quả là, việc lượng tử hóa lớp tuyến tính về FP8 được mô tả trong phần này thực sự là lượng tử hóa độ chính xác hỗn hợp.
+
+Khi việc tích lũy được thực hiện trong BF16 hoặc FP32, tỷ lệ mất mát không cần thiết và chỉ các độ lệch tỷ lệ được giải thích trong Phần 2.3 đủ để ngăn chặn tràn dưới hoặc tràn trên sau khi ép kiểu
+
+--- TRANG 6 ---
+về FP8. Tuy nhiên, khi việc tích lũy được thực hiện trong FP16, cần có tỷ lệ mất mát để biểu diễn tốt hơn gradient sau khi chúng được xuất ra bởi phép nhân ma trận FP8 và hủy tỷ lệ. Phương pháp điều chỉnh tỷ lệ mất mát cho huấn luyện FP8-FP16 hỗn hợp giống hệt với huấn luyện FP16 đầy đủ. Có một số phương pháp trong tài liệu: chạy quét tỷ lệ mất mát [Micikevicius et al., 2017], kiểm tra biểu đồ gradient để điều chỉnh tỷ lệ mất mát trong quá trình huấn luyện [Perez, 2022], lùi lại để bỏ qua cập nhật trọng số khi xảy ra tràn trên, hoặc tỷ lệ mất mát sao cho giá trị trung bình cộng độ lệch chuẩn nhân với một hằng số bằng log2 của giá trị tối đa có thể biểu diễn trong FP16 [Kuchaiev et al., 2018]. Chúng tôi đề cập người đọc đến phần 4 của [Noune et al., 2022] để phân tích về cách các phương pháp tỷ lệ mất mát này ảnh hưởng đến huấn luyện FP8-FP16 hỗn hợp. Trong các thí nghiệm ở Phần 4, chúng tôi sử dụng tỷ lệ mất mát không đổi, sử dụng cùng giá trị cho huấn luyện FP16 đầy đủ và huấn luyện FP8-FP16 hỗn hợp.
+
+3 Chi tiết để thực hiện huấn luyện và suy luận trong FP8
+
+Chúng tôi tuân theo hai chiến lược khác nhau để tính toán độ lệch tỷ lệ cho huấn luyện và suy luận:
+
+• FP8-AMAX: đây là phương pháp giá trị tuyệt đối tối đa được chi tiết trong Phần 2.3 và trong hàm compute_bias của Hình 1. Việc tính toán diễn ra cho mỗi lớp tuyến tính cho mọi micro batch và mọi bản sao dữ liệu hoặc tensor, theo sơ đồ trong Hình 3b.
+
+• FP8-CSCALE: một chiến lược đơn giản hơn dựa trên việc có cùng độ lệch tỷ lệ cho tất cả trọng số, kích hoạt và gradient. Độ lệch tỷ lệ giữ nguyên trong suốt quá trình huấn luyện và suy luận. Chúng tôi chạy quét các giá trị độ lệch tỷ lệ để tìm những giá trị không làm giảm độ chính xác.
+
+Mặc dù trong bài báo này chúng tôi tập trung vào sự khác biệt về số, đáng chú ý rằng thông lượng tương đối và chi phí bộ nhớ của FP8-AMAX so với FP8-CSCALE phụ thuộc vào phần cứng được sử dụng. Khi sử dụng FP8-AMAX trong phần cứng có SRAM giới hạn, các tensor FP16 trong bộ nhớ cache L2 phải chịu chi phí của một chuyến đi khứ hồi thứ hai đến bộ nhớ: lần đầu để tính toán giá trị tuyệt đối tối đa của tensor, và lần thứ hai để áp dụng tỷ lệ. Chi phí này có thể triệt tiêu tốc độ từ các phép nhân FP8. Một giải pháp có thể là dựa vào lịch sử giá trị tuyệt đối tối đa trong quá khứ thay vì sử dụng giá trị tuyệt đối tối đa just-in-time Nvidia [2022b]. Ngược lại, phần cứng có đủ SRAM có thể tính toán các độ lệch tỷ lệ just-in-time và thực hiện FP8 như chi tiết trong công trình này.
+
+3.1 Suy luận với FP8
+
+Khi thực hiện suy luận, trọng số đến từ checkpoint ở định dạng độ chính xác cao hơn như FP16, BF16 hoặc FP32, hoặc trực tiếp trong FP8 E4. Trong trường hợp trước, việc lượng tử hóa trọng số về FP8 đơn giản hơn so với biểu diễn điểm cố định như INT8, có thể cần huấn luyện nhận biết lượng tử hóa (QAT) thêm vào lượng tử hóa sau huấn luyện (PTQ) [van Baalen et al., 2023]. Đối với FP8, đủ để sử dụng PTQ bao gồm việc áp dụng độ lệch tỷ lệ cho mỗi tensor và sau đó ép kiểu về FP8, như mô tả trong Phần 2.3. Việc tính toán độ lệch tỷ lệ cho trọng số chỉ được thực hiện một lần khi tải checkpoint (xem Hình 2). Trong trường hợp sau, khi checkpoint đến từ huấn luyện trong FP8, trọng số có thể được sử dụng trực tiếp mà không cần lượng tử hóa nào.
+
+3.2 Huấn luyện với FP8
+
+Đối với tiền huấn luyện hoặc tinh chỉnh, chúng ta cần các định dạng FP8 khác nhau cho trọng số/kích hoạt và gradient (xem Phụ lục B và Noune et al. [2022]). Đối với cả hai định dạng, chúng tôi tính toán độ lệch tỷ lệ theo FP8-AMAX hoặc FP8-CSCALE, như được nêu trong mỗi thí nghiệm ở Phần 4. Chúng tôi thực hiện cập nhật trọng số trong FP16 và giữ trọng số chính trong FP16. Việc tính toán độ lệch tỷ lệ cho trọng số và việc ép kiểu trọng số về FP8 E4 diễn ra ngay sau cập nhật trọng số. Khi tích lũy trong FP16, có rủi ro tràn trên khi thực hiện hai phép nhân ma trận của lượt truyền ngược, có đầu vào FP8 E4 và FP8 E5: điều này do FP8 E5 và FP16 có phạm vi động tương tự (xem Bảng 7), và khi sử dụng FP8-AMAX, đầu vào FP8 E5 kết quả cho phép nhân có giá trị gần hơn với số tối đa có thể biểu diễn trong FP16. Do đó, chúng tôi đặt một lề để giảm độ lệch tỷ lệ từ phương pháp FP8-AMAX. Theo kinh nghiệm, chúng tôi quan sát rằng giá trị 3 đủ để ngăn chặn tràn trên. Giá trị tối ưu cho lề này liên quan đến căn bậc hai của kích thước batch [Blake et al., 2023, Yang et al., 2021], trong các thí nghiệm tinh chỉnh của chúng tôi là 512 (xem Phụ lục H). Điều này dẫn đến lề tối ưu log2(√512) = 4.5, gần với giá trị thực nghiệm 3 của chúng tôi.
+
+--- TRANG 7 ---
+Bảng 1: Phân cấp kích thước mô hình GPT và Llama 2 được sử dụng trong các thí nghiệm huấn luyện và xác thực.
+
+Tham số  dmodel  nlayers  nheads  dhead  dffn
+GPT 111M  768  10  12  64  3072
+GPT 590M  1536  18  12  128  6144
+GPT 1.3B  2048  24  16  128  8192
+GPT 6.7B  4096  32  32  128  16384
+GPT 13B  5120  40  40  128  20480
+Llama 2 7B  4096  32  32  128  11008
+Llama 2 70B  8192  80  64  128  28672
+
+4 Thí nghiệm
+
+4.1 Kiến trúc mô hình được sử dụng cho các thí nghiệm
+
+Chúng tôi sử dụng hai loại mô hình transformer decoder ngôn ngữ trong các thí nghiệm. Loại đầu tiên là kiến trúc giống GPT-3 [Brown et al., 2020] với sự khác biệt duy nhất là sử dụng attention dày đặc trong tất cả các khối decoder, thay vì attention dày đặc và sparse-banded. Đối với mô hình này, chúng tôi thử nghiệm năm kích thước mô hình khác nhau (xem Bảng 1). Trong các thí nghiệm tinh chỉnh, chúng tôi sử dụng các checkpoint đã được tiền huấn luyện do Dey et al. [2023] cung cấp. Trong các thí nghiệm suy luận, chúng tôi bắt đầu từ checkpoint đã được tinh chỉnh trong FP16 cho mỗi nhiệm vụ cụ thể. Chúng tôi tập trung vào ba nhiệm vụ GLUE [Wang et al., 2018]: nhiệm vụ suy luận MNLI, nhiệm vụ câu đơn SST-2 và nhiệm vụ tương đồng và paraphrase QQP.
+
+Loại thứ hai của mô hình decoder ngôn ngữ là mô hình Llama 2 được chi tiết trong Touvron et al. [2023]. Những thay đổi chính so với kiến trúc giống GPT-3 là việc chuẩn hóa trước sử dụng RMSNorm, SwiGLU như hàm kích hoạt và rotary positional embeddings. Ngoài ra, phiên bản 70 tỷ tham số sử dụng grouped-query attention. Chúng tôi sử dụng các checkpoint nguồn mở từ các mô hình đã được tiền huấn luyện không được tinh chỉnh cho các trường hợp sử dụng đối화. Chi tiết về 2 kích thước được thử nghiệm trong các thí nghiệm của chúng tôi được hiển thị trong Bảng 1. Chúng tôi tập trung vào sáu benchmark được bao gồm trong Touvron et al. [2023]: MMLU, HellaSwag, ARC-e, ARC-c, PIQA và WinoGrande.
+
+Đối với cả hai kiến trúc, chúng tôi lượng tử hóa các lớp tuyến tính về FP8 trong tất cả các lớp decoder. Chi tiết về các lớp tuyến tính như vậy được hiển thị trong Phụ lục E. Hình 4 hiển thị các thành phần chính của các lớp decoder GPT và Llama và chỉ ra những thành phần được lượng tử hóa về FP8. Chi tiết thêm về siêu tham số và phần cứng để chạy các thí nghiệm được chứa trong Phụ lục H.
+
+4.2 Suy luận FP8 cho mô hình GPT
+
+Chúng tôi so sánh kết quả xác thực sử dụng phương pháp FP8-AMAX và FP8-CSCALE với chuẩn FP16, cho mô hình GPT có kích thước từ 111M đến 13B. Kết quả được hiển thị trong Bảng 2. Với cả hai phương pháp, chúng tôi quản lý để đạt được độ chính xác xác thực FP16 cho tất cả các kích thước.
+
+Đối với phương pháp FP8-CSCALE, chúng tôi chạy quét các độ lệch tỷ lệ. Không phải tất cả các độ lệch tỷ lệ đều đạt được độ chính xác FP16, và trong Bảng 2 chúng tôi báo cáo độ chính xác trung bình thu được với chỉ những giá trị đạt độ chính xác cuối cùng lớn hơn 99,5% giá trị FP16. Khoảng chứa các giá trị hội tụ được hiển thị trong Bảng 3. Đối với các giá trị độ lệch tỷ lệ ngoài các khoảng trong Bảng 3, độ chính xác xác thực giảm đáng kể. Trong Hình 5 ở Phụ lục F, chúng tôi hiển thị so sánh độ chính xác thu được với mỗi độ lệch tỷ lệ trong quét, cho nhiệm vụ MNLI. Ngay khi độ lệch tỷ lệ được chọn không nằm trong khoảng, nó nhanh chóng giảm. Trung bình chúng tôi quan sát rằng khoảng các giá trị độ lệch tỷ lệ hội tụ chứa năm số nguyên tập trung quanh không.
+
+Đối với phương pháp FP8-AMAX, có một độ lệch tỷ lệ khác nhau cho mỗi tensor trọng số và kích hoạt. Để hiểu cách các độ lệch tỷ lệ khác nhau thay đổi tùy thuộc vào lớp decoder và loại lớp tuyến tính, chúng tôi vẽ biểu đồ phân bố của chúng trong Hình 6 cho các mô hình 111M, 1.3B và 6.7B tham số. Người đọc có thể tìm thấy chi tiết về cách Hình 6 được tạo trong Phụ lục G, cùng với một số hiểu biết về phân bố độ lệch tỷ lệ.
+
+--- TRANG 8 ---
+Bảng 2: Kết quả suy luận: độ chính xác xác thực so sánh FP16 với FP8-AMAX và FP8-CSCALE, cho các kích thước mô hình GPT khác nhau.
+
+Mô hình  Lượng tử hóa  MNLI  QQP  SST-2
+111M  FP16  72.61  85.76  84.26
+  FP8-AMAX  72.39  85.78  84.38
+  FP8-CSCALE  72.49  85.73  84.59
+590M  FP16  78.59  88.40  90.63
+  FP8-AMAX  78.44  88.37  90.63
+  FP8-CSCALE  78.56  88.40  90.54
+1.3B  FP16  82.82  89.43  91.55
+  FP8-AMAX  82.68  89.42  91.44
+  FP8-CSCALE  82.72  89.36  91.42
+6.7B  FP16  87.17  91.19  94.50
+  FP8-AMAX  87.15  91.22  94.38
+  FP8-CSCALE  87.18  91.18  94.48
+13B  FP16  88.26  91.22  94.61
+  FP8-AMAX  88.27  91.21  94.61
+  FP8-CSCALE  88.26  91.20  94.50
+
+Bảng 3: Kết quả suy luận với FP8-CSCALE: phạm vi của độ lệch tỷ lệ đạt được độ chính xác xác thực lớn hơn 99,5% giá trị FP16, khi thực hiện xác thực FP8 với FP8-CSCALE. Cả trọng số và kích hoạt trong tất cả các lớp decoder chia sẻ cùng độ lệch tỷ lệ.
+
+Mô hình  MNLI  QQP  SST-2
+111M  [-3, 2]  [-4, 2]  [-4, 2]
+590M  [-3, 2]  [-4, 2]  [-1, 2]
+1.3B  [-3, 3]  [-4, 2]  [-3, 2]
+6.7B  [-3, 2]  [-3, 2]  [-3, 2]
+13B  [-3, 2]  [-4, 2]  [-4, 2]
+
+Bảng 4: Kết quả suy luận của Llama 2. Để đánh giá, chúng tôi tuân theo Touvron et al. [2023], thực hiện đánh giá 5-shot cho MMLU và 0-shot cho HellaSwag, ARC-e, ARC-c, PIQA và WinoGrande. Đối với WinoGrande, chúng tôi báo cáo độ chính xác và đối với MMLU, HellaSwag, ARC-e, ARC-c và PIQA là độ chính xác chuẩn hóa, có tính đến độ dài của mỗi câu trả lời có thể.
+
+Mô hình  Lượng tử hóa  MMLU  HellaSwag  ARC-e  ARC-c  PIQA  WinoGrande
+7B  Llama 2 paper  45.3  77.2  75.2  45.9  78.8  69.2
+  FP16  46.6  76.0  74.6  46.3  79.1  69.1
+  FP8-AMAX  46.3  75.8  74.5  45.7  78.7  69.1
+70B  Llama 2 paper  68.9  85.3  80.2  57.4  82.8  80.2
+  FP16  69.6  83.8  81.1  57.3  82.8  78.0
+  FP8-AMAX  69.3  83.8  80.9  57.7  82.6  78.5
+
+4.3 Suy luận few-shot FP8 cho mô hình Llama 2
+
+Chúng tôi chạy sáu benchmark đánh giá trong Touvron et al. [2023] với cả FP16 và FP8-AMAX, cho các kích thước mô hình 7B và 70B tham số. Đối với các benchmark, chúng tôi sử dụng Thư viện Evaluation Harness của Eleuther [Gao et al., 2021]. Kết quả được hiển thị trong Bảng 4. Chúng tôi thấy rằng việc lượng tử hóa FP16 và FP8-AMAX cho kết quả tương đương. Đối với một số benchmark như HellaSwag có một số khác biệt so với kết quả được công bố trong Touvron et al. [2023], chúng tôi cho rằng điều này do các tác giả sử dụng thư viện đánh giá nội bộ khác với Gao et al. [2021]. Chúng tôi đã kiểm tra điều này bằng cách so sánh kết quả benchmark của harness trong FP32 chạy trên CPU với những kết quả thu được với FP16 và xác nhận rằng các metric thu được là giống hệt nhau.
+
+4.4 FP8-CSCALE có đủ để huấn luyện trong FP8?
+
+Chạy quét các giá trị tỷ lệ mất mát là một thực tiễn phổ biến để huấn luyện các mô hình trong FP16. Khi kích thước của mô hình tăng, người ta thường cần tăng giá trị tỷ lệ mất mát. Mặc dù tồn tại các phương pháp tinh vi hơn để cập nhật tỷ lệ mất mát trong quá trình huấn luyện [Perez, 2022, Kuchaiev et al., 2018], các nhà thực hành vẫn chạy quét các giá trị tỷ lệ mất mát cho đến khi tìm thấy giá trị hội tụ.
+
+--- TRANG 9 ---
+Bảng 5: Kết quả tinh chỉnh: độ chính xác xác thực sau khi tinh chỉnh trong FP16 và FP8-AMAX trong 3 epoch.
+
+Mô hình  Lượng tử hóa  MNLI  QQP  SST-2
+111M  FP16  72.61  85.32  85.07
+  FP8-AMAX  72.50  85.84  85.57
+590M  FP16  78.59  88.25  89.27
+  FP8-AMAX  79.12  88.31  89.00
+1.3B  FP16  82.82  89.32  91.36
+  FP8-AMAX  82.58  89.32  91.28
+6.7B  FP16  87.17  91.19  94.53
+  FP8-AMAX  87.26  91.06  94.84
+13B  FP16  88.26  91.22  94.61
+  FP8-AMAX  88.28  91.53  94.50
+
+Bảng 6: Kết quả tinh chỉnh với FP8-CSCALE: phạm vi của độ lệch tỷ lệ đạt được độ chính xác xác thực lớn hơn 99,5% giá trị FP16, khi thực hiện tinh chỉnh FP8 với FP8-CSCALE. Trọng số, kích hoạt và gradient trong tất cả các lớp decoder chia sẻ cùng độ lệch tỷ lệ.
+
+Mô hình  MNLI
+111M  [-3, 2]
+590M  [-2, 2]
+1.3B  [-2, 1]
+6.7B  [-1, 1]
+13B  [-1, 0]
+
+Lấy cảm hứng từ thực tiễn này, chúng tôi nhằm hiểu liệu phương pháp FP8-CSCALE có thể hội tụ đến độ chính xác yêu cầu hay không. Để làm điều đó, chúng tôi chạy quét các giá trị và để việc tinh chỉnh cho nhiệm vụ MNLI hoàn thành ba epoch cho các mô hình nhỏ hơn lên đến 1.3B và 1 epoch cho 6.7B và 13B. Sau đó chúng tôi kiểm tra xem độ chính xác xác thực có khớp với tinh chỉnh FP16 tham chiếu hay không.
+
+Kết quả của chúng tôi được tóm tắt trong Bảng 6. Chúng tôi có thể hội tụ đến độ chính xác xác thực ít nhất 99,5% của tham chiếu FP16 cho tất cả các kích thước mô hình, nhưng khi kích thước tăng, phạm vi các độ lệch tỷ lệ hội tụ bị giảm. Đối với các kích thước mô hình lớn hơn 6.7B và 13B, chúng tôi quan sát rằng sự hội tụ không phải lúc nào cũng được đảm bảo ngay cả trong các khoảng trong Bảng 6: ví dụ, một seed khác có thể dẫn đến phân kỳ. Những kết quả này cho thấy rằng FP8-AMAX là một chiến lược mạnh mẽ hơn khi tinh chỉnh trong FP8 so với FP8-CSCALE, mặc dù sự hội tụ với FP8-CSCALE có thể khả thi.
+
+4.5 Kết quả tinh chỉnh FP8 cho mô hình GPT
+
+Sau khi thử nghiệm FP8-CSCALE, chúng tôi sử dụng phương pháp FP8-AMAX để tinh chỉnh các mô hình GPT cho các kích thước từ 111M đến 13B. Với FP8-AMAX, chúng tôi có thể hội tụ tốt cho tất cả các kích thước được thử nghiệm và ba nhiệm vụ GLUE khác nhau của MNLI, QQP và SST-2, khi so sánh với độ chính xác xác thực đạt được trong FP16. Kết quả được hiển thị trong Bảng 5. Sự phát triển hàm mất mát cũng hội tụ tương tự khi so sánh FP8-AMAX và FP16. Các biểu đồ hàm mất mát cho nhiệm vụ MNLI được hiển thị trong Hình 10 trong Phụ lục J.
+
+Trong Phụ lục I, chúng tôi cung cấp các biểu đồ và phân tích về cách các độ lệch tỷ lệ phát triển khi việc tinh chỉnh tiến triển, cho các kích thước mô hình 111M, 1.3B và 6.7B. Kiểm tra các tỷ lệ cho từng tensor từ FP8-AMAX hữu ích để làm sáng tỏ tại sao chiến lược FP8-CSCALE trong Phần 4.4 không mạnh mẽ đối với các mô hình lớn. Nó cũng cung cấp hiểu biết về tần suất cập nhật cần thiết nếu người ta muốn tiết kiệm một số tính toán bổ sung cần thiết để cập nhật độ lệch tỷ lệ với FP8-AMAX.
+
+5 Kết luận
+
+Chúng tôi cung cấp các chi tiết kỹ thuật cho các nhà thực hành quan tâm đến việc tận dụng lượng tử hóa FP8 để sử dụng hiệu quả cho suy luận và huấn luyện. Chúng tôi cho thấy rằng phương pháp của chúng tôi có thể điều chỉnh các độ lệch tỷ lệ để ngăn chặn tràn dưới hoặc tràn trên từ định dạng FP8 và khớp với kết quả tham chiếu thu được ở độ chính xác cao hơn, cho các mô hình ngôn ngữ lớn như GPT và Llama lên đến 70B tham số.
+
+Trong công trình này, chúng tôi đã tập trung vào việc lượng tử hóa các lớp tuyến tính về FP8, nhưng còn có các lớp khác có mặt khắp nơi trong hầu hết các kiến trúc transformer có thể hưởng lợi từ lượng tử hóa FP8, như dot-product attention. Chúng tôi sẽ khám phá những lớp đó trong các công trình tương lai, cũng như ứng dụng của FP8 trong các mô hình khác không thuộc họ kiến trúc transformer, chẳng hạn như mạng nơ-ron đồ thị hoặc các mô hình thị giác máy tính dựa trên các lớp tích chập.
+
+--- TRANG 10 ---
+Lời cảm ơn
+
+Chúng tôi muốn cảm ơn những người sau đây vì những đóng góp của họ cho bài báo ở các giai đoạn phát triển khác nhau: Matthew Haddock, Shiraz Butt, Artemiy Bulavin, Mark Kattenbelt, Godfrey Da Costa, Jake Hall, Tim Poole, Douglas Orr, Graham Horn, Ian Hales, Sylvain Viguier, Anjlee Gopiani, Arsalan Uddin và Manuele Sigona.
+
+Tài liệu tham khảo
+
+A. Ahmadian, S. Dash, H. Chen, B. Venkitesh, S. Gou, P. Blunsom, A. Üstün, và S. Hooker. Intriguing properties of quantization at scale. arXiv preprint arXiv:2305.19268, 2023.
+
+C. Blake, D. Orr, và C. Luschi. Unit scaling: Out-of-the-box low-precision training. arXiv preprint arXiv:2303.11257, 2023.
+
+Y. Bondarenko, M. Nagel, và T. Blankevoort. Understanding and overcoming the challenges of efficient transformer quantization. arXiv preprint arXiv:2109.12948, 2021.
+
+Y. Bondarenko, M. Nagel, và T. Blankevoort. Quantizable transformers: Removing outliers by helping attention heads do nothing. arXiv preprint arXiv:2306.12929, 2023.
+
+T. Brown, B. Mann, N. Ryder, M. Subbiah, J. D. Kaplan, P. Dhariwal, A. Neelakantan, P. Shyam, G. Sastry, A. Askell, et al. Language models are few-shot learners. Advances in neural information processing systems, 33:1877–1901, 2020.
+
+C. Chen. Transformer inference arithmetic, 2022. URL https://kipp.ly/blog/transformer-inference-arithmetic/. (Trực tuyến: truy cập ngày 28 tháng 9 năm 2023).
+
+T. Dettmers và L. Zettlemoyer. The case for 4-bit precision: k-bit inference scaling laws. https://arxiv.org/abs/2212.09720, 2022.
+
+T. Dettmers, M. Lewis, Y. Belkada, và L. Zettlemoyer. Llm. int8(): 8-bit matrix multiplication for transformers at scale. arXiv preprint arXiv:2208.07339, 2022.
+
+N. Dey, G. Gosal, H. Khachane, W. Marshall, R. Pathria, M. Tom, J. Hestness, et al. Cerebras-gpt: Open compute-optimal language models trained on the cerebras wafer-scale cluster. arXiv preprint arXiv:2304.03208, 2023.
+
+E. Frantar, S. Ashkboos, T. Hoefler, và D. Alistarh. Gptq: Accurate post-training quantization for generative pre-trained transformers. arXiv preprint arXiv:2210.17323, 2022.
+
+L. Gao, J. Tow, S. Biderman, S. Black, A. DiPofi, C. Foster, L. Golding, J. Hsu, K. McDonell, N. Muennighoff, J. Phang, L. Reynolds, E. Tang, A. Thite, B. Wang, K. Wang, và A. Zou. A framework for few-shot language model evaluation, Tháng 9 năm 2021. URL https://doi.org/10.5281/zenodo.5371628.
+
+Graphcore. Bow-2000 ipu-machine datasheet, 2022a. URL https://docs.graphcore.ai/projects/bow-2000-datasheet/en/latest/index.html#bow-2000-ipu-machine-datasheet. (Trực tuyến: truy cập ngày 28 tháng 9 năm 2023).
+
+Graphcore. Graphcore tile vertex isa release 1.3.1 ipu21, 2022b. URL https://docs.graphcore.ai/projects/isa/en/latest/_static/TileVertexISA-IPU21-1.3.1.pdf. (Trực tuyến: truy cập ngày 28 tháng 9 năm 2023).
+
+C. S. IEEE. Ieee standard for floating-point arithmetic, 2019. Trang 1-84.
+
+Z. Jia, B. Tillman, M. Maggioni, và D. P. Scarpazza. Dissecting the graphcore ipu architecture via microbenchmarking. arXiv preprint arXiv:1912.03413, 2019.
+
+D. Kalamkar, D. Mudigere, N. Mellempudi, D. Das, K. Banerjee, S. Avancha, D. T. Voothuri, N. Jammalamadaka, J. Huang, H. Yuen, et al. A study of bfloat16 for deep learning training. arXiv preprint arXiv:1905.12322, 2019.
+
+O. Kuchaiev, B. Ginsburg, I. Gitman, V. Lavrukhin, J. Li, H. Nguyen, C. Case, và P. Micikevicius. Mixed-precision training for nlp and speech recognition with openseq2seq. arXiv preprint arXiv:1805.10387, 2018.
+
+A. Kuzmin, M. Van Baalen, Y. Ren, M. Nagel, J. Peters, và T. Blankevoort. Fp8 quantization: The power of the exponent. arXiv preprint arXiv:2208.09225, 2022.
+
+--- TRANG 11 ---
+I. Loshchilov và F. Hutter. Decoupled weight decay regularization. arXiv preprint arXiv:1711.05101, 2017.
+
+P. Micikevicius, S. Narang, J. Alben, G. Diamos, E. Elsen, D. Garcia, B. Ginsburg, M. Houston, O. Kuchaiev, G. Venkatesh, et al. Mixed precision training. arXiv preprint arXiv:1710.03740, 2017.
+
+P. Micikevicius, D. Stosic, N. Burgess, M. Cornea, P. Dubey, R. Grisenthwaite, S. Ha, A. Heinecke, P. Judd, J. Kamalu, et al. Fp8 formats for deep learning. arXiv preprint arXiv:2209.05433, 2022.
+
+B. Noune, P. Jones, D. Justus, D. Masters, và C. Luschi. 8-bit numerical formats for deep neural networks. arXiv preprint arXiv:2206.02915, 2022.
+
+Nvidia. Nvidia h100 tensor core gpu architecture, 2022a. URL https://resources.nvidia.com/en-us-tensor-core. (Trực tuyến: truy cập ngày 28 tháng 9 năm 2023).
+
+Nvidia. Transformer engine. https://github.com/NVIDIA/TransformerEngine, 2022b. (Trực tuyến: truy cập ngày 28 tháng 9 năm 2023).
+
+I. W. G. P3109. Interim report on 8-bit binary floating-point formats. https://github.com/P3109/Public/tree/main/Shared%20Reports, 2023. (Trực tuyến: truy cập ngày 28 tháng 9 năm 2023).
+
+S. P. Perez. Training large models more stably with automatic loss scaling, 2022. URL https://www.graphcore.ai/posts/training-large-models-more-stably-with-automatic-loss-scaling. (Trực tuyến: truy cập ngày 28 tháng 9 năm 2023).
+
+R. Pope, S. Douglas, A. Chowdhery, J. Devlin, J. Bradbury, J. Heek, K. Xiao, S. Agrawal, và J. Dean. Efficiently scaling transformer inference. Proceedings of Machine Learning and Systems, 5, 2023.
+
+J. W. Rae, S. Borgeaud, T. Cai, K. Millican, J. Hoffmann, F. Song, J. Aslanides, S. Henderson, R. Ring, S. Young, et al. Scaling language models: Methods, analysis & insights from training gopher. arXiv preprint arXiv:2112.11446, 2021.
+
+A. Sanger. Why gpt-3.5 is (mostly) cheaper than llama 2, 2023. URL https://www.cursor.so/blog/llama-inference. (Trực tuyến: truy cập ngày 28 tháng 9 năm 2023).
+
+T. L. Scao, A. Fan, C. Akiki, E. Pavlick, S. Ilić, D. Hesslow, R. Castagné, A. S. Luccioni, F. Yvon, M. Gallé, et al. Bloom: A 176b-parameter open-access multilingual language model. arXiv preprint arXiv:2211.05100, 2022.
+
+Tesla. A guide to tesla's configurable floating point formats & arithmetic. https://tesla-cdn.thron.com/static/MXMU3S_tesla-dojo-technology_1WDVZN.pdf, 2021. (Trực tuyến: truy cập ngày 28 tháng 9 năm 2023).
+
+H. Touvron, L. Martin, K. Stone, P. Albert, A. Almahairi, Y. Babaei, N. Bashlykov, S. Batra, P. Bhargava, S. Bhosale, et al. Llama 2: Open foundation and fine-tuned chat models. arXiv preprint arXiv:2307.09288, 2023.
+
+M. van Baalen, A. Kuzmin, S. S. Nair, Y. Ren, E. Mahurin, C. Patel, S. Subramanian, S. Lee, M. Nagel, J. Soriaga, và T. Blankevoort. Fp8 versus int8 for efficient deep learning inference, 2023.
+
+A. Wang, A. Singh, J. Michael, F. Hill, O. Levy, và S. R. Bowman. Glue: A multi-task benchmark and analysis platform for natural language understanding. arXiv preprint arXiv:1804.07461, 2018.
+
+G. Xiao, J. Lin, M. Seznec, H. Wu, J. Demouth, và S. Han. Smoothquant: Accurate and efficient post-training quantization for large language models. In International Conference on Machine Learning, trang 38087–38099. PMLR, 2023.
+
+G. Yang, E. Hu, I. Babuschkin, S. Sidor, X. Liu, D. Farhi, N. Ryder, J. Pachocki, W. Chen, và J. Gao. Tuning large neural networks via zero-shot hyperparameter transfer. Advances in Neural Information Processing Systems, 34:17084–17097, 2021.
+
+S. Zhang, S. Roller, N. Goyal, M. Artetxe, M. Chen, S. Chen, C. Dewan, M. Diab, X. Li, X. V. Lin, et al. Opt: Open pre-trained transformer language models. arXiv preprint arXiv:2205.01068, 2022.
+
+--- TRANG 12 ---
+A Các định dạng số thực dấu phẩy động trong học sâu
+
+Quy ước định dạng số thực dấu phẩy động được định nghĩa bởi tiêu chuẩn IEEE 754 [IEEE, 2019]. Có một số định nghĩa về các định dạng số thực dấu phẩy động, khác nhau về tổng số bit để biểu diễn chúng và cách các bit được phân bố giữa các bit số mũ (E) và các bit mantissa (M). Công thức tổng quát cho một giá trị số thực dấu phẩy động là
+
+giá trị = (-1)^dấu × 2^số_mũ × mantissa, (4)
+
+trong đó dấu ∈ {0,1} là bit dấu, số_mũ = bexp - bias với bexp là một chuỗi bit có E bit và bias = 2^(E-1) - 1, và mantissa = 1 + ∑(i=0 đến M) di*2^(-i) với di ∈ {0,1}. Cũng tồn tại một số giá trị đặc biệt được biểu diễn bởi các chuỗi bit không tuân theo cách diễn giải ở trên. Đó là vô cực, NaN (không phải số) và các số dưới chuẩn để biểu diễn các giá trị tuyệt đối nhỏ hơn nữa.
+
+Các định dạng số thực dấu phẩy động thông thường được sử dụng trong học sâu được so sánh trong Bảng 7. Số bit tổng cộng trong mỗi định dạng bằng tổng của bit dấu (luôn là 1), E và M. Trong khi nhiều ứng dụng trong tính toán khoa học yêu cầu ít nhất độ chính xác kép (tức là FP64) để bảo toàn độ chính xác, trong học sâu đủ để sử dụng độ chính xác đơn (tức là FP32). Tuy nhiên, các định dạng sử dụng ít bit hơn đã nhận được nhiều sự chú ý do triển vọng tăng số phép toán trên mỗi chu kỳ, giảm bộ nhớ để lưu trữ trọng số, kích hoạt hoặc gradient và giảm bớt các ràng buộc về băng thông.
+
+Đồng thời, số bit thấp hơn có thể ảnh hưởng đến độ chính xác số và phạm vi động. Chúng tôi ký hiệu bằng "độ chính xác thấp" tất cả các định dạng số có ít hơn 32 bit. Lý do chính các định dạng độ chính xác thấp có thể làm giảm hiệu suất là do phạm vi động giảm của chúng. Trong khi FP32 có thể biểu diễn các giá trị bình thường xấp xỉ trong khoảng [2^(-126), 2^128], phạm vi cho FP16 giảm xuống khoảng [2^(-14), 2^16]. Có phạm vi động hẹp hơn đã được chứng minh là có hại, đặc biệt khi biểu diễn gradient, thường thể hiện phân bố rộng hơn so với trọng số và kích hoạt. Ngoài ra, gradient có các giá trị thấp hơn bị tràn dưới (tức là chúng thấp hơn số tối thiểu có thể biểu diễn trong FP16), dẫn đến tín hiệu giảm cho việc cập nhật trọng số vì độ lớn thực của gradient bị cắt về không. Một vấn đề tương tự có thể xảy ra nếu các giá trị lớn hơn số tối đa có thể biểu diễn, dẫn đến tràn trên thường được giải quyết bằng cách cắt giá trị đến số tối đa đó. Để ngăn chặn tràn dưới hoặc tràn trên của gradient, một chiến lược phổ biến là sử dụng tỷ lệ mất mát [Micikevicius et al., 2017], với các biến thể tự động để điều chỉnh tỷ lệ mất mát trong quá trình huấn luyện [Noune et al., 2022, Perez, 2022].
+
+Bảng 7: So sánh các định dạng số thực dấu phẩy động được sử dụng trong học sâu. E ký hiệu số bit số mũ, M số bit mantissa của một định dạng cho trước, và Max exp. và Min exp. là các giá trị tối đa và tối thiểu có thể được biểu diễn bởi số mũ, loại trừ các giá trị đặc biệt. E5 (a) và E4 (a) ký hiệu các định dạng FP8 được giới thiệu trong Noune et al. [2022], trong khi E5 (b) và E4 (b) được giới thiệu trong Micikevicius et al. [2022].
+
+Định dạng  E  M  Max exp.  Min exp.  Max normal  Min subnormal  bias
+FP32  8  23  127  -126  3.4×10^38  1.4×10^(-45)  127
+FP16  5  10  15  -14  65504  6.0×10^(-8)  15
+BF16  8  7  127  -126  3.4×10^38  9.2×10^(-41)  127
+FP8 E5 (a)  5  2  15  -15  57344  7.6×10^(-6)  16
+FP8 E5 (b)  5  2  15  -14  57344  1.5×10^(-5)  15
+FP8 E4 (a)  4  3  7  -7  240  9.8×10^(-4)  8
+FP8 E4 (b)  4  3  8  -6  448  2.0×10^(-3)  7
+
+Do phạm vi động ngắn hơn này của FP16, các nhà thực hành học sâu đã thiết kế định dạng BF16 để giữ số bit số mũ của FP32, do đó duy trì phạm vi động lớn hơn. Mặc dù điều này đã được chứng minh là có lợi để tránh việc điều chỉnh tỷ lệ mất mát, một số công trình như Gopher [Rae et al., 2021] đã cho thấy rằng BF16 làm giảm hiệu suất so với FP32, ngay cả khi bổ sung các kỹ thuật như làm tròn ngẫu nhiên. Điều này do số bit mantissa thấp hơn so với FP16.
+
+--- TRANG 13 ---
+B Các định dạng số thực dấu phẩy động 8-bit
+
+Tiêu chuẩn IEEE định nghĩa nhiều định dạng số thực dấu phẩy động với độ rộng bit khác nhau, từ FP256 đến FP16. Các đề xuất gần đây đã được đưa ra cho các định dạng FP8, chủ yếu cho mục đích học máy. Những đề xuất đáng chú ý nhất là Noune et al. [2022] và Micikevicius et al. [2022] (các đề xuất bổ sung bao gồm Tesla [2021], Kuzmin et al. [2022]). Việc tiêu chuẩn hóa định dạng FP8 đang được phát triển tích cực bởi một nhóm làm việc IEEE, với một báo cáo tạm thời được công bố gần đây P3109 [2023].
+
+Cả hai đề xuất trong Noune et al. [2022] và Micikevicius et al. [2022] đều độc lập khuyến nghị sử dụng hai định dạng FP8 khác nhau. Đối với gradient, phạm vi được cung cấp bởi năm bit số mũ là cần thiết, thúc đẩy việc sử dụng định dạng E5 (5 bit số mũ, 2 bit mantissa). Ngược lại, đối với kích hoạt và trọng số, cần ít nhất 3 bit mantissa để duy trì độ chính xác số, thúc đẩy việc sử dụng định dạng E4.
+
+Định dạng E5 của Micikevicius et al. [2022] tuân theo sơ đồ số thực dấu phẩy động IEEE thông thường. Do các hạn chế về phạm vi do có quá ít bit, đối với định dạng E4 họ điều chỉnh các biểu diễn giá trị đặc biệt, gán một codeword ±NaN/inf duy nhất cho chuỗi bit chứa tất cả số 1 trong số mũ và mantissa, với tất cả các chuỗi bit khác hiện là các giá trị hợp lệ. Noune et al. [2022] áp dụng một phương pháp tương tự, nhưng thay vào đó sử dụng mã hóa số không âm để biểu diễn giá trị NaN/inf duy nhất.
+
+Các định dạng này cũng khác nhau bởi các giá trị bias mặc định của chúng. Chi tiết thêm có thể tìm thấy trong Bảng 7.
+
+Noune et al. [2022] và Micikevicius et al. [2022] trình bày các định dạng FP8 của họ như bao gồm một giá trị bias bổ sung do người dùng định nghĩa, hoạt động theo cách tương tự như bias tiêu chuẩn IEEE 754. Điều này tương tự như việc nhân tensor với một giá trị tỷ lệ là lũy thừa của hai. Cả hai cách diễn giải đều được sử dụng trong tài liệu, mặc dù trong thực tế quan điểm bias ánh xạ tốt hơn với giao diện thường được cung cấp bởi phần cứng.
+
+Trong bài báo này, nếu không được nêu khác, chúng tôi giả định các định dạng của Noune et al. [2022] khi đề cập đến FP8 và cho mục đích thực nghiệm. Trong thực tế, các định dạng này đủ tương tự để sự khác biệt trong sử dụng có thể là tối thiểu.
+
+Lưu ý rằng Noune et al. [2022] và Micikevicius et al. [2022] giả định một chế độ huấn luyện độ chính xác hỗn hợp, trong đó FP8 chỉ được sử dụng cho phép nhân ma trận. Nói cách khác, các giá trị được lưu trữ và tích lũy ở độ chính xác cao hơn, với việc ép kiểu về FP8 được thực hiện ngay trước phép nhân ma trận, bản thân chúng xuất ra ở độ chính xác cao hơn. Mức độ FP8 có thể được sử dụng rộng rãi hơn vẫn là một câu hỏi mở.
+
+C Lợi ích của FP8 so với INT8 cho học sâu
+
+Định dạng 8-bit phổ biến nhất hiện được sử dụng trong học máy là định dạng INT8, thường được sử dụng để tăng tốc suy luận. Phép tính INT8 gia tốc đã được hỗ trợ bởi các thế hệ phần cứng AI trước đây, cho phép người dùng cải thiện độ trễ và thông lượng của các ứng dụng của họ tại thời điểm suy luận bằng cách lượng tử hóa các giá trị (đặc biệt là trọng số) về INT8. Tuy nhiên, quá trình này đôi khi có thể yêu cầu các thủ thuật bổ sung để duy trì độ chính xác [Dettmers et al., 2022, Xiao et al., 2023], liên quan đến các sơ đồ tỷ lệ phức tạp.
+
+Từ góc độ lý thuyết, FP8 có một số lợi thế so với INT8 cho học sâu, mà chúng tôi phác thảo dưới đây. Với việc giới thiệu phần cứng cung cấp phép tính FP8 gia tốc, FP8 có tiềm năng thay thế việc sử dụng INT8 cho nhiều khối lượng công việc suy luận, cũng như mở ra khả năng huấn luyện 8-bit (thường được coi là không khả thi đối với INT8).
+
+C.1 Phân bố giá trị cho định dạng số nguyên so với số thực dấu phẩy động
+
+Các định dạng số nguyên phân bố các giá trị của chúng đều đặn trên phạm vi có thể biểu diễn, trong khi các định dạng số thực dấu phẩy động có các giá trị cách nhau theo cấp số nhân. Một hàm ý của điều này, như được mô tả toán học bởi Noune et al. [2022], là khi lượng tử hóa các giá trị được rút ra từ phân bố chuẩn đơn vị, các định dạng số thực dấu phẩy động có SNR (tỷ lệ tín hiệu trên nhiễu) cao và gần như không đổi trong phạm vi động của chúng, trong khi các định dạng số nguyên chỉ có một vùng hẹp với SNR đủ cao. Hiện tượng này được mô tả trực quan trong các biểu đồ SNR trong [Blake et al., 2023, Hình A.1.].
+
+--- TRANG 14 ---
+Trong thực tế, điều này có nghĩa là khi sử dụng các định dạng số thực dấu phẩy động, các tensor có thể được tỷ lệ hóa bởi một yếu tố hằng số tùy ý và không có thay đổi nào trong độ chính xác tương đối của biểu diễn xảy ra (miễn là các giá trị vẫn nằm trong phạm vi có thể biểu diễn của định dạng). Đây là một tính chất hữu ích cho các mô hình học sâu nơi các phép biến đổi nhân như vậy là phổ biến. Ngược lại, đối với các định dạng số nguyên, các giá trị nhỏ hơn trong phạm vi có thể biểu diễn trở nên ngày càng không chính xác.
+
+C.2 Hàm ý cho suy luận
+
+Đối với hầu hết các kịch bản, FP8 cung cấp độ chính xác tốt như độ chính xác đầy đủ, với cùng thông lượng như INT8 (giả sử phần cứng cung cấp cùng thông lượng cho FP8 và INT8, như trong Nvidia [2022a]) và dễ sử dụng hơn trong thực tế. Các sơ đồ FP8 được đề xuất của chúng tôi cũng đơn giản hơn đáng kể so với loại phương pháp cần thiết để đạt được độ chính xác INT8 đầy đủ cho các mô hình lớn nhất [Dettmers et al., 2022, Xiao et al., 2023]. Ngoài ra, nếu một mô hình đã được tiền huấn luyện hoặc tinh chỉnh trong suy luận FP8, suy luận có thể được đơn giản hóa thêm bằng cách sử dụng các tỷ lệ được tìm thấy ở cuối quá trình huấn luyện.
+
+Mặc dù độ chính xác FP8 và INT8 tương đương, có một số ít kết quả trong tài liệu mà sự suy giảm FP8 đáng chú ý và không thể bỏ qua, chẳng hạn như trong MobileNetV2 [Micikevicius et al., 2022, Kuzmin et al., 2022]. Điều này có thể là do độ chính xác số thấp được cung cấp bởi FP8. van Baalen et al. [2023] cho thấy rằng khi sử dụng trọng số cố định, các định dạng số nguyên có thể chính xác hơn một chút về mặt số so với các định dạng số thực dấu phẩy động, trong trường hợp đó INT8 có thể giúp thu hẹp khoảng cách ở đây. Tuy nhiên, trong hầu hết các ứng dụng, độ chính xác số bổ sung này không hữu ích vì FP8 đã đạt được độ chính xác nhiệm vụ đầy đủ, và INT8 đi kèm với chi phí phức tạp như đã nêu ở trên.
+
+C.3 Hàm ý cho huấn luyện
+
+Lượng tử hóa cho huấn luyện là một vấn đề khó hơn so với suy luận vì hai lý do. Thứ nhất, lượt truyền ngược phải được biểu diễn cũng như lượt truyền xuôi, tạo ra một tập hợp tensor thứ hai cần được lượng tử hóa thường yêu cầu một tỷ lệ khác. Thứ hai, phân bố của các tensor trọng số, kích hoạt và gradient thay đổi do các cập nhật gradient, điều này không xảy ra đối với suy luận. Không có gì đảm bảo rằng sự lựa chọn thích hợp của các định dạng và tỷ lệ cho một điểm trong huấn luyện sẽ đủ cho điểm khác.
+
+Phạm vi hẹp mà các định dạng số nguyên có SNR cao có nghĩa là lượng tử hóa số nguyên yêu cầu tỷ lệ cẩn thận dựa trên phân bố các giá trị cần được lượng tử hóa. Do những phân bố này không ổn định trong quá trình huấn luyện, việc huấn luyện với các định dạng số nguyên thường được coi là cấm đoán, vì các tỷ lệ sẽ phải được tính toán lại thường xuyên. Tính không ổn định này được chứng minh bởi Noune et al. [2022], Kuzmin et al. [2022] trong bối cảnh huấn luyện FP8, nơi SNR gần như đồng đều của các định dạng số thực dấu phẩy động được cho thấy cho phép huấn luyện FP8 hiệu quả ngay cả khi tỷ lệ của các tensor thay đổi theo thời gian.
+
+Vấn đề phải lượng tử hóa các tensor gradient về FP8 cũng được giảm thiểu bởi thực tế rằng định dạng FP8 E5 được sử dụng trong lượt truyền ngược có phạm vi động lớn hơn định dạng E4 được sử dụng trong lượt truyền xuôi. Gradient thường sử dụng một phạm vi giá trị rộng hơn so với kích hoạt [Noune et al., 2022, Phụ lục D], làm cho chúng không phù hợp với các định dạng số nguyên, nhưng được biểu diễn tốt bởi FP8 E5.
+
+D Những thách thức của lượng tử hóa FP8 ở quy mô lớn
+
+Đã được quan sát khi huấn luyện các mô hình ngôn ngữ lớn rằng lượng tử hóa sau huấn luyện trở nên ngày càng thách thức khi quy mô mô hình tăng, do sự hiện diện của các ngoại lệ xuất hiện. Những điều này được định nghĩa là các chiều chuỗi [Bondarenko et al., 2021] hoặc các chiều đặc trưng [Dettmers et al., 2022] trong đó các giá trị có độ lớn lớn có xu hướng tập trung; một hiện tượng phát triển khi quy mô mô hình tăng. Đã được cho thấy rằng lượng tử hóa INT8 ngây thơ khi có mặt các ngoại lệ này làm giảm đáng kể độ chính xác, và nhiều kỹ thuật khác nhau đã được đưa ra để phá vỡ vấn đề này, thường phát sinh các chi phí bổ sung [Bondarenko et al., 2021, Dettmers et al., 2022, Frantar et al., 2022, Xiao et al., 2023].
+
+Vì những lý do được nêu trong Phụ lục C, các đặc trưng ngoại lệ tạo ra một vấn đề đặc biệt cho các định dạng số nguyên, nơi chỉ một phần nhỏ của phạm vi số của định dạng có SNR cao cho các giá trị phân bố chuẩn. Khi tỷ lệ hóa khi có mặt các ngoại lệ, người ta thường có thể biểu diễn tốt hoặc các ngoại lệ hoặc các giá trị thông thường với các định dạng số nguyên, không phải cả hai. Ngược lại, phân bố mũ của các giá trị trong các định dạng số thực dấu phẩy động tự nhiên phù hợp để biểu diễn các ngoại lệ.
+
+[Blake et al., 2023, Phụ lục D] mô hình một kịch bản nơi một tensor với các giá trị ngoại lệ được lượng tử hóa trong cả INT8 và FP8, chứng minh một biểu diễn chính xác hơn đáng kể (SNR cao hơn 635 lần) trong FP8 so với INT8. Điều này không loại trừ khả năng rằng các giá trị ngoại lệ đủ lớn cũng có thể gây ra vấn đề cho phạm vi được cung cấp bởi các định dạng FP8, nhưng chỉ ra rằng các định dạng số thực dấu phẩy động mạnh mẽ hơn đáng kể so với các định dạng số nguyên khi lượng tử hóa các ngoại lệ xuất hiện làm cho lượng tử hóa sau huấn luyện quy mô lớn trở nên thách thức.
+
+Để giảm thiểu thêm tác động của các ngoại lệ, công trình gần đây đã cho thấy rằng một số sửa đổi nhất định có thể khuyến khích các mô hình tạo ra ít ngoại lệ hơn ngay từ đầu, thông qua sự lựa chọn đúng đắn của các siêu tham số [Ahmadian et al., 2023], hoặc thông qua các thay đổi trong lớp attention [Bondarenko et al., 2023]. Những phương pháp này được phát triển trong bối cảnh suy luận INT8, nhưng cũng áp dụng được cho huấn luyện và suy luận FP8 khi có mặt các ngoại lệ xuất hiện. Sự kết hợp của những phát triển này và sự chuyển đổi dự kiến sang suy luận FP8 sẽ làm cho việc lượng tử hóa các mô hình lớn dễ dàng hơn đáng kể so với những gì cộng đồng đã tìm thấy với lượng tử hóa INT8 cho đến nay.
+
+E Các lớp tuyến tính trong kiến trúc GPT và Llama 2 được lượng tử hóa về FP8
+
+Trong công trình này, chúng tôi tập trung vào việc lượng tử hóa các lớp tuyến tính của các lớp decoder về FP8. Các kiến trúc decoder GPT và Llama có các loại lớp khác bao gồm dot-product attention có thể hưởng lợi từ lượng tử hóa FP8, nhưng chúng tôi để dành cho công trình tương lai.
+
+Hình 4 hiển thị các thành phần chính của các lớp decoder GPT và Llama và nhấn mạnh những thành phần được lượng tử hóa về FP8. Đó là:
+
+• Ba lớp tuyến tính attention để chiếu các ma trận Q, K và V.
+• Lớp tuyến tính attention sau khi các đầu ra của các head được nối lại.
+• Lớp tuyến tính feed-forward đầu tiên mở rộng chiều ẩn lên gấp bốn lần.
+• Lớp tuyến tính feed-forward thứ hai co lại chiều ẩn đi bốn lần.
+
+Đầu vào
+Chuẩn hóa lớp
+Các lớp tuyến tính QKV FP8 weights
+Dot-product attention
+Lớp tuyến tính đầu ra FP8 weights
++
+Chuẩn hóa lớp
+Lớp tuyến tính FP8 weights
+GELU
+Lớp tuyến tính FP8 weights
++
+Đầu ra
+
+Multi-Head Attention
+Feed-Forward
+
+Ép kiểu về FP8
+Ép kiểu về FP8
+Ép kiểu về FP8
+Ép kiểu về FP8
+
+(a) Decoder GPT.
+
+Đầu vào
+RMSNorm
+Các lớp tuyến tính QKV FP8 weights
+Rotary Pos. Embed.
+Dot-product attention
+Lớp tuyến tính đầu ra FP8 weights
++
+RMSNorm
+Lớp tuyến tính FP8 weights
+SwiGLU
+Lớp tuyến tính FP8 weights
++
+Đầu ra
+
+Multi-Head Attention
+Feed-Forward
+
+Ép kiểu về FP8
+Ép kiểu về FP8
+Ép kiểu về FP8
+Ép kiểu về FP8
+
+(b) Decoder Llama 2.
+
+Hình 4: Sơ đồ nhấn mạnh các lớp tuyến tính được lượng tử hóa về FP8 (màu xanh) cho các mô hình GPT và Llama 2 được mô tả trong Phần 4.1. Các lớp còn lại (màu cam) được giữ ở độ chính xác cao hơn.
+
+Nhìn chung, bốn lớp tuyến tính này chiếm hơn 99,9% tổng tính toán trong lớp decoder, đối với một mô hình điển hình như Llama 2 70B với độ dài chuỗi vừa phải. FLOP trong bốn lớp tuyến tính này là bội số của dmodel²×sl, với dmodel là chiều ẩn và sl là độ dài chuỗi, vì chúng dựa trên các phép toán ma trận-với-vector. Ngược lại, dot-product attention mà chúng tôi giữ ở độ chính xác cao hơn chỉ chiếm bội số của dmodel×sl², vì nó dựa trên các phép toán vector-với-vector. Đối với các chiều ẩn như Llama 2 70B có 8192 và độ dài chuỗi vừa phải khoảng 4096, FLOP từ dot-product attention là không đáng kể so với FLOP của các lớp tuyến tính. Tuy nhiên, đối với độ dài chuỗi dài hơn, attention thống trị do chi phí bình phương của nó đối với độ dài chuỗi. Người đọc có thể tìm thêm thông tin về đếm FLOP cho transformer trong hai bài blog này: Chen [2022], Sanger [2023].
+
+F Kết quả của phương pháp FP8-CSCALE cho suy luận
+
+Hình 5 so sánh độ chính xác xác thực FP16, FP8-AMAX và FP8-CSCALE cho nhiệm vụ MNLI. FP8-CSCALE chỉ đạt được độ chính xác mục tiêu FP16 cho một phạm vi cụ thể của các độ lệch tỷ lệ. Khi độ lệch tỷ lệ được chọn không nằm trong phạm vi đó, độ chính xác xác thực giảm.
+
+[Các biểu đồ cho thấy kết quả cho GPT 111M, 590M, 1.3B, 6.7B và 13B]
+
+Hình 5: So sánh các phương pháp độ lệch tỷ lệ cho xác thực MNLI, cho các kích thước GPT khác nhau. Trong khi phương pháp FP8-AMAX luôn khớp với độ chính xác FP16, phương pháp FP8-CSCALE chỉ hội tụ trong một khoảng các giá trị tỷ lệ. Khoảng cụ thể đạt ít nhất 99,5% giá trị FP16 được hiển thị trong Bảng 3.
+
+G Phân bố độ lệch tỷ lệ cho từng tensor cho suy luận với FP8-AMAX
+
+Trong Hình 6, chúng tôi hiển thị phân bố độ lệch tỷ lệ cho từng tensor cho trọng số và kích hoạt, cho thiết lập suy luận MNLI với mô hình GPT được chi tiết trong Phần 4.2. Độ lệch tỷ lệ được tính toán với phương pháp FP8-AMAX trong Phần 2.3. Trong khi độ lệch tỷ lệ cho trọng số chỉ được tính toán một lần trong quá trình PTQ từ FP16 sang FP8 E4, độ lệch tỷ lệ cho kích hoạt thay đổi tùy thuộc vào mẫu dữ liệu. Để đơn giản hóa, trong Hình 6 chúng tôi hiển thị mode thống kê (tức là giá trị thường xuyên nhất) của độ lệch tỷ lệ kích hoạt cho tất cả các mẫu dữ liệu trong benchmark đánh giá. Bốn lớp tuyến tính được hiển thị (ký hiệu là attn qkv, attn out, ff intermediate và ff output) tương ứng với các lớp tuyến tính được lượng tử hóa về FP8, như giải thích trong Phụ lục E. Đối với mỗi kích thước mô hình, chúng tôi hiển thị độ lệch tỷ lệ cho bốn chỉ số lớp decoder, với hai trong số chúng là đầu tiên và cuối cùng và hai cái khác là các lớp decoder trung gian.
+
+Một số quan sát về các biểu đồ trong Hình 6 là:
+
+[Các biểu đồ cho 111M, 1.3B và 6.7B parameters]
+
+Hình 6: Phân bố độ lệch tỷ lệ theo decoder và loại lớp tuyến tính cho xác thực MNLI, so sánh các kích thước khác nhau của mô hình GPT. Độ lệch tỷ lệ được tính toán với phương pháp FP8-AMAX trong Phần 2.3.
+
+--- TRANG 17 ---
+• Độ lệch tỷ lệ trọng số so với kích hoạt: trước đây có giá trị lớn hơn và phân bố hẹp hơn, chỉ trải rộng ba giá trị số nguyên so với năm hoặc sáu cho độ lệch tỷ lệ kích hoạt.
+
+• Kích thước của các mô hình: độ lệch tỷ lệ có xu hướng thay đổi nhiều hơn theo chỉ số lớp decoder khi kích thước mô hình tăng.
+
+• Loại lớp tuyến tính: đối với kích hoạt, các độ lệch tỷ lệ của lớp tuyến tính attention sau các đầu ra có giá trị lớn hơn so với các lớp tuyến tính khác. Độ lệch tỷ lệ cho lớp tuyến tính đó cũng thay đổi nhiều hơn theo chỉ số lớp decoder, đạt giá trị cao hơn cho các lớp decoder đầu tiên.
+
+• Các phạm vi hội tụ thu được với FP8-CSCALE và hiển thị trong Bảng 3 được tập trung quanh không, trong khi các tỷ lệ trong Hình 6 cho FP8-AMAX đạt giá trị lớn hơn. Điều này liên quan đến thực tế rằng FP8-AMAX chọn độ lệch tỷ lệ tối đa cho mỗi tensor hội tụ, nhưng có thể có các độ lệch tỷ lệ thấp hơn khác cũng dẫn đến hội tụ. Đặc biệt, các giá trị trong Bảng 3 phù hợp với các độ lệch tỷ lệ của kích hoạt attn qkv trong Hình 6, là những giá trị thấp nhất giữa trọng số, kích hoạt và loại lớp tuyến tính. Một giá trị độ lệch tỷ lệ lớn hơn so với giá trị được hiển thị trong Bảng 3 với FP8-CSCALE dẫn đến tràn trên cho lớp tuyến tính cụ thể đó, hạn chế độ lệch tỷ lệ tối đa đảm bảo hội tụ.
+
+H Chi tiết thêm để chạy các thí nghiệm GPT và Llama
+
+H.1 Chi tiết tinh chỉnh
+
+Các mô hình được tinh chỉnh trong Phần 4.4 và 4.5 sử dụng trình tối ưu AdamW [Loshchilov và Hutter, 2017] với (beta1, beta2) = (0.9, 0.999) và epsilon bằng 1e-5. Suy giảm trọng số là 0.01 cho 111M và 590M và 0 cho các kích thước mô hình lớn hơn. Kích thước batch toàn cục là 512 cho tất cả các kích thước mô hình. Chúng tôi chạy 3 epoch cho mỗi nhiệm vụ tinh chỉnh trừ khi được nêu khác. Chúng tôi không chỉ định cắt norm gradient. Chúng tôi sử dụng dropout trong quá trình tinh chỉnh.
+
+Chi tiết thêm cụ thể cho kích thước mô hình được hiển thị trong Bảng 8. Lưu ý rằng chúng tôi giữ tốc độ học không đổi trong suốt quá trình tinh chỉnh vì chúng tôi quan sát rằng việc thiết lập warmup cộng với suy giảm không ảnh hưởng nhiều đến độ chính xác xác thực cuối cùng.
+
+Bảng 8: Siêu tham số tinh chỉnh cho việc tinh chỉnh các mô hình GPT trong Phần 4.4 và 4.5.
+
+Tham số  Độ dài chuỗi  Tốc độ học  Tỷ lệ mất mát
+GPT 111M  120  4e-5  512
+GPT 590M  264  6e-5  4096
+GPT 1.3B  528  3e-5  4096
+GPT 6.7B  1040  8e-6  32768
+GPT 13B  1080  7e-6  32768
+
+H.2 Phần cứng để chạy các thí nghiệm
+
+Các mô hình được huấn luyện trên phần cứng IPU [Graphcore, 2022a, Jia et al., 2019], sử dụng máy Bow Pod 64, Bow Pod 16, IPU-POD 64 hoặc IPU-POD 16. Phần cứng IPU cho phép phân phối huấn luyện và suy luận trên nhiều chip để tận dụng nhiều mức độ song song, hữu ích để tăng tốc huấn luyện với các bản sao dữ liệu hoặc để làm cho các mô hình phù hợp bằng cách phân phối các lớp trên nhiều chip. Mặc dù phần cứng mà chúng tôi sử dụng không có FP8 gốc, nó cho phép FP8 được hỗ trợ trong phần mềm.
+
+I Sự phát triển của độ lệch tỷ lệ cho từng tensor trong quá trình huấn luyện với FP8-AMAX
+
+Trong Hình 7, 8 và 9, chúng tôi báo cáo sự phát triển của độ lệch tỷ lệ cho từng tensor cho các kích thước mô hình GPT 111M, 1.3B và 6.7B tham số. Độ lệch tỷ lệ được tính toán với phương pháp FP8-AMAX trong
+
+--- TRANG 19 ---
+Phần 2.3, và tương ứng với epoch đầu tiên của việc tinh chỉnh cho nhiệm vụ MNLI. Độ lệch tỷ lệ hiển thị cho mỗi bước huấn luyện được tính toán như mode thống kê (tức là giá trị thường xuyên nhất) của các mẫu dữ liệu chứa trong batch của bước cụ thể đó. Bốn lớp tuyến tính được hiển thị (ký hiệu là attn qkv, attn out, ff intermediate và ff output) tương ứng với các lớp tuyến tính được lượng tử hóa về FP8, như được giải thích trong Phụ lục E. Đối với mỗi kích thước mô hình, chúng tôi hiển thị độ lệch tỷ lệ cho bốn chỉ số lớp decoder, với hai trong số chúng là đầu tiên và cuối cùng và hai cái khác là các lớp decoder trung gian.
+
+Một số quan sát từ sự phát triển độ lệch tỷ lệ trong Hình 7, 8 và 9 là:
+
+• Độ lệch tỷ lệ trọng số và kích hoạt: cả hai đều khá tĩnh trong suốt quá trình huấn luyện, với một số cập nhật thỉnh thoảng chỉ một giá trị số nguyên. Nhưng mỗi lớp decoder ổn định ở một giá trị độ lệch tỷ lệ khác nhau, điều này biện minh cho lợi ích của các tỷ lệ cho từng tensor.
+
+• Độ lệch tỷ lệ gradient: tần suất thay đổi cao hơn so với độ lệch tỷ lệ trọng số và kích hoạt, và các giá trị cho mỗi loại lớp decoder cho thấy sự tăng mạnh trong các bước huấn luyện đầu tiên. Điều này được thúc đẩy bởi thực tế rằng gradient lớn hơn ở đầu quá trình huấn luyện (tức là cần độ lệch tỷ lệ nhỏ hơn) và thấp hơn sau này trong quá trình huấn luyện (tức là cần độ lệch tỷ lệ lớn hơn).
+
+[Tiếp tục với các hình và mô tả chi tiết...]
+
+--- TRANG 20 ---
+[Tiếp tục các biểu đồ và phân tích...]
+
+--- TRANG 21 ---
+[Tiếp tục các biểu đồ và phân tích...]
+
+• Lớp decoder đầu tiên và cuối cùng: đã được chỉ ra trong Noune et al. [2022] rằng, với độ lệch tỷ lệ không đổi, một số mô hình yêu cầu kích hoạt và gradient lớp decoder đầu tiên phải ở lại trong FP16 để hội tụ tốt hơn. Các biểu đồ của chúng tôi chứng thực thực tế rằng lớp đầu tiên hoạt động khá khác so với hành vi trung bình của các lớp khác. Ví dụ, độ lệch tỷ lệ cho kích hoạt thường cao hơn cho chỉ số lớp decoder đầu tiên so với các lớp khác, và độ lệch tỷ lệ gradient thay vào đó có giá trị thấp hơn. Về lớp decoder cuối cùng, độ lệch tỷ lệ gradient của nó có giá trị lớn hơn so với phần còn lại của các lớp decoder và thể hiện một số đột biến tản mạn làm nổi bật khi kích thước mô hình tăng (xem Hình 9 cho mô hình 6.7B làm ví dụ).
+
+• Loại lớp tuyến tính: độ lệch tỷ lệ kích hoạt cho lớp tuyến tính attention sau các đầu ra cao hơn so với phần còn lại. Độ lệch tỷ lệ gradient thay đổi giống nhau cho bốn lớp tuyến tính, nhưng đối với lớp tuyến tính attention sau các đầu ra có nhiều sự khác biệt hơn giữa lớp decoder đầu tiên và phần còn lại.
+
+• Kích thước của mô hình: độ lệch tỷ lệ trọng số và kích hoạt cho thấy các biểu đồ tương tự cho ba kích thước, nhưng độ lệch tỷ lệ gradient dao động nhiều hơn khi kích thước tăng, trải rộng nhiều giá trị số nguyên hơn nữa.
+
+J So sánh hàm mất mát FP16 vs FP8 trong quá trình huấn luyện
+
+Trong Hình 10, chúng tôi báo cáo sự phát triển của hàm mất mát trong quá trình tinh chỉnh mô hình GPT trong Phần 4.5, tập trung vào nhiệm vụ MNLI và năm kích thước mô hình. Các hàm mất mát cho hai nhiệm vụ khác, QQP và SST2, theo một đường cong tương tự và được bỏ qua.
+
+[Các biểu đồ hàm mất mát cho GPT 111M, 590M, 1.3B, 6.7B và 13B]
+
+Hình 10: Mất mát tinh chỉnh cho nhiệm vụ MNLI cho các kích thước mô hình GPT khác nhau, so sánh sự phát triển FP16 và FP8.
