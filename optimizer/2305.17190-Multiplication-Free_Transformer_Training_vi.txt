@@ -1,0 +1,206 @@
+# Huấn luyện Transformer không cần phép nhân
+# thông qua các phép toán affine từng đoạn
+
+Atli Kosson Martin Jaggi
+EPFL, Thụy Sĩ
+firstname.lastname@epfl.ch
+
+## Tóm tắt
+
+Phép nhân chiếm phần lớn chi phí tính toán trong quá trình huấn luyện và suy luận mạng nơ-ron. Nghiên cứu gần đây đã tìm cách giảm chi phí liên quan đến chúng. Lấy cảm hứng từ Mogami (2020), chúng tôi thay thế phép nhân bằng một phép xấp xỉ affine từng đoạn rẻ tiền được thực hiện bằng cách cộng biểu diễn bit của các số dấu phẩy động với nhau dưới dạng số nguyên. Chúng tôi chỉ ra rằng transformer có thể được huấn luyện với các phép nhân ma trận đã được sửa đổi kết quả trên cả tác vụ thị giác và ngôn ngữ với ít hoặc không có tác động đến hiệu suất, và không cần thay đổi siêu tham số huấn luyện. Chúng tôi tiếp tục thay thế tất cả các tính phi tuyến trong mạng khiến chúng hoàn toàn và cùng nhau trở thành affine từng đoạn trong cả đầu vào và trọng số. Cuối cùng, chúng tôi chỉ ra rằng có thể loại bỏ tất cả phép nhân trong toàn bộ quá trình huấn luyện, bao gồm các phép toán trong lượt đi tới, lượt đi ngược và cập nhật tối ưu hóa, chứng minh việc huấn luyện thành công đầu tiên các kiến trúc mạng nơ-ron hiện đại theo cách hoàn toàn không cần phép nhân.
+
+## 1 Giới thiệu
+
+Chi phí tính toán để huấn luyện các mạng nơ-ron tiên tiến đã tăng nhanh trong những năm gần đây [1]. Ngoài việc tăng giá huấn luyện, điều này cũng đòi hỏi nhiều năng lượng hơn thường kèm theo tác động môi trường. Các mô hình ngôn ngữ lớn, chẳng hạn như mô hình nền tảng [2], đặc biệt tốn kém để huấn luyện. Những mô hình này thường dựa trên kiến trúc transformer [34].
+
+Huấn luyện mạng nơ-ron bao gồm chủ yếu các phép nhân ma trận thường chiếm phần lớn chi phí tính toán cho các kiến trúc chuẩn như transformer. Những phép nhân ma trận này được thực hiện bằng cách nhân và tích lũy các phần tử vô hướng của ma trận thường được mã hóa dưới dạng giá trị dấu phẩy động trong quá trình huấn luyện. Vì phép nhân dấu phẩy động phức tạp hơn đáng kể so với phép cộng, nó đòi hỏi nhiều cổng logic và năng lượng hơn để thực hiện trong phần cứng. Horowitz (2014) ước tính rằng đối với toán hạng float32, phép nhân cần gấp 4 lần năng lượng so với phép cộng. Các phương pháp huấn luyện hiệu quả về mặt tính toán do đó thường tập trung vào việc giảm chi phí của phép nhân. Một phương pháp như vậy là huấn luyện độ chính xác hỗn hợp [23], trong đó phép nhân được thực hiện ở định dạng độ chính xác thấp hơn như float16 hoặc bfloat16 [15] trong khi tích lũy vẫn được thực hiện ở float32 chuẩn. Bộ tăng tốc phần cứng hiện đại cho học sâu, như TPU [14] và GPU tensor core [26], có hỗ trợ phần cứng chuyên biệt cho phép nhân ma trận ở độ chính xác hỗn hợp.
+
+Một cách tiếp cận rất khác là sửa đổi chính kiến trúc mạng nơ-ron, chẳng hạn như thay thế phép nhân bằng các phép toán rẻ hơn về mặt tính toán nhưng khác nhau về cơ bản. Đây là ý tưởng đằng sau AdderNet [4] sử dụng sự khác biệt tuyệt đối của hai số thay vì tích của chúng trong phép nhân ma trận. AdderNet ít phép nhân trong quá trình suy luận nhưng yêu cầu các thủ thuật đặc biệt trong quá trình lan truyền ngược liên quan đến phép nhân và/hoặc lũy thừa để đạt hiệu suất tối ưu. Một lựa chọn khác là đại số nhiệt đới thay thế tích bằng phép cộng và tích lũy bằng maximum, nhưng không cho thấy hiệu suất cạnh tranh với mạng nơ-ron chuẩn [22,9]. Đối với cả hai phương pháp này, lợi thế phần cứng chính là thay thế phép nhân bằng phép cộng có xu hướng rẻ hơn nhiều trong phần cứng.
+
+Ý tưởng cốt lõi chúng tôi theo đuổi trong bài báo này nằm giữa hai phương pháp nói trên. Chúng tôi thay thế phép nhân bằng các phép toán xấp xỉ gần đúng chúng nhưng có chi phí rẻ như phép cộng. Vì các phép toán không khác biệt về cơ bản, chúng sẽ hoạt động như một sự thay thế trực tiếp cho phép nhân—tương tự như độ chính xác hỗn hợp—mà không cần thay đổi kiến trúc, trong khi có thể rẻ hơn đáng kể. Một xấp xỉ như vậy là phép nhân logarithm của Mitchell [24] xấp xỉ tích của A > 0 và B > 0 như:
+
+AB ≈ paexp2(palog2(A) + palog2(B))  (1)
+
+trong đó paexp2 và palog2 là các xấp xỉ rẻ của exp2 và log2 được hiển thị trong Hình 1 cùng với một ví dụ đầu ra. Tất cả các xấp xỉ đều là affine từng đoạn (đôi khi gọi là tuyến tính từng đoạn) trong các đối số đầu vào. Cốt lõi của phép toán này có thể được thực hiện hiệu quả trong phần cứng bằng cách sử dụng phép cộng int rẻ hơn khoảng 9 lần so với phép cộng float cho toán hạng 32-bit [12]. Chúng tôi ước tính thô chi phí của phép nhân affine từng đoạn là khoảng 30 lần ít hơn so với phép nhân float32 chuẩn về mặt diện tích và năng lượng được sử dụng bởi chính phép toán (Phụ lục B). Các phương pháp dựa trên phép nhân logarithm cũng đã được khám phá cho suy luận mạng nơ-ron và được tìm thấy cho phép tiết kiệm năng lượng khoảng 5 lần so với các phép toán nhân-và-tích-lũy bfloat16 [16].
+
+Mogami [25] đã chỉ ra rằng Phương trình (1) có thể được thực hiện bằng cách trực tiếp cộng các biểu diễn số dấu phẩy động với nhau dưới dạng số nguyên, với một số xử lý bổ sung của số mũ tính đến độ lệch số mũ, underflow và overflow. Họ tiếp tục chỉ ra rằng thủ thuật này có thể được sử dụng để huấn luyện mạng nơ-ron tích chập (cụ thể là ResNet50 [11]) với sự suy giảm nhỏ hoặc không có so với phép nhân chuẩn. Trong công trình này, chúng tôi khám phá thêm ứng dụng của xấp xỉ hàm affine từng đoạn vào huấn luyện mạng nơ-ron, được tóm tắt dưới đây:
+
+• Chúng tôi chỉ ra rằng transformer có thể được huấn luyện với phép nhân ma trận affine từng đoạn trên cả dữ liệu thị giác và ngôn ngữ với ít hoặc không có tác động đến hiệu suất. Chúng tôi so sánh điều này với transformer dựa trên AdderNet [30] chứng minh độ chính xác tốt hơn trong khi thay thế nhiều phép nhân hơn.
+
+• Chúng tôi định nghĩa các hàm affine từng đoạn bổ sung cho tất cả các phép toán khác trong mạng nơ-ron và chứng minh huấn luyện hoàn toàn không cần phép nhân, chỉ với tác động hiệu suất nhỏ. Không có phép nhân nào được sử dụng trong bất kỳ phần nào của huấn luyện, bao gồm lượt đi tới, lan truyền ngược và tính toán tối ưu hóa. Theo hiểu biết tốt nhất của chúng tôi, đây là lần đầu tiên mạng nơ-ron được huấn luyện hoàn toàn mà không có phép nhân chuẩn.
+
+• Chúng tôi chỉ ra rằng các mạng nơ-ron kết quả hoàn toàn là affine từng đoạn (đôi khi gọi là tuyến tính từng đoạn) trong cả đầu vào và trọng số của chúng, một tính chất mà transformer truyền thống rất xa mới thỏa mãn.
+
+• Chúng tôi công bố công khai mã của mình, bao gồm kernel tùy chỉnh, với hy vọng hỗ trợ nghiên cứu thêm về mạng nơ-ron không cần phép nhân.
+
+## 2 Phương pháp
+
+### 2.1 Số dấu phẩy động
+
+Vì biểu diễn chính xác của số dấu phẩy động quan trọng đối với phương pháp của chúng tôi, chúng tôi sẽ đưa ra một cái nhìn tổng quan ngắn gọn ở đây. Một số dấu phẩy động được biểu diễn như:
+
+(-1)^S · 2^E · (1 + M)  (2)
+
+trong đó S ∈ {0,1} là bit dấu, E là số nguyên mã hóa số mũ, và 0 ≤ M < 1 là phần thập phân của mantissa. Lưu ý rằng điều này tương tự như ký hiệu khoa học chuẩn hóa cho số thập phân (ví dụ +1.23 · 10^-2).
+
+Mã hóa được sử dụng cho E và M khác nhau giữa các định dạng dấu phẩy động. IEEE 754 float32 thường được sử dụng sử dụng biểu diễn bit sau:
+
+[S, e0, ..., e7 =: Ē, m0, ..., m22 =: M̄]  (3)
+
+trong đó số mũ được mã hóa như một số nguyên không dấu Ē với độ lệch 127 tức là E = Ē - 127 = e0e1e2e3e4e5e6e7 - 127 và mantissa như một số nguyên không dấu M̄ được chia cho 2^23 để có M = M̄/2^23 = m0...m22/2^23.
+
+Số dấu phẩy động cũng có thể mã hóa các giá trị đặc biệt không phù hợp với biểu diễn trong Phương trình (2). Trong float32, Ē = 255 được sử dụng để biểu diễn NaN (không phải số) hoặc vô cùng tùy thuộc vào giá trị của M̄. Đối với Ē = 0, float được hiểu là số không chuẩn (-1)^S · 2^E · M cũng cho biểu diễn của 0, là Ē = 0 và M̄ = 0. Một số định dạng dấu phẩy động, ví dụ bfloat16 không cho phép số không chuẩn ngoài 0, vì những số đó có thể tốn kém hơn để xử lý trong phần cứng.
+
+### 2.2 Phép nhân affine từng đoạn
+
+Chúng tôi định nghĩa phép nhân affine từng đoạn (hoặc PAM để ngắn gọn) của hai số dấu phẩy động:
+
+A = (-1)^SA · 2^EA · (1 + MA), B = (-1)^SB · 2^EB · (1 + MB)  (4)
+
+như A ⊙ B:
+
+A ⊙ B := (-1)^SA⊙B · 2^EA⊙B · (1 + MA⊙B)  (5)
+
+SA⊙B := SA + SB  (6)
+
+EA⊙B := EA + EB + 1{MA+MB≥1}  (7)
+
+MA⊙B := MA + MB - 1{MA+MB≥1}  (8)
+
+trong đó 1{a} là một khi a đúng và không nếu khác.
+
+Chúng tôi quan sát rằng A ⊙ B gần như đạt được bằng cách cộng dấu, số mũ và mantissa của A và B. Thực tế, điều này trở nên chính xác nếu chúng ta cho phép MA⊙B tràn vào EA⊙B. Điều này xảy ra nếu chúng ta cộng các biểu diễn bit float32 của A và B với nhau dưới dạng int32.
+
+Một chi tiết kỹ thuật là số mũ yêu cầu xử lý đặc biệt, vì Ē kết quả chỉ được bù đắp bởi -127 nhưng nên được bù đắp bởi gấp đôi số lượng đó yêu cầu chúng ta trừ 127 từ số mũ của tổng. Chúng ta cũng cần đảm bảo Ē kết quả không bị tràn hoặc thiếu, thay vào đó kẹp nó vào giá trị min và max. Các giá trị không chuẩn có thể (mantissa bắt đầu bằng số không) có thể được xóa về không để đơn giản, như được thực hiện trong ví dụ bfloat16. Cuối cùng, chúng ta kiểm tra rằng A và B đến không biểu diễn các giá trị đặc biệt như NaN hoặc vô cùng và xử lý những trường hợp đó một cách rõ ràng.
+
+Đối với float32, PAM có thể được triển khai đơn giản với hai phép cộng int và một vài kiểm tra cho số mũ. Đối với bộ tăng tốc phần cứng hiện tại như GPU, điều này tốn kém và yêu cầu nhiều lệnh. Tuy nhiên, logic đơn giản hơn nhiều so với phép nhân chuẩn, vì vậy phần cứng mới với hỗ trợ bản địa có thể thực hiện phép toán này một cách rẻ tiền. Với định dạng dấu phẩy động tùy chỉnh không có độ lệch số mũ, chúng ta có thể tiếp tục loại bỏ một trong các phép cộng int. Điều này cũng có thể được thực hiện cho phần cứng có thể cấu hình như FPGA. Trong Phụ lục B, chúng tôi ước tính thô chi phí phần cứng của PAM, ước tính tiết kiệm khoảng 5-30 lần so với phép nhân chuẩn trong float16 và float32.
+
+### 2.3 Các phép toán affine từng đoạn khác
+
+Như đã đề cập trong phần giới thiệu, phép nhân affine từng đoạn có thể được biểu diễn dưới dạng paexp2 và palog2 mà chúng ta có thể viết như sau cho A, B từ Phương trình (4):
+
+paexp2(A) = 2^⌊A⌋ · (1 + A - ⌊A⌋)  (9)
+
+palog2(A) = EA + MA, cho A > 0  (10)
+
+trong đó ⌊A⌋ biểu thị làm tròn xuống số nguyên gần nhất. Đối với đầu vào dương Phương trình 1 sau đó trở thành:
+
+AB ≈ paexp2(palog2(A) + palog2(B))  (11)
+
+= 2^⌊EA+EB+MA+MB⌋ · (1 + EA + EB + MA + MB - ⌊EA + EB + MA + MB⌋)  (12)
+
+= 2^(EA+EB+1{MA+MB≥1}) · (1 + MA + MB - 1{MA+MB≥1})  (13)
+
+Điều này tương đương với A ⊙ B, ngoài việc tính toán dấu.
+
+Chúng tôi định nghĩa phép chia affine từng đoạn như nghịch đảo của A ⊙ B:
+
+A ⊘ B := (-1)^SA⊘B · 2^EA⊘B · (1 + MA⊘B)  (14)
+
+SA⊘B := SA - SB  (15)
+
+EA⊘B := EA - EB - 1{MA-MB≤0}  (16)
+
+MA⊘B := MA - MB + 1{MA-MB≤1}  (17)
+
+tương ứng với paexp2(palog2(A) - palog2(B)) cho số dương. A ⊘ B cũng có thể được thực hiện hiệu quả trong phần cứng float32 bằng cách sử dụng phép trừ int32 trong đó độ lệch bù đắp 127 cần được thêm vào kết quả.
+
+Với paexp2 và palog2, chúng ta cũng có thể định nghĩa các hàm affine từng đoạn tổng quát cho lũy thừa, bao gồm logarithm tự nhiên và hàm mũ cũng như căn bậc hai.
+
+paexp(A) := paexp2(log2(e) ⊙ A)  (18)
+
+palog(A) := palog2(A) ⊘ log2(e)  (19)
+
+pasqrt(A) := paexp2(palog2(A) ⊘ 2)  (20)
+
+Với những hàm này, chúng ta có thể triển khai các phép toán mạng nơ-ron khác nhau như các lớp chuẩn hóa, softmax, cross-entropy và các hàm mất mát khác cũng như cập nhật tối ưu hóa.
+
+### 2.4 Mạng nơ-ron affine từng đoạn
+
+Mạng nơ-ron nhân tạo hiện đại là thành phần của các phép toán được thảo luận trong các phần con trước. Do đó, chúng tôi thay thế mỗi phép toán truyền thống trong mạng bằng xấp xỉ affine từng đoạn của nó. Không giống như mạng truyền thống, mạng kết quả bây giờ sẽ là một hàm affine từng đoạn, trong cả trọng số và cũng trong các giá trị đầu vào. Điều này theo trực tiếp vì thành phần (và tổng) của hai hàm affine từng đoạn (với một hoặc nhiều đối số) vẫn là affine từng đoạn. Chúng tôi lặp lại thành phần qua tất cả các lớp và tính toán mất mát.
+
+Tính chất toàn cục này của việc là affine từng đoạn (và do đó có gradient từng đoạn không đổi) đáng chú ý vì nó không đúng với mạng ReLU truyền thống, do thành phần với các hàm mất mát thông thường nhất, và cũng không đúng với transformer truyền thống. Bất chấp sự thay đổi mạnh mẽ này trong cấu trúc gradient và không gian mất mát, chúng tôi sẽ chỉ ra rằng các tối ưu hóa thường được sử dụng (và các đối tác không cần phép nhân của chúng) vẫn cho phép huấn luyện thành công ngay lập tức mà không cần điều chỉnh siêu tham số bổ sung.
+
+### 2.5 Đạo hàm
+
+Theo Mogami [25], chúng tôi xem xét hai cách để tính đạo hàm của các hàm affine từng đoạn. Lựa chọn đầu tiên là tính đạo hàm thực của những hàm đó, là từng đoạn không đổi và không liên tục. Lựa chọn thứ hai là triển khai đạo hàm phân tích của hàm gốc chúng ta đang xấp xỉ, ví dụ phép nhân chuẩn, với các hàm affine từng đoạn. Chúng tôi sẽ gọi lựa chọn đầu tiên là đạo hàm chính xác và lựa chọn thứ hai là đạo hàm xấp xỉ. Bảng 1 liệt kê cả hai loại đạo hàm cho mỗi phép toán được mô tả trước đó.
+
+Chúng tôi sử dụng ký hiệu delta cho lan truyền ngược, tức là δA = ∂L/∂A và δY = ∂L/∂Y cho một hàm vô hướng L không xác định chỉ phụ thuộc vào A thông qua đầu ra Y.
+
+Chúng tôi lưu ý rằng mặc dù đạo hàm chính xác đôi khi chứa phép nhân, một trong các số là lũy thừa chính xác của hai có nghĩa là phép nhân có thể được thực hiện chính xác qua PAM, xem Phần 2.7. Do đó, cả hai loại đạo hàm có thể được tính toán theo cách không cần phép nhân, chỉ sử dụng PAM và các phép toán liên quan. Điều này cũng mở rộng cho các phép toán phái sinh như paexp, palog, pasqrt, softmax và chuẩn hóa. Chúng ta có thể lan truyền ngược qua các hàm phái sinh qua đồ thị tính toán định nghĩa chúng, sử dụng đạo hàm chính xác hoặc xấp xỉ được đưa ra ở trên. Bằng cách mở rộng, chúng ta có thể thực hiện toàn bộ lượt đi tới và đi ngược qua mạng nơ-ron bao gồm những nguyên tắc này mà không có bất kỳ phép toán nhân truyền thống nào.
+
+### 2.6 Tối ưu hóa
+
+Mạng với các thành phần affine từng đoạn có thể được huấn luyện bằng cách sử dụng tối ưu hóa dựa trên gradient chuẩn bằng cách sử dụng các đạo hàm được đưa ra trong phần trước. Tuy nhiên, việc triển khai chính thuật toán tối ưu hóa có thể liên quan đến các phép nhân bổ sung (như với tỷ lệ học thay đổi, tỷ lệ học thích ứng hoặc để tính toán thống kê tối ưu hóa khác). Do đó, chúng tôi cũng thử nghiệm với việc thay thế tất cả phép nhân và chia tối ưu hóa bằng các đại lượng affine từng đoạn của chúng, và định lượng tác động của thay đổi này trong kết quả thực nghiệm của chúng tôi.
+
+### 2.7 Lỗi xấp xỉ
+
+Hình 2 so sánh PAM và phép nhân chuẩn. Nó cũng hiển thị lỗi tương đối của x1 ⊙ x2 so với x1x2, phụ thuộc vào mantissa chính xác của đầu vào. PAM cho kết quả chính xác khi mantissa của một trong hai đầu vào là không, tức là khi nó là lũy thừa của 2. Lỗi tương đối tối đa của (1+0.5+0.5)-1.52/1.52 = -1/9 = -11.1% đạt được khi M = 0.5 cho cả hai số. Khi một trong hai đầu vào cố định, ví dụ khi nhân một biến với một hằng số, lỗi tối đa có thể thấp hơn.
+
+Lỗi xấp xỉ tương đối của PAM có thể được giảm bằng một phép toán PAM bổ sung. Đối với giá trị α được chọn phù hợp, biểu thức x1 ⊙ x2 ⊙ α sẽ xấp xỉ x1x2 tốt hơn trung bình và/hoặc trường hợp tồi tệ nhất. Nếu x1 hoặc x2 là hằng số được biết trước, ví dụ khi tính toán paexp và palog, điều này có thể được tính đến khi chọn α cho một phép toán cụ thể. Đối với phép nhân ma trận PAM, việc chia tỷ lệ đầu ra thay vì tích vô hướng bên trong có thể đủ để loại bỏ độ lệch về độ lớn đầu ra. Nói chung, loại xấp xỉ này sẽ đắt hơn một phép toán PAM đơn và chúng tôi để lại cho công việc tương lai khám phá nơi và khi nào bù đắp lỗi bổ sung này có lợi.
+
+Các đạo hàm chính xác và xấp xỉ có đặc điểm lỗi khác nhau khi được xem như xấp xỉ của đạo hàm cho phép nhân chuẩn. Đạo hàm chính xác không thiên vị trung bình, vì PAM liên tục và khớp phép nhân tại những điểm nhất định. Tuy nhiên, đạo hàm chính xác không liên tục và có phương sai cao theo nghĩa rằng đối với đầu vào cụ thể, lỗi thường lớn. Mặt khác, đạo hàm xấp xỉ thường có lỗi thấp hơn tại một điểm nhất định (tức là phương sai thấp) nhưng có thể thiên vị trung bình. Những đặc điểm này của hai loại đạo hàm cũng đúng với các hàm khác. Hình 3 và 4 trong phụ lục hiển thị đạo hàm chính xác và xấp xỉ cho một số hàm.
+
+## 3 Thực nghiệm & Kết quả
+
+### 3.1 Thiết lập thực nghiệm
+
+Chúng tôi sử dụng PyTorch [28] cho thực nghiệm và chạy chúng bằng GPU Nvidia A100 (40GB) hoặc V100 (32GB). Phép nhân affine từng đoạn theo phần tử, chia, palog2 và paexp2, cũng như phép nhân ma trận PAM được thực hiện bằng kernel CUDA tùy chỉnh. Để xác minh, chúng tôi cũng chạy các triển khai torch bản địa thay thế của những phép toán này chạy chậm hơn đáng kể. Các hàm khác như chuẩn hóa và softmax được triển khai bằng cách kết hợp những phép toán này. Thiết lập huấn luyện (ví dụ siêu tham số) cho cả mạng chuẩn và affine từng đoạn giống hệt nhau. Tất cả siêu tham số được lấy từ các công trình khác và chưa được điều chỉnh cụ thể cho huấn luyện affine từng đoạn.
+
+Trong thực nghiệm, chúng tôi xem xét hai tác vụ huấn luyện, một trên dữ liệu văn bản và một trong thị giác máy tính. Tác vụ đầu tiên là dịch từ tiếng Đức sang tiếng Anh trên tập dữ liệu IWSLT14 DE-EN [3] bao gồm khoảng 160K cặp câu từ các bài nói TED được dịch. Mô hình là một transformer nhỏ với 6 lớp encoder và decoder mỗi lớp, 4 đầu attention, chiều embedding 512, chiều ẩn feed forward 1024 và kích hoạt ReLU. Mã huấn luyện cho tác vụ này dựa trên codebase FairSeq [27]. Thiết lập cơ sở của chúng tôi huấn luyện trong 20 epoch, sử dụng lịch trình suy giảm cosine với 4000 bước khởi động và tỷ lệ học đỉnh 5·10^-4 với kích thước batch tối đa 4096 token. Chúng tôi sử dụng AdamW [21,17] để tối ưu hóa với β1 = 0.9, β2 = 0.98 và weight decay 10^-4. Trong quá trình huấn luyện, chúng tôi áp dụng dropout với xác suất drop 0.3 và sử dụng cross entropy với label smoothing 0.1. Để đánh giá, chúng tôi sử dụng beam search với 5 beam và báo cáo điểm BLEU trên tập test.
+
+Tác vụ thứ hai là huấn luyện DeiT-Tiny [32] Vision Transformer [5,7] không có chưng cất. Mô hình này có 5M tham số, 12 lớp với 3 đầu và chiều embedding 192. Chúng tôi huấn luyện trên CIFAR10 [19] hoặc tập dữ liệu ImageNet-1k [6]. CIFAR10 bao gồm 50K ảnh huấn luyện và 10K ảnh test kích thước 32×32 tương ứng với 10 lớp. Khi huấn luyện trên CIFAR10, chúng tôi nâng cấp ảnh lên 224×224 và sử dụng cùng quy trình tăng cường dữ liệu được mô tả trong DeiT [32] cho ImageNet. ImageNet-1k [6] chứa 1.28M ảnh huấn luyện và 50K ảnh validation trong 1000 lớp. Ảnh có kích thước khác nhau nhưng được xử lý ở độ phân giải 224×224 để huấn luyện. Những thực nghiệm này dựa trên dự án PyTorch Image Models [36]. Tối ưu hóa được thực hiện bằng AdamW với β1 = 0.9, β2 = 0.999 và weight decay 0.05. Tỷ lệ học cơ sở của chúng tôi là 5·10^-4 được chia tỷ lệ tuyến tính theo tổng kích thước batch (1152 cho ImageNet, 1024 cho CIFAR10) chia cho 512. Chúng tôi sử dụng lịch trình tỷ lệ học suy giảm cosine với khởi động 5 epoch và huấn luyện tổng cộng 300 epoch trên ImageNet hoặc 600 epoch trên CIFAR10.
+
+### 3.2 Thay thế phép nhân ma trận
+
+Như đã đề cập trước đó, phép nhân ma trận chiếm phần lớn chi phí tính toán của việc huấn luyện mạng nơ-ron và do đó cung cấp cơ hội lớn nhất để giảm chi phí. Chúng tôi thử nghiệm với việc thay thế tất cả phép nhân ma trận trên cả lượt đi tới và lượt đi ngược bằng phép nhân ma trận trong đó phép nhân vô hướng được thay thế bằng phép nhân affine từng đoạn. Điều này bao gồm tất cả các lớp tuyến tính, phép nhân ma trận theo batch được sử dụng trong attention và lớp tích chập được sử dụng cho patch embedding trong vision transformer. Ở đây chúng tôi sử dụng cùng loại phép nhân ma trận trên lượt đi ngược tương ứng với đạo hàm xấp xỉ được mô tả trong Phần 2.5.
+
+Kết quả của chúng tôi cho DeiT-Tiny trên CIFAR10 và ImageNet có thể thấy trong Bảng 2. Huấn luyện phép nhân ma trận dựa trên PAM khớp với độ chính xác cơ sở cho cả hai tập dữ liệu. Chúng tôi so sánh với Adder Attention [30] cũng thay thế phép nhân bằng các phép toán rẻ hơn dựa trên phép cộng. Họ không thay thế phép nhân ma trận theo batch và sử dụng phép nhân ma trận chuẩn cho lớp transformer đầu tiên và cuối cùng trên ImageNet và cũng sử dụng phép nhân để làm mịn gradient trong lượt đi ngược. Transformer Adder Attention có thể gần như khớp với độ chính xác cơ sở báo cáo của họ cho CIFAR10, nhưng bị suy giảm đáng kể trên ImageNet.
+
+Đối với IWSLT14, chúng tôi đạt được điểm BLEU test cơ sở 34.37. Thay thế tất cả phép nhân ma trận trên lượt đi tới và lượt đi ngược bằng phép nhân ma trận dựa trên PAM cho điểm BLEU test 34.22. Cả hai điểm đều được lấy trung bình trên ba lần chạy. Sự khác biệt quan sát được 0.15 hơi lớn hơn phương sai chạy-đến-chạy chúng tôi quan sát, nhưng khá nhỏ tổng thể. Chúng tôi cũng lưu ý rằng chúng tôi sử dụng siêu tham số chuẩn ban đầu được lấy từ FairSeq và điều chỉnh siêu tham số có thể cải thiện hiệu suất.
+
+Trong Phụ lục C, chúng tôi hiển thị các thực nghiệm tương tự cho một số mô hình không phải transformer bao gồm kiến trúc mạng nơ-ron tích chập và mixer trên CIFAR-10. Chúng tôi thấy ít hoặc không có suy giảm trên tất cả các mạng được thử nghiệm.
+
+### 3.3 Thay thế các phép toán khác
+
+Trong Bảng 3, chúng tôi đo lường tác động của việc sử dụng phiên bản affine từng đoạn của các thành phần mạng khác nhau. Chúng tôi tách biệt tác động của mỗi thành phần và thử nghiệm với hai loại đạo hàm khác nhau được mô tả trong Phần 2. MATMUL đề cập đến các lớp tuyến tính và phép nhân ma trận theo batch mà chúng tôi đã thay thế trong Phần 3.2. Sử dụng đạo hàm chính xác cho phép nhân ma trận hoạt động tệ hơn đáng kể so với đạo hàm xấp xỉ. Điều tương tự đúng với chuẩn hóa lớp affine từng đoạn, với đạo hàm xấp xỉ, chúng tôi quan sát ít hoặc không có suy giảm nhưng sử dụng đạo hàm chính xác gây ra suy giảm đáng chú ý. ATTENTION SOFTMAX đề cập đến phép toán softmax được thực hiện trong tính toán attention và loại trừ softmax cho mất mát. Ở đây chúng tôi thấy rằng việc sử dụng đạo hàm chính xác gây ra bất ổn định huấn luyện khi sử dụng siêu tham số mặc định trong khi với lượt đi ngược xấp xỉ, tác động hiệu suất có thể bỏ qua. Hàm LOSS, softmax cross-entropy với label smoothing, là phép toán duy nhất mà chúng tôi thấy lượt đi ngược xấp xỉ hoạt động tệ hơn đạo hàm chính xác. Nó cũng là thành phần mạng duy nhất mà cả hai loại đạo hàm đều có mất mát hiệu suất đáng chú ý.
+
+Cuối cùng, chúng tôi thử nghiệm với việc sử dụng các phép toán affine từng đoạn cho cập nhật tối ưu hóa. Tối ưu hóa AdamW sử dụng phép nhân, chia và căn bậc hai. Thay thế tất cả chúng chỉ gây ra suy giảm nhỏ 0.2 BLEU so với phiên bản chuẩn.
+
+### 3.4 Huấn luyện hoàn toàn không cần phép nhân
+
+Ở đây chúng tôi kết hợp tất cả các thay thế affine từng đoạn từ phần trước từng cái một. Điểm BLEU kết quả được hiển thị trong cột cuối của Bảng 3. Chúng tôi chọn loại đạo hàm hoạt động tốt hơn cho mỗi phép toán là đạo hàm xấp xỉ cho mọi thứ trừ mất mát. Mỗi khối transformer chứa một độ lợi mà chúng tôi thay thế bằng PAM khi thay thế attention softmax. Tổng thể có ít hoặc không có tác động hiệu suất từ việc thay thế phép nhân ma trận, softmax và chuẩn hóa lớp. Thay thế tất cả chúng cùng nhau dường như không gây ra bất kỳ vấn đề không lường trước nào. Phù hợp với các quan sát trước đây, việc thay thế mất mát bằng hàm affine từng đoạn gây ra suy giảm điểm BLUE nhỏ.
+
+Mục cuối cùng trong Bảng 3 bao gồm mọi phép nhân và phi tuyến trong quá trình huấn luyện. Điều này bao gồm lượt đi tới, lượt đi ngược và cập nhật tham số bởi tối ưu hóa. Tác động hiệu suất kết quả chỉ là 0.9 điểm BLEU và điều chỉnh siêu tham số có thể giảm thêm.
+
+## 4 Công trình liên quan
+
+Như đã đề cập trong phần giới thiệu, hầu hết công trình liên quan thuộc hai loại phương pháp, tùy thuộc vào việc kiến trúc mạng nơ-ron gốc có được bảo tồn hay không.
+
+Đối với loại đầu tiên, những thay đổi chi tiết được thực hiện đối với phép nhân cá nhân hoặc nhóm của chúng, nhằm xấp xỉ gần các phép nhân gốc. Ví dụ cho điều này là huấn luyện độ chính xác hỗn hợp [23], và tổng quát hơn là các lược đồ dấu phẩy động khối, trong đó một số trọng số được nhóm lại để chia sẻ cùng số mũ dấu phẩy động, cho phép suy luận và huấn luyện [18,8]. Một lớp phương pháp liên quan khác là quantization, được sử dụng rộng rãi cho suy luận nhưng đưa ra những thách thức bổ sung cho huấn luyện [20]. Tất cả các phương pháp đã đề cập có điểm chung là vẫn cần một số phép nhân, do đó có thể không khả thi trên phần cứng không có phép nhân.
+
+Các phương pháp loại thứ hai cho phép thay đổi mạnh mẽ hơn đối với kiến trúc, do đó cung cấp nhiều hứa hẹn hơn cho các loại phép toán không cần phép nhân mới. Một ví dụ nổi bật là AdderNet [4,30] hoặc EF-operator liên quan [38] dựa trên sự khác biệt tuyệt đối thay vì tích trong, và chỉ ra những điều này có thể phục vụ như các lớp thay thế cho tích chập hoặc cũng là các phần của lớp self-attention [30], mặc dù huấn luyện không thể được thực hiện hoàn toàn không cần phép nhân trong khi duy trì hiệu suất. Một loại kiến trúc cơ bản khác có thể phát sinh bằng cách thay thế số học cổ điển bằng đại số nhiệt đới, trong đó tất cả phép nhân được thay thế bằng phép cộng và phép cộng được thay thế bằng maximum. Trong khi hiệu quả về mặt số học, hiệu suất không được chỉ ra là cạnh tranh với mạng nơ-ron chuẩn [22, 9].
+
+Theo hiểu biết tốt nhất của chúng tôi, phương pháp của Mogami [25]—làm cơ sở cho công trình của chúng tôi ở đây—hiện tại là công trình duy nhất cho phép bảo tồn kiến trúc mạng nơ-ron trong khi đồng thời mở đường cho huấn luyện trên phần cứng hoàn toàn không cần phép nhân, nếu được áp dụng cho tất cả các yếu tố của quá trình huấn luyện.
+
+## 5 Thảo luận
+
+Mục tiêu chính của công trình này là chứng minh khả năng áp dụng của xấp xỉ hàm affine từng đoạn cho huấn luyện transformer từ đầu đến cuối. Trong thực nghiệm, chúng tôi đã chỉ ra rằng tất cả phép toán trong quá trình huấn luyện có thể được thay thế bằng các hàm như vậy. Chúng tôi tin đây là huấn luyện hoàn toàn không cần phép nhân đầu tiên của mô hình transformer và có thể là bất kỳ mạng nơ-ron nào. Trong khi PAM xấp xỉ phép nhân thực đến một mức độ nhất định, nó không nhằm mục đích làm như vậy chặt chẽ nhất có thể, không giống như phép nhân dấu phẩy động ở độ chính xác hữu hạn. Thay vào đó, PAM sử dụng các đoạn thẳng với độ dốc là lũy thừa của 2. Bằng cách làm như vậy, nó trở nên đơn giản hơn đáng kể, cung cấp cùng lợi ích phần cứng như thay thế tất cả phép nhân bằng ví dụ phép cộng, như một số phương pháp khác đối với mạng không cần phép nhân nhằm mục đích làm. Đồng thời, PAM xấp xỉ gần đúng phép nhân chuẩn tổng thể, cho phép nó hoạt động như một sự thay thế plug-in trên các trường hợp sử dụng khác nhau. Điều này bao gồm cập nhật tối ưu hóa và trung bình có trọng số trong attention, sẽ khó thay thế bằng thứ gì đó như phép cộng. Do đó, PAM dường như tạo ra sự cân bằng tốt giữa chi phí và tiện ích.
+
+Cảm hứng chính của chúng tôi là công trình của Mogami [25] đã áp dụng xấp xỉ affine từng đoạn cho mạng tích chập, bao gồm các lớp tích chập, lớp tuyến tính, batch normalization và hàm mũ. Tùy thuộc vào việc triển khai, điều này có thể đủ để làm cho lượt đi tới và lượt đi ngược hoàn toàn không cần phép nhân nhưng không may không rõ ràng từ bài báo và không có mã được công bố. Chúng tôi tập trung vào transformer làm cho cả lượt đi tới và lượt đi ngược không cần phép nhân và hoàn toàn affine từng đoạn. Chúng tôi cũng mở rộng điều này cho tối ưu hóa loại bỏ tất cả phép nhân trong quá trình huấn luyện, cho phép nó chạy hoàn toàn trên phần cứng không có hỗ trợ phép nhân.
+
+Mặc dù các phép toán affine từng đoạn đơn giản hơn về mặt logic so với các phép toán chuẩn tương đương, phần cứng đặc biệt được yêu cầu để gặt hái đầy đủ lợi thế lý thuyết. Bộ tăng tốc phần cứng hiện có, như GPU và TPU, có các đơn vị số học chuyên biệt cho phép nhân dấu phẩy động nhưng thiếu các mạch logic đơn giản hơn tương đối sẽ cho phép phép nhân affine từng đoạn nhanh. Trên thực tế, điều này có nghĩa là triển khai GPU hiện tại của chúng tôi phải thực hiện nhiều lệnh cho mỗi phép toán nhân-và-tích-lũy chuẩn khiến nó chạy chậm hơn đáng kể, ngay cả với kernel tùy chỉnh. Field-Programmable Gate Array (FPGA) là một loại phần cứng có thể hưởng lợi ngay lập tức từ PAM. Vì mạch logic của chúng hoàn toàn có thể cấu hình, chúng không có "chi phí chìm" của số học nhân chuẩn và thay vào đó có thể chi tiêu cho mạch PAM.
+
+Như được mô tả trong Phần 2.4, việc thay thế tất cả phép nhân và phi tuyến trong mạng nơ-ron bằng các phép toán affine từng đoạn dẫn đến mạng hoàn toàn cùng nhau affine từng đoạn trong cả đầu vào và trọng số. Đây là một tính chất lý thuyết thú vị vì nó khác biệt đáng kể so với transformer chuẩn.
+
+Đáng ngạc nhiên, việc thay thế tất cả phép toán trong chính mạng dường như không có tác động lớn đến hiệu suất trong thiết lập của chúng tôi. Điều này khác với quan sát của Mogami 2020 đã thấy rằng các lớp tuyến tính không hoạt động tốt với đạo hàm xấp xỉ. Chúng tôi quan sát một hiện tượng tương tự cho hàm mất mát có thể chỉ ra rằng huấn luyện nhạy cảm với lỗi nhẹ sớm trong lan truyền ngược.
+
+Dự án này tập trung vào mạng nơ-ron chuẩn mà không có bất kỳ sửa đổi nào. Tuy nhiên, sẽ thú vị khi khám phá việc sửa đổi kiến trúc mạng để phù hợp hơn với xấp xỉ affine từng đoạn. Một cách tiềm năng làm điều này là sử dụng log2 và exp2 xuyên suốt, chẳng hạn trong tính toán softmax và mất mát. Những phép toán này dễ xấp xỉ hơn nhiều so với các phép toán cơ số e tương đương. Khám phá tác động của lỗi cả từ quantization khi mantissa giảm và từ độ lệch độ lớn là một hướng nghiên cứu tương lai khác.
+
+## 6 Kết luận
+
+Trong công trình này, chúng tôi khám phá việc sử dụng các phép toán affine từng đoạn hiệu quả phần cứng cho huấn luyện transformer. Chúng tôi thử nghiệm trên CIFAR10 [19] và ImageNet-1k [6] với DeiT-tiny [32] cũng như trên dịch IWSLT14 từ tiếng Đức sang tiếng Anh [3] sử dụng mạng transformer nhỏ. Chúng tôi chỉ ra rằng phép nhân dấu phẩy động trong phép nhân ma trận có thể được thay thế bằng phép nhân affine từng đoạn hiệu quả về chi phí với suy giảm hiệu suất nhỏ hoặc không có cho tất cả ba tập dữ liệu, và không cần điều chỉnh siêu tham số bổ sung.
+
+Chúng tôi tiếp tục chỉ ra rằng có thể mở rộng điều này để thay thế tất cả phép nhân, chia và hàm phi tuyến trong transformer nhỏ, hàm mất mát và tối ưu hóa bằng các hàm affine từng đoạn. Tác động hiệu suất kết quả là nhỏ và có thể được giảm thêm bằng điều chỉnh siêu tham số. Điều này loại bỏ tất cả phép nhân trong toàn bộ quá trình huấn luyện, để huấn luyện hoàn toàn không cần phép nhân mà chúng tôi tin chưa được chứng minh trước đây. Điều này cũng làm cho mạng hoàn toàn và cùng nhau affine từng đoạn trong cả đầu vào và trọng số, một tính chất có thể có ý nghĩa lý thuyết.
+
+Chúng tôi công bố công khai mã của mình, bao gồm các kernel đã làm cho thực nghiệm của chúng tôi khả thi về mặt tính toán. Điều này có thể giúp nghiên cứu thêm trong lĩnh vực này và các phương pháp không cần phép nhân khác.
