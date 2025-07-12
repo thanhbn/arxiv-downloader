@@ -33,12 +33,57 @@ class AutocompletionSetup:
         self.commands = {
             'download': ['single', 'batch', 'crawler'],
             'convert': ['main'],
-            'translate': ['openai', 'claude', 'check', 'add-queue', 'cleanup', 'process-stalled'],
+            'translate': ['claude', 'openai', 'check', 'queue', 'cleanup', 'stalled', 'test'],
             'organize': ['enhanced', 'basic', 'simple'],
             'analyze': ['duplicates', 'translations', 'monitor', 'status'],
-            'inventory': ['create', 'update', 'check'],
-            'setup': ['init', 'config', 'test'],
+            'inventory': ['all', 'expected', 'quick'],
+            'setup': ['init', 'env', 'simple', 'test', 'direnv', 'completion'],
             'workflow': []
+        }
+        
+        # Command-specific options mapping
+        self.command_options = {
+            'download': {
+                'single': [],  # Uses positional args
+                'batch': [],   # Uses positional args
+                'crawler': []  # No known options
+            },
+            'convert': {
+                'main': ['--convert', '--rename', '--both', '--collection', '--all', '--help']
+            },
+            'translate': {
+                'claude': ['--workers', '--claude-path', '--queue-file', '--verbose', '--clean-only', '--clean-stale'],
+                'openai': [],
+                'check': ['--threshold', '--output', '--root-dir', '--move-vi', '--zip-txt', '--add-to-queue'],
+                'queue': ['--queue-file', '--recursive', '--force', '--list', '--clear'],
+                'cleanup': ['--threshold', '--backup', '--requeue', '--execute', '--verbose'],
+                'stalled': ['--execute', '--max-age', '--score'],
+                'test': []
+            },
+            'organize': {
+                'enhanced': ['--execute', '--base-dir', '--collections', '--exclude', '--log-level', '--log-file', '--verbose'],
+                'basic': [],
+                'simple': []
+            },
+            'analyze': {
+                'duplicates': ['--verbose', '--output-file', '--directory'],
+                'translations': [],
+                'monitor': [],
+                'status': []
+            },
+            'inventory': {
+                'all': ['--verbose', '--output-file', '--collections', '--format'],
+                'expected': ['--collection', '--collections', '--format'],
+                'quick': ['--summary']
+            },
+            'setup': {
+                'init': ['--quick', '--full'],
+                'env': [],
+                'simple': [],
+                'test': ['--verbose'],
+                'direnv': [],
+                'completion': ['--install', '--uninstall']
+            }
         }
         
         # Common file extensions for autocompletion
@@ -59,7 +104,30 @@ class AutocompletionSetup:
             f"    local commands=\"{' '.join(self.commands.keys())}\"",
             "",
             "    # Special options",
-            "    local options=\"--help --samples --list --version\"",
+            "    local options=\"--help --samples --list --interactive\"",
+            "",
+            "    # Handle option completion for any position",
+            "    if [[ \"$cur\" == --* ]]; then",
+            "        local cmd_options=\"\"",
+            "        case \"${words[1]}\" in"
+        ]
+        
+        # Add option completions for each command
+        for cmd, subcmds in self.commands.items():
+            if cmd in self.command_options:
+                script_lines.append(f"            {cmd})")
+                all_options = set()
+                for subcmd, opts in self.command_options[cmd].items():
+                    all_options.update(opts)
+                if all_options:
+                    script_lines.append(f"                cmd_options=\"{' '.join(sorted(all_options))}\"")
+                script_lines.append("                ;;")
+        
+        script_lines.extend([
+            "        esac",
+            "        COMPREPLY=($(compgen -W \"$cmd_options\" -- \"$cur\"))",
+            "        return 0",
+            "    fi",
             "",
             "    case $cword in",
             "        1)",
@@ -70,7 +138,7 @@ class AutocompletionSetup:
             "        2)",
             "            # Complete subcommands based on main command",
             "            case $prev in"
-        ]
+        ])
         
         # Add subcommand completions
         for cmd, subcmds in self.commands.items():
@@ -79,6 +147,23 @@ class AutocompletionSetup:
                 script_lines.append(f"                    COMPREPLY=($(compgen -W \"{' '.join(subcmds)}\" -- \"$cur\"))")
                 script_lines.append("                    return 0")
                 script_lines.append("                    ;;")
+        
+        script_lines.extend([
+            "            esac",
+            "            ;;",
+            "        3)",
+            "            # Complete options for subcommands",
+            "            case \"${words[1]}-${words[2]}\" in"
+        ])
+        
+        # Add specific option completions for command-subcommand pairs
+        for cmd, subcmd_options in self.command_options.items():
+            for subcmd, options in subcmd_options.items():
+                if options:
+                    script_lines.append(f"                {cmd}-{subcmd})")
+                    script_lines.append(f"                    COMPREPLY=($(compgen -W \"{' '.join(options)}\" -- \"$cur\"))")
+                    script_lines.append("                    return 0")
+                    script_lines.append("                    ;;")
         
         script_lines.extend([
             "            esac",
@@ -145,7 +230,7 @@ class AutocompletionSetup:
             "                '--help:Show help message'",
             "                '--samples:Show sample commands'",
             "                '--list:List available commands'",
-            "                '--version:Show version information'",
+            "                '--interactive:Interactive sample picker'",
             "            )",
             "            _describe 'commands' commands",
             "            ;;",
@@ -153,13 +238,19 @@ class AutocompletionSetup:
             "            case $words[2] in"
         ])
         
-        # Add subcommand completions
+        # Add subcommand completions with options
         for cmd, subcmds in self.commands.items():
             if subcmds:
                 script_lines.append(f"                {cmd})")
                 script_lines.append("                    local subcommands=(")
                 for subcmd in subcmds:
-                    script_lines.append(f"                        '{subcmd}:Subcommand {subcmd}'")
+                    # Add options for this subcommand
+                    options = self.command_options.get(cmd, {}).get(subcmd, [])
+                    if options:
+                        options_str = ' '.join(options)
+                        script_lines.append(f"                        '{subcmd}:Subcommand {subcmd} (options: {options_str})'")
+                    else:
+                        script_lines.append(f"                        '{subcmd}:Subcommand {subcmd}'")
                 script_lines.append("                    )")
                 script_lines.append("                    _describe 'subcommands' subcommands")
                 script_lines.append("                    ;;")
@@ -168,6 +259,30 @@ class AutocompletionSetup:
             "            esac",
             "            ;;",
             "        args)",
+            "            # Handle option completion",
+            "            if [[ $words[CURRENT] == --* ]]; then",
+            "                local cmd_options=()",
+            "                case \"$words[2]-$words[3]\" in"
+        ])
+        
+        # Add specific option completions for command-subcommand pairs
+        for cmd, subcmd_options in self.command_options.items():
+            for subcmd, options in subcmd_options.items():
+                if options:
+                    script_lines.append(f"                    {cmd}-{subcmd})")
+                    script_lines.append("                        cmd_options=(")
+                    for option in options:
+                        script_lines.append(f"                            '{option}:Option {option}'")
+                    script_lines.append("                        )")
+                    script_lines.append("                        ;;")
+        
+        script_lines.extend([
+            "                esac",
+            "                _describe 'options' cmd_options",
+            "                return 0",
+            "            fi",
+            "",
+            "            # Handle file completion",
             "            case $words[2] in",
             "                download)",
             "                    _files -g '*.txt'",
