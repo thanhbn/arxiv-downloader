@@ -110,23 +110,28 @@ class TranslationCleanup:
     
     def find_corresponding_english_file(self, vi_file: Path) -> Optional[Path]:
         """Find the corresponding English file for a Vietnamese translation."""
-        # Remove _vi suffix from filename
+        # Extract arXiv ID from Vietnamese filename
+        vi_name = vi_file.name
+        if '_vi.txt' in vi_name:
+            arxiv_id = vi_name.replace('_vi.txt', '')
+            
+            # Look for any English file starting with this arXiv ID in the same directory
+            for en_file in vi_file.parent.glob(f"{arxiv_id}*.txt"):
+                if not en_file.name.endswith('_vi.txt') and en_file.is_file():
+                    return en_file
+            
+            # Also check for PDF files with same arXiv ID
+            pdf_file = vi_file.parent / f"{arxiv_id}.pdf"
+            if pdf_file.exists():
+                # If PDF exists but no English txt, we could consider the VI file orphaned
+                pass
+        
+        # Fallback to original simple matching
         en_filename = vi_file.name.replace('_vi.txt', '.txt')
         en_file = vi_file.parent / en_filename
         
         if en_file.exists():
             return en_file
-        
-        # Try alternative naming patterns
-        alternatives = [
-            vi_file.name.replace('_vi.txt', '-vi.txt').replace('-vi.txt', '.txt'),
-            vi_file.name.replace('_vi.txt', '')
-        ]
-        
-        for alt in alternatives:
-            alt_file = vi_file.parent / alt
-            if alt_file.exists():
-                return alt_file
         
         return None
     
