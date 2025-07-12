@@ -1,0 +1,340 @@
+# QMoE: Nén Thực tế Dưới 1-Bit cho Mô hình Nghìn tỷ Tham số
+
+Elias Frantar1Dan Alistarh1 2
+
+## Tóm tắt
+
+Các kiến trúc Hỗn hợp các Chuyên gia (MoE) cung cấp một giải pháp tổng quát cho chi phí suy luận cao của các mô hình ngôn ngữ lớn (LLM) thông qua định tuyến thưa thớt, mang lại các mô hình nhanh hơn và chính xác hơn, với chi phí là số lượng tham số khổng lồ. Ví dụ, mô hình SwitchTransformer-c2048 có 1,6 nghìn tỷ tham số, yêu cầu 3,2TB bộ nhớ máy gia tốc để chạy hiệu quả, điều này khiến việc triển khai thực tế trở nên thách thức và đắt đỏ. Trong bài báo này, chúng tôi trình bày một giải pháp cho vấn đề bộ nhớ này, dưới dạng một khung nén và thực thi mới có tên QMoE. Cụ thể, QMoE bao gồm một thuật toán có thể mở rộng nén chính xác các MoE nghìn tỷ tham số xuống dưới 1 bit trên mỗi tham số, trong một định dạng tùy chỉnh được đồng thiết kế với các kernel giải mã GPU chuyên biệt để tạo điều kiện cho suy luận nén đầu cuối hiệu quả, với chi phí thời gian chạy nhỏ so với thực thi không nén. Cụ thể, QMoE có thể nén mô hình SwitchTransformer-c2048 1,6 nghìn tỷ tham số xuống dưới 160GB (nén 20x, 0,8 bit trên mỗi tham số) chỉ với mất mát độ chính xác nhỏ, trong vòng chưa đầy một ngày trên một GPU duy nhất. Điều này cho phép, lần đầu tiên, thực thi một mô hình nghìn tỷ tham số trên phần cứng thông dụng giá cả phải chăng, như một máy chủ đơn với 4x NVIDIA A6000 hoặc 8x NVIDIA 3090 GPU, với chi phí thời gian chạy dưới 5% so với suy luận không nén lý tưởng. Mã nguồn và các mô hình nén có sẵn tại github.com/IST-DASLab/qmoe.
+
+## 1. Giới thiệu
+
+Các mô hình ngôn ngữ lớn sinh tạo (LLM), ví dụ (Radford et al., 2019; Brown et al., 2020; Touvron et al., 2023a;b), đã thu hút sự chú ý đáng kể từ công nghiệp và công chúng do hiệu suất đáng ngạc nhiên của chúng trên nhiều tác vụ ngôn ngữ và lập luận thực tế. Tuy nhiên, một trở ngại lớn đối với việc triển khai rộng rãi là chi phí suy luận cực kỳ cao của chúng. Một cách tiếp cận đặc biệt hứa hẹn để giảm những chi phí này là sử dụng các kiến trúc Hỗn hợp các Chuyên gia (MoE), ví dụ (Fedus et al., 2022; Artetxe et al., 2022), có ý tưởng chung là nhân bản một số thành phần mô hình nhiều lần trong khi chỉ định tuyến mỗi đầu vào đến một tập con nhỏ của các bản sao đó. Thông qua "chuyên môn hóa" chuyên gia cho các tập con đầu vào, MoE đạt được suy luận nhanh hơn với cùng chất lượng mô hình, nhưng với chi phí bộ nhớ cao hơn đáng kể do các thành phần được nhân bản hàng trăm hoặc thậm chí hàng nghìn lần, đối với các mô hình lớn nhất và hiệu suất tốt nhất.
+
+Ví dụ, họ SwitchTransformer phổ biến (Fedus et al., 2022), mà chúng tôi tập trung vào trong nghiên cứu này, sử dụng từ 128 đến 2048 chuyên gia (các bản sao lớp) để vượt trội đáng kể so với các mô hình T5 dày đặc tiêu chuẩn (Raffel et al., 2020b) về chi phí suy luận và huấn luyện, với độ chính xác mô hình tương đương. Artetxe et al. (2022) báo cáo những cải thiện tương tự, trên các tác vụ khác nhau, cho 512 chuyên gia. Tuy nhiên, những kết quả này có chi phí là sự gia tăng đáng kể kích thước mô hình: SwitchTransformer lớn nhất có 1,6 nghìn tỷ tham số, yêu cầu 3,2TB lưu trữ ở độ chính xác nửa tiêu chuẩn, và tương ứng yêu cầu một trăm hoặc nhiều hơn các máy gia tốc đắt tiền (GPU hoặc TPU) để sử dụng hiệu quả. Điều này không chỉ khiến việc triển khai thực tế trở nên tốn kém và thách thức, mà còn hạn chế mạnh mẽ nghiên cứu về những mô hình như vậy.
+
+**Thách thức.** Một cách tự nhiên là hỏi liệu chi phí bộ nhớ thực sự khổng lồ của những MoE như vậy có thể được giảm thông qua các kỹ thuật tiêu chuẩn cho nén mô hình, như lượng tử hóa (Gholami et al., 2021) hoặc thưa thớt (Hoefler et al., 2021), mà không có mất mát độ chính xác đáng kể. Đạt được điều này sẽ yêu cầu vượt qua các rào cản khái niệm và kỹ thuật:
+
+1. Về mặt khái niệm, các phương pháp nén sau huấn luyện hiện tại, có chi phí đủ phải chăng để thực thi trên những mô hình như vậy, hiện tại chỉ có thể giảm độ chính xác xuống 3 hoặc 4 bit trên mỗi tham số (Frantar et al., 2022; Dettmers & Zettlemoyer, 2022; Wu et al., 2023) hoặc khoảng 50% thưa thớt (Frantar & Alistarh, 2023), trước khi xảy ra mất mát độ chính xác đáng kể. Tuy nhiên, làm cho các MoE nghìn tỷ tham số trở nên thực tế sẽ yêu cầu tỷ lệ nén từ 10× đến 20× so với độ chính xác 16-bit, tức là trung bình dưới 1 bit trên mỗi tham số.
+
+2. Một vấn đề thực tế quan trọng là mở rộng quy mô: áp dụng các phương pháp nén hiện đại, được thiết kế cho các mô hình dày đặc lớn, cho các MoE lớn hơn một bậc độ lớn, trong khi duy trì tính phải chăng, gặp phải vô số rào cản về bộ nhớ, hiệu suất và độ tin cậy.
+
+3. Thực sự đạt được nén dưới 1-bit sẽ yêu cầu một định dạng nén tùy chỉnh không tầm thường. Định dạng như vậy cũng sẽ cần đi kèm với các thuật toán giải mã có hiệu suất cao trên các máy gia tốc như GPU, để chạy suy luận trên các mô hình nén mà không có sự chậm lại xử lý lớn.
+
+**Đóng góp.** Trong bài báo này, chúng tôi vượt qua những thách thức này và giới thiệu QMoE, một khung cho nén chính xác và suy luận nén nhanh của các MoE khổng lồ, giảm kích thước mô hình 10-20×, xuống dưới 1 bit trên mỗi tham số. QMoE được thiết kế đặc biệt để nén và sau đó suy luận với các mô hình như SwitchTransformer-c2048 1,6 nghìn tỷ tham số, chỉ sử dụng tài nguyên tính toán khiêm tốn.
+
+Các đóng góp kỹ thuật chính của chúng tôi là một triển khai thuật toán nén có khả năng mở rộng cao và một định dạng nén tùy chỉnh được thiết kế cùng với các kernel GPU chuyên biệt để giải mã nhanh chóng. Hơn nữa, chúng tôi cho thấy lần đầu tiên rằng nén dưới 1-bit chính xác của các MoE nghìn tỷ tham số là khả thi và có thể đạt được thông qua các kỹ thuật nén không cần huấn luyện lại có giá cả phải chăng.
+
+Cụ thể, chúng tôi giảm kích thước của SwitchTransformer-c2048, mô hình lớn nhất có sẵn công khai, từ 3,2TB ở bfloat16 xuống dưới 160GB trong định dạng nén tùy chỉnh của chúng tôi, tức là ≈0,8 bit trên mỗi tham số, chỉ với sự gia tăng nhỏ trong mất mát trên dữ liệu xác thực huấn luyện trước và zero-shot. Sử dụng các kernel QMoE của chúng tôi, mô hình nén này sau đó có thể được thực thi đầy đủ, mà không có bất kỳ offloading chậm nào, trên phần cứng thông dụng như 8×NVIDIA RTX 3090 hoặc 4×NVIDIA A6000 GPU, với chi phí thời gian chạy <5% so với phiên bản lý tưởng hóa của thực thi không nén, điều này sẽ yêu cầu ≈20× nhiều GPU hơn.
+
+Tóm lại, công trình của chúng tôi cho phép, lần đầu tiên, thực thi hiệu suất của các mô hình MoE quy mô lớn trên phần cứng thông dụng. Điều này được minh họa bởi thực tế là chúng tôi có thể chạy hiệu quả mô hình SwitchTransformer-c2048 nghìn tỷ tham số trên một máy chủ GPU thông dụng đơn, với mất mát độ chính xác nhỏ. Điều này giải quyết một trong những hạn chế chính đằng sau các kiến trúc MoE, và sẽ cải thiện việc áp dụng thực tế của chúng cũng như tạo điều kiện cho nghiên cứu thêm về hiểu biết và cải thiện những mô hình như vậy.
+
+## 2. Bối cảnh
+
+### 2.1. Mô hình Hỗn hợp các Chuyên gia (MoE)
+
+Ý tưởng cốt lõi đằng sau các mô hình Hỗn hợp các Chuyên gia (MoE) là tăng số lượng tham số, và do đó sức mạnh mô hình hóa của mạng, trong khi vẫn giữ chi phí tính toán gần như không đổi, so với kiến trúc feed-forward tiêu chuẩn. Điều này thường đạt được bằng cách tạo nhiều bản sao của một số thành phần mô hình nhất định, mỗi thành phần chịu trách nhiệm xử lý chỉ một tập con của tất cả token đầu vào. Các phân công đầu vào-thành phần tương ứng thường được quyết định bởi một lớp "router". Có lẽ thiết kế MoE phổ biến nhất (Fedus et al., 2022; Artetxe et al., 2022), mà chúng tôi cũng tập trung vào trong bài báo này, là nhân bản mô-đun kết nối đầy đủ của Transformer và định tuyến token đến bản sao, được gọi là chuyên gia, với điểm phân công cao nhất được dự đoán bởi một lớp định tuyến tuyến tính; xem Hình 1 để minh họa. Thiết kế này cho phép huấn luyện và suy luận hiệu quả của các mô hình cực kỳ lớn, sử dụng hàng trăm hoặc thậm chí hàng nghìn chuyên gia, vì mỗi token chỉ được xử lý bởi một tập con nhỏ của mạng khổng lồ tổng thể.
+
+[Hình 1: Ví dụ về khối Transformer MoE. Mỗi token được định tuyến đến một khối kết nối đầy đủ (FC) khác nhau.]
+
+MoE đã được chứng minh mang lại những cải thiện đáng kể về độ chính xác và tốc độ huấn luyện với tốc độ suy luận tương đương (Clark et al., 2022; Du et al., 2022; Zoph et al., 2022). Tuy nhiên, tính thực tế hiện tại của chúng bị hạn chế vì chúng cực kỳ lớn về kích thước và do đó yêu cầu lượng bộ nhớ máy gia tốc khổng lồ để được thực thi hiệu quả.
+
+### 2.2. Lượng tử hóa Phụ thuộc Dữ liệu
+
+Chiến lược hiệu quả nhất hiện tại để giảm kích thước mô hình và chi phí bộ nhớ tương ứng là lượng tử hóa, tức là chuyển đổi trọng số mô hình sang độ chính xác số thấp hơn. Trên các mô hình lớn (Dettmers et al., 2022; Dettmers & Zettlemoyer, 2022), đặc biệt là cả MoE (Kim et al., 2022b; Yi et al., 2023), chỉ làm tròn đơn giản có thể giảm độ chính xác xuống 8 hoặc thậm chí 4 bit trên mỗi trọng số, với mất mát độ chính xác tối thiểu so với độ chính xác nửa tiêu chuẩn (16-bit) được sử dụng cho những mô hình này. Tuy nhiên, một số MoE lớn đến mức tỷ lệ giảm cao hơn đáng kể so với 4× (đạt được bởi 4-bit) sẽ được yêu cầu để làm cho chúng trở nên thực tế. Lượng tử hóa chính xác các mô hình đến độ chính xác cực thấp (ví dụ, thấp hơn 3 bit trên mỗi tham số) thường yêu cầu các phương pháp phụ thuộc dữ liệu phức tạp hơn (Nagel et al., 2020; Wang et al., 2020; Hubara et al., 2021).
+
+Những phương pháp lượng tử hóa phụ thuộc dữ liệu như vậy sử dụng một tập nhỏ dữ liệu hiệu chuẩn, được truyền qua mô hình. Khi điều này xảy ra, đối với mỗi lớp tuyến tính ℓ với trọng số Wℓ, các trọng số lượng tử hóa Qℓ được xác định từng cái một. Cụ thể, một cách tiếp cận để làm điều này là giải quyết một bài toán lượng tử hóa theo lớp, được phát biểu đối với Wℓ và các đầu vào dữ liệu hiệu chuẩn quan sát được Xℓ tại lớp hiện tại:
+
+argminQℓ||QℓXℓ−WℓXℓ||. (1)
+
+Nhiều giải pháp khác nhau cho Phương trình (1) đã được đề xuất, với một số được tối ưu hóa, về tốc độ và độ chính xác, đặc biệt cho các mô hình cực kỳ lớn, như GPTQ (Frantar et al., 2022) hoặc ZeroQuant (Yao et al., 2022; Wu et al., 2023). Phương pháp trước thực hiện lượng tử hóa sử dụng thông tin bậc hai trong ma trận Hessian theo lớp XℓX⊤ℓ, trong khi phương pháp sau áp dụng tối ưu hóa SGD với ước lượng gradient thẳng (Bengio et al., 2013).
+
+Một đặc điểm đáng chú ý khác của nhiều phương pháp như vậy là lượng tử hóa theo lớp có thể được thực hiện tuần tự, sử dụng đầu vào từ mô hình đã được lượng tử hóa một phần đến lớp ℓ−1, khi lượng tử hóa lớp ℓ, phục vụ để giảm tích lũy lỗi. Cụ thể, điều này có thể được triển khai hiệu quả bằng cách sử dụng Xℓ để tìm Qℓ trước khi chuyển Xℓ+1=QℓXℓ đến lớp tiếp theo.
+
+### 2.3. Lượng tử hóa MoE
+
+Có một số khía cạnh khiến lượng tử hóa bit rất thấp, ví dụ ternary (3 giá trị) trở nên hứa hẹn cho các mô hình MoE:
+
+• Trong nhiều kiến trúc, hầu như tất cả tham số đều nằm trong các chuyên gia, vì có hàng nghìn chúng. Điều này có nghĩa là, để giảm kích thước, chỉ cần tập trung vào nén những chuyên gia đó và để các lớp khác ở độ chính xác tiêu chuẩn. Điều này giảm tích lũy lỗi vì chỉ một tập con các mô-đun tham gia vào một lượt truyền tiến thực sự được lượng tử hóa.
+
+• Công trình trước đây đã quan sát thấy rằng các mô hình dày đặc cực kỳ lớn có khả năng chống lại nhiễu lượng tử hóa tốt hơn những mô hình nhỏ hơn (Frantar et al., 2022; Chee et al., 2023). Các MoE lớn có thể lớn hơn nhiều so với một số mô hình dày đặc khổng lồ này, và do đó là mục tiêu chính cho lượng tử hóa chính xác.
+
+• Huấn luyện MoE bao gồm tính ngẫu nhiên bổ sung thông qua tính không ổn định định tuyến và các chiến lược như token dropping (Lepikhin et al., 2020), điều này có thể vốn dĩ khuyến khích khả năng chống nhiễu cao. Fine-tuning cũng thường được thực hiện với dropout cao (Fedus et al., 2022).
+
+Các thí nghiệm của chúng tôi trong Phần 5.2 xác nhận rằng MoE thực sự có khả năng chống lại mức độ lượng tử hóa cực độ cao.
+
+## 3. Mở rộng Lượng tử hóa Phụ thuộc Dữ liệu cho MoE Nghìn tỷ Tham số
+
+### 3.1. Thách thức
+
+Trong khi các kỹ thuật lượng tử hóa phụ thuộc dữ liệu đã được sử dụng thành công để nén các mô hình dày đặc lớn lên đến 176 tỷ tham số (Frantar et al., 2022; Wu et al., 2023), áp dụng chúng cho các mô hình hỗn hợp chuyên gia thưa thớt lớn hơn một bậc độ lớn mang lại một số thách thức mới.
+
+**Chi phí Bộ nhớ.** Vấn đề lớn đầu tiên chúng tôi gặp phải là sự gia tăng lớn trong bộ nhớ cần thiết để áp dụng những kỹ thuật như vậy. Không chỉ trọng số mô hình gốc lớn gần 10× hơn, mà quá trình lượng tử hóa bản thân cũng cần >100× dữ liệu hơn. Ràng buộc thứ hai là do các phương pháp lượng tử hóa phụ thuộc dữ liệu chính xác yêu cầu một số lượng đủ mẫu đầu vào cho mỗi lớp đang được nén. Đối với các mô hình dày đặc rất lớn, một vài trăm nghìn "token hiệu chuẩn" thường đủ (Frantar et al., 2022; Yao et al., 2022). Tuy nhiên, trong MoE với hàng nghìn lớp, một chuyên gia đơn lẻ chỉ xử lý một tập con nhỏ của tất cả đầu vào, do đó chúng ta cần nhiều token hơn tổng thể để đạt được phủ sóng tốt của tất cả chuyên gia. Hơn nữa, trong các mô hình kiến trúc encoder-decoder, như SwitchTransformer, mỗi token chỉ được xử lý bởi một nửa của mô hình, lại gia tăng yêu cầu dữ liệu. Để nén nhanh, chúng ta phải duy trì kết quả trung gian cho toàn bộ tập dữ liệu hiệu chuẩn, điều này yêu cầu hàng trăm GB bộ nhớ cho các mô hình lớn nhất.
+
+**Sử dụng GPU.** Thách thức đáng kể tiếp theo là các triển khai lượng tử hóa quy mô lớn hiện tại, đặc biệt cho GPTQ và các phương pháp liên quan (Frantar et al., 2022; Chee et al., 2023), được thiết kế để nhanh và tiết kiệm bộ nhớ cho các lớp cá nhân khổng lồ xảy ra trong các mô hình dày đặc. Trong khi đó, MoE thường có các lớp nhỏ hơn, nhưng nhiều hơn 100× đến 1000×. Các triển khai hiện tại có sử dụng GPU kém trong trường hợp này, và do đó hiệu suất kém. Một vấn đề tương tự xảy ra nếu activations và trọng số phải được chuyển giữa CPU và GPU với tần suất cao, điều này có thể được yêu cầu để đối phó với yêu cầu bộ nhớ khổng lồ đã thảo luận trước đó.
+
+**Yêu cầu Độ tin cậy.** Cuối cùng, một vấn đề khác khi nén các mô hình với hàng chục nghìn lớp là việc chạy vào các trường hợp biên hiếm, có thể phá vỡ quá trình, rất có khả năng xảy ra. Điều này bao gồm các vấn đề số học như ma trận Hessian theo lớp không khả nghịch, cũng như những vấn đề cụ thể của mô hình, ví dụ, các mẫu định tuyến cực độ trên các lớp cụ thể.
+
+### 3.2. Thiết kế Hệ thống & Tối ưu hóa
+
+Trong phần này, chúng tôi mô tả thiết kế hệ thống và các tối ưu hóa để giải quyết các thách thức trong Phần 3.1. Điều này cho phép chúng tôi áp dụng nén phụ thuộc dữ liệu cho các MoE khổng lồ, trong khi bảo toàn đặc điểm chính của các kỹ thuật nén sau huấn luyện: khả năng thực hiện nén hiệu quả chỉ sử dụng tài nguyên tính toán khiêm tốn, ví dụ, một GPU NVIDIA A6000 đơn và ít hơn một ngày tính toán. Mặc dù chúng tôi tập trung vào mở rộng phương pháp GPTQ phổ biến, hầu hết các kỹ thuật được mô tả dưới đây sẽ tổng quát hóa cho các cách tiếp cận lượng tử hóa phụ thuộc dữ liệu khác, như ZeroQuant (Yao et al., 2022), cũng vậy.
+
+#### 3.2.1. Offloading Activation Tối ưu hóa
+
+Như đã thảo luận trong Phần 3.1, một thách thức chính trong việc nén MoE là chúng ta cần duy trì các tập activation khổng lồ. Tuy nhiên, có thể cẩn thận điều phối thực thi mô hình theo cách mà chúng ta chỉ cần thực hiện tính toán trên một tập con nhỏ của dữ liệu trung gian. Điều này cho phép chúng ta offload lưu trữ chính từ GPU sang bộ nhớ CPU ít đắt tiền và dồi dào hơn nhiều.
+
+Cụ thể, chúng tôi duy trì một buffer lớn đơn B mà chúng tôi cập nhật như sau, cho phần dày đặc của khối Transformer:
+
+1. Lấy một "mẫu" X, chứa một vài trăm token, từ CPU sang GPU.
+2. Truyền nó qua các lớp dày đặc tương ứng để có được kết quả Y.
+3. Tính toán và lưu trữ phân công chuyên gia cho các token trong Y.
+4. Gửi Y về CPU và ghi đè X trong B.
+
+và tương ứng cho phần thưa thớt, lặp qua các chuyên gia:
+
+1. Lấy tất cả các token cá nhân trong B đã được phân công cho chuyên gia E, ký hiệu bởi XE, từ CPU sang GPU.
+2. Sử dụng chúng để tạo ra chuyên gia nén E′ (ví dụ, với GPTQ).
+3. Chạy XE qua E′ để có được YE′.
+4. Gửi YE′ về CPU và ghi đè XE trong B.
+
+Quá trình này, được minh họa trong Hình 2, giảm thiểu cả tiêu thụ bộ nhớ và chi phí chuyển: chúng ta chỉ cần một bản sao duy nhất của B và mỗi token chỉ được đọc và viết hai lần cho mỗi khối Transformer.
+
+[Hình 2: Minh họa thực thi offloading cho phần thưa thớt của khối Transformer. Một chuyên gia E2 và các token đầu vào tương ứng XE của nó được lấy vào bộ nhớ GPU để tạo ra E′2, sau đó cùng với các đầu ra tương ứng YE được viết trở lại CPU.]
+
+#### 3.2.2. List Buffer
+
+Để hỗ trợ hiệu quả truy cập theo mẫu cho việc đánh giá các thành phần mô hình dày đặc, cũng như truy vấn vector hóa hoàn toàn các token chuyên gia, chúng tôi lưu trữ B như một cấu trúc dữ liệu list buffer. Điều này có thể được xem như một buffer liền kề khổng lồ của tất cả các trạng thái ẩn token, cùng với các chỉ số ranh giới biểu thị ranh giới giữa các mẫu cá nhân. Hình 3 minh họa định dạng lưu trữ này. Cấu trúc dữ liệu này rất quan trọng cho hiệu quả; việc lặp qua các mẫu một cách ngây thơ và lấy các token liên quan thông qua masking rất chậm đối với số lượng mẫu lớn không thể sử dụng được.
+
+[Hình 3: Ví dụ list buffer với 3 mẫu, được chỉ định bởi màu sắc.]
+
+#### 3.2.3. Lazy Weight Fetching
+
+Vì các trọng số của mô hình 1,6 nghìn tỷ tham số tiêu thụ >3TB lưu trữ, chúng không thể được lưu trữ trong RAM CPU. Do đó, chúng tôi lười biếng lấy chúng trực tiếp từ lưu trữ đĩa khi chúng được yêu cầu. Nếu chúng ta tuân theo quy trình suy luận được nêu trong Phần 3.2.1, điều này sẽ là chính xác một lần. Sau đó, bộ nhớ của chúng được giải phóng lại.
+
+#### 3.2.4. Expert Grouping
+
+Ngoài ra, để tránh sử dụng GPU kém (xem Phần 3.1), chúng tôi nhóm nhiều chuyên gia lại với nhau và áp dụng một biến thể batch joint của thuật toán GPTQ. Cụ thể, chúng tôi trích xuất các đầu vào XE tương ứng với tất cả chuyên gia E∈E trong nhóm E (các XE sẽ có kích thước khác nhau nói chung) và tính toán các Hessian HE. Những ma trận này, cùng với các ma trận trọng số WE, sau đó được xếp chồng thành các tensor 3 chiều, mà thuật toán GPTQ đã sửa đổi của chúng tôi hoạt động trên đó, nén tất cả chuyên gia đồng thời. Chúng ta cũng có thể tính toán HE=XEX⊤E trực tiếp với một matmul đơn vì các XE thường đủ nhỏ, tránh việc tích lũy chậm theo mẫu được sử dụng bởi các triển khai trước. Kích thước nhóm chuyên gia mặc định |E| của chúng tôi là 16, mang lại sự cân bằng tốt giữa tiêu thụ bộ nhớ GPU và sử dụng.
+
+Bảng 1 chứng minh tác động của expert grouping thông qua GPTQ batching, khi nén một lớp encoder thưa thớt của switch-base-128 sử dụng 10k mẫu; |E|= 16 mang lại khoảng ≈6× tăng tốc so với tính toán theo chuyên gia tiêu chuẩn.
+
+| |E|= 1 | |E|= 4 | |E|= 16 |
+|--------|--------|----------|
+| 174.1s | 54.4s  | 28.8s    |
+
+Bảng 1. Thời gian nén lớp thưa thớt cho các |E| khác nhau.
+
+#### 3.2.5. Sửa đổi Tính mạnh mẽ
+
+Để đạt được tính mạnh mẽ đủ cao để lượng tử hóa thành công các mô hình nghìn tỷ tham số với hàng chục nghìn lớp, chúng ta cần sử dụng các điều chỉnh số học và bộ nhớ khác nhau. Những điều quan trọng nhất được liệt kê dưới đây:
+
+• Chúng tôi sử dụng Hessian dampening tương đối cao hơn 10× δ = 0,1, tránh sự cố với các giá trị inf.
+
+• Rất ít Hessian lớp không khả nghịch ngay cả sau dampening cao; chúng tôi bỏ qua GPTQ cho những lớp đó và chỉ đơn giản thực hiện làm tròn vanilla.
+
+• Đôi khi một chuyên gia nhận được số lượng token lớn hơn nhiều so với trung bình, dẫn đến tình huống hết bộ nhớ khi những token này được lấy vào GPU. Chúng tôi tránh điều này bằng cách giới hạn số lượng token tối đa được sử dụng để nén ở 4× mức trung bình và sử dụng nhiều lần lặp để tính toán và cập nhật YE trong những trường hợp như vậy.
+
+### 3.3. Cải thiện Độ chính xác
+
+Ngoài việc triển khai một hệ thống nén hiệu quả cao, chúng tôi cũng có những khám phá mới về việc áp dụng GPTQ trong bối cảnh cụ thể của chúng tôi, tức là cho các mô hình được huấn luyện cho masked-language-modelling, MoE và lượng tử hóa ternary.
+
+**Premasking Special Tokens.** Đầu tiên, chúng tôi thấy rằng kết quả có thể được cải thiện nếu các token separator đặc biệt khác nhau được chèn bởi tác vụ masked-language-modelling (Raffel et al., 2020b) được loại trừ khỏi dữ liệu hiệu chuẩn được sử dụng cho nén. Cụ thể, trong encoder, chúng tôi mask out những "mask-token" đó trong quá trình tính toán Hessian. Trong khi đó, trong decoder, chúng tôi bỏ qua token ngay trước token đặc biệt như vậy vì đây là token được sử dụng để dự đoán token sau.
+
+Như được hiển thị trong Bảng 2 cho switch-base-128 với 10k mẫu, điều này mang lại loss thấp hơn đáng chú ý mà không có chi phí tính toán bổ sung. Chúng tôi nghĩ rằng vì những token đó rất phổ biến trong quá trình huấn luyện, mô hình mạnh mẽ đến mức trong dự đoán của chúng mà bất kỳ bù đắp lỗi nào trên chúng trong quá trình lượng tử hóa đều không cần thiết, trong khi làm xấu đi việc sửa chữa cho các token khác.
+
+| mask | BF16 | 2bit | tern |
+|------|------|------|------|
+| no   | 1.73 | 1.86 | 2.16 |
+| yes  | 1.73 | 1.76 | 1.99 |
+
+Bảng 2. Tác động của special token masking; validation loss.
+
+**Heuristics Không hiệu quả.** Chúng tôi cũng đánh giá hai heuristic cải thiện GPTQ được đề xuất gần đây hơn: activation reordering và true sequential execution (Frantar et al., 2023). Tuy nhiên, như được hiển thị trong Bảng 3 cho lượng tử hóa ternary của switch-base-128, chúng tôi thấy heuristic trước thực sự có hại và heuristic sau có chất lượng trung tính hơn hoặc ít hơn, đối với trường hợp sử dụng cụ thể của chúng tôi. Chúng tôi nghi ngờ rằng, trong setting tích cực này, lượng tử hóa tất cả các cột nhạy cảm nhất trước, dẫn đến các thay đổi lớn của toàn bộ ma trận trọng số, và do đó đến overfitting.
+
+| GPTQ | act | seq | act + seq |
+|------|-----|-----|-----------|
+| 1.99 | 2.23| 1.99| 2.28      |
+
+Bảng 3. Activation reordering (act) và sequential execution (seq).
+
+## 4. Thực hiện Nén Dưới 1-Bit
+
+Sử dụng hệ thống của chúng tôi được thảo luận trong Phần 3, chúng ta có thể lượng tử hóa chính xác các SwitchTransformer cực kỳ lớn đến độ rộng bit rất thấp: 2-bit và thậm chí ternary (3 giá trị có thể). Tuy nhiên, trong thực tế, điều này vẫn chưa đáp ứng mục tiêu nén của chúng tôi là dưới 1 bit trên mỗi tham số. Chúng tôi thấy rằng tỷ lệ nén có thể được đẩy xa hơn đáng kể bằng cách tận dụng entropy thấp trong các trọng số lượng tử hóa. Tiếp theo, chúng tôi đồng thiết kế một sơ đồ mã hóa và một CUDA kernel thực hiện nén dưới 1-bit trên mỗi trọng số trong thực tế, với chi phí tối thiểu về chi phí thực thi GPU cho suy luận.
+
+### 4.1. Natural Sparsity
+
+Chúng tôi chọn lưới lượng tử hóa theo cách tiêu chuẩn: theo hàng xung quanh các giá trị trọng số min và max (Dettmers et al., 2022; Frantar et al., 2022), ví dụ, cho ternary: {wmin,0, wmax}. Những lưới khá rộng này kết hợp với thực tế là trọng số thường được phân bố gần như bình thường, tự nhiên dẫn đến sparsity cao sau lượng tử hóa, tức là một số lượng lớn các số không. Chúng tôi chứng minh điều này trong Bảng 4, trung bình trên tất cả các lớp. Đối với trọng số ternary, mô hình lớn nhất đạt được gần 90% natural sparsity; độ lệch chuẩn cũng khá thấp, ở <5%. Nhìn theo cách khác, các trọng số lượng tử hóa có entropy thấp, có nghĩa là, trung bình, đáng kể ít bit hơn trên mỗi trọng số sẽ được yêu cầu cho lưu trữ lossless.
+
+| model   | 2-bit | ternary |
+|---------|-------|---------|
+| base128 | 72.2% | 85.7%   |
+| large128| 73.1% | 86.4%   |
+| c2048   | 76.5% | 88.6%   |
+
+Bảng 4. Natural sparsity cho các mô hình nén khác nhau.
+
+### 4.2. Từ Sparsity đến Entropy
+
+Cách trực tiếp để sử dụng những tỷ lệ số không cao này sẽ là dưới dạng biểu diễn thưa thớt & lượng tử hóa joint (Kurtic et al., 2022; Yu et al., 2023): chỉ lưu trữ các giá trị lượng tử hóa của trọng số khác không, cùng với metadata vị trí cần thiết. Tuy nhiên, vì mức lượng tử hóa cơ sở của chúng tôi đã rất thấp, các định dạng metadata sparsity tiêu chuẩn (Elsen et al., 2020; Lin et al., 2023) sẽ chỉ cho phép nén bổ sung hạn chế. Một bitmask chỉ ra các vị trí khác không yêu cầu 1 bit trên mỗi trọng số, trong khi các chỉ số cột 10-13 bit (tùy thuộc vào kích thước lớp) thậm chí còn ít hiệu quả bộ nhớ hơn ở mức sparsity chúng ta gặp. Do đó, chúng tôi thực hiện một cách tiếp cận khác: chúng tôi không sử dụng sparsity trực tiếp mà là entropy thấp, điều này được ngụ ý bởi thực tế rằng một giá trị đơn (0) xảy ra rất thường xuyên, sử dụng một sơ đồ mã hóa thích hợp.
+
+#### 4.2.1. Thách thức Giải mã GPU Nhanh
+
+Về nguyên tắc, chúng ta có thể nhóm nhiều trọng số ternary liên tiếp thành super-symbol và sau đó áp dụng một mã gán codeword có độ dài thay đổi cho những super-symbol đó, dựa trên xác suất xuất hiện của chúng, ví dụ, thông qua cách tiếp cận Huffman (Huffman, 1952). Nếu các giá trị trọng số lượng tử hóa gần như độc lập, điều này sẽ đạt được tỷ lệ nén mạnh; trên thực tế, đối với tính độc lập thực tế, chúng sẽ về cơ bản là Shannon-optimal (MacKay, 2003).
+
+Đồng thời, mục tiêu chính của chúng tôi là sử dụng các mô hình nén cho suy luận nhanh và tiết kiệm không gian. Do đó, điều quan trọng là không chỉ sơ đồ mã hóa của chúng tôi đạt được nén tốt, mà còn có thể được giải mã nhanh trên phần cứng GPU. Điều này thách thức vì một số lý do:
+
+**Thách thức 1:** Các mã dựa trên entropy thường có phụ thuộc giải mã tuần tự: symbol i chỉ có thể được xác định nếu độ dài, là biến thiên, của tất cả (i−1) symbol trước được biết. Do đó, xử lý các symbol liên tiếp đồng thời dẫn đến chi phí đồng bộ hóa cao.
+
+**Thách thức 2:** Các từ nhị phân trong lưu trữ (ví dụ, các blob INT32) có thể chứa số lượng symbol giải mã khác nhau. Do đó, ngay cả khi các hàng/khối được mã hóa độc lập, giải mã song song sẽ xảy ra không đồng đều, trong khi tất cả thread trong một GPU-warp phải luôn thực thi cùng một lệnh. Điều này sẽ dẫn đến nhiều thao tác lãng phí.
+
+**Thách thức 3:** Giải mã bit thấp có độ dài thay đổi liên quan đến một số lượng lớn các thao tác nhị phân như shifts, không đặc biệt hiệu quả trên GPU.
+
+**Thách thức 4:** Các ma trận cá nhân của MoE thường không rất lớn, khiến việc chia chúng thành đủ phân đoạn giải mã riêng biệt để đạt được sử dụng GPU tốt trở nên khó khăn mà không phải lưu trữ dữ liệu bổ sung để phá vỡ phụ thuộc tuần tự, điều này sẽ làm hại tỷ lệ nén.
+
+Ngược lại, các sản phẩm ma trận-vector độ chính xác nửa không nén, là thao tác chính bên dưới suy luận sinh tạo, dễ dàng đạt được sử dụng băng thông bộ nhớ gần như lý tưởng và do đó trình bày một baseline rất mạnh.
+
+### 4.3. Đồng thiết kế Sơ đồ Nén & Kernel
+
+Để đạt được mục tiêu của chúng tôi, chúng ta cần thiết kế một sơ đồ nén và kernel giải mã GPU của nó cùng nhau, và có thể đánh đổi nén cho giải mã nhanh hơn. Chúng tôi bắt đầu với tổng quan về các ý tưởng chính đằng sau cách tiếp cận của chúng tôi, sau đó thảo luận chi tiết về các chi tiết quan trọng.
+
+#### 4.3.1. Tổng quan
+
+Thay vì một mã với codeword có độ dài thay đổi (xem Phần 4.2.1) ánh xạ đến dữ liệu có độ dài cố định, chúng tôi sẽ sử dụng một mã dựa trên từ điển với codeword có độ dài cố định ánh xạ đến một số lượng thay đổi symbol. Những sơ đồ dựa trên LZW như vậy (Welch, 1984) phổ biến cho nén mục đích chung như ZIP, vì chúng đặc biệt hiệu quả cho dữ liệu văn bản với các phân đoạn lặp lại dài. Trong khi một mã từ điển không lý tưởng về tỷ lệ nén cho trường hợp dữ liệu gần như ngẫu nhiên trong ứng dụng của chúng tôi, nó sẽ là chìa khóa cho giải mã GPU nhanh.
+
+Đầu tiên, thiết kế kernel của chúng tôi sử dụng một warp, tức là 32 thread liên tiếp, để xử lý một hàng của ma trận trọng số, mỗi hàng được mã hóa độc lập. Điều này giải quyết Thách thức 4 trong Phần 4.2.1, mang lại sử dụng GPU hợp lý cho các kích thước ma trận liên quan, với chi phí metadata không đáng kể. Hơn nữa, chúng tôi sử dụng một mã cố định-thành-thay đổi với một từ điển lớn. Điều này cho phép chúng tôi sử dụng một warp đầy đủ để xử lý một codeword tại một thời điểm, trích xuất tất cả dữ liệu, trong khi duy trì hiệu quả tốt, do đó giải quyết các Thách thức 1 và 2. Theo cách này, các thao tác bit và base-3 chậm (cho ternary) cũng có thể được giữ ở mức tối thiểu, giải quyết Thách thức 3.
+
+#### 4.3.2. Thiết kế và Triển khai Từ điển
+
+Nói chung, giả sử rằng các giá trị của ma trận trọng số ternary (ký hiệu bởi 0, 1, 2) được phân bố gần như độc lập theo phân bố:
+
+P(0) = p0, P(1) = P(2) = (1−p0)/2, (2)
+
+trong đó p0 biểu thị xác suất lấy mẫu 0, ví dụ, 0,885 như trong Bảng 4. Vì chúng tôi dự định sử dụng một từ điển khá lớn, nó nên được chia sẻ giữa nhiều ma trận trọng số, để từ điển bản thân không gây ra chi phí lưu trữ đáng kể. Chúng tôi thấy rằng một từ điển tĩnh như vậy hoạt động đủ tốt, trong khi đơn giản hóa nén tiết kiệm bộ nhớ (xem Phần 3.2) vì chúng ta không phải thu thập thống kê trên nhiều chuyên gia chưa được nén.
+
+Tiếp theo, chúng tôi xem xét các cặp giá trị ternary t= (t1, t2), có xác suất tương ứng là P(t) =P(t1)P(t2). Chúng tôi tạo 216 chuỗi xác suất cao nhất chứa tối đa 14 cặp như vậy. Từ điển này có thể được tạo bằng cách sử dụng hàng đợi ưu tiên tối đa trên xác suất, như được hiển thị bởi Thuật toán 1.
+
+Để hiểu ngắn gọn quy trình, chú ý rằng trong lần lặp đầu tiên, nó sẽ đẩy tất cả các cặp cá nhân t= (t1, t2) vào hàng đợi ưu tiên, sắp xếp chúng theo xác suất giảm dần, sau đó chúng sẽ được mở rộng theo thứ tự này.
+
+Chúng tôi có chính xác 216 codeword vì điều này cho phép chúng tôi lưu trữ chúng trong kiểu dữ liệu UINT16 gốc, tránh bất kỳ bit-extraction chậm nào ở mức giải mã này. Mỗi codeword đó ánh xạ đến hai giá trị UINT32 liên tiếp chứa tối đa 7 cặp mỗi giá trị, được lưu trữ sử dụng 2 bit cho mỗi giá trị ternary, theo sau là tổng số cặp trong chuỗi; xem cũng Hình 4. Định dạng này quyết định số cặp tối đa được chọn của chúng tôi là 14. Hơn nữa, chúng tôi xem xét các cặp, chứ không phải trọng số cá nhân, để phù hợp với số đếm tối đa vào 4 bit. Định dạng 2-bit-per-weight được sử dụng vì có đủ không gian, trong khi mã hóa ternary compact hơn sẽ liên quan đến các thao tác modulo và division chậm để trích xuất. Chúng tôi lưu trữ pair-count hai lần để mỗi thread có thể làm việc chỉ với một nửa dữ liệu, được lưu trữ trong kiểu INT32 nhanh.
+
+[Hình 4: Định dạng dữ liệu của một entry từ điển; ở đây của 24 trọng số.]
+
+Nhìn chung, ánh xạ codeword 16-bit đến data blob 64-bit đạt được sự cân bằng tốt giữa một số mục tiêu: (a) Có codeword ánh xạ đến, trung bình, nhiều giá trị không nén hơn so với bitwidth của chúng, một điều kiện cần thiết để đạt được nén <1-bit. (b) Giảm thiểu chi phí lưu trữ tổng thể của từ điển để phù hợp với L2-cache của GPU, điều này quan trọng cho hiệu suất giải mã tốt. (c) Sử dụng càng nhiều thread trong một warp càng tốt để đồng thời trích xuất trọng số thuần túy từ dữ liệu đã giải mã; thường, >16 sẽ làm công việc hữu ích và chỉ 4 trong số 32 thread không bao giờ hoạt động trong bước này. (d) Tránh càng nhiều điều kiện và thao tác bổ sung cần thiết để xử lý lưu trữ dữ liệu không đồng nhất càng tốt, điều này làm chậm song song hóa.
+
+Cuối cùng, chúng tôi lưu ý rằng trong khi tra cứu từ điển về nguyên tắc là truy cập ngẫu nhiên, việc giữ nó được sắp xếp từ xác suất cao nhất đến thấp nhất đảm bảo hành vi caching rất thuận lợi. Vì mỗi tra cứu cũng tự động prefetch một số phần tử tiếp theo, và hầu hết tra cứu là cho các codeword xảy ra thường xuyên, có nhiều hit L1-cache nhanh.
+
+**Xác thực.** Để đánh giá hiệu quả của sơ đồ của chúng tôi, chúng tôi tính toán tỷ lệ nén đạt được, cả trên mô hình c2048 lượng tử hóa ternary thực và trên các ma trận trọng số được lấy mẫu trực tiếp từ phân bố (2), mang lại 20,07× và 21,11×, tương ứng. Khoảng cách chỉ ≈5% này cho thấy rằng giả định độc lập đơn giản hóa của chúng tôi thực sự khá gần cho các mô hình lớn. Chúng tôi cũng lưu ý rằng tỷ lệ của chúng tôi chỉ ≈20% cách xa giới hạn nén lý thuyết của phân bố (với p= 0,885) là 25,40×, mà chúng tôi coi là một sự đánh đổi hợp lý để cho phép giải mã GPU nhanh.
+
+#### 4.3.3. GPU Kernel
+
+Đã định nghĩa định dạng từ điển, chúng ta giờ có thể thảo luận thiết kế của kernel giải mã thực tế chi tiết. Chúng tôi tập trung vào thao tác quan trọng nhất cho suy luận, decompression được hợp nhất với matrix-vector-product. Tuy nhiên, kỹ thuật của chúng tôi có thể dễ dàng được điều chỉnh cho các trường hợp sử dụng khác, ví dụ, decompression thuần túy.
+
+Listing 1 cung cấp pseudocode giống CUDA cho kernel của chúng tôi, tính toán matrix-vector-product của ma trận nén wcomp (với metadata rowoff và terminmax, sử dụng từ điển dec) và vector BF16 x, vào buffer đầu ra y. Việc xử lý các trường hợp biên khác nhau và một số tính toán chỉ số đã được loại bỏ để dễ đọc. Vui lòng xem repository của chúng tôi để có triển khai hoàn toàn chức năng.
+
+[Listing 1: Pseudocode kernel đơn giản hóa cho thao tác decompress + matrix-vector-product được hợp nhất.]
+
+**Song song hóa.** Nhìn chung, mỗi threadblock sẽ xử lý nhiều hàng liên tiếp, mỗi hàng được xử lý bởi một warp đơn. Chúng tôi sử dụng chính xác một thread-block cho mỗi GPU Streaming Multiprocessor (SM) với min(#rows in block, 32) warp; nếu có nhiều hơn 32 hàng trong một block, (một số) warp tuần tự xử lý nhiều hàng (lưu ý rằng phần này được bỏ qua trong Listing 1 để đơn giản). Điều này tránh bất kỳ hiệu ứng wave quantization xấu nào. Chúng tôi thấy chiến lược này là một heuristic hiệu quả mang lại hiệu suất tốt cho tất cả hình dạng ma trận chúng tôi xem xét.
+
+**Thực thi.** Kernel của chúng tôi bắt đầu bằng cách tải toàn bộ vector đầu vào vào shared memory (xshared, dòng 7-9), sử dụng tất cả warp trong một threadblock. Điều này cho phép truy cập phần tử nhanh trong các tích lũy product-sum theo hàng tiếp theo.
+
+Tiếp theo, mỗi warp xử lý hàng tương ứng của nó bằng cách đầu tiên lấy (tối đa) 32 codeword vào shared memory (wcompblock, dòng 23) sử dụng một giao dịch coalesced đơn. Sau đó nó lặp qua những symbol đó, xử lý từng cái một (dòng 26-33). Đầu tiên, sử dụng 28 trong số 32 thread của nó (dòng 25), nó lấy dữ liệu giải mã tương ứng từ từ điển nơi UINT32 đầu tiên được gán cho thread 0-13 và UINT32 thứ hai cho thread 14-27 (wx14, dòng 27). Sau đó, mỗi thread trích xuất trọng số ternary tương ứng của nó (dòng 29-30) và thêm sản phẩm đầu vào tương ứng vào bộ tích lũy kết quả một phần của riêng nó (res, dòng 31). Chúng tôi lưu ý rằng các lần đọc đầu vào từ shared memory liền kề và không gây ra xung đột bank. Sau đó, mỗi thread tiến offset index (idx, dòng 32) vào vector đầu vào bằng tổng số trọng số được mã hóa trong symbol hiện tại.
+
+Cuối cùng, sau khi toàn bộ hàng đã được quét, một warp-reduction (dòng 37-38) trên các kết quả một phần của mỗi thread mang lại đầu ra (y, dòng 39-40).
+
+**Giải mã Ternary.** Một chi tiết liên quan khác là trọng số ternary được lưu trữ như 0,1,2 (dòng 29) nhưng cần được dequantize thành 0, wmin, wmax để nhân với đầu vào. Chúng tôi thấy rằng cách hiệu quả nhất để thực hiện chuyển đổi này là thông qua bảng tra cứu shared memory (dòng 11-14). Điều quan trọng, bảng này cần được nhân bản 32 lần qua column-dimension để tránh xung đột bank rất thường xuyên, điều này sẽ xảy ra mỗi khi không phải tất cả 28 thread dequantize cùng một giá trị (dòng 30). May mắn, chỉ có 3 giá trị đầu vào và do đó kích thước tổng thể của nó có thể chấp nhận được.
+
+**Mã hóa.** Cho đến nay, chúng tôi chỉ tập trung vào thao tác giải mã, nhưng chúng tôi cũng phải mã hóa ma trận với hiệu quả hợp lý. Nói chung, điều này được thực hiện bằng cách xây dựng cấu trúc dữ liệu trie (của từ điển được thảo luận trong Phần 4.3.2) ánh xạ chuỗi đến codeword. Sau đó, chúng tôi lặp qua đầu vào trong khi đồng thời traversing trie để tìm longest prefix match, mang lại các codeword tương ứng. Cuối cùng, chúng tôi pack các hàng có độ dài khác nhau một cách dày đặc vào buffer liền kề và ghi lại các row offset tương ứng. Không giống như giải mã, mã hóa không rất quan trọng về độ trễ và một GPU kernel thẳng thắn sử dụng một thread cho mỗi hàng của ma trận để nén là đủ.
+
+## 5. Thí nghiệm
+
+### 5.1. Thiết lập Chung
+
+**Mô hình.** Chúng tôi tập trung thí nghiệm của mình vào họ mô hình SwitchTransformer (Fedus et al., 2022). Mục tiêu chính của chúng tôi là biến thể lớn nhất, c2048, với khoảng 1,6 nghìn tỷ tham số, nhưng chúng tôi cũng xem xét các phiên bản tương đối nhỏ base128 (7B tham số) và large128 (26B tham số) để thử nghiệm và ablation. Chúng tôi chọn họ SwitchTransformer vì nó chứa mô hình lớn nhất có sẵn công khai, cũng có tỷ lệ token huấn luyện với tham số tương tự hoặc cao hơn so với các lựa chọn thay thế tiềm năng như Artetxe et al. (2022). Hơn nữa, những mô hình đó cũng nằm trong số các MoE khổng lồ phổ biến nhất, với một số triển khai trên các framework.
+
+**Framework.** Vì khả năng tiếp cận là một mục tiêu chính của công việc chúng tôi, chúng tôi xây dựng codebase của mình xung quanh PyTorch-backend của framework HuggingFace rất phổ biến (Wolf et al., 2019), thay vì trên môi trường huấn luyện gốc của SwitchTransormer MeshTensorflow (Shazeer et al., 2018) hoặc người kế nhiệm dựa trên JAX T5X (Google, 2023). Điều này mang lại một số thách thức bổ sung.
+
+Đầu tiên, chúng tôi thấy rằng các biến thể mô hình lớn nhất yêu cầu một số bugfix, chủ yếu là thay đổi cấu hình và thiết lập mô hình, để chạy đúng cách. Chúng tôi nghi ngờ rằng điều này là do kích thước khổng lồ của chúng đã khiến việc thử nghiệm rộng rãi trở nên rất khó khăn. Thứ hai, chúng tôi quan sát thấy một sự thiếu hiệu quả lớn trong bối cảnh suy luận sinh tạo cho các mô hình với số lượng lớn chuyên gia: triển khai HuggingFace sẽ thực hiện một số (trống) lệnh gọi CUDA cho hàng nghìn chuyên gia tiềm năng mà không có token nào được định tuyến đến, tích lũy chi phí lớn. Chúng tôi sửa đổi triển khai (cũng cho baseline) để bỏ qua những lệnh gọi không cần thiết như vậy, dẫn đến >10× tăng tốc cho các mô hình lớn. Chúng tôi áp dụng tất cả thay đổi cho framework HuggingFace chỉ động tại runtime, để mã của chúng tôi có thể chạy trực tiếp với cài đặt chính thức.
+
+HuggingFace ưu tiên tính dễ sử dụng và linh hoạt hơn hiệu suất cao. Vì lý do đó, chúng tôi tiến hành đo lường suy luận không chỉ end-to-end, bao gồm tất cả chi phí HuggingFace, mà còn theo cách riêng biệt, so sánh các thao tác ma trận không nén và nén trực tiếp. Điều này là để chứng minh rằng các kernel GPU của chúng tôi cũng sẽ mang lại chi phí thấp trong các môi trường suy luận được tối ưu hóa hơn.
+
+**Bộ dữ liệu.** SwitchTransformer đã được huấn luyện cho mục tiêu Masked-Language-Modelling (MLM) (Raffel et al., 2020b) trên bộ dữ liệu C4 (Raffel et al., 2020a). Tương tự như hầu hết các công trình trong lĩnh vực lượng tử hóa LLM (Yao et al., 2022; Frantar et al., 2022; Dettmers & Zettlemoyer, 2022), chúng tôi tập trung vào nén upstream chung trực tiếp trên tổ hợp tác vụ/bộ dữ liệu pretraining này. Do đó, đánh giá của chúng tôi tập trung vào hiệu suất validation cho C4/MLM, nơi chúng tôi sử dụng bản sao công khai của C4 trên HuggingFace cũng như bản sao của quy trình masking gốc. Dữ liệu hiệu chuẩn cho nén được lấy, theo thứ tự, từ hai shard đầu tiên của tập huấn luyện. Để hiệu quả, chúng tôi chủ yếu đánh giá trên 128 mẫu (tương ứng với loss trung bình trên >10K token, khá ổn định) từ shard đầu tiên của tập validation, nhưng chúng tôi cũng thực hiện một số đánh giá trên các bộ dữ liệu khác.
+
+**Phần cứng.** Tất cả thí nghiệm nén, bao gồm cả những thí nghiệm cho các mô hình lớn nhất, có thể được thực hiện trong vòng chưa đầy một ngày trên một NVIDIA A6000 đơn với 48GB bộ nhớ GPU. Tuy nhiên, nén hiệu quả các mô hình nghìn tỷ tham số sử dụng số lượng lớn mẫu hiệu chuẩn yêu cầu một vài trăm GB RAM (CPU); bản thân mô hình 1.6T gốc cũng chiếm >3TB lưu trữ đĩa. Chúng tôi nhấn mạnh rằng công việc của chúng tôi được thực hiện trong môi trường rất hạn chế cho các mô hình có kích thước này, ví dụ, đã không thể tải toàn bộ mô hình 1.6T (không nén) vào RAM, chứ đừng nói đến bộ nhớ GPU. Để suy luận trên các mô hình nén, chúng tôi cũng sẽ xem xét chạy trên nhiều NVIDIA 3090 GPU, với 24GB bộ nhớ mỗi cái, ngoài A6000.
+
+### 5.2. Kết quả Nén
+
+**Độ chính xác.** Chúng tôi bắt đầu bằng cách lượng tử hóa tất cả mô hình SwitchTransformer đến độ chính xác 2-bit và ternary, và đánh giá validation loss của chúng. Số lượng mẫu hiệu chuẩn mặc định của chúng tôi là 10K cho 128 chuyên gia và 160K cho 2048, nhưng chúng tôi cũng xem xét sử dụng 0,5× và 2× nhiều mẫu. Ngoài việc sử dụng framework QMoE hiệu quả của chúng tôi được thảo luận trong Phần 3, chúng tôi cũng xem xét baseline round-to-nearest (RTN) tiêu chuẩn (Dettmers et al., 2022). Chúng tôi mô phỏng cái sau bằng cách cố định Hessian thành ma trận đơn vị, do đó áp dụng chính xác cùng thiết lập lượng tử hóa và giao thức đánh giá. Bảng 5 tóm tắt kết quả của chúng tôi.
+
+| method      | base128      | large128     | c2048        |
+|-------------|--------------|--------------|--------------|
+|             | 2bit | tern | 2bit | tern | 2bit | tern |
+| BF16        | 1.73        | 1.55        | 1.18        |
+| RTN         | 2.27 | 4.54 | 1.96 | 2.79 | 1.33 | 2.15 |
+| QMoE 0.5x   | 1.78 | 2.11 | 1.54 | 1.70 | 1.22 | 1.27 |
+| QMoE 1.0x   | 1.76 | 1.99 | 1.56 | 1.69 | 1.20 | 1.26 |
+| QMoE 2.0x   | 1.76 | 1.93 | 1.57 | 1.64 | 1.21 | 1.26 |
+
+Bảng 5. So sánh C4 validation loss cho SwitchTransformer lượng tử hóa 2-bit và ternary (tern). "QMoE 0.5x" chỉ ra rằng chỉ một nửa số lượng mẫu hiệu chuẩn mặc định được sử dụng.
+
+Có lẽ đáng ngạc nhiên, làm tròn vanilla (RTN) không dẫn đến sự sụp đổ mô hình hoàn toàn ngay cả ở độ chính xác ternary, nhấn mạnh tính mạnh mẽ cao của các MoE lớn đối với lượng tử hóa. Tuy nhiên, sự gia tăng loss khá đáng kể cho các mô hình nhỏ hơn ở 2-bit và quá lớn để có thể sử dụng ở độ chính xác ternary. Ngược lại, sử dụng lượng tử hóa phụ thuộc dữ liệu, 2-bit có thể đạt được với loss tối thiểu (1,7% tương đối trên c2048) và ternary chỉ với sự gia tăng nhỏ (6,7% tương đối trên c2048). Điều này không chỉ chứng minh hiệu quả của những phương pháp lượng tử hóa nâng cao như vậy trong bối cảnh này, mà còn cho thấy rằng nén bit cực thấp thực sự thực tế cho các MoE khổng lồ.
+
+Ngoài ra, chúng tôi tiến hành đánh giá trên dữ liệu Arxiv, GitHub, StackeEchange và Wikipedia được lấy mẫu từ RedPajama (Computer, 2023). Mặc dù chỉ <0,01% dữ liệu hiệu chuẩn C4 của chúng tôi có nguồn gốc từ những trang web đó, mô hình nén vẫn bảo toàn hiệu suất gần như tốt như trên lõi của phân bố (xem Bảng 6).
+
+| bits | arxiv | github | stackexch. | wiki |
+|------|-------|--------|------------|------|
+| BF16 | 1.31  | 0.99   | 1.15       | 1.20 |
+| 2-bit| 1.34  | 1.05   | 1.17       | 1.24 |
+| tern | 1.42  | 1.13   | 1.22       | 1.32 |
+
+Bảng 6. Đánh giá bổ sung cho mô hình c2048.
+
+Về dữ liệu hiệu chuẩn, chúng ta thấy rằng tăng lượng mẫu thường cải thiện hiệu suất một chút, đáng chú ý nhất cho lượng tử hóa ternary, nhưng cũng có một số nhiễu trong quá trình, đặc biệt ở 2-bit.
+
+**Nén.** Tiếp theo, chúng tôi điều tra tỷ lệ nén thực tế được đạt bằng cách nén thêm các mô hình ternary sử dụng sơ đồ của chúng tôi được giới thiệu trong Phần 4. Chúng tôi xem xét cả nén tương đối với chỉ các mô-đun MoE (các phần mô hình chúng ta lượng tử hóa) cũng như với toàn bộ mô hình và tất cả metadata của nó. Tỷ lệ nén và kích thước checkpoint tổng thể được liệt kê trong Bảng 7.
+
+| model   | moe-only | full | size [GB]   |
+|---------|----------|------|-------------|
+|         |          |      | bf16 | ours |
+| base128 | 17.06×   |11.76×| 14.9 | 1.27 |
+| large128| 18.34×   |13.32×| 52.7 | 3.96 |
+| c2048   | 20.07×   |19.81×|3142  |158.6 |
+
+Bảng 7. Tỷ lệ nén và kích thước cho các mô hình ternary.
+
+Nói chung, đo chỉ tương đối với các phần chúng ta nén (moe-only), tất cả kích thước đạt được >16× tỷ lệ nén và do đó <1 bit trên mỗi tham số lưu trữ. Trên c2048, ngay cả tỷ lệ tổng thể, bao gồm tất cả các lớp dày đặc không nén, vẫn ở 19,81×, tương ứng với 0,807 bit trên mỗi tham số, giảm kích thước checkpoint từ 3142GB xuống 158,6GB. Người ta cũng có thể quan sát rằng tỷ lệ nén tăng với kích thước mô hình, vì hai lý do: (a) natural sparsity tăng trong khi từ điển mã hóa của chúng tôi cũng được tối ưu hóa cho c2048 (xem Phần 4), và (b) phân bố trọng số trở nên gần với độc lập hơn cho kích thước lớp lớn hơn.
+
+**Runtime.** Cuối cùng, chúng tôi đánh giá mất bao lâu để tạo ra các mô hình nén trên một GPU A6000 đơn, cho các lượng dữ liệu hiệu chuẩn khác nhau. Kết quả được hiển thị trong Bảng 8. Các mô hình nhỏ hơn có thể được nén trong chưa đầy một giờ và thậm chí c2048 trong chưa đầy một ngày, xác nhận hiệu quả cao của QMoE. Sự gia tăng runtime từ large128 đến c2048 gần như tỷ lệ thuận với sự khác biệt về kích thước, mặc dù cái sau sử dụng 16× mẫu hơn. Điều này là do số lượng mẫu trên mỗi chuyên gia giữ nguyên và kích thước chuyên gia tăng chỉ một chút. Cuối cùng, chúng tôi lưu ý rằng chỉ đơn giản (lặp) tải mô hình 1.6T gốc vào RAM mất gần 5 giờ trên lưu trữ đĩa chậm của chúng tôi.
+
+| model   | 5K/80K   | 10K/160K | 20K/320K |
+|---------|----------|----------|----------|
+| base128 | 8.4min   | 14.0min  | 21.6min  |
+| large128| 22.0min  | 30.2min  | 45.2min  |
+| c2048   | 13.3h    | 16.0h    | 20.8h    |
+
+Bảng 8. Runtime nén cho kích thước dữ liệu hiệu chuẩn khác nhau.
+
+### 5.3. Kết quả Runtime
+
+**Các Lớp Cá nhân.** Đánh giá hiệu suất kernel của chúng tôi bắt đầu với so sánh trực tiếp (riêng biệt) các kernel matrix-vector product nén của chúng tôi (xem Phần 4) với các kernel cuBLAS bfloat16 tiêu chuẩn (không nén) của PyTorch. Hình 5 (Trái) hiển thị thời gian được thực hiện bởi các kernel nén của chúng tôi tương đối với bfloat16, cho các hình dạng ma trận được tìm thấy trong MoE của chúng tôi, trên hai GPU khác nhau. Trong khi các kernel của chúng tôi phải thực hiện ít lần đọc bộ nhớ (toàn cục) chậm hơn nhiều so với baseline bfloat16 do chi phí lưu trữ thấp hơn, chúng cần phải dành nhiều tính toán hơn cho việc giải nén phức tạp của các trọng số được nén nặng. Tuy nhiên, thực thi các kernel nén của chúng tôi mất ít thời gian hơn so với baseline bfloat16 gần như lý tưởng trong tất cả trường hợp, với tăng tốc lên đến 35% trên các hình dạng ma trận cụ thể. Chúng tôi lưu ý rằng đây là những thao tác có độ trễ rất thấp, với ma trận nhỏ nhất mất <0,02 millisecond và lớn nhất <0,05.
+
+**Thực thi End-to-End.** Cuối cùng, chúng tôi cũng benchmark các kernel của mình end-to-end trong HuggingFace trên các trọng số thực của các mô hình MoE nén của chúng tôi. Chúng tôi xem xét một ứng dụng người dùng cá nhân, như (Frantar et al., 2022; Leviathan et al., 2023; Park et al., 2022), nơi một prompt đơn (được lấy mẫu từ C4) nên được xử lý để tạo ra phản hồi 128-token. Vì thực sự chạy phiên bản bfloat16 của mô hình c2048 sẽ yêu cầu >65 A6000 và >130 3090 GPU (so với 4 và 8, tương ứng, cho trọng số nén dưới 1-bit) chúng tôi phải ước lượng runtime của nó. Chúng tôi làm điều này bằng cách để tất cả chuyên gia trong một lớp trỏ đến cùng dữ liệu trọng số (giải quyết hoàn toàn vấn đề bộ nhớ), điều này cho phép chúng tôi thu thập thời gian với chính xác cùng chi phí như cho các mô hình nén của chúng tôi. Tuy nhiên, đây là một ước lượng rất lạc quan vì thực thi thực sự sẽ yêu cầu gần 20× GPU hơn, với chi phí truyền thông tương ứng, và số liệu của chúng tôi do đó chỉ nên được xem như là giới hạn dưới.
+
+Kết quả, được hiển thị trong Hình 5 (Phải), chứng minh rằng thực thi end-to-end của các mô hình nén chỉ <5% chậm hơn so với thực thi tiêu chuẩn (không nén). Sự chậm lại nhẹ này mặc dù thời gian theo lớp nhanh hơn là do thực tế rằng encoder đôi khi có thể định tuyến nhiều token đến cùng một chuyên gia. Triển khai hiện tại của chúng tôi ngây thơ thực thi một matrix-vector product riêng biệt cho mỗi token, trong khi baseline thực hiện một matrix multiplication joint hiệu quả hơn nhiều. Đối với các ứng dụng mà đây là bottleneck đáng kể, người ta có thể dễ dàng giới thiệu một vòng lặp bên trong qua token vào kernel của chúng tôi (Listing 1, dòng 30), hoặc giải nén hoàn toàn trước, theo sau là một matmul tiêu chuẩn, cho số lượng token lớn.
+
+## 6. Công trình Liên quan
+
+**Mô hình Hỗn hợp Chuyên gia (MoE).** Các mô hình hỗn hợp chuyên gia là một hướng nghiên cứu phổ biến nhằm tạo ra các mô hình quy mô lớn hiệu quả hơn đáng kể (Fedus et al., 2022; Artetxe et al., 2022; Clark et al., 2022). Tại lõi của MoE nằm các cơ chế định tuyến (thưa thớt), trong đó nhiều biến thể đã được đề xuất. Chúng dao động từ phân công tĩnh dựa trên ID token đầu vào (Roller et al., 2021), qua việc khớp token-chuyên gia động (Zhou et al., 2022), đến định tuyến "mềm" của các kết hợp đầu vào tuyến tính (Puigcerver et al., 2023). Vì MoE có thể có các hồ sơ tính toán khá khác biệt so với các mô hình dày đặc tiêu chuẩn, cũng có nghiên cứu đáng kể về tối ưu hóa các hệ thống suy luận và huấn luyện (Barham et al., 2022; Gale et al., 2023; Hwang et al., 2023). Trong số các vấn đề quan trọng nhất trong lĩnh vực này là trao đổi dữ liệu giữa các máy gia tốc trong quá trình định tuyến và xử lý tải tính toán không đều cho các chuyên gia khác nhau.
+
+**Lượng tử hóa LLM.** Lượng tử hóa là một kỹ thuật nén rất phổ biến, đã thấy một lượng lớn công trình (Gholami et al., 2021), đặc biệt trong bối cảnh LLM. Cụ thể, khả năng thực hiện lượng tử hóa trọng số chính xác cho các mô hình tỷ tham số đã thúc đẩy rất nhiều khả năng tiếp cận của chúng: đã được chứng minh rằng các mô hình dày đặc cực kỳ lớn có thể được lượng tử hóa đến độ chính xác 8- hoặc thậm chí 4-bit với ít mất mát độ chính xác (Dettmers et al., 2022; Yao et al., 2022; Frantar et al., 2022; Dettmers & Zettlemoyer, 2022). Đẩy về phía bitwidth thậm chí thấp hơn thông qua các định dạng nén phức tạp hơn, như nhóm đa cấp kết hợp với outlier độ chính xác cao hơn (Dettmers et al., 2023b), hoặc các kỹ thuật lượng tử hóa mới, như preprocessing incoherence (Chee et al., 2023), là một lĩnh vực nghiên cứu tích cực. Hiện tại, lượng tử hóa chính xác đến 2 hoặc ít bit hơn trên mỗi tham số dường như là một rào cản lớn cho lượng tử hóa sau huấn luyện của LLM tiêu chuẩn. Ngược lại, trong công trình này chúng tôi cho thấy rằng các mô hình MoE khổng lồ dường như có thể nén được đáng kể hơn, vì chúng tôi đạt được nén dưới 1-bit với sự gia tăng loss tương đương với lượng tử hóa 3-bit hoặc 4-bit của LLM tiêu chuẩn với các kỹ thuật nâng cao.
+
+**Nén MoE.** Cũng đã có công trình về nén các mô hình MoE cụ thể. Chen et al. (2022) và Koishekenov et al. (2022) thực hiện nén thông qua chuyên môn hóa MoE cho các bộ dữ liệu finetuning "downstream" cụ thể bằng cách cắt tỉa các thành phần không liên quan đến tác vụ cụ thể. Ngược lại, chúng tôi tập trung vào nén "upstream" chung của mô hình pretrained, thông qua lượng tử hóa bit cực thấp. Các công trình khác (Kim et al., 2022b; Yi et al., 2023; Kim et al., 2023) cũng thực hiện lượng tử hóa MoE, nhưng tập trung vào bitwidth cao hơn đáng chú ý, như 8 hoặc 4 bit trên mỗi trọng số. Điều này được thực hiện chủ yếu thông qua làm tròn đơn giản, mà như được hiển thị bởi các thí nghiệm của chúng tôi, không đủ chính xác cho nén 2-bit đầy đủ hoặc thấp hơn. Kim et al. (2022a) đạt được lượng tử hóa 2-bit trên một MoE 5 tỷ tham số, được coi là tương đối nhỏ trong lĩnh vực này, bằng cách tối ưu hóa thêm mô hình thông qua Quantization-Aware Training (Nagel et al., 2021). Áp dụng cách tiếp cận như vậy cho các mô hình quy mô nghìn tỷ sẽ cực kỳ tốn tài nguyên. Họ cũng không cung cấp bất kỳ cơ chế nào để khai thác lượng tử hóa bit thấp và natural sparsity tương ứng của nó trong thực tế, điều này thách thức và tạo thành một đóng góp chính của công việc chúng tôi.
+
+Chúng tôi đặc biệt tập trung vào khả năng mở rộng và tính thực tế. Trong khi các công trình hiện tại nghiên cứu các mô hình với nhiều nhất hàng chục tỷ tham số, chúng tôi chứng minh hiệu quả và hiệu suất của các kỹ thuật của mình ở quy mô nghìn tỷ tham số, cả cho bản thân quá trình lượng tử hóa cũng như cho suy luận thực tế của các mô hình nén.
+
+## 7. Thảo luận và Hạn chế
+
+Chúng tôi đã trình bày QMoE, một framework nén và suy luận end-to-end để giải quyết chi phí bộ nhớ khổng lồ của suy luận MoE. Chúng tôi đã cho thấy, lần đầu tiên, rằng các mô hình như SwitchTransformer-c2048 nghìn tỷ tham số có thể được nén chính xác xuống dưới 1 bit trên mỗi tham số, gần 20× tỷ lệ nén, trong một định dạng tùy chỉnh cho phép thực thi end-to-end hiệu quả đầu tiên của mô hình như vậy trên một máy chủ GPU thông dụng đơn. QMoE hoàn toàn mã nguồn mở và được xây dựng xung quanh framework HuggingFace phổ biến, làm cho việc triển khai và nghiên cứu cho các MoE khổng lồ trở nên rẻ hơn đáng kể và dễ tiếp cận hơn.
+
+Nghiên cứu của chúng tôi bị giới hạn ở một tập hạn chế các mô hình, vì chỉ có rất ít MoE khổng lồ và chính xác có sẵn công khai. Ngoài ra, do kích thước của chúng, hầu hết MoE được huấn luyện và triển khai trong các framework chuyên biệt khác nhau, yêu cầu tích hợp thủ công phức tạp để sử dụng cho nghiên cứu thêm. Tuy nhiên, chúng tôi đã bao phủ một số MoE lớn nhất và chính xác nhất có sẵn, cụ thể là SwitchTransformer (Fedus et al., 2022). Một phần mở rộng tự nhiên của công việc chúng tôi sẽ là áp dụng các kỹ thuật QMoE của chúng tôi cho các mô hình và biến thể MoE khác, như Artetxe et al. (2022) hoặc SoftMoE được đề xuất gần đây (Puigcerver et al., 2023).
+
+Ngoài ra, chúng tôi đã tập trung vào nén trực tiếp của mô hình base pretrained. Tuy nhiên, sẽ cũng thú vị khi finetune thêm một mô hình nén cho các tác vụ downstream chuyên biệt, tương tự như QLoRA (Dettmers et al., 2023a). Zoph et al. (2022) báo cáo kết quả mạnh khi finetuning chỉ các lớp không phải chuyên gia, mà QMoE để lại không nén, gợi ý rằng ứng dụng này có thể hứa hẹn. Chúng tôi hy vọng khám phá điều này trong công việc tương lai.
+
+[Phần Tài liệu tham khảo được giữ nguyên như trong bản gốc]

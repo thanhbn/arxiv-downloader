@@ -1,0 +1,218 @@
+# LLM-FP4: Bộ biến đổi được lượng tử hóa điểm động 4-bit
+
+Shih-yang Liu∗1, Zechun Liu∗2, Xijie Huang1, Pingcheng Dong1, Kwang-Ting Cheng1
+1Đại học Khoa học và Công nghệ Hồng Kông, 2Meta Reality Labs
+{sliuau, xhuangbs, pingcheng.dong}@connect.ust.hk
+zechunliu@meta.com
+timcheng@ust.hk
+
+## Tóm tắt
+
+Chúng tôi đề xuất LLM-FP4 để lượng tử hóa cả trọng số và hoạt động trong các mô hình ngôn ngữ lớn (LLM) xuống giá trị điểm động 4-bit, theo cách sau huấn luyện. Các giải pháp lượng tử hóa sau huấn luyện (PTQ) hiện tại chủ yếu dựa trên số nguyên và gặp khó khăn với độ rộng bit dưới 8 bit. So với lượng tử hóa số nguyên, lượng tử hóa điểm động (FP) linh hoạt hơn và có thể xử lý tốt hơn các phân phối đuôi dài hoặc hình chuông, và đã trở thành lựa chọn mặc định trong nhiều nền tảng phần cứng. Một đặc điểm của lượng tử hóa FP là hiệu suất của nó phần lớn phụ thuộc vào việc lựa chọn bit số mũ và phạm vi cắt. Về vấn đề này, chúng tôi xây dựng một baseline FP-PTQ mạnh mẽ bằng cách tìm kiếm các tham số lượng tử hóa tối ưu. Hơn nữa, chúng tôi quan sát thấy một mô hình phương sai liên kênh cao và phương sai nội kênh thấp trong phân phối hoạt động, điều này làm tăng khó khăn trong lượng tử hóa hoạt động. Chúng tôi nhận thấy mô hình này nhất quán trên một phổ các mô hình transformer được thiết kế cho các nhiệm vụ đa dạng, như LLM, BERT và các mô hình Vision Transformer. Để giải quyết vấn đề này, chúng tôi đề xuất lượng tử hóa hoạt động theo kênh và chỉ ra rằng các yếu tố tỷ lệ bổ sung này có thể được tái tham số hóa như các độ lệch số mũ của trọng số, gây ra chi phí không đáng kể. Phương pháp của chúng tôi, lần đầu tiên, có thể lượng tử hóa cả trọng số và hoạt động trong LLaMA-13B chỉ xuống 4-bit và đạt điểm trung bình 63.1 trên các nhiệm vụ lý luận zero-shot thông thường, chỉ thấp hơn 5.8 so với mô hình độ chính xác đầy đủ, vượt trội đáng kể so với state-of-the-art trước đó 12.7 điểm. Mã nguồn có sẵn tại: https://github.com/nbasyl/LLM-FP4.
+
+## 1 Giới thiệu
+
+Kể từ khi giới thiệu kiến trúc transformer (Vaswani et al., 2017), transformer đã thay thế các mạng nơ-ron đệ quy, nổi lên như kiến trúc chi phối trong nhiều nhiệm vụ xử lý ngôn ngữ tự nhiên (NLP) (Kenton và Toutanova, 2019; Lewis et al., 2020). Tác động biến đổi của transformer đã được thúc đẩy thêm bởi sự xuất hiện của các mô hình như GPT (Brown et al., 2020; OpenAI, 2023), đẩy độ phổ biến của kiến trúc này lên tầm cao mới. Trong khi đó, tính linh hoạt của transformer mở rộng ra ngoài NLP, bao gồm các lĩnh vực đa dạng như thị giác (Dosovitskiy et al.; Touvron et al., 2021), âm thanh (Akbari et al., 2021), v.v. Xu hướng hướng tới một kiến trúc thống nhất cho các phương thức khác nhau đại diện cho một phát triển đột phá trong lĩnh vực học sâu.
+
+Tuy nhiên, những tiến bộ trong hiệu suất transformer đi kèm với sự gia tăng tương ứng về kích thước mô hình và chi phí tính toán (Kaplan et al., 2020). Điều này đặt ra những thách thức đáng kể khi cố gắng tận dụng toàn bộ tiềm năng của các mô hình transformer trong các trường hợp sử dụng mà tài nguyên bộ nhớ hoặc tính toán bị hạn chế. Mặc dù có nghiên cứu rộng rãi và việc áp dụng rộng rãi các transformer, lĩnh vực nén transformer vẫn còn tương đối ít được khám phá. Để giải quyết khoảng trống này, nghiên cứu của chúng tôi tập trung vào việc nén transformer, đặc biệt thông qua các kỹ thuật lượng tử hóa sau huấn luyện điểm động.
+
+Lượng tử hóa sau huấn luyện (PTQ) mang lại lợi thế đơn giản sử dụng với yêu cầu tinh chỉnh tối thiểu (Nagel et al., 2020; Cai et al., 2020). Các giải pháp PTQ hiện tại cho transformer chủ yếu tập trung vào lượng tử hóa số nguyên (INT) (Liu et al., 2021; Yuan et al., 2022), có thể hiệu quả trong một số tình huống nhưng thường bị phá vỡ khi độ rộng bit dưới 8 bit. Mặt khác, lượng tử hóa điểm động (FP) đã thu hút sự chú ý đáng kể như một lựa chọn thay thế linh hoạt hơn, có khả năng phù hợp tốt hơn với các phân phối hoạt động và trọng số khác nhau. Trên thực tế, FP8 đã trở thành lựa chọn mặc định trong các nền tảng phần cứng khác nhau, bao gồm NVIDIA H100.
+
+Khác với lượng tử hóa số nguyên (INT), một thách thức đặc biệt trong lượng tử hóa điểm động (FP) là cách chọn bit số mũ và tham số tỷ lệ thích hợp. Việc lựa chọn tham số không phù hợp có thể dẫn đến kết quả lượng tử hóa kém hoặc phân kỳ. Để giải quyết thách thức này, chúng tôi giới thiệu một công thức mạnh mẽ cho lượng tử hóa FP, tận dụng tái tạo theo lớp để tìm kiếm đồng thời các bit số mũ và giá trị tối đa tối ưu. So với các phương pháp trước đây sử dụng cập nhật gradient cho bit số mũ (Kuzmin et al., 2022), phương pháp dựa trên tìm kiếm của chúng tôi chứng minh ổn định hơn và liên tục mang lại kết quả lượng tử hóa mong muốn, thiết lập một baseline mạnh cho FP-PTQ.
+
+Hơn nữa, cuộc điều tra của chúng tôi khám phá một mô hình thú vị của phân phối hoạt động trong transformer, đặc trưng bởi phương sai liên kênh cao và phương sai nội kênh thấp. Các mô hình tương tự cũng được quan sát trong các công trình trước đây (Xiao et al., 2022; Dettmers et al., 2022), trong khi chúng tôi lập luận rằng mô hình này vốn có trong kiến trúc transformer và không giới hạn ở các nhiệm vụ cụ thể, vì chúng tôi đã quan sát các mô hình nhất quán không chỉ trong các mô hình ngôn ngữ lớn mà còn trong mô hình BERT và thậm chí cả vision transformer. Được thúc đẩy bởi những phát hiện này, chúng tôi giới thiệu một độ lệch số mũ được dịch chuyển trước mới lạ cho lượng tử hóa FP của transformer. Cụ thể, chúng tôi tận dụng phương sai hoạt động theo kênh được tính từ dữ liệu hiệu chuẩn và tái tham số hóa các tỷ lệ này như độ lệch số mũ của các vector trọng số FP được lượng tử hóa tương ứng. Phương pháp này hiệu quả giải quyết thách thức do phương sai liên kênh cao gây ra trong khi gây ra chi phí tính toán không đáng kể.
+
+Tóm lại, chúng tôi nghiên cứu lượng tử hóa sau huấn luyện điểm động (PTQ) cho kiến trúc transformer, và đóng góp của bài báo này bao gồm:
+
+• Chúng tôi đề xuất một khung tìm kiếm để xác định độ lệch số mũ tối ưu và giá trị lượng tử hóa tối đa. Phương pháp này vượt trội hơn các kỹ thuật hiện tại về tính ổn định và hiệu suất, thiết lập một baseline mạnh cho lượng tử hóa sau huấn luyện điểm động.
+
+• Chúng tôi đề xuất một kỹ thuật mới, độ lệch số mũ được dịch chuyển trước, hiệu quả giải quyết thách thức của phương sai liên kênh cao trong transformer với chi phí tính toán không đáng kể.
+
+• Kết quả thực nghiệm chứng minh rằng phương pháp được đề xuất mang lại mô hình LLaMA-13B lượng tử hóa trọng số và hoạt động FP4 khả dụng đầu tiên với chỉ 5.8 điểm suy giảm trong các nhiệm vụ lý luận zero-shot so với mô hình độ chính xác đầy đủ, giảm khoảng cách ~70% so với SoTA trước đó.
+
+• Chúng tôi mở rộng thêm phương pháp của mình cho BERT và vision transformer. Nó vượt qua BERT lượng tử hóa 4-bit tốt nhất trước đó 7.8 điểm trên tập dữ liệu GLUE và đạt 31.4 điểm độ chính xác cao hơn so với phương pháp lượng tử hóa ViT SoTA trước đó cho DeiT-S 4-bit trên tập dữ liệu ImageNet.
+
+## 2 Công trình liên quan
+
+### 2.1 Lượng tử hóa sau huấn luyện
+
+Lượng tử hóa mô hình có thể được phân loại chủ yếu thành huấn luyện có nhận thức lượng tử hóa (QAT) và lượng tử hóa sau huấn luyện (PTQ), tùy thuộc vào việc nó có bao gồm huấn luyện bổ sung để tinh chỉnh trọng số hay không. Hầu hết các nghiên cứu PTQ chủ yếu tập trung vào mạng nơ-ron tích chập (CNN) (Nagel et al., 2020; Li et al., 2021; Wu et al., 2020; Cai et al., 2020; Nagel et al., 2019). Tuy nhiên, với sự phổ biến ngày càng tăng của các mô hình dựa trên transformer, chỉ có một số lượng hạn chế các công trình (Bondarenko et al., 2021; Yuan et al., 2022; Ding et al., 2022) đã được thực hiện để hiện thực PTQ trên transformer. Hơn nữa, các công trình hiện tại chủ yếu tập trung vào các mô hình visual transformer và thể hiện hiệu suất kém khi độ rộng bit dưới 8. Do đó, trong công trình này, chúng tôi đi sâu vào các thách thức của PTQ bit thấp cho transformer ngôn ngữ.
+
+### 2.2 Lượng tử hóa điểm động
+
+Lượng tử hóa điểm động (FP) đã nổi lên như một lựa chọn thay thế đầy hứa hẹn cho lượng tử hóa số nguyên do khả năng xử lý phân phối đuôi dài và cung cấp tính linh hoạt tăng (Kuzmin et al., 2022). Ngoài ra, các GPU hiện đại như H100 (Micikevicius et al., 2022) hiện hỗ trợ lượng tử hóa FP. Tuy nhiên, nghiên cứu tối thiểu đã được tiến hành về lượng tử hóa FP. Chỉ có (Kuzmin et al., 2022) đề xuất một sơ đồ lượng tử hóa FP8 tổng quát chủ yếu cho các nhiệm vụ thị giác, và (Zhang et al., 2023) áp dụng lượng tử hóa hỗn hợp định dạng FP và INT cho LLM. Trong công trình này, chúng tôi đề xuất baseline FPQ như một hướng dẫn tổng quát cho PTQ điểm động bit thấp để nén các mô hình transformer ngôn ngữ.
+
+## 3 Kiến thức cơ bản
+
+### 3.1 Công thức của biến điểm động
+
+Một số điểm động chuẩn được biểu diễn như:
+XFP = (-1)^s * 2^(p-b) * (1 + d1/2 + d2/2^2 + ... + dm/2^m)  (1)
+
+trong đó s ∈ {0,1} là bit dấu. di ∈ {0,1} là bit mantissa thứ i, m biểu thị số bit mantissa. p là một số nguyên trong [0, 2^e - 1], và e biểu thị số bit số mũ. b là một độ lệch số mũ nguyên. Một điểm động với j bit số mũ và k bit mantissa được ký hiệu là định dạng FP EjMk.
+
+### 3.2 Quá trình lượng tử hóa điểm động
+
+Trong lượng tử hóa số nguyên, biến có giá trị thực XR được lượng tử hóa thành số nguyên XINT với công thức sau:
+
+XINT = ⌊Clip(XR/α, Qmin, Qmax)⌉  (2)
+
+trong đó ⌊·⌉ là hàm làm tròn. XR là biến có giá trị thực, α đại diện cho yếu tố tỷ lệ độ chính xác đầy đủ, và Qmin, Qmax là giá trị min/max của phạm vi lượng tử hóa. Tương tự, một biến có giá trị thực XR có thể được chuyển đổi thành điểm động XFP trong hai bước.
+
+(1) Tỷ lệ và cắt. Trong lượng tử hóa FP, chúng ta cũng tỷ lệ và cắt biến có giá trị thực trước khi lượng tử hóa như:
+
+X'R = Clip(XR, Qmin, Qmax)  (3)
+
+trong đó phạm vi giá trị min/max của lượng tử hóa điểm động có dấu có thể được tính từ Eq.1:
+
+Qmax = -Qmin = (2 - 2^(-m)) * 2^(2^e - b - 1)  (4)
+
+Ở đây độ lệch số mũ nguyên b là một siêu tham số điều chỉnh khác kiểm soát Qmax và Qmin, có chức năng tương tự như α. Do đó, để đơn giản, chúng tôi công thức lại Eq. 3 như:
+
+X''R = Clip(XR, Q̃min, Q̃max)  (5)
+
+trong đó
+Q̃max = α * Qmax = α * (2 - 2^(-m)) * 2^(2^e - b - 1)
+     = α * 2^(-b) * (2 - 2^(-m)) * 2^(2^e - 0 - 1)
+     = 2^(-b̃) * (2 - 2^(-m)) * 2^(2^e - 0 - 1)  (6)
+
+Lưu ý rằng chúng tôi kết hợp yếu tố tỷ lệ có giá trị thực theo tensor α với độ lệch số mũ nguyên b để tạo thành một yếu tố tỷ lệ mới α̃ = 2^(-b̃) = 2^(-b) * α. Ở đây b̃ biểu thị một số mũ có giá trị thực được nới lỏng theo tensor, và chúng ta có thể suy ra b̃ từ giá trị cắt mong muốn Q̃max từ Eq. 6 như:
+
+b̃ = 2^e - log2(Q̃max) + log2(2 - 2^(-m)) - 1  (7)
+
+(2) So sánh và lượng tử hóa. Khác với lượng tử hóa số nguyên, chỉ đơn giản sử dụng hàm làm tròn để chuyển đổi các biến có giá trị thực thành các biến được lượng tử hóa, trong lượng tử hóa điểm động, có một bước bổ sung là so sánh X''R với các mức lượng tử hóa và sau đó lượng tử hóa:
+
+XFP = α̃ * v * ⌊X''R / (α̃ * v)⌉  (8)
+
+trong đó X''R là biến có giá trị thực đã được cắt (Eq. 5), α̃ là yếu tố tỷ lệ điểm động theo tensor, và v là lũy thừa nguyên của 2.
+
+v = {
+  2^(⌊log2|X''R| + b̃⌋ - m)  nếu ⌊log2|X''R| + b̃⌋ ≥ 1
+  2^(1-m)                      ngược lại
+}  (9)
+
+Ở đây chúng ta chọn mức lượng tử hóa v theo độ lớn của X''R/α̃, bằng X''R * 2^b̃. Sau đó các biến được lượng tử hóa điểm động có thể được suy ra với Eq.8. Minh họa của quá trình lượng tử hóa trong Fig. 1, giải thích chi tiết cũng có thể được tìm thấy trong (Micikevicius et al., 2022).
+
+### 3.3 Phép nhân ma trận điểm động
+
+Với các biến được lượng tử hóa điểm động, phép nhân ma trận được công thức hóa như:
+
+O^out_(i,k) = X^FP_(i,:) * W^FP_(:,k) = α̃X * α̃^W_k * X̃^FP_(i,:) * W̃^FP_(:,k)  (10)
+
+Ở đây trong lượng tử hóa activation theo tensor và lượng tử hóa weight theo kênh, X^FP_(i,:) biểu thị hàng thứ i trong ma trận activation và W^FP_(:,k) biểu thị cột thứ k trong ma trận weight, sao cho mỗi phần tử O^out_(i,k) trong ma trận output được tính bằng tích của hai vô hướng có giá trị thực α̃X và α̃^W_k nhân với các vector activation và weight được lượng tử hóa tương ứng. Chúng tôi mô tả tất cả các tùy chọn granularity lượng tử hóa có thể hỗ trợ phép nhân ma trận hiệu quả như vậy trong Phụ lục D.
+
+## 4 Phương pháp
+
+Trong phần này, chúng tôi bắt đầu bằng cách giới thiệu tìm kiếm định dạng và giá trị max chung của chúng tôi, thiết lập baseline mạnh và đã đạt kết quả state-of-the-art ở lượng tử hóa 8-bit và 6-bit. Sau đó chúng tôi trình bày một độ lệch số mũ được dịch chuyển trước hiệu quả để giải quyết phương sai activation liên kênh cao thảm khốc trong các mô hình transformer và đẩy giới hạn lượng tử hóa xuống 4-bit.
+
+### 4.1 Tìm kiếm định dạng và giá trị Max chung
+
+Mục tiêu của lượng tử hóa sau huấn luyện là giảm thiểu nhiễu loạn (δX = XFP - XR) được giới thiệu bởi lượng tử hóa vào mạng có giá trị thực được huấn luyện trước:
+
+min E[L(XR + δX) - L(XR)]  (11)
+
+Trong nghiên cứu này, chúng tôi áp dụng cài đặt được trình bày trong (Choukroun et al., 2019; Wu et al., 2020), giả định một tương quan tích cực giữa sự thay đổi trong output trung gian của mô hình được lượng tử hóa và Eq. 11. Do đó, việc giảm thiểu khoảng cách giữa output trung gian của lớp được lượng tử hóa (Ô) và output của lớp ban đầu (O) dẫn đến việc giảm thiểu Eq. 11. Do đó, metric loss mục tiêu được công thức hóa như:
+
+min (Ô - O)²  (12)
+
+được sử dụng để tìm kiếm hàm lượng tử hóa FP tối ưu trong khung được đề xuất sau đây.
+
+Các thách thức trong lượng tử hóa FP phát sinh từ độ nhạy cảm của nó với định dạng lượng tử hóa và phạm vi cắt. Việc lựa chọn định dạng không mong muốn sẽ dẫn đến tỷ lệ lỗi thảm khốc. Ngoài ra, chúng tôi quan sát rằng phạm vi cắt tối ưu khác nhau tùy thuộc vào định dạng được sử dụng. Công trình trước đây (Kuzmin et al., 2022) về huấn luyện có nhận thức lượng tử hóa điểm động (FP) (QAT) đề xuất học cả định dạng FP và giá trị tối đa với gradient. Tuy nhiên, chúng tôi thấy phương pháp này gặp vấn đề over-fitting trong PTQ, với độ chính xác thậm chí còn tệ hơn phương pháp MinMax naïve, chi tiết có thể được tìm thấy trong Phụ lục E. Thay vào đó, chúng tôi đề xuất một thuật toán dựa trên tìm kiếm xác định đồng thời định dạng tối ưu và phạm vi cắt liên quan để giải quyết thách thức này.
+
+Quá trình tìm kiếm được tiến hành từng lớp với metric giảm thiểu Eq. 12. Output của phép nhân ma trận tương ứng với mỗi sub-module được ký hiệu là O = XY, trong đó Y có thể là tensor weight W hoặc tensor activation khác.
+
+Không gian tìm kiếm của định dạng FP q-bit bao gồm tất cả các định dạng ngoại trừ định dạng với bit số mũ bằng 0, vì lượng tử hóa của định dạng với bit số mũ bằng 1 đã thoái hóa thành lượng tử hóa INT. Chúng tôi tìm kiếm độ lệch số mũ có giá trị thực b̃, bằng logarithm của yếu tố tỷ lệ. Chúng tôi khởi tạo b̃X và b̃Y từ Eq. 7 với Qmax bằng giá trị tối đa của |XR| và |YR|, tương ứng. Sau đó chúng tôi định nghĩa không gian tìm kiếm của b̃X và b̃Y bằng cách chia tuyến tính [γ1b̃^init_X, γ2b̃^init_X] và [γ1b̃^init_Y, γ2b̃^init_Y] thành k khoảng, trong đó γ1 và γ2 được đặt kinh nghiệm là 0.01 và 1.2, và k = 100.
+
+Quá trình tìm kiếm được nêu trong Alg.1. Chúng tôi tìm kiếm sơ đồ lượng tử hóa trong tất cả các lớp nhân ma trận song song theo (Yuan et al., 2022; Bai et al., 2022). Thuật toán có thể được chia thành hai phần. (1) Thực hiện forward propagation để lưu trữ output thô trung gian của mỗi lớp l. (2) Cập nhật lặp định dạng và bias tối ưu cho mỗi lớp trong ba vòng bằng cách giảm thiểu metric tái tạo (Eq. 12). Chúng tôi đặt tên khung dựa trên tìm kiếm này là Floating Point Quantization Baseline (FPQ baseline), và nó đã có thể đạt kết quả state-of-the-art trên cả cài đặt 8-bit và 6-bit.
+
+### 4.2 Độ lệch số mũ được dịch chuyển trước
+
+Trong kiến trúc transformer, chúng tôi quan sát một hiện tượng thú vị về phương sai liên kênh cao. Như được hiển thị trong Fig.2, độ lớn của các giá trị trong cùng một kênh gần nhau nhưng thể hiện sự khác biệt đáng kể giữa các kênh khác nhau. Hiện tượng này không chỉ được quan sát trong các mô hình ngôn ngữ (tức là, LLaMA và BERT) mà còn đáng kể trong các mô hình vision transformer. Vì các kênh outlier thường lớn hơn nhiều bậc so với phần còn lại, chúng sẽ chi phối độ chính xác lượng tử hóa của tensor được lượng tử hóa, dẫn đến ít khả năng đại diện hơn cho những kênh có độ lớn nhỏ hơn (Xiao et al., 2022). Điều này làm cho yếu tố tỷ lệ theo tensor hoặc theo token không đủ cho lượng tử hóa activation chính xác.
+
+Tuy nhiên, việc áp dụng các yếu tố tỷ lệ theo kênh cho activation đặt ra thách thức cho phép nhân ma trận hiệu quả, vì yếu tố tỷ lệ không phải là hằng số được chia sẻ dọc theo hướng nhân và không thể được trích xuất như Eq. 10. Để giải quyết thách thức này, chúng tôi giới thiệu độ lệch số mũ được dịch chuyển trước, cho phép chúng tôi tính các yếu tố tỷ lệ theo kênh từ activation. Các yếu tố tỷ lệ này sau đó được tái tham số hóa như các độ lệch số mũ của các weight tương ứng. Phương pháp này hiệu quả xử lý phương sai liên kênh cao trong khi duy trì hiệu quả gần như giống hệt với lượng tử hóa theo tensor.
+
+Nhớ lại trong Eq. 7, chúng tôi trích xuất độ lệch số mũ nguyên theo tensor b và nhân nó với yếu tố tỷ lệ có giá trị thực α và trở thành một yếu tố tỷ lệ mới α̃ = 2^(-b̃) = 2^(-b) * α. Sau đó, công thức lượng tử hóa điểm động trong Eq. 13 trở thành:
+
+XFP = 2^(-b̃) * (-1)^s * 2^(p-0) * (1 + d1/2 + d2/2² + ... + dm/2^m)  (13)
+
+Chúng tôi lưu ý rằng sau khi bias được hấp thụ trong yếu tố tỷ lệ, số hạng bias ban đầu (bori) trong công thức FP luôn là zero. Trong việc xử lý phương sai liên kênh, chúng tôi đưa ra một cách sử dụng sáng tạo của độ lệch số mũ nguyên này: chúng tôi đặt nó là một biến thể theo kênh (bori ∈ Z^c).
+
+Sau đó việc tính vector bias nguyên theo kênh (bori) rất đơn giản. Trước tiên chúng tôi tính yếu tố tỷ lệ có giá trị thực theo kênh ban đầu (2^(-b̃j)) từ các giá trị tối đa theo kênh:
+
+b̃j = 2^e - log2(max(|X^R_{:,j}|)) + log2(2 - 2^(-m)) - 1  (14)
+
+Ở đây X^R_{:,j} biểu thị kênh thứ j trong ma trận activation. Sau đó chúng tôi tách b̃ thành một yếu tố tỷ lệ có giá trị thực theo tensor cộng với một yếu tố tỷ lệ nguyên theo kênh:
+
+b̃ = ρ̃ + bori
+  = ρ̃ + clip(⌊b̃ - ρ̃⌉, 0, 2^e - 1)  (15)
+
+trong đó ρ̃ ∈ R¹, bori ∈ Z^c. Sau đó công thức cho một trong các mục trong kênh thứ j của X có thể được viết lại như sau:
+
+XFP = 2^(-b̃j) * (-1)^s * 2^(p-0) * (1 + d1/2 + ... + dm/2^m)
+    = 2^(-ρ̃) * (-1)^s * 2^(p-bori_j) * (1 + d1/2 + ... + dm/2^m)  (16)
+
+Lưu ý rằng bias bori bị ràng buộc với các số nguyên trong [0, 2^e - 1], tương thích với tính toán số điểm động chuẩn. Tuy nhiên, việc thêm các bias khác nhau cho mỗi kênh trong quá trình suy luận vẫn có thể gây ra một số hoạt động phần cứng bổ sung. Do đó, chúng tôi tái tham số hóa bias activation theo kênh thành một tensor weight và tính trước các weight sử dụng tập hiệu chuẩn. Bằng cách này, việc dịch chuyển bias số mũ chỉ xảy ra trong giai đoạn hiệu chuẩn. Sau đó, một phần tử trong kênh thứ j của tensor activation X trở thành:
+
+XFP = 2^(-ρ̃) * (-1)^s * 2^(p-0) * (1 + d1/2 + ... + dm/2^m)  (17)
+
+và phần tử weight tương ứng trong hàng thứ j của tensor weight W trở thành:
+
+WFP = 2^(-b̃W) * (-1)^s * 2^(p-bori_j) * (1 + d1/2 + ... + dm/2^m)  (18)
+
+Kết quả là, phép nhân ma trận hiệu quả trong Eq.10 được công thức lại như:
+
+O^out_{i,k} = X^FP_{i,:} * W^FP_{:,k} = α̃X * α̃^W_k * X̃^FP_{i,:} * (β ⊙ W̃^FP_{:,k})  (19)
+
+trong đó ⊙ là phép nhân theo phần tử, β = 2^(-bori) và (β ⊙ W̃^FP_{:,k}) có thể được tính trước và lưu trữ ở định dạng FP bit thấp. Chúng tôi mô tả phương pháp độ lệch số mũ được dịch chuyển trước tổng thể trong Fig.3. Phương pháp này áp dụng cho việc lượng tử hóa tất cả các lớp fully-connected. Trong quá trình tìm kiếm, chúng tôi khởi tạo ρ̃X như minj(b̃j). Sau đó, chúng tôi cố định b̃X là bias được tính từ Eq. 14 và tìm kiếm ρ̃X tối ưu từ [γ1ρ̃^init_X, γ2ρ̃^init_X].
+
+Kết hợp phương pháp độ lệch số mũ được dịch chuyển trước với khung tìm kiếm định dạng và giá trị max chung (FPQ baseline), chúng tôi đặt tên phương pháp của mình là (FPQ), viết tắt của Floating Point Quantization.
+
+## 5 Thí nghiệm
+
+Để xác nhận hiệu quả của phương pháp được đề xuất, chúng tôi tiến hành thí nghiệm trên các mô hình LLaMA (Touvron et al., 2023) và BERT (Devlin et al., 2019) trong 5.2.1 và Phần 5.2.2. Hơn nữa, trong Phần 5.2.3 chúng tôi chỉ ra rằng phương pháp của chúng tôi cũng tổng quát hóa tốt cho kiến trúc vision transformer. Chúng tôi trình bày các nghiên cứu ablation về kích thước hiệu chuẩn và phạm vi tìm kiếm trong Phần 5.3, và phân tích chi phí phần cứng của việc triển khai các toán tử FP trong Phần 5.4.
+
+### 5.1 Chi tiết thí nghiệm
+
+Chúng tôi áp dụng lượng tử hóa per-tensor cho activation và lượng tử hóa per-channel cho weight. Chúng tôi sử dụng tái tạo lớp theo cài đặt của (Yuan et al., 2022; Nagel et al., 2020), và lượng tử hóa song song dựa trên phương pháp được nêu trong (Bai et al., 2022; Yuan et al., 2022). Thảo luận chi tiết hơn về các quyết định triển khai của chúng tôi có thể được tìm thấy trong Phụ lục F. Đối với các mô hình LLaMA, chúng tôi lượng tử hóa tất cả các tensor weight và activation trong các lớp fully-connected để so sánh công bằng với công trình trước đây (Xiao et al., 2022; Liu et al., 2023). Đối với các mô hình BERT và ViT, cả các lớp fully-connected và các tensor nhân activation-activation trong module self-attention đều được lượng tử hóa. Lưu ý rằng đối với FPQ trên BERT (Devlin et al., 2019) và các mô hình ViT, metric tái tạo Eq. 12 được thay thế bằng metric loss xấp xỉ Hessian. Việc thay thế này được chi tiết thêm trong Phụ lục A.
+
+### 5.2 Kết quả chính
+
+#### 5.2.1 Lý luận Zero-Shot LLM
+
+Chúng tôi đánh giá hiệu quả của FPQ cho LLaMA-7B/LLaMA-13B (Touvron et al., 2023) trên các nhiệm vụ lý luận zero-shot thông thường. Đối với dữ liệu hiệu chuẩn, chúng tôi lấy mẫu 32 đoạn ngẫu nhiên với độ dài 2048 token từ C4 (Raffel et al., 2020) theo cài đặt của GPTQ (Frantar et al., 2023). Việc tiền xử lý dữ liệu và tính điểm dựa trên EleutherAI evaluation harness. Trong Bảng 1, chúng tôi so sánh FPQ với các baseline PTQ điểm động, và các phương pháp PTQ và QAT state-of-the-art, bao gồm SmoothQuant (Xiao et al., 2022) và GPTQ (Frantar et al., 2023), và LLM-QAT (Liu et al., 2023).
+
+Nhìn chung, tất cả các phương pháp, ngoại trừ MinMax INT Quantization naïve, tạo ra kết quả tương đương trong cài đặt 8-bit trên cả LLaMA-7B và LLaMA-13B. Ngoài ra, chúng tôi quan sát rằng MinMax FP Quantization naïve đạt kết quả gần như không mất mát và thậm chí vượt qua phương pháp lượng tử hóa sau huấn luyện số nguyên state-of-the-art, SmoothQuant (Xiao et al., 2022), điều này chỉ ra rằng lượng tử hóa điểm động tự nhiên có khả năng mạnh mẽ trong việc xử lý các phân phối trong transformer. Tuy nhiên, cả MinMax FP Quant và FPQ baseline đều thất bại khi đẩy độ chính xác lượng tử hóa xuống cài đặt bit cực thấp 4/4/4, với 28.9% và 23.8% suy giảm độ chính xác trên LLaMA-7B, tương ứng. Trong trường hợp cực đoan này, các phương pháp PTQ và QAT state-of-the-art trước đây, SmoothQuant (Xiao et al., 2022) và LLM-QAT (Liu et al., 2023) cũng gặp suy giảm độ chính xác nghiêm trọng. So sánh, FPQ thể hiện khả năng mạnh mẽ trong việc xử lý cài đặt bit cực thấp và đạt chỉ 8.2/5.8% giảm độ chính xác trên LLaMA-7B/13B với độ rộng bit 4/4/4, vượt trội hơn SmoothQuant (Xiao et al., 2022) với một biên độ lớn, nhưng với độ rộng bit ít hơn và kích thước hiệu chuẩn nhỏ hơn. Hơn nữa, FPQ thậm chí đạt 5.3% cải thiện độ chính xác so với LLM-QAT (Liu et al., 2023) trong cài đặt 4/4/4 và 1.5% so với GPTQ (Frantar et al., 2023) trong cấu hình 4/4/16 trên LLaMA-7B.
+
+Đối với các nhà thực hành, một cân nhắc quan trọng là xác định các phương pháp lượng tử hóa phù hợp cho các độ rộng bit khác nhau. Do đó, dựa trên các phát hiện của chúng tôi, chúng tôi đưa ra hai khuyến nghị cân bằng sự đánh đổi giữa độ chính xác và hiệu quả tìm kiếm/tối ưu hóa. Trước hết, vì sự khác biệt giữa MinMax FP Quant và phần còn lại của các phương pháp là không đáng kể cho cài đặt 8/8/8, chúng tôi khuyến nghị chỉ sử dụng phương pháp MinMax FP Quant cho cài đặt 8/8/8 vì phương pháp MinMax không liên quan đến quá trình tìm kiếm. Tuy nhiên, đối với các tình huống đòi hỏi khắt khe hơn, đặc biệt với lượng tử hóa activation xuống 4 bit, chúng tôi khuyến nghị sử dụng FPQ để giảm thiểu suy giảm độ chính xác với chi phí suy luận không đáng kể.
+
+#### 5.2.2 Mô hình BERT
+
+Chúng tôi đánh giá các kỹ thuật lượng tử hóa được đề xuất cho mô hình BERT trên các nhiệm vụ GLUE (Wang et al., 2019). Các mô hình BERT-base độ chính xác đầy đủ được fine-tune trên tập dữ liệu GLUE được lấy từ kho lưu trữ công cộng Huggingface. Chúng tôi lấy mẫu ngẫu nhiên 128 dữ liệu từ tập huấn luyện làm tập hiệu chuẩn. Trong Bảng 2, FPQ thể hiện hiệu suất đáng chú ý, đạt cải thiện độ chính xác trung bình tuyệt đối 44.3% so với BrecQ (Li et al., 2021) và 7.9% so với QDrop (Wei et al., 2022) với cài đặt bit 4/4/4. Hơn nữa, với weight 4-bit và activation 8-bit, MREM-S/MREM-P (Bai et al., 2022) trình bày khoảng cách độ chính xác 1.6/1.5% so với mô hình độ chính xác đầy đủ với 4096 dữ liệu hiệu chuẩn, trong khi FPQ đạt gần như không mất độ chính xác với chỉ 128 điểm dữ liệu hiệu chuẩn.
+
+#### 5.2.3 Khả năng tổng quát hóa trên Vision Transformer
+
+Dựa trên phát hiện của chúng tôi rằng vision transformer cũng thể hiện mô hình phân phối activation nhất quán như transformer ngôn ngữ, đặc trưng bởi phương sai liên kênh cao và phương sai nội kênh thấp, như được chi tiết trong Fig. 2, chúng tôi mở rộng các phương pháp được đề xuất cho ViT và so sánh FPQ với các baseline PTQ điểm động và phương pháp PTQ state-of-the-art cho ViT trên nhiệm vụ phân loại ImageNet. Bảng 3 cho thấy rằng các phát hiện trên ViT nhất quán với những gì trên các mô hình ngôn ngữ: các phương pháp dựa trên số nguyên state-of-the-art trước đây đã gặp khó khăn để duy trì độ chính xác hợp lý khi lượng tử hóa transformer xuống bit thấp hơn. So sánh, FPQ được đề xuất vượt trội hơn cả PTQ4ViT và APQ-ViT trên 6 bit, và cũng đạt 40.9% và 31.5% cải thiện độ chính xác tuyệt đối so với PTQ4ViT và APQ-ViT trên DeiT-S trong cấu hình 4-bit.
+
+### 5.3 Nghiên cứu Ablation
+
+Trong phần này, trước tiên chúng tôi so sánh ảnh hưởng của các kích thước hiệu chuẩn khác nhau trên FPQ. Chúng tôi thay đổi kích thước hiệu chuẩn trong {32, 64, 128, 256} và kiểm tra trên MNLI, QQP, và CoLA. Bảng 4 cho thấy rằng đánh giá trên MNLI và QQP mạnh mẽ hơn với các cài đặt khác nhau, và phương sai đáng kể hơn trên CoLA. Chúng tôi quan sát rằng FPQ hoạt động tốt với kích thước tập hiệu chuẩn 128 điểm dữ liệu. Tuy nhiên, chúng tôi cũng thấy rằng nó vẫn mạnh mẽ và duy trì độ chính xác cạnh tranh ngay cả với quyền truy cập hạn chế vào dữ liệu hiệu chuẩn, chẳng hạn như khi sử dụng ít nhất 32 điểm dữ liệu.
+
+Chúng tôi điều tra tính mạnh mẽ của FPQ với các phạm vi tìm kiếm khác nhau (γ1, γ2). Bảng 5 trình bày kết quả của FPQ sử dụng ba bộ (γ1, γ2): (0.01, 1.2), (0.1, 1.2), (0.5, 1.5), trên MNLI, QQP, và CoLA. Quan sát thấy rằng không có phạm vi tìm kiếm đơn lẻ nào vượt trội hơn những phạm vi khác một cách nhất quán trên tất cả các nhiệm vụ. Ví dụ, phạm vi tìm kiếm (0.01, 1.2) hoạt động tốt hơn (0.5, 1.5) trên MNLI và QQP, nhưng hơi tệ hơn trên CoLA trong cấu hình 4-bit. Nhìn chung, FPQ thể hiện tính mạnh mẽ với các γ1 và γ2 khác nhau, miễn là phạm vi tìm kiếm không quá quyến rũ.
+
+### 5.4 Chi phí phần cứng
+
+Chúng tôi tiếp tục kiểm tra việc sử dụng phần cứng của các toán tử nhân INT bit thấp, FP, và FP định dạng hỗn hợp, bao gồm bộ cộng, bộ nhân, và đơn vị nhân-tích lũy (MAC), về mặt diện tích phần cứng. FP định dạng hỗn hợp đề cập đến phép nhân của các số điểm động với các định dạng khác nhau, ví dụ, E2M1 nhân với E1M2. Chúng tôi triển khai toán tử MAC bằng Verilog HDL và sử dụng Cadence Genus để có được diện tích tổng hợp dưới công nghệ TSMC 40nm và tần số đồng hồ 0.5GHz.
+
+Bảng 6 minh họa chi phí phần cứng của các toán tử INT và FP, với bộ nhân là chi phí chính cho INT và bộ cộng cho FP. Đáng chú ý, sự chênh lệch giữa bộ cộng FP4 và INT4 là nhỏ, trong khi INT có gấp đôi chi phí phần cứng cho bộ nhân. Hơn nữa, toán tử FP4 định dạng hỗn hợp có diện tích phần cứng tương đương với toán tử FP4 chuẩn. Những phát hiện này chỉ ra rằng phương pháp FPQ được đề xuất gây ra chi phí không đáng kể về mặt triển khai phần cứng khi so sánh với các toán tử FP chuẩn và chi phí phần cứng cho FP tương đương với INT.
+
+## 6 Kết luận
+
+Bài báo này trình bày minh chứng thành công đầu tiên về lượng tử hóa sau huấn luyện điểm động 4-bit cho weight, activation, và embedding trong kiến trúc transformer ngôn ngữ tự nhiên, bao gồm cả các mô hình ngôn ngữ lớn và mô hình BERT. Chúng tôi cũng mở rộng phương pháp của mình cho vision transformer và quan sát khả năng tổng quát hóa mạnh mẽ của nó. Phương pháp của chúng tôi bao gồm một kỹ thuật dựa trên tìm kiếm thực tế thiết lập một baseline mạnh và đạt kết quả state-of-the-art cho lượng tử hóa 6-bit và 8-bit. Hơn nữa, chúng tôi giải quyết thách thức của phương sai liên kênh cao trong transformer bằng cách đề xuất độ lệch số mũ được dịch chuyển trước, chứng minh hiệu quả cao trong việc đạt lượng tử hóa 4-bit chính xác.
+
+## Lời cảm ơn
+
+Nghiên cứu này được hỗ trợ bởi Quỹ Khoa học Tự nhiên Quốc gia Trung Quốc/Hội đồng Tài trợ Nghiên cứu HKSAR Joint Research Scheme theo Grant NHKUST 627/20, và Dự án Foshan HKUST theo Grant FSUST 21−HKUST 10E.
+
+## Hạn chế
+
+Các thí nghiệm của chúng tôi được tiến hành trên các tập dữ liệu có sẵn công khai với độ dài câu hữu hạn, và khả năng tổng quát hóa của phương pháp chúng tôi cho các chuỗi cực dài hoặc dữ liệu streaming chưa được xác minh và có thể cần điều tra thêm. Ngoài ra, vẫn chưa rõ phương pháp được đề xuất của chúng tôi có thể tổng quát hóa như thế nào cho các lĩnh vực khác ngoài ngôn ngữ và thị giác, chẳng hạn như âm thanh. Sẽ thú vị khi thấy khả năng áp dụng của phương pháp chúng tôi cho các nhiệm vụ sinh tạo và các ứng dụng khác.

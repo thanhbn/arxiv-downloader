@@ -1,0 +1,112 @@
+# TEQ: Phép Biến Đổi Tương Đương Có Thể Huấn Luyện cho Lượng Tử Hóa LLMs
+
+Wenhua Cheng và Yiyang Cai và Kaokao Lv và Haihao Shen
+Intel
+{wenhua.cheng, yiyang.cai, kaokao.lv, haihao.shen}@intel.com
+
+Tóm tắt
+Khi các mô hình ngôn ngữ lớn (LLMs) trở nên phổ biến hơn, có nhu cầu ngày càng tăng về các phương pháp lượng tử hóa mới và cải tiến có thể đáp ứng các yêu cầu tính toán của các kiến trúc hiện đại này trong khi vẫn duy trì độ chính xác. Trong bài báo này, chúng tôi trình bày TEQ, một phép biến đổi tương đương có thể huấn luyện bảo toàn độ chính xác FP32 của đầu ra mô hình trong khi tận dụng lượng tử hóa độ chính xác thấp, đặc biệt là lượng tử hóa chỉ trọng số 3 và 4 bit. Quá trình huấn luyện là nhẹ nhàng, chỉ yêu cầu 1K bước và ít hơn 1‰ tham số có thể huấn luyện của mô hình gốc. Hơn nữa, phép biến đổi không thêm bất kỳ chi phí tính toán nào trong quá trình suy luận. Kết quả của chúng tôi ngang bằng với các phương pháp tiên tiến nhất (SOTA) trên các LLMs điển hình. Phương pháp của chúng tôi có thể được kết hợp với các phương pháp khác để đạt được hiệu suất tốt hơn. Mã nguồn có sẵn tại https://github.com/intel/neural-compressor.
+
+1 Giới thiệu
+Các mô hình ngôn ngữ lớn (LLMs) không chỉ cho thấy hiệu suất đột phá trong một loạt các tiêu chuẩn và nhiệm vụ mà còn đóng vai trò ngày càng quan trọng trong cuộc sống hàng ngày, ví dụ, ChatGPT (OpenAI) trong truy xuất thông tin và Copilot (Github) trong lập trình. Tuy nhiên, khi kích thước mô hình của LLMs tiếp tục tăng mạnh, dung lượng bộ nhớ đáng kể và yêu cầu tính toán nặng nề của chúng trở thành nút thắt cổ chai chính trong việc sử dụng.
+
+Một trong những cách hứa hẹn nhất để giảm thiểu thách thức này là lượng tử hóa, có thể giảm chi phí lưu trữ và tính toán. Lượng tử hóa chuyển đổi dữ liệu điểm nổi bit cao thành các biểu diễn bit thấp hơn, và nó đã trở thành một kỹ thuật nén mô hình hiệu quả.
+
+Các phương pháp lượng tử hóa thường có thể được chia thành hai loại: huấn luyện nhận biết lượng tử hóa (QAT) (Shen et al., 2021; Zhuang et al., 2021; Gong et al., 2019; Esser et al., 2019; Louizos et al., 2018) và lượng tử hóa sau huấn luyện (PTQ) (Frantar et al., 2022; Li et al., 2022; Xiao et al., 2022; Wei et al., 2022; Frantar and Alistarh, 2022; Hubara et al., 2021; Nagel et al., 2020; Hassibi et al., 1993; LeCun et al., 1989). Hiệu quả của chúng đã được xác nhận cho một loạt các mô hình. Tuy nhiên, một số vấn đề vẫn cần được giải quyết, đặc biệt đối với LLMs. QAT mô phỏng hành vi lượng tử hóa trong giai đoạn huấn luyện/tinh chỉnh, nhưng quá trình như vậy rất tốn kém đối với LLMs do quy mô tham số chưa từng có của chúng. Ngược lại, PTQ không yêu cầu huấn luyện và do đó đã thu hút sự chú ý ngày càng tăng. Tuy nhiên, PTQ dễ bị giảm độ chính xác lớn, đặc biệt đối với lượng tử hóa bit cực thấp. Điều này mang lại cho các phương pháp PTQ của LLMs cơ hội cải thiện lớn.
+
+Lượng tử hóa bit thấp hơn (ví dụ, Int4, W4) gần đây đã được thảo luận rộng rãi vì băng thông bộ nhớ đang trở thành nút thắt cổ chai chính của LLMs. Tuy nhiên, hầu hết các công trình hiện có tập trung vào các mô hình thị giác máy tính (He et al., 2016; Howard et al., 2017) nhỏ hơn nhiều so với các LLMs phổ biến hiện tại như BLOOM-176B (Scao et al., 2022), OPT-175B (Zhang et al., 2022). Các phương pháp lượng tử hóa cực đoan khác (Bai et al., 2020; Zhang et al., 2020) dựa vào kỹ thuật chưng cất kiến thức, đưa ra chi phí phụ. GPTQ (Frantar et al., 2022) điều chỉnh các trọng số dựa trên phẫu thuật não tối ưu (Hassibi et al., 1993) và thành công đạt được lượng tử hóa bit thấp trên LLMs với chi phí tính toán thấp.
+
+Phương pháp được đề xuất của chúng tôi giảm lỗi nén bằng cách đưa ra một phép biến đổi tương đương có thể huấn luyện (Hình 1), giữ tính tương đương toán học của đầu ra mô hình ở độ chính xác FP32. Hơn nữa, chi phí huấn luyện thấp đáng kể, chỉ 1k bước với kích thước batch 1 với khoảng ít hơn một phần nghìn tham số có thể huấn luyện của các mô hình gốc. Ngoài ra, phương pháp của chúng tôi trực giao với các phương pháp lượng tử hóa LLMs phổ biến hiện tại, và có thể đạt được kết quả độ chính xác tốt hơn bằng cách kết hợp của chúng tôi với chúng.
+
+Tóm lại, đóng góp của bài báo này có ba khía cạnh:
+• Chúng tôi giới thiệu một phép biến đổi tương đương có thể huấn luyện cho lượng tử hóa LLMs, giữ đầu ra mô hình không thay đổi ở độ chính xác FP32. Bên cạnh đó, việc huấn luyện khá nhẹ nhàng.
+• Kết quả thực nghiệm cho thấy phương pháp của chúng tôi có thể đạt được kết quả ngang bằng hoặc tốt hơn các phương pháp SOTA.
+• Chúng tôi cũng cho thấy rằng phương pháp của chúng tôi có thể được kết hợp để có được hiệu suất SOTA mới.
+
+Trong phần tiếp theo, chúng tôi trước tiên giới thiệu ngắn gọn công trình liên quan đến chúng tôi trong Phần 2. Sau đó chúng tôi trình bày phép biến đổi tương đương có thể huấn luyện trong Phần 3. Thí nghiệm và kết luận được mô tả lần lượt trong Phần 4 và 5.
+
+2 Công trình liên quan
+
+Huấn luyện nhận biết lượng tử hóa. Các phương pháp QAT được sử dụng rộng rãi trong nén mô hình. Bằng cách cho phép quá trình tinh chỉnh, độ chính xác của các mô hình lượng tử hóa thường có thể ngang bằng hoặc thậm chí tốt hơn so với các mô hình gốc. (Louizos et al., 2018) giới thiệu một quy trình lượng tử hóa có thể vi phân bằng cách chuyển đổi phân phối trọng số và kích hoạt gốc thành các phân phối phân loại. OQAT (Shen et al., 2021) đề xuất một sơ đồ huấn luyện kết hợp kiến trúc và lượng tử hóa để có được nhiều mô hình lượng tử hóa. Sau đó, chúng được chuyển đổi thành các mô hình bit thấp hơn và được tối ưu hóa. (Zhuang et al., 2021) đề xuất một sơ đồ lượng tử hóa tiến bộ bằng cách lượng tử hóa kích hoạt sau trọng số. Thực tế, các phương pháp QAT phổ biến trong các mô hình quy mô tương đối nhỏ, nhưng ứng dụng của chúng trong LLMs bị hạn chế do chi phí huấn luyện hoặc thậm chí chi phí tinh chỉnh đắt đỏ như đã đề cập trong Phần 1.
+
+Lượng tử hóa sau huấn luyện. Một số lượng lớn các phương pháp sau huấn luyện lượng tử hóa trọng số từng bước và điều chỉnh các trọng số chưa lượng tử hóa để bù đắp cho các lỗi được tạo ra bởi các trọng số được lượng tử hóa trước đó. Optimal Brain Damage (OBD) (LeCun et al., 1989) sử dụng thông tin đạo hàm bậc hai (ước lượng dựa trên Hessian) để dự đoán tác động của nhiễu loạn trọng số một cách phân tích. Optimal Brain Surgeon (OBS) (Hassibi et al., 1993) áp dụng ý tưởng như vậy bằng cách thiết kế một khung bậc hai cho cắt tỉa trọng số. Sau đó, Optimal Brain Quantization (OBQ) di chuyển khung cắt tỉa của OBS sang lượng tử hóa vì cắt tỉa và lượng tử hóa chia sẻ ý tưởng chung về việc đưa ra nhiễu loạn trong các mô hình gốc. Cuối cùng, GPTQ (Frantar et al., 2022) cải thiện hiệu quả của khung gốc bằng cách cố định thứ tự lượng tử hóa trong lớp và tính toán phân rã Cholesky của ma trận Hessian trước khi lượng tử hóa. Các phương pháp PTQ khác sử dụng một sơ đồ làm tròn tốt hơn so với làm tròn thông thường về gần nhất (RTN). AdaRound (Nagel et al., 2020) học một sơ đồ làm tròn sử dụng lỗi bình phương trung bình (MSE) cho kích hoạt theo lớp. AQuant (Li et al., 2022) thêm một hàm biên có thể học được cho lượng tử hóa kích hoạt.
+
+Lượng tử hóa mô hình ngôn ngữ lớn. Các nhà nghiên cứu đang dành nỗ lực cho các phương pháp nén được thiết kế đặc biệt cho LLMs khi có nhiều bản phát hành mã nguồn mở. LLM.int8() (Dettmers et al., 2022) khám phá các giá trị đỉnh trong các kênh cụ thể của các outlier kích hoạt. Nó đề xuất các phương pháp để đảm bảo rằng các kênh này được giữ ở độ chính xác cao hơn. SmoothQuant (Xiao et al., 2022) giải quyết các vấn đề đã đề cập ở trên bằng cách di chuyển khó khăn từ kích hoạt sang trọng số với một phép biến đổi tương đương được tạo thủ công. ZeroQuant (Yao et al., 2022) thiết kế một pipeline lượng tử hóa và suy luận end-to-end với một thuật toán chưng cất kiến thức theo lớp mới. Tuy nhiên, mô hình lớn nhất mà nó đã lượng tử hóa chỉ có 1.3B tham số. GPTQ (Frantar et al., 2022) điều chỉnh các trọng số dựa trên phẫu thuật não tối ưu (Hassibi et al., 1993) và thành công đạt được lượng tử hóa bit thấp trên LLMs với chi phí tính toán thấp. Gần đây hơn, AWQ (Lin et al., 2023) đề xuất tìm kiếm các tỷ lệ tối ưu để bảo vệ các phần trọng số, vì chúng có thể giảm đáng kể lỗi gây ra bởi lượng tử hóa.
+
+3 Phương pháp
+
+Hình 1 trình bày một minh họa sơ đồ của phép biến đổi tương đương. Trong phần tiếp theo, chúng tôi giới thiệu quá trình lượng tử hóa trước. Xem xét một mạng nơ-ron feed-forward bao gồm L lớp, thực hiện các phép toán matmul hoặc convolution. Chúng tôi chỉ xem xét lớp matmul để đơn giản vì phương pháp của chúng tôi có thể dễ dàng mở rộng sang các lớp convolution. Phép toán matmul thứ l có thể được ký hiệu bởi yl = wl · xl. Trong đó wl và xl là trọng số và kích hoạt (đầu vào), và yl là đầu ra tương ứng. Để lượng tử hóa một tensor, một phép toán lượng tử hóa được trình bày dưới đây có thể được áp dụng.
+
+Q(v) = clip(⌊v/s⌋, −n, n), n ∈ N (1)
+
+trong đó s biểu thị tham số tỷ lệ lượng tử hóa và [·] biểu thị phép toán làm tròn về gần nhất (RTN), trong khi −n và n biểu thị các ngưỡng số nguyên để cắt. Chúng tôi bỏ qua điểm zero để đơn giản. Đối với lượng tử hóa int8 bình thường, tức là W8A8, chúng tôi cần lượng tử hóa cả kích hoạt và trọng số. Và đối với lượng tử hóa chỉ trọng số, chỉ các trọng số cần được lượng tử hóa. Cuối cùng, một phép toán khử lượng tử hóa sẽ được thêm vào để tái tạo đầu ra float, thường không bằng yl. Tóm lại, đầu ra của Ll sau lượng tử hóa bình thường được chuyển đổi thành:
+
+ŷl = Q^(-1)(Q(wl) · Q(xl)) (2)
+
+trong đó ŷl biểu thị đầu ra tái tạo của Ll sau lượng tử hóa. Giá trị của (yl − ŷl)² thường được gọi là mất mát lượng tử hóa.
+
+3.1 Phép biến đổi tương đương có thể huấn luyện
+
+PTQ có xu hướng gây ra sự sụt giảm độ chính xác đáng chú ý như đã đề cập trước đó. SmoothQuant (Xiao et al., 2022) và AWQ (Lin et al., 2023) dựa vào các quy tắc được tạo thủ công để di chuyển khó khăn lượng tử hóa của trọng số và kích hoạt. Tuy nhiên, các quy tắc này thường rơi vào các giải pháp dưới tối ưu, không thể giảm thiểu lỗi gây ra bởi lượng tử hóa. Để giảm thiểu vấn đề này, chúng tôi giới thiệu một phép biến đổi tương đương có thể huấn luyện buộc đầu ra Fp32 giống nhau nhưng cải thiện đáng kể tính mạnh mẽ của lượng tử hóa. Cụ thể hơn, giả sử hình dạng của wl là cin^l × cout^l, biểu thị số kênh đầu vào và đầu ra tương ứng. Đối với mỗi lớp Ll, chúng ta có thể nhân một vector tỷ lệ theo kênh sl ∈ R^(cin^l) cho trọng số và thêm một vector tỷ lệ nghịch đảo tương ứng cho kích hoạt. Về mặt toán học, điều này có thể được phát biểu lại là
+
+yl = wl · diag(sl) · diag(sl)^(-1) · xl (3)
+
+toán tử diag(·) biểu thị chuyển đổi một vector cột/hàng thành ma trận chéo có các giá trị riêng giống hệt với các phần tử của vector gốc.
+
+diag[s1, s2, ..., sn] = [s1, 0, ..., 0; 0, s2, ..., 0; ...; 0, 0, ..., sn] (4)
+
+Quan sát của chúng tôi cho thấy sw tối ưu hữu ích để giảm mất mát lượng tử hóa. Do đó, chúng tôi lượng tử hóa mô hình được biến đổi thay vì mô hình gốc.
+
+Phép biến đổi có hai phép toán tỷ lệ theo kênh, sẽ đưa ra chi phí tính toán. Chúng tôi hợp nhất tỷ lệ trọng số vào chính trọng số. Đối với tỷ lệ kích hoạt, theo (Xiao et al., 2022), chúng tôi hợp nhất nó vào các lớp trước đó, chẳng hạn như layernorm (Ba et al., 2016), batchnorm (Ioffe và Szegedy, 2015) và v.v. Trong tất cả các thí nghiệm của chúng tôi, chúng tôi chỉ áp dụng phép biến đổi cho lớp có thể hợp nhất tỷ lệ, không đưa ra chi phí phụ khi triển khai.
+
+3.2 Chi tiết huấn luyện
+
+Chúng tôi huấn luyện các tỷ lệ sl vì có ít kiến thức về phép biến đổi tương đương tốt nhất do các mô hình và cấu hình lượng tử hóa khác nhau. Điều đáng chú ý là số lượng tỷ lệ có thể huấn luyện ít hơn nhiều so với các tham số của mô hình, và các trọng số mô hình được đóng băng.
+
+Để huấn luyện các tỷ lệ biến đổi, chúng tôi tuân theo QAT cơ bản để mô phỏng hành vi lượng tử hóa, có thể được ký hiệu là
+
+ylq = (Q^(-1)Q(wl))(Q^(-1)Q(xl)) (5)
+
+Đối với lượng tử hóa chỉ trọng số, lượng tử hóa kích hoạt sẽ bị bỏ qua. Chúng tôi áp dụng ước lượng straight-through (STE) (Bengio et al., 2013) để truyền ngược gradient.
+
+Chúng tôi sử dụng tối ưu hóa Adam (Kingma và Ba, 2014), beta [0.9, 0.9], và weight decay 0. Tốc độ học là 1e-3 trừ khi được nêu rõ và loại suy giảm là tuyến tính. Chúng tôi chỉ huấn luyện 1000 bước. Chúng tôi sử dụng cùng hàm mất mát như trong giai đoạn huấn luyện gốc. Ví dụ, mất mát CrossEntropy được áp dụng cho LLMs. sl thường được khởi tạo với 1. Tuy nhiên, đôi khi 1.0/sqrt(wcin) dẫn đến kết quả tốt hơn, vì vậy chúng tôi chọn cái tốt hơn trong các thí nghiệm của mình.
+
+4 Thí nghiệm
+
+Trong phần này, chúng tôi đánh giá TEQ được đề xuất của chúng tôi ở các khía cạnh khác nhau. Ban đầu, chúng tôi giới thiệu ngắn gọn các kiến trúc LLM và nhiệm vụ được bao gồm trong đánh giá của chúng tôi. Thứ hai, chúng tôi minh họa so sánh chi tiết phương pháp của chúng tôi và các phương pháp tiên tiến nhất (SOTA) khác, và cả độ chính xác lượng tử hóa và thời gian đều được xem xét.
+
+4.1 Cài đặt thí nghiệm
+
+Mô hình ngôn ngữ lớn. Chúng tôi tiến hành các thí nghiệm trên các kiến trúc LLM phổ biến nhất, bao gồm LLaMAs (Touvron et al., 2023), BLOOMs (Scao et al., 2022), và OPTs (Zhang et al., 2022). Quy mô tham số từ triệu đến tỷ đều được bao gồm.
+
+Đánh giá và Bộ dữ liệu. Chúng tôi thực hiện đánh giá trên một số nhiệm vụ ngôn ngữ để đáp ứng cài đặt bất khả tri nhiệm vụ. Cụ thể, chúng tôi báo cáo kết quả độ chính xác trung bình trên bốn nhiệm vụ lý luận thông thường bằng cách tận dụng lm-eval-harness (Gao et al., 2021), bao gồm HellaSwag (Zellers et al., 2019), WinoGrande (Sakaguchi et al., 2021), PIQA (Bisk et al., 2020) và LAMBADA (Paperno et al., 2016). Hơn nữa, chúng tôi bổ sung đánh giá với phân tích perplexity (PPL) trên WikiText2 (Merity et al., 2016), PTB (Marcus et al., 1994) cũng như C4 (Raffel et al., 2020).
+
+Chi tiết triển khai. Theo GPTQ (Frantar et al., 2022), chúng tôi tập trung vào lượng tử hóa chỉ trọng số và loại trừ lớp cuối cùng khi lượng tử hóa. Chúng tôi sử dụng một bộ tăng tốc HW duy nhất để lượng tử hóa các mô hình với quy mô khoảng mười tỷ tham số. Chúng tôi sử dụng cùng bộ dữ liệu hiệu chuẩn pile-10k cho so sánh công bằng.
+
+Baseline. Baseline chính của chúng tôi là lượng tử hóa làm tròn về gần nhất vanilla (RTN) có kết quả đáng chú ý ở 4bit sử dụng kích thước nhóm nhỏ là 128. Chúng tôi cũng so sánh với phương pháp tiên tiến GPTQ (Frantar et al., 2022).
+
+4.2 Kết quả
+
+Như đã đề cập ở trên, chúng tôi so sánh kết quả của chúng tôi với RTN và GTPQ tiên tiến (Frantar et al., 2022). Ngoài ra, vì phương pháp của chúng tôi trực giao với GPTQ, chúng tôi cũng báo cáo Ours+GPTQ, áp dụng TEQ trước và sau đó chạy mã chính thức GPTQ. Chúng tôi chủ yếu tập trung vào các mô hình khoảng 10B được sử dụng phổ biến.
+
+Lượng tử hóa W4. Chúng tôi đầu tiên đánh giá TEQ trên lượng tử hóa 4 bit phổ biến. Bảng 1 cho thấy kết quả lm-eval của các kiến trúc mô hình LLM và kích thước tham số khác nhau. TEQ vượt trội hơn RTN trong tất cả các trường hợp trừ một. So sánh với GPTQ, TEQ cho thấy kết quả tốt hơn trong 6 trên 12 kịch bản. Sau khi kết hợp GPTQ, có thể đạt được kết quả tiên tiến mới trong 5 kịch bản. Tóm lại, TEQ có thể hữu ích trong 8 trên 12 kịch bản. Bảng 8 cho thấy các siêu tham số mà chúng tôi đã sử dụng trong các thí nghiệm.
+
+Chúng tôi cũng đánh giá WikiText2 ppl trong bảng 2 không có kích thước nhóm và kích thước nhóm 128. TEQ tốt hơn hoặc ngang bằng với RTN. Tương tự, phương pháp kết hợp (Ours và GPTQ) cho thấy kết quả tương đương hoặc tốt hơn so với GPTQ độc lập.
+
+Lượng tử hóa W3. Chúng tôi cũng đánh giá TEQ ở trọng số với 3 bit. Chúng tôi chỉ xem xét kích thước nhóm 128, vì hiệu suất giảm nhiều mà không có kích thước nhóm và thường không thể được triển khai trong thực tế. Tương tự như đánh giá 4 bit, chúng tôi báo cáo kết quả lm-eval và kết quả wikitext2 ppl lần lượt trong bảng 3 và 4. TEQ vượt trội hơn RTN trong tất cả các kịch bản và kém hơn GPTQ trên một số mô hình. Tuy nhiên, TEQ có thể mang lại cải thiện cho 8 trên 12 kịch bản nếu tính đến Ours+GPTQ.
+
+Thời gian lượng tử hóa. Chúng tôi báo cáo thời gian lượng tử hóa trong Bảng 5. Chúng tôi áp dụng Deepspeed cho các mô hình 10B+ do vấn đề hết bộ nhớ (OOM) tiềm ẩn. Vì TEQ cần huấn luyện, chi phí thời gian của chúng tôi cao hơn hợp lý so với GPTQ, đặc biệt khi mô hình không vừa với bộ nhớ thiết bị. Có thể giảm thời gian hơn nữa bằng cách sử dụng nhiều tài nguyên hơn hoặc tối ưu hóa mã, trong khi điều đó nằm ngoài phạm vi.
+
+Phân tích các tỷ lệ trong TEQ. Chúng tôi hình dung phân phối độ lớn histogram của sl cho các lớp mà TEQ có thể được áp dụng. Hình 2 hiển thị kết quả của các mô hình với sl được khởi tạo là các giá trị scalar. Có thể rút ra một số kết luận từ những kết quả này. Đáng chú ý nhất, phần lớn các tỷ lệ được huấn luyện vẫn gần với các giá trị ban đầu của chúng (ví dụ, 1), thường trong phạm vi [0.75, 1.25]. Điều này cho thấy rằng ngay cả những thay đổi nhỏ đối với mô hình cũng có thể giảm đáng kể mất mát lượng tử hóa. Ngoài ra, một số tỷ lệ lệch đáng kể so với 1, cho thấy sự hiện diện của các kênh "outlier". Hơn nữa, các tỷ lệ ở các lớp giữa có xu hướng ở gần hơn với các giá trị ban đầu của chúng so với các lớp khác, cho thấy rằng các lớp đầu và cuối nhạy cảm hơn với mất mát lượng tử hóa. Chúng tôi cũng đính kèm kết quả của các tỷ lệ được khởi tạo với 1.0/sqrt(wcin) trong Phụ lục A.5.
+
+5 Kết luận
+
+Trong bài báo này, chúng tôi đề xuất TEQ, một phép biến đổi tương đương có thể huấn luyện bảo toàn độ chính xác FP32 của đầu ra mô hình trong khi cũng tận dụng lượng tử hóa độ chính xác thấp, và quá trình huấn luyện của nó là nhẹ nhàng. Thêm vào đó, TEQ được coi là hỗ trợ trực giao cho các phương pháp lượng tử hóa khác để cải thiện hiệu suất của chúng. Các thí nghiệm bất khả tri nhiệm vụ và so sánh với các phương pháp khác của chúng tôi cho thấy rằng TEQ hoặc sự kết hợp của nó với các phương pháp khác có thể đạt được kết quả tương đương hoặc tốt hơn.
+
+5.1 Hạn chế
+
+Chúng tôi thấy rằng bộ nhớ cần thiết trong quá trình huấn luyện vẫn cao, mặc dù số lượng tham số huấn luyện vẫn thấp. Hơn nữa, vì chúng tôi buộc phép biến đổi phải tương đương và giữ kiến trúc và đầu ra FP32 không thay đổi, kết quả của chúng tôi trong một số kịch bản kém hơn các phương pháp SOTA, điều này có thể được khắc phục bằng cách kết hợp các phương pháp SOTA.
+
+5.2 Tuyên bố đạo đức
+
+Chúng tôi đề xuất TEQ cho lượng tử hóa LLMs. Phương pháp có thể được sử dụng riêng lẻ hoặc kết hợp với các phương pháp lượng tử hóa khác. Vì TEQ chỉ yêu cầu một vài bước tinh chỉnh trên các mô hình gốc. Do đó, có thể an toàn nói rằng các chi tiết kỹ thuật của TEQ không có ý nghĩa đạo đức đáng kể. Công trình của chúng tôi cung cấp một khám phá về lượng tử hóa mô hình ngôn ngữ lớn thông qua tinh chỉnh đơn giản, làm cho ứng dụng của chúng dễ dàng hơn. Chúng tôi tin rằng ngày càng nhiều công trình như thế này sẽ xuất hiện, làm cho lượng tử hóa LLMs mạnh mẽ hơn.
