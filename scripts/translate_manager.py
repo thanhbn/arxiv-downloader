@@ -29,6 +29,7 @@ import signal
 import glob
 import re
 from datetime import datetime
+import json
 
 # Configure logging
 logging.basicConfig(
@@ -478,10 +479,53 @@ class TranslationQueueManager:
 class ClaudeTranslator:
     """Handles translation using local Claude executable."""
     
-    def __init__(self, claude_path: str = "claude"):
+    def __init__(self, claude_path: str = "/home/admin88/.nvm/versions/node/v18.20.8/bin/claude", worker_id: Optional[int] = None):
         self.claude_path = claude_path
+        self.worker_id = worker_id or os.getpid()
         self.translation_prompt = self._build_translation_prompt()
+        self.worker_home_dir = self._get_worker_home_dir()
+        self.auth_lock_file = "/tmp/claude_auth.lock"
         
+    def _acquire_auth_lock(self, timeout: int = 30) -> bool:
+        """Acquire lock for Claude authentication/initialization only."""
+        try:
+            start_time = time.time()
+            while time.time() - start_time < timeout:
+                try:
+                    # Try to create lock file exclusively
+                    with open(self.auth_lock_file, 'x') as f:
+                        f.write(f"{self.worker_id}:{os.getpid()}:{time.time()}")
+                    return True
+                except FileExistsError:
+                    # Check if lock is stale (older than 2 minutes)
+                    try:
+                        if os.path.exists(self.auth_lock_file):
+                            stat = os.stat(self.auth_lock_file)
+                            if time.time() - stat.st_mtime > 120:  # 2 minutes
+                                os.unlink(self.auth_lock_file)
+                                continue
+                    except:
+                        pass
+                    time.sleep(0.5)  # Wait 0.5 seconds before retry
+            return False
+        except Exception as e:
+            logger.error(f"Error acquiring auth lock: {e}")
+            return False
+    
+    def _release_auth_lock(self):
+        """Release Claude authentication lock."""
+        try:
+            if os.path.exists(self.auth_lock_file):
+                os.unlink(self.auth_lock_file)
+        except Exception as e:
+            logger.warning(f"Error releasing auth lock: {e}")
+        
+    def _get_worker_home_dir(self) -> str:
+        """Get worker-specific home directory with Claude config."""
+        # Use original config (authenticated) with random delays to reduce conflicts
+        return os.path.expanduser("~")
+        
+    
     def _build_translation_prompt(self) -> str:
         """Build the translation prompt template."""
         return """Translate this text to Vietnamese. Output ONLY the translation, no explanations, no summaries, no meta-commentary:
@@ -490,6 +534,82 @@ class ClaudeTranslator:
 
 IMPORTANT: Output only the Vietnamese translation. Do not explain what you did. Do not summarize. Start with the first Vietnamese sentence immediately."""
     
+    def _sanitize_content(self, content: str) -> str:
+        """Sanitize content to prevent prompt injection and parsing errors."""
+        # Remove null bytes and normalize line endings
+        content = content.replace('\x00', '').replace('\r', '\n')
+        
+        # Replace problematic Unicode characters that may break prompts
+        unicode_replacements = {
+            # Mathematical symbols
+            'α': 'alpha',
+            'β': 'beta', 
+            'γ': 'gamma',
+            'δ': 'delta',
+            'ε': 'epsilon',
+            'ζ': 'zeta',
+            'η': 'eta',
+            'θ': 'theta',
+            'ι': 'iota',
+            'κ': 'kappa',
+            'λ': 'lambda',
+            'μ': 'mu',
+            'ν': 'nu',
+            'ξ': 'xi',
+            'ο': 'omicron',
+            'π': 'pi',
+            'ρ': 'rho',
+            'σ': 'sigma',
+            'τ': 'tau',
+            'υ': 'upsilon',
+            'φ': 'phi',
+            'χ': 'chi',
+            'ψ': 'psi',
+            'ω': 'omega',
+            
+            # Punctuation and symbols
+            '–': '-',    # en dash
+            '—': '-',    # em dash
+            ''': "'",    # left single quotation
+            ''': "'",    # right single quotation
+            '"': '"',    # left double quotation
+            '"': '"',    # right double quotation
+            '…': '...',  # horizontal ellipsis
+            '∗': '*',    # asterisk operator
+            '≥': '>=',   # greater than or equal
+            '≤': '<=',   # less than or equal
+            '≠': '!=',   # not equal
+            '≈': '~=',   # approximately equal
+            '∈': 'in',   # element of
+            '∉': 'not in', # not element of
+            '∀': 'for all', # universal quantifier
+            '∃': 'exists',  # existential quantifier
+            '∅': 'empty set', # empty set
+            '∪': 'union',    # union
+            '∩': 'intersection', # intersection
+            '⊂': 'subset',   # subset
+            '⊃': 'superset', # superset
+        }
+        
+        # Apply replacements
+        for unicode_char, replacement in unicode_replacements.items():
+            content = content.replace(unicode_char, replacement)
+        
+        # Remove or replace other problematic characters that could break prompts
+        # Replace control characters (except \n and \t)
+        import re
+        content = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', content)
+        
+        # Escape potential prompt injection patterns
+        # Replace sequences that might confuse the AI model
+        content = content.replace('```', '`‌`‌`')  # Insert zero-width non-joiner
+        content = content.replace('IMPORTANT:', 'Important:')
+        content = content.replace('SYSTEM:', 'System:')
+        content = content.replace('USER:', 'User:')
+        content = content.replace('ASSISTANT:', 'Assistant:')
+        
+        return content
+
     def translate_file(self, input_file: str) -> bool:
         """Translate a single file using Claude executable."""
         input_path = Path(input_file)
@@ -511,11 +631,11 @@ IMPORTANT: Output only the Vietnamese translation. Do not explain what you did. 
             output_path = input_path.with_suffix(input_path.suffix + '_vi.txt')
         
         try:
-            # Read input file content and sanitize
+            # Read input file content and sanitize thoroughly
             content = input_path.read_text(encoding='utf-8')
             
-            # Remove null bytes and other problematic characters
-            content = content.replace('\x00', '').replace('\r', '\n')
+            # Apply comprehensive sanitization to prevent prompt issues
+            content = self._sanitize_content(content)
             
             # Build full prompt
             full_prompt = self.translation_prompt.format(content=content)
@@ -526,7 +646,7 @@ IMPORTANT: Output only the Vietnamese translation. Do not explain what you did. 
                 temp_prompt_path = temp_file.name
             
             try:
-                # Use Claude CLI with stdin to avoid argument length limits
+                # Use Claude CLI with worker-specific config
                 cmd = [
                     self.claude_path,
                     "--print",
@@ -534,21 +654,36 @@ IMPORTANT: Output only the Vietnamese translation. Do not explain what you did. 
                     "--model", "sonnet"
                 ]
                 
+                # Use default environment (shared config with auth lock)
+                env = os.environ.copy()
+                
                 worker_logger.info(f"Translating {input_file} -> {output_path}")
                 worker_logger.info(f"Running Claude CLI with stdin input and --dangerously-skip-permissions")
                 
                 # Run Claude with stdin input
                 try:
                     worker_logger.info(f"Processing {len(content)} chars with Claude CLI")
-                    worker_logger.info("Starting Claude translation...")
                     
-                    result = subprocess.run(
-                        cmd,
-                        input=full_prompt,
-                        capture_output=True,
-                        text=True,
-                        timeout=1800  # 30 minute timeout
-                    )
+                    # Acquire auth lock only during Claude initialization/auth phase
+                    if not self._acquire_auth_lock():
+                        worker_logger.error("Failed to acquire auth lock for Claude initialization")
+                        return False
+                    
+                    try:
+                        worker_logger.info("Starting Claude translation (auth lock acquired)...")
+                        
+                        result = subprocess.run(
+                            cmd,
+                            input=full_prompt,
+                            capture_output=True,
+                            text=True,
+                            timeout=1800,  # 30 minute timeout
+                            env=env
+                        )
+                    finally:
+                        # Release auth lock immediately after Claude process starts
+                        self._release_auth_lock()
+                        worker_logger.debug("Auth lock released - other workers can proceed")
                     
                     stdout = result.stdout
                     stderr = result.stderr
@@ -556,7 +691,7 @@ IMPORTANT: Output only the Vietnamese translation. Do not explain what you did. 
                     
                     worker_logger.info(f"Claude process completed with return code: {return_code}")
                     if stderr:
-                        worker_logger.warning(f"Claude stderr: {stderr[:500]}...")  # Log first 500 chars of stderr
+                        worker_logger.error(f"Claude stderr (full): {stderr}")  # Log full stderr for debugging
                     
                     if return_code == 0 and stdout:
                         # Check if output is valid translation (not summary)
@@ -592,7 +727,7 @@ IMPORTANT: Output only the Vietnamese translation. Do not explain what you did. 
                                 # Try once more with simpler command using stdin
                                 simple_cmd = [self.claude_path, "--print", "--dangerously-skip-permissions"]
                                 try:
-                                    retry_result = subprocess.run(simple_cmd, input=full_prompt, capture_output=True, text=True, timeout=1800)
+                                    retry_result = subprocess.run(simple_cmd, input=full_prompt, capture_output=True, text=True, timeout=1800, env=env)
                                     if retry_result.returncode == 0 and retry_result.stdout and len(retry_result.stdout.strip()) > 50:
                                         output_path.write_text(retry_result.stdout, encoding='utf-8')
                                         worker_logger.info(f"Retry successful: Translation saved to {output_path} ({len(retry_result.stdout)} chars)")
@@ -654,8 +789,8 @@ def translate_worker(args: Tuple[str, str]) -> Tuple[str, bool]:
     signal.signal(signal.SIGINT, signal_handler)
     
     try:
-        translator = ClaudeTranslator(claude_path)
-        worker_logger.info(f"Translator initialized for {filename}")
+        translator = ClaudeTranslator(claude_path, worker_pid)
+        worker_logger.info(f"Translator initialized for {filename} with worker ID {worker_pid}")
         
         result = translator.translate_file(filename)
         
@@ -702,7 +837,7 @@ def idle_worker(args: Tuple[str, str]) -> Tuple[Optional[str], bool]:
     
     try:
         queue_manager = TranslationQueueManager(queue_file)
-        translator = ClaudeTranslator(claude_path)
+        translator = ClaudeTranslator(claude_path, worker_pid)
         
         # Poll for files every 5 seconds
         poll_interval = 5
@@ -748,7 +883,7 @@ class TranslationManager:
     """Main translation manager orchestrating the entire process."""
     
     def __init__(self, queue_file: str = "translation_queue.txt", 
-                 claude_path: str = "claude", max_workers: int = 6):
+                 claude_path: str = "/home/admin88/.nvm/versions/node/v18.20.8/bin/claude", max_workers: int = 6):
         self.queue_manager = TranslationQueueManager(queue_file)
         self.claude_path = claude_path
         self.max_workers = max_workers
@@ -964,8 +1099,8 @@ def main():
     parser = argparse.ArgumentParser(description="Automated Paper Translation Manager")
     parser.add_argument("--workers", type=int, default=6,
                        help="Number of parallel workers (default: 6)")
-    parser.add_argument("--claude-path", type=str, default="claude",
-                       help="Path to Claude executable (default: claude)")
+    parser.add_argument("--claude-path", type=str, default="/home/admin88/.nvm/versions/node/v18.20.8/bin/claude",
+                       help="Path to Claude executable (default: npm-global claude)")
     parser.add_argument("--queue-file", type=str, default="translation_queue.txt",
                        help="Path to translation queue file (default: translation_queue.txt)")
     parser.add_argument("--verbose", "-v", action="store_true",

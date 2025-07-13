@@ -1,0 +1,305 @@
+# Làm mượt dữ liệu lặp: Giảm thiểu hiện tượng quá khớp phần thưởng và tối ưu hóa quá mức trong RLHF
+
+Banghua Zhu1, Michael I. Jordan1, và Jiantao Jiao1
+1Đại học California, Berkeley
+
+## Tóm tắt
+
+Học tăng cường từ phản hồi con người (RLHF) là một kỹ thuật then chốt giúp điều chỉnh các mô hình ngôn ngữ sát với các giá trị lấy con người làm trung tâm. Giai đoạn đầu của RLHF bao gồm việc học các giá trị con người bằng cách sử dụng mô hình phần thưởng từ dữ liệu xếp hạng. Người ta quan sát thấy rằng hiệu suất của mô hình phần thưởng giảm sau một epoch huấn luyện, và tối ưu hóa quá nhiều đối với mô hình phần thưởng đã học cuối cùng cản trở mục tiêu thực sự. Bài báo này đi sâu vào những vấn đề này, tận dụng những hiểu biết lý thuyết để thiết kế thuật toán học phần thưởng cải tiến có tên 'Làm mượt dữ liệu lặp' (IDS). Ý tưởng cốt lõi là trong mỗi epoch huấn luyện, chúng ta không chỉ cập nhật mô hình với dữ liệu, mà còn cập nhật dữ liệu bằng cách sử dụng mô hình, thay thế các nhãn cứng bằng các nhãn mềm. Những phát hiện thực nghiệm của chúng tôi làm nổi bật hiệu suất vượt trội của phương pháp này so với các phương pháp truyền thống.
+
+## 1 Giới thiệu
+
+Tiến bộ gần đây về các Mô hình Ngôn ngữ Lớn (LLM) đang có tác động biến đổi không chỉ trong xử lý ngôn ngữ tự nhiên mà còn rộng rãi hơn trong một loạt các ứng dụng AI (Radford et al., 2019; Chowdhery et al., 2022; Brown et al., 2020; Touvron et al., 2023; Bubeck et al., 2023; Schulman et al., 2022; OpenAI, 2023; Anthropic, 2023). Một thành phần chính trong việc triển khai LLM là bước tinh chỉnh, trong đó các mô hình được đưa đến gần hơn với các mục tiêu hành vi và chuẩn mực cụ thể. Khi không được tinh chỉnh đầy đủ, LLM có thể thể hiện hành vi không mong muốn và không thể dự đoán, bao gồm việc bịa đặt sự thật hoặc tạo ra nội dung thiên vị và độc hại (Perez et al., 2022; Ganguli et al., 2022). Cách tiếp cận hiện tại để giảm thiểu những vấn đề như vậy là sử dụng học tăng cường dựa trên đánh giá của con người.
+
+Cụ thể, Học tăng cường với Phản hồi của Con người (RLHF) đề xuất sử dụng các đánh giá của con người làm hàm phần thưởng từ các so sánh theo cặp hoặc đa chiều của các phản hồi mô hình, và sau đó tinh chỉnh mô hình ngôn ngữ dựa trên các hàm phần thưởng đã học (Ziegler et al., 2019; Ouyang et al., 2022; Schulman et al., 2022).
+
+Tiếp theo từ giai đoạn học có giám sát, một giao thức RLHF điển hình bao gồm hai bước chính:
+
+• **Học phần thưởng**: Lấy mẫu các prompt từ tập dữ liệu prompt và tạo ra nhiều phản hồi cho cùng một prompt. Thu thập dữ liệu ưa thích của con người dưới dạng so sánh theo cặp hoặc đa chiều của các phản hồi khác nhau. Huấn luyện mô hình phần thưởng dựa trên dữ liệu ưa thích.
+
+• **Học chính sách**: Tinh chỉnh LLM hiện tại dựa trên mô hình phần thưởng đã học với các thuật toán học tăng cường.
+
+Mặc dù RLHF đã thành công trong thực tế (Bai et al., 2022; Ouyang et al., 2022; Dubois et al., 2023), nó không phải là không có khuyết điểm, và thực sự mô hình huấn luyện phần thưởng hiện tại phải vật lộn với sự không khớp giá trị-phần thưởng đáng kể. Có hai vấn đề chính với mô hình hiện tại:
+
+• **Quá khớp phần thưởng**: Trong quá trình huấn luyện mô hình phần thưởng, người ta quan sát thấy rằng mất mát cross-entropy kiểm tra của mô hình phần thưởng có thể xấu đi sau một epoch huấn luyện Ouyang et al. (2022).
+
+• **Tối ưu hóa quá mức phần thưởng**: Khi huấn luyện mô hình chính sách để tối đa hóa phần thưởng được dự đoán bởi mô hình đã học, người ta quan sát thấy rằng phần thưởng thực tế có thể tăng khi chính sách gần với chính sách ban đầu trong phân kỳ KL, nhưng giảm với việc huấn luyện tiếp tục (Gao et al., 2023).
+
+Trong bài báo này, chúng tôi điều tra những vấn đề này một cách sâu sắc. Chúng tôi đơn giản hóa công thức của RLHF thành một bài toán multi-armed bandit và tái tạo các hiện tượng quá khớp và tối ưu hóa quá mức. Chúng tôi tận dụng những hiểu biết lý thuyết trong bối cảnh bandit để thiết kế các thuật toán mới hoạt động tốt trong các tình huống tinh chỉnh thực tế.
+
+### 1.1 Kết quả chính
+
+Là đóng góp đầu tiên của chúng tôi, chúng tôi xác định nguyên nhân gốc rễ của cả quá khớp phần thưởng và tối ưu hóa quá mức. Chúng tôi chỉ ra rằng đó là sự không đầy đủ của mất mát cross-entropy đối với các tập dữ liệu ưa thích có đuôi dài.
+
+Như được minh họa trong Hình 1, ngay cả một bài toán bandit 3 cánh tay đơn giản cũng có thể gặp phải quá khớp và tối ưu hóa quá mức khi đối mặt với các tập dữ liệu mất cân bằng như vậy. Xem xét một tình huống trong đó chúng ta có ba cánh tay với phần thưởng thực được cho bởi r⋆₁ = 1, r⋆₂ = r⋆₃ = 0, và phân phối ưa thích được tạo ra bởi mô hình Bradley-Terry-Luce (BTL) (Bradley and Terry, 1952), tức là P(i ≻ j) = exp(r⋆ᵢ)/(exp(r⋆ᵢ) + exp(r⋆ⱼ)).
+
+Giả sử tập dữ liệu ưa thích của chúng ta so sánh cánh tay thứ nhất và thứ hai 1000 lần nhưng chỉ so sánh cánh tay thứ nhất và thứ ba một lần, và để n(i ≻ j) biểu thị số lần cánh tay i được ưa thích hơn cánh tay j. Mất mát cross-entropy thực nghiệm tiêu chuẩn được sử dụng trong tài liệu để học mô hình phần thưởng (Ouyang et al., 2022; Zhu et al., 2023a) có thể được viết như sau:
+
+-∑ᵢ,ⱼ n(i ≻ j) log exp(rᵢ)/(exp(rᵢ) + exp(rⱼ))
+
+Chúng ta biết rằng các giá trị thực nghiệm n(1 ≻ 2) và n(2 ≻ 1) tập trung xung quanh giá trị trung bình của chúng. Tuy nhiên, chúng ta có với xác suất 0.73, n(1 ≻ 3) = 1 và n(3 ≻ 1) = 0, và với xác suất 0.27, n(1 ≻ 3) = 0 và n(3 ≻ 1) = 1. Trong cả hai trường hợp, bộ tối thiểu hóa của mất mát entropy thực nghiệm sẽ thỏa mãn hoặc là r̂₁ - r̂₃ = -∞ hoặc r̂₁ - r̂₃ = +∞. Điều này tạo ra một nhiễu hiệu quả rất lớn khi độ bao phủ mất cân bằng. Hơn nữa, phân phối ưa thích giới hạn rất khác với phân phối thực tế, dẫn đến quá khớp phần thưởng. Ngoài ra, vì có xác suất 0.27 rằng r̂₁ - r̂₃ = -∞, chúng ta sẽ lấy cánh tay 3 làm cánh tay tối ưu thay vì cánh tay 1. Điều này gây ra tối ưu hóa quá mức phần thưởng trong giai đoạn học chính sách vì chính sách cuối cùng hội tụ về cánh tay sai với phần thưởng bằng không.
+
+Để giảm thiểu những hiệu ứng này, chúng tôi tận dụng cơ chế bi quan từ học bandit để phân tích và thiết kế một thuật toán mới, Làm mượt Dữ liệu Lặp (IDS), giải quyết đồng thời cả quá khớp phần thưởng và tối ưu hóa quá mức phần thưởng. Thiết kế thuật toán rất đơn giản: trong mỗi epoch, ngoài việc cập nhật mô hình với dữ liệu, chúng ta cũng điều chỉnh dữ liệu bằng cách sử dụng mô hình. Về mặt lý thuyết, chúng tôi điều tra hai hiện tượng trong trường hợp bandit dạng bảng. Chúng tôi chỉ ra rằng phương pháp được đề xuất, như một thay thế cho thuật toán dựa trên cận tin cậy thấp hơn (Jin et al., 2021; Xie et al., 2021; Rashidinejad et al., 2021; Zhu et al., 2023a), học phân phối thực tế cho các cặp được so sánh đủ nhiều lần, và bỏ qua các so sánh ít được bao phủ do đó giảm thiểu các vấn đề được tạo ra bởi dữ liệu có đuôi dài.
+
+Về mặt thực nghiệm, chúng tôi trình bày bằng chứng thực nghiệm rằng phương pháp được đề xuất cải thiện huấn luyện phần thưởng trong cả bối cảnh bandit và mạng nơ-ron.
+
+### 1.2 Công trình liên quan
+
+**RLHF và Học tăng cường dựa trên ưa thích.** RLHF, hoặc Học tăng cường dựa trên Ưa thích (PbRL), đã mang lại thành công thực nghiệm đáng kể trong các lĩnh vực chơi game, huấn luyện robot, dự đoán chứng khoán, hệ thống gợi ý, thử nghiệm lâm sàng và xử lý ngôn ngữ tự nhiên (Novoseller et al., 2019; Sadigh et al., 2017; Christiano et al., 2017b; Kupcsik et al., 2018; Jain et al., 2013; Wirth et al., 2017; Knox and Stone, 2008; MacGlashan et al., 2017; Christiano et al., 2017a; Warnell et al., 2018; Brown et al., 2019; Shin et al., 2023; Ziegler et al., 2019; Stiennon et al., 2020; Wu et al., 2021; Nakano et al., 2021; Ouyang et al., 2022; Menick et al., 2022; Glaese et al., 2022; Gao et al., 2022; Bai et al., 2022; Ganguli et al., 2022; Ramamurthy et al., 2022). Trong bối cảnh các mô hình ngôn ngữ, đã có công trình khám phá việc tinh chỉnh hiệu quả của mô hình chính sách (Snell et al., 2022; Song et al., 2023a; Yuan et al., 2023; Zhu et al., 2023b; Rafailov et al., 2023; Wu et al., 2023).
+
+Trong trường hợp học phần thưởng, Ouyang et al. (2022) lưu ý rằng nói chung phần thưởng chỉ có thể được huấn luyện trong một epoch trong pipeline RLHF, sau đó mất mát kiểm tra có thể tăng lên. Gao et al. (2023) nghiên cứu quy luật tỷ lệ của việc huấn luyện mô hình phần thưởng, và lưu ý rằng tối ưu hóa quá mức là một vấn đề khác trong học phần thưởng. Để giải quyết vấn đề này, Zhu et al. (2023a) đề xuất một phương pháp dựa trên bi quan cải thiện chính sách được huấn luyện từ mô hình phần thưởng khi phần thưởng tối ưu nằm trong một họ tuyến tính. Người ta quan sát trong Song et al. (2023b) rằng mô hình phần thưởng có xu hướng giống hệt nhau bất kể các prompt là mở hay đóng trong giai đoạn cuối của huấn luyện, và họ đề xuất một kế hoạch tối ưu hóa phần thưởng phụ thuộc prompt.
+
+Một chủ đề liên quan chặt chẽ khác là vấn đề ước tính và xếp hạng từ các so sánh theo cặp hoặc K-chiều. Trong tài liệu về dueling bandit, người ta so sánh hai hành động và nhằm tối thiểu hóa hối tiếc dựa trên các so sánh theo cặp (Yue et al., 2012; Zoghi et al., 2014b; Yue and Joachims, 2009, 2011; Saha and Krishnamurthy, 2022; Ghoshal and Saha, 2022; Saha and Gopalan, 2018a; Ailon et al., 2014; Zoghi et al., 2014a; Komiyama et al., 2015; Gajane et al., 2015; Saha and Gopalan, 2018b, 2019; Faury et al., 2020). Novoseller et al. (2019); Xu et al. (2020) phân tích độ phức tạp mẫu của các tác nhân RL dueling trong trường hợp dạng bảng, được mở rộng cho trường hợp tuyến tính và xấp xỉ hàm bởi công trình gần đây của Pacchiano et al. (2021); Chen et al. (2022). Chatterji et al. (2022) nghiên cứu một bối cảnh liên quan trong đó mỗi episode chỉ nhận được phản hồi nhị phân. Hầu hết công trình lý thuyết về học từ xếp hạng tập trung vào tối thiểu hóa hối tiếc, trong khi RLHF tập trung nhiều hơn vào chất lượng của chính sách cuối cùng.
+
+**Chưng cất kiến thức** Tài liệu về chưng cất kiến thức tập trung vào việc chuyển giao kiến thức từ mô hình giáo viên sang mô hình học sinh (Hinton et al., 2015; Furlanello et al., 2018; Cho and Hariharan, 2019; Zhao et al., 2022; Romero et al., 2014; Yim et al., 2017; Huang and Wang, 2017; Park et al., 2019; Tian et al., 2019; Tung and Mori, 2019; Qiu et al., 2022; Cheng et al., 2020). Người ta quan sát trong tài liệu này rằng các nhãn mềm được tạo ra bởi mạng giáo viên có thể giúp huấn luyện một mạng học sinh tốt hơn, ngay cả khi mạng giáo viên và học sinh có cùng kích thước và cấu trúc Hinton et al. (2015). Furlanello et al. (2018) trình bày một phương pháp huấn luyện lặp đi lặp lại một mạng học sinh mới sau khi mạng giáo viên đạt được mất mát đánh giá nhỏ nhất. Cả thuật toán làm mượt dữ liệu lặp của chúng tôi và các phương pháp chưng cất kiến thức này đều học từ các nhãn mềm. Tuy nhiên, làm mượt dữ liệu lặp cập nhật lặp đi lặp lại cùng một mô hình và dữ liệu, trong khi phương pháp chưng cất kiến thức thường tập trung vào việc chuyển giao kiến thức từ mô hình này sang mô hình khác.
+
+## 2 Công thức
+
+Chúng tôi bắt đầu với ký hiệu mà chúng tôi sử dụng trong bài báo. Sau đó chúng tôi giới thiệu công thức tổng quát của RLHF, cùng với sự đơn giản hóa của chúng tôi trong trường hợp multi-armed bandit.
+
+**Ký hiệu.** Chúng tôi sử dụng các chữ cái viết hoa nghiêng cho các tập hợp, ví dụ S và A. Cho một tập hợp S, chúng tôi viết |S| để biểu thị lực lượng của S. Chúng tôi sử dụng [K] để biểu thị tập hợp các số nguyên từ 1 đến K. Chúng tôi sử dụng μ(a, a') để biểu thị xác suất so sánh a và a' trong tập dữ liệu ưa thích, và μ(a) = ∑_{a'∈A} μ(a, a') để biểu thị xác suất so sánh a với bất kỳ cánh tay nào khác. Tương tự, chúng tôi sử dụng n(a), n(a, a') để biểu thị số lượng mẫu so sánh a với bất kỳ cánh tay nào khác, và số lượng mẫu so sánh a với a', tương ứng. Chúng tôi sử dụng a₁ ≻ a₂ để biểu thị sự kiện a₁ được ưa thích hơn so với a₂.
+
+### 2.1 Công thức tổng quát của RLHF
+
+Các thành phần chính trong RLHF bao gồm hai bước: học phần thưởng và học chính sách. Chúng tôi giới thiệu ngắn gọn công thức tổng quát của RLHF dưới đây.
+
+Trong giai đoạn học phần thưởng, người ta thu thập một tập dữ liệu ưa thích dựa trên tập dữ liệu prompt và các phản hồi cho các prompt. Theo công thức của Zhu et al. (2023a), đối với mẫu thứ i, một trạng thái (prompt) sᵢ được lấy mẫu đầu tiên từ một phân phối prompt ρ nào đó. Cho trạng thái sᵢ, M hành động (phản hồi) (a₁⁽ⁱ⁾, a₂⁽ⁱ⁾, ···, a_M⁽ⁱ⁾) được lấy mẫu từ một phân phối kết hợp P(a⁽¹⁾, ···, a⁽ᴹ⁾|sᵢ) nào đó. Gọi σᵢ: [M] ↦ [M] là đầu ra của người dán nhãn con người, là một hàm hoán vị biểu thị thứ hạng của các hành động. Ở đây σᵢ(1) đại diện cho hành động được ưa thích nhất, và σᵢ(M) là hành động ít được ưa thích nhất. Một mô hình phổ biến cho phân phối của σ dưới các so sánh đa ngành là mô hình Plackett-Luce (Plackett, 1975; Luce, 2012). Mô hình Plackett-Luce định nghĩa xác suất của một cặp trạng thái-hành động (s, aᵢ) là lớn nhất trong một tập hợp đã cho {(s, aᵢ)}ᵢ₌₁ᴹ như:
+
+P(aᵢ ≻ aⱼ, ∀j ≠ i|s) = exp(r⋆(s, aᵢ))/∑ⱼ₌₁ᴹ exp(r⋆(s, aⱼ))
+
+trong đó r⋆: S × A ↦ ℝ là phần thưởng thực tế cho phản hồi đã cho prompt. Hơn nữa, xác suất quan sát hoán vị σ được định nghĩa là¹
+
+P(σ|s, {a⁽ⁱ⁾}ᵢ₌₁ᴹ) = ∏ᵢ₌₁ᴹ exp(r(s, a⁽σ⁽ⁱ⁾⁾))/∑ⱼ₌ᵢᴹ exp(r(s, a⁽σ⁽ʲ⁾⁾))
+
+Khi M = 2, điều này giảm xuống thành so sánh theo cặp được xem xét trong mô hình Bradley-Terry-Luce (BTL) (Bradley and Terry, 1952), được sử dụng trong các thuật toán RLHF hiện tại. Trong trường hợp này, hoán vị σ có thể được rút gọn thành một biến ngẫu nhiên Bernoulli, biểu thị liệu một hành động có được ưa thích hơn so với hành động khác hay không. Cụ thể, đối với mỗi cặp trạng thái-hành động được truy vấn (s, a, a'), chúng ta quan sát một mẫu c từ phân phối Bernoulli với tham số exp(r_θ⋆(s,a))/(exp(r_θ⋆(s,a)) + exp(r_θ⋆(s,a'))). Dựa trên tập dữ liệu quan sát được, mất mát cross-entropy được tối thiểu hóa để ước tính phần thưởng thực tế cho trường hợp so sánh theo cặp. Bộ tối thiểu hóa của mất mát cross-entropy là bộ ước tính maximum likelihood:
+
+r̂_MLE ∈ arg min_r L_CE(D, r)
+
+L_CE(D, r) = -∑ᵢ₌₁ⁿ log[yᵢ · exp(r(sᵢ, a₁⁽ⁱ⁾))/(exp(r(sᵢ, a₁⁽ⁱ⁾)) + exp(r(sᵢ, a₂⁽ⁱ⁾))) + (1-yᵢ) · exp(r(sᵢ, a₂⁽ⁱ⁾))/(exp(r(sᵢ, a₁⁽ⁱ⁾)) + exp(r(sᵢ, a₂⁽ⁱ⁾)))]
+
+Sau khi học phần thưởng, chúng ta nhằm học chính sách tối ưu dưới chính quy hóa KL đối với chính sách ban đầu π₀ dưới một phân phối trạng thái (prompt) ρ' nào đó.
+
+π̂ = arg max_π E_{s∼ρ',a∼π}[r̂_MLE(s, a)] - λ · E_{s∼ρ'}[KL(π(·|s)||π₀(·|s))]
+
+### 2.2 RLHF trong Multi-Armed Bandits
+
+Để hiểu các vấn đề quá khớp và tối ưu hóa quá mức, chúng tôi đơn giản hóa bài toán RLHF để xem xét công thức multi-armed bandit trạng thái đơn với các so sánh theo cặp. Thay vì khớp mô hình phần thưởng và mô hình chính sách với mạng nơ-ron, chúng tôi khớp mô hình phần thưởng dạng bảng trong bài toán bandit K-cánh tay.
+
+Xem xét một bài toán multi-armed bandit với K cánh tay. Mỗi cánh tay có phần thưởng thực tế xác định r⋆(k) ∈ ℝ, k ∈ [K]. Trong trường hợp này, chính sách trở thành một phân phối được hỗ trợ trên K cánh tay π ∈ Δ([K]). Quá trình lấy mẫu cho RLHF tổng quát giảm xuống như sau: chúng ta đầu tiên lấy mẫu hai hành động aᵢ, a'ᵢ từ phân phối kết hợp μ ∈ Δ([K] × [K]), và sau đó quan sát một biến so sánh nhị phân yᵢ theo phân phối:
+
+P(yᵢ = 1) = exp(r⋆(aᵢ))/(exp(r⋆(aᵢ)) + exp(r⋆(a'ᵢ))), P(yᵢ = 0) = 1 - P(yᵢ = 1)
+
+Giả sử rằng chúng ta được cho n mẫu, được lấy mẫu i.i.d. từ quá trình trên. Gọi n(a, a') là tổng số so sánh giữa các hành động a và a' trong n mẫu. Gọi tập dữ liệu kết quả là D = {aᵢ, a'ᵢ, yᵢ}ᵢ₌₁ⁿ. Các nhiệm vụ trong RLHF cho bối cảnh multi-armed bandit có thể được đơn giản hóa như:
+
+1. **Học phần thưởng**: Ước tính phần thưởng thực r⋆ với phần thưởng proxy r̂ từ tập dữ liệu so sánh D.
+2. **Học chính sách**: Tìm một chính sách π ∈ Δ([K]) tối đa hóa phần thưởng proxy dưới các ràng buộc KL.
+
+Trong hai phần tiếp theo, chúng tôi thảo luận riêng biệt về giai đoạn học phần thưởng và giai đoạn học chính sách, cùng với các lý do đằng sau quá khớp và tối ưu hóa quá mức.
+
+### 2.3 Quá khớp trong Học phần thưởng
+
+Đối với học phần thưởng, bộ ước tính maximum likelihood thường được sử dụng là bộ ước tính tối thiểu hóa mất mát cross-entropy thực nghiệm:
+
+r̂_MLE = arg min_r L̂_CE(D, r), trong đó (1)
+
+L̂_CE(D, r̂) = -1/n ∑ᵢ₌₁ⁿ [yᵢ log exp(r̂(aᵢ))/(exp(r̂(aᵢ)) + exp(r̂(a'ᵢ))) + (1-yᵢ) log exp(r̂(a'ᵢ))/(exp(r̂(aᵢ)) + exp(r̂(a'ᵢ)))]
+
+Theo định nghĩa, r̂_MLE là điểm hội tụ khi chúng ta tối ưu hóa hoàn toàn cross entropy thực nghiệm. Do đó mất mát cross-entropy quần thể của r̂_MLE là một chỉ số cho việc liệu có tồn tại quá khớp trong quá trình huấn luyện phần thưởng hay không.
+
+Chúng tôi định nghĩa mất mát cross entropy quần thể như:
+
+L_CE(r) = -E_{(a,a')∼μ,y∼Ber(exp(r⋆(a))/(exp(r⋆(a))+exp(r⋆(a'))))}[y log exp(r(a))/(exp(r(a)) + exp(r(a'))) + (1-y) log exp(r(a'))/(exp(r(a)) + exp(r(a')))]
+
+= -E_{(a,a')∼μ}[exp(r⋆(a))/(exp(r⋆(a)) + exp(r⋆(a'))) log exp(r(a))/(exp(r(a)) + exp(r(a'))) + exp(r⋆(a'))/(exp(r⋆(a)) + exp(r⋆(a'))) log exp(r(a'))/(exp(r(a)) + exp(r(a')))]
+
+Đối với phân phối so sánh theo cặp cố định μ, người ta biết rằng bộ ước tính maximum likelihood r̂_MLE hội tụ về phần thưởng thực tế r⋆ khi số lượng mẫu n tiến đến vô cùng.
+
+**Định lý 2.1** (Tính nhất quán của MLE, xem, ví dụ, Định lý 6.1.3. của Hogg et al. (2013)). Cố định r⋆(K) = r̂(K) = 0 để duy nhất nghiệm. Đối với bất kỳ μ cố định nào, và bất kỳ phần thưởng thực tế r⋆ đã cho nào, chúng ta có r̂_MLE hội tụ theo xác suất về r⋆; tức là, đối với bất kỳ ε > 0:
+
+lim_{n→+∞} P(||r̂_MLE - r⋆||_∞ ≥ ε) = 0
+
+Ở đây chúng tôi xem r̂_MLE và r⋆ như các vector K-chiều.
+
+Chứng minh được hoãn lại đến Phụ lục D. Điều này gợi ý rằng hiện tượng quá khớp không phát sinh khi chúng ta có số lượng mẫu vô hạn. Tuy nhiên, trong chế độ không tiệm cận khi phân phối so sánh μ có thể phụ thuộc vào n, người ta có thể không mong đợi kết quả hội tụ cho MLE. Chúng ta có định lý sau.
+
+**Định lý 2.2** (Quá khớp phần thưởng của MLE trong chế độ không tiệm cận). Cố định r⋆(a) = 1(a = 1) và r̂(K) = 0 để duy nhất nghiệm. Đối với bất kỳ n > 500 cố định nào, tồn tại một bài toán bandit 3-cánh tay sao cho với xác suất ít nhất 0.09:
+
+L_CE(r̂_MLE) - L_CE(r⋆) ≥ C
+
+với bất kỳ C lớn tùy ý nào.
+
+Chứng minh được hoãn lại đến Phụ lục E. Dưới đây chúng tôi cung cấp một giải thích trực quan. Trường hợp khó được xây dựng là một bandit trong đó r⋆(a) = 1(a = 1). Đối với bất kỳ n cố định nào, chúng ta đặt μ(1,2) = 1 - 1/n, μ(1,3) = 1/n.
+
+Trong trường hợp khó này, có xác suất không đổi rằng cánh tay 3 chỉ được so sánh với cánh tay 1 một lần. Và với xác suất không đổi, kết quả so sánh quan sát được giữa cánh tay 1 và cánh tay 3 sẽ khác với thực tế. MLE sẽ gán r(3) = +∞ vì bộ tối đa hóa của log(exp(x)/(1 + exp(x))) là vô cùng khi x không bị chặn. Do đó khi tối ưu hóa hoàn toàn cross entropy thực nghiệm, bộ ước tính maximum likelihood sẽ dẫn đến mất mát cross-entropy quần thể lớn. Chúng tôi cũng xác nhận hiện tượng này trong Phần 4.1 với các thí nghiệm mô phỏng.
+
+Trường hợp cận dưới này mô phỏng chế độ chiều cao trong đó số lượng mẫu có thể so sánh với chiều, và độ bao phủ dữ liệu mất cân bằng trên các chiều. Người ta cũng có thể mở rộng cận dưới cho nhiều hơn 3 cánh tay, trong đó xác suất mất mát lớn tùy ý sẽ tăng lên gần bằng 1 thay vì một hằng số nhỏ.
+
+### 2.4 Tối ưu hóa quá mức trong Học chính sách
+
+Sau khi có được hàm phần thưởng ước tính r̂, chúng ta tối ưu hóa chính sách π ∈ Δ([K]) để tối đa hóa phần thưởng ước tính. Trong RLHF, người ta bắt đầu từ chính sách ban đầu (tham chiếu) π₀, và tối ưu hóa chính sách mới π để tối đa hóa phần thưởng ước tính r̂ dưới một số ràng buộc trong phân kỳ KL giữa π và π₀. Người ta quan sát trong Gao et al. (2022) rằng khi chúng ta tiếp tục tối ưu hóa chính sách để tối đa hóa phần thưởng ước tính, phần thưởng thực của chính sách sẽ tăng đầu tiên rồi giảm, thể hiện hiện tượng tối ưu hóa quá mức phần thưởng.
+
+Xem xét bài toán tối ưu hóa chính sách sau cho một mô hình phần thưởng r̂ đã cho:
+
+max_{π∈Δ([K])} E_{a∼π(·)}[r̂(a)] - 1/λ · KL(π||π₀) (2)
+
+Giả sử rằng phương pháp gradient chính sách hội tụ về chính sách tối ưu cho bài toán tối ưu hóa chính sách trên, có nghiệm dạng đóng:
+
+π_λ(a) = π₀(a) · exp(λ · r̂(a)) / ∑_{a'∈A} π₀(a') · exp(λ · r̂(a')) (3)
+
+Trong trường hợp dạng bảng, chúng ta có thể dẫn xuất nghiệm dạng đóng cho cách phân kỳ KL và phần thưởng thực tế thay đổi đối với λ, do đó hoàn toàn đặc trưng cho sự đánh đổi phần thưởng-KL. Chúng ta tính phân kỳ KL và phần thưởng thực tế của chính sách như:
+
+KL(π_λ||π₀) = [∑_{a∈A} π₀(a) · exp(λ · r̂(a)) · log(exp(λ · r̂(a))/(∑_{a'∈A} π₀(a') · exp(λ · r̂(a'))))] / [∑_{a'∈A} π₀(a') · exp(λ · r̂(a'))]
+
+= [∑_{a∈A} π₀(a) · exp(λ · r̂(a)) · λ · r̂(a)] / [∑_{a'∈A} π₀(a') · exp(λ · r̂(a'))] - log(∑_{a'∈A} π₀(a') · exp(λ · r̂(a')))
+
+E_{a∼π_λ}[r⋆(a)] = [∑_{a∈A} π₀(a) · exp(λ · r̂(a)) · r⋆(a)] / [∑_{a'∈A} π₀(a') · exp(λ · r̂(a'))]
+
+Phương trình trên cung cấp một đặc trưng chính xác về cách sự không khớp giữa r̂ và r⋆ dẫn đến hiện tượng tối ưu hóa quá mức, có thể được xác thực từ các thí nghiệm trong Phần 4. Để đơn giản hóa phân tích và cung cấp trực giác tốt hơn, chúng tôi tập trung vào trường hợp khi λ → ∞, tức là khi chính sách tối ưu chọn cánh tay thực nghiệm tốt nhất mà không xem xét ràng buộc KL. Trong trường hợp này, chính sách cuối cùng giảm xuống thành cánh tay thực nghiệm tốt nhất, π_∞(a) = 1(a = arg max_{a'} r̂(a')).
+
+Theo định nghĩa, π_∞ là chính sách hội tụ khi chúng ta tiếp tục nới lỏng ràng buộc phân kỳ KL trong Phương trình (2). Do đó hiệu suất của π_∞ là một chỉ số tốt cho việc liệu có tồn tại tối ưu hóa quá mức trong quá trình huấn luyện chính sách hay không. Do đó chúng tôi định nghĩa một khái niệm về độ dưới tối ưu để đặc trưng khoảng cách hiệu suất giữa chính sách hội tụ và chính sách tối ưu:
+
+SubOpt(π̂) := max_a E[r⋆(a) - r⋆(π̂)]
+
+Chúng ta biết từ Định lý 2.1 rằng, theo tiệm cận, MLE cho phần thưởng r̂_MLE hội tụ về phần thưởng thực tế r⋆. Như một kết quả trực tiếp, khi sử dụng MLE làm phần thưởng, độ dưới tối ưu của chính sách π_∞ cũng hội tụ về không với số lượng mẫu vô hạn.
+
+Tuy nhiên, như một hệ quả của Định lý 2.2 và một kết quả trực tiếp của quá khớp phần thưởng, π_∞ có thể có độ dưới tối ưu lớn trong chế độ không tiệm cận khi được huấn luyện từ r̂_MLE.
+
+**Hệ quả 2.3** (Tối ưu hóa quá mức phần thưởng của MLE trong chế độ không tiệm cận). Cố định r⋆(a) = 1(a = 1). Đối với bất kỳ n cố định nào, tồn tại một bài toán bandit 3-cánh tay sao cho với xác suất ít nhất 0.09:
+
+SubOpt(π̂_∞) ≥ 1
+
+Chứng minh được hoãn lại đến Phụ lục F. Điều này gợi ý rằng r̂_MLE cũng dẫn đến hiện tượng tối ưu hóa quá mức phần thưởng trong chế độ không tiệm cận. Trong Phần 4, chúng tôi tiến hành mô phỏng trong chính xác cùng bối cảnh để xác minh các kết quả lý thuyết.
+
+## 3 Phương pháp: MLE Bi quan và Làm mượt Dữ liệu Lặp
+
+Vấn đề quá khớp và tối ưu hóa quá mức đòi hỏi thiết kế thuật toán học phần thưởng tốt hơn và thực tế giúp giảm thiểu cả hai vấn đề. Chúng tôi đầu tiên thảo luận thuật toán MLE bi quan trong Zhu et al. (2023a), được chỉ ra là hội tụ về một chính sách với độ dưới tối ưu biến mất dưới giả định bao phủ tốt.
+
+### 3.1 MLE Bi quan
+
+Trong trường hợp dạng bảng, MLE bi quan sửa chữa MLE ban đầu bằng cách trừ đi một khoảng tin cậy. Cụ thể, chúng ta có:
+
+r̂_PE(a) = r̂_MLE(a) - λ · √(1/n) (4)
+
+trong đó n là tổng số mẫu và λ = ||（L+εI)^{-1/2}_j||₂ là chuẩn của cột thứ j của ma trận (L+εI)^{-1/2}, trong đó L là ma trận thỏa mãn L_{a,a} = n(a)/n, L_{a,a'} = -n(a,a')/n, ∀a ≠ a', và ε là một hằng số nhỏ. Trực quan, đối với những cánh tay được so sánh ít lần hơn, chúng ta không chắc chắn hơn về giá trị phần thưởng thực tế của chúng. MLE bi quan phạt những cánh tay này bằng cách trực tiếp trừ đi độ dài của khoảng tin cậy dưới của phần thưởng của chúng, đảm bảo rằng những cánh tay ít được so sánh sẽ ít có khả năng được chọn hơn. Người ta chỉ ra trong Zhu et al. (2023a) rằng độ dưới tối ưu của chính sách tối ưu hóa r̂_PE hội tụ về không dưới hai điều kiện sau:
+
+• Số lần mong đợi mà người ta so sánh cánh tay tối ưu (hoặc cánh tay chuyên gia để so sánh trong định nghĩa độ dưới tối ưu) được chặn dưới bởi một hằng số dương μ(a⋆) ≥ C.
+
+• Họ phần thưởng được tham số hóa nằm trong không gian bị chặn |r̂(a)| ≤ B, ∀a ∈ [K].
+
+Điều này chỉ ra rằng MLE bi quan có thể giúp giảm thiểu hiện tượng tối ưu hóa quá mức phần thưởng. Tuy nhiên, đối với mô hình huấn luyện phần thưởng thực tế, họ phần thưởng được tham số hóa bằng mạng nơ-ron có thể không bị chặn. Hơn nữa, việc ước tính khoảng tin cậy chính xác cho một mô hình được tham số hóa bằng mạng nơ-ron có thể khó và tốn kém. Điều này ngăn cản việc sử dụng thực tế của MLE bi quan, và đòi hỏi các phương pháp mới có thể vượt qua những điều kiện này và áp dụng cho mạng nơ-ron.
+
+### 3.2 Làm mượt Dữ liệu Lặp
+
+Chúng tôi đề xuất một thuật toán mới, Làm mượt Dữ liệu Lặp (IDS), chia sẻ những hiểu biết tương tự như MLE bi quan. Trực quan, MLE bi quan giúp giảm thiểu vấn đề tối ưu hóa quá mức phần thưởng bằng cách giảm phần thưởng ước tính cho các cánh tay ít được thấy. Trong IDS, chúng ta đạt được điều này bằng cách cập nhật nhãn của dữ liệu mà chúng ta huấn luyện.
+
+**Thuật toán 1** Làm mượt Dữ liệu Lặp (D, θ₀, α, β)
+
+**Đầu vào:** Tập dữ liệu so sánh theo cặp D = {aᵢ, a'ᵢ, yᵢ}ⁿᵢ₌₁. Một họ mô hình phần thưởng được tham số hóa {r_θ: A ↦ ℝ | θ ∈ Θ} với khởi tạo θ₀ ∈ Θ. Hai kích thước bước α, β. Một hàm mất mát thực nghiệm:
+
+L_θ({yᵢ}, D) = -1/n ∑ᵢ₌₁ⁿ [yᵢ · log exp(r_θ(aᵢ))/(exp(r_θ(aᵢ)) + exp(r_θ(a'ᵢ))) + (1-yᵢ) · log exp(r_θ(a'ᵢ))/(exp(r_θ(aᵢ)) + exp(r_θ(a'ᵢ)))]
+
+Khởi tạo t = 0 và y_{i,0} = yᵢ, ∀i ∈ [n].
+
+**while** r_θt chưa hội tụ **do**
+    θ_{t+1} ← θₜ - α · ∇L_θ({y_{i,t}}, D)
+    y_{i,t+1} ← (1-β) · y_{i,t} + β · exp(r_θ_{t+1}(aᵢ))/(exp(r_θ_{t+1}(aᵢ)) + exp(r_θ_{t+1}(a'ᵢ)))
+    t ← t + 1
+**end while**
+
+**Trả về:** r_θt
+
+Như được hiển thị trong Thuật toán 1, chúng tôi khởi tạo y_{i,0} như các nhãn cho các mẫu yᵢ. Trong epoch thứ t, chúng tôi đầu tiên cập nhật mô hình bằng cách sử dụng tập dữ liệu so sánh hiện tại với các nhãn {y_{i,t}}ⁿᵢ₌₁. Sau khi mô hình được cập nhật, chúng tôi cũng cập nhật dữ liệu bằng cách sử dụng mô hình bằng cách dự đoán xác suất P(yᵢ = 1) cho mỗi so sánh (aᵢ, a'ᵢ) bằng cách sử dụng ước tính phần thưởng hiện tại r̂_θt. Chúng tôi cập nhật mỗi nhãn y_{i,t} như một kết hợp có trọng số của giá trị trước đó và xác suất dự đoán mới.
+
+Trực quan, y_{i,t} đại diện cho một proxy của mức độ tin cậy của các nhãn được dự đoán bởi các checkpoint mô hình tạm thời. Ý tưởng là khi mô hình tiến qua nhiều epoch huấn luyện, nó sẽ mang lại thay đổi lớn hơn cho phần thưởng đối với các mẫu được quan sát thường xuyên có đại diện được bao phủ tốt trong tập dữ liệu. Trong khi đó, đối với các mẫu hiếm khi thấy, mô hình sẽ thực hiện điều chỉnh tối thiểu cho phần thưởng.
+
+#### 3.2.1 Lợi ích của descent gradient một bước
+
+Trước khi phân tích thuật toán IDS, chúng tôi đầu tiên thảo luận tại sao huấn luyện trong một đến hai epoch trong phương pháp học phần thưởng truyền thống hoạt động tốt (Ouyang et al., 2022). Chúng tôi cung cấp phân tích sau về cập nhật gradient một bước cho mô hình phần thưởng. Chứng minh được hoãn lại đến Phụ lục G.
+
+**Định lý 3.1.** Xem xét cùng bối cảnh multi-armed bandit trong đó phần thưởng được khởi tạo bằng nhau cho tất cả K cánh tay. Sau đó sau khi descent gradient một bước, người ta có:
+
+∀a, a' ∈ [K], r̂(a) - r̂(a') = α · (n₊(a) - n₋(a) - (n₊(a') - n₋(a')))
+
+trong đó n₊(a), n₋(a) là tổng số lần a được ưa thích và không được ưa thích, tương ứng.
+
+**Nhận xét 3.2.** Kết quả chỉ ra tại sao dừng sớm trong học phần thưởng truyền thống hoạt động tốt trong một bối cảnh đơn giản. Sau một bước gradient, cánh tay thực nghiệm tốt nhất trở thành cánh tay có thời gian thắng tuyệt đối lớn nhất. Điều này có thể được xem như một tiêu chí khác bên cạnh bi quan cân bằng cả thời gian so sánh và thời gian được chọn làm cánh tay ưa thích. Khi cánh tay a chỉ được so sánh ít lần, sự khác biệt n₊(a) - n₋(a) sẽ bị chặn bởi tổng số so sánh, sẽ nhỏ hơn những cánh tay đã được so sánh nhiều lần hơn. Do đó mô hình phần thưởng sẽ phạt những cánh tay ít được thấy. Sau khi cập nhật nhãn với dự đoán mô hình, nhãn của các mẫu ít được thấy sẽ gần hơn với không, do đó bị phạt ngầm.
+
+#### 3.2.2 Lợi ích của làm mượt dữ liệu lặp
+
+Do tối ưu hóa dưới mức, bộ ước tính từ cập nhật gradient một bước có thể vẫn còn xa so với phần thưởng thực tế. Chúng tôi cung cấp phân tích ở đây tại sao IDS có thể tốt hơn. Xem xét bất kỳ hai cánh tay a, a' với n(a, a') quan sát trong n tổng quan sát. Bằng cách tính gradient, chúng ta có thể viết thuật toán IDS như:
+
+r̂ₜ₊₁(a) - r̂ₜ₊₁(a') = r̂ₜ(a) - r̂ₜ(a') + α · n(a,a')/n · [(μ̂(a≻a') · yₜ + μ̂(a≺a') · (1-yₜ)) · exp(r̂ₜ(a'))/(exp(r̂ₜ(a)) + exp(r̂ₜ(a'))) - (μ̂(a≺a') · yₜ + μ̂(a≻a') · (1-yₜ)) · exp(r̂ₜ(a))/(exp(r̂ₜ(a)) + exp(r̂ₜ(a')))]
+
+yₜ₊₁ = (1-β) · yₜ + β · exp(r̂ₜ₊₁(a))/(exp(r̂ₜ₊₁(a)) + exp(r̂ₜ₊₁(a')))
+
+trong đó chúng tôi định nghĩa μ̂(a≻a') = n(a≻a')/n(a,a'). Người ta có thể thấy rằng kích thước bước hiệu quả để cập nhật r̂ là α·n(a,a')/n, trong khi kích thước bước hiệu quả để cập nhật y là β. Giả sử rằng chúng ta chọn α, β, l, m sao cho:
+
+α·l/n ≪ β ≪ α·m/n
+
+Xem xét hai thang đo sau:
+
+• **Khi có đủ quan sát**, n(a,a') ≥ m, chúng ta biết rằng β ≪ α·n(a,a')/n. Trong trường hợp này, kích thước bước cập nhật của yₜ chậm hơn nhiều so với r̂ₜ. Người ta có thể xấp xỉ lấy yₜ ≈ 0 hoặc 1 như không thay đổi trong quá trình cập nhật. Hơn nữa, vì n(a,a') ≥ m đủ lớn, μ̂ tập trung xung quanh μ thực tế. Trong trường hợp này, người ta có thể thấy rằng phần thưởng hội tụ về phần thưởng thực tế r̂ₜ → r⋆.
+
+• **Khi số lượng quan sát không lớn**, tức là n(a,a') ≤ l, chúng ta biết rằng α·l/n ≪ β. Trong trường hợp này, việc cập nhật r̂ chậm hơn nhiều so với yₜ. Khi r̂₀ được khởi tạo bằng không, yₜ sẽ đầu tiên hội tụ về 1/2, dẫn đến r̂ₜ(a) ≈ r̂ₜ(a') khi t lớn.
+
+Để chính thức hóa lập luận trên, chúng tôi xem xét các phương trình vi phân sau:
+
+ḋ(t) = αn · [(μ·y(t) + (1-μ)·(1-y(t)))·1/(1+exp(d(t))) - ((1-μ)·y(t) + μ·(1-y(t)))·exp(d(t))/(1+exp(d(t)))]
+
+ẏ(t) = β · exp(d(t))/(1+exp(d(t))) - y(t) (5)
+
+Ở đây d đại diện cho sự khác biệt phần thưởng giữa hai cánh tay a, a', và μ đại diện cho tần suất thực nghiệm μ̂(a≻a'). Gọi khởi tạo là d(0) = 0, y(0) = 1. Chúng ta có định lý sau.
+
+**Định lý 3.3.** Các phương trình vi phân trong Phương trình (5) có một điểm cân bằng duy nhất d(t) = 0, y(t) = 1/2. Mặt khác, đối với bất kỳ α, β, n, T với βT ≤ ε ≪ 1 ≪ αnT, người ta có:
+
+exp(d(T))/(1+exp(d(T))) - μ ≤ max(2(1-exp(-ε)), exp(-μ(1-μ)αnT))
+
+y(T) ≥ exp(-ε)
+
+Chứng minh được hoãn lại đến Phụ lục H. Lưu ý rằng lập luận trên chỉ chứng minh hội tụ về đo lường thực nghiệm μ. Người ta có thể kết hợp lập luận tập trung tiêu chuẩn để chứng minh hội tụ về xác suất thực tế. Kết quả chỉ ra rằng khi chọn α, β cẩn thận, đối với cặp cánh tay với số lượng lớn so sánh, sự khác biệt phần thưởng sẽ gần với thực tế trong quá trình huấn luyện. Như một ví dụ cụ thể, bằng cách lấy α = n^{-1/2}, β = n^{-1}T^{-2}, ε = βT, chúng ta có:
+
+exp(d(T))/(1+exp(d(T))) - μ ≤ max(2n^{-1}T^{-1}, exp(-μ(1-μ)n^{1/2}T))
+
+Người ta có thể thấy rằng đối với những cặp so sánh với kích thước mẫu lớn n, xác suất ước tính gần với xác suất thực tế. Mặt khác, đối với những cặp được so sánh ít thường xuyên hơn, sự khác biệt d(t) được cập nhật ít thường xuyên hơn và vẫn gần với các giá trị khởi tạo. Do đó thuật toán ngầm phạt các cặp ít được thấy thường xuyên, trong khi vẫn ước tính chính xác các cặp thường được thấy.
+
+Tóm lại, thuật toán IDS có một số lợi ích:
+
+• Đối với số lượng quan sát đủ, phần thưởng ước tính xấp xỉ hội tụ về phần thưởng thực tế; trong khi đối với số lượng quan sát không đủ, phần thưởng ước tính vẫn phần lớn không thay đổi ở khởi tạo. Do đó mô hình phần thưởng phạt các cánh tay ít được quan sát với độ bất định cao hơn.
+
+• Dễ dàng kết hợp với mạng nơ-ron, cho phép tham số hóa tùy ý của mô hình phần thưởng.
+
+• Nó sử dụng các nhãn mềm bắt đầu từ epoch thứ hai, có thể hiệu quả hơn các nhãn cứng theo tài liệu về chưng cất kiến thức (Hinton et al., 2015; Zhao and Zhu, 2023).
+
+Chúng tôi cũng trình bày một công thức thay thế của IDS trong Phụ lục B.
+
+## 4 Thí nghiệm
+
+Trong phần này, chúng tôi trình bày kết quả của các thí nghiệm với cả multi-armed bandits và mạng nơ-ron.
+
+### 4.1 Multi-Armed Bandit
+
+Trong bối cảnh bandit, chúng tôi tập trung vào ví dụ khó được xây dựng trong Định lý 2.2. Chúng tôi lấy tổng số mẫu n = 60 và số cánh tay K là 10 và 20. Chúng tôi so sánh hiệu suất của MLE vanilla, MLE bi quan và IDS trong cả giai đoạn học phần thưởng và giai đoạn học chính sách.
+
+Trong giai đoạn học phần thưởng, chúng tôi chạy stochastic gradient descent với tỷ lệ học 0.01 trên mô hình phần thưởng cho nhiều epoch và theo dõi cách mất mát thay đổi đối với số epoch huấn luyện. Đối với MLE bi quan, chúng tôi trừ mức tin cậy trong phần thưởng theo Phương trình (4). Đối với IDS, chúng tôi lấy hai kích thước bước là α = 0.01, β = 0.001. Như được hiển thị trong phần bên trái của Hình 2, cả MLE và MLE bi quan đều gặp phải quá khớp phần thưởng, trong khi mất mát cross-entropy kiểm tra cho thuật toán IDS tiếp tục giảm cho đến khi hội tụ. Vì mất mát huấn luyện thay đổi với các nhãn được cập nhật, chúng tôi vẽ mất mát cross-entropy quần thể được tính trung bình trên tất cả các cặp so sánh.
+
+Trong phần bên phải của hình, chúng tôi vẽ sự đánh đổi KL-phần thưởng khi huấn luyện chính sách dựa trên phần thưởng đã học. Chúng tôi thay đổi lựa chọn λ trong Phương trình (3) để dẫn xuất chính sách tối ưu dưới các mức ràng buộc KL đa dạng, trong đó chúng tôi lấy chính sách tham chiếu π₀ là chính sách đồng nhất. Người ta có thể thấy rằng IDS có thể hội tụ về phần thưởng tối ưu khi KL lớn, trong khi cả MLE và MLE bi quan đều gặp phải tối ưu hóa quá mức.
+
+Chúng tôi nhận xét ở đây rằng lý do MLE bi quan gặp phải cả quá khớp và tối ưu hóa quá mức có thể do thiết kế phần thưởng không bị chặn trong trường hợp multi-armed bandit. Khi họ phần thưởng bị chặn, MLE bi quan cũng được đảm bảo giảm thiểu vấn đề tối ưu hóa quá mức. Hơn nữa, chúng tôi chỉ chạy một random seed cho bối cảnh này để giữ cho biểu đồ sạch sẽ vì sự đánh đổi KL-phần thưởng phụ thuộc mạnh vào các mẫu quan sát được.
+
+### 4.2 Mạng Nơ-ron
+
+Chúng tôi cũng tiến hành thí nghiệm với mạng nơ-ron. Chúng tôi sử dụng tập dữ liệu Helpfulness and Harmlessness (HH) được gán nhãn bởi con người từ Bai et al. (2022)². Chúng tôi lấy Dahoas/pythia-125M-static-sft³ làm mô hình chính sách với ba mô hình phần thưởng khác nhau có kích thước 125M, 1B và 3B. Khi huấn luyện mô hình phần thưởng, chúng tôi lấy một mô hình ngôn ngữ được tinh chỉnh có giám sát, loại bỏ lớp cuối cùng và thay thế nó bằng một lớp tuyến tính. Khi tinh chỉnh mô hình ngôn ngữ, chúng tôi sử dụng thuật toán proximal policy optimization (PPO) (Schulman et al., 2017).
+
+Chúng tôi lấy một mô hình phần thưởng 6B được huấn luyện đầy đủ Dahoas/gptj-rm-static được huấn luyện từ cùng tập dữ liệu dựa trên EleutherAI/gpt-j-6b làm thực tế. Chúng tôi sử dụng mô hình để gán nhãn các mẫu so sánh bằng cách sử dụng mô hình BTL (Bradley and Terry, 1952). Và chúng tôi huấn luyện mô hình phần thưởng 125M, 1B và 3B với các mẫu so sánh được gán nhãn mới. Kết quả huấn luyện phần thưởng được hiển thị trong Hình 3. Người ta có thể thấy rằng MLE bắt đầu quá khớp sau 1-2 epoch, trong khi mất mát của thuật toán IDS tiếp tục giảm ổn định cho đến khi hội tụ.
+
+Đối với cả thuật toán MLE và IDS, chúng tôi lấy phần thưởng với mất mát đánh giá nhỏ nhất và tối ưu hóa chính sách đối với mô hình phần thưởng đã chọn. Chúng tôi so sánh kết quả cho học chính sách như được hiển thị trong Hình 4. Người ta có thể thấy rằng MLE gặp phải tối ưu hóa quá mức phần thưởng với vài nghìn bước, trong khi phần thưởng thực tế tiếp tục tăng khi sử dụng thuật toán IDS của chúng tôi. Chúng tôi chọn kích thước bước α = 10⁻⁵ và β = 0.7 cho tất cả các thí nghiệm. Chúng tôi quan sát rằng mô hình lớn hơn dẫn đến cải thiện nhiều hơn sau một epoch, có thể do ước tính chính xác hơn của các nhãn. Chúng tôi cung cấp thêm chi tiết về thí nghiệm cùng với các thí nghiệm trên tập dữ liệu khác, TLDR, trong Phụ lục C.
+
+Trong việc triển khai, chúng tôi thấy rằng việc khôi phục checkpoint tốt nhất ở cuối mỗi epoch là hữu ích. Điều này là do các nhãn không phù hợp {yᵢ}ⁿᵢ₌₁ ở epoch nhất định có thể làm tổn hại hiệu suất của mô hình. Để ngăn chặn quá khớp với tập kiểm tra, chúng tôi chọn tập validation và test lớn, và chúng tôi chọn checkpoint tốt nhất theo mất mát nhỏ nhất trong tập validation, và vẽ mất mát trên tập test. Trong toàn bộ quy trình huấn luyện bao gồm khôi phục checkpoint, chúng tôi không sử dụng bất kỳ mẫu nào trong tập test.
+
+## 5 Kết luận
+
+Chúng tôi đã trình bày các phân tích và phương pháp nhằm giải quyết các vấn đề quá khớp và tối ưu hóa quá mức trong huấn luyện phần thưởng cho RLHF. Chúng tôi chỉ ra rằng thuật toán được đề xuất của chúng tôi, IDS, giúp giảm thiểu hai vấn đề này trong cả bối cảnh multi-armed bandit và mạng nơ-ron. Lưu ý rằng trong khi chúng tôi xác định nguồn gốc cơ bản của quá khớp phần thưởng và tối ưu hóa quá mức là phương sai của dữ liệu ưa thích con người, cũng có thể rằng thiên vị cũng góp phần vào những hiện tượng này. Trong công việc tương lai, chúng tôi dự định theo đuổi phân tích lý thuyết chính thức hơn về thuật toán IDS, và khám phá các ứng dụng tiềm năng ngoài huấn luyện phần thưởng trong các lĩnh vực chung của phân loại và dự đoán.
+
+## Lời cảm ơn
+
+Các tác giả muốn cảm ơn John Schulman về các cuộc thảo luận và đề xuất trong suốt dự án, đã khởi tạo ý tưởng tái tạo quá khớp phần thưởng và tối ưu hóa quá mức trong bối cảnh bandit, và truyền cảm hứng cho ý tưởng kết hợp các nhãn mềm trong quá trình huấn luyện để huấn luyện tốt hơn. Các tác giả cũng muốn cảm ơn Lester Mackey về các cuộc thảo luận hữu ích. Công trình được hỗ trợ bởi NSF Cloudbank và chương trình Mathematical Data Science của Office of Naval Research dưới số tài trợ N00014-21-1-2840.
