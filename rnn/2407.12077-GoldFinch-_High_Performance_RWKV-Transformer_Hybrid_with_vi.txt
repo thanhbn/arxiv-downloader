@@ -1,0 +1,235 @@
+# GoldFinch: Hiệu Suất Cao RWKV/Transformer Lai với Linear Pre-Fill và Nén KV-Cache Cực Độ
+
+Daniel Goldstein1,2, Fares Obeid1, Eric Alcaide1,3, Guangyu Song1,4, và Eugene Cheah1,2
+1EleutherAI, 2Recursal AI, 3Viện Trí Tuệ Nhân Tạo Dalle Molle USI-SUPSI, 4Tano Labs
+
+## Tóm tắt
+
+Chúng tôi giới thiệu GoldFinch, một mô hình chuỗi lai Linear Attention/Transformer sử dụng kỹ thuật mới để tạo ra KV-Cache được nén cao và có thể tái sử dụng trong thời gian và không gian tuyến tính theo độ dài chuỗi. GoldFinch xếp chồng transformer GOLD mới của chúng tôi lên trên phiên bản cải tiến của kiến trúc Finch (RWKV-6). Chúng tôi huấn luyện các mô hình lớp 1.5B tham số của kiến trúc Finch, Llama và GoldFinch, và phát hiện hiệu suất mô hình hóa được cải thiện đáng kể so với cả Finch và Llama. Việc tiết kiệm kích thước cache của chúng tôi tăng tuyến tính với số lượng lớp mô hình, dao động từ 756-2550 lần nhỏ hơn so với cache transformer truyền thống cho các kích thước phổ biến, cho phép suy luận với độ dài ngữ cảnh cực lớn ngay cả trên phần cứng hạn chế. Mặc dù sinh tự động có độ phức tạp thời gian O(n) mỗi token do attention, việc tính toán pre-fill của toàn bộ trạng thái cache ban đầu cho ngữ cảnh được gửi chỉ tốn O(1) thời gian mỗi token nhờ sử dụng mạng nơ-ron hồi quy (RNN) để tạo cache này. Chúng tôi phát hành các trọng số đã huấn luyện và mã huấn luyện dưới giấy phép Apache 2.0 cho cộng đồng sử dụng.
+
+## 1 Giới thiệu
+
+Các biến thể của linear attention (Katharopoulos et al., 2020) đã phát triển mạnh trong nghiên cứu gần đây (Peng et al., 2024; Qin et al., 2024; Katsch, 2024; Yang et al., 2024), tiếp cận hiệu suất của Multi-Headed Scaled Dot Product Attention (MHA) truyền thống (Vaswani et al., 2023) trong khi đạt được chi phí suy luận thấp hơn. Trong MHA, bộ nhớ hiệu quả của mô hình bị giới hạn bởi độ dài ngữ cảnh, với việc tính toán attention dẫn đến độ phức tạp thời gian bậc hai theo độ dài đó. Ngược lại, hầu hết các dạng linear attention có thể được tính toán hồi quy trong thời gian O(1) mỗi bước thời gian. Thay vì kiểm tra toàn bộ độ dài ngữ cảnh để tạo mỗi token mới, linear attention hồi quy sử dụng trạng thái ẩn có kích thước cố định được cập nhật ở mỗi bước thời gian, hoạt động như bộ nhớ của nó về quá khứ. Kích thước hạn chế của trạng thái này ràng buộc khả năng của bộ nhớ này.
+
+Thành công của Mô hình Ngôn ngữ Lớn (LLMs) đã thúc đẩy sự quan tâm đến các mô hình ngôn ngữ có độ dài ngữ cảnh cực dài. Ví dụ, Gemini Pro (Team et al., 2024) cung cấp cửa sổ độ dài hơn 1 triệu token. Tuy nhiên, nếu dựa trên attention, những độ dài ngữ cảnh cực lớn này đi kèm với chi phí liên quan lớn do nhu cầu của MHA phải kiểm tra mọi token trước đó trong ngữ cảnh khi tạo token tiếp theo (Liu & Abbeel, 2023; Liu et al., 2023). Mặc dù việc triển khai suy luận ngây thơ sẽ tính toán lại mọi key và value ở mọi lớp trong transformer truyền thống, thông thường người ta lưu trữ chúng trong key-value cache ("KV-Cache")(Pope et al., 2022) và truy xuất thay vì tính toán lại. Chi phí bộ nhớ KV-Cache có thể rất cao. Ví dụ, cache 1 triệu token cho mô hình transformer truyền thống 80 lớp với chiều ẩn 8192 sẽ chiếm hơn 2.5 terabyte ở độ chính xác bfloat16. Chúng tôi tập trung vào việc giảm chi phí bộ nhớ của cache này đồng thời giảm độ phức tạp tính toán và sử dụng bộ nhớ để xử lý ngữ cảnh ban đầu của yêu cầu.
+
+Đóng góp của chúng tôi là sự kết hợp của nhiều đổi mới để tạo ra kiến trúc GoldFinch, cải thiện hiệu quả pre-fill và giải mã, cũng như hiệu suất mô hình hóa downstream, và giới thiệu những đổi mới sau:
+
+1. sử dụng một sửa đổi hiệu quả tham số mới của Finch (RWKV-6), mà chúng tôi gọi là "Finch-C2", cho 2/3 đầu của các lớp
+2. sử dụng đầu ra của các lớp Finch-C2 này để tạo ra cache key toàn cục nén cực nhỏ bằng cơ chế mới mà chúng tôi gọi là "TokenCat". Cache của chúng tôi do đó chỉ yêu cầu 1/16 dmodel mỗi token cộng với các chỉ số token đầu vào gốc, thay vì 2 dmodel nlayer cho KV-cache truyền thống.
+3. sử dụng một sửa đổi mới của kiến trúc transformer truyền thống, mà chúng tôi gọi là "GOLD", cho 1/3 cuối của các lớp để tiêu thụ cache key này và tạo ra đầu ra mà không cần đến cache value truyền thống.
+
+[Hình 1: Sơ đồ Khối Kiến trúc GoldFinch]
+
+Các lớp GOLD là một thích ứng của transformer cải tiến mới mà chúng tôi gọi là "GPTAlpha" cũng có thể được sử dụng như một mô hình transformer độc lập để cải thiện hiệu suất không lai.
+
+Kiến trúc mới này mang lại một loạt lợi ích đáng kể:
+
+1. Chúng tôi có thể tái sử dụng cùng một KV-Cache trên mọi lớp transformer trong khi duy trì hiệu suất lớn hơn Llama (Touvron et al., 2023). Điều này giảm kích thước KV-Cache theo hệ số tổng số lớp của mô hình.
+
+2. Chúng tôi loại bỏ các value khỏi KV-Cache, chỉ để lại cache key. Thay vì cache các value, chúng tôi lưu trữ các chỉ số đầu vào và tạo ra các value từ chúng, giảm kích thước KV-Cache thêm gần hệ số 2.
+
+3. Chúng tôi có thể nén cache key bằng cách áp dụng một dạng Low Rank Adaptation (LoRA) (Hu et al., 2021) vào đầu ra của một lớp duy nhất, và mở rộng lại phiên bản nén bằng cách nối phiên bản nén với embedding token gốc, giảm thêm kích thước 128 lần. ("TokenCat")
+
+4. Chúng tôi sử dụng bảng embedding đầu vào và token shift kiểu RWKV để tạo value cho attention mà không hy sinh hiệu suất.
+
+5. Bằng cách sử dụng các khối Finch-C2 ở đầu mô hình, cache key tự động mã hóa biểu diễn vị trí ngầm cơ bản, do đó loại bỏ nhu cầu mã hóa vị trí trong các lớp transformer cho độ dài ngữ cảnh đã huấn luyện. Chúng tôi vẫn yêu cầu phương pháp mã hóa vị trí bổ sung để ngoại suy đến độ dài ngữ cảnh mới chưa thấy trong huấn luyện.
+
+6. Có nhiều trường hợp sử dụng LLM liên quan đến các phản hồi tương đối ngắn cho câu hỏi về tài liệu dài. Vì cache key nén của chúng tôi được tạo bởi RNN với độ phức tạp thời gian và không gian hoạt động O(1) mỗi token theo độ dài chuỗi, chúng tôi có thể tạo cache trong những trường hợp này cực kỳ rẻ và áp dụng chi phí O(N) mỗi token của phần transformer GOLD chỉ cho việc tạo token mới, mà tương đối ít lần lặp thường được yêu cầu.
+
+Để có được kiến trúc Finch-C2, chúng tôi cải thiện time-mixer Finch bằng cách loại bỏ gate, thay GroupNorm bằng LayerNorm trên tất cả các head, thực hiện phép nhân mới (của key với một trừ decay) để giữ các hàng kv-state được chuẩn hóa, và thay thế thuật ngữ u("bonus") của Finch bằng Value thứ hai token-shifted riêng biệt phụ thuộc dữ liệu mới. Những thay đổi này dẫn đến hiệu suất cải thiện với ít hoặc không có phạt tốc độ và ít tham số tổng cộng hơn đáng kể.
+
+Để có được kiến trúc GPTAlpha, chúng tôi cải thiện kiến trúc Llama bằng cách thay thế mạng feed-forward transformer (FFN) bằng channel mixer RWKV, và thêm token shift kiểu RWKV và LayerNorm bổ sung vào các lớp attention.
+
+Cả Finch-C2 và GPTAlpha đều có thể được sử dụng như kiến trúc mô hình độc lập với hiệu suất cải thiện so với các đối tác, hoặc như một phần của kiến trúc mô hình lai GoldFinch.
+
+Kiến trúc transformer GOLD (GPTAlpha Over Linear transformer Decoder) loại bỏ trọng số key và value khỏi GPTAlpha để tạo ra key và value từ sự kết hợp của các chỉ số token gốc được truyền qua bảng embedding, phiên bản nén cao của đầu ra các lớp Finch-C2, và LoRA hướng dữ liệu.
+
+GoldFinch xếp chồng một tập hợp các lớp transformer GOLD lên trên transformer tuyến tính Finch-C2, truyền đầu ra cho các lớp Finch cả vào bộ nén key để lưu trữ cho mọi vị trí chuỗi, và cũng qua bước thời gian hiện tại như một phần của dòng residual bình thường.
+
+Chúng tôi huấn luyện các mô hình GoldFinch lên đến 1.45 tỷ tham số trên 1.5 trillion token của minipile (Kaddour, 2023) và so sánh chúng với các mô hình Finch (Peng et al., 2024) và Llama (Touvron et al., 2023) lớn hơn một chút được huấn luyện tương đương. Chúng tôi thấy rằng GoldFinch vượt trội đáng kể so với cả Llama và Finch về hiệu suất downstream và perplexity trên gần như mọi benchmark chúng tôi đã thử nghiệm, trong khi duy trì ít tham số hơn, cache nhỏ hơn nhiều so với Llama, và khả năng nhớ MQAR hoàn hảo do sử dụng attention đầy đủ.
+
+## 2 Bối cảnh
+
+Transformer đã trở thành lựa chọn de-facto cho hầu hết các tác vụ mô hình hóa chuỗi, và đã được chứng minh là đặc biệt hiệu quả trong bối cảnh mô hình hóa ngôn ngữ. Tuy nhiên, chúng đưa ra những thách thức tính toán khi xử lý độ dài ngữ cảnh dài, điều này đã cản trở việc áp dụng chúng cho các tác vụ chuỗi dài. Cụ thể, công thức của multi-head scaled dot-product attention (MHA) có độ phức tạp tính toán O(N²) theo độ dài ngữ cảnh. Ngoài ra, các engine suy luận thường dựa vào việc sử dụng KV-Cache để cho phép tạo token tự động hồi quy trong thời gian O(N) mỗi token. Cache này tăng tuyến tính với độ dài ngữ cảnh, và trở nên khó khăn để vừa với Video Random-Access Memory (VRAM) hạn chế cho các chuỗi dài hơn.
+
+Các mô hình transformer gần đây như dòng Llama dựa vào Grouped-Query Attention (GQA) (Ainslie et al., 2023) để giúp giảm nhẹ vấn đề kích thước cache này. Ở số nhóm điển hình ng=8, GQA giảm kích thước KV-Cache ng/nh lần, trong đó nh là số head. Điều này hữu ích, đặc biệt trên phần cứng cấp tiêu dùng, nhưng dẫn đến giảm hiệu suất downstream, và các chuỗi dài hơn vẫn gây ra vấn đề đáng kể về sử dụng VRAM.
+
+YOCO được đề xuất gần đây (Sun et al., 2024) cải thiện độ phức tạp tính toán cho pre-fill của ngữ cảnh yêu cầu ban đầu và cũng giảm kích thước KV-cache bằng cách giới thiệu KV-Cache toàn cục mới thay vì cache thông thường mỗi lớp. Cải thiện tính toán được đạt được bằng cách thay thế nửa đầu các lớp trong mô hình bằng các lớp RetNet-G dựa trên Linear Attention (Sun et al., 2023), đây là kiến trúc mạng nơ-ron hồi quy (RNN) chỉ yêu cầu thời gian tuyến tính theo độ dài chuỗi. YOCO lưu trữ đầu ra của các lớp đầu này như KV-Cache toàn cục, sau đó được sử dụng bởi nửa sau các lớp, có MHA. Tổng thể, điều này giảm kích thước KV-Cache theo hệ số số lượng lớp, mà không có báo cáo giảm hiệu suất.
+
+Goldfinch thực hiện phương pháp liên quan tương tự như RetNet-G, và xử lý đầu ra khác nhau, tạo ra cache hiệu quả nhưng nhỏ hơn nhiều thông qua cơ chế TokenCat của chúng tôi, sau đó được tiêu thụ bởi các lớp transformer GOLD cải tiến của chúng tôi.
+
+Hungry Hungry Hippos (H3) (Fu et al., 2023) huấn luyện mô hình lai recurrent SSM/transformer chứa chỉ hai lớp attention, mà họ thấy vượt trội so với transformer. Điều này phục vụ như một cảnh báo rằng các lai SSM(hoặc linear attention)-transformer có tiềm năng can thiệp như những thay thế hiệu suất cao hơn cho transformer đơn thuần.
+
+Nhận ra những thách thức được đặt ra tại thời điểm suy luận bởi KV-Cache, DeepSeek-V2 (DeepSeek-AI et al., 2024) đề xuất một sự thay thế cho MHA gọi là Multi-head Latent Attention (MLA). Điều này sử dụng nén key-value kết hợp low-rank để giảm kích thước KV-Cache từ 2 nhdhl thành 9/2 dhl, tương đương với kích thước KV-Cache yêu cầu cho GQA với chỉ 2.25 nhóm. Vì nén key-value low-rank yêu cầu ít tham số hơn so với ma trận key và value full rank, MLA đạt được hiệu suất mỗi tham số lớn hơn so với MHA. GoldFinch cũng cải thiện hiệu suất thông qua loại giảm tham số tương đối dựa trên nén này.
+
+HGRN2 (Qin et al., 2024) thay thế GroupNorm mỗi head (Wu & He, 2018) bằng LayerNorm full-width, và chúng tôi cũng làm tương tự trong kiến trúc Finch-C2. HGRN2 đặt key của họ bằng một trừ decay, và chúng tôi làm điều gì đó liên quan nhưng hơi khác, nhân key của chúng tôi với một trừ decay.
+
+Được truyền cảm hứng từ những công trình này, chúng tôi đề xuất một phương pháp mới giảm thêm KV-Cache theo bậc độ lớn và giảm chi phí tải ngữ cảnh ban đầu trở thành tuyến tính theo độ dài chuỗi, tất cả trong khi đạt được hiệu suất lớn hơn Llama.
+
+### 2.1 Công trình Liên quan Đồng thời Khác
+
+Công trình đồng thời khác về các mô hình lai có một số điểm tương đồng với các phần của kiến trúc chúng tôi:
+
+Zamba (Glorioso et al., 2024) xen kẽ Global Shared Attention (GSA) mỗi N khối Mamba (Gu & Dao, 2024). Thay vì sử dụng đầu ra residual của khối Mamba trước đó làm đầu vào, Zamba nối embedding gốc được tạo trước lớp zero vào đầu ra residual này, và sử dụng kết hợp có độ rộng gấp đôi làm đầu vào cho attention. Mặc dù các khối GSA của họ chia sẻ tham số, chúng không thể chia sẻ cùng một KV-Cache. Việc nối embedding có điểm tương đồng với kỹ thuật "TokenCat" mới của chúng tôi.
+
+Jamba (Lieber et al., 2024) là mô hình mixture-of-experts (MoE) (Shazeer et al., 2017) dựa trên Mamba (Gu & Dao, 2024) chèn các lớp attention định kỳ trong kiến trúc của nó, với tỷ lệ tổng cộng 1:7 lớp attention-với-Mamba. Tương tự như khả năng của Goldfinch dựa vào mã hóa vị trí ngầm của RWKV trong độ dài ngữ cảnh được huấn luyện trước, họ thấy rằng mã hóa vị trí rõ ràng có thể không được yêu cầu cho kiến trúc lai dựa trên Mamba của họ.
+
+Samba (Ren et al., 2024) là mô hình lai lặp lại các khối chứa lớp Mamba, lớp MLP, lớp sliding-window attention (SWA) có RoPE (Su et al., 2023), và lớp MLP khác. Việc sử dụng SWA cho phép chi phí thực thi cố định mỗi token, bất kể độ dài ngữ cảnh.
+
+## 3 Phương pháp
+
+GoldFinch tuân theo cấu trúc chung của kiến trúc Finch, cũng là cấu trúc decoder transformer pre-norm phổ biến được sử dụng trong Llama và RWKV. Nó bao gồm một loạt các lớp, mỗi lớp chứa sub-layer time mixing theo sau bởi sub-layer channel mixing. Tất cả sub-layer channel mixing đều là channel mixer Finch.
+
+Các công thức sau mô tả ba loại sub-layer GoldFinch. Tất cả ma trận W đều được học mỗi lớp, trừ khi được mô tả khác. Chúng tôi hiển thị tất cả công thức time mixing mỗi head để ngắn gọn, ngoại trừ công thức cho những đầu ra lớp nơi các head được kết hợp qua concat.
+
+Chiều mô hình được ký hiệu là D, kích thước head là H, và số head là N. Tất cả giá trị ∈RH trừ khi được nêu khác.
+
+### 3.1 Finch-C2 Time Mixing
+
+Hai phần ba đầu của các sub-layer time mixing sử dụng một biến thể trên time mixer Finch mà chúng tôi gọi là Finch-C2.
+
+Chúng tôi tùy chỉnh các sub-layer time-mixing Finch bằng cách loại bỏ gate, thay GroupNorm bằng LayerNorm trên tất cả các head và thực hiện phép nhân mới của key với một trừ decay. Cuối cùng, chúng tôi thay thế thuật ngữ u("bonus") của Finch bằng Value thứ hai token-shifted riêng biệt phụ thuộc dữ liệu mới, được tính bằng cùng trọng số với Value cơ sở, với LoRA bổ sung được thêm vào kết quả. Chúng tôi thấy rằng điều này cho phép chúng tôi loại bỏ tất cả tham số Gate trong khi duy trì hiệu suất.
+
+Theo hướng của (Peng et al., 2024), chúng tôi giới thiệu ký hiệu sau cho các toán tử phổ biến trong mô hình, sử dụng chỉ số vuông để biểu thị một biến:
+
+lerp(a,b,t) = a+(b−a)⊙t, (1)
+lora□(x) = λ□+tanh(xA□)B□, (2)
+ddlerp□(a,b) = a+(b−a)⊙lora□(a+(b−a)⊙µx), (3)
+
+Sau đó, khối Finch-C2 có thể được hình thức hóa như:
+
+dt = lora!(ddlerpd(xt,xt−1)), (4)
+wt = exp(−exp(dt)), (5)
+rt = ddlerpr(xt,xt−1)WR, (6)
+kt = ddlerpk(xt,xt−1)WK·(1−wt), (7)
+vt = ddlerpv(xt,xt−1)WV, (8)
+ut = ddlerpu(xt,xt−1), (9)
+u′t = utWV+tanh(utWUD)WUU. (10)
+
+Và sau khi chia chiều ẩn thành N head:
+
+wkvt = Σt−1i=1 diag(Πt−1j=i+1 wj)·kTi·vi ∈ RH×H, (12)
+ot = LayerNorm(concat(rt·wkvt+u′t))WO ∈ RD. (13)
+
+Xin lưu ý rằng việc tính toán cho u′t tái sử dụng cùng trọng số WV - đây là một tiết kiệm số lượng tham số có chủ ý và không phải lỗi đánh máy.
+
+### 3.2 GOLD Key Compression
+
+Đầu ra từ hai phần ba đầu của mô hình được sử dụng theo hai cách: nó được truyền đến lớp tiếp theo theo cách thông thường, và cũng được nén xuống thông qua phép nhân với ma trận học toàn cục (không phải mỗi lớp) WKD ∈ RDx(D/16) xuống một phần mười sáu kích thước ban đầu và lưu trữ vào cache key nén hợp nhất một lớp:
+
+ct = xtWKD ∈ R(D/16). (14)
+
+### 3.3 GOLD Key Decompression (TokenCat)
+
+Cache key nén được giải nén thông qua phương pháp hai bước. Bước đầu tiên là "TokenCat", viết tắt của "Token conCatenation", trong đó key nén được nối với embedding token đầu vào gốc từ đầu mô hình. Kết quả nối sau đó được nhân với ma trận học toàn cục (không phải mỗi lớp) WKU ∈ R(D+D/16)xD và RMSNormed để có được proto-key attention đã giải nén, chung cho tất cả sub-layer attention GOLD.
+
+kDt = RMSNorm(concat(x0t,ct)WKU). (15)
+
+### 3.4 GOLD Attention Time Mixing
+
+Các sub-layer time mixing còn lại là một biến thể trên các sub-layer attention GPTAlpha sử dụng MHA mà chúng tôi gọi là attention GOLD.
+
+Mỗi sub-layer attention GOLD tính toán key và value attention riêng từ proto-key đã giải nén và embedding token đầu vào gốc, tương ứng. Mỗi cái được truyền qua token shift phụ thuộc dữ liệu, với kết quả được truyền qua LoRA cộng thêm. Chúng tôi gọi quá trình này là "DDLoRAdapt", giới thiệu ký hiệu liên quan bên dưới, sử dụng chỉ số vuông để biểu thị một biến:
+
+loradapt□(x) = x+tanh(xC□)D□. (16)
+
+Sau đây là các công thức cho attention time mixing GOLD:
+
+qt = LayerNorm(ddlerpq(xt,xt−1)WQ), (17)
+at = lerp(x0t,x0t−1,µx), (18)
+kt = LayerNorm(loradaptk(lerp(kDt,kDt−1,lorak(at)))), (19)
+vt = LayerNorm(loradaptv(lerp(x0t,x0t−1,lorav(at)))), (20)
+ot = LayerNorm(concat(attention(qt,k,v)))WO ∈ RD. (21)
+
+Xin lưu ý token-shift kiểu receptance của Finch trên query, và token-shift hướng dữ liệu bổ sung trên key và value, với key được tái tạo từ cache key nén ct và value đến từ embedding token gốc x0. x0 là đầu vào embedding cho sub-layer đầu tiên trong mô hình, và có thể được tái tạo trong suy luận từ các chỉ số token bằng cách lưu trữ những chỉ số đó, thường chỉ là hai byte bổ sung mỗi độ dài ngữ cảnh.
+
+Token shift phụ thuộc dữ liệu (ddlerp) là một loại tích chập 1D hai bước chi phí tham số thấp chuyên biệt có nguồn gốc từ kiến trúc RWKV. Nó cho phép mô hình nội suy tuyến tính động giữa bước thời gian hiện tại và trước đó trên cơ sở mỗi kênh. Chúng tôi sử dụng phiên bản DDLoRAdapt của kỹ thuật để áp dụng thông tin ngữ cảnh một cách rẻ cho key và value, tăng lượng thông tin từ đó chúng được tạo ra mà không tăng đáng kể số lượng tham số.
+
+Lưu ý rằng token shift không thể phụ thuộc vào hidden-state, vì điều đó sẽ làm cho việc tính toán hồi quy cho các key và value cũ hơn trở nên bất khả thi, và sẽ yêu cầu KV-Cache đầy đủ được lưu trữ. Thay vào đó, chúng tôi sử dụng embedding token đầu vào gốc làm dữ liệu mà key và value token-shift phụ thuộc vào.
+
+Pre-fill của cache key nén để chuẩn bị cho tạo tự động hồi quy có thể được tính toán trong thời gian tuyến tính theo số lượng token. Điều này được thực hiện bằng cách chỉ chạy phần Finch-C2 của mô hình trên những token đó. Một lưu ý triển khai quan trọng là token shift yêu cầu đầu ra hidden-state lớp trước từ bước thời gian trước đó. Thoạt nhìn điều này có vẻ có vấn đề, vì các lớp GOLD yêu cầu attention bậc hai đầy đủ, đó là điều chúng ta đang cố gắng tránh trong pre-fill. Nhưng giải pháp đơn giản: cho GGOLD lớp trong mô hình, phải có 2G-1 sub-layer yêu cầu hidden state bước thời gian trước đó như vậy nhưng phụ thuộc trực tiếp hoặc gián tiếp vào đầu ra của attention bậc hai. Do đó, 2G-1 token cuối của pre-fill phải được chạy qua mô hình đầy đủ (không chỉ các lớp Finch-C2) để tạo ra những hidden-state này. Những tính toán 2G-1 này có thể được thực hiện trong một lời gọi duy nhất đến mô hình đầy đủ để tận dụng cùng loại song song được sử dụng trong huấn luyện.
+
+Chỉ các cache key nén và chỉ số token đầu vào gốc cần được giữ vĩnh viễn trong VRAM trong suy luận, vì cache key có thể được tái tạo thông qua giải nén theo yêu cầu. Vì giải nén và token shift có thể được thực hiện trên các vùng liền kề của các cặp key value thay vì tất cả cùng một lúc, việc sử dụng VRAM cực thấp có thể đạt được trong suy luận bằng cách tính toán attention tăng dần qua chuỗi cho mỗi lớp và giải nén khi bạn đi.
+
+### 3.5 GoldFinch Channel Mixing (giống như Finch Channel Mixing)
+
+Channel mixing Goldfinch giống hệt channel mixing Finch. Nó được sử dụng như thành phần mạng feed forward trên tất cả các lớp của mô hình, cả Finch-C2 và GOLD. Chúng tôi tái tạo nó ở đây để tham khảo. Xin lưu ý rằng các biến có định nghĩa độc lập riêng trong tiểu mục này.
+
+rt = lerpr(xt,xt−1,µr)WR ∈ RD, (22)
+kt = lerpk(xt,xt−1,µk)WK ∈ R3.5D, (23)
+vt = ReLU(kt)2WV ∈ RD, (24)
+ot = σ(rt)⊙vt ∈ RD. (25)
+
+### 3.6 GPTAlpha Time Mixing
+
+Để hoàn thiện và để cho thấy cách nó có thể được sử dụng trong kiến trúc transformer thuần túy, chúng tôi liệt kê các công thức cho GPTAlpha time mixing khi không được sử dụng kết hợp với TokenCat bên dưới:
+
+qt = LayerNorm(ddlerpq(xt,xt−1)WQ), (26)
+kt = LayerNorm(ddlerpk(xt,xt−1)WK), (27)
+vt = LayerNorm(ddlerpv(xt,xt−1)WV), (28)
+ot = LayerNorm(concat(attention(qt,k,v)))WO ∈ RD. (29)
+
+## 4 Thí nghiệm
+
+### 4.1 So sánh Kiến trúc
+
+Chúng tôi huấn luyện các mô hình lớp 1.5B tham số với 24 lớp, 2048 chiều ẩn, 2048 độ dài ngữ cảnh của Finch, Llama và GoldFinch để so sánh trên minipile (Kaddour, 2023), tất cả sử dụng cùng tokenizer RWKV World. GoldFinch kết thúc với loss cuối cùng thấp hơn đáng kể so với những cái khác (hơn 0.1 trên 2.39), và sử dụng hơn 100 triệu tham số ít hơn so với đối tác Finch.
+
+Chúng tôi cũng huấn luyện một GoldFinch không có nén, để cho thấy rằng có rất ít mất mát với lựa chọn tỷ lệ nén chiều ẩn 16:1 của chúng tôi.
+
+Vì lợi ích của việc so sánh công bằng hiệu suất cho Llama bằng cách tạo cho nó những điều kiện thuận lợi nhất, chúng tôi thêm tối ưu hóa embedding khởi tạo nhỏ RWKV (LayerNorm sau embedding với giá trị khởi tạo nhỏ) (Peng et al., 2023) và không sử dụng Grouped Query Attention. Tất cả kiến trúc sử dụng cùng siêu tham số và được huấn luyện trên 4 GPU, với kích thước batch mỗi GPU mỗi bước là 8, hai bước tích lũy gradient, và khởi động tốc độ học 10 bước theo sau bởi cosine decay được ủ từ 3e-5 đến 1e-5. Chúng tôi huấn luyện với Adam beta 0.9 và 0.99, epsilon 1e-8 và weight decay 0.001. Weight decay chỉ được áp dụng cho các tham số ma trận không phải một phần của LoRA hoặc các bước nén/mở rộng key GoldFinch.
+
+[Hình 2: Đường cong Loss của các mô hình lớp 1.5B.]
+
+Ngoài việc so sánh loss huấn luyện và validation, chúng tôi đã chạy một loạt đánh giá benchmark phổ biến trên ba mô hình lớp 1.5B tham số được huấn luyện trên minipile. Finch và Llama ghi điểm tương tự nhau, và GoldFinch vượt trội đáng kể so với cả hai.
+
+### 4.2 Nghiên cứu Ablation
+
+Chúng tôi đã chạy nhiều nghiên cứu ablation quy mô nhỏ khác nhau để xác định đóng góp của các phần khác nhau của kiến trúc GoldFinch so với Finch, Llama, GPTAlpha, và một lai của Finch cải tiến và GPTAlpha mà không có nén KV-Cache hoặc chia sẻ key/value. Value thứ hai mới được thêm trong Finch-C2 có tác động tích cực nhỏ nhất của bất cứ thứ gì được đo. Đáng ngạc nhiên, GoldFinch thực hiện tốt hơn một chút so với cả lai Finch-C2/GPTAlpha không có nén KV. Mỗi thử nghiệm huấn luyện mô hình 12 lớp 768 chiều ẩn tại 1024 độ dài ngữ cảnh với cùng tokenizer RWKV World trên tập dữ liệu minipile đầy đủ. Tất cả kiến trúc sử dụng cùng siêu tham số và được huấn luyện trên GPU đơn, với kích thước batch mỗi bước là 32, hai bước tích lũy gradient, và khởi động tốc độ học 10 bước theo sau bởi cosine decay được ủ từ 6e-5 đến 2e-5. Chúng tôi huấn luyện với Adam beta 0.9 và 0.99, epsilon 1e-8 và weight decay 0.001. Weight decay chỉ được áp dụng cho các tham số ma trận không phải một phần của LoRA hoặc các bước nén/mở rộng key GoldFinch.
+
+### 4.3 Khả năng Nhớ Liên kết
+
+Khả năng nhớ liên kết (AR) là một tác vụ tổng hợp được thiết kế để bắt chước khả năng con người liên kết và truy xuất thông tin. Nó đánh giá kỹ năng của mô hình trong việc nhớ lại thông tin được đề cập trước đó trong một ngữ cảnh cho trước. Các nghiên cứu trước đây cho thấy rằng hiệu suất của mô hình trong AR là một chỉ báo tốt về hiệu quả của nó trong học trong ngữ cảnh (Elhage et al., 2021; Olsson et al., 2022). Do đó, AR đã được sử dụng như một benchmark để phát triển kiến trúc mô hình ngôn ngữ mới (Fu et al., 2023; Poli et al., 2023; Lutati et al., 2023). Arora et al. (2023) đã đánh giá nhiều mô hình khác nhau cho khả năng nhớ liên kết đa truy vấn (MQAR) và phát hiện ra khoảng cách hiệu suất giữa các kiến trúc transformer tuyến tính khác nhau và transformer truyền thống với attention.
+
+[Hình 3: Các tác vụ MQAR. Sự gia tăng độ dài chuỗi tương quan với độ khó tác vụ tăng.]
+
+Trong Hình 3, chúng tôi sử dụng cùng cài đặt thực nghiệm như Arora et al. (2023) và cho thấy rằng GoldFinch đạt điểm MQAR hoàn hảo, vượt trội so với các mô hình ngôn ngữ truyền thống không có attention. Như một kiến trúc lai tận dụng attention, GoldFinch có thể giải quyết MQAR cũng như các mô hình transformer với attention. Ngoài ra, chúng tôi đã huấn luyện GoldFinch trên độ dài ngữ cảnh 1024 để chứng minh rằng xu hướng này tiếp tục, như được mô tả trong Hình 4.
+
+### 4.4 Thí nghiệm Ngữ cảnh Dài
+
+Chúng tôi đã thử nghiệm loss của các mô hình Finch và GoldFinch nhỏ được huấn luyện trước trên minipile ở tất cả độ dài ngữ cảnh lên đến 65536 trên tập dữ liệu PG19 (Rae et al., 2019) gồm các cuốn sách cũ. Những mô hình được huấn luyện trước này đều được huấn luyện chỉ ở độ dài ngữ cảnh 1024. Mô hình Finch có thể duy trì loss khá thấp trong suốt độ dài ngữ cảnh 65536. Mô hình GoldFinch cơ sở được huấn luyện không có mã hóa vị trí tăng loss đáng kể bắt đầu từ khoảng gấp đôi độ dài ngữ cảnh được huấn luyện, sau đó ổn định ở loss cao. Mô hình GoldFinch được huấn luyện với RoPE trên các sub-layer attention GOLD thực hiện tốt hơn, nhưng loss vẫn tăng phần nào khi chuỗi tiến triển. Tuy nhiên, bằng cách áp dụng các giá trị RoPE nội suy chúng tôi có thể có được loss thấp trong suốt độ dài ngữ cảnh mở rộng. Chúng tôi kết luận rằng đối với các mô hình GoldFinch trong đó ngoại suy vượt ra ngoài độ dài ngữ cảnh tối đa được huấn luyện là mong muốn, các sub-layer attention GOLD nên được huấn luyện với RoPE, với nội suy được sử dụng khi suy luận.
+
+Sau đó chúng tôi tinh chỉnh các mô hình RoPE và không RoPE được đề cập ở trên trên 165 triệu token của minipile với độ dài ngữ cảnh dài hơn. Trong quá trình tinh chỉnh này, chúng tôi đóng băng toàn bộ phần RWKV của mô hình cho đến lớp GOLD đầu tiên, cho phép bộ tối ưu hóa cập nhật các tham số chỉ của các lớp GOLD và head đầu ra. Điều này tiết kiệm đáng kể thời gian và VRAM trong tinh chỉnh, cho phép độ dài ngữ cảnh thậm chí dài hơn vừa với bộ nhớ và sử dụng khoảng 3x ít FLOPS hơn mỗi token. Chúng tôi lý thuyết rằng vì phần attention GOLD của mô hình có thể sử dụng key được tạo từ đầu ra RWKV, điều này đủ để hỗ trợ khớp attention tinh vi qua toàn bộ độ dài ngữ cảnh.
+
+Các thí nghiệm của chúng tôi cho thấy rằng thực sự mô hình RoPE với các lớp GOLD được tinh chỉnh ở độ dài ngữ cảnh dài hơn thể hiện loss thấp hơn đáng kể so với PG19 lên đến những độ dài đó và thậm chí vượt ra ngoài. Trên mô hình không RoPE quá trình này hơi thành công trong độ dài ngữ cảnh được tinh chỉnh, trong khi vẫn thất bại ở ngoại suy. Điều này bất ngờ, vì các lớp RWKV không được cập nhật và các lớp GOLD không bao gồm cơ chế mã hóa vị trí. Chúng tôi giả định rằng token-shift có thể cung cấp một số thông tin vị trí tối thiểu cho mô hình.
+
+### 4.5 Huấn luyện Nâng cấp Checkpoint
+
+Chúng tôi đã thử nâng cấp các mô hình Finch được huấn luyện trước hiện có thành phiên bản hạn chế hơn của GoldFinch sử dụng kiến trúc Finch cho các lớp RWKV thay vì thành phần Finch-C2. Chúng tôi đã thử nhiều biến thể trên hai phương pháp, một thêm các lớp GOLD mới lên trên với tổng cộng khoảng 11% tham số nhiều hơn, và một khác giữ nguyên số lượng lớp như mô hình được huấn luyện trước. Cho đến nay với chỉ một lượng nhỏ huấn luyện nâng cấp cả hai phương pháp đều chưa thực hiện đến mức thỏa mãn của chúng tôi.
+
+Cả hai phương pháp đều được thử trên checkpoint Finch 1.6B đã được huấn luyện trước trên 2.5 trillion token.
+
+Đối với phương pháp đầu tiên chúng tôi thêm 4 lớp GOLD lên trên checkpoint Finch 1.6B được huấn luyện trước trước head mô hình hóa ngôn ngữ, và tiếp tục huấn luyện nó trong 100 triệu token sử dụng hai tốc độ học khác nhau. 24 lớp được huấn luyện trước gốc được giữ ở cùng LR 1e-5 mà huấn luyện trước của chúng đã kết thúc, trong khi LR cho 4 lớp GOLD mới được ủ dọc theo lịch trình cosine từ 3e-4 đến 1e-5. Trong khi hiệu suất của mô hình này phù hợp với mô hình gốc, không rõ liệu mô hình kết quả từ phương pháp này thực sự học được điều gì có giá trị trong các lớp GOLD của nó.
+
+Phương pháp thứ hai liên quan đến việc đóng băng embedding và các lớp RWKV và nhập khẩu nhưng không đóng băng 1/3 cuối của các sub-layer channel mixer được ghép nối với các sub-layer attention GOLD được khởi tạo mới. Sau đó chúng tôi huấn luyện mô hình này trên một lượng dữ liệu tương đối nhỏ (trong trường hợp của chúng tôi khoảng 7.5 tỷ token của tập dữ liệu nội bộ mới) trong khi ủ tốc độ học đến tốc độ học cuối cùng được thấy trong mô hình cơ sở được huấn luyện trước. Mô hình kết quả có được validation loss tương tự trên minipile so với mô hình cơ sở, mặc dù được huấn luyện trên tập dữ liệu hoàn toàn khác và mô hình cơ sở đã được huấn luyện hơn 2.25 trillion token. Tuy nhiên, điểm LAMBADA của mô hình mới tệ hơn. Chúng tôi quy việc mất hiệu suất này cho 'phẫu thuật não' cần thiết để giữ nguyên số lượng lớp, trong đó chúng tôi thực tế xóa các tham số time-mix Finch trong 1/3 trên của mô hình.
+
+Chúng tôi vẫn đang thực hiện thêm thí nghiệm trên những phương pháp nâng cấp này để xem chúng có thể được thực hiện tốt đến mức nào. Chúng tôi hy vọng có thể nâng cấp một cách rẻ tiền thậm chí mô hình Finch 14B lớn nhất thành định dạng GoldFinch giảm này và thấy cải thiện hiệu suất đáng kể ở độ dài ngữ cảnh dài hơn do attention GOLD có thể nhìn lại qua toàn bộ ngữ cảnh mà không có giới hạn bộ nhớ dựa trên kích thước state.
+
+## 5 Công việc Tiếp theo
+
+Chúng tôi dự đoán cập nhật pre-print này với các nghiên cứu tiếp theo khi kết quả có sẵn, bao gồm kết quả và đánh giá nâng cấp checkpoint, các lần chạy thí nghiệm huấn luyện dài hơn, và thí nghiệm ngữ cảnh dài mới. Xin kiểm tra lại để cập nhật.
+
+Hầu hết các thí nghiệm được thực hiện cho pre-print này đều được thực hiện trong một khoảng thời gian ngắn trên một node duy nhất chứa 8 card RTX 4090. Trong tương lai chúng tôi hy vọng chứng minh hiệu suất của GoldFinch trên các mô hình lớn hơn với nhiều token hơn đáng kể.
+
+Chúng tôi kỳ vọng rằng GoldFinch sẽ hoạt động tương tự với các kiến trúc linear attention và SSM khác thay cho các khối Finch-C2. Ví dụ, nó nên có thể triển khai kiến trúc "GoldMamba" theo cùng phong cách.
+
+Công việc tiếp theo có thể khám phá tăng giảm bộ nhớ cho KV-Cache toàn cục thông qua lượng tử hóa, và áp dụng ring attention Liu et al. (2023) để giảm yêu cầu bộ nhớ khi mở rộng đến ngữ cảnh rất dài. Như một mô hình kiến trúc lai, GoldFinch có thể sẽ hưởng lợi từ bất kỳ cải tiến tương lai nào cho kiến trúc RWKV và transformer.
+
+## 6 Kết luận
+
+Chúng tôi đã giới thiệu kiến trúc mô hình RNN-Attention lai (GoldFinch) và huấn luyện các mô hình chứng minh hiệu suất của nó lên đến 1.45B. Các mô hình RNN-Attention lai kết quả kết hợp hiệu quả của RNN với khả năng của các mô hình dựa trên attention. Có RNN cho các lớp ban đầu cho phép pre-fill nhanh và loại bỏ nhu cầu mã hóa vị trí trên các lớp RNN, trong khi các lớp attention cải thiện khả năng nhớ liên kết. Sự kết hợp với KV-Cache toàn cục được nén cao mở khóa giảm bộ nhớ trong suy luận trong khi duy trì hiệu suất tăng cường. Chúng tôi phát hành các trọng số đã huấn luyện và mã huấn luyện dưới giấy phép Apache 2.0.
+
+## 7 Lời cảm ơn
+
+Cảm ơn đặc biệt đến Bo Peng vì sự cống hiến không mệt mỏi của anh ấy cho kiến trúc và cộng đồng RWKV. Mã GoldFinch chính ở đây dựa trên phiên bản sửa đổi của kho mã Linear Attention Arena công khai của anh ấy, và các mô hình được nâng cấp dựa trên các bản phát hành mô hình Finch được huấn luyện trước của anh ấy.

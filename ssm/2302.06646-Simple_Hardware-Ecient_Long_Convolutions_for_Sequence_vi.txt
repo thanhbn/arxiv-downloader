@@ -1,0 +1,190 @@
+# Tích chập dài đơn giản hiệu quả phần cứng cho mô hình hóa chuỗi
+
+Daniel Y. Fu*y, Elliot L. Epsteinz, Eric Nguyenx, Armin W. Thomasyy, Michael Zhangy,
+Tri Daoy, Atri Rudrazz, và Christopher R ey
+yKhoa Khoa học Máy tính, Đại học Stanford
+zViện Kỹ thuật Tính toán và Toán học, Đại học Stanford
+xKhoa Kỹ thuật Sinh học, Đại học Stanford
+yyKhoa Tâm lý học, Đại học Stanford
+zzKhoa Khoa học Máy tính và Kỹ thuật, Đại học Buffalo, SUNY
+
+## Tóm tắt
+
+Các mô hình không gian trạng thái (SSM) có hiệu suất cao trong mô hình hóa chuỗi dài nhưng yêu cầu các kỹ thuật khởi tạo phức tạp và các triển khai chuyên biệt để đạt được chất lượng và hiệu suất thời gian chạy cao. Chúng tôi nghiên cứu liệu một phương án đơn giản có thể sánh bằng SSM về hiệu suất và hiệu quả: học trực tiếp các tích chập dài trên chuỗi. Chúng tôi thấy rằng một yêu cầu chính để đạt hiệu suất cao là giữ cho các kernel tích chập mượt. Chúng tôi phát hiện rằng các can thiệp đơn giản—như nén các trọng số kernel—dẫn đến các kernel mượt và khôi phục hiệu suất SSM trên một loạt các tác vụ bao gồm long range arena, phân loại hình ảnh, mô hình hóa ngôn ngữ, và mô hình hóa dữ liệu não. Tiếp theo, chúng tôi phát triển FlashButterfly, một thuật toán nhận biết IO để cải thiện hiệu suất thời gian chạy của các tích chập dài. FlashButterfly tận dụng các phân tích Butterfly cổ điển của tích chập để giảm IO bộ nhớ GPU và tăng việc sử dụng FLOP. FlashButterfly tăng tốc các tích chập lên 2.2×, và cho phép chúng tôi huấn luyện trên Path256, một tác vụ thách thức với độ dài chuỗi 64K, nơi chúng tôi thiết lập state-of-the-art với 29.1 điểm trong khi huấn luyện nhanh hơn 7.2× so với công việc trước đó. Cuối cùng, chúng tôi giới thiệu một mở rộng cho FlashButterfly học các hệ số của phân tích Butterfly, tăng khả năng biểu đạt mà không tăng thời gian chạy. Sử dụng mở rộng này, chúng tôi vượt trội hơn Transformer trên WikiText103 với 0.2 PPL và ít hơn 30% tham số.
+
+## 1 Giới thiệu
+
+Gần đây, một lớp mô hình chuỗi mới dựa trên các mô hình không gian trạng thái (SSM) đã nổi lên như một khung mô hình hóa chuỗi đa năng mạnh mẽ. SSM mở rộng gần như tuyến tính theo độ dài chuỗi và đã thể hiện hiệu suất state-of-the-art trên một loạt các tác vụ mô hình hóa chuỗi, từ mô hình hóa tầm xa đến mô hình hóa ngôn ngữ, thị giác máy tính, và phân tích y tế.
+
+Tuy nhiên, SSM phụ thuộc vào các cấu trúc toán học phức tạp để huấn luyện hiệu quả trong các mạng sâu. Các cấu trúc này tạo ra một kernel tích chập dài bằng chuỗi đầu vào bằng cách nhân lặp lại một ma trận trạng thái ẩn. Quá trình này có thể không ổn định và yêu cầu các khởi tạo thủ công cẩn thận, để lại cho các nhà thực hành một loạt các lựa chọn và siêu tham số chóng mặt. Điều này đặt ra câu hỏi, tại sao không tham số hóa kernel tích chập dài trực tiếp?
+
+Có hai thách thức mà các tích chập dài phải đối mặt cho mô hình hóa chuỗi. Thứ nhất là chất lượng: các nỗ lực trước đó trong việc tham số hóa kernel tích chập trực tiếp đã kém hiệu suất hơn SSM. Thứ hai là hiệu suất thời gian chạy: các tích chập dài có thể được tính toán trong O(N log N) FLOPS theo độ dài chuỗi N sử dụng biến đổi Fourier nhanh (FFT), nhưng các ràng buộc hệ thống thường làm chúng chậm hơn các thuật toán bậc hai, như attention. Trong bài báo này, chúng tôi chỉ ra rằng các kỹ thuật chính quy hóa đơn giản và một thuật toán tích chập nhận biết IO có thể giải quyết các thách thức này. Tính đơn giản của công thức tích chập dài hơn nữa cho phép các kết nối với phép nhân ma trận khối thưa thớt tăng khả năng biểu đạt vượt xa các tích chập hoặc SSM.
+
+**Đóng khoảng cách chất lượng** Đầu tiên, để hiểu khoảng cách chất lượng, chúng tôi nghiên cứu hiệu suất của các tích chập dài so với SSM trên Long Range Arena (LRA), một benchmark chính được thiết kế để kiểm tra các mô hình chuỗi dài. Các tích chập dài kém hiệu suất hơn SSM lên đến 16.6 điểm trung bình (Bảng 4). Việc trực quan hóa các kernel tích chập xác định một thủ phạm tiềm năng: các kernel tích chập dài không mượt, trong khi các kernel SSM mượt (Hình 2).
+
+Chúng tôi khám phá hai kỹ thuật chính quy hóa đơn giản từ tài liệu xử lý tín hiệu để giảm thiểu vấn đề này. Kỹ thuật đầu tiên sử dụng toán tử Squash để giảm độ lớn của các trọng số kernel trong miền thời gian, thực thi tính thưa thớt chuyển đổi thành độ mượt trong miền tần số. Kỹ thuật thứ hai áp dụng toán tử Smooth cho các trọng số kernel trong miền thời gian, mà chúng tôi thấy cũng thúc đẩy độ mượt trong miền tần số. Với chính quy hóa, các tích chập dài khôi phục hiệu suất của SSM—và dường như mạnh mẽ hơn với khởi tạo so với SSM, sánh bằng S4 trên LRA ngay cả với khởi tạo hoàn toàn ngẫu nhiên.
+
+Được thúc đẩy bởi thành công của các chính quy hóa đơn giản này trên LRA, chúng tôi tiếp tục đánh giá hiệu suất của các tích chập dài trên các tác vụ mô hình hóa chuỗi phức tạp khác từ các phương thức đa dạng. Về phân loại hình ảnh, chúng tôi thấy rằng các tích chập dài có thể là một sự thay thế hiệu quả cho các lớp SSM. Thay thế lớp SSM trong các mô hình S4 bằng tích chập dài mang lại cải thiện 0.3 điểm độ chính xác trên CIFAR tuần tự và đến trong phạm vi 0.8 điểm của S4ND-ISO trên 2D CIFAR. Về mô hình hóa văn bản, các tích chập dài cạnh tranh với mô hình dựa trên SSM H3 gần đây—đến trong phạm vi 0.3 PPL của H3 trên OpenWebText và sánh bằng H3 trên PILE. Cuối cùng, các tích chập dài vượt trội hơn cả Transformer và SSM trong mô hình hóa dữ liệu não—với 0.14 và 0.16 điểm MAE, tương ứng—điều này gợi ý rằng kiến trúc đơn giản hơn thậm chí có thể vượt trội hơn SSM cho một số ứng dụng.
+
+**Cải thiện hiệu suất thời gian chạy** Tuy nhiên, các tích chập dài không hiệu quả trên phần cứng hiện đại, vì tích chập FFT phát sinh IO bộ nhớ GPU đắt đỏ và không thể sử dụng các đơn vị nhân ma trận—ngay cả khi sử dụng các triển khai tối ưu hóa như cuFFT. Các công thức tích chập SSM dựa vào các kernel Cauchy chuyên biệt và kernel Vandermonde, cũng như cấu trúc truyền tin đệ quy đặc biệt, để vượt qua các thách thức này.
+
+Để đáp ứng, chúng tôi phát triển FlashButterfly, một thuật toán đơn giản nhận biết IO cho các tích chập dài, không yêu cầu kỹ thuật thủ công ad hoc. FlashButterfly tận dụng các phân tích Butterfly cổ điển của FFT để viết lại tích chập FFT như một chuỗi các ma trận Butterfly khối thưa thớt. Phân tích này giảm số lần truyền qua chuỗi đầu vào—giảm yêu cầu bộ nhớ GPU—và sử dụng các đơn vị nhân ma trận trên GPU, điều này tăng việc sử dụng FLOP.
+
+FlashButterfly tăng tốc các tích chập lên 2.2× so với cuFFT, và vượt trội hơn các triển khai SSM nhanh nhất, vì nó không phát sinh chi phí tạo kernel tích chập SSM. Để chứng minh khả năng mở rộng của FlashButterfly, chúng tôi huấn luyện một mô hình tích chập dài trên Path256, một tác vụ với độ dài chuỗi 64K. Chúng tôi thiết lập state-of-the-art với 29.1 điểm và huấn luyện nhanh hơn 7.2× so với mô hình tốt nhất trước đó.
+
+**Kết nối sâu hơn và mở rộng Butterfly đã học** Phân tích Butterfly trong FlashButterfly tạo thành các kết nối sâu với công việc gần đây trong phép nhân ma trận khối thưa thớt. Các ma trận Butterfly là một trường hợp đặc biệt của ma trận Monarch, bao trùm một lớp lớn các ma trận có cấu trúc. Kích thước khối r nội suy giữa FFT cố định cho kích thước khối nhỏ đến phép nhân ma trận dày đặc hoàn toàn cho các ma trận lớn. Kết nối này gợi ý một mở rộng Butterfly đã học tự nhiên vượt xa các tích chập về khả năng biểu đạt.
+
+Mở rộng Butterfly đã học của chúng tôi đơn giản là học các tham số trong các ma trận Butterfly từ dữ liệu, thay vì sử dụng các ma trận cố định tương ứng với FFT và FFT nghịch đảo. Học các ma trận Butterfly trong khi giữ kích thước khối cố định mang lại các tham số bổ sung mà không có FLOPS bổ sung—mang lại 0.8 điểm cải thiện bổ sung trên CIFAR tuần tự. Tăng kích thước khối của các ma trận Butterfly tiếp cận khả năng biểu đạt của các ma trận dày đặc hoàn toàn—bao gồm những ma trận được sử dụng trong các lớp tuyến tính và MLP. Như một bằng chứng khái niệm, chúng tôi sử dụng tính chất này để thay thế các MLP trong một mô hình ngôn ngữ Transformer—và vượt trội hơn một mô hình GPT-2 trên WikiText103 với 0.2 PPL và ít hơn 30% tham số.
+
+**Tóm tắt** Tóm lại, chúng tôi chỉ ra rằng các tích chập dài là một mô hình hiệu quả cho mô hình hóa chuỗi dài. Chúng sánh bằng hoặc vượt trội SSM trên một loạt các miền chuỗi đa dạng trong khi yêu cầu ít khởi tạo thủ công hơn và thể hiện tính ổn định được cải thiện. Ngoài ra, bằng cách tận dụng các kết nối với ma trận Butterfly, các tích chập dài có thể được huấn luyện nhanh hơn lên đến 1.8× so với SSM.
+
+## 2 Bối cảnh
+
+**Mô hình Không gian Trạng thái Sâu** Một mô hình không gian trạng thái thời gian liên tục (SSM) ánh xạ một tín hiệu đầu vào u(t) ∈ R^N, theo thời gian t, đến một tín hiệu đầu ra y(t) ∈ R^N như:
+
+ẋ(t) = Ax(t) + Bu(t)
+y(t) = Cx(t) + Du(t);
+
+bằng việc sử dụng trạng thái ẩn x(t) ∈ R^d và một số tập hợp các ma trận A ∈ R^{d×d}, D ∈ R^{1×1}, B ∈ R^{d×1}, C ∈ R^{1×d}.
+
+Rời rạc hóa SSM mang lại một đệ quy x_t = Ax_{t-1} + Bu_t, y_t = Cx_t + Du_t. Bằng cách mở rộng đệ quy, y có thể được viết như một tích chập giữa u và một kernel K phụ thuộc vào A, B, C:
+
+y = K ∗ u + Du. (1)
+
+Một thành phần chính để huấn luyện các mô hình SSM sâu là khởi tạo đúng đắn của các ma trận có thể học A, B, C, và D. Các chiến lược khởi tạo thường dựa trên lý thuyết HiPPO về các đa thức trực giao, và liên quan đến việc lựa chọn các thước đo và chiến lược rời rạc hóa. Các tham số cũng có thể không ổn định để học, điều này có thể yêu cầu các lịch trình tốc độ học tùy chỉnh.
+
+**Tích chập FFT** Tính toán tích chập trong Phương trình 1 có thể tốn kém cho các chuỗi dài. Một phương pháp tiêu chuẩn là tính toán tích chập sử dụng định lý tích chập FFT. Sau đó, tích chập có thể được tính toán như:
+
+y = u ∗ K = F^{-1}_N D_K F_N u; (2)
+
+trong đó F_N biểu thị ma trận DFT kích thước N, và D_K = diag(F_N K). Tích chập FFT được gọi như vậy mở rộng trong O(N log N) theo độ dài chuỗi N, nhưng thường không được tối ưu hóa trên phần cứng hiện đại (hầu hết các toán tử tích chập được tối ưu hóa tập trung vào các tích chập ngắn, ví dụ 3×3).
+
+**Đặc tính Hiệu suất Thời gian Chạy** Chúng tôi cung cấp một cuộc thảo luận ngắn gọn về các yếu tố liên quan ảnh hưởng đến hiệu suất thời gian chạy. Tùy thuộc vào sự cân bằng của tính toán và truy cập bộ nhớ, các hoạt động có thể được phân loại như bị ràng buộc tính toán hoặc bị ràng buộc bộ nhớ. Trong các hoạt động bị ràng buộc tính toán, thời gian truy cập bộ nhớ GPU tương đối nhỏ so với thời gian dành cho các hoạt động số học. Các ví dụ điển hình là phép nhân ma trận với chiều trong lớn, và các kernel tích chập ngắn với số lượng kênh lớn. Trong các hoạt động bị ràng buộc bộ nhớ, thời gian thực hiện hoạt động được xác định bởi số lần truy cập bộ nhớ, trong khi thời gian dành cho tính toán nhỏ hơn nhiều. Các ví dụ bao gồm hầu hết các hoạt động khác: elementwise (ví dụ kích hoạt, dropout) và reduction (ví dụ sum, softmax, batch norm, layer norm).
+
+**Phương pháp của chúng tôi** Thay vì tham số hóa K với các ma trận SSM được khởi tạo cẩn thận, chúng tôi tìm cách tham số hóa trực tiếp tích chập K trong Phương trình 1. Mục tiêu của chúng tôi là thay thế lớp SSM bằng một kernel tích chập đã học như một sự thay thế trực tiếp, trong khi giữ cấu trúc xếp chồng và đa đầu của các mô hình SSM (có thể được nghĩ như nhiều bộ lọc tích chập). Chúng tôi cũng nhằm mục đích làm cho tích chập FFT có hiệu suất thời gian chạy trên phần cứng hiện đại.
+
+## 3 Phương pháp
+
+Trong Phần 3.1, chúng tôi tiến hành một cuộc điều tra ban đầu về các tích chập dài cho mô hình hóa chuỗi, và phát triển hai chiến lược chính quy hóa đơn giản dựa trên các phát hiện của chúng tôi. Sau đó, trong Phần 3.2, chúng tôi trình bày FlashButterfly, một thuật toán nhận biết IO để tăng tốc các tích chập được mô hình hóa theo phép nhân ma trận khối thưa thớt. Cuối cùng, chúng tôi trình bày một mở rộng của FlashButterfly tận dụng kết nối khối thưa thớt để có thêm khả năng biểu đạt.
+
+### 3.1 Tích chập Dài cho Mô hình hóa Chuỗi
+
+Đầu tiên, chúng tôi tiến hành một cuộc điều tra ngắn gọn về hiệu suất của các tích chập dài vanilla trong mô hình hóa chuỗi, và chúng tôi thấy một khoảng cách về chất lượng. Sau đó chúng tôi đề xuất hai kỹ thuật chính quy hóa đơn giản để đóng khoảng cách này.
+
+**Động lực cho Chính quy hóa: Kernel Không Mượt** Chúng tôi bắt đầu bằng cách thay thế trực tiếp các lớp SSM trong một mô hình S4 bằng các tích chập dài, với khởi tạo ngẫu nhiên. Chúng tôi huấn luyện một mô hình trên tác vụ ListOps từ benchmark long range arena (LRA), với dropout element-wise trên các trọng số kernel tích chập. Bảng 1 cho thấy rằng các tích chập dài kém hiệu suất hơn SSM với 6.2 điểm trên ListOps.
+
+Để hiểu khoảng cách trong hiệu suất, chúng tôi trực quan hóa một đầu của kernel tích chập K, so với một kernel SSM trong Hình 2. So với các kernel SSM được khởi tạo tốt, chúng tôi thấy rằng việc học trực tiếp các trọng số tích chập dẫn đến các kernel tích chập không mượt và xuất hiện nhiễu. Chúng tôi giả thuyết rằng các tính chất này chịu trách nhiệm cho khoảng cách hiệu suất.
+
+**Chính quy hóa Kernel** Chúng tôi đề xuất hai kỹ thuật đơn giản để chính quy hóa kernel tích chập để giảm thiểu các vấn đề này: Squash và Smooth. Toán tử Squash được áp dụng element-wise cho kernel tích chập, và giảm độ lớn của tất cả các trọng số: K = sign(K) max(|K| - ε, 0). Như một lưu ý phụ, chúng tôi lưu ý rằng Squash tương đương với việc thực hiện một bước của toán tử L1 proximal: K = Prox_{ε‖·‖₁}(K) = arg min_x {‖x‖₁ + (1/2ε)‖x - K‖₂²} và do đó có thể có các kết nối có nguyên tắc với các kỹ thuật gradient proximal. Toán tử Smooth áp dụng average pooling đơn giản, với độ rộng p, cho kernel tích chập: K_k = (2p + 1)^{-1} ∑_{j=1}^{2p+1} K_{k+j-p}.
+
+Huấn luyện các tích chập dài với các chính quy hóa này sánh bằng SSM về hiệu suất trên tác vụ ListOps (Bảng 1). Ngoài ra, Hình 2 bên phải cho thấy rằng các chính quy hóa này cải thiện độ mượt trong miền tần số. Trong Phụ lục B, chúng tôi đánh giá việc làm mượt trực tiếp trong miền tần số.
+
+**Khởi tạo** Chúng tôi tìm cách hiểu mức độ nhạy cảm của các tích chập dài với khởi tạo. Chúng tôi lưu ý rằng vì K tham số hóa trực tiếp kernel tích chập, chúng tôi cũng có thể tận dụng các tiến bộ trong khởi tạo trong SSM như HiPPO và S4-LegS—đơn giản bằng cách chuyển đổi mô hình SSM được khởi tạo thành một kernel tích chập, và khởi tạo K thành các trọng số tích chập.
+
+Trong khi các chiến lược khởi tạo phức tạp có thể mạnh mẽ, chúng yêu cầu điều chỉnh cẩn thận để cấu hình. Để hiểu tác động của khởi tạo trên các tích chập dài, chúng tôi đánh giá hai kỹ thuật khởi tạo đơn giản: khởi tạo ngẫu nhiên, và khởi tạo suy giảm hình học. Khởi tạo ngẫu nhiên khởi tạo các trọng số được phân phối ngẫu nhiên từ phân phối Normal: K_i ~ N. Khởi tạo suy giảm hình học ngoài ra còn điều chỉnh các trọng số kernel để suy giảm qua chuỗi, cũng như qua các đầu. Đối với kernel K^{(h)}, 1 ≤ h ≤ H, chúng tôi khởi tạo các trọng số như: K^{(h)}_k = x exp(-k/N * (1 - (H/2 - h)/(H - 1))); cho 1 ≤ k ≤ N, trong đó x ~ N được rút từ phân phối Normal.
+
+**Tóm tắt** Phương pháp đầy đủ được viết trong Thuật toán 1, với một tham chiếu tiến về giải pháp tích chập nhanh FlashButterfly của chúng tôi. Trong Thuật toán 1, tất cả các toán tử (max, sign, và giá trị tuyệt đối) được áp dụng entry-wise, FlashButterfly được thực hiện trên chiều chuỗi và kết nối bỏ qua được thực hiện trên chiều đầu. Các siêu tham số cụ thể cho tích chập được hiển thị trong Bảng 2. So với các siêu tham số cần thiết để huấn luyện S4, các phương pháp chính quy hóa của chúng tôi có ít siêu tham số và lựa chọn hơn S4.
+
+### 3.2 FlashButterfly
+
+Ngoài việc cải thiện chất lượng của các tích chập dài, cũng rất quan trọng là cải thiện hiệu suất thời gian chạy. Chúng tôi trình bày FlashButterfly, một thuật toán nhận biết IO để tăng tốc các tích chập tổng quát trên phần cứng hiện đại. Chúng tôi sử dụng kernel fusion để giảm yêu cầu IO bộ nhớ GPU, và sử dụng phân tích Butterfly để viết lại FFT như một chuỗi các phép nhân ma trận khối thưa thớt. Để mở rộng đến các chuỗi dài, chúng tôi sử dụng một phân tích Butterfly thay thế để xây dựng một thuật toán tích chập FFT ba lần truyền để giảm thêm yêu cầu IO.
+
+**Kernel Fusion** Các triển khai naive của tích chập FFT phát sinh IO bộ nhớ GPU đắt đỏ. FFT, FFT nghịch đảo, và phép nhân pointwise trong Phương trình 2 mỗi cái yêu cầu ít nhất một lần đọc và ghi của chuỗi đầu vào từ bộ nhớ GPU. Đối với các chuỗi dài, chi phí IO thậm chí có thể tồi tệ hơn: toàn bộ chuỗi đầu vào không thể vừa với SRAM, vì vậy các triển khai được tối ưu hóa như cuFFT phải thực hiện nhiều lần truyền qua chuỗi đầu vào sử dụng phân tích Cooley-Tukey của FFT. Theo FlashAttention, FlashButterfly đầu tiên hợp nhất toàn bộ tích chập FFT thành một kernel duy nhất để tính toán toàn bộ tích chập trong GPU SRAM và tránh overhead này.
+
+**Phân tích Butterfly** Kernel fusion giảm yêu cầu IO, nhưng các hoạt động FFT được hợp nhất vẫn không thể tận dụng đầy đủ các đơn vị nhân ma trận chuyên biệt trên GPU hiện đại, như Tensor Cores trên GPU Nvidia, thực hiện phép nhân ma trận 16×16 nhanh. Chúng tôi tận dụng một kết quả cổ điển, được biết đến như thuật toán FFT bốn bước hoặc sáu bước, viết lại FFT như một chuỗi các ma trận Butterfly khối chéo xen kẽ với hoán vị.
+
+Phân tích Butterfly nói rằng chúng ta có thể phân tích một FFT N-điểm thành một chuỗi các FFT kích thước N₁ và N₂, trong đó N = N₁N₂. Về mặt khái niệm, thuật toán định hình lại đầu vào như một ma trận N₁×N₂, áp dụng N₁ FFT kích thước N₂ cho các cột, nhân mỗi phần tử với một yếu tố twiddle, và sau đó áp dụng N₂ FFT kích thước N₁ cho các hàng.
+
+Chính xác hơn, đặt F_N biểu thị ma trận DFT tương ứng với việc thực hiện FFT N-điểm. Sau đó, tồn tại các ma trận hoán vị P, và một ma trận chéo D, sao cho F_N = P(I_{N₂} ⊗ F_{N₁})P^T D(I_{N₁} ⊗ F_{N₂})P. P biểu thị một ma trận hoán vị định hình lại đầu vào thành N₁×N₂ và lấy chuyển vị, D biểu thị một ma trận chéo với các yếu tố twiddle dọc theo đường chéo, ⊗ biểu thị tích Kronecker, và I_{N_i} và F_{N_i} là các ma trận đơn vị và DFT kích thước N_i×N_i. Các giá trị chính xác cho F_{N_i}, D, và P được cho trong Phụ lục C.
+
+Phân tích Butterfly phát sinh O(Nr log N / log r) FLOPS cho độ dài chuỗi N = r^p, với kích thước khối r. Trong các triển khai FFT tổng quát, N thường được padding thành lũy thừa của hai, sao cho kích thước khối có thể được đặt thành 2 để giảm thiểu tổng số FLOPS. Tuy nhiên, trên GPU với đơn vị nhân ma trận chuyên biệt, chi phí FLOP của việc tính toán phép nhân ma trận r×r với r < b tương đương với việc thực hiện một phép nhân ma trận b×b duy nhất. Do đó, số lượng FLOP thực tế mở rộng như O(Nb log N / log r) cho r < b. Tăng kích thước khối lên đến b thực sự giảm chi phí FLOP.
+
+Bảng 3 chứng minh sự đánh đổi này trên GPU A100, có các đơn vị nhân ma trận chuyên biệt lên đến 16×32. Thời gian chạy giảm khi r tăng từ 2, mặc dù FLOPS lý thuyết tăng. Một khi r > b, thời gian chạy bắt đầu tăng khi FLOPS thực tế cũng tăng.
+
+**Thuật toán Ba lần truyền** Kernel fusion và phân tích Butterfly cải thiện hiệu suất thời gian chạy, nhưng chỉ cho các tích chập đủ ngắn để vừa với SRAM (độ dài 8K hoặc ngắn hơn trên A100). Đối với các chuỗi dài hơn, chúng tôi lại tận dụng phân tích Butterfly, nhưng sử dụng một công thức thay thế loại bỏ các hoán vị trên chuỗi đầu vào. Công thức này cho phép chúng tôi phân tích tích chập thành ba lần truyền qua dữ liệu: một phép nhân ma trận Butterfly có thể được tính toán với một IO duy nhất, các tích chập FFT mà chúng tôi có thể tính toán song song, và một phép nhân ma trận Butterfly cuối cùng cũng có thể được tính toán với một IO duy nhất.
+
+Cụ thể, chúng tôi viết lại ma trận DFT F_N kích thước N như NP⁻¹(I_m ⊗ (l F_l))B⁻¹; và ma trận nghịch đảo của nó F_N⁻¹ như N⁻¹B(I_m ⊗ F_l)P, trong đó B là một ma trận khối N×N với m² khối kích thước l×l, mỗi khối đều là đường chéo (xem Phụ lục C cho phép dẫn xuất chính xác). Quan trọng, phép nhân ma trận-vector Bu có thể được tính toán trong một lần truyền duy nhất qua vector đầu vào u. Thay thế những điều này vào Phương trình 2 và đơn giản hóa mang lại:
+
+y = u ∗ K = B(I_m ⊗ F_l)D'_K(I_m ⊗ F_l)B⁻¹; (3)
+
+trong đó D'_K = lPD_KP⁻¹ là một ma trận chéo khác. Các thành phần giữa bây giờ có thể được tính toán như m tích chập FFT độc lập kích thước l, với một kernel tích chập khác nhau. Các tích chập song song này cộng lại yêu cầu một lần truyền qua N phần tử đầu vào, vì vậy toàn bộ tích chập có thể được tính toán với ba lần truyền qua đầu vào.
+
+Thuật toán đầy đủ cho FlashButterfly cho N > l được hiển thị trong Thuật toán 2.
+
+Chúng tôi chỉ ra rằng Thuật toán 2 đúng, và nó có thể được tính toán trong ba lần truyền qua chuỗi đầu vào. Chứng minh được đưa ra trong Phụ lục D.
+
+**Mệnh đề 1.** Thuật toán 2 tính toán tích chập u ∗ K với nhiều nhất ba lần truyền qua chuỗi đầu vào u.
+
+#### 3.2.1 Mở rộng Butterfly Đã học
+
+Phân tích Butterfly trong FlashButterfly gợi ý một mở rộng tự nhiên: học các giá trị của các ma trận Butterfly F_r trong phân tích Butterfly, thay vì sử dụng các ma trận cố định tương ứng với FFT. Nếu chúng ta giữ kích thước khối r cố định, thì số lượng tham số trong các ma trận Butterfly tăng bởi O(Hr²), nhưng tổng FLOPS trong mô hình giữ nguyên. Tăng kích thước khối cho phép chúng ta tăng thêm khả năng biểu đạt, nhưng với chi phí tính toán bổ sung. Khi r tiếp cận N, phân tích Butterfly tiếp cận chi phí tính toán và khả năng biểu đạt của phép nhân ma trận dày đặc đầy đủ: O(N²).
+
+## 4 Đánh giá
+
+Chúng tôi đánh giá mức độ hoạt động tốt của các tích chập dài trong nhiều tác vụ mô hình hóa chuỗi thách thức từ các phương thức và benchmark đa dạng, bao gồm benchmark long range arena, phân loại hình ảnh, mô hình hóa văn bản, và mô hình hóa dữ liệu não (Phần 4.1). Chúng tôi thấy rằng các tích chập dài là những người mô hình hóa chuỗi mạnh mẽ trên các tác vụ này. Tiếp theo, chúng tôi đánh giá hiệu suất thời gian chạy của các tích chập dài dưới FlashButterfly và đánh giá mức độ mở rộng tốt của nó đến các chuỗi rất dài (Phần 4.2). Cuối cùng, chúng tôi đánh giá các cải thiện chất lượng từ mở rộng Butterfly đã học (Phần 4.3).
+
+### 4.1 Chất lượng trong Mô hình hóa Chuỗi
+
+Trong phần này, chúng tôi đánh giá hiệu suất của các tích chập dài trong mô hình hóa chuỗi về mặt chất lượng. Chúng tôi bắt đầu bằng cách đánh giá các kỹ thuật chính quy hóa và khởi tạo khác nhau trên benchmark long range arena, một bộ tác vụ mô hình hóa chuỗi đa năng được thiết kế để kiểm tra căng thẳng các chuỗi dài. Chúng tôi lấy các biến thể hoạt động tốt nhất và chuyển sang hai phương thức thách thức và đa dạng đã được sử dụng để đánh giá các mô hình chuỗi, bao gồm SSM: phân loại hình ảnh (cả một chiều và hai chiều) và mô hình hóa văn bản. Chúng tôi kết thúc phần với một ứng dụng thực tế của các tích chập dài cho mô hình hóa dữ liệu não.
+
+Chúng tôi thấy rằng các tích chập dài hoạt động tốt trên tất cả các tác vụ và phương thức đa dạng này—và thường mạnh mẽ hơn với lựa chọn khởi tạo so với SSM. Kết quả của chúng tôi gợi ý rằng các tích chập dài có thể là một sự thay thế đơn giản hơn hấp dẫn cho SSM trong mô hình hóa chuỗi. Chi tiết thực nghiệm cho các tác vụ được đưa ra trong Phụ lục F, và các thực nghiệm bổ sung được cung cấp trong Phụ lục B.
+
+#### 4.1.1 Mô hình hóa Chuỗi Dài: Long Range Arena
+
+Chúng tôi đầu tiên đánh giá các tích chập dài trên Long Range Arena (LRA), một bộ benchmark được sử dụng để kiểm tra mô hình hóa chuỗi đa năng trên các ngữ cảnh dài. LRA bao gồm sáu tác vụ mô hình hóa chuỗi tầm xa, với độ dài chuỗi từ 1K đến 16K token. Các tác vụ có phương thức bao gồm văn bản, hình ảnh tự nhiên và tổng hợp, và biểu thức toán học. Chúng tôi lấy kiến trúc S4 state-of-the-art, và thay thế các lớp SSM bằng các tích chập dài.
+
+Chúng tôi trình bày năm biến thể của các tích chập dài: khởi tạo ngẫu nhiên và không có chính quy hóa, khởi tạo ngẫu nhiên với toán tử Smooth, khởi tạo ngẫu nhiên với toán tử Squash, khởi tạo ngẫu nhiên với cả hai toán tử, và khởi tạo hình học với toán tử Squash. Chúng tôi so sánh các phương pháp tích chập dài với các biến thể của Transformer được trình bày trong bài báo Long Range Arena gốc, cũng như các biến thể của S4 với các tham số hóa và khởi tạo khác nhau. Các khởi tạo này quan trọng để S4 đạt được chất lượng cao.
+
+Bảng 4 cho thấy kết quả cho các tích chập dài trên benchmark LRA. Một ✗ trong cột Path-X cho biết rằng mô hình không bao giờ đạt được độ chính xác phân loại tốt hơn phỏng đoán ngẫu nhiên. Các tích chập dài dường như mạnh mẽ với khởi tạo: chỉ có một khoảng cách 0.5 điểm trong điểm số trung bình giữa các tích chập dài với khởi tạo hình học và các tích chập dài với khởi tạo ngẫu nhiên—mặc dù các tác vụ riêng lẻ có thể có nhiều khoảng cách hơn. Điều này trái ngược với các phương pháp S4, nhạy cảm với các lựa chọn khởi tạo và tham số hóa—với khoảng cách 7.6 điểm giữa S4-LegS và S4-LegS/FouT.
+
+Chính quy hóa là quan trọng để đạt được hiệu suất mạnh mẽ; không có nó, các tích chập dài mất 17.1 điểm trung bình trên sáu tác vụ LRA. Sử dụng toán tử Squash một mình dường như hoạt động tốt hơn việc sử dụng toán tử Smooth, hoặc sử dụng cả hai cùng nhau. Đối với phần còn lại của các thực nghiệm, chúng tôi tập trung vào hai biến thể hoạt động tốt nhất của các tích chập dài: khởi tạo ngẫu nhiên với toán tử Squash, và khởi tạo hình học với toán tử Squash.
+
+#### 4.1.2 Phân loại Hình ảnh
+
+Tiếp theo, chúng tôi đánh giá các tích chập dài trên phân loại hình ảnh. Chúng tôi đánh giá hai thiết lập đã được sử dụng để đánh giá SSM và các mô hình chuỗi: phân loại hình ảnh pixel-by-pixel 1D, và phân loại hình ảnh 2D. Các thiết lập này thách thức cho mô hình hóa chuỗi, vì chúng yêu cầu mô hình hóa các mối quan hệ không gian phức tạp giữa các pixel hình ảnh trong không gian liên tục. Đối với trường hợp 1D, chúng tôi lại sử dụng các tích chập dài như một sự thay thế trực tiếp cho lớp SSM trong kiến trúc S4 state-of-the-art. Đối với trường hợp 2D, chúng tôi thay thế các lớp S4 trong S4ND bằng các bộ lọc tích chập dài 2D.
+
+Bảng 5 và 6 cho thấy kết quả. Trên phân loại hình ảnh 1D, các tích chập dài lại sánh bằng hiệu suất của S4, ngay cả với khởi tạo ngẫu nhiên, trong khi hiệu suất của chúng cải thiện thêm 1.1 điểm khi sử dụng khởi tạo hình học. Trên phân loại hình ảnh 2D, các tích chập dài đến trong phạm vi 0.8 điểm của mô hình S4ND state-of-the-art. Chính quy hóa hoặc bias quy nạp thêm có thể hữu ích cho các tích chập dài để khôi phục hiệu suất của SSM trong các chiều cao hơn.
+
+#### 4.1.3 Mô hình hóa Văn bản: OpenWebText và PILE
+
+Chúng tôi đánh giá các tích chập dài trên mô hình hóa văn bản. Văn bản đã là một phương thức thách thức cho các mô hình không gian trạng thái và các mô hình chuỗi không attention, vì nó yêu cầu so sánh và sao chép các phần tử qua chuỗi đầu vào. Chúng tôi xây dựng dựa trên mô hình H3—mô hình SSM state-of-the-art cho mô hình hóa văn bản—xếp chồng hai SSM và nhân các đầu ra của chúng với nhau như một cơ chế gating. Chúng tôi sử dụng các tích chập dài như một sự thay thế trực tiếp cho các SSM trong lớp H3.
+
+Theo bài báo H3, chúng tôi giữ hai lớp attention trong mô hình ngôn ngữ tổng thể và đánh giá trên hai dataset: OpenWebText và Pile. Chúng tôi sử dụng OpenWebText để đánh giá vai trò của khởi tạo: chúng tôi huấn luyện các mô hình đến hoàn thành ở 100B token, và đánh giá cả khởi tạo ngẫu nhiên và hình học. Đối với Pile, chúng tôi đánh giá mức độ mở rộng tốt của các tích chập dài với dữ liệu: chúng tôi sử dụng khởi tạo suy giảm hình học, và đánh giá hiệu suất của các mô hình được huấn luyện với 5B, 10B, và 15B token.
+
+Bảng 7 và 8 cho thấy kết quả. Trên OpenWebText, các tích chập dài với khởi tạo ngẫu nhiên đến trong phạm vi 0.5 điểm PPL của H3, và khởi tạo suy giảm hình học đến trong phạm vi 0.3 PPL. Cả hai mô hình đều vượt trội hơn Transformer. Trên Pile, các tích chập dài với khởi tạo suy giảm hình học gần như sánh bằng H3 ở mọi nơi dọc theo đường cong mở rộng dữ liệu, và vượt trội hơn Transformer. Các kết quả ban đầu này gợi ý rằng các tích chập—với một số cơ chế gating nhân—có thể là một ứng cử viên đầy hứa hẹn cho mô hình hóa ngôn ngữ.
+
+#### 4.1.4 Phân tích fMRI Não
+
+Cuối cùng, chúng tôi đánh giá các tích chập dài trên một phương thức mô hình hóa chuỗi thực tế: phân tích dữ liệu chuỗi Magnetic Resonance Imaging (fMRI) chức năng của não. Để mục đích này, chúng tôi sao chép tác vụ pre-training tự giám sát được đề xuất bởi Thomas et al.: huấn luyện các mô hình để dự đoán hoạt động toàn não cho bước thời gian tiếp theo của một chuỗi fMRI (sử dụng một dataset upstream quy mô lớn, trải rộng dữ liệu fMRI từ 11,980 lần chạy thực nghiệm của 1,726 cá nhân). Chúng tôi so sánh các tích chập dài với Transformer và H3, các kiến trúc đạt hiệu suất state-of-the-art trong tác vụ này, bằng cách điều chỉnh mô hình H3 và thay thế kernel SSM bằng các tích chập dài. Các tích chập dài vượt trội hơn các mô hình khác trong việc dự đoán chính xác hoạt động não trong tác vụ này (xem Bảng 9). Chi tiết đầy đủ của phân tích này được cung cấp trong Phụ lục F.1, nơi chúng tôi cũng chỉ ra rằng các tích chập dài hoạt động ngang bằng với các mô hình khác trong việc phân loại chính xác các chuỗi fMRI mới trong một sự thích ứng downstream.
+
+### 4.2 Hiệu quả: FlashButterfly
+
+Bây giờ chúng tôi chuyển sang đánh giá hiệu suất thời gian chạy của FlashButterfly. Chúng tôi tập trung vào hai câu hỏi: liệu FlashButterfly có thể vượt trội hơn SSM về hiệu suất thời gian chạy, và FlashButterfly mở rộng tốt như thế nào đến các chuỗi dài. Đầu tiên, chúng tôi đánh giá thời gian chạy của FlashButterfly trên benchmark tốc độ Long Range Arena, đo thời gian chạy trên một benchmark phân loại văn bản cấp byte đại diện cho các tải mô hình hóa chuỗi tiêu chuẩn. FlashButterfly vượt trội hơn SSM và baseline từ benchmark tốc độ LRA gốc. Tiếp theo, chúng tôi đánh giá mức độ mở rộng tốt của FlashButterfly đến các chuỗi dài hơn. Qua nhiều độ dài chuỗi, FlashButterfly vượt trội hơn triển khai SSM nhanh nhất. Cuối cùng, chúng tôi chứng minh khả năng mở rộng chuỗi của FlashButterfly trên một tác vụ chuỗi cực dài: Path256, có độ dài chuỗi 64K.
+
+#### 4.2.1 Thời gian chạy trên Long Range Arena
+
+Chúng tôi bắt đầu bằng cách đánh giá thời gian chạy trên benchmark tốc độ Long Range Arena. Benchmark đo thời gian chạy trên một tác vụ phân loại văn bản cấp byte. Tác vụ này, có độ dài chuỗi 4K, đại diện cho các tải công việc huấn luyện mô hình hóa chuỗi điển hình, và là một benchmark đánh giá tiêu chuẩn cho Transformer và SSM. Benchmark được đo bằng tốc độ tăng tốc so với Transformer vanilla sử dụng triển khai HuggingFace. Chúng tôi ngoài ra so sánh với hai baseline khác: a) Transformer sử dụng FlashAttention, thuật toán attention nhanh nhất, và b) SSM sử dụng FlashConv, triển khai SSM nhanh nhất.
+
+Bảng 10 cho thấy kết quả. FlashButterfly đạt được tăng tốc 7.0× so với baseline Transformer. Nó vượt trội hơn FlashAttention, vì tính toán của nó mở rộng gần như tuyến tính với độ dài chuỗi thay vì bậc hai. Nó cũng vượt trội hơn FlashConv, triển khai SSM nhanh nhất, vì nó không yêu cầu tạo kernel. Các kết quả này cho thấy rằng FlashButterfly vượt trội hơn SSM và Transformer về hiệu quả thời gian chạy trong các tải công việc mô hình hóa chuỗi tiêu chuẩn.
+
+#### 4.2.2 Mở rộng đến Chuỗi Dài hơn
+
+Tiếp theo, chúng tôi đánh giá mức độ mở rộng tốt của FlashButterfly đến độ dài chuỗi dài hơn. Chúng tôi so sánh FlashButterfly với a) các tích chập sử dụng cuFFT, triển khai tiêu chuẩn trong PyTorch, và b) SSM sử dụng FlashConv. Chúng tôi đo thời gian chạy cho độ dài chuỗi từ 1K đến 128K. Theo, chúng tôi đo thời gian chạy của một lớp duy nhất sử dụng kích thước batch 32 và 128 chiều mô hình. Chúng tôi cũng cung cấp thời gian chạy attention, cũng như SSM sử dụng triển khai PyTorch tiêu chuẩn, để tham khảo.
+
+Hình 3 cho thấy kết quả. FlashButterfly mang lại tăng tốc lên đến 2.2× so với các tích chập baseline dựa trên cuFFT. FlashButterfly vượt trội hơn FlashConv cho tất cả độ dài chuỗi, vì nó không yêu cầu bước tạo kernel của SSM. Các kết quả này cho thấy rằng FlashButterfly vượt trội hơn SSM và Transformer qua tất cả độ dài chuỗi—ngay cả các chuỗi rất dài.
+
+Chúng tôi chứng minh tiện ích của FlashButterfly bằng cách huấn luyện các mô hình trên một tác vụ với các chuỗi cực dài: Path256, có độ dài chuỗi 64K. Bảng 11 cho thấy rằng các tích chập dài đạt hiệu suất state-of-the-art trên Path256, vượt trội hơn block-sparse FlashAttention từ, công việc trước đó duy nhất báo cáo hiệu suất không tầm thường (>50% độ chính xác) trên Path256. Các tích chập dài với FlashButterfly vượt hiệu suất state-of-the-art với 29.1 điểm, và huấn luyện nhanh hơn 7.2×.
+
+### 4.3 Mở rộng Butterfly Đã học
+
+Cuối cùng, chúng tôi đánh giá thực nghiệm mức độ cải thiện chất lượng của mở rộng Butterfly đã học trên hai tác vụ: CIFAR tuần tự và WikiText103.
+
+Đầu tiên, trên CIFAR tuần tự, chúng tôi sử dụng cùng kiến trúc như trong Phần 4.1, ngoại trừ với các ma trận Butterfly đã học. Bảng 12 cho thấy kết quả cho CIFAR tuần tự, với các kích thước khối khác nhau. Kích thước khối 16 mang lại cải thiện so với baseline với các ma trận Butterfly cố định, mà không hy sinh thời gian chạy. Các kích thước khối lớn hơn mang lại cải thiện thêm, nhưng với chi phí thời gian chạy bổ sung.
+
+Tiếp theo, trên WikiText103, chúng tôi đánh giá mở rộng Butterfly đã học trong một thiết lập thay thế: thay thế MLP trong Transformer, theo. Trong thiết lập này, chúng tôi tận dụng thực tế rằng một ma trận Butterfly với kích thước khối lớn (256) xấp xỉ một phép nhân ma trận dày đặc, nhưng có ít tham số hơn. Chúng tôi so sánh mở rộng Butterfly đã học của chúng tôi với Transformer với MLP dày đặc, và với Transformer nơi MLP đã được thay thế bằng ma trận Monarch. Metric là liệu chúng ta có thể đạt được cùng hiệu suất như Transformer với MLP dày đặc, nhưng với ít tham số hơn.
+
+Bảng 13 cho thấy kết quả. Mở rộng của chúng tôi vượt trội hơn cả Transformer baseline và Monarch, vượt trội hơn Transformer với giảm 30% tham số. Kết quả này xác thực kết nối giữa mở rộng Butterfly đã học của chúng tôi và ma trận thưa thớt có cấu trúc.
+
+## 5 Kết luận
+
+Chúng tôi thấy rằng việc chính quy hóa các trọng số kernel với toán tử squash cho phép các tích chập dài đạt được hiệu suất mạnh mẽ trên nhiều tác vụ mô hình hóa chuỗi dài. Chúng tôi phát triển FlashButterfly để cải thiện hiệu quả thời gian chạy của các tích chập dài, sử dụng các phân tích Butterfly, và chúng tôi kết nối các tích chập với các tiến bộ gần đây trong phép nhân ma trận khối thưa thớt.
