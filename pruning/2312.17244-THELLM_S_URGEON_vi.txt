@@ -1,0 +1,534 @@
+# THẦY THUỐC LLM
+
+Tycho F.A. van der Ouderaa1*, Markus Nagel2, Mart van Baalen2,
+Yuki M. Asano3, Tijmen Blankevoort2
+1Đại học Imperial London ,2Nghiên cứu AI Qualcomm†,3Phòng thí nghiệm QUVA, Đại học Amsterdam
+
+TÓM TẮT
+Các mô hình ngôn ngữ hiện đại nhất đang trở nên ngày càng lớn hơn trong nỗ lực đạt được hiệu suất cao nhất trên các tập dữ liệu văn bản có sẵn lớn. Tuy nhiên, kích thước khổng lồ của các kiến trúc Transformer khiến việc triển khai mô hình trong các ràng buộc về tính toán, môi trường hoặc thiết bị cụ thể trở nên khó khăn. Chúng tôi khám phá việc nén dựa trên dữ liệu của các mô hình đã được huấn luyện trước hiện có như một giải pháp thay thế cho việc huấn luyện các mô hình nhỏ hơn từ đầu. Để làm được điều này, chúng tôi mở rộng quy mô các xấp xỉ độ cong được phân tích Kronecker của cảnh quan hàm mất mục tiêu cho các mô hình ngôn ngữ lớn. Bằng cách này, chúng tôi có thể tính toán cả việc phân bổ động của các cấu trúc có thể bị loại bỏ cũng như các cập nhật của các trọng số còn lại tính đến việc loại bỏ. Chúng tôi cung cấp một khung chung cho việc cắt tỉa không có cấu trúc, bán cấu trúc và có cấu trúc và cải thiện việc cập nhật trọng số để nắm bắt nhiều tương quan hơn giữa các trọng số, trong khi vẫn hiệu quả về mặt tính toán. Về mặt thực nghiệm, phương pháp của chúng tôi có thể cắt tỉa các hàng và cột từ một loạt các mô hình OPT và Llamav2-7B từ 20%-30%, với mức mất hiệu suất không đáng kể, và đạt được kết quả hiện đại nhất trong việc cắt tỉa không có cấu trúc và bán cấu trúc của các mô hình ngôn ngữ lớn.
+Mã nguồn có sẵn tại: https://github.com/Qualcomm-AI-research/llm-surgeon.
+
+1 GIỚI THIỆU
+
+Những tiến bộ gần đây trong mô hình hóa ngôn ngữ (Vaswani et al., 2017) cho phép khớp các mô hình ngôn ngữ lớn (LLM) với hàng triệu hoặc thậm chí hàng tỷ tham số (như OPT (Zhang et al., 2022) và Llama 2 (Touvron et al., 2023)) trên các tập dữ liệu văn bản lớn đạt hiệu suất cao. Thật không may, kích thước của các LLM này thường khiến việc triển khai chúng trong các ràng buộc thực tế trở nên khó khăn. Việc triển khai dựa trên đám mây có thể trở nên rất tốn kém đối với các mô hình lớn hơn, và các thiết bị hiệu quả như điện thoại thường bị hạn chế về kích thước bộ nhớ để lưu trữ một mô hình.
+
+Một nhánh tài liệu mở rộng từ cuối những năm 1980, ví dụ, Optimal Brain Damage (OBD, LeCun et al. (1989)) và Optimal Brain Surgeon (OBS, Hassibi & Stork (1992)), diễn đạt việc cắt tỉa như một bài toán tối ưu hóa có ràng buộc để giảm dấu chân và yêu cầu thời gian chạy của mô hình. Ma trận Hessian cần thiết cho phương pháp này tăng theo bình phương của số lượng tham số, và chỉ có thể được tính toán trong thực tế cho các mạng nhỏ một cách không thực tế. Để khắc phục vấn đề này, Eigendamage (Wang et al., 2019) giới thiệu một phân tích Kronecker của một xấp xỉ đường chéo theo khối của Hessian. Các công trình gần đây, như Optimal Brain Compression (Frantar & Alistarh, 2022), SparseGPT (Frantar & Alistarh, 2023), chứng minh việc cắt tỉa sau huấn luyện thực tế của LLM, nhưng chỉ xem xét độ cong mất mát của lỗi tái tạo đầu ra bình phương của lớp bị cắt tỉa, bỏ qua các gradient liên kết chi phí loại bỏ cục bộ với hàm mất mục tiêu. Kết quả là, xấp xỉ của họ đối với cảnh quan hàm mất mục tiêu không chính xác, dẫn đến suy giảm hiệu suất đáng kể cho các LLM bị cắt tỉa. Hơn nữa, các phương pháp này không dễ dàng mở rộng cho việc cắt tỉa có cấu trúc.
+
+Nén có cấu trúc (hàng và cột) Nén không có cấu trúc (các phần tử ma trận)
+1.3b 2.7b 6.7b kích thước mô hình:14.62
+12.47
+10.86
+perplexity
+tập kiểm tra
+đã huấn luyện trước
+K-OBD
+LLM Surgeon
+1.3b 2.7b 6.7b kích thước mô hình:14.62
+12.47
+10.86
+perplexity
+tập kiểm tra
+đã huấn luyện trước
+SparseGPT
+LLM Surgeon
+
+Hình 1: LLM Surgeon cho phép nội suy kích thước mô hình giữa các mô hình đã huấn luyện trước hiện có.
+
+Công trình này giới thiệu LLM Surgeon, một khung chung cho việc cắt tỉa không có cấu trúc, bán cấu trúc và có cấu trúc của LLM. Tại thời điểm nộp bài báo, chúng tôi coi đây là phương pháp đầu tiên thực hiện thành công việc cắt tỉa có cấu trúc của LLM. Công trình đồng thời của Ashkboos et al. (2024) cũng xem xét việc cắt tỉa có cấu trúc của LLM nhưng bỏ qua thông tin gradient, dẫn đến hiệu suất cuối cùng thấp hơn. Hiệu suất vượt trội của LLM Surgeon đạt được bằng cách mở rộng quy mô các xấp xỉ đường chéo theo khối được phân tích Kronecker đối với Fisher thực nghiệm từ Eigendamage cho LLM. Chúng tôi tiếp tục mở rộng công trình bằng cách suy ra chi phí cắt tỉa trọng số và cập nhật giống OBS cho việc cắt tỉa có cấu trúc của nhiều hàng và cột, và cung cấp một khung chung cũng kết hợp việc cắt tỉa bán cấu trúc và không có cấu trúc. Thay vì xử lý các cập nhật trọng số riêng lẻ một cách độc lập, chúng tôi cố gắng xem xét càng nhiều tương quan giữa các trọng số càng tốt một cách thực tế và suy ra các cập nhật trọng số kết hợp để cắt tỉa nhiều trọng số (hoặc nhiều tập hợp trọng số có cấu trúc) cùng một lúc. Không giống như công trình trước đây trong việc cắt tỉa LLM, LLM Surgeon cắt tỉa theo nhiều lần, cập nhật trọng số và ước lượng độ cong giữa các lần. Chúng tôi sử dụng ngưỡng toàn cục cho việc cắt tỉa không có cấu trúc, bán cấu trúc và có cấu trúc, tức là, thay vì cắt tỉa các lớp theo một lượng cố định, các lớp nhạy cảm hơn được cắt tỉa ít hơn so với những lớp mạnh mẽ hơn. Cuối cùng, chúng tôi đề xuất giảm thiểu các gradient bậc nhất có thể không bằng không bằng cách sử dụng các cập nhật bậc nhất hạng thấp tùy chọn giữa các lần. Một lợi thế chính của LLM Surgeon là nó cho phép đánh đổi tính toán bổ sung trong quá trình nén để có độ chính xác tốt hơn bằng cách tăng số lượng tương quan và/hoặc số lần. Phương pháp của chúng tôi đưa ra kết quả đầu tiên có thể sử dụng thực tế cho việc cắt tỉa có cấu trúc của LLM - chúng có thể được cắt tỉa lên đến 30% với suy giảm hiệu suất nhỏ. Hơn nữa, chúng tôi đạt được kết quả hiện đại nhất trong việc cắt tỉa LLM không có cấu trúc và bán cấu trúc.
+
+2 BỐI CẢNH VÀ CÔNG TRÌNH LIÊN QUAN
+
+Việc cắt tỉa mạng nơ-ron nhằm loại bỏ các tham số khỏi mô hình trong khi giảm thiểu tác động tiêu cực đến hiệu suất cuối cùng. Chính thức hơn, chúng tôi ký hiệu P tham số mô hình như vectơ theta*= vec(W*1,W*2, . . .W*L) trong RP, bằng cách làm phẳng L ma trận trọng số của các khối attention và fully-connected, với theta* đã được khớp ~= arg min_theta L(theta) với dữ liệu D để tối thiểu hóa hàm mất khả năng xảy ra âm L(theta) = −log p(theta|D). Để nén mô hình, chúng tôi đang tìm kiếm một vectơ đã cắt tỉa ˆtheta:
+
+ˆtheta = arg min_theta L(theta) s.t. các ràng buộc cắt tỉa dựa trên theta* (1)
+
+trong đó các ràng buộc được chọn xác định cấu trúc của các trọng số nén ˆtheta. Trong việc cắt tỉa không có cấu trúc, một phần của tổng số phần tử trọng số được đặt bằng không. Trong việc cắt tỉa bán cấu trúc của M:N, chúng ta có M trọng số trong mỗi N trọng số liên tiếp bằng không (Zhou et al., 2021; Hubara et al., 2021). Và trong việc cắt tỉa có cấu trúc (Louizos et al., 2017), toàn bộ các hàng và cột được đặt bằng không. Việc cắt tỉa có cấu trúc dẫn đến lợi ích trực tiếp nhất về bộ nhớ và tính toán, vì nó trực tiếp giảm kích thước của các ma trận cần được biểu diễn một cách rõ ràng nhưng được coi là khó nén nhất. Duy trì hiệu suất cao thường dễ dàng hơn trong các sơ đồ khác nhưng đòi hỏi số học chuyên biệt khai thác cấu trúc thưa thớt để có lợi khi triển khai. Chúng tôi xem xét tất cả các loại cắt tỉa ở trên, với trọng tâm vào việc cắt tỉa có cấu trúc cho LLM.
+
+Thông thường, phương trình (1) không thể được giải trực tiếp, vì không gian của các cấu hình cắt tỉa có thể vượt quá những gì có thể được đánh giá trong thực tế. Để minh họa, một tìm kiếm qua tất cả các mặt nạ cắt tỉa không có cấu trúc có thể của một LLM 125 triệu tham số sẽ yêu cầu 2^P = 2^125m ~= 10^37628749 đánh giá. Do đó, ý tưởng là tìm ˆtheta bằng cách sử dụng một đại lý của cảnh quan hàm mất q dễ làm việc hơn:
+
+L(theta) = −log p(D|theta) ~= −log q(theta) (2)
+
+Nếu ta chọn một dạng Gaussian cụ thể cho đại lý q của chúng ta, thì các giải pháp cho các ràng buộc cắt tỉa không có cấu trúc, bán cấu trúc và có cấu trúc có thể được suy ra dưới dạng đóng (phụ lục A).
+
+2.1 KHAI TRIỂN TAYLOR
+
+Làm thế nào để chúng ta có được một đại lý tốt của hàm mất q? Một trong những phương pháp dễ nhất là khai triển cục bộ log hàm mất thông qua khai triển Taylor bậc hai xung quanh các trọng số đã huấn luyện trước theta*, tạo ra:
+
+−log q(theta) ~= −log p(D|theta*) − (theta−theta*)^T ∇L(theta*) − 1/2(theta−theta*)^T H_theta* (theta−theta*) (3)
+
+trong đó [∇L(theta*)]_i = ∂/∂theta_i L(theta*_i) ký hiệu Jacobian và [H_theta]_ij = ∂²/∂theta_i∂theta_j L(theta_ij) ký hiệu Hessian. Số hạng bậc nhất biến mất [∇L(theta*)]_i = 0 tại điểm tối ưu. Lưu ý rằng trong thực tế số hạng bậc nhất có thể không biến mất. Mặc dù chúng tôi tuân theo giả định này ban đầu, chúng tôi xem xét các hiệu chỉnh bậc nhất xen kẽ để giảm thiểu vấn đề trong phần 3.6. Khai triển bậc hai của phương trình (3) tạo thành cơ sở của các phương pháp cắt tỉa optimal brain damage (LeCun et al., 1989) và optimal brain surgeon (Hassibi & Stork, 1992). Lưu ý rằng từ góc độ xác suất, một xấp xỉ bậc hai của log khả năng xảy ra ngụ ý một xấp xỉ Gaussian của khả năng xảy ra, như cũng được quan sát bởi (Wang et al., 2019) và được minh họa trong hình 2. Điều này được biết đến rộng rãi (Bishop & Nasrabadi, 2006), (MacKay, 2003) như xấp xỉ Laplace q(theta) = N(theta|theta* + ∇L(theta*), H^{−1}_theta*), với các trọng số đã huấn luyện trước là trung bình và Hessian nghịch đảo cục bộ là ma trận hiệp phương sai nắm bắt tương quan giữa các trọng số.
+
+2.2 MA TRẬN THÔNG TIN FISHER THEO KHỐI
+
+Đối với một mạng được huấn luyện với hàm mất log-khả năng xảy ra âm, Hessian giống hệt với ma trận Fisher:
+
+H_theta = F_theta = Σ_{n=1}^N E_{y~p_theta(y|x_n)} [∇_theta log p_theta(y|x_n) ∇_theta log p_theta(y|x_n)^T] (4)
+
+có lợi ích luôn là bán xác định dương, với nghịch đảo do đó tạo thành một ma trận hiệp phương sai thích hợp cho q, và có thể được xấp xỉ với các mẫu Monte Carlo của p_theta(y|x_n). Đối với hầu hết các LLM, điều này sẽ là xử lý đầu ra softmax của mạng như phân phối categorical p_theta(y|x_n), và lấy mẫu từ đó. Trong thực tế, chúng tôi sử dụng 'Fisher thực nghiệm' thay thế kỳ vọng trên y bằng dữ liệu mục tiêu y_n (Kunstner et al., 2019). (Fisher thực nghiệm) đầy đủ F_theta trong R^{P×P} tỷ lệ bậc hai theo số lượng tham số P. Để khắc phục điều này, Fisher thường được viết dưới dạng các khối theo lớp F_{lk} = Σ_{n=1}^N E[vec(∇_{W_l} log p_theta(y|x_n)) vec(∇_{W_k} log p_theta(y|x_n))^T], và xấp xỉ bằng cách chỉ xử lý các lớp một cách độc lập (Martens & Grosse, 2015; Botev et al., 2017):
+
+F_theta = diag(F_{11}, F_{22}, . . . , F_{LL}), F_l = Σ_{n=1}^N E[(g_{l,n} g_{l,n}^T) ⊗ (a_{l,n} a_{l,n}^T)] (5)
+
+trong đó ⊗ ký hiệu tích Kronecker và vec(·) phép toán vector hóa ma trận. Bởi vì chúng tôi bỏ qua các tương tác giữa các lớp, chúng tôi viết F_l thay vì F_{ll} cho các khối Fisher liên kết với ma trận trọng số W_l trong R^{R×C} tạo ra đầu ra y_{l,n} = W_l a_{l,n} trong R^R từ đầu vào a_{l,n} trong R^C, cho mỗi lớp l và điểm dữ liệu n. Do đó, chúng ta có thể tính toán các khối Fisher từ các kích hoạt đầu vào a_{l,n} trong R^C của dữ liệu x_n được truyền tiến và các gradient đầu ra g_{l,n} = ∇_{y_{l,n}} L trong R^R từ lan truyền ngược.
+
+2.3 CẮT TỈA NHƯ TỐI ƯU HÓA CÓ RÀNG BUỘC
+
+Optimal brain surgery dựa vào việc loại bỏ và điều chỉnh trọng số sao cho hàm mất bị ảnh hưởng tiêu cực ít nhất, do đó việc viết bài toán như một bài toán tối ưu hóa có ràng buộc là có lợi. Từ xấp xỉ Gaussian được thảo luận trong phần 2.1 thu được bằng cách khai triển bậc hai log khả năng xảy ra hàm mất −log p ~= 1/2 theta^T F theta, cập nhật tối ưu Δtheta = ˆtheta − theta (và do đó cũng ˆtheta = theta + Δtheta) trở thành bài toán tối ưu hóa bậc hai có ràng buộc đẳng thức sau (Hassibi & Stork, 1992):
+
+arg min_{Δtheta} 1/2 Δtheta^T F Δtheta (6)
+s.t. e_k^T Δtheta + e_k^T theta = 0, for all k in K
+
+trong đó F là bán xác định dương và K là tập hợp K chỉ số được cắt tỉa (tức là, đặt bằng không).
+
+Giải pháp chung Chúng tôi ký hiệu E_K = [e_1 e_2 . . . e_K]^T trong [0,1]^{K×P} như một ma trận mà các vectơ hàng là các vectơ cơ sở canonical e_k trong R^P chọn các phần tử để được cắt tỉa. Một trong những phương pháp tiêu chuẩn nhất để giải phương trình (6) là sử dụng nhân tử Lagrange, kết quả là một giải pháp dạng đóng chung cho sự gia tăng dự kiến trong hàm mất L và cập nhật trọng số tối ưu Δtheta:
+
+L = 1/2 (E_K theta*)^T (E_K F^{-1} E_K^T)^{-1} E_K theta (7)
+Δtheta = −F^{-1} E_K^T (E_K F^{-1} E_K^T)^{-1} E_K theta (8)
+
+mà chúng tôi sử dụng để suy ra không có cấu trúc, bán cấu trúc, có cấu trúc cho các xấp xỉ Fisher hiện đại (xem phụ lục A.2 đến A.4). Cùng dạng chung của phương trình (7) và (8) xuất hiện trong công trình cắt tỉa LLM trước đây Kurtic et al. (2022), nhưng chỉ cho việc cắt tỉa theo lớp đơn giản hơn nhiều và không có cắt tỉa có cấu trúc.
+
+3 LLM SURGEON
+
+Phần này mô tả các thành phần của phương pháp của chúng tôi, LLM Surgeon, được tóm tắt trong thuật toán 1.
+
+3.1 ƯỚC LƯỢNG ĐỘ CONG CẢNH QUAN HÀM MẤT
+
+Việc cắt tỉa chính xác dựa vào việc xấp xỉ độ cong cục bộ một cách chính xác trong khi vượt qua chi phí bộ nhớ liên quan đến việc lưu trữ độ cong thực. Cụ thể, ngay cả với xấp xỉ theo khối của phương trình (5), F trong R^{RC×RC} yêu cầu tổng N ma trận RC×RC lớn, quá lớn để thực tế phù hợp trong bộ nhớ. Thay vào đó, chúng tôi điều chỉnh xấp xỉ KFAC (Martens & Grosse, 2015) giả định tính độc lập của các kích hoạt và đạo hàm, xấp xỉ kỳ vọng của các tích Kronecker như một tích Kronecker của hai kỳ vọng E[g_{l,n} g_{l,n}^T ⊗ a_{l,n} a_{l,n}^T] ~= E[g_{l,n} g_{l,n}^T] ⊗ E[a_{l,n} a_{l,n}^T], cho phép các khối Fisher theo lớp được xấp xỉ như F_l ~= F̃_l, trong đó
+
+F̃_l = G_l ⊗ A_l, với G_l = 1/√N Σ_{n=1}^N g_{l,n} g_{l,n}^T và A_l = 1/√N Σ_{n=1}^N a_{l,n} a_{l,n}^T (9)
+
+được xây dựng từ các kích hoạt a_{l,n} trong R^C từ các lần truyền tiến và gradient g_{l,n} trong R^R từ các lần truyền ngược (Eschenhagen et al., 2024). Xấp xỉ này bắt nguồn từ tài liệu tối ưu hóa, nhưng gần đây đã trở nên phổ biến cho các bài toán khác yêu cầu xấp xỉ độ cong (Immer et al., 2022; van der Ouderaa et al., 2023), bao gồm cắt tỉa có cấu trúc trong Wang et al. (2019).
+
+Một lợi thế bổ sung của việc xấp xỉ các khối Fisher như các tích Kronecker là nghịch đảo trở nên đặc biệt dễ tính toán F̃^{-1} = G^{-1} ⊗ A^{-1}, do đó chỉ yêu cầu nghịch đảo các thừa số. Thực tế này cho phép chúng tôi không bao giờ xây dựng rõ ràng các ma trận RC×RC lớn trong bộ nhớ tạo thành F̃ và F̃^{-1}, mà thay vào đó làm việc trực tiếp với các ma trận G và A nhỏ hơn nhiều.
+
+3.2 TÍNH TOÁN CHI PHÍ TRONG HÀM MẤT CUỐI CÙNG
+
+Số lượng kết hợp có thể trong đó các trọng số có thể được loại bỏ tăng theo cấp số nhân (supra-) trong số lượng tham số, khiến việc ước lượng chi phí L riêng biệt cho mỗi việc loại bỏ như vậy trở nên không khả thi. Do đó, một chiến lược phổ biến là xử lý các trọng số một cách độc lập khi tính toán chi phí loại bỏ L. Chúng tôi cũng tuân theo chiến lược này, nhưng lưu ý rằng điều này không nhất thiết ngụ ý rằng chúng ta phải đưa ra giả định độc lập mạnh tương tự cho các cập nhật trọng số Δtheta sau khi chọn các trọng số để loại bỏ. Không giống như hầu hết các công trình trước đây, chúng tôi trình bày các cập nhật trọng số có tương quan bằng cách tính đến các phần tử ngoài đường chéo của xấp xỉ Fisher trong phần 3.4.
+
+Đối với bán cấu trúc và không có cấu trúc, chúng tôi sử dụng chi phí độc lập cho các phần tử trọng số riêng lẻ k trong [1, RC], và đối với có cấu trúc sử dụng chi phí độc lập cho tất cả các hàng r trong [1, R] và cột c trong [1, C]. Chúng tôi thấy rằng chúng ta có thể suy ra các chi phí thích hợp từ công thức chi phí chung phương trình (7) bằng cách để E = e_k trong R^{RC} trong đó phần tử one-hot duy nhất tại chỉ số k của vectơ cơ sở canonical e_k chọn trọng số để loại bỏ. Đối với cắt tỉa có cấu trúc, chúng tôi tương tự chọn các hàng r và cột c, bằng cách đặt E = e_r^T ⊗ I trong R^{C×RC} hoặc E = I ⊗ e_c trong R^{R×RC} với e_r trong R^R, e_c trong R^C. Thay vào phương trình (7), chúng tôi tìm thấy:
+
+L_k = 1/2 (theta_k)^2 / [G^{-1} ⊗ A^{-1}]_{kk}, L_r = 1/2 theta_r^T A theta_r / [G^{-1}]_{rr}, L_c = 1/2 theta_c^T G theta_c / [A^{-1}]_{cc} (10)
+
+Các suy dẫn đầy đủ có thể được tìm thấy trong phụ lục A.2 và A.3. Chi phí cho các phần tử đơn L_k tương đương với những chi phí được tìm thấy trong optimal brain surgeon (Hassibi & Stork, 1992) và L_r và L_c gần giống với structured brain surgeon của (Wang et al., 2019), nhưng trong trường hợp của chúng tôi được suy ra cho các hàng và cột ma trận (xem phụ lục A.3). Cho các ước lượng độ cong, chi phí để loại bỏ tất cả trọng số hoặc tất cả hàng và cột có thể được tính toán song song. Ngoài ra, chúng tôi suy ra chi phí cho tổng các xấp xỉ thừa số Kronecker tổng quát hơn F̃ ~= G_1 ⊗ A_1 + G_2 ⊗ A_2 trong phụ lục I thông qua phân tích eigendecomposition.
+
+3.3 PHÂN BỔ TRỌNG SỐ ĐỘNG VỚI NGƯỠNG TOÀN CỤC
+
+W gốc
+chi phí hàng r, 
+chi phí cột c
+có cấu trúc
+W+ΔW
+chi phí phần tử k
+bán cấu trúc
+W+ΔW
+chi phí phần tử k
+không có cấu trúc
+W+ΔW
+
+Trọng số đã cắt tỉa    Trọng số còn lại đã cập nhật
+
+Hình 3: Khung chung cho nén có cấu trúc, bán cấu trúc và không có cấu trúc.
+
+Không giống như các công trình trước đây nén theo từng lớp (Frantar & Alistarh, 2023), chúng tôi sử dụng ngưỡng toàn cục tau cho phép phân bổ động các mức độ thưa thớt qua các lớp, cắt tỉa nhiều nhất ở nơi gây tổn hại ít nhất. Phương pháp của chúng tôi có thể nén mô hình đến kích thước mục tiêu được chọn cụ thể alpha, được định nghĩa là phần của trọng số nên còn lại, tức là giữ khác không sau khi nén. Trong tất cả việc cắt tỉa có cấu trúc, bán cấu trúc và không có cấu trúc (hình 3), chúng tôi chọn càng nhiều trọng số để loại bỏ sao cho kích thước mục tiêu alpha đạt được mà gây ra chi phí L ít nhất có thể, như được tính toán theo phần 3.2. Đối với cắt tỉa không có cấu trúc, điều này đơn giản như việc sắp xếp chi phí cho tất cả trọng số L_k trong mạng và đặt ngưỡng toàn cục tau sao cho phần alpha của trọng số nằm trong ngưỡng L_k <= tau. Đối với cắt tỉa bán cấu trúc M:N, chúng tôi sắp xếp M chi phí của mỗi N trọng số liên tiếp và chọn M trọng số có chi phí thấp nhất. Trong trường hợp lịch trình nhiều lần (xem phần 3.5), chúng tôi cũng tổng M chi phí thấp nhất trong mỗi khối để tìm chi phí mỗi khối, sắp xếp chi phí mỗi khối trên toàn bộ mạng, và tương tự như trường hợp không có cấu trúc đặt ngưỡng toàn cục tau sao cho phần alpha của trọng số nằm trong ngưỡng. Cuối cùng đối với cắt tỉa có cấu trúc, chúng tôi thực hiện sắp xếp được trọng số thích hợp bởi số lượng phần tử tạo thành một hàng hoặc cột và đặt ngưỡng toàn cục tau sao cho phần alpha của tất cả trọng số nằm trong ngưỡng. Sau đó chúng tôi loại bỏ tất cả các hàng và cột nằm trong ngưỡng L_r, L_c <= tau.
+
+3.4 CẬP NHẬT TRỌNG SỐ CÓ TƯƠNG QUAN
+
+Giống như hầu hết các phương pháp cắt tỉa khác, chúng tôi cắt tỉa nhiều trọng số cùng một lúc (Frantar & Alistarh, 2023; Wang et al., 2019). Để đi đến chi phí cắt tỉa và cập nhật trọng số cho việc cắt tỉa nhiều trọng số, việc tính toán chi phí và cập nhật cho các trọng số riêng lẻ (hoặc tập hợp trọng số) một cách độc lập và cộng chúng lại để đạt được chi phí cắt tỉa kết hợp là phổ biến. Trong LLM Surgeon, chúng tôi lập luận rằng tốt hơn là xem xét các cập nhật trọng số một cách kết hợp thay vì độc lập. Sau khi chọn tập hợp trọng số để cắt tỉa, chúng ta thường có thể đủ khả năng tính toán một cập nhật trọng số có tương quan duy nhất liên quan đến việc loại bỏ kết hợp nhiều trọng số, thay vì cộng một cách ngây thơ các cập nhật trọng số liên quan đến việc loại bỏ riêng lẻ. Chúng tôi suy ra các cập nhật trọng số có tương quan như vậy dưới đây. Lưu ý rằng, đối với việc tính toán chi phí dự kiến, chúng tôi giả định rằng chi phí hàng, cột hoặc trọng số là độc lập, vì số lượng kết hợp có thể của trọng số để cắt tỉa tăng quá lớn để tính toán trong thời gian hợp lý.
+
+Cập nhật trọng số có tương quan không có cấu trúc / bán cấu trúc nhanh Về mặt toán học, chúng tôi biểu diễn các trọng số bị cắt tỉa như E_K = [e_1 e_2 . . . e_{R'}]^T trong R^{K×RS}, trong đó e_r trong R^{R'} là các vectơ cơ sở canonical one-hot chọn các trọng số để loại bỏ. Vì mỗi phần tử k có chỉ số hàng r và cột c liên kết duy nhất, chúng ta do đó cũng có thể sử dụng các vectơ cơ sở canonical cho các hàng E_R tương ứng trong R^{K×R} và cột E_C trong R^{K×C} (tức là, chúng ta có [E_R]_i ⊗ [E_C]_i = [E_K]_i được thỏa mãn cho tất cả i). Chúng tôi suy ra các cập nhật trọng số không có cấu trúc trong phụ lục A.2, bằng cách xem xét các phân tích eigendecomposition G = K_1 S_1 K_1^T, A = K_2 S_2 K_2 của xấp xỉ Fisher F̃ = G ⊗ A, từ phương trình (8) cho:
+
+ΔW = G^{-1} K̄_1 (K̄_1^T W̄ K̄_2 ⊘ S̄)^{-1} K̄_2^T A^{-1} (11)
+
+trong đó ⊘ là phép chia theo phần tử, và để ngắn gọn sử dụng ký hiệu thanh K̄_1 = E_K K_1, K̄_2 = E_K K_2, θ̄ = E_K theta, và S̄ = diag(S_1) diag(S_2)^T trong R^{R×C}, và diag(·) vector hóa các đường chéo ma trận. Về mặt lập trình, chúng tôi luôn tránh biểu diễn rõ ràng các ma trận lớn F̃ và F̃^{-1} trong bộ nhớ, mà thay vào đó tính toán các đại lượng liên quan từ các thừa số của chúng. Tương tự, chúng tôi không bao giờ biểu diễn các ma trận thưa E_K, E_R hoặc E_C trong bộ nhớ, mà thay vào đó làm việc với danh sách các chỉ số của các phần tử one-hot trực tiếp. Ví dụ, chúng ta có thể xây dựng một cách rẻ tiền K̄_1 = E_R K_1 trong R^{K×R} và K̄_2 = E_C K_2 trong R^{K×C}, bằng cách sao chép các vectơ hàng, và vectơ θ̄ = E_K theta = E_R W E_C^T trong R^K bằng cách lập chỉ mục tất cả trọng số bị cắt tỉa.
+
+Số lượng tối đa trọng số có tương quan Nút thắt tính toán chính là nghịch đảo ma trận K×K trong phương trình (11). Để kiểm soát tốc độ nén, chúng ta có thể chia các trọng số bị cắt tỉa thành các tập con rời rạc K = K_1 ∪ K_2 ∪ . . ., sao cho mỗi tập con K_i không vượt quá số lượng tối đa trọng số có tương quan đã đặt K_i <= m, và tổng các cập nhật độc lập liên quan. Sử dụng ít tương quan hơn bằng cách đặt m thấp hơn cho phép đánh đổi chất lượng nén cho tốc độ.
+
+Cập nhật trọng số có tương quan có cấu trúc nhanh Không giống như trường hợp chung yêu cầu nghịch đảo ma trận K×K cho K trọng số có tương quan, chúng tôi thấy rằng các cập nhật trọng số với xấp xỉ Fisher được phân tích Kronecker F̃ = G ⊗ A chỉ yêu cầu nghịch đảo ma trận R'×R' khi loại bỏ R' hàng hoặc ma trận C'×C' khi loại bỏ C' cột. Các cập nhật rẻ hơn nhiều so với những gì chúng tôi mong đợi dựa trên số lượng trọng số hiệu quả trong các hàng và cột đó, điều này sẽ ngụ ý nghịch đảo các ma trận R'C×R'C hoặc RC'×RC'. Trong thực tế, điều này dẫn đến tăng tốc đáng kể cho việc cắt tỉa có cấu trúc và cập nhật trọng số có tính đến tương quan giữa các hàng hoặc cột.
+
+Khi loại bỏ R' hàng, r_1, r_2, . . . r_{R'}, hoặc C' cột c_1, c_2, . . . , c_{C'}, với 1 < R' < R và 1 < C' < C, chúng tôi ký hiệu các vectơ one-hot chọn tất cả hàng và cột để loại bỏ tương ứng như E_{R'} = [e_1 e_2 . . . e_{R'}]^T trong R^{R'×R} và E_{C'} = [e_1 e_2 . . . e_{C'}]^T trong R^{C'×C}. Chúng tôi tìm thấy các cập nhật trọng số liên quan đến việc loại bỏ R' hàng bằng cách đặt E_K = E_{R'} ⊗ I hoặc E_K = I ⊗ E_{C'}:
+
+loại bỏ nhiều R' hàng: ΔW = −G^{-1} E_{R'}^T (E_{R'} G^{-1} E_{R'}^T)^{-1} W
+loại bỏ nhiều C' cột: ΔW = −W (E_{C'} A^{-1} E_{C'}^T)^{-1} (A^{-1} E_{C'}^T) (12)
+
+Từ đây, rõ ràng là trường hợp đặc biệt loại bỏ một hàng r hoặc cột c duy nhất dưới xấp xỉ Kronecker liên quan đến nghịch đảo ma trận 1×1, và do đó chỉ yêu cầu phép chia vô hướng:
+
+loại bỏ hàng r đơn: Δtheta = −G^{-1} e_r ⊗ theta_r / [G^{-1}]_{rr}, hoặc cột c đơn: Δtheta = −theta_c ⊗ A^{-1} e_c / [A^{-1}]_{cc} (13)
+
+phù hợp với các cập nhật có cấu trúc độc lập trong Wang et al. (2019), cho các bộ lọc tích chập. Do đó, chúng tôi đã mở rộng các cập nhật trọng số có cấu trúc hiện có cho các hàng và cột, và suy ra các quy tắc cập nhật cũng xem xét tương quan giữa các nhóm có cấu trúc (trong trường hợp của chúng tôi là các hàng và cột).
+
+3.5 LỊCH TRÌNH CẮT TỈA NHIỀU LẦN
+
+Để cải thiện tỷ lệ hiệu suất so với độ thưa thớt, chúng tôi đề xuất cắt tỉa theo nhiều lần. Chúng tôi biện minh lý thuyết cho phương pháp nhiều lần này bằng cách lưu ý rằng cảnh quan hàm mất đại lý q dựa vào khai triển Taylor (phương trình (3)) chỉ giữ nguyên cục bộ và do đó trở nên không đáng tin cậy cho các bước nhảy Δtheta lớn hơn trong không gian tham số. Chúng tôi giảm thiểu điều này bằng cách cắt tỉa theo nhiều T > 1 lần, t trong [1, 2, . . . , T], mỗi lần dẫn đến cập nhật trọng số Δtheta nhỏ hơn sau đó độ cong của bề mặt hàm mất có thể được ước lượng lại. Khi cắt tỉa đến kích thước mục tiêu alpha, tức là loại bỏ 1−alpha của tổng trọng số, chúng tôi chọn lịch trình alpha_t bắt đầu từ alpha_0 = 1 và kết thúc với alpha_T = alpha, sao cho sau T lần, chính xác phần alpha của tổng trọng số còn lại. Theo kinh nghiệm, chúng tôi thấy rằng lịch trình tuyến tính cho alpha_t, như được công thức hóa trong phần 4, cải thiện đơn điệu hiệu suất cắt tỉa với nhiều lần hơn, và các mức độ thưa thớt cao hơn thường yêu cầu nhiều lần hơn (xem phụ lục F.1). Cắt tỉa nhiều lần cho phép một người chi tiêu (tuyến tính theo T) nhiều tính toán hơn để cải thiện hiệu suất nén cuối cùng.
+
+3.6 HIỆU CHỈNH BẬC NHẤT HẠNG THẤP XEN KẼ
+
+Chúng tôi đề xuất các hiệu chỉnh bậc nhất hạng thấp xen kẽ tùy chọn để cải thiện thêm hiệu suất nén. Cho đến nay, chúng tôi giả định các tham số ở trong tối ưu cục bộ khi tìm giải pháp dạng đóng cho bài toán ràng buộc bậc hai. Tuy nhiên, trong thực tế, giả định này có thể không đúng vì (i) mạng nơ-ron có thể không được tối ưu hóa đến mức tối thiểu, (ii) một hàm mất khác có thể được sử dụng cho nén so với được sử dụng cho huấn luyện, hoặc (iii) chúng ta cắt tỉa theo nhiều lần (phần 3.5) chắc chắn khiến trọng số lệch khỏi tối ưu. Để giảm thiểu điều này, chúng tôi xem xét các hiệu chỉnh bậc nhất bằng cách xen kẽ các lần cắt tỉa với các thích ứng hạng thấp của trọng số W_l + UV (LoRA, bởi (Hu et al., 2021)), thường được sử dụng trong tinh chỉnh LLM. Chúng tôi luôn hấp thụ các cập nhật sau mỗi lần, sao cho ước lượng hàm mất q tiếp theo gần hơn với tối ưu và các giả định cơ bản có khả năng đúng chặt chẽ hơn. Bằng cách hấp thụ các cập nhật LoRA giữa các lần, tổng các cập nhật hạng thấp có thể có hạng cao hơn các cập nhật riêng lẻ. Nghĩa là, chúng ta có rank(U_1 V_1 + U_2 V_2 + . . . + U_T V_T) >= rank(U_t V_t) cho các cập nhật U_t V_t tại bất kỳ lần t nào, với đẳng thức chỉ xảy ra nếu các cập nhật nằm chính xác trong cùng không gian con điều này không bao giờ xảy ra trong thực tế. Hiểu biết này cũng có thể được sử dụng trong quá trình tinh chỉnh LoRA thông thường và do đó có thể hữu ích bên ngoài bối cảnh nén mô hình để cho phép thích ứng mô hình hạng thấp biểu cảm hơn, với chi phí không đáng kể.
+
+4 KẾT QUẢ
+
+Chúng tôi so sánh hiệu suất nén của LLM Surgeon trên các tác vụ mô hình hóa ngôn ngữ trên họ mô hình OPT (Zhang et al., 2022) và Llama-v2 (Touvron et al., 2023), sử dụng dữ liệu từ tập dữ liệu wikitext-2 (phụ lục B.2). Để nén, chúng tôi sử dụng 128 chuỗi với độ dài chuỗi 2048 token từ tập dữ liệu huấn luyện và đánh giá perplexity kiểm tra (PPL) trên phân tách kiểm tra tiêu chuẩn. Trong các thí nghiệm của chúng tôi, chúng tôi sử dụng lịch trình độ thưa thớt tuyến tính alpha_t = 1 − t(1 − alpha/T) tại mỗi lần s trước khi đạt độ thưa thớt cuối cùng alpha. Chúng tôi sử dụng 40 lần tại độ thưa thớt alpha = 0.5 và báo cáo các tỷ lệ nén trung gian, hiệu quả sử dụng T = 8 lần cho alpha = 0.9, T = 16 cho alpha = 0.8, T = 24 cho alpha = 0.7, và T = 32 cho alpha = 0.6. Chúng tôi so sánh với các đường cơ sở magnitude pruning, L-OBD, SparseGPT và K-OBD. K-OBD và LLM Surgeon sử dụng thủ tục nhiều lần của phần 3.5 sử dụng T = 40 lần cho cắt tỉa có cấu trúc và T = 5 lần cho cắt tỉa bán cấu trúc và không có cấu trúc. Chi tiết thêm được tìm thấy trong phụ lục B.
+
+4.1 NÉN CÓ CẤU TRÚC
+
+Nén có cấu trúc của các hàng và cột cho phép tiết kiệm trực tiếp về bộ nhớ và tính toán thông qua việc giảm thẳng kích thước ma trận trong mô hình. Đối với LLM surgeon, chúng tôi xem xét trong phần 3.4 các cập nhật trọng số với các mức độ tương quan khác nhau: giới hạn ở tương quan trong các hàng và cột, và tương quan cả trong và giữa các hàng và cột. Chúng tôi tiếp tục so sánh với magnitude pruning, chỉ sử dụng độ lớn trọng số, L-OBD, chỉ sử dụng các kích hoạt, và K-OBD, cũng sử dụng độ cong được phân tích Kronecker nhưng giả định độc lập hoàn toàn và do đó chỉ cắt tỉa mà không cập nhật các trọng số còn lại. Chúng tôi báo cáo kết quả trong bảng 1, và quan sát thấy nhiều tương quan hơn dẫn đến hiệu suất tốt hơn, với những cải thiện lớn nhất cho họ mô hình Llama-v2.
+
+Mặc dù nén có cấu trúc 50% không tốt hơn một mô hình nhỏ hơn có kích thước tương tự, LLM Surgeon cho phép chúng tôi giảm kích thước mô hình lên đến 30% với mất mát tối thiểu, mà không huấn luyện một mô hình nhỏ hơn từ đầu hình 1. Trong các thí nghiệm nén có cấu trúc của chúng tôi, phương pháp LLM Surgeon được đề xuất vượt trội hơn tất cả các đường cơ sở và đạt hiệu suất tốt nhất cho mỗi kích thước nén mục tiêu.
+
+4.2 CẬP NHẬT HẠNG THẤP XEN KẼ
+
+Bảng 2: Nén có cấu trúc của OPT-125m trên wikitext-2 sử dụng các cập nhật LoRA xen kẽ
+Kích thước không có với
+Mục tiêu LoRA LoRA
+Đã huấn luyện trước 100% 27.65 23.35
+LLM Surgeon 90% 28.01 24.16
+(của chúng tôi) 80% 28.73 25.25
+G⊗A 70% 31.82 28.86
+full cor. Δ 60% 38.47 31.26
+50% 49.78 36.50
+
+Ngoài ra, chúng tôi đánh giá hiệu suất nén kết hợp với các hiệu chỉnh bậc nhất được đề xuất sử dụng thích ứng hạng thấp xen kẽ được mô tả trong phần 3.6. Chúng tôi thấy rằng LoRA cải thiện hiệu suất nén trong mô hình 125m nhỏ nhất, nhưng không trong các mô hình lớn hơn. Chúng tôi giả thuyết rằng các mô hình lớn hơn dễ bị overfitting trên số lượng batch tương đối ít của dữ liệu wikitext-2 được sử dụng để nén mô hình. Tuy nhiên, chúng tôi kết luận rằng LoRA xen kẽ có thể hữu ích trong các trường hợp, và khuyến nghị trước tiên sử dụng phương pháp được đề xuất mà không có các cập nhật xen kẽ và, nếu có đủ dữ liệu cho nén, tùy chọn sử dụng nó nếu nó cải thiện hiệu suất.
+
+4.3 NÉN BÁN CẤU TRÚC
+
+Đối với cắt tỉa bán cấu trúc 2:4, chúng tôi so sánh LLM Surgeon với magnitude pruning, chỉ sử dụng độ lớn trọng số, L-OBD một lần, chỉ sử dụng các kích hoạt, và K-OBD một lần, cũng sử dụng độ cong được phân tích Kronecker nhưng giả định độc lập hoàn toàn và do đó chỉ cắt tỉa mà không cập nhật các trọng số còn lại cũng như SparseGPT hiện đại nhất gần đây (Frantar & Alistarh, 2023). Chúng tôi báo cáo hiệu suất kiểm tra sau khi nén bán cấu trúc 50% (2:4) trên dữ liệu wikitext-2 trong bảng 3. Chúng tôi thấy theo kinh nghiệm rằng xem xét nhiều tương quan trọng số hơn dẫn đến hiệu suất cuối cùng được cải thiện sau khi nén. LLM Surgeon được đề xuất của chúng tôi cạnh tranh với công trình trước đây vượt trội hơn tất cả các đường cơ sở về perplexity tập kiểm tra (PPL).
+
+Bảng 3: Nén bán cấu trúc 2:4 cho các mô hình ngôn ngữ lớn trên dữ liệu wikitext-2.
+Hiệu suất kiểm tra (PPL)
+Phương pháp F̃= kích thước OPT (125m) OPT (1.3b) OPT (2.7b) OPT (6.7b)
+Đường cơ sở 100% 27.65 14.62 12.47 10.86
+Magnitude I⊗I 50% 342.04 379.57 1106.01 187.29
+L-OBD diag(I⊗A) 50% 87.26 44.92 41.40 27.36
+K-OBD diag(G⊗A) 50% 68.74 27.22 20.23 15.55
+SparseGPT I⊗A 50% 45.51 29.44 14.92 13.01
+LLM Surgeon (của chúng tôi) G⊗A 50% 44.64 25.10 14.64 12.10
+
+4.4 NÉN KHÔNG CÓ CẤU TRÚC
+
+Đối với cắt tỉa không có cấu trúc, chúng tôi lặp lại các thí nghiệm tương tự như trường hợp cắt tỉa có cấu trúc được mô tả trong phần 4.1. Trong bảng 4, chúng tôi báo cáo hiệu suất kiểm tra cuối cùng về perplexity (PPL) trên wikitext-2 sau khi nén LLM với các kích thước khác nhau của họ OPT và Llama-v2. Nhìn chung, chúng tôi thấy rằng các phương pháp với các xấp xỉ chính xác hơn của cảnh quan độ cong và tính đến nhiều tương quan hơn hoạt động tốt hơn. LLM Surgeon được đề xuất vượt trội hơn tất cả các đường cơ sở, đạt hiệu suất kiểm tra cao nhất qua các kích thước mục tiêu.
+
+Bảng 4: Nén không có cấu trúc của các mô hình ngôn ngữ lớn trên dữ liệu wikitext-2.
+Hiệu suất kiểm tra (PPL)
+Phương pháp kích thước OPT (125m) OPT (1.3b) OPT (2.7b) OPT (6.7b) Llama-v2 (7b)
+Đường cơ sở 100% 27.65 14.62 12.47 10.86 5.12
+Magnitude 90% 27.62 14.69 12.60 10.88 5.18
+I⊗I 80% 28.53 15.68 13.18 11.26 5.37
+70% 52.88 140.2 15.22 12.22 6.03
+L-OBD 90% 29.70 16.24 14.44 13.43 6.09
+diag(I⊗A) 80% 32.18 21.92 23.35 39.85 116.2
+một lần 70% 49.08 204.7 274.8 810.4 6549
+K-OBD 90% 27.64 14.62 12.09 36.89 5.13
+G⊗A 80% 27.62 14.37 130220 39928 5.19
+một lần 70% 27.92 220.1 23097 19506 5.60
+60% 29.24 13783 10331 33896 9.20
+50% 34.43 7311 10495 91506 118.6
+SparseGPT 90% 27.93 14.69 12.00 10.86 5.49
+I⊗A 80% 28.18 15.07 12.05 10.86 5.58
+70% 28.93 22.77 12.17 10.89 5.71
+60% 30.20 25.07 12.37 10.98 5.94
+50% 33.17 26.77 12.88 11.92 6.51
+LLM Surgeon (của chúng tôi) 90% 27.69 14.62 12.01 10.86 5.13
+G₁⊗A₁ 80% 27.83 14.66 12.14 10.87 5.20
+full cor. Δ 70% 28.35 14.81 12.25 10.82 5.36
+nhiều lần 60% 28.98 14.91 12.28 10.83 5.66
+50% 30.30 15.47 12.68 10.97 6.08
+
+4.5 CẤU TRÚC THƯA THỚT ĐÃ HỌC
+
+Phương pháp được đề xuất có thể phân bổ động các mức độ thưa thớt qua các lớp thông qua ngưỡng toàn cục được mô tả trong phần 3.3. Trong Hình 4.5, chúng tôi so sánh tổng các mức độ thưa thớt được phân bổ theo độ sâu lớp và theo loại lớp sau khi nén mô hình OPT-125m đã huấn luyện trước. Chúng tôi thấy rằng LLM Surgeon cắt tỉa tương đối nhiều hơn ở lớp đầu tiên và ít hơn ở các lớp giữa. Hơn nữa, chúng tôi quan sát thấy một phần lớn hơn của trọng số được loại bỏ trong các khối fully-connected so với attention, nhưng độ lệch ít hơn so với các phương pháp khác. Phân bổ động cho phép cắt tỉa nhiều nhất ở nơi gây tổn hại ít nhất.
+
+[Hình 4: Các mức độ thưa thớt thu được với cắt tỉa có cấu trúc trên OPT-125m theo độ sâu lớp và loại.]
+
+5 KẾT LUẬN
+
+Trong công trình này, chúng tôi đã giới thiệu thuật toán LLM Surgeon cho nén không có cấu trúc, bán cấu trúc và có cấu trúc của mạng nơ-ron. Công trình xây dựng dựa trên các phương pháp nén mạng nơ-ron cổ điển bắt nguồn từ đầu những năm 1990 nhằm tìm cắt tỉa tối ưu bằng cách mở rộng độ cong của cảnh quan hàm mất. Phương pháp sử dụng các xấp xỉ Fisher hiện đại để mở rộng quy mô cắt tỉa chính xác đến lĩnh vực các mô hình ngôn ngữ lớn (LLM) với hàng tỷ tham số, trong khi vẫn thực tế cả về bộ nhớ và tính toán. Không giống như hầu hết công trình trước đây về nén LLM dựa trên dữ liệu, chúng tôi không chỉ sử dụng độ lớn trọng số và các kích hoạt từ các lần truyền tiến, mà còn sử dụng thông tin gradient từ các lần truyền ngược để liên kết chi phí loại bỏ trọng số với mục tiêu cuối cùng thực sự. Chúng tôi cải thiện công trình trước đây thông qua các xấp xỉ chính xác hơn đối với độ cong cảnh quan hàm mất và xem xét nhiều tương quan trọng số hơn để cập nhật các trọng số còn lại. Tăng số lượng tương quan và sử dụng nhiều lần cho phép chúng tôi đánh đổi tính toán bổ sung để có độ chính xác tốt hơn. Cuối cùng, LLM Surgeon đưa ra kết quả đầu tiên có thể sử dụng thực tế cho cắt tỉa có cấu trúc của LLM và đạt được kết quả hiện đại nhất trong việc cắt tỉa mô hình ngôn ngữ lớn không có cấu trúc và bán cấu trúc.
+
+TÀI LIỆU THAM KHẢO
+
+Saleh Ashkboos, Maximilian L Croci, Marcelo Gennari do Nascimento, Torsten Hoefler, và James Hensman. Slicegpt: Compress large language models by deleting rows and columns. arXiv preprint arXiv:2401.15024, 2024.
+
+Christopher M Bishop và Nasser M Nasrabadi. Pattern recognition and machine learning, tập 4. Springer, 2006.
+
+Aleksandar Botev, Hippolyt Ritter, và David Barber. Practical gauss-newton optimisation for deep learning. Trong International Conference on Machine Learning, pp. 557-565. PMLR, 2017.
+
+Runa Eschenhagen, Alexander Immer, Richard Turner, Frank Schneider, và Philipp Hennig. Kronecker-factored approximate curvature for modern neural network architectures. Advances in Neural Information Processing Systems, 36, 2024.
+
+Elias Frantar và Dan Alistarh. Optimal brain compression: A framework for accurate post-training quantization and pruning. Advances in Neural Information Processing Systems, 35:4475-4488, 2022.
+
+Elias Frantar và Dan Alistarh. Sparsegpt: Massive language models can be accurately pruned in one-shot. 2023.
+
+Gene H Golub và Charles F Van Loan. Matrix computations. JHU press, 2013.
+
+Babak Hassibi và David Stork. Second order derivatives for network pruning: Optimal brain surgeon. Advances in neural information processing systems, 5, 1992.
+
+Edward J Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang, và Weizhu Chen. Lora: Low-rank adaptation of large language models. arXiv preprint arXiv:2106.09685, 2021.
+
+Itay Hubara, Yury Nahshan, Yair Hanani, Ron Banner, và Daniel Soudry. Accurate post training quantization with small calibration sets. Trong International Conference on Machine Learning, pp. 4466-4475. PMLR, 2021.
+
+Alexander Immer, Tycho van der Ouderaa, Gunnar Rätsch, Vincent Fortuin, và Mark van der Wilk. Invariance learning in deep neural networks with differentiable laplace approximations. Advances in Neural Information Processing Systems, 35:12449-12463, 2022.
+
+Abdoulaye Koroko, Ani Anciaux-Sedrakian, Ibtihel Ben Gharbia, Valérie Garès, Mounir Haddou, và Quang Huy Tran. Efficient approximations of the fisher matrix in neural networks using kronecker product singular value decomposition. arXiv preprint arXiv:2201.10285, 2022.
+
+Frederik Kunstner, Philipp Hennig, và Lukas Balles. Limitations of the empirical fisher approximation for natural gradient descent. Advances in neural information processing systems, 32, 2019.
+
+Eldar Kurtic, Daniel Campos, Tuan Nguyen, Elias Frantar, Mark Kurtz, Benjamin Fineran, Michael Goin, và Dan Alistarh. The optimal bert surgeon: Scalable and accurate second-order pruning for large language models. arXiv preprint arXiv:2203.07259, 2022.
+
+Yann LeCun, John Denker, và Sara Solla. Optimal brain damage. Advances in neural information processing systems, 2, 1989.
+
+Christos Louizos, Max Welling, và Diederik P Kingma. Learning sparse neural networks through l0 regularization. arXiv preprint arXiv:1712.01312, 2017.
+
+David JC MacKay. Information theory, inference and learning algorithms. Cambridge university press, 2003.
+
+James Martens và Roger Grosse. Optimizing neural networks with kronecker-factored approximate curvature. Trong International conference on machine learning, pp. 2408-2417. PMLR, 2015.
+
+Stephen Merity, Caiming Xiong, James Bradbury, và Richard Socher. Pointer sentinel mixture models. arXiv preprint arXiv:1609.07843, 2016.
+
+Mingjie Sun, Zhuang Liu, Anna Bair, và J Zico Kolter. A simple and effective pruning approach for large language models. arXiv preprint arXiv:2306.11695, 2023.
+
+Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei, Nikolay Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, et al. Llama 2: Open foundation and fine-tuned chat models. arXiv preprint arXiv:2307.09288, 2023.
+
+Tycho van der Ouderaa, Alexander Immer, và Mark van der Wilk. Learning layer-wise equivariances automatically using gradients. Advances in Neural Information Processing Systems, 36, 2023.
+
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Łukasz Kaiser, và Illia Polosukhin. Attention is all you need. Advances in neural information processing systems, 30, 2017.
+
+Chaoqi Wang, Roger Grosse, Sanja Fidler, và Guodong Zhang. Eigendamage: Structured pruning in the kronecker-factored eigenbasis. Trong International conference on machine learning, pp. 6566-6575. PMLR, 2019.
+
+Wikipedia. Wikipedia. PediaPress, 2004.
+
+Thomas Wolf, Lysandre Debut, Victor Sanh, Julien Chaumond, Clement Delangue, Anthony Moi, Pierric Cistac, Tim Rault, Rémi Louf, Morgan Funtowicz, et al. Huggingface's transformers: State-of-the-art natural language processing. arXiv preprint arXiv:1910.03771, 2019.
+
+Susan Zhang, Stephen Roller, Naman Goyal, Mikel Artetxe, Moya Chen, Shuohui Chen, Christopher Dewan, Mona Diab, Xian Li, Xi Victoria Lin, et al. Opt: Open pre-trained transformer language models. arXiv preprint arXiv:2205.01068, 2022.
+
+Aojun Zhou, Yukun Ma, Junnan Zhu, Jianbo Liu, Zhijie Zhang, Kun Yuan, Wenxiu Sun, và Hongsheng Li. Learning n: m fine-grained structured sparse neural networks from scratch. arXiv preprint arXiv:2102.04010, 2021.
+
+A SỬ DỢI CHO CẮT TỈA
+
+Cho rằng chúng tôi sử dụng xấp xỉ Gaussian của hàm mất p ~= q = N thông qua xấp xỉ bậc hai của log khả năng xảy ra −log p ~= 1/2(theta*)^T F theta*, việc nén tối ưu nhất trở thành giải pháp cho bài toán tối ưu hóa có ràng buộc sau:
+
+arg min_{Δtheta*} 1/2 Δ(theta*)^T F Δtheta* (14)
+s.t. e_k^T Δtheta* + e_k^T theta* = 0, for all k in Q
+
+trong đó Q là tập hợp Q chỉ số được cắt tỉa.
+
+A.1 GIẢI PHÁP CHUNG
+
+Theo (Kurtic et al., 2022), chúng tôi ký hiệu các phần tử bị cắt tỉa như E_K = [e_{q1} e_{q2} . . .]^T trong [0,1]^{|Q|×P} và sử dụng thực tế rằng giải phương trình (6) thông qua sử dụng nhân tử Lagrange cho giải pháp dạng đóng chung cho chi phí L và cập nhật trọng số Δtheta:
+
+L = 1/2 (E_K theta*)^T (E_K F^{-1} E_K^T)^{-1} E_K theta* (15)
+Δtheta* = F^{-1} E_K^T (E_K F^{-1} E_K^T)^{-1} E_K theta* (16)
+
+A.2 LOẠI BỎ MỘT PHẦN TỬ DỤNG
+
+Optimal brain surgeon (OBS) Để loại bỏ một phần tử duy nhất với chỉ số q, chúng ta chỉ cần đặt E_K = e_k^T:
+
+L = 1/2 (E_K theta*)^T (E_K F^{-1} E_K^T)^{-1} E_K theta
+= 1/2 theta_k^T 1/[F^{-1}]_{kk} theta_k
+= 1/2 (theta_k)^2 / [F^{-1}]_{kk}, Δtheta = −F^{-1} E_K^T (E_K F^{-1} E_K^T)^{-1} E_K theta
+= −F^{-1} e_k (e_k^T F^{-1} e_k)^{-1} e_K^T theta
+= −theta_k / [F^{-1}]_{kk} F^{-1} e_k (17)
+
+chính xác tương ứng với hàm mất và cập nhật của optimal brain surgeon (Hassibi & Stork, 1992).
+
+Optimal brain damage (OBD) Chúng ta cũng có thể xem xét rằng các phần tử độc lập và Fisher là đường chéo. Sau khi lưu ý rằng điều này ngụ ý rằng các phần tử đường chéo của Fisher nghịch đảo là nghịch đảo vô hướng của các phần tử trong Fisher [F^{-1}]_{kk} = 1/[F]_{kk}, các công thức đơn giản hóa thành:
+
+L = [F]_{kk}(theta_k)^2, Δtheta = −theta_k e_k (18)
+
+chính xác tương ứng với hàm mất và cập nhật của optimal brain damage (LeCun et al., 1989).
+
+VECTOR HÓA
+Cho mục đích triển khai, có thể thuận tiện để có ký hiệu vector hóa L_theta trong R^{RC} hoặc L_W trong R^{R×C} để tính toán tất cả các hàm mất dự kiến song song:
+
+Cho OBD: L_theta = 1/2 theta* ⊙ theta* ⊙ diag(F)
+Cho OBS: L_theta = 1/2 theta* ⊙ theta* ⊘ diag(F^{-1}), L_W = 1/2 W* ⊙ W* ⊙ mat(diag(F))
+L_W = 1/2 W* ⊙ W* ⊘ mat(diag(F^{-1})) (19)
+
+A.3 LOẠI BỎ MỘT HÀNG HOẶC CỘT DUY NHẤT
+
+Structured OBS Nếu chúng ta xem xét xấp xỉ F̃ = G ⊗ A với nghịch đảo đã biết (G ⊗ A)^{-1} = G^{-1} ⊗ A^{-1}, thì để loại bỏ một hàng tại chỉ số r trong [0, R], chúng ta phải tính đến tương quan trong các phần tử của hàng đó. Nghĩa là, chúng ta viết ma trận E_K = (e_r^T ⊗ I) chứa các vectơ hàng one-hot cho tất cả các phần tử trong hàng r. Thay vào giải pháp chung phương trình (7), chúng ta tìm thấy:
+
+L = 1/2 E_K theta*^T (E_K F^{-1} E_K^T)^{-1} E_K theta*
+= 1/2 ((e_r^T ⊗ I)theta*)^T ((e_r^T ⊗ I)(G ⊗ A)^{-1}(e_r^T ⊗ I)^T)^{-1} (e_r^T ⊗ I)theta*
+= 1/2 theta_r^T (e_r^T G^{-1} e_r ⊗ I A^{-1} I)^{-1} theta_r
+= 1/2 theta_r^T (e_r^T ⊗ I) ([G^{-1}]_{rr} ⊗ A^{-1})^{-1} (e_r ⊗ I) theta_r
+= 1/2 theta_r^T A theta_r / [G^{-1}]_{rr} (20)
+
+trong đó chúng ta viết theta_r = e_r^T W* trong R^C cho vectơ hàng thứ r trong W. Tương tự, chúng ta thu được cập nhật trọng số liên quan:
+
+Δtheta = −F^{-1} E_K^T (E_K F^{-1} E_K^T)^{-1} E_K theta*
+= −(G ⊗ A)^{-1} (e_r^T ⊗ I)^T ((e_r^T ⊗ I) (G ⊗ A)^{-1} (e_r^T ⊗ I)^T)^{-1} (e_r^T ⊗ I)theta*
+= −(G^{-1} ⊗ A^{-1}) (e_r ⊗ I) (e_r^T G^{-1} e_r ⊗ A^{-1})^{-1} theta_r
+= −1/[G^{-1}]_{rr} G^{-1} e_r ⊗ A^{-1} I A^{-1} I theta_r
+= −G^{-1} e_r ⊗ theta_r / [G^{-1}]_{rr} (21)
+
+đạt được cập nhật cắt tỉa có cấu trúc tương tự như được suy ra trong (Wang et al., 2019) cho các bộ lọc tích chập. Chúng ta có thể suy ra tương đương hàm mất dự kiến và cập nhật cho các cột, bằng cách xem xét E_K = (I ⊗ e_c^T). Nếu chúng ta làm như vậy, chúng ta tìm thấy các cập nhật có cấu trúc cho một hàng r hoặc cột c:
+
+Loại bỏ hàng r: L = 1/2 theta_r^T A theta_r / [G^{-1}]_{rr}, Δtheta = −G^{-1} e_r ⊗ theta_r / [G^{-1}]_{rr}
+Loại bỏ cột c: L = 1/2 theta_c^T G theta_c / [A^{-1}]_{cc}, Δtheta = −theta_c ⊗ A^{-1} e_c / [A^{-1}]_{cc} (22)
+
+Structured OBD Chúng ta cũng có thể giả định rằng, khi loại bỏ một hàng r, các phần tử riêng lẻ trong hàng cũng độc lập điều này sẽ ngụ ý [A]_{ii} = 1/[A^{-1}]_{ii}. Tương tự, [G]_{ii} = 1/[G^{-1}]_{ii} khi loại bỏ một cột c. Do đó, chúng ta có thể đơn giản hóa thành:
+
+Loại bỏ hàng r: L = 1/2 G_{rr} theta_r^T A theta_r, Δtheta = −e_r theta_r^T
+Loại bỏ cột c: L = 1/2 A_{cc} theta_c^T G theta_c, Δtheta = −theta_c e_c^T (23)
+
+dạng tương tự với các hàm mất và cập nhật structured OBD như được suy ra trong (Wang et al., 2019) cho các bộ lọc tích chập. Các suy dẫn hơi khác ở chỗ chúng tôi bắt đầu từ giải pháp chung phương trình (8), tránh việc cần phải suy ra lại nhân tử Lagrange cho mỗi cấu trúc có thể.
+
+A.4 CẮT TỈA NHIỀU HÀNG VÀ CỘT (CÓ TƯƠNG QUAN)
+
+Hãy xem xét việc loại bỏ R' hàng r_1, r_2, . . . r'_R hoặc C' cột với chỉ số c_1, c_2, . . . , c_{C'}, với 1 < R' < R và 1 < C' < C. Chúng tôi ký hiệu các ma trận chứa các vectơ one-hot chọn tất cả hàng và cột để loại bỏ tương ứng như:
+
+E_{R'} = [e_1 e_2 . . . e_{R'}]^T trong R^{R'×R}, E_{C'} = [e_1 e_2 . . . e_{C'}]^T trong R^{C'×C} (24)
+
+Sau đó, ma trận E_K chứa các vectơ hàng one-hot chọn tất cả các phần tử để loại bỏ có thể được viết như:
+
+Nhiều hàng: E_K = (E_{R'} ⊗ I_C) trong R^{Q×RC}, (với Q = R'C)
+Nhiều cột: E_K = (I_R ⊗ E_{C'}) trong R^{Q×RC}, (với Q = RC') (25)
+
+Để đồng thời loại bỏ hàng và cột, chúng ta có thể xếp chồng các ma trận với các vectơ hàng trùng lặp được loại bỏ:
+
+Nhiều hàng và cột: E_K = [E_{R'} ⊗ I_C; I_R ⊗ E_{C'}] trong R^{Q×RC} với các hàng trùng lặp được loại bỏ (26)
+
+Việc loại bỏ các hàng trùng lặp được yêu cầu do một số phần tử R'C' chồng chéo giữa các hàng và cột, sau đó tổng số hàng trở thành Q = R'C + C'R − R'C'. Chúng tôi sử dụng các ma trận đơn vị có kích thước thích hợp I_R trong R^{R×R} và I_C trong R^{C×C}. Để ngắn gọn, chúng tôi viết vectơ hoặc ma trận của các trọng số bị cắt tỉa theta := E_K theta trong R^Q.
+
+Đầu tiên, chúng tôi suy ra việc loại bỏ cho R' hàng bằng cách định nghĩa ma trận loại bỏ như E_K = E_{R'} ⊗ I và định nghĩa W := E_{R'} W trong R^{R'×C}. Cập nhật trọng số hoàn chỉnh cho việc loại bỏ nhiều hàng trở thành:
+
+Δtheta = −F^{-1} E_K^T (E_K F^{-1} E_K^T)^{-1} E_K theta*
+= −(G ⊗ A)^{-1} (E_{R'} ⊗ I)^T ((E_{R'} ⊗ I)(G ⊗ A)^{-1}(E_{R'} ⊗ I)^T)^{-1} (E_{R'} ⊗ I)theta*
+= −(G^{-1} E_{R'}^T ⊗ A^{-1}) (E_{R'} G^{-1} E_{R'}^T ⊗ A^{-1})^{-1} theta*
+= −(G^{-1} E_{R'}^T ⊗ A^{-1}) ((E_{R'} G^{-1} E_{R'}^T)^{-1} ⊗ A) theta*
+
+ΔW = −G^{-1} E_{R'}^T (E_{R'} G^{-1} E_{R'}^T)^{-1} W A A^{-1}
+= −G^{-1} E_{R'}^T (E_{R'} G^{-1} E_{R'}^T)^{-1} W (27)
+
+Tương tự, chúng tôi suy ra việc loại bỏ C' cột bằng cách định nghĩa ma trận loại bỏ như E_K = I ⊗ E_{C'} và định nghĩa W := E_{C'} W trong R^{R×C'}. Cập nhật trọng số hoàn chỉnh cho việc loại bỏ nhiều cột trở thành:
+
+Δtheta = −F^{-1} E_K^T (E_K F^{-1} E_K^T)^{-1} E_K theta*
+= −(G ⊗ A)^{-1} (I ⊗ E_{C'}))^T ((I ⊗ E_{C'})(G ⊗ A)^{-1}(I ⊗ E_{C'})^T)^{-1} (I ⊗ E_{C'})theta*
+= −(G ⊗ A)^{-1} (I ⊗ E_{C'}))^T ((I ⊗ E_{C'})(G ⊗ A)^{-1}(I ⊗ E_{C'})^T)^{-1} (I ⊗ E_{C'})theta*
+= −(G^{-1} ⊗ A^{-1} E_{C'}^T) (G ⊗ E_{C'} A^{-1} E_{C'}^T)^{-1} theta
+
+ΔW = −G^{-1} G W (E_{C'} A^{-1} E_{C'}^T)^{-1} (A^{-1} E_{C'}^T)
+= −W (E_{C'} A^{-1} E_{C'}^T)^{-1} (A^{-1} E_{C'}^T) (28)
+
+B CHI TIẾT THỰC NGHIỆM
+
+Mã nguồn có sẵn tại: https://github.com/Qualcomm-AI-research/llm-surgeon.
+
+B.1 CÁC MÔ HÌNH
+
+Mô hình OPT Từ họ mô hình OPT ((Zhang et al., 2022)), chúng tôi xem xét các mô hình với số lượng tham số sau: 125 triệu (125m), 1,3 tỷ (1.3b), 2,7 tỷ (2.7b), 6,7 tỷ (6.7b) mô hình. Chúng tôi bỏ qua mô hình 350 triệu do layer norm khác biệt. Chúng tôi có được các checkpoint đã huấn luyện trước tiêu chuẩn bằng Huggingface (Wolf et al., 2019) và sử dụng điều này như đường cơ sở và khởi tạo cho nén.
+
+Mô hình Llama-v2 Từ họ mô hình Llama-v2 ((Touvron et al., 2023)), chúng tôi xem xét một mô hình với 7 tỷ (7b) tham số và một mô hình với 13 tỷ (13b) tham số. Chúng tôi có được các checkpoint đã huấn luyện trước tiêu chuẩn bằng Huggingface (Wolf et al., 2019) và sử dụng điều này như đường cơ sở và khởi tạo cho nén.
+
+B.2 TẬP DỮ LIỆU
+
+Tiếng Anh / Wikitext-2 Phần lớn kết quả được thu được trên tập dữ liệu Wikitext-2 chứa các tập con được phân tích của Wikipedia tiếng Anh (Merity et al., 2016; Wikipedia, 2004), sử dụng các tập huấn luyện và kiểm tra mặc định. Để khớp, chúng tôi sử dụng 128 batch của 2048 ký tự và để kiểm tra chúng tôi sử dụng tập kiểm tra tiêu chuẩn chứa 4358 ký tự.
+
+Tiếng Pháp / Wikipedia Đối với các thí nghiệm dữ liệu tiếng Pháp, chúng tôi sử dụng một tập con của wikipedia tiếng Pháp (Wikipedia, 2004). Để khớp, chúng tôi sử dụng 128 batch của 2048 ký tự và để kiểm tra chúng tôi sử dụng một tập kiểm tra được chọn ngẫu nhiên chứa 1067888 ký tự.
+
+Tiếng Đức / Wikipedia Đối với các thí nghiệm dữ liệu tiếng Ý, chúng tôi sử dụng một tập con của wikipedia tiếng Đức (Wikipedia, 2004). Để khớp, chúng tôi sử dụng 128 batch của 2048 ký tự và để kiểm tra chúng tôi sử dụng một tập kiểm tra được chọn ngẫu nhiên chứa 1112372 ký tự.
+
+Tiếng Ý / Wikipedia Đối với các thí nghiệm dữ liệu tiếng Ý, chúng tôi sử dụng một tập con của wikipedia tiếng Ý (Wikipedia, 2004). Để khớp, chúng tôi sử dụng 128 batch của 2048 ký tự và để kiểm tra chúng tôi sử dụng một tập kiểm tra được chọn ngẫu nhiên chứa 633177 ký tự.
+
+B.3 TƯƠNG ĐƯƠNG MẶT NẠ
+
+Khi so sánh tương đương của các mặt nạ cắt tỉa thu được giữa hai mô hình theta_A và theta_B thu được bởi hai phương pháp nén A và B. Chúng tôi luôn xem xét trường hợp cắt tỉa 50%, và định nghĩa tương đương mặt nạ như phần của cùng trọng số được đặt bằng không trong cả hai mô hình:
+
+tương đương mặt nạ = (Σ_{i=1}^P 1([theta_A]_i = 0 và [theta_B]_i = 0)) / P (29)
+
+trong đó 1 ký hiệu hàm chỉ thị trả về 1 nếu cả hai trọng số [theta_A]_i và [theta_B]_i đều bằng không, và trả về 0 ngược lại.
+
+B.4 SPARSE GPT VÀ ĐÁNH GIÁ CÁC ĐƯỜNG CƠ SỞ
+
+Đối với đường cơ sở SparseGPT, chúng tôi đã sử dụng kho mã SparseGPT chính thức (Frantar & Alistarh, 2023) cho phép huấn luyện và đánh giá trên wikitext-2. Các kết quả thu được có thể khác với những kết quả được báo cáo trong bài báo gốc vì tập dữ liệu C4 được sử dụng ở đó.
+
+Trong công trình này, các mô hình được huấn luyện với cùng 128 batch của tập huấn luyện wikitext-2 như có sẵn trong codebase SparseGPT và được đánh giá trên tập kiểm tra wikitext-2 sử dụng chính xác cùng thủ tục đánh giá.
+
+C CHI TIẾT KỸ THUẬT
+
+C.1 MÃ GIẢ
+
+Thuật toán 2 LLM Surgeon (có cấu trúc)
+Đầu vào: kích thước mục tiêu alpha
+Đầu vào: trọng số ban đầu theta_0
+Cho shot t trong [1, 2, . . . , T]
+    Tính toán: độ cong xấp xỉ G_1, A_1 từ dữ liệu (tùy chọn cũng G_2, A_2) ▷ phần 3.1
+    Tính toán: chi phí mỗi hàng/cột L_r, L_c từ G_1, A_1, (G_2, A_2) ▷ phần 3.2
+    Tính toán: ngưỡng tau sử dụng L_r và L_c cho kích thước mục tiêu alpha ▷ phần 3.3
+    Chọn: hàng và cột để loại bỏ E_R, E_C dựa trên tau ▷ phần 3.3
+    Tính toán: cập nhật trọng số Δtheta_{t-1} dựa trên E_R, E_C và G_1, A_1, (G_2, A_2) ▷ phần 3.4
+    Cập nhật: trọng số còn lại theta_t ← theta_{t-1} + Δtheta_{t-1} ▷ phần 3.5
+    Tùy chọn: theta_t ← cập nhật hạng thấp (theta_t)
+Đầu ra: trọng số nén ˆtheta = theta_T
+
+Thuật toán 3 LLM Surgeon (bán cấu trúc / không có cấu trúc)
+Đầu vào: kích thước mục tiêu alpha
+Đầu vào: trọng số ban đầu theta_0
+Cho shot t trong [1, 2, . . . , T]
+    Tính toán: độ cong xấp xỉ G_1, A_1 từ dữ liệu (tùy chọn cũng G_2, A_2) ▷ phần 3.1
+    Tính toán: chi phí mỗi phần tử L_k từ G_1, A_1, (G_2, A_2) ▷ phần 3.2
+    Tính toán: ngưỡng tau từ L_k và kích thước mục tiêu alpha_t (không có cấu trúc/bán cấu trúc) ▷ phần 3.3
+    Chọn: phần tử để loại bỏ E_K dựa trên tau (không có cấu trúc/bán cấu trúc) ▷ phần 3.3
+    Tính toán: cập nhật trọng số Δtheta_{t-1} dựa trên E_K và G_1, A_1, (G_2, A_2) ▷ phần 3.4
+    Cập nhật: trọng số còn lại theta_t ← theta_{t-1} + Δtheta_{t-1} ▷ phần 3.5
+    Tùy chọn: theta_t ← cập nhật hạng thấp (theta_t)
+Đầu ra: trọng số nén ˆtheta = theta_T
+
+C.2 TẮT DẦN
+
+Trong thực tế, chúng tôi tắt dần các ma trận G và A bằng cách thêm một số hạng đường chéo G + lambda_G I và A + lambda_A I. Trong các thí nghiệm của chúng tôi, chúng tôi thấy rằng các giá trị trong khoảng [0.01, 0.1] nhân với các số hạng đường chéo trung bình thường hoạt động tốt. Chúng tôi tuân theo (Frantar & Alistarh, 2023) và luôn sử dụng lambda_A = 0.01 diag(A) để nhất quán với công trình trước đây và cho phép so sánh công bằng với các đường cơ sở. Hơn nữa, chúng tôi sử dụng lambda_G = 0.1 diag(G) cho các thí nghiệm có cấu trúc và lambda_G = 0.01 diag(G) trong các thí nghiệm bán cấu trúc và không có cấu trúc.
+
+D HIỆU SUẤT TÁC VỤ DOWNSTREAM
+
+Chúng tôi cũng đánh giá phương pháp của chúng tôi trên các tác vụ downstream vì các chỉ số perplexity không nhất thiết tương quan với hiệu suất downstream. Hơn nữa, chúng tôi cũng lặp lại thí nghiệm này sử dụng tập dữ liệu C4 làm dữ liệu tham chiếu cho nén, vì điều này được sử dụng trong công trình trước đây (Frantar & Alistarh, 2023) và vì điều này có thể được coi như một tập dữ liệu tham chiếu tổng quát hơn. Trong bảng 5 và 6, chúng tôi báo cáo hiệu suất kiểm tra 0-shot của cắt tỉa có cấu trúc cho LLM surgeon và đường cơ sở K-OBD.
+
+[Các bảng 5, 6, 7, 8 với dữ liệu hiệu suất chi tiết được giữ nguyên như trong bản gốc]
+
+Chúng tôi thấy rằng phương pháp của chúng tôi không chỉ hoạt động tốt về perplexity kiểm tra mà còn tương quan tốt với hiệu suất downstream, vượt trội hơn các đường cơ sở trên các tác vụ downstream này.
+
+E CÁC THÍ NGHIỆM BỔ SUNG TRÊN LLAMA-V2 13B
+
+Để đánh giá hiệu suất trên các mô hình 13B tham số lớn hơn, chúng tôi cũng báo cáo nén có cấu trúc trên mô hình Llama-v2 13B và đánh giá hiệu suất tác vụ downstream.
+
+[Bảng 7 và 8 với kết quả Llama-v2 13B được giữ nguyên]
+
+Chúng tôi thấy rằng LLM Surgeon cũng vượt trội hơn các đường cơ sở trên các mô hình Llama-v2 13B hiện có. Chúng tôi nhấn mạnh rằng những kết quả này được thu được trên việc cắt tỉa có cấu trúc của các hàng và cột, được coi là cấu trúc cắt tỉa khó khăn và bị ràng buộc nhất. Tuy nhiên, chúng ta có thể nén Llama 13B 20% với mức giảm hiệu suất tác vụ downstream dưới 2%. Nó cũng vượt trội đáng kể so với đường cơ sở cho tất cả tỷ lệ nén, cả về perplexity kiểm tra và hiệu suất tác vụ downstream.
+
+F CÁC ABLATION
+
+F.1 SỐ LẦN
+
+Bảng 9: Ablation của số lần T cho LLM Surgeon có cấu trúc nén mô hình OPT-1.3b.
+
+[Bảng 9 với dữ liệu ablation được giữ nguyên]
+
+F.2 NÉN ĐẶC THÙ CHO TÁC VỤ
+
+Bảng 10: Hiệu suất cross-task và tương đương mặt nạ của mô hình OPT-125m nén có cấu trúc 50% sử dụng LLM Surgeon trên các tập con ngôn ngữ.
+
+[Bảng 10 và phân tích về hiệu suất đa ngôn ngữ được giữ nguyên]
+
+G VỀ SO SÁNH CÔNG BẰNG
+
+Tất cả kết quả trong công trình này (bao gồm SparseGPT) được huấn luyện trên Wikitext-2 để so sánh công bằng. Để làm điều này, chúng tôi đã sử dụng cùng dataloader và script đánh giá như repo SparseGPT chính thức và chạy lại tất cả kết quả SparseGPT để được huấn luyện trên Wikitext-2. Trong một số trường hợp, điều này dẫn đến điểm số tốt hơn cho đường cơ sở SparseGPT so với kết quả được huấn luyện trên C4 được báo cáo trong bài báo SparseGPT gốc. Tuy nhiên, chúng tôi thấy rằng phương pháp của chúng tôi sử dụng các ước lượng độ cong được cải thiện vẫn vượt trội hơn các đường cơ sở về hiệu suất kiểm tra cuối cùng.
+
+H HIỆU SUẤT TÍNH TOÁN
+
+Chúng tôi báo cáo chi phí tính toán về thời gian cắt tỉa trong bảng 11 và bộ nhớ GPU trong bảng 12.
+
+[Bảng 11 và 12 với dữ liệu hiệu suất được giữ nguyên]
+
+Phương pháp của chúng tôi hiệu quả nhất cho cắt tỉa có cấu trúc, nhưng cần lưu ý rằng các nỗ lực kỹ thuật có thể cải thiện thêm tốc độ cho cắt tỉa không có cấu trúc. Trọng tâm của bài báo là cắt tỉa có cấu trúc, mà chúng tôi đạt được tỷ lệ nén hiện đại nhất. Quan trọng là, việc nén LLM chỉ cần xảy ra một lần sau đó một mô hình đã cắt tỉa có thể được triển khai vô số lần mà không có chi phí thêm. Điều này thúc đẩy phương pháp của chúng tôi mất thời gian chạy lâu hơn nhưng đạt hiệu suất kiểm tra cuối cùng tốt hơn.
+
+[Phần tiếp theo với phân tích chi tiết về đánh đổi hiệu suất và tính toán được giữ nguyên]
+
+I MỞ RỘNG ƯỚC LƯỢNG ĐỘ CONG
+
+Thay vì sử dụng một tích Kronecker duy nhất, chúng ta có thể xem xét cải thiện xấp xỉ thông qua tổng của nhiều thừa số Kronecker:
+
+F̃ = F̃ = G_1 ⊗ A_1 + G_2 ⊗ A_2 (30)
+
+Phụ lục cuối cùng này đề cập đến câu hỏi làm thế nào một người có thể tính toán tìm các xấp xỉ như vậy và cách sử dụng chúng trong khung cắt tỉa mạng nơ-ron.
+
+[Phần còn lại của phụ lục I với các công thức toán học chi tiết được giữ nguyên]
+
+J MÃ NGUỒN
+
+Mã nguồn có sẵn tại: https://github.com/Qualcomm-AI-research/llm-surgeon.
