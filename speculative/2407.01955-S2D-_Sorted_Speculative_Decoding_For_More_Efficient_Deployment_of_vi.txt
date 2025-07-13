@@ -1,0 +1,213 @@
+S2D: Giải Mã Suy Đoán Được Sắp Xếp Để Triển Khai Hiệu Quả Hơn Các Mô Hình Ngôn Ngữ Lớn Lồng Nhau
+
+Parsa Kavehzadeh², Mohammadreza Pourreza², Mojtaba Valipour¹
+Tianshu Zhu², Haoli Bai², Ali Ghodsi¹
+Boxing Chen², Mehdi Rezagholizadeh²
+{mojtaba.valipour, ali.ghodsi}@uwaterloo.ca, {mehdi.rezagholizadeh, parsa.kavehzadeh}@huawei.com
+¹: Đại học Waterloo, ²: Phòng thí nghiệm Noah's Ark của Huawei
+
+Tóm tắt
+Triển khai các mô hình ngôn ngữ lớn tự hồi quy (LLM) rất tốn kém, và khi các mô hình này tăng kích thước, chi phí liên quan sẽ trở nên đáng kể hơn. Do đó, các phương pháp khác nhau đã được đề xuất để tăng tốc quá trình tạo token và giảm chi phí. Giải mã suy đoán (SD) là một trong những phương pháp hứa hẹn nhất để tăng tốc quá trình giải mã LLM bằng cách xác minh nhiều token song song và sử dụng một mô hình nháp phụ trợ nhỏ hơn để tạo ra các token có thể. Trong SD, thường một mô hình nháp được sử dụng để phục vụ một mô hình đích cụ thể; tuy nhiên, trong thực tế, các LLM rất đa dạng, và chúng ta có thể cần phải xử lý nhiều mô hình đích hoặc nhiều hơn một mô hình đích đồng thời. Trong kịch bản này, không rõ mô hình nháp nào nên được sử dụng cho mô hình đích nào, và việc tìm kiếm giữa các mô hình nháp khác nhau, hoặc huấn luyện các mô hình nháp tùy chỉnh, có thể làm tăng thêm chi phí triển khai. Trong bài báo này, đầu tiên chúng tôi giới thiệu một kịch bản đa mục tiêu mới cho việc triển khai các mô hình nháp để suy luận nhanh hơn. Sau đó, chúng tôi trình bày một cơ chế giải mã suy đoán được sắp xếp mới hiệu quả hơn và vượt trội hơn các baseline thông thường trong thiết lập đa mục tiêu. Chúng tôi đánh giá phương pháp của mình trên Spec-Bench trong các thiết lập khác nhau bao gồm các mô hình cơ sở như Vicuna 7B, 13B và LLama Chat 70B. Kết quả của chúng tôi cho thấy các mô hình nháp của chúng tôi hoạt động tốt hơn baseline cho nhiều mô hình đích cùng lúc.
+
+1 Giới thiệu
+Các mô hình ngôn ngữ lớn (LLM) đã phát triển rất nhanh và trở nên phổ biến trong các lĩnh vực học thuật và công nghiệp khác nhau (Brown et al., 2020). Khi kích thước của các mô hình này tăng lên (Narayanan et al., 2021), suy luận được tăng tốc đang trở nên phổ biến hơn để giảm chi phí phụ trội của việc triển khai chúng. Có ngày càng nhiều ấn phẩm trong tài liệu nghiên cứu cố gắng đạt được suy luận nhanh hơn (Stern et al., 2018; Chen et al., 2023a; Leviathan et al., 2023a; Chen et al., 2023b). Những phương pháp khác nhau này bao gồm, nhưng không giới hạn ở, giảm các lớp dư thừa (Men et al., 2024), lượng tử hóa, thoát sớm (Varshney et al., 2023), tối ưu hóa KV-caching của transformers (Zhang et al., 2023b), và giải mã suy đoán (Leviathan et al., 2023b; Chen et al., 2023a). Trong bài báo này, chúng tôi tập trung vào giải mã suy đoán (SD) như một trong những giải pháp nổi bật nhất (do tính đơn giản và việc sử dụng rộng rãi) để cải thiện tốc độ giải mã của LLM.
+
+SD là một kỹ thuật dựa trên soạn thảo và xác minh. Vì việc tạo tự hồi quy của LLM là một quá trình tuần tự, SD cố gắng sử dụng một mô hình proxy nhanh hơn để tạo ra một bản nháp ứng viên (với độ dài cố định được xác định trước). Sau đó, các token được tạo ra bởi mô hình nháp sẽ được gửi đến LLM đích trong một lần forward pass để được xác minh. Trong SD thông thường, mô hình nháp là một mô hình ngôn ngữ nhỏ hơn riêng biệt; tuy nhiên, chúng ta có các giải pháp tự suy đoán (Zhang et al., 2023a; Elhoushi et al., 2024; Zhong và Bharadwaj, 2024) trong đó mô hình nháp là một phần của mô hình đích.
+
+Mặc dù SD khá phổ biến trong tài liệu nghiên cứu và chúng ta có nhiều biến thể của nó, nhưng có một vài thắt cổ chai trong SD mà chúng tôi sẽ tập trung vào trong bài báo của mình: 1- "vấn đề tìm kiếm" chúng ta có thể có các mô hình đích với kích thước khác nhau và không rõ làm thế nào để có được mô hình nháp phù hợp cho mỗi mô hình đích. Hơn nữa, các mô hình đích có thể được huấn luyện trên các tác vụ downstream khác nhau, và việc sử dụng một mô hình nháp duy nhất để phục vụ tất cả các tác vụ có thể không mang lại kết quả tốt nhất. Điều này có thể dẫn đến sự không khớp phân phối giữa mô hình đích và mô hình nháp trừ khi cả mô hình đích và mô hình nháp đều được cập nhật. 2- "huấn luyện tối thiểu" Chúng tôi thích không huấn luyện hoặc sửa đổi mô hình đích nhận được từ người dùng. Điều này có nghĩa là hầu hết các giải pháp trong danh mục giải pháp tự suy đoán không nằm trong phạm vi của chúng tôi.
+
+Để giải quyết các vấn đề đã đề cập, chúng tôi đề xuất giải pháp của mình được gọi là giải mã suy đoán được sắp xếp (S2D). Sắp xếp đề cập đến phương pháp huấn luyện được sắp xếp (Valipour et al., 2023) trong đó một mô hình và các mô hình con được chọn của nó có thể được huấn luyện trên một hoặc nhiều tác vụ cùng lúc. Lấy cảm hứng từ huấn luyện được sắp xếp, S2D của chúng tôi huấn luyện nhiều mô hình nháp trong một mô hình để có thể phục vụ nhiều hơn chỉ một mô hình đích tại một thời điểm (mà không cần duy trì nhiều mô hình nháp) để xử lý vấn đề tìm kiếm. Về mặt này, mô hình nháp ban đầu được trích xuất từ mô hình đích và sau khi thiết kế các mô hình con, chúng được huấn luyện cùng nhau. Hơn nữa, trái ngược với các giải pháp tự suy đoán, phương pháp của chúng tôi chỉ được áp dụng cho phía nháp và chúng tôi không cần huấn luyện mô hình đích. Cuối cùng, để sử dụng hiệu quả các mô hình nháp được sắp xếp đã huấn luyện, chúng tôi sử dụng một cơ chế lựa chọn nháp thích ứng.
+
+Những đóng góp của bài báo này được liệt kê như sau: 1- Giới thiệu Mô hình nháp đa mục tiêu: Chúng tôi đi tiên phong trong khái niệm sử dụng một mô hình nháp duy nhất có thể đồng thời phù hợp với nhiều mô hình đích, giảm độ phức tạp và chi phí triển khai. 2- Phát triển Cơ chế giải mã suy đoán được sắp xếp: Cơ chế S2D của chúng tôi tận dụng fine-tuning được sắp xếp, cho phép tạo ra các mô hình con trong một mô hình nháp, mà không cần thiết phải duy trì các mô hình nháp riêng biệt cho mỗi LLM đích. 3- Chiến lược lựa chọn nháp thích ứng: Chúng tôi giới thiệu một cơ chế lựa chọn nháp thích ứng mà tối ưu chọn các mô hình con dựa trên ngưỡng tin cậy. 4- Đánh giá toàn diện trên Spec-Bench: Chúng tôi đã đánh giá nghiêm ngặt phương pháp S2D của mình trên Spec-Bench.
+
+2 Nghiên cứu liên quan
+Để LLM hoạt động hiệu quả hơn, các phương pháp giải mã/lấy mẫu hiệu quả (Leviathan et al., 2023a; Li et al., 2024) là cần thiết. Khi LLM phát triển về độ phức tạp và kích thước, nhu cầu về các kỹ thuật sáng tạo để tăng cường tốc độ và độ chính xác của chúng trở nên cấp bách hơn. Các phương pháp luận khác nhau được thảo luận trong bài tổng quan tài liệu này, bao gồm lấy mẫu song song, giải mã suy đoán và chiến lược thoát sớm, cùng với những đóng góp và tiến bộ của chúng.
+
+Giải mã song song Cơ chế đầu tiên nhằm tăng tốc quá trình suy luận của các mô hình ngôn ngữ lớn được trình bày trong (Stern et al., 2018). Bài báo này giới thiệu một chiến lược giải mã song song theo khối, nhằm tạo ra k token tiếp theo đồng thời trong một forward pass duy nhất bằng cách sử dụng một tập hợp các mô hình phụ trợ. Sau đó họ đề xuất sử dụng cùng một mô hình ngôn ngữ để xác minh các token được tạo ra song song. Cơ chế soạn-thảo-rồi-xác-minh đơn giản này, như đã thảo luận trong bài báo, có thể giảm số lần forward pass từ m xuống m/k+1 (Stern et al., 2018).
+
+Giải mã suy đoán Lấy cảm hứng từ (Sun et al., 2021), (Xia et al., 2022) đề xuất một cơ chế soạn-thảo-rồi-xác-minh để tích cực tạo ra một số lượng token cố định song song mà không cần các token mới phụ thuộc vào những token trước đó, và sau đó xác minh các token được tạo ra trong một forward pass.
+
+Sau đó, họ (Xia et al., 2023) đề xuất một cơ chế attention tiên tiến hơn để tạo ra các token độc lập song song bằng cách sử dụng các truy vấn attention riêng biệt thay vì sử dụng một truy vấn attention chung, hoặc đơn giản là thêm nhiều đầu mô hình ngôn ngữ như đã làm trong quá khứ. Ngoài ra, đối với quá trình xác minh, họ cũng nới lỏng việc giải mã greedy top-1. Thay vào đó, họ đề xuất chấp nhận bất kỳ token nào từ các ứng viên top-beta miễn là khoảng cách điểm số của chúng không quá xa so với token có khả năng nhất (Xia et al., 2023).
+
+Lấy mẫu suy đoán Các phương pháp khác, như (Chen et al., 2023a), (Leviathan et al., 2023a), tổng quát hóa giải mã suy đoán cho thiết lập ngẫu nhiên không greedy. Vì các phương pháp này chỉ là một biến thể của cơ chế soạn-thảo-rồi-xác-minh với một thuật toán lấy mẫu từ chối được sửa đổi để đảm bảo chất lượng lấy mẫu, chúng tôi sẽ để việc tích hợp các phương pháp này với phương pháp đề xuất của chúng tôi cho công việc tương lai.
+
+Giải mã tự suy đoán Các phương pháp khác, như (Zhang et al., 2023a), giới thiệu tự suy đoán, cố gắng loại bỏ các mô hình phụ trợ bằng cách có chọn lọc bỏ qua một số lớp trung gian nhất định trong giai đoạn soạn thảo. Vì chúng ta có thể sử dụng LLM đầy đủ để xác thực các token được tạo ra, mà không cần bất kỳ mô hình bổ sung nào, chúng ta có thể tận hưởng suy luận được tăng tốc. Điều này cũng phù hợp với các phương pháp như (Elhoushi et al., 2024), (Chataoui et al., 2023), (Kavehzadeh et al., 2024), và (Valipour et al., 2023).
+
+Các phương pháp khác Gần đây hơn, các kỹ thuật mới (Liu et al., 2023; Chen et al., 2023b; Li et al., 2024; Cai et al., 2024; Fu et al., 2024; Sun et al., 2023; Miao et al., 2023; Varshney et al., 2023; Ankner et al., 2024; He et al., 2023; Yi et al., 2024) đã xuất hiện cố gắng kết hợp các cơ chế tinh vi để cải thiện thêm lợi ích tăng tốc lấy mẫu suy đoán.
+
+Để đơn giản, bài báo này sẽ tập trung vào thiết lập Giải mã tự suy đoán, nhưng phương pháp của chúng tôi cũng có thể áp dụng cho các phương pháp lấy mẫu suy đoán khác với những điều chỉnh nhỏ, mà không mất tính tổng quát.
+
+Benchmarks Ngoài ra, để đánh giá các thuật toán khác nhau này, một số benchmark (Zheng et al., 2024; Taori et al., 2023; Chen et al., 2021) có thể được sử dụng để đo lường hiệu suất và mức tăng tốc. Tuy nhiên, một trong những benchmark toàn diện nhất là Spec-Bench, được thiết kế đặc biệt để đánh giá các phương pháp giải mã suy đoán (Xia et al., 2024). Spec-Bench bao gồm 6 tác vụ con: dịch thuật, hội thoại đa lượt (MT-Bench), tạo tăng cường bằng truy xuất, lý luận toán học, trả lời câu hỏi và tóm tắt, mỗi tác vụ có 80 trường hợp. Trong bài báo này, chúng tôi sẽ tập trung chủ yếu vào Spec-Bench.
+
+3 Phương pháp luận
+3.1 Nền tảng
+Giải mã suy đoán: Giải mã suy đoán là một quá trình hai bước bao gồm soạn thảo và xác minh. Tại mỗi bước giải mã, một mô hình nháp hiệu quả tạo ra nhiều token tương lai tiềm năng, sau đó được xác minh song song bởi mô hình đích tại thời điểm suy luận. Cụ thể, trong bước soạn thảo, cho một chuỗi đầu vào {x1, . . . , xn} và LLM đích Mt, một mô hình soạn thảo nhanh hơn Md giải mã K token được soạn tiếp theo như một suy đoán về đầu ra của LLM đích (Xia et al., 2024):
+
+p1, . . . , pK = DS(x≤k, Md),
+x̂i ∼ pi, i = 1, . . . , K (1)
+
+trong đó DS(·) đại diện cho chiến lược soạn thảo, p là phân phối xác suất có điều kiện được tính bởi Md, và x̂i là token được lấy mẫu từ phân phối xác suất pi của mô hình nháp. Các token được tạo ra bởi mô hình nháp sau đó được xác minh bởi LLM đích Mt. Cho chuỗi đầu vào {x1, . . . , xn} và các token được soạn {x̂1, . . . , x̂K}, mô hình Mt được sử dụng để đo K+1 phân phối xác suất đồng thời như sau:
+
+qi = Mt(x|x≤t, x<i), i = 1, . . . , K + 1 (2)
+
+Mỗi token được soạn x̂i sau đó được xác minh bằng một tiêu chí xác minh cụ thể sử dụng x̂i, qi và pi. Chỉ những token đáp ứng tiêu chí này mới được chọn làm đầu ra cuối cùng.
+
+Thuật toán 1 Giải mã suy đoán được sắp xếp
+Yêu cầu: Các lớp nháp được sắp xếp L, Mô hình đích f(θN), Ngữ cảnh đầu vào C, Ngưỡng nháp T, Hàm xác minh ứng viên nháp VerifyTokens
+Đảm bảo: Chuỗi được tạo S
+1: function GENERATE CANDIDATES(S)
+2: candidates ← []
+3: while not end of draft generation do
+4: // Tạo thích ứng ứng viên nháp
+5: for n, threshold in zip(L, T) do
+6: pS ← f(S; θn)
+7: // Lấy mẫu từ phân phối mô hình con nháp
+8: x, c ∼ pS
+9: if threshold ≤ c then
+10: append(x, c) to candidates
+11: break // Thoát từ nháp trung gian
+12: end if
+13: end for
+14: end while
+15: return candidates
+16: end function
+17: Initialize S ← C
+18: while not end of sequence do // Khởi tạo tạo
+19: // Tạo nháp
+20: Cands ← GENERATE CANDIDATES(S)
+21: // Xác minh token nháp
+22: Matches ← VerifyTokens(f(θN), S, Cands)
+23: append Matches to S
+24: end while
+25: return S
+
+Fine-tuning được sắp xếp: Fine-tuning được sắp xếp (Valipour et al., 2023; Kavehzadeh et al., 2024) là một phương pháp được đề xuất gần đây để huấn luyện các mô hình nhiều-trong-một bằng cách hình thành các mô hình con từ một mô hình lớn hơn. Trong trường hợp LLM, các mô hình con là các lớp con của LLM hiện có. Đầu ra của mỗi mô hình con được dự đoán bằng cách sử dụng đầu dự đoán đầu ra chung từ lớp cuối cùng (đầu LLM gốc). Để huấn luyện mạng, chúng ta định nghĩa loss là tổng của các loss của tất cả các mô hình con:
+
+L = ∑n in B Ln(x; θn) / |B| (3)
+
+trong đó Ln(x; θn) là loss cho mô hình con thứ n cho batch đầu vào x và B biểu thị số lượng mô hình con.
+
+3.2 Tại sao nháp được sắp xếp thay vì đích được sắp xếp?
+Trong bài báo này, chúng tôi giới thiệu một phương pháp bao gồm Fine-tuning được sắp xếp (SoFT) của một mô hình nháp và sử dụng các mô hình con cho giải mã suy đoán được sắp xếp để tăng tốc độ suy luận của nhiều mô hình đích. Một phương pháp thay thế là sử dụng SoFT để huấn luyện mô hình đích, thay vì mô hình nháp, tương tự như phương pháp được đề xuất trong (Kavehzadeh et al., 2024). Để đánh giá hai phương pháp này, chúng tôi fine-tune Llama2 13B (Touvron et al., 2023) trên tập dữ liệu GSM8K sử dụng cả supervised fine-tuning (SFT) tiêu chuẩn và Sorted fine-tuning (SoFT) như được mô tả trong (Kavehzadeh et al., 2024). Kết quả được cung cấp trong Bảng 1, nơi chúng tôi so sánh giải mã suy đoán được sắp xếp với huấn luyện mô hình nháp được sắp xếp với giải mã suy đoán tự được sắp xếp.
+
+Theo Bảng 1, phương pháp huấn luyện mô hình đích được sắp xếp có ba nhược điểm đáng kể. Thứ nhất, nó giảm độ chính xác 16% trong hiệu suất tác vụ cuối cùng và cung cấp cải thiện tốc độ thấp hơn vì các mô hình con được sử dụng lớn hơn so với những mô hình trong huấn luyện mô hình nháp được sắp xếp. Thứ hai, phương pháp này không phù hợp cho các kịch bản với nhiều mô hình đích vì nó yêu cầu mỗi mô hình đích trải qua huấn luyện SoFT để giải mã suy đoán tự có thể áp dụng. Cuối cùng, huấn luyện SoFT của mô hình đích phát sinh chi phí cao hơn đáng kể so với phương pháp huấn luyện SoFT một mô hình nháp nhỏ hơn của chúng tôi.
+
+GSM8K
+Mô hình Giải mã tự hồi quy
+Tăng tốc Độ chính xác
+SFT (Llama2 13B) 1× 48.97
+Mô hình Giải mã suy đoán tự được sắp xếp (Đích được sắp xếp)
+Tăng tốc Độ chính xác
+Lớp 12:40 (SoFT) 1.21× 33.51
+Mô hình nháp Giải mã suy đoán được sắp xếp (Nháp được sắp xếp)
+Tăng tốc Độ chính xác
+Lớp 6:12 (SoFT 6,9,12 13B) 1.53× 48.97
+
+Bảng 1: So sánh hiệu suất giữa giải mã suy đoán tự được sắp xếp (đích được sắp xếp) và lấy mẫu suy đoán thích ứng (nháp được sắp xếp) được đề xuất trong bài báo này trên tập dữ liệu GSM8K.
+
+3.3 Giải mã suy đoán được sắp xếp
+Trong phần này, chúng tôi giới thiệu phương pháp của mình sử dụng nhiều mô hình nháp trong cùng một kiến trúc theo cách thích ứng để giải quyết vấn đề tăng tốc suy luận đa mục tiêu. Để đạt được mục tiêu này, đầu tiên chúng tôi giới thiệu một kiến trúc nháp được sắp xếp mới có thể kết hợp nhiều mô hình con nháp trong cùng một kiến trúc. Sau đó chúng tôi giải thích thuật toán tạo nháp thích ứng mà chúng tôi thiết kế để sử dụng các mô hình con nháp một cách hiệu quả trong mô hình giải mã suy đoán.
+
+Huấn luyện Nháp SoFT Giả sử chúng ta có một mô hình ngôn ngữ lớn được huấn luyện trước f(x; θN) với các tham số θ, đầu vào x và N số lượng lớp. Cũng coi f(θn) là mô hình con với các tham số của n lớp đầu tiên của LLM (n ≤ N). Để đạt được kiến trúc nháp của chúng tôi, đầu tiên chúng tôi trích xuất một mô hình con với f(θNd), trong đó Nd < N. Sau đó chúng tôi cũng xác định ba mô hình con khác nhau trong kiến trúc nháp được trích xuất là f(x; θNds), f(x; θNdm) và f(x; θNd), trong đó Nds < Ndm < Nd. Chúng tôi sử dụng phương pháp fine-tuning được sắp xếp (Kavehzadeh et al., 2024) để fine-tune toàn bộ nháp trên tập dữ liệu downstream để đạt được ba mô hình nháp với kích thước khác nhau trong cùng một kiến trúc. Trong bài báo này, chúng tôi sử dụng Vicuna 7B như là mô hình ngôn ngữ được huấn luyện trước với 32 lớp. Để định nghĩa các mô hình con nháp của chúng tôi, chúng tôi đặt Nds thành 6, Ndm thành 9, và Nd thành 12 trong các thí nghiệm của chúng tôi. Hình 1 (Trái) hiển thị hai phương pháp SFT và SoFT để huấn luyện một mô hình nháp được trích xuất từ Vicuna 7B đích.
+
+Tạo nháp Để tận dụng tối đa thuật toán giải mã suy đoán, chúng ta cần có cả các mô hình nháp độ trễ thấp và tỷ lệ chấp nhận cao so với mô hình đích. Để tạo ra mỗi token, chúng tôi sử dụng một phương pháp thoát sớm dựa trên độ tin cậy trong kiến trúc f(x; θNd). Giả sử các lớp mô hình con nháp LD = {Nds, Ndm, Nd}, chúng ta có tập hợp các ngưỡng tin cậy TD = {τds, τdm, τd}. Để tạo ra một token nháp cho chuỗi đầu vào S, chúng ta bắt đầu lặp qua các mô hình con nháp, bắt đầu từ Nds. Đối với mỗi mô hình con Ni trong LD, chúng ta có:
+
+t, c ∼ f(S; θNi) (4)
+
+Trong đó t và c là token nháp và độ tin cậy của nó được lấy mẫu từ mô hình con nháp Ni. Chúng ta chấp nhận token t như là token nháp cuối cùng nếu c ≥ τi. Thuật toán 1 giải thích cơ chế tạo nháp của thuật toán S2D chi tiết hơn. Hình 1 (Phải) cũng hiển thị cách tạo nháp hoạt động trong thuật toán S2D.
+
+4 Thí nghiệm
+4.1 Thiết lập thí nghiệm
+Chúng tôi chọn 12 lớp đầu tiên của checkpoint Vicuna 7b để xây dựng kiến trúc của mô hình nháp. Sau đó, chúng tôi huấn luyện mô hình nháp trong cả mô hình SFT và SoFT trên tập dữ liệu ShareGPT trong 3 epoch. Chúng tôi sử dụng Spec-bench (Xia et al., 2024), một benchmark cho các phương pháp dựa trên giải mã suy đoán, để đánh giá các mô hình nháp và thuật toán S2D của chúng tôi. Chi tiết thêm về thiết lập thí nghiệm và siêu tham số có thể được tìm thấy trong Phụ lục 7.1.
+
+4.2 Baseline
+Chúng tôi phân loại các baseline dựa trên sự phụ thuộc của quy trình huấn luyện nháp vào các mô hình đích:
+
+Baseline phụ thuộc mục tiêu
+• Eagle (Li et al., 2024): Một phương pháp đề xuất một mô hình nháp một lớp được huấn luyện với hai loss căn chỉnh đặc trưng và cross-entropy dựa trên đầu ra mục tiêu.
+• Medusa (Cai et al., 2024): Một phương pháp để tạo ra nhiều ứng viên nháp cho các token tương lai bằng cách huấn luyện nhiều đầu mô hình ngôn ngữ cho mỗi vị trí token tương lai.
+• Hydra (Ankner et al., 2024): Một mô hình nháp dựa trên kiến trúc mạng nơ-ron hồi quy trên đỉnh mô hình đích, tạo ra nhiều ứng viên nháp.
+
+Baseline độc lập mục tiêu Chúng tôi có các kịch bản khác nhau cho việc tạo nháp của chúng tôi như baseline:
+• SFT Checkpoint + Giải mã suy đoán: Chúng tôi sử dụng checkpoint SFT của 12 lớp đầu tiên Vicuna 7b làm mô hình nháp trong thuật toán lấy mẫu suy đoán.
+• Mô hình con nhỏ của SoFT Checkpoint (6 lớp) + Giải mã suy đoán: Chúng tôi sử dụng mô hình con nhỏ nhất (Lớp 6) của checkpoint SoFT của 12 lớp đầu tiên Vicuna 7b làm mô hình nháp trong thuật toán giải mã suy đoán.
+• Mô hình con trung bình của SoFT Checkpoint (9 lớp) + Giải mã suy đoán: Chúng tôi sử dụng mô hình con trung bình (Lớp 9) của checkpoint SoFT của 12 lớp đầu tiên Vicuna 7b làm mô hình nháp trong thuật toán giải mã suy đoán.
+• SoFT Checkpoint đầy đủ (12 lớp) + Giải mã suy đoán: Chúng tôi sử dụng checkpoint SoFT đầy đủ của 12 lớp đầu tiên Vicuna 7b làm mô hình nháp trong thuật toán giải mã suy đoán.
+• SoFT Checkpoint đầy đủ (12 lớp) + S2D: Chúng tôi sử dụng checkpoint SoFT đầy đủ của 12 lớp đầu tiên Vicuna 7b làm mô hình nháp trong thuật toán S2D. Chúng tôi đặt ngưỡng của các mô hình con trung gian từ các nghiên cứu loại bỏ trong phần 4.4.1.
+
+4.3 Kết quả
+Trong phần này, chúng tôi sẽ thảo luận về kết quả của các thí nghiệm chúng tôi đã tiến hành để đánh giá mô hình nháp SoFT và phương pháp S2D so với các baseline khác.
+
+Nháp đa mục tiêu: Bảng 2 hiển thị tỷ lệ tăng tốc (so với suy luận tự hồi quy thường của mô hình đích) và độ dài token được chấp nhận trung bình của các baseline khác nhau trên tập dữ liệu MT-Bench trong Spec-Bench. Fine-tuning một mạng được trích xuất từ Vicuna 7b, có thể dẫn đến tăng tốc trong nhiều mục tiêu với kích thước khác nhau mà không cần huấn luyện trước. Phương pháp S2D của chúng tôi vượt trội hoặc duy trì hiệu suất của giải mã suy đoán bình thường gần như trong tất cả các kích thước mục tiêu. Trong các mục tiêu nhỏ hơn như Vicuna 7b nơi độ trễ của nháp chủ yếu quan trọng, S2D có thể điều chỉnh quy trình tạo nháp để ít chậm hơn bằng cách chọn các lớp trung gian có khả năng hơn. Trong khi ở các mục tiêu lớn hơn như LLaMA Chat 70b, nó cho thấy rằng năng lực (độ dài token được chấp nhận trung bình) quan trọng hơn độ trễ nháp vì các nháp 12 lớp đạt được tăng tốc cao hơn so với lớp 6 của checkpoint nháp SoFT. Ngay cả trong kịch bản này S2D có thể duy trì hiệu suất tối ưu bằng cách điều chỉnh các lớp thoát tương ứng.
+
+S2D so với baseline (suy đoán): Bảng 2 và Hình 2 mô tả hiệu suất S2D so với SD bình thường với các tùy chọn nháp khác nhau trên nhiều mục tiêu và tác vụ. Lấy Vicuna 7b và 13b làm mô hình đích, S2D vượt trội đáng kể SD với các mô hình nháp SFT và SoFT đầy đủ (12 lớp). S2D cũng có tăng tốc cao hơn so với SD với kích thước trung bình (Lớp 9) của mô hình SoFT trong nhiều tác vụ như MT-Bench và GSM8K. SD với mô hình con nhỏ nhất (Lớp 6) của mô hình SoFT vượt trội S2D trong hầu hết các tác vụ do thực tế là mô hình con nhỏ nhất của kiến trúc nháp của chúng tôi có độ trễ 1/2 so với kiến trúc đầy đủ, điều này đóng vai trò quan trọng trong tăng tốc tổng thể trong thuật toán giải mã suy đoán.
+
+Tuy nhiên, khi nói đến các kích thước mục tiêu lớn hơn như LLaMA Chat 70b, S2D gần như duy trì tăng tốc của SD với kiến trúc mô hình SFT và SoFT đầy đủ. Trong khi sử dụng SD với các mô hình con nháp SoFT trung gian, đặc biệt là mô hình nhỏ nhất (Lớp 6), sẽ gây ra sự giảm đáng kể về tăng tốc so với các tùy chọn nháp khác, cho thấy tầm quan trọng của năng lực mô hình nháp và các yếu tố độ dài Token được chấp nhận trung bình khi nói đến tăng tốc suy luận mục tiêu lớn.
+
+Nhìn chung, tùy thuộc vào sự cần thiết của độ trễ nháp thấp hơn hoặc tỷ lệ token được chấp nhận cao hơn, hiệu suất S2D chứng minh rằng phương pháp đề xuất của chúng tôi có thể chọn các mô hình con tương ứng để có tăng tốc tối ưu so với các tùy chọn nháp khác trong kiến trúc. Chi tiết thêm về hiệu suất baseline trên Spec-Bench có thể được tìm thấy trong Phụ lục 7.2.
+
+4.4 Nghiên cứu loại bỏ
+4.4.1 Ngưỡng
+Để tìm ngưỡng tin cậy tối ưu cho các mô hình con nháp SoFT trong thuật toán S2D, chúng tôi đánh giá các bộ ngưỡng khác nhau để xem hiệu suất của thuật toán trong mỗi kịch bản. Hình 3 hiển thị so sánh hiệu suất của các ngưỡng tin cậy khác nhau. Trong khi ở các mô hình mục tiêu nhỏ hơn, có xu hướng chọn các mô hình con nháp nhỏ hơn bằng cách giảm ngưỡng tin cậy tương ứng của chúng để tăng tốc độ, ở mô hình mục tiêu lớn nhất có nhu cầu về năng lực mô hình nháp cao hơn do đó ngưỡng tin cậy cao hơn dẫn đến tăng tốc tối ưu. Chúng tôi cố định ngưỡng tốt nhất của mỗi mô hình mục tiêu trong tất cả các thí nghiệm khác được tiến hành với thuật toán S2D trong bài báo này.
+
+4.4.2 Tác động của Cây attention
+Không giống như các phương pháp giải mã suy đoán và giải mã suy đoán được sắp xếp, các phương pháp gần đây như EAGLE (Li et al., 2024), Medusa (Cai et al., 2024), và Hydra (Ankner et al., 2024) sử dụng attention cây để đồng thời xác minh nhiều token ứng viên. Việc bổ sung này làm phức tạp so sánh trực tiếp với các phương pháp khác. Do đó, chúng tôi cũng đánh giá các phương pháp này mà không có attention cây và cung cấp kết quả trong Bảng 2. Như mong đợi, tỷ lệ tăng tốc giảm đáng kể cho tất cả. Thú vị là, khi attention cây được loại bỏ, hiệu suất của Medusa thậm chí còn giảm xuống dưới mức của giải mã suy đoán, cụ thể là sử dụng lớp 6 của các mô hình con được huấn luyện SoFT.
+
+4.4.3 Tác động của Căn chỉnh đặc trưng
+Sử dụng biểu diễn trạng thái ẩn lớp cuối cùng của mô hình đích để huấn luyện mô hình nháp đã trở thành một phương pháp phổ biến trong các công trình gần đây (Cai et al., 2024; Ankner et al., 2024). Cụ thể hơn, EAGLE (Li et al., 2024) sử dụng cả đặc trưng và token được tạo ra bởi mô hình đích để huấn luyện một nháp một lớp. Giả sử ti và fi là token và đặc trưng trạng thái ẩn được tạo ra bởi LLM đích và t̂i và f̂i là token và đặc trưng trạng thái ẩn được tạo ra bởi nháp tại vị trí i, Eagle căn chỉnh các đặc trưng trạng thái ẩn của nháp và đích bằng cách sử dụng loss hồi quy L1:
+
+Lreg = SmoothL1(fi+1, Draft_Model(t2:i+1, f1:i)).
+
+Họ cũng sử dụng loss phân loại để tối ưu hóa trực tiếp hướng tới việc căn chỉnh các token:
+
+pi+2 = Softmax(LM_Head(fi+1)),
+p̂i+2 = Softmax(LM_Head(f̂i+1)),
+Lcls = CrossEntropy(pi+2, p̂i+2).
+
+Bằng cách tích hợp căn chỉnh đặc trưng (loss hồi quy) và căn chỉnh token (loss phân loại), đầu tự hồi quy của EAGLE được huấn luyện bằng hàm loss kết hợp: L = wregLreg + wclsLcls.
+
+Chúng tôi tiến hành các thí nghiệm nghiên cứu tác động mà mỗi căn chỉnh đặc trưng và token gây ra bằng cách đặt các kết hợp khác nhau của wreg và wcls (Bảng 3). Chúng tôi huấn luyện mô hình nháp eagle dựa trên mô hình đích LLaMA2 13b được fine-tune trên dữ liệu huấn luyện GSM8K. Chúng tôi phát hiện ra rằng việc hủy loss căn chỉnh token (wcls = 0) sẽ không có tác động đáng kể đến hiệu suất nháp so với thiết lập gốc được sử dụng trong bài báo Eagle (wreg = 1 và wcls = 0.1). Mặt khác, đặt wreg thành 0 sẽ gây ra tác động đáng chú ý đến hiệu suất nháp, giảm tăng tốc từ 2.73x xuống 1.61x. Như chúng ta có thể thấy, căn chỉnh đặc trưng đóng vai trò chính trong việc cải thiện hiệu suất nháp Eagle trong khi điều này không thực tế trong thiết lập đa mục tiêu nơi mô hình nháp cần phục vụ nhiều mô hình đích bất cứ lúc nào.
+
+4.4.4 Tác động của Huấn luyện trước
+Sử dụng các mô hình nháp huấn luyện trước có thể là một hướng có thể để tăng tỷ lệ chấp nhận của các token nháp trong thuật toán giải mã suy đoán. Theo cách này, chúng tôi lặp lại các thí nghiệm của mình trong một thiết lập mới nơi chúng tôi thay thế 12 lớp đầu tiên của Vicuna 7b bằng Vicuna 160m, là một checkpoint LLaMA 160m fine-tuned trên tập dữ liệu ShareGPT. LLaMA 160m là một kiến trúc 12 lớp decoder nhỏ được huấn luyện trước trên corpus C4. Chúng tôi cũng sorted fine-tuned Vicuna 160m trên ShareGPT với các mô hình con tương tự (Lớp 6, 9 và 12). Bảng 4 hiển thị lợi ích của việc sử dụng S2D thay vì SD thông thường cho các mô hình mục tiêu nhỏ hơn (Vicuna 7b và 13b). Dựa trên kết quả trong Bảng 2, fine-tuning một mô hình nháp 12 lớp được trích xuất có thể dẫn đến tăng tốc cao hơn so với việc sử dụng một kiến trúc được huấn luyện trước tương tự, điều này có thể chứng minh hiệu quả của phương pháp chúng tôi về mặt tài nguyên huấn luyện.
+
+Mô hình / Chỉ số Tự hồi quy EAGLE
+w_cls=0.1, w_reg=1.0 w_cls=0.0, w_reg=1.0 w_cls=1.0, w_reg=0.0
+GSM8K EM 48.90 48.67 48.90 48.82
+GSM8K Tỷ lệ tăng tốc 1.00x 2.73x 2.70x 1.61x
+
+Bảng 3: So sánh exact match (EM) GSM8K và tỷ lệ tăng tốc cho các cấu hình giải mã khác nhau. Với mô hình đích Llama2 13B và mô hình nháp Eagle 1 lớp.
+
+Phương pháp Greedy (T = 0)
+Vicuna 7B Vicuna 13B LLaMA Chat 70B
+Tăng tốc MAT Tăng tốc MAT Tăng tốc MAT
+Vicuna 160m + SD 1.05× 2.75 1.13× 2.66 1.93× 2.24
+SoFT L6 + SD 1.20× 2.10 1.26× 2.06 1.68× 1.76
+SoFT L9 + SD 1.10× 2.33 1.21× 2.29 1.79× 1.96
+SoFT L12 + SD 1.00× 2.67 1.07× 2.58 1.90× 2.19
+SoFT + S2D 1.17× 2.54 1.28× 2.44 1.91× 2.16
+
+Bảng 4: Tăng tốc tổng thể và Độ dài Token được chấp nhận trung bình (MAT) trên tập dữ liệu MT-Bench. Huấn luyện SoFT trong thí nghiệm này được khởi tạo với checkpoint Vicuna 160m.
+
+4.4.5 Huấn luyện mô hình đích
+Các mô hình nền tảng như GPT-4, Gemini (Team et al., 2023), và gia đình Claude (Anthropic, 2024) được huấn luyện trên các tập dữ liệu lớn, cho phép chúng hoạt động tốt trên nhiều tác vụ khác nhau. Tuy nhiên, đối với các tác vụ chuyên biệt nơi mô hình có sự tiếp xúc hạn chế trong quá trình huấn luyện trước, việc thích ứng miền thông qua fine-tuning dẫn đến hiệu suất vượt trội trong các tác vụ downstream (Liu et al., 2024). Phần này đánh giá tác động của fine-tuning cả mô hình đích và nháp cho các tác vụ cụ thể đối với mức tăng tốc có thể đạt được bằng phương pháp giải mã suy đoán được sắp xếp đề xuất của chúng tôi. Theo cách này, chúng tôi fine-tune một mô hình Llama 13B và cũng sorted fine-tuned mô hình nháp 12 lớp được trích xuất trên GSM8k, một tập dữ liệu lý luận toán học. Kết quả được hiển thị trong Bảng 5 chứng minh rằng fine-tuning cả đích và nháp trên cùng một tập dữ liệu, do việc căn chỉnh được cải thiện của chúng, dẫn đến tăng tốc 1.14× tại thời điểm suy luận.
+
+GSM8K
+Mô hình Giải mã tự hồi quy
+Đích được huấn luyện Tăng tốc Độ chính xác
+Llama2 13B ✓ 1× 48.97
+Llama2 13B ✗ 1× 28.7
+Mô hình nháp Giải mã suy đoán được sắp xếp
+Đích được huấn luyện Tăng tốc Độ chính xác
+S2D - SoFT ✓ 1.53× 48.97
+S2D - SoFT ✗ 1.38× 28.7
+
+Bảng 5: So sánh tăng tốc giữa hai thiết lập khác nhau: 1) huấn luyện mô hình đích trên tác vụ downstream 2) sử dụng mô hình được huấn luyện trước vanilla
+
+5 Kết luận
+Trong bài báo này, chúng tôi trình bày một phương pháp dựa trên huấn luyện SoFT của một mô hình nháp để vượt qua một hạn chế đáng kể của các phương pháp giải mã suy đoán truyền thống, nơi mỗi mô hình đích cần một mô hình nháp được huấn luyện duy nhất. Thông qua thí nghiệm toàn diện, chúng tôi chứng minh rằng bằng cách sử dụng cùng một mô hình nháp được huấn luyện SoFT với các ngưỡng khác nhau cho các mô hình con, chúng tôi đạt được tỷ lệ tăng tốc trung bình 1.55 cho các mô hình đích với tham số từ 7B đến 70B. Hơn nữa, phương pháp của chúng tôi vượt trội hơn giải mã suy đoán vanilla trên tất cả các mô hình đích, làm nổi bật hiệu quả của nó.
+
+6 Hạn chế
+Mặc dù phương pháp đề xuất của chúng tôi phù hợp với một loạt các mô hình đích đa dạng thông qua các mô hình con được huấn luyện SoFT để dự đoán token, nó giới thiệu ngưỡng mô hình con như một siêu tham số mới cần điều chỉnh. Tuy nhiên, yêu cầu này đơn giản hơn đáng kể so với các phương pháp thay thế bao gồm huấn luyện các mô hình nháp riêng biệt cho mỗi mục tiêu. Tuy nhiên, dựa trên các thí nghiệm của chúng tôi, ngưỡng lớn hơn hoạt động tốt hơn với các mô hình đích lớn hơn và ngưỡng nhỏ hơn nên được sử dụng với các mô hình đích nhỏ hơn.
+
+Ngoài ra, bài báo này chủ yếu tập trung vào một thiết lập cụ thể nơi một mô hình nháp được huấn luyện bằng SoFT với ba mô hình con. Tuy nhiên, khám phá một số lượng mô hình con khác nhau từ các lớp khác nhau có thể cung cấp hiểu biết sâu hơn về phương pháp luận của chúng tôi. Chúng tôi xác định các nghiên cứu so sánh này như công việc tương lai tiềm năng.
