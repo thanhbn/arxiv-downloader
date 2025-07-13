@@ -41,7 +41,7 @@ class ArXivCLI:
     """Unified CLI for ArXiv downloader tools."""
     
     def __init__(self):
-        self.script_dir = Path(__file__).parent / "scripts"
+        self.script_dir = Path(__file__).parent
         self.commands = self._discover_commands()
         self.samples = self._load_samples()
     
@@ -74,8 +74,8 @@ class ArXivCLI:
                     'check': 'check_translation_completeness.py',
                     'queue': 'add_to_translation_queue.py',
                     'cleanup': 'cleanup_translations.py',
-                    'stalled': 'process_stalled_translations.py',
-                    'test': 'test_translation.py'
+                    'queue-cleanup': 'clean_translation_queue.py',
+                    'stalled': 'process_stalled_translations.py'
                 },
                 'default': 'translate_manager.py',
                 'help': 'Translate papers using Claude API or OpenAI, with quality checking and queue management'
@@ -126,10 +126,8 @@ class ArXivCLI:
             },
             'workflow': {
                 'description': 'End-to-end workflow examples',
-                'scripts': {
-                    'help': 'workflow_help.py'
-                },
-                'default': 'workflow_help.py',
+                'scripts': {},
+                'default': None,
                 'help': 'Complete business use case workflows from paper discovery to translation'
             }
         }
@@ -228,6 +226,9 @@ class ArXivCLI:
                 'python3 cleanup_translations.py --threshold 0.2 --backup',
                 'python3 cleanup_translations.py --threshold 0.1 --requeue',
                 
+                # Clean translation queue from already translated files
+                'python3 clean_translation_queue.py',
+                
                 # Process stalled translations (uses 0.4 threshold by default)
                 'python3 process_stalled_translations.py',
                 'python3 process_stalled_translations.py --execute',
@@ -236,8 +237,6 @@ class ArXivCLI:
                 'python3 process_stalled_translations.py --score 0.3',
                 'python3 process_stalled_translations.py --execute --score 0.5',
                 
-                # Test translation setup
-                'python3 test_translation.py'
             ],
             'organize': [
                 # Enhanced organization with execution
@@ -285,10 +284,6 @@ class ArXivCLI:
                 'python3 check_status.py',
                 'python3 check_status.py --detailed',
                 
-                # Paper analysis
-                'python3 analyze_papers.py',
-                'python3 analyze_papers.py --collection multimodal',
-                'python3 analyze_papers.py --collection CoT --detailed'
             ],
             'inventory': [
                 # Complete inventory
@@ -341,15 +336,7 @@ class ArXivCLI:
                 
                 # Virtual environment setup
                 'python3 -m venv .venv',
-                'source .venv/bin/activate && pip install -r requirements.txt',
-                
-                # Git hooks setup
-                'pre-commit install',
-                'pre-commit run --all-files',
-                
-                # Configuration validation
-                'python3 validate_config.py',
-                'python3 validate_config.py --fix-issues'
+                'source .venv/bin/activate && pip install -r requirements.txt'
             ],
             'workflow': [
                 # Complete End-to-End Workflow: From Collection Discovery to Translation
@@ -509,8 +496,13 @@ class ArXivCLI:
         
         cmd_info = self.commands[command]
         
+        # Special handling for "cleanup --queue" syntax
+        if subcommand == 'cleanup' and args and '--queue' in args:
+            script = cmd_info['scripts']['queue-cleanup']
+            # Remove --queue from args since the script doesn't need it
+            args = [arg for arg in args if arg != '--queue']
         # Determine which script to use
-        if subcommand and subcommand in cmd_info['scripts']:
+        elif subcommand and subcommand in cmd_info['scripts']:
             script = cmd_info['scripts'][subcommand]
         else:
             script = cmd_info['default']
@@ -627,10 +619,10 @@ class ArXivCLI:
             'scripts/add_to_translation_queue.py': ('translate', 'queue'),
             'cleanup_translations.py': ('translate', 'cleanup'),
             'scripts/cleanup_translations.py': ('translate', 'cleanup'),
+            'clean_translation_queue.py': ('translate', 'queue-cleanup'),
+            'scripts/clean_translation_queue.py': ('translate', 'queue-cleanup'),
             'process_stalled_translations.py': ('translate', 'stalled'),
             'scripts/process_stalled_translations.py': ('translate', 'stalled'),
-            'test_translation.py': ('translate', 'test'),
-            'scripts/test_translation.py': ('translate', 'test'),
             
             # Organize scripts
             'check_and_move_papers_enhanced.py': ('organize', 'enhanced'),
