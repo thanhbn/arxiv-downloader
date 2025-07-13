@@ -1,0 +1,199 @@
+# Học Các Token Của Bạn:
+Tokenization Tập Hợp Từ cho Mô Hình Ngôn Ngữ
+
+Avijit Thawani
+thawani@usc.eduSaurabh Ghanekar
+USCXiaoyuan Zhu
+USCJay Pujara
+USC / ISI
+
+Tóm tắt
+Các mô hình ngôn ngữ thường tokenize văn bản thành các từ con, sử dụng một phương pháp heuristic xác định, được thiết kế thủ công để kết hợp các ký tự thành các chuỗi cấp bề mặt dài hơn như 'ing' hoặc toàn bộ từ. Nghiên cứu gần đây đã liên tục chỉ ra các hạn chế của chiến lược tokenization như vậy, đặc biệt đối với các tài liệu không được viết bằng tiếng Anh và để biểu diễn số. Ở thái cực khác, các mô hình ngôn ngữ cấp byte/ký tự ít bị hạn chế hơn nhiều nhưng gặp phải độ dài mô tả chuỗi tăng lên và sự mở rộng bậc hai tiếp theo trong tính toán self-attention. Các nỗ lực gần đây để nén và giới hạn độ dài ngữ cảnh này bằng các phép tích chập kích thước cố định là hữu ích nhưng hoàn toàn bỏ qua ranh giới từ. Bài báo này xem xét một sơ đồ 'học các token của bạn' thay thế sử dụng ranh giới từ để tập hợp các byte/ký tự thành các biểu diễn từ, được đưa vào mô hình ngôn ngữ chính, trước khi giải mã lại các ký tự/byte riêng lẻ cho mỗi từ song song. Chúng tôi thấy rằng tokenizer end-to-end vừa phải biểu cảm và vừa phải nhanh của chúng tôi vượt trội hơn 300% cả mô hình từ con và byte/ký tự trên metric mô hình ngôn ngữ nội tại của dự đoán từ tiếp theo trên các tập dữ liệu. Nó đặc biệt xuất sắc trên các từ hiếm, vượt trội gấp 30 lần! Chúng tôi nghiên cứu kỹ lưỡng cấu hình mô hình ngôn ngữ cho cả ba loại tokenizer và phân tích lý thuyết về cách các mô hình end-to-end của chúng tôi cũng có thể là sự đánh đổi mạnh mẽ về hiệu quả và tính bền vững. Mã nguồn trên Github.
+
+1 Giới thiệu
+Hầu hết tất cả xử lý ngôn ngữ tự nhiên (NLP) bắt đầu bằng tokenization (Mielke et al., 2021). Các chuỗi ký tự được phân đoạn (chủ yếu là xác định) thành các token rời rạc, mỗi token có một embedding tra cứu trong ma trận từ vựng khổng lồ. Các phương pháp NLP thống kê, tương tự như các hình thức machine learning khác vào thời điểm đó, dựa vào việc trích xuất đặc trưng từ các token này, dưới dạng số lần xuất hiện n-gram hoặc nhãn từ loại hoặc các biểu diễn cú pháp khác. Tất cả các pipeline này theo thời gian đã được thay thế bằng học end-to-end sử dụng mạng nơ-ron hồi quy (RNN) hoặc transformer, tuy nhiên các sơ đồ tokenization vẫn tĩnh, xác định và được thiết kế thủ công.
+
+Các phương pháp tiên tiến bao gồm các sơ đồ tokenization từ con như WordPiece (Wu et al., 2016), Byte Pair Encoding hoặc BPE (Sennrich et al., 2016), và Unigram (Kudo, 2018), tất cả đều là các phương pháp thống kê để tiền xử lý một corpus văn bản lớn không được gán nhãn để tạo ra một từ vựng cố định, ở giữa các ký tự hoặc byte ở một đầu và toàn bộ từ ở đầu kia. Điều này dẫn đến sự đánh đổi thuận tiện về độ dài mô tả chuỗi trong khi tránh token UNK, tức là cơ chế dự phòng để xử lý các từ hiếm. Tuy nhiên, không rõ ràng tại sao các thuật toán được thiết kế thủ công này lại là dạng tokenization tối ưu và liệu có tồn tại khả năng cho các mô hình end-to-end cũng bao gồm giai đoạn quan trọng này của pipeline NLP.
+
+Nghiên cứu gần đây đã chỉ ra vô số hạn chế với các embedding từ con. Một số ngôn ngữ chứa các đặc trưng hình thái đa dạng trong khi phân đoạn từ con chủ yếu chỉ thích hợp để xác định hậu tố và tiền tố (Clark et al., 2022). Các lĩnh vực kỹ thuật như tài liệu y sinh thường cần tiền huấn luyện tokenizer riêng để cải thiện từ vựng (Boecking et al., 2022). Cuối cùng, các số thường được phân đoạn không nhất quán thành các từ con, dẫn đến giảm kỹ năng số học (Wallace et al., 2019) và ước lượng (Thawani et al., 2021b). Mức độ của các hạn chế số này nghiêm trọng đến mức GPT-4 (OpenAI, 2023) có một cách giải quyết rõ ràng là thêm tất cả các số từ 0 đến 999 làm token riêng lẻ vào từ vựng của mô hình.
+
+Gần đây, một số mô hình ngôn ngữ đã được đề xuất loại bỏ hoàn toàn từ vựng tokenizer, bắt đầu với từ vựng cấp ký tự (El Boukkouri et al., 2020) hoặc byte (Xue et al., 2022) và thường nén chúng thành các đơn vị cố định khoảng bốn token mỗi cái (Tay et al., 2021; Yu et al., 2023; Clark et al., 2022). Trong khi các phương pháp không có giả định này hữu ích trong việc nén văn bản và do đó mở rộng cửa sổ ngữ cảnh, chúng hoàn toàn bỏ qua ranh giới từ. Ngoài ra, các mô hình cấp byte được gọi là 'không tokenizer' không hoàn toàn không có thiên vị vì mã hóa Unicode-8 mà chúng sử dụng bản thân nó có thiên vị hướng tới việc biểu diễn các chữ viết Latin bằng một byte mỗi ký tự, trong khi một số chữ viết châu Phi có thể cần bốn byte để biểu diễn một ký tự duy nhất.
+
+Khái niệm từ là một đặc trưng cơ bản của gần như tất cả các ngôn ngữ của con người, bao gồm những ngôn ngữ được viết bằng chữ Trung hoặc Nhật không phân định rõ ràng các từ bằng khoảng trắng. Bài báo này nghiên cứu thực nghiệm trường hợp các tokenizer mất thuật toán phân đoạn từ con nhưng sử dụng ranh giới từ cho mô hình đa cấp với hiệu quả được thêm vào. Cụ thể hơn, chúng tôi sử dụng ranh giới từ để nén các token cơ sở của byte hoặc ký tự thành các biểu diễn từ, sau đó được đưa vào mô hình ngôn ngữ cơ sở (ở đây, một phiên bản nhỏ của GPT (Radford et al., 2018)).
+
+Tokenization học end-to-end của chúng tôi chắc chắn có một số hạn chế. Nó không nhanh hơn từ con. Nó không cho phép ký tự/byte trong một từ trực tiếp chú ý đến những ký tự trong từ khác. Nó dựa vào ranh giới từ, không đơn giản để tìm cho hầu hết các tập dữ liệu quy mô internet. Tuy nhiên, chúng tôi tin rằng nghiên cứu sâu thực nghiệm này về tokenizer cho mô hình ngôn ngữ mang lại các đóng góp sau:
+
+1. Chúng tôi so sánh các chiến lược tokenizer khác nhau cho mô hình ngôn ngữ trên nhiều khía cạnh và trên cơ sở công bằng qua các ngôn ngữ.
+
+2. Chúng tôi là người đầu tiên sử dụng rõ ràng ranh giới từ để nén các token cơ sở của mô hình ngôn ngữ autoregressive.
+
+3. Chúng tôi báo cáo lợi ích hơn 300% trong khả năng mô hình ngôn ngữ trên nhiều ngôn ngữ và tập dữ liệu, so với cả mô hình từ con và ký tự/byte, và gấp 30 lần trên các từ hiếm.
+
+4. Chúng tôi phân tích lý thuyết điểm mạnh và điểm yếu của sơ đồ tokenization nén từ của chúng tôi, mang lại hiểu biết cho cộng đồng mô hình ngôn ngữ.
+
+Chúng tôi sẽ công khai phát hành tất cả mã nguồn (xem tài liệu bổ sung) và checkpoint khi được chấp nhận.
+
+2 Phương pháp
+
+Hình 1 mô tả bằng hình ảnh kiến trúc mô hình ngôn ngữ được đề xuất của chúng tôi. Chiến lược tokenization end-to-end của chúng tôi là một phương pháp tập hợp từ đơn giản sử dụng transformer encoder (Bước 1) để tập hợp các token cơ sở (ký tự hoặc byte) thành một số cố định embedding mỗi từ. Điều này tương tự như cách các embedding CLS thường được sử dụng để tập hợp các embedding của toàn bộ câu hoặc bất kỳ chuỗi văn bản nào trong các transformer encoder giống BERT. Trong trường hợp của chúng tôi, chúng tôi có tương đương với một số cố định token CLS được thêm vào đầu mỗi từ để lưu trữ ý nghĩa của toàn bộ từ.
+
+Tiếp theo, (Bước 2) các embedding tập hợp mỗi từ được chuyển đến mô hình ngôn ngữ chính, trong trường hợp của chúng tôi, một transformer decoder vanilla như GPT (Radford et al., 2018). Cuối cùng, các embedding từ được ngữ cảnh hóa được đưa qua một transformer decoder khác để autoregressive giải mã từ tiếp theo, từng đơn vị cơ sở (ký tự hoặc byte) một lúc. Lưu ý rằng chúng tôi gọi phương pháp này là 'tokenizer' end-to-end vì nó nén nhiều đơn vị thành ít embedding mỗi từ, giống như từ con, ngoại trừ việc nén được học từ đầu. Cuối cùng, ở giai đoạn giải mã (Bước 3), các biểu diễn từ được ngữ cảnh hóa được mở ra với một transformer decoder khác để autoregressive dự đoán từng token cơ sở (ký tự/byte) một lút.
+
+Lưu ý cách chúng tôi đạt được sự đánh đổi được tuyên bố giữa mô hình từ con và byte/ký tự. Các biểu diễn CLS được học không bị ràng buộc bởi ánh xạ xác định như trong từ con. Chúng cũng hiệu quả để tính toán và giải mã, vì bước đầu và cuối chỉ cho phép attention trong từ. Đối với mô hình không tokenizer, khoảng 80% nút thắt bộ nhớ được dành cho các token từ một từ chú ý đến các token ở từ khác, điều mà chúng tôi cho là có tầm quan trọng đáng ngờ so với overhead phát sinh.
+
+Chính thức, chúng tôi bắt đầu với một chuỗi từ w₀, w₁, ..., wₙ mỗi từ bao gồm một tập hợp có thứ tự các đơn vị cơ sở (ký tự/byte) wᵢ = c⁰ᵢ, c¹ᵢ, ..., cᵐⁱᵢ trong đó mᵢ + 1 là độ dài của từ thứ i. Nhiệm vụ là mô hình ngôn ngữ autoregressive, tức là cho các từ đã thấy trước đó w₀, w₁, ..., wᵢ₋₁ cũng như các đơn vị đã thấy trước đó trong wᵢ (từ hiện tại): c⁰ᵢ, c¹ᵢ, ..., cʲ⁻¹ᵢ dự đoán đơn vị tiếp theo cʲᵢ.
+
+Các mô hình cấp ký tự/byte bỏ qua ranh giới từ và mô hình trực tiếp nhiệm vụ như:
+cʲᵢ = Decoder(c⁰₀, ..., cᵐ⁰₀, c⁰₁, ..., c⁰ᵢ, ..., cʲ⁻¹ᵢ)
+
+Phân đoạn từ con ánh xạ các đơn vị cơ sở một cách xác định thành ít từ con hơn mỗi từ, tức là, wᵢ = c⁰ᵢ...cᵐⁱᵢ → s⁰ᵢ...sᵐ'ⁱᵢ trong đó m'ᵢ <= mᵢ, số từ con mà từ thứ i được phân tách thành. Theo quá trình xác định này, mô hình từ con dự đoán từ con tiếp theo như:
+sʲᵢ = Decoder(s⁰₀, ..., sᵐ'⁰₀, s⁰₁, ..., s⁰ᵢ, ..., sʲ⁻¹ᵢ)
+
+Các mô hình end-to-end của chúng tôi thay vào đó theo một quy trình ba bước để (1) tập hợp các đơn vị cơ sở thành một tập cố định embedding mỗi từ, (2) autoregressive dự đoán embedding từ tiếp theo, và (3) autoregressive dự đoán embedding đơn vị riêng lẻ mỗi từ:
+
+CLSᵢ = Encoder(c⁰ᵢ, c¹ᵢ, ..., cᵐⁱᵢ)                    (1)
+CLS'ᵢ = Decoder(CLS₀, CLS₁, ..., CLSᵢ₋₁)            (2)
+cʲᵢ = Decoder(CLS'ᵢ ⊗ c⁰ᵢ, ..., cʲ⁻¹ᵢ)               (3)
+
+Ở đây, Encoder đề cập đến transformer encoder giống BERT và Decoder đề cập đến transformer decoder giống GPT. Từ góc độ triển khai, chúng tôi thêm tiền tố một số cố định (n = 1 hoặc 4 trong bài báo này) token CLS vào mỗi từ trước khi chuyển qua transformer encoder. Các biểu diễn được ngữ cảnh hóa cấp từ thu được ở đầu kia được mô tả chung ở đây là wᵢ.
+
+Hình 2 là hình ảnh hóa cách mô hình end-to-end của chúng tôi tiết kiệm nút thắt tính toán self-attention bằng cách chỉ cho phép attention trong từ ở bước đầu, trước khi cho phép ngữ cảnh hóa thông tin qua ranh giới từ ở bước 2 sử dụng mô hình decoder cơ sở. Cuối cùng bước 3 lại hạn chế các ký tự/byte riêng lẻ được dự đoán chỉ sử dụng các embedding được dự đoán cấp từ đơn lẻ.
+
+3 Thí nghiệm
+
+Có nhiều nhiệm vụ NLP có thể hưởng lợi từ tokenization được cải thiện, như Dịch máy, Hỏi đáp, và Phân loại văn bản. Tuy nhiên, phạm vi phân tích sơ bộ của chúng tôi không phải là tung lưới rộng trên mọi ứng dụng downstream. Thay vào đó, chúng tôi chọn phân tích sâu nhiệm vụ tiền huấn luyện được sử dụng phổ biến nhất trong NLP tức là mô hình ngôn ngữ.
+
+Chúng tôi tiền huấn luyện các mô hình ngôn ngữ autoregressive từ đầu sử dụng các tokenizer khác nhau được mô tả trong phần trước, trên các tập dữ liệu khác nhau được mô tả trong Phần 3.2.
+
+3.1 Mô hình
+
+Chúng tôi báo cáo kết quả trên các tokenizer sau:
+Subword: từ vựng BPE được tiền huấn luyện được sử dụng bởi GPT-2 và GPT-3. Byte: từ vựng cấp byte được tiền huấn luyện như được triển khai trong ByT5 Xue et al. (2022). Character: từ vựng cụ thể corpus được học từ mỗi tập dữ liệu, với dự phòng UNK cho các ký tự không thấy trong huấn luyện. eByte/eChar: Các mô hình được tokenize end-to-end của chúng tôi bắt đầu với từ vựng Byte/Character ở trên, nhưng được nén thành các biểu diễn CLS như được mô tả trong Phần 2.
+
+Có thể có vô số cách để so sánh 'công bằng' qua các tokenizer. Chúng tôi huấn luyện tất cả mô hình trên tất cả tập dữ liệu trong cùng số epoch tổng. Chúng tôi cũng tập trung để các mô hình truy cập cùng kích thước cửa sổ ngữ cảnh, tức là lượng thông tin có sẵn để dự đoán tập token tiếp theo. Các tokenizer khác nhau có thể sử dụng kích thước bộ nhớ rất khác nhau để phù hợp với cùng lượng thông tin. Điều này tương tự như cách cùng một cuốn sách có thể được xuất bản với các kích thước font khác nhau để chọn giữa sách nhẹ và cồng kềnh. Chúng tôi kiểm soát tính ngang bằng thông tin này bằng cách cố định số ký tự trong ngữ cảnh có sẵn là 192 cho mỗi tokenizer và mỗi tập dữ liệu. Các mô hình subword sau đó sẽ được phép truy cập 192//N từ con trong đó N là số ký tự trung bình mỗi từ con.
+
+3.2 Tập dữ liệu
+
+Phương pháp được đề xuất của chúng tôi yêu cầu truy cập tín hiệu ranh giới từ, có thể được lấy từ corpus ngôn ngữ tự nhiên sạch, hoặc bằng cách chạy pipeline tiền xử lý trên corpus không sạch để lọc ra các token không ngôn ngữ như URL hoặc metadata. Chúng tôi chọn cách trước để tránh gây nhầm lẫn kết quả với một lớp quyết định tiền xử lý. Do đó, các tập dữ liệu của chúng tôi nhỏ hơn nhưng sạch hơn các tập dữ liệu quy mô lớn mC4 và OSCAR thường được sử dụng để huấn luyện các mô hình ngôn ngữ lớn.
+
+Lựa chọn ngôn ngữ của chúng tôi phụ thuộc vào tính khả dụng của corpus dữ liệu sạch đủ lớn. Chúng tôi cũng cố ý tránh corpus Trung Quốc và Nhật Bản vì phân đoạn chúng thành từ sẽ yêu cầu một bước bổ sung, có thể gây nhầm lẫn về phân đoạn thông qua mô hình có sẵn.
+
+Cụ thể, đây là bốn tập dữ liệu chúng tôi tiền huấn luyện và đánh giá các mô hình ngôn ngữ:
+
+1. English: Chúng tôi lấy mẫu ngẫu nhiên 10.000 đoạn văn từ các đoạn hiểu của tập dữ liệu SQuAD2.0 (Rajpurkar et al., 2016).
+
+2. French: Chúng tôi lấy mẫu ngẫu nhiên 10.000 đoạn văn từ các đoạn hiểu của tập dữ liệu SQuAD_FR (Cattan et al., 2021).
+
+3. Russian: Chúng tôi lấy mẫu ngẫu nhiên 10.000 đoạn văn từ các đoạn đọc của tập dữ liệu SberQuAD (Efimov et al., 2020).
+
+4. Numeracy: Chúng tôi lấy mẫu 60.000 hàng câu được chú thích số từ WikiConvert (Thawani et al., 2021a), bản thân được lấy từ Wikipedia tiếng Anh. Nhiệm vụ là ước lượng các số này gần đúng sử dụng các từ trước đó làm ngữ cảnh.
+
+Bảng 2 trình bày thống kê cho các tập dữ liệu chúng tôi sử dụng. Tập dữ liệu trung bình bao gồm 7,4M ký tự (676 duy nhất) và 1,4M từ (102k duy nhất).
+
+3.3 Metric
+
+Vì các mô hình có từ vựng khác nhau, chúng tôi không thể so sánh điểm perplexity của chúng. Thay vào đó, chúng tôi dựa vào độ chính xác cấp ký tự và từ trên dữ liệu validation được giữ lại từ cùng corpus với tập huấn luyện. Tuy nhiên, một số sơ đồ tokenization như phân đoạn cấp từ con và từ, giải mã nhiều ký tự cùng lúc và do đó được ưu thế trong metric cấp ký tự. Khi ước lượng số, chúng tôi báo cáo metric dựa trên độ lớn thường được báo cáo trong tài liệu: Độ chính xác Exponent (EAcc), và Median Absolute Percentage Error (MdAPE) trong đó số phải được ước lượng sử dụng ngữ cảnh chính xác 192 token.
+
+3.4 Triển khai
+
+Mỗi mô hình (sử dụng tokenizer khác nhau) được tiền huấn luyện từ đầu trên mỗi tập dữ liệu được mô tả ở trên. Chúng tôi báo cáo các metric đã nêu trên tập test riêng lẻ từ mỗi corpus. Mô hình ngôn ngữ cơ sở của chúng tôi là transformer chỉ decoder được gọi là minGPT với 8 lớp. Đối với các mô hình end-to-end của chúng tôi, mô hình ngôn ngữ chính (Bước 2) vẫn giống nhau - với 8 lớp như những cái khác, trong khi word-encoder (Bước 1) và word-decoder (Bước 3) đều là transformer nông (encoder và decoder tương ứng) với mỗi cái 2 lớp. Chúng sử dụng token padding để làm cho mỗi từ có độ dài bằng nhau để dễ huấn luyện. Chúng tôi sử dụng embedding vị trí tuyệt đối được huấn luyện cho tất cả mô hình, và các mô hình end-to-end sử dụng nó ba lần - một cho mỗi bước. Chúng tôi tiền huấn luyện tất cả mô hình trên tất cả tập dữ liệu từ đầu trong 100 epoch.
+
+Chúng tôi đặt learning rate là 0,0001, batch size là 2, và block size là 192. Chúng tôi sử dụng AdamW làm optimizer và huấn luyện các mô hình trên GPU NVIDIA A100-PCIe-40GB. Với cấu hình này, huấn luyện mỗi biến thể mô hình trong 100 epoch mất trung bình 52 giờ.
+
+4 Kết quả
+
+4.1 Kết quả chính
+
+Kết quả chính của chúng tôi được tóm tắt trong Bảng 3. Độ chính xác dự đoán từ tiếp theo trên các tập dữ liệu khác nhau cho thấy với cửa sổ ngữ cảnh cố định, các mô hình ngôn ngữ được tokenize end-to-end của chúng tôi thực hiện tốt hơn nhiều (lên đến 300% từ 14% đến 44% trên tiếng Anh) trên tất cả tập dữ liệu so với cả từ con BPE mặc định cũng như các mô hình ký tự và byte không tokenizer. Điều này đi kèm với việc tăng gấp đôi yêu cầu bộ nhớ GPU, do các module cấp từ bổ sung trong kiến trúc của chúng tôi.
+
+4.2 Sức mạnh biểu diễn
+
+Ở đây chúng tôi nghiên cứu ablation sức mạnh đại diện có sẵn cho word-pooling của embedding cấp ký tự hoặc byte. Siêu tham số này được kiểm soát đơn giản bằng cách thêm một số khác nhau (nhưng cố định) token CLS tiền tố mỗi từ trước khi mã hóa qua transformer. Bảng 4 cho thấy độ chính xác dự đoán từ và bước nhảy tương đối khi số token CLS tiền tố mỗi từ được tăng từ 1 lên 4. Chúng tôi nhận thấy bước nhảy lớn cho mỗi mô hình, với sự đánh đổi về độ dài mô tả chuỗi. Tuy nhiên, lưu ý rằng việc sử dụng bộ nhớ không tăng quá 20 MB. Tương tự, số tham số cũng tăng (không hiển thị trong bảng) chỉ 300K (~0,7%) cho cả mô hình eByte và eChar.
+
+4.3 Dự đoán từ hiếm
+
+Một trong những động lực chính cho tokenization từ con là khả năng tạo ra các từ hiếm hơn một cách tổ hợp sử dụng các từ con xuất hiện thường xuyên khác. Wolleb et al. (2023) gần đây cho thấy tính tổ hợp như vậy là đóng góp đáng kể cho lợi ích hiệu suất thực nghiệm đạt được bởi các mô hình từ con. Do đó, chúng tôi báo cáo trong Bảng 5 độ chính xác dự đoán từ cho các từ hiếm (những từ thấy ít hơn 10 lần trong tập dữ liệu huấn luyện) cũng như những từ thường xuyên (những từ thấy hơn 45 lần). Chúng tôi thấy các mô hình end-to-end của chúng tôi vượt trội gấp 5-7 lần trên từ thường xuyên và hơn 30 lần trên từ hiếm!
+
+4.4 Ước lượng số
+
+Chúng tôi tiếp tục đánh giá một tập con đại diện của tokenizer trên nhiệm vụ ước lượng số WikiConvert. Bảng 6 mô tả độ chính xác order-of-magnitude (EAcc) và median absolute percentage error (cả hai đều là metric được sử dụng phổ biến trong cộng đồng) trên ước lượng số trên tập dữ liệu Numeracy. Một lần nữa, chúng tôi thấy rằng khả năng của eByte được tokenize end-to-end tốt hơn nhiều so với cả mô hình subword và Byte.
+
+5 Phân tích hiệu quả
+
+Ở đây, chúng tôi xác định tốc độ tăng tốc huấn luyện và suy luận/sinh lý thuyết có thể truy cập được bằng cách nén từ sử dụng tokenizer end-to-end của chúng tôi so với các phương pháp không tokenizer, đồng thời cũng so sánh với các mô hình subword hiệu quả hơn.
+
+5.1 Tăng tốc huấn luyện
+
+Giả sử ngân sách bộ nhớ tổng M có sẵn (chẳng hạn, tính bằng GB) và cửa sổ ngữ cảnh T ký tự mỗi batch. Cũng giả sử mô hình không tokenizer (từ đây được gọi là base/baseline) là decoder transformer với L lớp và D chiều. Dấu chân bộ nhớ sẽ phụ thuộc đáng kể nhất vào số activation được lưu trữ có thể được ước lượng là M = LDBT² trong đó B là batch size. Cho ngân sách bộ nhớ cố định M và kích thước ngữ cảnh yêu cầu T ký tự, chúng ta có thể tìm batch size tối ưu:
+
+B = M/(LDT²)
+
+Giả sử corpus huấn luyện bao gồm N ký tự, số lần lặp huấn luyện yêu cầu là:
+X = N/(BT) = NDLT/M
+
+Tiếp theo, đối với subword, batch size tương tự có thể được ước lượng là:
+B' = M/(LDT²/s²)
+
+trong đó s là số ký tự mỗi subword (khoảng 2,8 cho ba ngôn ngữ của chúng tôi). Thay thế để tìm số bước huấn luyện:
+X' = N/(B'T) = NDLT/(Ms²)
+
+Tăng tốc huấn luyện của mô hình subword do đó được ước lượng là X/X' = s² = 7,8x.
+
+Cuối cùng, chúng tôi tính số bước huấn luyện tương tự cần thiết cho một epoch của mô hình được tokenize ký tự end-to-end của chúng tôi. Chúng tôi giả sử L/4 lớp word-encoder, L lớp LM chính (cấp từ), và L/4 lớp word-decoder để đơn giản (đây là thiết lập mặc định của chúng tôi trong bài báo này). Cho B'' là batch size tối ưu mà chúng tôi muốn tính và c là số ký tự trung bình mỗi từ (khoảng 5,5 cho tiếng Anh). Lưu ý rằng chúng tôi giữ T ký tự làm cửa sổ ngữ cảnh, do đó số từ trung bình mỗi chuỗi batch sẽ là T/c. Dấu chân bộ nhớ của activation sau đó sẽ là (LDB''Tc)/4 cho word encoder (và giống nhau cho word decoder) và (LDB''T²)/(c²) cho mô hình ngôn ngữ chính (cấp từ).
+
+Điều này dẫn đến batch size tối ưu:
+B'' = M/[LDT(c/2 + T/c²)]
+
+và số bước huấn luyện là:
+X'' = N/(B''T) = NDL/[M(c/2 + T/c²)]
+
+Cuối cùng, chúng tôi ước lượng tăng tốc đề xuất trong tổng thời gian huấn luyện là
+X/X'' = T/(c/2 + T/c²)
+
+Thay c = 5,5 như số ký tự bảo thủ mỗi từ và T = 192 độ dài cửa sổ ngữ cảnh, chúng ta có tăng tốc 6,8x trong các bước huấn luyện, chỉ ít hơn một chút so với tăng tốc subword (~7,8x) so với mô hình ngôn ngữ cấp ký tự.
+
+5.2 Tăng tốc sinh
+
+Một lợi thế độc đáo khác của mô hình được tokenize end-to-end của chúng tôi là trong sinh, cũng được song song hóa mỗi từ. Một mô hình ký tự/byte phải sinh một token mỗi lần, sau đó đưa token được dự đoán trở lại vào đầu vào và chạy vòng lặp forward lại để autoregressive sinh ra token tiếp theo. Giả sử L lớp của decoder mất t giây cho lần lặp forward của decoder giống GPT, tốc độ sinh cho mô hình dựa trên ký tự như vậy sẽ là 1/t ký tự mỗi giây.
+
+Các mô hình subword hưởng lợi từ việc có token dài hơn (khoảng 2,8 ký tự/subword cho ba ngôn ngữ chúng tôi xem xét), do đó chúng có thể sinh với tốc độ 2,8/t ký tự mỗi giây.
+
+Với giả định rất thô, mô hình ký tự end-to-end của chúng tôi với L/4 lớp word-encoder và L lớp decoder (bỏ qua L/4 lớp word-decoder hiện tại) sẽ yêu cầu 5t/4 giây để sinh biểu diễn của một từ mỗi lần. Bước tiếp theo sau đó có thể được song song hóa (với sự đánh đổi trong tiêu thụ bộ nhớ) để cả autoregressive tiếp tục sinh biểu diễn từ tiếp theo trong 5t/4 giây khác, cũng như autoregressive sinh một ký tự mỗi lần sử dụng biểu diễn từ được dự đoán này. Word-decoder cấp từ này phát ra ký tự hiện có L/4 lớp nên giả định thô sẽ có nghĩa là t/4 giây mỗi ký tự. Do đó, ở trạng thái ổn định, word-decoder sẽ mất 5,5t/4 giây để sinh trung bình 5,5 ký tự mỗi từ, trong khi từ tiếp theo sẽ sẵn sàng để giải mã đồng thời chỉ trong 5t/4 giây. Do đó, tốc độ sinh là 4/t ký tự mỗi giây, tức là khoảng 50% tốt hơn subword và nhanh gấp bốn lần so với các mô hình không tokenizer.
+
+6 Công trình liên quan
+
+Một số công trình gần đây đã thách thức các sơ đồ tokenization subword. Bảng 7 làm nổi bật các loại tokenization khác nhau tồn tại trong công trình trước và định vị công trình của chúng tôi một cách độc đáo trong số chúng.
+
+Cấp ký tự/Byte ByT5 (Xue et al., 2022), CANINE (Clark et al., 2022), và SubChar (Si et al., 2021) đề xuất sử dụng các đơn vị có độ dài cố định rất nhỏ như ký tự, byte, hoặc glyph stroke thay vì subword hoặc từ có độ dài động. Điều này thường đi kèm với chi phí độ dài chuỗi lớn hơn và yêu cầu tính toán nhiều hơn, đặc biệt đối với kiến trúc transformer thường có độ phức tạp O(n²) trong số token đầu vào.
+
+Vượt qua cấp từ CodeBPE (Chirkova và Troshin, 2022) và Multi Word Expressions (Kumar và Thawani, 2022; Zaninello và Birch, 2020; Rikters và Bojar, 2017) cho thấy triển vọng trong các token lớn hơn nữa vượt qua ranh giới từ, ví dụ, từ vựng với token đơn cho các chuỗi "for i in range" hoặc "New York City" tương ứng.
+
+Phân đoạn thị giác Một dòng công trình khác (Rust et al., 2022; Salesky et al., 2021) render văn bản thành hình ảnh trước khi đưa chúng vào CNN, loại bỏ hoàn toàn tokenization và cho thấy lợi ích về tính bền vững đối với lỗi chính tả hoặc in ấn.
+
+Phân đoạn subword đã học Cuối cùng, một số phương pháp (Mofijul Islam et al., 2022; Kaushal và Mahowald, 2022; Pinter et al., 2021; Tay et al., 2021; Provilkov et al., 2020; Wang et al., 2021) tham số hóa quá trình tokenization bằng cách tập hợp ký tự n-gram hoặc chọn ngẫu nhiên một trong nhiều cách để phân đoạn một từ cho trước.
+
+Một preprint gần đây về dịch máy bởi Sreedhar et al. (2022) đề xuất một phương pháp được gọi là WSF, có lẽ gần nhất với chúng tôi, ngoại trừ việc họ chỉ sử dụng fusion ranh giới từ ở giai đoạn encoder. Phân tích độc lập của chúng tôi tập trung vào mô hình ngôn ngữ thay vào đó và cũng sinh văn bản song song sử dụng tokenization dựa trên attention end-to-end.
+
+7 Kết luận
+
+Tokenization subword hiệu quả nhưng quá cứng nhắc và xác định. Mặt khác, các mô hình cấp ký tự/Byte quá biểu cảm, dẫn đến huấn luyện và suy luận không hiệu quả. Chúng tôi đề xuất một tokenizer được thông báo ranh giới từ thực hiện mô hình ngôn ngữ một cách hiệu quả và bền vững trong một mô hình phân cấp, end-to-end, đã học. Chúng tôi cho thấy nó vượt trội hơn 300% cả hai thái cực: subword và các mô hình ký tự/byte. Chúng tôi cũng phân tích các sự đánh đổi trong hiệu quả huấn luyện và suy luận. Mặc dù có nhiều khuyết điểm bao gồm dựa vào tín hiệu ranh giới từ và hiệu quả vừa phải cũng như tính biểu cảm vừa phải, chúng tôi mong đợi nghiên cứu sơ bộ này đặt ra một tokenization đánh đổi thú vị cho mô hình ngôn ngữ thực sự end-to-end.
+
+Mã nguồn của chúng tôi được phát hành trên Github.
+
+8 Hạn chế
+
+Chúng tôi liên tục làm nổi bật các hạn chế của công trình trong suốt bài báo: tokenization end-to-end được đề xuất của chúng tôi không nhanh hơn subword cũng không biểu cảm bằng các mô hình cấp ký tự/byte. Thay vào đó, chúng tôi đề xuất nó như một sự đánh đổi hợp lý giữa hai thái cực.
+
+Chúng tôi cũng không tung lưới rộng trên nhiều nhiệm vụ downstream như dịch máy hoặc hỏi đáp, do đó thiếu so sánh với các mô hình khác như CharFormer, CANINE, và Local Byte Fusion. Thay vào đó chúng tôi tập trung hoàn toàn vào metric nội tại của mô hình ngôn ngữ, qua nhiều ngôn ngữ cũng như trên ước lượng số.
+
+Lựa chọn ngôn ngữ của chúng tôi bị hạn chế bởi tính khả dụng của corpus 'ngôn ngữ tự nhiên' chất lượng cao, không giống như dữ liệu mô hình ngôn ngữ quy mô internet mà chúng tôi quan sát được điền đầy các ví dụ về chuỗi dài như URL và chuỗi không được phân đoạn. Chúng tôi không sử dụng pipeline tiền xử lý (ngoại trừ dọn dẹp dấu câu đơn giản) để tránh gây nhầm lẫn kết quả với lựa chọn các heuristic như vậy. Điều này thật không may ngăn chúng tôi thử nghiệm với các ngôn ngữ tài nguyên cao khác như Trung Quốc và Nhật Bản, corpus của chúng không ngầm có tín hiệu ranh giới khoảng trắng.
+
+Để tóm tắt, chúng tôi thừa nhận rằng các mô hình end-to-end được đề xuất của chúng tôi chưa sẵn sàng để áp dụng quy mô với các mô hình ngôn ngữ lớn được huấn luyện trên dữ liệu internet thô. Tuy nhiên, chúng tôi mong đợi các phân tích của chúng tôi khuyến khích cuộc trò chuyện sâu sắc trong cộng đồng về (1) phổ giữa subword và các mô hình ký tự/byte, cũng như về (2) vai trò của ranh giới từ như một tín hiệu có ý nghĩa trong tokenization và mô hình ngôn ngữ.
+
+9 Lời cảm ơn
+
+Công trình này được tài trợ bởi Defense Advanced Research Projects Agency với giải thưởng N660011924033. Các tác giả ghi nhận Center for Advanced Research Computing (CARC) tại University of Southern California về việc cung cấp tài nguyên tính toán đã đóng góp vào kết quả nghiên cứu được báo cáo trong ấn phẩm này. Chúng tôi cũng cảm ơn Google về sự hỗ trợ hào phóng của họ. Chúng tôi đánh giá cao các reviewer ẩn danh tại EMNLP 2023 đã giúp chúng tôi tinh chỉnh bài báo này.
+
+Tài liệu tham khảo
+
+[Phần tài liệu tham khảo được giữ nguyên bằng tiếng Anh như trong bản gốc]
