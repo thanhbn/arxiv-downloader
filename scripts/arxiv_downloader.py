@@ -14,11 +14,11 @@ import glob
 
 
 class ArxivDownloader:
-    def __init__(self, max_workers=1, min_delay=3.0, max_delay=3.5, check_existing_txt=True):
+    def __init__(self, max_workers=1, min_delay=3.0, max_delay=3.5, check_existing_pdf=True):
         self.max_workers = max_workers
         self.min_delay = min_delay
         self.max_delay = max_delay
-        self.check_existing_txt = check_existing_txt
+        self.check_existing_pdf = check_existing_pdf
         self.stats_lock = Lock()
         self.successful = 0
         self.failed = 0
@@ -33,10 +33,10 @@ class ArxivDownloader:
         match = re.search(r'(\d{4}\.\d{4,5})', url)
         return match.group(1) if match else None
     
-    def check_existing_txt_files(self, paper_id, project_root="."):
-        """Check if any TXT file with the same arXiv ID exists anywhere in the project."""
-        # Search for TXT files starting with the arXiv ID
-        search_pattern = os.path.join(project_root, "**", f"{paper_id}*.txt")
+    def check_existing_pdf_files(self, paper_id, project_root="."):
+        """Check if any PDF file with the same arXiv ID exists anywhere in the project."""
+        # Search for PDF files starting with the arXiv ID
+        search_pattern = os.path.join(project_root, "**", f"{paper_id}*.pdf")
         existing_files = glob.glob(search_pattern, recursive=True)
         
         # Filter out files that don't actually start with the arXiv ID
@@ -67,13 +67,13 @@ class ArxivDownloader:
                     self.skipped += 1
                 return True
             
-            # Check if any TXT file with this arXiv ID exists anywhere in the project
-            if self.check_existing_txt:
+            # Check if any PDF file with this arXiv ID exists anywhere in the project
+            if self.check_existing_pdf:
                 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-                existing_txt_files = self.check_existing_txt_files(paper_id, project_root)
+                existing_pdf_files = self.check_existing_pdf_files(paper_id, project_root)
                 
-                if existing_txt_files:
-                    print(f"📝 TXT file already exists for {paper_id}: {os.path.basename(existing_txt_files[0])}")
+                if existing_pdf_files:
+                    print(f"📄 PDF file already exists for {paper_id}: {os.path.basename(existing_pdf_files[0])}")
                     print(f"⏭️  Skipping download of {filename}")
                     with self.stats_lock:
                         self.skipped += 1
@@ -148,9 +148,15 @@ class ArxivDownloader:
         
         # Create output directory
         if output_dir is None:
-            # Create output directory based on filename (default behavior)
-            base_name = Path(file_path).stem
-            output_dir = Path(base_name)
+            # Check if input file is inside a collection folder (e.g., benchmark/arxiv_links.txt)
+            file_path_obj = Path(file_path)
+            if file_path_obj.name == "arxiv_links.txt" and file_path_obj.parent.name != ".":
+                # Use the parent directory as output directory (collection folder)
+                output_dir = file_path_obj.parent
+            else:
+                # Create output directory based on filename (default behavior)
+                base_name = file_path_obj.stem
+                output_dir = Path(base_name)
         else:
             output_dir = Path(output_dir)
         

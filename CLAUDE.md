@@ -12,13 +12,16 @@ python scripts/arxiv_downloader.py <url_file>
 # Examples:
 python scripts/arxiv_downloader.py CoT.txt
 python scripts/arxiv_downloader.py RAG.txt
-python scripts/arxiv_downloader.py Benchmark.txt
+python scripts/arxiv_downloader.py benchmark/arxiv_links.txt
 
 # WARNING: ArXiv allows only 1 concurrent connection and 3 second delays!
 # Only use 1 worker to comply with ArXiv rate limits
 python scripts/arxiv_downloader.py CoT.txt 1
 
-# Download to custom directory (FIXED)
+# Download to specific collection folder (automatically detects collection folder)
+python scripts/arxiv_downloader.py multimodal/arxiv_links.txt 1
+
+# Download to custom directory (explicit)
 python scripts/arxiv_downloader.py multimodal/arxiv_links.txt 1 multimodal
 
 # Orchestrator (respects ArXiv rate limits) - FIXED to save to correct folders
@@ -35,6 +38,9 @@ python scripts/arxiv_orchestrator.py 1 1
 ```bash
 # Test with small collection (fast with parallel processing)
 python scripts/arxiv_downloader.py icl.txt
+
+# Test with benchmark collection
+python scripts/arxiv_downloader.py benchmark/arxiv_links.txt
 
 # Test with custom worker count
 python scripts/arxiv_downloader.py icl.txt 4
