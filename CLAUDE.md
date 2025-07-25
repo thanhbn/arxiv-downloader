@@ -127,6 +127,50 @@ python3 arxivdl_cli.py
 python3 arxivdl_cli.py --file CoT.txt --workers 1
 ```
 
+### Google Drive Upload (Cloud Backup)
+```bash
+# Install Google Drive API dependencies with virtual environment support
+./scripts/install_drive_deps.sh
+
+# Upload all PDFs to Google Drive (organized by collection)
+arxiv-upload --folder-id YOUR_DRIVE_FOLDER_ID
+# OR: python3 scripts/upload_to_drive.py --folder-id YOUR_DRIVE_FOLDER_ID
+
+# Upload specific collection only
+arxiv-upload --folder-id YOUR_DRIVE_FOLDER_ID --collection multimodal
+
+# Upload with custom workers (parallel uploads)
+arxiv-upload --folder-id YOUR_DRIVE_FOLDER_ID --workers 5
+
+# Dry run to see what would be uploaded
+arxiv-upload --folder-id YOUR_DRIVE_FOLDER_ID --dry-run
+
+# Overwrite existing files
+arxiv-upload --folder-id YOUR_DRIVE_FOLDER_ID --overwrite
+
+# See setup instructions
+cat GOOGLE_DRIVE_SETUP.md
+```
+
+### Environment Management
+```bash
+# Manual environment setup (if direnv not available)
+source .venv/bin/activate
+
+# Check environment status
+source scripts/setup_env_common.sh
+
+# Install direnv for automatic activation (recommended)
+sudo apt install direnv  # Ubuntu/Debian
+brew install direnv      # macOS
+
+# Add to ~/.bashrc or ~/.zshrc
+echo 'eval "$(direnv hook bash)"' >> ~/.bashrc
+
+# Reload environment
+direnv reload
+```
+
 ## Architecture Overview
 
 This is an ArXiv paper downloader tool designed for academic research paper collection with the following components:

@@ -12,6 +12,17 @@ from threading import Lock
 import random
 import glob
 
+# Add project root to Python path and setup environment
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
+# Try to setup environment
+try:
+    from scripts.setup_env_common import setup_arxiv_env
+    setup_arxiv_env(quiet=True)
+except ImportError:
+    # Continue without environment setup if not available
+    pass
+
 
 class ArxivDownloader:
     def __init__(self, max_workers=1, min_delay=3.0, max_delay=3.5, check_existing_pdf=True):
