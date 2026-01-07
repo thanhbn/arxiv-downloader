@@ -1,0 +1,1628 @@
+
+
+--- [Phan 1/11] ---
+
+# Các Mô hình Không gian Trạng thái Tích chập cho
+# Mô hình hóa Không-Thời gian Tầm xa
+Jimmy T.H. Smith*,2,4, Shalini De Mello1, Jan Kautz1, Scott W. Linderman3, 4, Wonmin Byeon1
+1NVIDIA,*Công việc được thực hiện trong thời gian thực tập tại NVIDIA
+2Viện Kỹ thuật Tính toán và Toán học, Đại học Stanford.
+3Khoa Thống kê, Đại học Stanford.
+4Viện Khoa học Thần kinh Wu Tsai, Đại học Stanford.
+{jsmith14,scott.linderman}@stanford.edu
+{shalinig,jkautz,wbyeon}@nvidia.com .
+Tóm tắt
+Việc mô hình hóa hiệu quả các chuỗi không-thời gian dài là một thách thức do nhu cầu mô hình hóa đồng thời các tương quan không gian phức tạp và các phụ thuộc thời gian tầm xa. ConvLSTMs cố gắng giải quyết vấn đề này bằng cách cập nhật các trạng thái có giá trị tensor với các mạng nơ-ron hồi quy, nhưng tính toán tuần tự của chúng khiến chúng chậm trong huấn luyện. Ngược lại, Transformers có thể xử lý song song toàn bộ chuỗi không-thời gian, được nén thành các token. Tuy nhiên, chi phí của attention tăng bậc hai theo độ dài, hạn chế khả năng mở rộng của chúng đối với các chuỗi dài hơn. Ở đây, chúng tôi giải quyết các thách thức của các phương pháp trước đây và giới thiệu các mô hình không gian trạng thái tích chập (ConvSSM)1 kết hợp các ý tưởng mô hình hóa tensor của ConvLSTM với các phương pháp mô hình hóa chuỗi dài của các phương pháp không gian trạng thái như S4 và S5. Đầu tiên, chúng tôi trình bày cách các phép quét song song có thể được áp dụng cho các hồi quy tích chập để đạt được song song hóa dưới bậc hai và sinh tự động hồi quy nhanh. Sau đó chúng tôi thiết lập một sự tương đương giữa động lực học của ConvSSMs và SSMs, điều này thúc đẩy các chiến lược tham số hóa và khởi tạo để mô hình hóa các phụ thuộc tầm xa. Kết quả là ConvS5, một biến thể ConvSSM hiệu quả cho mô hình hóa không-thời gian tầm xa. ConvS5 vượt trội đáng kể so với Transformers và ConvLSTM trong thí nghiệm Moving-MNIST chân trời dài trong khi huấn luyện nhanh hơn 3× so với ConvLSTM và sinh mẫu nhanh hơn 400× so với Transformers. Ngoài ra, ConvS5 đạt hoặc vượt hiệu suất của các phương pháp tiên tiến trên các benchmark dự đoán đầy thách thức DMLab, Minecraft và Habitat và mở ra các hướng mới để mô hình hóa các chuỗi không-thời gian dài.
+
+1 Giới thiệu
+Việc phát triển các phương pháp mô hình hóa hiệu quả và có hiệu suất các phụ thuộc không-thời gian tầm xa là một vấn đề đầy thách thức trong học máy. Dù là dự đoán các khung hình video trong tương lai [1,2], mô hình hóa các mô hình giao thông [3,4], hay dự báo thời tiết [5,6], việc mô hình hóa không-thời gian sâu đòi hỏi đồng thời nắm bắt cấu trúc không gian cục bộ và các phụ thuộc thời gian tầm xa. Mặc dù đã có tiến bộ trong mô hình hóa sinh sâu của dữ liệu không-thời gian phức tạp [7-12], hầu hết các nghiên cứu trước đây chỉ xem xét các chuỗi ngắn từ 20-50 bước thời gian do chi phí xử lý các chuỗi không-thời gian dài. Các nghiên cứu gần đây đã bắt đầu xem xét các chuỗi từ hàng trăm đến hàng nghìn bước thời gian [13-16]. Khi phần cứng và thu thập dữ liệu của các chuỗi không-thời gian dài tiếp tục cải thiện, các phương pháp mô hình hóa mới được yêu cầu phải mở rộng hiệu quả theo độ dài chuỗi và nắm bắt hiệu quả các phụ thuộc tầm xa.
+
+1Triển khai có sẵn tại: https://github.com/NVlabs/ConvSSM .
+Hội nghị lần thứ 37 về Hệ thống Xử lý Thông tin Nơ-ron (NeurIPS 2023).arXiv:2310.19694v1  [cs.LG]  30 Oct 2023
+
+--- TRANG 2 ---
+Sự tiến hóa trạng thái của ConvSSM với kernel trạng thái điểm ảnh Các điểm ảnh trạng thái tiến hóa theo cập nhật trạng thái SSM một chuỗi L đầu vào, U1:L2RL⇥H⇥W⇥U, chúng ta có thể định nghĩa một mô hình không gian trạng thái tích chập thời gian rời rạc như
+Xk=A⇤Xk1+B⇤Uk(9)
+Yk=C⇤Xk+D⇤Uk(10)
+trong đó A2RP⇥P⇥kA⇥kA và B2RP⇥U⇥kB⇥kB biểu thị rằng các kernel này ở thời gian rời rạc. Chúng tôi sẽ quay lại các ý tưởng rời rạc hóa trong Phần 3.4.
+
+3.2 Song song hóa Các Hồi quy Tích chập
+Chúng tôi mong muốn tận dụng các phép quét song song để song song hóa hiệu quả việc tính toán hồi quy tích chập thời gian rời rạc trong Phương trình (9). Như đã thảo luận trong Phần 2.2, điều này yêu cầu một toán tử kết hợp nhị phân. Cho sự kiện các toán tử tích chập là kết hợp, chúng tôi chỉ ra điều sau:
+
+Mệnh đề 1. Cho các phần tử ck=(ck,a,ck,b): =(A,B⇤Uk), toán tử nhị phân, được định nghĩa là:
+qiqj:= (qj,aqi,a,qj,a⇤qi,b+qj,b),(11)
+trong đó  biểu thị phép tích chập của hai kernel, ⇤ biểu thị tích chập và + biểu thị phép cộng theo phần tử, là kết hợp.
+
+Chứng minh. Xem Phụ lục C.1.
+
+Điều này cho thấy về mặt lý thuyết, chúng ta có thể sử dụng phép quét song song để tính toán hồi quy trong Phương trình (9). Tuy nhiên, có một vấn đề thực tế liên quan đến việc tích chập hai kernel tích chập cần được giải quyết. Khi chúng ta tích chập hai kernel tích chập với nhau, mỗi cái có hình dạng (P,P,kA,kA), hình dạng kết quả sẽ là (P,P,2ka1,2ka1)[JS: cần liệt kê các giả định về padding cho điều này]. Điều này ngụ ý rằng các chiều không gian của kernel kết quả phải tăng lên khi chiều cao hoặc chiều rộng của các kernel ban đầu lớn hơn một. Điều này trở nên có vấn đề về mặt tính toán đối với các chuỗi dài. Do đó, chúng tôi giải quyết điều này bằng cách đưa ra quyết định thiết kế đặt kA=1 và chỉ xem xét các tích chập điểm ảnh cho kernel trạng thái A. Mặc dù điều này làm cho phép quét song song khả thi về mặt tính toán, một nhược điểm tiềm ẩn là nó ngăn cản một ConvSSM duy nhất nắm bắt toàn bộ ngữ cảnh không-thời gian vì trường tiếp nhận không thể tăng theo hướng thời gian. Tuy nhiên, khi chúng ta xếp chồng nhiều lớp bao gồm các ConvSSMs, điều này sẽ cho phép trường tiếp nhận tăng theo hướng chiều sâu của mạng và cho phép mạng tổng thể nắm bắt ngữ cảnh không-thời gian [62]. Các kết quả thực nghiệm của chúng tôi trong Phần 5 cho thấy đây không phải là một hạn chế về tính biểu cảm so với các phương pháp tiên tiến hoặc so với ConvLSTM với kernel 3⇥3. Về mặt tính toán, bây giờ chúng ta có một cấu trúc có thể được song song hóa hiệu quả với độ phức tạp dưới bậc hai đối với độ dài chuỗi.
+
+Mệnh đề 2. Chi phí tính toán của hồi quy tích chập trong Phương trình ?? là O(UPk2HWL).
+
+Chứng minh. Xem Phụ lục C.1.
+
+3.3 Kết nối với Các Mô hình Không gian Trạng thái
+Chúng tôi chỉ ra trong phần này rằng có thể thiết lập một sự tương đương giữa động lực học của một ConvSSM sử dụng các kernel trạng thái điểm ảnh và động lực học của một hệ thống SSM khối đường chéo lớn. Do đó, chúng ta có thể sử dụng sự kiện này để tận dụng các ý tưởng tham số hóa và khởi tạo từ các SSMs sâu được thảo luận trong Phần 2.2.3 để cho phép ConvSSMs mô hình hóa hiệu quả các phụ thuộc tầm xa.
+
+X0(t)=A⇤X(t)+B⇤U(t)
+U(t)2RH0⇥W0⇥U
+X0(t)2RH⇥W⇥P
+A2RP⇥P⇥1⇥1
+B2RP⇥U⇥kB⇥kB
+X(t)2RH⇥W⇥P
+ABlock2RHWP⇥HWP
+
+
+--- [Phan 2/11] ---
+
+tích chập của hai kernel, ⇤ ký hiệu tích chập và + ký hiệu phép cộng theo từng phần tử, có tính kết hợp.
+
+Chứng minh. Xem Phụ lục C.1.
+
+Điều này cho thấy về mặt lý thuyết, chúng ta có thể sử dụng phép quét song song để tính toán công thức truy hồi trong Phương trình (9). Tuy nhiên, có một vấn đề thực tế liên quan đến việc tích chập hai kernel tích chập cần được giải quyết. Khi chúng ta tích chập hai kernel tích chập với nhau, mỗi kernel có kích thước (P,P,kA,kA), kích thước kết quả sẽ là (P,P,2ka−1,2ka−1) [JS: cần liệt kê các giả định về padding cho điều này]. Điều này ngụ ý rằng các chiều không gian của kernel kết quả phải tăng lên khi chiều cao hoặc chiều rộng của các kernel ban đầu lớn hơn một. Điều này trở nên có vấn đề về mặt tính toán đối với các chuỗi dài. Do đó, chúng tôi giải quyết vấn đề này bằng cách đưa ra quyết định thiết kế là đặt kA=1 và chỉ xem xét các tích chập theo điểm (pointwise convolutions) cho kernel trạng thái A. Mặc dù điều này làm cho phép quét song song khả thi về mặt tính toán, nhưng một nhược điểm tiềm năng là nó ngăn cản một ConvSSM đơn lẻ nắm bắt toàn bộ ngữ cảnh không gian-thời gian vì trường tiếp nhận không thể tăng theo hướng thời gian. Tuy nhiên, khi chúng ta xếp chồng nhiều lớp bao gồm các ConvSSM, điều này sẽ cho phép trường tiếp nhận tăng theo hướng chiều sâu của mạng và cho phép toàn bộ mạng nắm bắt ngữ cảnh không gian-thời gian [62]. Các kết quả thực nghiệm của chúng tôi trong Mục 5 cho thấy đây không phải là một hạn chế về khả năng biểu đạt so với các phương pháp tiên tiến nhất hoặc so với ConvLSTM với kernel 3×3. Về mặt tính toán, bây giờ chúng ta có một cấu trúc có thể được song song hóa hiệu quả với độ phức tạp dưới bậc hai so với độ dài chuỗi.
+
+Mệnh đề 2. Chi phí tính toán của công thức truy hồi tích chập trong Phương trình ?? là O(UPk²HWL).
+
+Chứng minh. Xem Phụ lục C.1.
+
+3.3 Mối liên hệ với các Mô hình Không gian Trạng thái
+
+Chúng tôi chỉ ra trong phần này rằng có thể thiết lập một sự tương đương giữa động lực học của ConvSSM sử dụng kernel trạng thái theo điểm và động lực học của một hệ thống SSM khối chéo lớn. Do đó, chúng ta có thể sử dụng thực tế này để tận dụng các ý tưởng tham số hóa và khởi tạo từ các SSM sâu được thảo luận trong Mục 2.2.3 để cho phép ConvSSM mô hình hóa hiệu quả các phụ thuộc tầm xa.
+
+X'(t)=A⇤X(t)+B⇤U(t)
+U(t)∈ℝH'×W'×U
+X'(t)∈ℝH×W×P
+A∈ℝP×P×1×1
+B∈ℝP×U×kB×kB
+X(t)∈ℝH×W×P
+ABlock∈ℝHWP×HWP
+
+3.3 Mối liên hệ với các Mô hình Không gian Trạng thái
+
+Do các tích chập trong 7-8 và 9-10 là các phép toán tuyến tính, chúng có thể được mô tả tương đương dưới dạng phép nhân ma trận-vector sử dụng các ma trận tuần hoàn lớn bao gồm các phần tử kernel và làm phẳng các tensor đầu vào và trạng thái thành vector [73]. Do đó, bất kỳ ConvSSM nào cũng có thể được mô tả như một SSM lớn với ma trận động lực học tuần hoàn. Tuy nhiên, chúng tôi chỉ ra ở đây rằng việc sử dụng các kernel trạng thái theo điểm như được mô tả trong phần trước cung cấp một sự tương đương SSM thay thế, mang lại một cấu trúc đặc biệt có thể tận dụng các ý tưởng tham số hóa và khởi tạo của SSM sâu được thảo luận trong Mục 2.2.3 để mô hình hóa các phụ thuộc tầm xa. Chúng tôi chỉ ra rằng mỗi pixel của trạng thái, X(t)i,j∈ℝP có thể được mô tả tương đương như phát triển theo một phương trình vi phân với ma trận trạng thái được chia sẻ, ASSM, và ma trận đầu vào, BSSM. Xem Hình 1.
+
+X'(t)i,jP
+X(t)i,jP
+ASSMP×P
+BSSMP×(Uk²B)
+X'(t)i,j=ASSMX(t)i,j+BSSMUim2col(t)i,j
+Uk²B
+H'×W'×U
+P×U×kB×kB
+P×P×1×1
+H×W×P
+
+[WB: Định nghĩa im2col trước phương trình 12. im2cal là đặc thù cho ảnh. Có cách nào khác để mô tả nó không?][JS: im2col áp dụng cho bất kỳ tensor HxWxC nào (đây là trường hợp duy nhất chúng ta xem xét). Nó cũng là một phép toán chính thức trong các phép toán GEMM, và có một bài báo chúng ta có thể trích dẫn. Tôi sẵn sàng nghe đề xuất, nhưng đang gặp khó khăn trong việc tìm ra một cách sạch hơn để mô tả những gì chúng ta cần ở đây. Tôi cảm thấy rằng việc nói im2col và trích dẫn nó thực sự khá chính xác.]
+
+Mệnh đề 3. Xét một cập nhật trạng thái ConvSSM như trong (7) với kernel trạng thái theo điểm A∈ℝP×P×1×1, kernel đầu vào B∈ℝP×U×kB×kB, và đầu vào U(t)∈ℝH'×W'×U. Sắp xếp lại kernel trạng thái theo điểm A thành một ma trận ASSM∈ℝP×P. Sắp xếp lại kernel đầu vào B thành một ma trận BSSM∈ℝP×(Uk²B). Phương trình vi phân của (7) là tương đương, sau khi định hình lại X(t) và X'(t) thành x(t), x'(t)∈ℝHWP tương ứng, với phương trình vi phân sau:
+
+x'(t)=ABlockx(t)+BBlocku(t), (12)
+
+trong đó ABlock∈ℝHWP×HWP và BBlock∈ℝHWP×HWUk²B là khối chéo với ASSM và BSSM trên các khối chéo tương ứng, và u(t)∈ℝHWUk²B là kết quả của việc nối các cột được hình thành bằng cách thực hiện phép toán im2col [74, 75] trên đầu vào U(t).
+
+Chứng minh. Xem Phụ lục C.3.
+
+Do đó, việc tham số hóa và khởi tạo ASSM với các ma trận HiPPO có cấu trúc đặc biệt [47] và rời rạc hóa với một tham số thang thời gian có thể học để thu được A̅SSM và B̅SSM sẽ trao cho các SSM này cùng động lực học như trong các phương pháp S4/S5 mà quan trọng để mô hình hóa các phụ thuộc tầm xa. Do sự tương đương của Mệnh đề 3, sau đó chúng ta có thể sắp xếp lại các ma trận này thành các kernel trạng thái và đầu vào ConvSSM rời rạc của (9) để cung cấp cho công thức truy hồi tích chập các đặc tính động lực học có lợi tương tự. Lưu ý rằng công thức ConvSSM dễ làm việc hơn so với việc hình thành một cách rõ ràng bản cập nhật trạng thái SSM khối chéo lớn và cho phép tận dụng các phép toán tích chập được tối ưu hóa cao trong các framework học sâu hiện đại [76-78].
+
+3.4 ConvSSM Hiệu quả cho Các Phụ thuộc Tầm xa: ConvS5
+
+Trong phần này, chúng tôi giới thiệu ConvS5 kết hợp các ý tưởng song song hóa các công thức truy hồi tích chập (Mục 3.2) và mối liên hệ SSM (Mục 3.3). ConvS5 là một ConvSSM tận dụng phép quét song song và các sơ đồ tham số hóa/khởi tạo SSM sâu. Với Mệnh đề
+
+
+--- [Phan 3/11] ---
+
+các phép tích chập trong 7-8 và 9-10 là các phép toán tuyến tính, chúng có thể được mô tả tương đương dưới dạng các phép nhân ma trận-vector sử dụng các ma trận tuần hoàn lớn bao gồm các phần tử của kernel và làm phẳng các tensor đầu vào và trạng thái thành các vector [73]. Do đó, bất kỳ ConvSSM nào cũng có thể được mô tả như một SSM lớn với ma trận động lực học tuần hoàn. Tuy nhiên, chúng tôi chỉ ra ở đây rằng việc sử dụng các kernel trạng thái điểm như được mô tả trong phần trước cung cấp một tương đương SSM thay thế, tạo ra một cấu trúc đặc biệt có thể tận dụng các ý tưởng về tham số hóa và khởi tạo SSM sâu được thảo luận trong Mục 2.2.3 để mô hình hóa các phụ thuộc tầm xa. Chúng tôi chỉ ra rằng mỗi điểm ảnh của trạng thái, X(t)i,j ∈ RP có thể được mô tả tương đương như đang tiến triển theo một phương trình vi phân với một ma trận trạng thái được chia sẻ, ASSM, và ma trận đầu vào, BSSM. Xem Hình 1.
+
+X'(t)i,j ∈ P
+X(t)i,j ∈ P
+ASSM ∈ P×P
+BSSM ∈ P×(Uk²B)
+X'(t)i,j = ASSMX(t)i,j + BSSMUim2col(t)i,j
+Uk²B
+H'×W'×U
+P×U×kB×kB
+P×P×1×1
+H×W×P
+
+[WB: Định nghĩa im2col trước phương trình 12. im2cal là dành riêng cho ảnh. Có cách nào khác để mô tả nó không?][JS: im2col áp dụng được cho bất kỳ tensor HxWxC nào (đây là trường hợp duy nhất chúng ta xem xét). Nó cũng là một phép toán chính thức trong các phép toán GEMM, và có một bài báo chúng ta có thể trích dẫn. Tôi sẵn sàng nghe đề xuất, nhưng đang gặp khó khăn trong việc nghĩ ra một cách mô tả sạch hơn cho những gì chúng ta cần ở đây. Tôi cảm thấy rằng việc nói im2col và trích dẫn nó thực sự khá chính xác.]
+
+Mệnh đề 3. Xem xét một cập nhật trạng thái ConvSSM như trong (7) với kernel trạng thái điểm A ∈ RP×P×1×1, kernel đầu vào B ∈ RP×U×kB×kB, và đầu vào U(t) ∈ RH'×W'×U. Sắp xếp lại kernel trạng thái điểm A thành một ma trận ASSM ∈ RP×P. Sắp xếp lại kernel đầu vào B thành một ma trận BSSM ∈ RP×(Uk²B). Phương trình vi phân của (7) là tương đương, sau khi định hình lại X(t) và X'(t) thành x(t), x'(t) ∈ RHWP tương ứng, với phương trình vi phân sau
+
+x'(t) = ABlockx(t) + BBLocku(t), (12)
+
+trong đó ABlock ∈ RHWP×HWP và BBlock ∈ RHWP×HWUk²B là khối chéo với ASSM và BSSM trên các khối chéo tương ứng, và u(t) ∈ RHWUk²B là kết quả của việc nối các cột được hình thành bằng cách thực hiện một phép toán im2col [74, 75] trên đầu vào U(t).
+
+Chứng minh. Xem Phụ lục C.3.
+
+Do đó, việc tham số hóa và khởi tạo ASSM với các ma trận HiPPO có cấu trúc đặc biệt [47] và rời rạc hóa với một tham số thang thời gian có thể học được để có ASSM và BSSM sẽ trao cho các SSM này cùng động lực học như trong các phương pháp S4/S5 quan trọng để mô hình hóa các phụ thuộc tầm xa. Do tính tương đương của Mệnh đề 3, sau đó chúng ta có thể sắp xếp lại các ma trận này thành các kernel trạng thái và đầu vào ConvSSM rời rạc của 9 để cung cấp cho sự hồi quy tích chập các thuộc tính động lực học có lợi tương tự. Lưu ý rằng công thức ConvSSM dễ làm việc hơn so với việc hình thành cập nhật trạng thái SSM khối chéo lớn một cách rõ ràng và cho phép tận dụng các phép toán tích chập được tối ưu hóa cao trong các framework học sâu hiện đại [76-78].
+
+3.4 ConvSSM Hiệu quả cho Phụ thuộc Tầm xa: ConvS5
+
+Trong phần này, chúng tôi giới thiệu ConvS5 kết hợp các ý tưởng về song song hóa các hồi quy tích chập (Mục 3.2) và kết nối SSM (Mục 3.3). ConvS5 là một ConvSSM tận dụng các quét song song và các sơ đồ tham số hóa/khởi tạo SSM sâu. Cho Mệnh đề 3, chúng ta có thể tham số hóa ngầm định một kernel trạng thái điểm, A ∈ RP×P×1×1 và kernel đầu vào B ∈ RP×U×kB×kB trong (7) sử dụng các tham số SSM như được sử dụng bởi S5 [36], AS5 ∈ RP×P và BS5 ∈ RP×(Uk²B). Chúng ta có thể rời rạc hóa các tham số SSM S5 này như được thảo luận trong Mục 2.2.1 để có
+
+Ā S5 = DISCRETIZEA(AS5, Δ), B̄S5 = DISCRETIZEB(AS5, BS5, Δ), (13)
+
+và sau đó sắp xếp lại để có các kernel cập nhật trạng thái ConvS5:
+
+Ā S5 ∈ RP×P --sắp xếp lại--> ĀConvS5 ∈ RP×P×1×1 (14)
+B̄S5 ∈ RP×(Uk²B) --sắp xếp lại--> B̄ConvS5 ∈ RP×U×kB×kB. (15)
+
+Sau đó chúng ta chạy hệ thống ConvSSM rời rạc của các Phương trình (9, 10), trong đó hồi quy có thể được tính toán bằng cách sử dụng các quét song song. Lưu ý rằng trong thực tế, thiết lập này thực sự cho phép chúng ta tham số hóa ConvS5 bằng cách sử dụng một trạng thái chéo [34-36] giúp giảm chi phí áp dụng quét song song trong Mệnh đề 2 xuống O(LPHW). Xem Phụ lục A để thảo luận chi tiết hơn về tham số hóa, khởi tạo và rời rạc hóa.
+
+sử dụng các phép tích chập thay vì các phép nhân ma trận-vector trong các RNN 1-D tiêu chuẩn (ví dụ: LSTM/GRU [13,14]). Cách tiếp cận này cho phép thông tin không gian và thời gian được mô hình hóa chung và cung cấp các lợi ích của RNN như sinh tự hồi quy có trạng thái nhanh và một cửa sổ ngữ cảnh không giới hạn về mặt lý thuyết. Tuy nhiên, chúng cũng thừa hưởng các điểm yếu của RNN như đào tạo chậm do cấu trúc tuần tự vốn có của chúng và vấn đề gradient biến mất/bùng nổ [15].
+
+Gần đây hơn, các phương pháp dựa trên transformer [3,7,8,16-19] đã tăng lên về mức độ phổ biến do hiệu suất mạnh mẽ của chúng và khả năng được song song hóa trên chuỗi để tăng tốc đáng kể việc đào tạo. Các cách tiếp cận này thường yêu cầu các sơ đồ nén phức tạp [20-22] để nén chuỗi không gian-thời gian thành một chuỗi các token mà transformer có thể xử lý. Ngoài ra, cơ chế self-attention khiến Transformer chịu độ phức tạp bậc hai theo độ dài chuỗi cho đào tạo và suy luận [23,24] và cũng có một cửa sổ ngữ cảnh bị giới hạn. Trong khi các phương pháp transformer hiệu quả hơn đã được đề xuất trong tài liệu [25-31], có bằng chứng cho thấy các phương pháp này vẫn không hoạt động tốt trên các chuỗi có phụ thuộc tầm xa [32,7]. Do đó, các phương pháp attention vẫn có xu hướng là cách tiếp cận được các nhà thực hành ưa thích. Tuy nhiên, công trình gần đây trong các mô hình không gian trạng thái sâu (SSM) [33-37] (ví dụ: S4 và S5) đã tìm cách vượt qua độ phức tạp bậc hai theo độ dài chuỗi của attention trong khi duy trì khả năng song song hóa và hiệu suất của attention và tính có trạng thái của RNN. Các phương pháp này đã được chứng minh là hiệu quả trong các lĩnh vực khác nhau như giọng nói [38], hình ảnh [39], phân loại video [39,40], học tăng cường [41, 42], dự báo [43] và mô hình hóa ngôn ngữ [44-46].
+
+Lấy cảm hứng từ các ý tưởng mô hình hóa từ ConvRNN và SSM sâu, chúng tôi giới thiệu các mô hình không gian trạng thái tích chập (ConvSSM) có một trạng thái cấu trúc tensor như ConvLSTM nhưng một tham số hóa thời gian liên tục và các cập nhật trạng thái tuyến tính như S4 và S5. Chúng tôi chỉ ra cách tính tuyến tính này có thể được khai thác để sử dụng các quét song song cho việc song song hóa hiệu quả trên chuỗi không gian-thời gian. Chúng tôi cũng thiết lập một tương đương giữa động lực học của các ConvSSM có cấu trúc đặc biệt và SSM. Điều này cho phép tận dụng các hiểu biết về tham số hóa và khởi tạo từ tài liệu SSM sâu [47] để mô hình hóa hiệu quả các phụ thuộc tầm xa. Kết quả là, chúng tôi giới thiệu ConvS5, một lớp không gian-thời gian mới, không yêu cầu nén các khung hình thành các token 1-D, có thể được song song hóa hiệu quả trên chuỗi, và có sinh tự hồi quy nhanh và một ngữ cảnh không giới hạn. ConvS5 vượt trội đáng kể so với Transformer và ConvLSTM trong một thí nghiệm Moving-Mnist [48] đầy thách thức yêu cầu các phương pháp sinh ra 1200 khung hình. Ngoài ra, ConvS5 đào tạo nhanh hơn 3× so với ConvLSTM trong nhiệm vụ này và sinh mẫu nhanh hơn 400× so với Transformer. Cuối cùng, chúng tôi chỉ ra rằng ConvS5 phù hợp hoặc vượt quá hiệu suất của các phương pháp tiên tiến khác nhau trên các benchmark dự đoán video tầm xa đầy thách thức DMLab, Minecraft, và Habitat [7].
+
+2 Kiến thức nền
+
+Phần này cung cấp kiến thức nền cần thiết để giới thiệu ConvSSM và ConvS5 trong Mục 3.
+
+2.1 Mạng Hồi quy Tích chập
+
+Cho một chuỗi 1-D các đầu vào u1:L ∈ RU, một RNN cập nhật trạng thái của nó xk ∈ RP tại mỗi bước thời gian k với một phương trình cập nhật trạng thái xk = F(xk-1, uk), trong đó F() biểu diễn một hàm phi tuyến nào đó. Ví dụ, người ta có thể biểu diễn một RNN vanilla (bỏ qua số hạng bias) như
+
+xk = tanh(Axk-1 + Buk) (1)
+
+với ma trận trạng thái A ∈ RP×P, ma trận đầu vào B ∈ RP×U và hàm tangent hyperbolic tanh() được áp dụng theo từng phần tử. Các RNN khác như LSTM [13] và GRU [14] định nghĩa các công thức phức tạp hơn của F().
+
+Mạng nơ-ron hồi quy tích chập [11,12] (ConvRNN) mô hình hóa các chuỗi không gian-thời gian bằng cách thay thế các trạng thái và đầu vào 1-D của RNN bằng các tensor N-D và thay thế các phép nhân ma trận-vector bằng các phép tích chập như trong mạng nơ-ron tích chập (CNN). Cho một chuỗi độ dài L các khung hình, U1:L ∈ RL×H'×W'×U, với chiều cao H', chiều rộng W' và U đặc trưng [SD: điểm nhỏ, nhưng thường viết WxH thay vì HxW hơn][JS: Thú vị, bạn có thể chỉ cho tôi vài ví dụ không? Quy ước H×W phù hợp với các hình dạng mong đợi của các phép toán conv2d của Torch và JAX/Flax và phù hợp với chiều cao và chiều rộng của các hàng×cột của một ma trận, vì vậy hiện tại tôi có xu hướng giữ nguyên như vậy], một ConvRNN cập nhật trạng thái của nó, Xk ∈ RH×W×P, với một phương trình cập nhật trạng thái Xk = G(Xk-1, Uk), trong đó G() là một hàm phi tuyến. Để có một ví dụ cụ thể tương tự như (1), phương trình cập nhật trạng thái ConvRNN vanilla sẽ là
+
+Xk = tanh(A ⋆ Xk-1 + B ⋆ Uk), (2)
+
+trong đó ⋆ là một toán tử tích chập không gian với kernel trạng thái A ∈ RP×P×kA×kA (sử dụng quy ước [đặc trưng đầu ra, đặc trưng đầu vào, chiều cao kernel, chiều rộng kernel]), kernel đầu vào B ∈ RP×U×kB×kB và hàm tanh() được áp dụng theo từng phần tử. Thông thường hơn, các cập nhật phức tạp như ConvLSTM [11] và ConvGRU [12] được sử dụng bằng cách thực hiện các thay đổi tương tự cho các phương trình LSTM và GRU 1-D tương ứng. ConvRNN đã được sử dụng cho y sinh, robot, mô hình hóa giao thông, dự báo thời tiết và nhiều ứng dụng khác [49-60] và nhiều biến thể đã được đề xuất [61-68].
+
+2.2 Mô hình Không gian Trạng thái Sâu
+
+Phần này cung cấp một nền tảng ngắn gọn về các ý tưởng của các phương pháp SSM sâu như S4 [33] và S5 [36] được phát triển cho mô hình hóa chuỗi 1-D và có những hiểu biết mà chúng tôi tận dụng cho cách tiếp cận ConvS5 không gian-thời gian của chúng tôi.
+
+2.2.1 Mô hình Không gian Trạng thái Tuyến tính
+
+Cho một tín hiệu đầu vào liên tục u(t) ∈ RU, một trạng thái ẩn x(t) ∈ RP và một tín hiệu đầu ra y(t) ∈ RM, một SSM tuyến tính thời gian liên tục được định nghĩa bởi phương trình vi phân:
+
+x'(t) = Ax(t) + Bu(t), y(t) = Cx(t) + Du(t), (3)
+
+và được tham số hóa bởi một ma trận trạng thái A ∈ RP×P, một ma trận đầu vào B ∈ RP×U, một ma trận đầu ra C ∈ RM×P và một ma trận truyền thẳng D ∈ RM×U. Cho một chuỗi được lấy mẫu, u1:L ∈ RL×U, SSM có thể được rời rạc hóa để định nghĩa một SSM thời gian rời rạc
+
+xk = Āxk-1 + B̄uk, yk = Cxk + Duk, (4)
+
+trong đó các tham số thời gian rời rạc là một hàm của các tham số thời gian liên tục và một tham số thang thời gian, Δ. Chúng ta định nghĩa Ā = DISCRETIZEA(A, Δ) và B̄ = DISCRETIZEB(A, B, Δ) trong đó DISCRETIZE() là một phương pháp rời rạc hóa như Euler, song tuyến tính hoặc zero-order hold [69].
+
+[SD: Tôi cảm thấy phần hồi quy của SSM không được giải thích rõ ràng lắm và do đó khó theo dõi/hiểu. Điểm này cũng quan trọng để hiểu Quét Song song và tại sao điều đó quan trọng.][JS: Đồng ý điều này quan trọng. Bạn có thể chỉ ra phần nào không rõ nhất hoặc có lẽ điều gì dường như còn thiếu không?]
+
+2.2.2 Các Lớp Không gian Trạng thái: S4 và S5
+
+Gu và cộng sự [33] đã đề xuất lớp chuỗi không gian trạng thái có cấu trúc (S4), mô hình hóa hiệu quả các chuỗi dài với độ phức tạp dưới bậc hai theo độ dài chuỗi. Một lớp S4 bao gồm nhiều SSM đầu vào đơn, đầu ra đơn (SISO) được tham số hóa thời gian liên tục, một bước rời rạc hóa rõ ràng với các tham số thang thời gian có thể học được, và các hàm kích hoạt phi tuyến theo vị trí được áp dụng cho các đầu ra SSM để tạo ra chuỗi đầu ra của lớp. Nhiều lớp có thể được xếp chồng để hình thành các mô hình chuỗi sâu có thể biểu diễn các hệ thống phi tuyến. Một lớp S4 có thể sử dụng các SSM tuyến tính của nó để xử lý một chuỗi song song bằng cách sử dụng các phép tích chập 1-D. Nó cũng có thể chạy các SSM tuyến tính của nó như các RNN để cho phép sinh tự hồi quy nhanh. Smith và cộng sự [36] đã chỉ ra rằng với một số thay đổi kiến trúc, cách tiếp cận có thể được đơn giản hóa và làm cho linh hoạt hơn bằng cách thay thế
+
+
+--- [Phan 4/11] ---
+
+các tích chập với quét song song, dẫn đến lớp S4 đơn giản hóa (S5). Một lớp S5 thay thế nhiều SSM SISO của S4 bằng một SSM đa đầu vào, đa đầu ra như trong công thức 3 và là một mô hình hoàn toàn hồi quy, có trạng thái cho cả tính toán song song và tuần tự.
+
+2.2.3 Tham số hóa và Khởi tạo SSM
+
+Tham số hóa và khởi tạo là các khía cạnh quan trọng của các SSM sâu như S4 và S5 cho phép chúng nắm bắt các phụ thuộc tầm xa. Các phương pháp này dựa vào các tham số SSM thời gian liên tục, thực hiện rõ ràng một bước rời rạc hóa với một tham số thang thời gian có thể học được, và một khởi tạo xác định của ma trận trạng thái A với các ma trận có cấu trúc đặc biệt được lấy cảm hứng từ khung HiPPO. Nhiều thí nghiệm loại bỏ đã được thực hiện nhấn mạnh tầm quan trọng của thiết lập này để các SSM sâu đạt được hiệu suất cao trên các nhiệm vụ tầm xa đầy thách thức. Công trình đồng thời đã nghiên cứu các khởi tạo này chi tiết hơn và cung cấp cái nhìn sâu sắc về các phân phối giá trị riêng ban đầu thuận lợi và các hiệu ứng chuẩn hóa của thiết lập này.
+
+trong đó G() là một hàm phi tuyến. Đối với một ví dụ cụ thể tương tự như (1), phương trình cập nhật trạng thái ConvRNN cơ bản sẽ là
+
+Xk=tanh(A⇤Xk−1+B⇤Uk),                    (2)
+
+trong đó ⇤ là toán tử tích chập không gian với nhân trạng thái A∈RP×P×kA×kA (sử dụng quy ước [đặc trưng đầu ra, đặc trưng đầu vào, chiều cao nhân, chiều rộng nhân]), nhân đầu vào B∈RP×U×kB×kB và hàm tanh() được áp dụng theo từng phần tử. Phổ biến hơn, các cập nhật tinh vi như ConvLSTM và ConvGRU được sử dụng bằng cách thực hiện các thay đổi tương tự đối với các phương trình LSTM và GRU 1-D tương ứng. ConvRNN đã được sử dụng cho y sinh, robot, mô hình hóa giao thông, dự báo thời tiết và nhiều ứng dụng khác và nhiều biến thể đã được đề xuất.
+
+2.2 Mô hình Không gian Trạng thái Sâu
+
+Phần này cung cấp nền tảng ngắn gọn về các ý tưởng của các phương pháp SSM sâu như S4 và S5 được phát triển cho mô hình hóa chuỗi 1-D và những hiểu biết mà chúng tôi tận dụng cho phương pháp ConvS5 không gian-thời gian của mình.
+
+2.2.1 Mô hình Không gian Trạng thái Tuyến tính
+
+Cho một tín hiệu đầu vào liên tục u(t)∈RU, một trạng thái tiềm ẩn x(t)∈RP và một tín hiệu đầu ra y(t)∈RM, một SSM tuyến tính thời gian liên tục được định nghĩa bởi phương trình vi phân:
+
+x′(t)=Ax(t)+Bu(t),   y(t)=Cx(t)+Du(t),                    (3)
+
+và được tham số hóa bởi một ma trận trạng thái A∈RP×P, một ma trận đầu vào B∈RP×U, một ma trận đầu ra C∈RM×P và một ma trận feedthrough D∈RM×U. Cho một chuỗi được lấy mẫu, u1:L∈RL×U, SSM có thể được rời rạc hóa để định nghĩa một SSM thời gian rời rạc
+
+xk=A̅xk−1+B̅uk,   yk=Cxk+Duk,                    (4)
+
+trong đó các tham số thời gian rời rạc là một hàm của các tham số thời gian liên tục và một tham số thang thời gian Δ. Chúng ta định nghĩa A̅=DISCRETIZEA(A,Δ) và B̅=DISCRETIZEB(A,B,Δ) trong đó DISCRETIZE() là một phương pháp rời rạc hóa như Euler, song tuyến hoặc giữ bậc không.
+
+2.2.2 Các Lớp Không gian Trạng thái: S4 và S5
+
+Gu và cộng sự đề xuất lớp chuỗi không gian trạng thái có cấu trúc (S4), mô hình hóa hiệu quả các chuỗi dài với độ phức tạp dưới bậc hai theo độ dài chuỗi. Một lớp S4 bao gồm nhiều SSM đơn đầu vào, đơn đầu ra (SISO) được tham số hóa thời gian liên tục, một bước rời rạc hóa rõ ràng với các tham số thang thời gian có thể học được, và các hàm kích hoạt phi tuyến theo vị trí được áp dụng cho các đầu ra SSM để tạo ra chuỗi đầu ra của lớp. Nhiều lớp có thể được xếp chồng để tạo thành các mô hình chuỗi sâu có thể biểu diễn các hệ thống phi tuyến. Một lớp S4 có thể sử dụng các SSM tuyến tính của nó để xử lý một chuỗi song song bằng cách sử dụng tích chập 1-D. Nó cũng có thể chạy các SSM tuyến tính của mình như RNN để cho phép sinh tự hồi quy nhanh. Smith và cộng sự chỉ ra rằng với một số thay đổi kiến trúc, phương pháp có thể được đơn giản hóa và linh hoạt hơn bằng cách thay thế các tích chập bằng quét song song, dẫn đến lớp S4 đơn giản hóa (S5). Một lớp S5 thay thế nhiều SSM SISO của S4 bằng một SSM đa đầu vào, đa đầu ra như trong công thức 3 và là một mô hình hoàn toàn hồi quy, có trạng thái cho cả tính toán song song và tuần tự.
+
+2.2.3 Tham số hóa và Khởi tạo SSM
+
+Tham số hóa và khởi tạo là các khía cạnh quan trọng của các SSM sâu như S4 và S5 cho phép chúng nắm bắt các phụ thuộc tầm xa. Các phương pháp này dựa vào các tham số SSM thời gian liên tục, thực hiện rõ ràng một bước rời rạc hóa với một tham số thang thời gian có thể học được, và một khởi tạo xác định của ma trận trạng thái A với các ma trận có cấu trúc đặc biệt được lấy cảm hứng từ khung HiPPO. Nhiều thí nghiệm loại bỏ đã được thực hiện nhấn mạnh tầm quan trọng của thiết lập này để các SSM sâu đạt được hiệu suất cao trên các nhiệm vụ tầm xa đầy thách thức. Công trình đồng thời đã nghiên cứu các khởi tạo này chi tiết hơn và cung cấp cái nhìn sâu sắc về các phân phối giá trị riêng ban đầu thuận lợi và các hiệu ứng chuẩn hóa của thiết lập này.
+
+
+--- [Phan 5/11] ---
+
+tăng tốc đáng kể quá trình huấn luyện. Các phương pháp này thường yêu cầu các lược đồ nén phức tạp [20-22] để nén chuỗi không-thời gian thành một chuỗi các token mà transformer có thể xử lý. Ngoài ra, cơ chế tự chú ý (self-attention) khiến Transformers phải chịu độ phức tạp bậc hai theo độ dài chuỗi cho cả huấn luyện và suy luận [23,24] và cũng có cửa sổ ngữ cảnh bị giới hạn. Mặc dù các phương pháp transformer hiệu quả hơn đã được đề xuất trong tài liệu [25-31], có bằng chứng cho thấy các phương pháp này vẫn không hoạt động tốt trên các chuỗi có phụ thuộc tầm xa [32,7]. Do đó, các phương pháp chú ý vẫn có xu hướng là cách tiếp cận được các nhà thực hành ưa chuộng. Tuy nhiên, các nghiên cứu gần đây về các mô hình không gian trạng thái sâu (deep state space models - SSMs) [33-37] (ví dụ: S4 và S5) đã tìm cách vượt qua độ phức tạp bậc hai của attention theo độ dài chuỗi trong khi vẫn duy trì khả năng song song hóa và hiệu suất của attention cũng như tính trạng thái của RNNs. Các phương pháp này đã được chứng minh là hiệu quả trong nhiều lĩnh vực khác nhau như giọng nói [38], hình ảnh [39], phân loại video [39,40], học tăng cường [41, 42], dự báo [43] và mô hình hóa ngôn ngữ [44-46].
+
+Được truyền cảm hứng từ các ý tưởng mô hình hóa từ ConvRNNs và SSMs sâu, chúng tôi giới thiệu các mô hình không gian trạng thái tích chập (convolutional state space models - ConvSSMs) có trạng thái có cấu trúc tensor như ConvLSTM nhưng có tham số hóa thời gian liên tục và cập nhật trạng thái tuyến tính như S4 và S5. Chúng tôi chỉ ra cách tính tuyến tính này có thể được khai thác để sử dụng các phép quét song song (parallel scans) để song song hóa hiệu quả trên chuỗi không-thời gian. Chúng tôi cũng thiết lập một sự tương đương giữa động lực học của các ConvSSMs có cấu trúc đặc biệt và SSMs. Điều này cho phép tận dụng các hiểu biết về tham số hóa và khởi tạo từ tài liệu SSM sâu [47] để mô hình hóa hiệu quả các phụ thuộc tầm xa. Kết quả là, chúng tôi giới thiệu ConvS5, một lớp không-thời gian mới, không yêu cầu nén các khung hình thành các token 1-D, có thể được song song hóa hiệu quả trên chuỗi, và có sinh tự hồi quy nhanh và ngữ cảnh không giới hạn. ConvS5 vượt trội đáng kể so với Transformers và ConvLSTM trong một thí nghiệm Moving-Mnist [48] đầy thách thức yêu cầu các phương pháp phải sinh 1200 khung hình. Ngoài ra, ConvS5 huấn luyện nhanh hơn 3× so với ConvLSTM trong nhiệm vụ này và sinh mẫu nhanh hơn 400× so với Transformer. Cuối cùng, chúng tôi chỉ ra rằng ConvS5 đạt được hoặc vượt qua hiệu suất của nhiều phương pháp tiên tiến khác nhau trên các benchmark dự đoán video tầm xa đầy thách thức DMLab, Minecraft và Habitat [7].
+
+2 Bối cảnh
+
+Phần này cung cấp nền tảng cần thiết để giới thiệu ConvSSMs và ConvS5 trong Phần 3.
+
+2.1 Mạng Hồi quy Tích chập
+
+Cho một chuỗi 1-D các đầu vào u₁:L ∈ R^U, một RNN cập nhật trạng thái x_k ∈ R^P của nó tại mỗi bước thời gian k với phương trình cập nhật trạng thái x_k = F(x_{k-1}, u_k), trong đó F() biểu diễn một hàm phi tuyến nào đó. Ví dụ, người ta có thể biểu diễn một RNN vanilla (bỏ qua số hạng bias) như
+
+x_k = tanh(Ax_{k-1} + Bu_k)  (1)
+
+với ma trận trạng thái A ∈ R^{P×P}, ma trận đầu vào B ∈ R^{P×U} và hàm tang hyperbol tanh() được áp dụng theo từng phần tử. Các RNN khác như LSTM [13] và GRU [14] định nghĩa các công thức F() phức tạp hơn.
+
+Mạng nơ-ron hồi quy tích chập [11,12] (ConvRNNs) mô hình hóa các chuỗi không-thời gian bằng cách thay thế các trạng thái và đầu vào 1-D của RNN bằng các tensor N-D và thay thế phép nhân ma trận-vector bằng các phép tích chập như trong mạng nơ-ron tích chập (CNNs). Cho một chuỗi độ dài L các khung hình, U₁:L ∈ R^{L×H₀×W₀×U}, với chiều cao H₀, chiều rộng W₀ và U đặc trưng, một ConvRNN cập nhật trạng thái của nó, X_k ∈ R^{H×W×P}, với phương trình cập nhật trạng thái X_k = G(X_{k-1}, U_k), trong đó G() là một hàm phi tuyến. Đối với một ví dụ cụ thể tương tự như (1), phương trình cập nhật trạng thái ConvRNN vanilla sẽ là
+
+X_k = tanh(A ∗ X_{k-1} + B ∗ U_k),  (2)
+
+trong đó ∗ là toán tử tích chập không gian với kernel trạng thái A ∈ R^{P×P×k_A×k_A} (sử dụng quy ước [đặc trưng đầu ra, đặc trưng đầu vào, chiều cao kernel, chiều rộng kernel]), kernel đầu vào B ∈ R^{P×U×k_B×k_B} và hàm tanh() được áp dụng theo từng phần tử. Phổ biến hơn, các cập nhật phức tạp như ConvLSTM [11] và ConvGRU [12] được sử dụng bằng cách thực hiện các thay đổi tương tự đối với phương trình LSTM và GRU 1-D tương ứng. ConvRNNs đã được sử dụng cho y sinh, robot, mô hình hóa giao thông, dự báo thời tiết và nhiều ứng dụng khác [49-60] và nhiều biến thể đã được đề xuất [61-68].
+
+2.2 Mô hình Không gian Trạng thái Sâu
+
+Phần này cung cấp một nền tảng ngắn gọn về các ý tưởng của các phương pháp SSM sâu như S4 [33] và S5 [36] được phát triển cho mô hình hóa chuỗi 1-D và chúng tôi tận dụng các hiểu biết của chúng cho phương pháp ConvS5 không-thời gian của chúng tôi.
+
+2.2.1 Mô hình Không gian Trạng thái Tuyến tính
+
+Cho một tín hiệu đầu vào liên tục u(t) ∈ R^U, một trạng thái ẩn x(t) ∈ R^P và một tín hiệu đầu ra y(t) ∈ R^M, một SSM tuyến tính thời gian liên tục được định nghĩa bởi phương trình vi phân:
+
+x'(t) = Ax(t) + Bu(t),  y(t) = Cx(t) + Du(t),  (3)
+
+và được tham số hóa bởi ma trận trạng thái A ∈ R^{P×P}, ma trận đầu vào B ∈ R^{P×U}, ma trận đầu ra C ∈ R^{M×P} và ma trận feedthrough D ∈ R^{M×U}. Cho một chuỗi lấy mẫu, u₁:L ∈ R^{L×U}, SSM có thể được rời rạc hóa để định nghĩa một SSM thời gian rời rạc
+
+x_k = Āx_{k-1} + B̄u_k,  y_k = Cx_k + Du_k,  (4)
+
+trong đó các tham số thời gian rời rạc là hàm của các tham số thời gian liên tục và một tham số tỷ lệ thời gian, Δ. Chúng ta định nghĩa Ā = DISCRETIZE_A(A, Δ) và B̄ = DISCRETIZE_B(A, B, Δ) trong đó DISCRETIZE() là một phương pháp rời rạc hóa như Euler, song tuyến (bilinear) hoặc giữ bậc không (zero-order hold) [69].
+
+2.2.2 Lớp Không gian Trạng thái: S4 và S5
+
+Gu et al. [33] đề xuất lớp chuỗi không gian trạng thái có cấu trúc (structured state space sequence - S4), mô hình hóa hiệu quả các chuỗi dài với độ phức tạp dưới bậc hai theo độ dài chuỗi. Một lớp S4 bao gồm nhiều SSMs đầu vào đơn, đầu ra đơn (SISO) được tham số hóa thời gian liên tục, một bước rời rạc hóa rõ ràng với các tham số tỷ lệ thời gian có thể học, và các hàm kích hoạt phi tuyến theo vị trí được áp dụng cho các đầu ra SSM để tạo ra chuỗi đầu ra của lớp. Nhiều lớp có thể được xếp chồng để tạo thành các mô hình chuỗi sâu có thể biểu diễn các hệ thống phi tuyến. Một lớp S4 có thể sử dụng các SSM tuyến tính của nó để xử lý một chuỗi song song bằng cách sử dụng các phép tích chập 1-D. Nó cũng có thể chạy các SSM tuyến tính của nó như RNNs để cho phép sinh tự hồi quy nhanh. Smith et al. [36] chỉ ra rằng với một số thay đổi kiến trúc, phương pháp này có thể được đơn giản hóa và linh hoạt hơn bằng cách thay thế các phép tích chập bằng các phép quét song song, dẫn đến lớp S4 đơn giản hóa (simplified S4 - S5). Một lớp S5 thay thế nhiều SSMs SISO của S4 bằng một SSM đa đầu vào, đa đầu ra như trong (3) và là một mô hình hồi quy đầy đủ, có trạng thái cho cả tính toán song song và tuần tự.
+
+2.3 Quét Song song
+
+Ở đây chúng tôi cung cấp một nền tảng ngắn gọn về các phép quét song song được sử dụng bởi S5 vì chúng cũng quan trọng đối với việc song song hóa phương pháp ConvS5 mà chúng tôi giới thiệu trong Phần 3. Xem Blelloch [72] để có một đánh giá chi tiết hơn. Cho một toán tử nhị phân kết hợp • (tức là (a•b)•c = a•(b•c)) và một chuỗi L phần tử [a₁, a₂, ..., a_L], phép toán quét trả về chuỗi
+
+[a₁, (a₁•a₂), ..., (a₁•a₂•...•a_L)].  (5)
+
+Các phép quét song song sử dụng thực tế là các toán tử kết hợp có thể được tính theo bất kỳ thứ tự nào. Một phép quét song song có thể được định nghĩa cho sự hồi quy tuyến tính của phương trình cập nhật trạng thái trong (4) bằng cách tạo các phần tử ban đầu c_k = (c_{k,a}, c_{k,b}) := (Ā, B̄u_k), phép quét được áp dụng trên và sử dụng toán tử nhị phân kết hợp lấy hai phần tử quét q_i, q_j và tạo ra một phần tử mới cùng kiểu,
+
+q_i • q_j := (q_{j,a}q_{i,a}, q_{j,a} ⊗ q_{i,b} + q_{j,b}),  (6)
+
+trong đó ⊙ là phép nhân ma trận-ma trận và ⊗ là phép nhân ma trận-vector. Cho đủ bộ xử lý, phép quét song song có thể được sử dụng để tính toán sự hồi quy tuyến tính của SSM rời rạc trong thời gian song song O(log L) [72].
+
+3 Phương pháp
+
+Trong phần này, chúng tôi giới thiệu các mô hình không gian trạng thái tích chập (ConvSSMs) và ConvS5, một lớp mô hình hóa không-thời gian có thể mở rộng và hiệu quả. Đầu tiên chúng tôi mô tả cách ConvSSMs có thể được song song hóa bằng cách sử dụng các phép quét song song. Sau đó chúng tôi kết nối ConvSSMs với SSMs và sử dụng kết nối này để thúc đẩy tham số hóa và khởi tạo của ConvS5 để cho phép nắm bắt các phụ thuộc tầm xa.
+
+3.1 Mô hình Không gian Trạng thái Tích chập
+
+Xét một tín hiệu đầu vào có giá trị tensor thời gian liên tục U(t) ∈ R^{H₀×W₀×U} với chiều cao H₀, chiều rộng W₀ và số đặc trưng đầu vào U. Chúng ta sẽ định nghĩa một mô hình không gian trạng thái tích chập tuyến tính thời gian liên tục (ConvSSM) với trạng thái X(t) ∈ R^{H×W×P}, đạo hàm X'(t) ∈ R^{H×W×P} và đầu ra Y(t) ∈ R^{H×W×U}, là phương trình vi phân:
+
+X'(t) = A ∗ X(t) + B ∗ U(t)  (7)
+Y(t) = C ∗ X(t) + D ∗ U(t)  (8)
+
+trong đó ∗ ký hiệu toán tử tích chập, A ∈ R^{P×P×k_A×k_A} là kernel trạng thái, B ∈ R^{P×U×k_B×k_B} là kernel đầu vào, C ∈ R^{U×P×k_C×k_C} là kernel đầu ra, và D ∈ R^{U×U×k_D×k_D} là kernel feedthrough. Chúng ta giả định rằng padding thích hợp được sử dụng để đảm bảo độ phân giải không gian giống nhau, H×W, được duy trì trong các trạng thái và đầu ra. Tương tự, cho một chuỗi L đầu vào, U₁:L ∈ R^{L×H₀×W₀×U}, chúng ta có thể định nghĩa một mô hình không gian trạng thái tích chập thời gian rời rạc là
+
+X_k = Ā ∗ X_{k-1} + B̄ ∗ U_k  (9)
+Y_k = C ∗ X_k + D ∗ U_k  (10)
+
+trong đó Ā ∈ R^{P×P×k_A×k_A} và B̄ ∈ R^{P×U×k_B×k_B} ký hiệu rằng các kernel này ở thời gian rời rạc. Lưu ý rằng các định nghĩa này tương tự với các định nghĩa của ConvRNNs được thảo luận trong Phần 2.1, vì chúng ta đã thay thế các đầu vào, trạng thái và đầu ra có giá trị vector của SSM bằng các tensor và thay thế phép nhân ma trận-vector bằng các phép tích chập.
+
+3.2 Song song hóa các Hồi quy Tích chập
+
+Chúng ta mong muốn tận dụng các phép quét song song để song song hóa hiệu quả việc tính toán hồi quy tích chập thời gian rời rạc trong (9). Như đã thảo luận trong Phần 2.2, điều này yêu cầu một toán tử nhị phân kết hợp. Cho thực tế là các toán tử tích chập là kết hợp, chúng tôi chỉ ra điều sau:
+
+Mệnh đề 1. Xét một hồi quy tích chập như trong (9) và định nghĩa các phần tử quét song song ban đầu c_k = (c_{k,a}, c_{k,b}) := (Ā, B̄ ∗ U_k). Toán tử nhị phân ~, được định nghĩa là:
+
+q_i ~ q_j := (q_{j,a} ⊛ q_{i,a}, q_{j,a} ∗ q_{i,b} + q_{j,b}),  (11)
+
+trong đó ⊛ ký hiệu phép tích chập của hai kernel, ∗ ký hiệu phép tích chập và + ký hiệu phép cộng theo từng phần tử, là kết hợp.
+
+
+--- [Phan 6/11] ---
+
+--- TRANG 3 ---
+động lực học của SSM và ConvSSM (Mục 3.3) và tận dụng điều này, trong Mục 3.4, để giới thiệu một thiết kế tham số hóa và khởi tạo có thể nắm bắt các phụ thuộc không gian-thời gian tầm xa.
+Kết quả là, chúng tôi giới thiệu ConvS5, một lớp không gian-thời gian mới là một biến thể ConvSSM hiệu quả. Nó
+có thể song song hóa và vượt qua các khó khăn trong quá trình huấn luyện (ví dụ: vấn đề gradient biến mất/bùng nổ)
+mà các phương pháp ConvRNN truyền thống gặp phải. ConvS5 không yêu cầu nén các khung hình thành
+token và cung cấp ngữ cảnh không giới hạn. Nó cũng cung cấp khả năng sinh tự hồi quy nhanh (thời gian và bộ nhớ không đổi cho mỗi bước)
+so với Transformer. ConvS5 vượt trội đáng kể so với Transformer
+và ConvLSTM trên một thí nghiệm Moving-MNIST [54] chân trời dài đầy thách thức đòi hỏi các phương pháp
+phải huấn luyện trên 600 khung hình và sinh tới 1.200 khung hình. Ngoài ra, ConvS5 huấn luyện nhanh hơn 3 lần so với
+ConvLSTM trên tác vụ này và sinh mẫu nhanh hơn 400 lần so với Transformer. Cuối cùng, chúng tôi chỉ ra
+rằng ConvS5 có hiệu suất ngang bằng hoặc vượt qua các phương pháp tiên tiến khác nhau trên các tiêu chuẩn dự đoán video tầm xa
+DMLab, Minecraft và Habitat đầy thách thức [13].
+2 Kiến thức nền tảng
+Mục này cung cấp kiến thức nền tảng cần thiết cho ConvSSM và ConvS5, được giới thiệu trong Mục 3.
+2.1 Mạng Hồi quy Tích chập
+Cho một chuỗi đầu vào u1:L trong RL×U, một RNN cập nhật trạng thái của nó, xk trong RP, sử dụng phương trình cập nhật
+trạng thái xk=F(xk−1,uk), trong đó F() là một hàm phi tuyến. Ví dụ, một RNN vanilla có thể được
+biểu diễn (bỏ qua số hạng bias) như
+xk= tanh(Axk−1+Buk) (1)
+với ma trận trạng thái A trong RP×P, ma trận đầu vào B trong RP×U và tanh() được áp dụng theo từng phần tử. Các
+RNN khác như LSTM [21] và GRU [22] sử dụng các công thức phức tạp hơn của F().
+Mạng nơ-ron hồi quy tích chập [17,18] (ConvRNN) được thiết kế để mô hình hóa các chuỗi
+không gian-thời gian bằng cách thay thế các trạng thái và đầu vào có giá trị vectơ của RNN truyền thống bằng tensor và
+thay thế phép nhân ma trận-vectơ bằng phép tích chập. Cho một chuỗi độ dài L các khung hình,
+U1:L trong RL×H′×W′×U, với chiều cao H′, chiều rộng W′ và U đặc trưng, một ConvRNN cập nhật trạng thái của nó,
+Xk trong RH×W×P, với phương trình cập nhật trạng thái Xk=G(Xk−1,Uk), trong đó G() là một hàm
+phi tuyến. Tương tự như (1), chúng ta có thể biểu diễn phương trình cập nhật trạng thái cho một ConvRNN vanilla như
+Xk= tanh(A*Xk−1+B*Uk), (2)
+trong đó * là toán tử tích chập không gian với hạt nhân trạng thái A trong RP×P×kA×kA (sử dụng quy ước [đầu ra
+đặc trưng, đầu vào đặc trưng, chiều cao hạt nhân, chiều rộng hạt nhân]), hạt nhân đầu vào B trong RP×U×kB×kB và
+tanh() được áp dụng theo từng phần tử. Các cập nhật phức tạp hơn như ConvLSTM [17] và ConvGRU [18]
+thường được sử dụng bằng cách thực hiện các thay đổi tương tự đối với các phương trình LSTM và GRU, tương ứng.
+2.2 Mô hình Không gian Trạng thái Sâu
+Mục này giới thiệu ngắn gọn các SSM sâu như S4 [19] và S5 [20] được thiết kế để mô hình hóa các
+chuỗi dài. Phương pháp ConvS5 mà chúng tôi giới thiệu trong Mục 3 mở rộng những ý tưởng này sang miền
+không gian-thời gian.
+Mô hình Không gian Trạng thái Tuyến tính Cho một tín hiệu đầu vào liên tục u(t) trong RU, một trạng thái ẩn x(t) trong RP
+và một tín hiệu đầu ra y(t) trong RM, một SSM tuyến tính thời gian liên tục được định nghĩa sử dụng một phương trình
+vi phân:
+x′(t) =Ax(t) +Bu(t),y(t) =Cx(t) +Du(t), (3)
+và được tham số hóa bởi một ma trận trạng thái A trong RP×P, một ma trận đầu vào B trong RP×U, một ma trận đầu ra
+C trong RM×P và một ma trận feedthrough D trong RM×U. Cho một chuỗi, u1:L trong RL×U, SSM có thể
+được rời rạc hóa để định nghĩa một SSM thời gian rời rạc
+xk=Axk−1+Buk,yk=Cxk+Duk, (4)
+trong đó các tham số thời gian rời rạc là một hàm của các tham số thời gian liên tục và một tham số
+thang thời gian, ∆. Chúng ta định nghĩa A= DISCRETIZE A(A,∆) và B= DISCRETIZE B(A,B,∆) trong đó
+DISCRETIZE() là một phương pháp rời rạc hóa như Euler, song tuyến tính hoặc giữ bậc không [55].
+3
+
+--- TRANG 4 ---
+S4 và S5 Gu et al. [19] đã giới thiệu lớp chuỗi không gian trạng thái có cấu trúc (S4) để
+mô hình hóa các chuỗi dài một cách hiệu quả. Một lớp S4 sử dụng nhiều SSM tuyến tính thời gian liên tục, một bước rời rạc hóa
+tường minh với các tham số thang thời gian có thể học, và các hàm kích hoạt phi tuyến theo vị trí được áp dụng cho
+các đầu ra SSM. Smith et al. [20] đã chỉ ra rằng với một số thay đổi kiến trúc, phương pháp có thể
+được đơn giản hóa và linh hoạt hơn bằng cách chỉ sử dụng một SSM như trong (3) và tận dụng các phép quét song song.
+Các lớp SSM, như S4 và S5, tận dụng thực tế rằng động lực học tuyến tính có thể được song song hóa
+với độ phức tạp dưới bậc hai theo độ dài chuỗi. Chúng cũng có thể chạy tuần tự như các
+RNN có trạng thái để sinh tự hồi quy nhanh. Trong khi một lớp SSM đơn như S4 hoặc S5 chỉ có
+động lực học tuyến tính, các kích hoạt phi tuyến được áp dụng cho các đầu ra SSM cho phép biểu diễn các hệ thống
+phi tuyến bằng cách xếp chồng nhiều lớp SSM [56-58].
+Tham số hóa và Khởi tạo SSM Tham số hóa và khởi tạo là các khía cạnh quan trọng
+cho phép các SSM sâu nắm bắt các phụ thuộc tầm xa hiệu quả hơn so với các nỗ lực trước đây
+với RNN tuyến tính [59-61]. Thiết lập chung bao gồm các tham số SSM thời gian liên tục, rời rạc hóa
+tường minh với các tham số thang thời gian có thể học, và khởi tạo ma trận trạng thái sử dụng các
+ma trận có cấu trúc lấy cảm hứng từ khung HiPPO [62]. Nghiên cứu trước đây nhấn mạnh tầm quan trọng của những
+lựa chọn này trong việc đạt được hiệu suất cao trên các tác vụ tầm xa đầy thách thức [19,20,56,57]. Công trình
+gần đây [57] đã nghiên cứu các tham số hóa/khởi tạo này chi tiết hơn và cung cấp cái nhìn sâu sắc về
+các phân phối giá trị riêng ban đầu thuận lợi và các hiệu ứng chuẩn hóa của thiết lập này.
+2.3 Phép Quét Song song
+Chúng tôi giới thiệu ngắn gọn các phép quét song song, như được S5 sử dụng, vì chúng quan trọng cho việc song song hóa
+phương pháp ConvS5 mà chúng tôi giới thiệu trong Mục 3. Xem Blelloch [63] để có bài đánh giá chi tiết hơn. Một phép toán
+quét, cho một toán tử kết hợp nhị phân • (tức là (a•b)•c=a•(b•c)) và một chuỗi L
+phần tử [a1, a2, ..., aL], cho ra chuỗi: [a1,(a1•a2), ..., (a1•a2•...•aL)].
+Các phép quét song song sử dụng thực tế rằng các toán tử kết hợp có thể được tính theo bất kỳ thứ tự nào. Một phép quét song song
+có thể được định nghĩa cho sự hồi quy tuyến tính của cập nhật trạng thái trong (4) bằng cách tạo các bộ quét ban đầu
+ck= (ck,a, ck,b) := (A,Buk) và tận dụng một toán tử kết hợp nhị phân lấy hai bộ
+qi, qj (hoặc là các bộ ban đầu ci, cj hoặc các bộ trung gian) và tạo ra một bộ mới cùng
+loại, qi•qj:= (qj,a⊙qi,a, qj,a⊗qi,b+qj,b), trong đó ⊙ là phép nhân ma trận-ma trận và ⊗
+là phép nhân ma trận-vectơ. Cho đủ bộ xử lý, phép quét song song tính toán sự hồi quy tuyến tính
+của (4) trong O(logL) bước tuần tự (tức là, độ sâu hoặc khoảng) [63].
+3 Phương pháp
+Mục này giới thiệu các mô hình không gian trạng thái tích chập (ConvSSM). Chúng tôi chỉ ra cách ConvSSM có thể
+được song song hóa với các phép quét song song. Sau đó chúng tôi kết nối động lực học của ConvSSM với SSM để thúc đẩy
+tham số hóa. Cuối cùng, chúng tôi sử dụng những hiểu biết này để giới thiệu một biến thể ConvSSM hiệu quả, ConvS5.
+3.1 Mô hình Không gian Trạng thái Tích chập
+Xét một đầu vào có giá trị tensor liên tục U(t) trong RH′×W′×U với chiều cao H′, chiều rộng W′, và
+số lượng đặc trưng đầu vào U. Chúng ta sẽ định nghĩa một mô hình không gian trạng thái tích chập tuyến tính thời gian liên tục
+(ConvSSM) với trạng thái X(t) trong RH×W×P, đạo hàm X′(t) trong RH×W×P và đầu ra Y(t) trong
+RH×W×U, sử dụng một phương trình vi phân:
+X′(t) =A*X(t) +B*U(t) (5)
+Y(t) =C*X(t) +D*U(t) (6)
+trong đó * ký hiệu toán tử tích chập, A trong RP×P×kA×kA là hạt nhân trạng thái, B trong RP×U×kB×kB
+là hạt nhân đầu vào, C trong RU×P×kC×kC là hạt nhân đầu ra, và D trong RU×U×kD×kD là
+hạt nhân feedthrough. Để đơn giản, chúng tôi đệm tích chập để đảm bảo độ phân giải không gian
+giống nhau, H×W, được duy trì trong các trạng thái và đầu ra. Tương tự, cho một chuỗi các đầu
+vào, U1:L trong RL×H′×W′×U, chúng ta định nghĩa một mô hình không gian trạng thái tích chập thời gian rời rạc như
+Xk=A*Xk−1+B*Uk (7)
+Yk=C*Xk+D*Uk (8)
+trong đó A trong RP×P×kA×kA và B trong RP×U×kB×kB ký hiệu rằng các hạt nhân này ở thời gian rời rạc.
+4
+
+
+--- [Phan 7/11] ---
+
+--- TRANG 5 ---
+Tiến hóa trạng thái của ConvSSM với kernel trạng thái theo điểm ảnh. Các điểm ảnh trạng thái tiến hóa theo cập nhật trạng thái SSM với một chuỗi L đầu vào, U1:L ∈ RL×H×W×U, chúng ta có thể định nghĩa một mô hình không gian trạng thái tích chập thời gian rời rạc như sau:
+
+Xk = A ⋆ Xk-1 + B ⋆ Uk     (9)
+Yk = C ⋆ Xk + D ⋆ Uk       (10)
+
+trong đó A ∈ RP×P×kA×kA và B ∈ RP×U×kB×kB ký hiệu rằng các kernel này ở dạng thời gian rời rạc. Chúng tôi sẽ quay lại các ý tưởng rời rạc hóa trong Phần 3.4.
+
+3.2 Song song hóa Đệ quy Tích chập
+
+Chúng tôi mong muốn tận dụng parallel scan để song song hóa hiệu quả việc tính toán đệ quy tích chập thời gian rời rạc trong Phương trình (9). Như đã thảo luận trong Phần 2.2, điều này yêu cầu một toán tử kết hợp nhị phân. Với thực tế rằng các toán tử tích chập có tính kết hợp, chúng tôi chỉ ra điều sau:
+
+Mệnh đề 1. Cho các phần tử ck = (ck,a, ck,b) := (A, B ⋆ Uk), toán tử nhị phân ∘, được định nghĩa là:
+
+qi ∘ qj := (qj,a ⊛ qi,a, qj,a ⋆ qi,b + qj,b),     (11)
+
+trong đó ⊛ ký hiệu phép tích chập của hai kernel, ⋆ ký hiệu phép tích chập và + ký hiệu phép cộng theo từng phần tử, có tính kết hợp.
+
+Chứng minh. Xem Phụ lục C.1.
+
+Điều này cho thấy về mặt lý thuyết, chúng ta có thể sử dụng parallel scan để tính toán đệ quy trong Phương trình (9). Tuy nhiên, có một vấn đề thực tế liên quan đến việc tích chập hai kernel tích chập cần được giải quyết. Khi chúng ta tích chập hai kernel tích chập với nhau, mỗi kernel có hình dạng (P, P, kA, kA), hình dạng kết quả sẽ là (P, P, 2ka-1, 2ka-1) [JS: cần liệt kê các giả định về padding cho điều này]. Điều này có nghĩa là các chiều không gian của kernel kết quả phải tăng lên khi chiều cao hoặc chiều rộng của các kernel gốc lớn hơn một. Điều này trở nên có vấn đề về mặt tính toán đối với các chuỗi dài. Do đó, chúng tôi giải quyết vấn đề này bằng cách đưa ra quyết định thiết kế đặt kA = 1 và chỉ xem xét các tích chập theo điểm (pointwise convolution) cho kernel trạng thái A. Trong khi điều này làm cho parallel scan khả thi về mặt tính toán, một nhược điểm tiềm ẩn là nó ngăn cản một ConvSSM đơn lẻ nắm bắt toàn bộ ngữ cảnh không gian-thời gian vì trường tiếp nhận không thể tăng lên theo hướng thời gian. Tuy nhiên, khi chúng ta xếp chồng nhiều lớp bao gồm các ConvSSM, điều này sẽ cho phép trường tiếp nhận tăng lên theo hướng chiều sâu của mạng và cho phép mạng tổng thể nắm bắt ngữ cảnh không gian-thời gian [62]. Các kết quả thực nghiệm của chúng tôi trong Phần 5 cho thấy đây không phải là một hạn chế về khả năng biểu đạt so với các phương pháp tiên tiến hoặc so với ConvLSTM với kernel 3×3. Về mặt tính toán, chúng ta hiện có một cấu trúc có thể được song song hóa hiệu quả với độ phức tạp dưới bậc hai so với độ dài chuỗi.
+
+Mệnh đề 2. Chi phí tính toán của đệ quy tích chập trong Phương trình ?? là O(UPk²HWL).
+
+Chứng minh. Xem Phụ lục C.1.
+
+3.3 Kết nối với Các Mô hình Không gian Trạng thái
+
+Chúng tôi chỉ ra trong phần này rằng có thể thiết lập một sự tương đương giữa động lực học của một ConvSSM sử dụng các kernel trạng thái theo điểm và động lực học của một hệ thống SSM khối chéo lớn. Do đó, chúng ta có thể sử dụng thực tế này để tận dụng các ý tưởng tham số hóa và khởi tạo từ các SSM sâu được thảo luận trong Phần 2.2.3 để cho phép các ConvSSM mô hình hóa hiệu quả các phụ thuộc tầm xa.
+
+3.3 Kết nối với Các Mô hình Không gian Trạng thái
+
+Vì các phép tích chập trong 7-8 và 9-10 là các phép toán tuyến tính, chúng có thể được mô tả tương đương dưới dạng phép nhân ma trận-vector sử dụng các ma trận circulant lớn bao gồm các phần tử kernel và làm phẳng các tensor đầu vào và trạng thái thành các vector [73]. Do đó, bất kỳ ConvSSM nào cũng có thể được mô tả như một SSM lớn với một ma trận động lực học circulant. Tuy nhiên, chúng tôi chỉ ra ở đây rằng việc sử dụng các kernel trạng thái theo điểm như được mô tả trong phần trước cung cấp một sự tương đương SSM thay thế, mang lại một cấu trúc đặc biệt có thể tận dụng các ý tưởng tham số hóa và khởi tạo SSM sâu được thảo luận trong Phần 2.2.3 để mô hình hóa các phụ thuộc tầm xa. Chúng tôi chỉ ra rằng mỗi điểm ảnh của trạng thái, X(t)i,j ∈ RP có thể được mô tả tương đương là tiến hóa theo một phương trình vi phân với một ma trận trạng thái được chia sẻ, ASSM, và ma trận đầu vào, BSSM. Xem Hình 1.
+
+X'(t)i,j ∈ RP
+X(t)i,j ∈ RP
+ASSM ∈ RP×P
+BSSM ∈ RP×(Uk²B)
+X'(t)i,j = ASSMX(t)i,j + BSSMUim2col(t)i,j
+U ∈ Uk²B
+H'×W'×U
+P×U×kB×kB
+P×P×1×1
+H×W×P
+
+[WB: Định nghĩa im2col trước phương trình 12. im2col cụ thể cho hình ảnh. Có cách nào khác để mô tả nó không?][JS: im2col áp dụng được cho bất kỳ tensor HxWxC nào (đây là trường hợp duy nhất chúng ta
+
+
+--- [Phan 8/11] ---
+
+xem xét). Nó cũng là một phép toán chính thức trong các phép toán GEMM217, và có một bài báo mà chúng ta có thể trích dẫn. Tôi sẵn sàng lắng nghe gợi ý, nhưng đang gặp khó khăn trong việc nghĩ ra một218cách mô tả sạch hơn về những gì chúng ta cần ở đây. Tôi cảm thấy rằng nói im2col và trích dẫn nó thực sự khá chính xác.]219Mệnh đề 3. Xét một cập nhật trạng thái ConvSSM như trong (7) với nhân trạng thái điểm A2220RP⇥P⇥1⇥1, nhân đầu vào B2RP⇥U⇥kB⇥kB, và đầu vào U(t)2RH0⇥W0⇥U. Sắp xếp lại221nhân trạng thái điểm A thành một ma trận ASSM2RP⇥P. Sắp xếp lại nhân đầu vào B thành một ma trận222BSSM2RP⇥(Uk2B). Phương trình vi phân của (7) là tương đương, sau khi định hình lại X(t) và X0(t)223thành x(t), x0(t)2RHWPtương ứng, với phương trình vi phân sau224x0(t)=ABlockx(t)+BBlocku(t),(12)trong đó ABlock2RHWP⇥HWP và BBlock2RHWP⇥HWUk2b là khối chéo với ASSM và225BSSM trên các khối chéo tương ứng, và u(t)2RHWUk2b là kết quả của việc nối các226cột được hình thành bằng cách thực hiện phép toán im2col [74, 75] trên đầu vào U(t).227Chứng minh. Xem Phụ lục C.3.228Do đó, việc tham số hóa và khởi tạo ASSM với các ma trận HiPPO có cấu trúc đặc biệt [47] và229rời rạc hóa với một tham số thang thời gian có thể học để có được ASSM và BSSM sẽ trao cho các230SSM này cùng động lực học như trong các phương pháp S4/S5 quan trọng để mô hình hóa các phụ thuộc231tầm xa. Do tính tương đương của Mệnh đề 3, sau đó chúng ta có thể sắp xếp lại các ma trận này thành232các nhân trạng thái và đầu vào ConvSSM rời rạc của 9 để trao cho đệ quy tích chập cùng233các tính chất động lực học có lợi. Lưu ý công thức ConvSSM dễ làm việc hơn so với234việc hình thành rõ ràng cập nhật trạng thái SSM lớn, khối chéo và cho phép tận dụng các phép toán235tích chập được tối ưu hóa cao trong các framework học sâu hiện đại [76-78].2363.4 ConvSSM Hiệu quả cho Phụ thuộc Tầm xa: ConvS5237Trong phần này, chúng tôi giới thiệu ConvS5 kết hợp các ý tưởng về song song hóa các đệ quy238tích chập (Mục 3.2) và kết nối SSM (Mục 3.3). ConvS5 là một ConvSSM239tận dụng quét song song và các sơ đồ tham số hóa/khởi tạo SSM sâu. Cho trước Mệnh đề24063.3 Kết nối với Mô hình Không gian Trạng thái196Vì các phép tích chập trong 7-8 và 9-10 là các phép toán tuyến tính, chúng có thể được mô tả tương đương dưới dạng197các phép nhân ma trận-vector sử dụng các ma trận tuần hoàn lớn bao gồm các phần tử nhân và198làm phẳng các tensor đầu vào và trạng thái thành các vector [73]. Do đó, bất kỳ ConvSSM nào cũng có thể được mô tả như199một SSM lớn với một ma trận động lực học tuần hoàn. Tuy nhiên, chúng tôi chỉ ra ở đây rằng việc sử dụng các nhân200trạng thái điểm như mô tả trong phần trước cung cấp một tương đương SSM thay thế, mang lại201một cấu trúc đặc biệt có thể tận dụng các ý tưởng tham số hóa và khởi tạo SSM sâu202được thảo luận trong Mục 2.2.3 để mô hình hóa các phụ thuộc tầm xa. Chúng tôi chỉ ra rằng mỗi pixel của203trạng thái, X(t)i,j2RP có thể được mô tả tương đương như phát triển theo một phương trình vi phân204với một ma trận trạng thái chung, ASSM, và ma trận đầu vào, BSSM. Xem Hình 1.205X0(t)i,jP206X(t)i,jP207ASSMP⇥P208BSSMP⇥(Uk2B)209X0(t)i,j=ASSMX(t)i,j+BSSMUim2col(t)i,j210Uk2B211H0⇥W0⇥U212P⇥U⇥kB⇥kB213P⇥P⇥1⇥1214H⇥W⇥P215[WB: Định nghĩa im2col trước phương trình 12. im2cal đặc thù cho ảnh. Có cách nào khác để mô tả nó không?][JS: im2col216áp dụng cho bất kỳ tensor HxWxC nào (đây là trường hợp duy nhất chúng ta xem xét). Nó cũng là một phép toán chính thức trong các phép toán GEMM217, và có một bài báo mà chúng ta có thể trích dẫn. Tôi sẵn sàng lắng nghe gợi ý, nhưng đang gặp khó khăn trong việc nghĩ ra một218cách mô tả sạch hơn về những gì chúng ta cần ở đây. Tôi cảm thấy rằng nói im2col và trích dẫn nó thực sự khá chính xác.]219Mệnh đề 3. Xét một cập nhật trạng thái ConvSSM như trong (7) với nhân trạng thái điểm A2220RP⇥P⇥1⇥1, nhân đầu vào B2RP⇥U⇥kB⇥kB, và đầu vào U(t)2RH0⇥W0⇥U. Sắp xếp lại221nhân trạng thái điểm A thành một ma trận ASSM2RP⇥P. Sắp xếp lại nhân đầu vào B thành một ma trận222BSSM2RP⇥(Uk2B). Phương trình vi phân của (7) là tương đương, sau khi định hình lại X(t) và X0(t)223thành x(t), x0(t)2RHWPtương ứng, với phương trình vi phân sau224x0(t)=ABlockx(t)+BBlocku(t),(12)trong đó ABlock2RHWP⇥HWP và BBlock2RHWP⇥HWUk2b là khối chéo với ASSM và225BSSM trên các khối chéo tương ứng, và u(t)2RHWUk2b là kết quả của việc nối các226cột được hình thành bằng cách thực hiện phép toán im2col [74, 75] trên đầu vào U(t).227Chứng minh. Xem Phụ lục C.3.228Do đó, việc tham số hóa và khởi tạo ASSM với các ma trận HiPPO có cấu trúc đặc biệt [47] và229rời rạc hóa với một tham số thang thời gian có thể học để có được ASSM và BSSM sẽ trao cho các230SSM này cùng động lực học như trong các phương pháp S4/S5 quan trọng để mô hình hóa các phụ thuộc231tầm xa. Do tính tương đương của Mệnh đề 3, sau đó chúng ta có thể sắp xếp lại các ma trận này thành232các nhân trạng thái và đầu vào ConvSSM rời rạc của 9 để trao cho đệ quy tích chập cùng233các tính chất động lực học có lợi. Lưu ý công thức ConvSSM dễ làm việc hơn so với234việc hình thành rõ ràng cập nhật trạng thái SSM lớn, khối chéo và cho phép tận dụng các phép toán235tích chập được tối ưu hóa cao trong các framework học sâu hiện đại [76-78].2363.4 ConvSSM Hiệu quả cho Phụ thuộc Tầm xa: ConvS5237Trong phần này, chúng tôi giới thiệu ConvS5 kết hợp các ý tưởng về song song hóa các đệ quy238tích chập (Mục 3.2) và kết nối SSM (Mục 3.3). ConvS5 là một ConvSSM239tận dụng quét song song và các sơ đồ tham số hóa/khởi tạo SSM sâu. Cho trước Mệnh đề240
+
+
+--- [Phan 9/11] ---
+
+kết nối (Mục 3.3). ConvS5 là một ConvSSM tận dụng các phép quét song song và các sơ đồ tham số hóa/khởi tạo SSM sâu. Cho Mệnh đề 3, chúng ta có thể tham số hóa ngầm định một kernel trạng thái pointwise, A∈RP×P×1×1 và kernel đầu vào B∈RP×U×kB×kB trong (7) bằng cách sử dụng các tham số SSM như được sử dụng bởi S5 [36], AS5∈RP×P và BS5∈RP×(Uk²B). Chúng ta có thể rời rạc hóa các tham số SSM S5 này như đã thảo luận trong Mục 2.2.1 để có ĀS5=DISCRETIZEA(AS5,Δ), B̄S5=DISCRETIZEB(AS5,BS5,Δ), (13) và sau đó sắp xếp lại để có các kernel cập nhật trạng thái ConvS5: ĀS5∈RP×P → ĀConvS5∈RP×P×1×1 (14) B̄S5∈RP×(Uk²B) → B̄ConvS5∈RP×U×kB×kB. (15) Sau đó chúng ta chạy hệ thống ConvSSM đã rời rạc hóa của các Phương trình (9, 10), trong đó sự hồi quy có thể được tính toán bằng cách sử dụng các phép quét song song. Lưu ý rằng trong thực tế, thiết lập này thực sự cho phép chúng ta tham số hóa ConvS5 bằng cách sử dụng trạng thái đường chéo [34-36], điều này làm giảm chi phí áp dụng phép quét song song trong Mệnh đề 2 xuống O(LPHW). Xem Phụ lục A để có thảo luận chi tiết hơn về tham số hóa, khởi tạo và rời rạc hóa.
+
+Hình 2: Động lực học của một ConvSSM với kernel trạng thái pointwise (trên) có thể được xem tương đương như động lực học của một SSM (dưới). Xem Mệnh đề 3. Mỗi pixel trạng thái ConvSSM phát triển theo một cập nhật trạng thái SSM với ma trận trạng thái được chia sẻ, ASSM, và ma trận đầu vào, BSSM, có thể được hình thành bằng cách định hình lại kernel trạng thái và kernel đầu vào của ConvSSM. Điều này cho phép tận dụng các hiểu biết về tham số hóa từ các SSM sâu [19, 41, 42, 20, 57] để trang bị cho ConvS5 khả năng mô hình hóa các phụ thuộc tầm xa.
+
+3.2 Song song hóa các Hồi quy Tích chập
+
+ConvS5 tận dụng các phép quét song song để song song hóa hiệu quả sự hồi quy trong (7). Như đã thảo luận trong Mục 2.3, điều này yêu cầu một toán tử nhị phân kết hợp. Cho rằng các phép tích chập có tính kết hợp, chúng tôi chỉ ra:
+
+Mệnh đề 1. Xét một hồi quy tích chập như trong (7) và định nghĩa các phần tử quét song song ban đầu ck = (ck,a, ck,b) := (A, B*Uk). Toán tử nhị phân ⊛, được định nghĩa dưới đây, có tính kết hợp.
+qi⊛qj:= (qj,a◦qi,a, qj,a*qi,b+qj,b), (9)
+trong đó ◦ biểu thị phép tích chập của hai kernel, * biểu thị phép tích chập và + là phép cộng theo từng phần tử.
+
+Chứng minh. Xem Phụ lục A.1.
+
+Do đó, về lý thuyết, chúng ta có thể sử dụng toán tử nhị phân này với một phép quét song song để tính toán sự hồi quy trong (7). Tuy nhiên, toán tử nhị phân, ⊛, yêu cầu tích chập hai kernel trạng thái có độ phân giải kA×kA với nhau. Để duy trì tính tương đương với phép quét tuần tự, kernel kết quả sẽ có độ phân giải 2ka−1×2ka−1. Điều này ngụ ý rằng kernel trạng thái sẽ phát triển trong các tính toán quét song song đối với các kernel tổng quát có độ phân giải lớn hơn 1×1. Điều này cho phép trường tiếp nhận phát triển theo hướng thời gian, một đặc điểm hữu ích để nắm bắt ngữ cảnh không gian-thời gian. Tuy nhiên, sự phát triển kernel này là không khả thi về mặt tính toán đối với các chuỗi dài.
+
+Chúng tôi giải quyết thách thức này bằng cách lấy cảm hứng thêm từ các SSM sâu. Các phương pháp này chọn các phép toán đơn giản nhưng có lợi về mặt tính toán theo hướng thời gian (động lực học tuyến tính) và sử dụng các phép toán phức tạp hơn (kích hoạt phi tuyến) theo hướng độ sâu của mô hình. Các kích hoạt phi tuyến này cho phép một chồng các lớp SSM với động lực học tuyến tính biểu diễn các hệ thống phi tuyến. Tương tự, chúng tôi chọn sử dụng các kernel trạng thái 1×1 và thực hiện các phép tích chập trạng thái pointwise cho hồi quy tích chập của (7). Khi chúng ta xếp chồng nhiều lớp ConvSSM này, trường tiếp nhận phát triển theo hướng độ sâu của mạng và cho phép chồng các lớp nắm bắt ngữ cảnh không gian-thời gian [64]. Về mặt tính toán, bây giờ chúng ta có một cấu trúc có thể được song song hóa với độ phức tạp dưới bậc hai đối với độ dài chuỗi.
+
+Mệnh đề 2. Cho các đầu vào hiệu quả B*U1:L trong RL×H×W×P và một kernel trạng thái pointwise A trong RP×P×1×1, chi phí tính toán để tính toán hồi quy tích chập trong Phương trình 7 với một phép quét song song là O(L(P³+P²HW)).
+
+Chứng minh. Xem Phụ lục A.2.
+
+Hơn nữa, việc triển khai ConvS5 được giới thiệu dưới đây cho phép tham số hóa đường chéo hóa làm giảm chi phí này xuống O(LPHW). Xem Mục 3.4 và Phụ lục B để biết thêm chi tiết.
+
+3.3 Kết nối với các Mô hình Không gian Trạng thái
+
+Vì các phép tích chập trong (5-6) và (7-8) là các phép toán tuyến tính, chúng có thể được mô tả tương đương như các phép nhân ma trận-vector bằng cách làm phẳng các tensor đầu vào và trạng thái thành các vector và sử dụng các ma trận tuần hoàn lớn bao gồm các phần tử kernel [65]. Do đó, bất kỳ ConvSSM nào cũng có thể được mô tả như một SSM lớn với ma trận động lực học tuần hoàn. Tuy nhiên, chúng tôi chỉ ra ở đây rằng việc sử dụng các kernel trạng thái pointwise, như được mô tả trong phần trước, cung cấp một sự tương đương SSM thay thế, mang lại một cấu trúc đặc biệt có thể tận dụng các ý tưởng tham số hóa/khởi tạo SSM sâu được thảo luận trong Mục 2.2 để mô hình hóa các phụ thuộc tầm xa. Chúng tôi chỉ ra rằng mỗi pixel của trạng thái, X(t)i,j trong RP, có thể được mô tả tương đương như phát triển theo một phương trình vi phân với ma trận trạng thái được chia sẻ, ASSM, và ma trận đầu vào, BSSM. Xem Hình 2.
+
+Mệnh đề 3. Xét một cập nhật trạng thái ConvSSM như trong (5) với kernel trạng thái pointwise A trong RP×P×1×1, kernel đầu vào B trong RP×U×kB×kB, và đầu vào U(t) trong RH'×W'×U. Gọi Uim2col(t) trong RH×W×Uk²B là kết quả định hình lại của việc áp dụng phép toán Image to Column (im2col) [66, 67] lên đầu vào U(t). Khi đó động lực học của mỗi pixel trạng thái của (5), X(t)i,j trong RP, phát triển theo phương trình vi phân sau
+X'(t)i,j=ASSMX(t)i,j+BSSMUim2col(t)i,j (10)
+trong đó ma trận trạng thái, ASSM trong RP×P, và ma trận đầu vào, BSSM trong RP×(Uk²B), có thể được hình thành bằng cách định hình lại kernel trạng thái, A, và kernel đầu vào, B, tương ứng.
+
+Chứng minh. Xem Phụ lục A.3.
+
+Do đó, để trang bị cho các SSM này cùng các tính chất động lực học tầm xa thuận lợi như các phương pháp S4/S5, chúng tôi khởi tạo ASSM với một ma trận lấy cảm hứng từ HiPPO [62] và rời rạc hóa với một tham số thang thời gian có thể học được để thu được ĀSSMvà B̄SSM. Do tính tương đương của Mệnh đề 3, chúng ta sau đó định hình lại các ma trận này thành các kernel trạng thái và đầu vào ConvSSM rời rạc của (7) để trao cho hồi quy tích chập cùng các tính chất động lực học có lợi. Chúng tôi lưu ý rằng nếu các độ rộng kernel đầu vào, đầu ra và động lực học được đặt thành 1×1, thì công thức ConvSSM tương đương với việc "tích chập" một SSM qua mỗi chuỗi pixel riêng lẻ trong chuỗi không gian-thời gian (điều này cũng có mối liên hệ với thành phần thời gian của S4ND [45] khi áp dụng cho video). Tuy nhiên, lấy cảm hứng từ ConvRNN, chúng tôi quan sát được hiệu suất cải thiện khi tận dụng cấu trúc tích chập tổng quát hơn mà ConvSSM cho phép và tăng kích thước kernel đầu vào/đầu ra để cho phép các đặc trưng không gian cục bộ được trộn lẫn trong hệ thống động lực học. Xem các ablation được thảo luận trong Mục 5.3.
+
+3.4 ConvSSM Hiệu quả cho Phụ thuộc Tầm xa: ConvS5
+
+Ở đây, chúng tôi giới thiệu ConvS5, kết hợp các ý tưởng song song hóa các hồi quy tích chập (Mục 3.2) và kết nối SSM (Mục 3.3). ConvS5 là một ConvSSM tận dụng các phép quét song song và các sơ đồ tham số hóa/khởi tạo SSM sâu. Cho Mệnh đề 3, chúng ta tham số hóa ngầm định một kernel trạng thái pointwise, A trong RP×P×1×1 và kernel đầu vào B trong RP×U×kB×kB trong (5) bằng cách sử dụng các tham số SSM như được sử dụng bởi S5 [20], AS5 trong RP×P và BS5 trong RP×(Uk²B). Chúng ta rời rạc hóa các tham số SSM S5 này như đã thảo luận trong Mục 2.2 để có
+ĀS5= DISCRETIZEA(AS5,Δ), B̄S5= DISCRETIZEB(AS5,BS5,Δ), (11)
+và sau đó định hình lại để có các kernel cập nhật trạng thái ConvS5:
+ĀS5 trong RP×P → ĀConvS5 trong RP×P×1×1 (12)
+B̄S5 trong RP×(Uk²B) → B̄ConvS5 trong RP×U×kB×kB. (13)
+Sau đó chúng ta chạy hệ thống ConvSSM đã rời rạc hóa của (7-8), sử dụng các phép quét song song để tính toán sự hồi quy. Trong thực tế, thiết lập này cho phép chúng ta tham số hóa ConvS5 bằng cách sử dụng tham số hóa đường chéo hóa [41, 42, 20] làm giảm chi phí áp dụng phép quét song song trong Mệnh đề 2 xuống O(LPHW). Xem Phụ lục B để có thảo luận chi tiết hơn về tham số hóa, khởi tạo và rời rạc hóa.
+
+Chúng tôi định nghĩa một lớp ConvS5 là sự kết hợp của ConvS5 với một hàm phi tuyến được áp dụng cho các đầu ra ConvS5. Ví dụ, cho các thí nghiệm trong bài báo này, chúng tôi sử dụng các khối ResNet [68] cho các kích hoạt phi tuyến giữa các lớp. Tuy nhiên, đây là dạng module, và các lựa chọn khác như ConvNext [69] hoặc các khối S4ND [45] có thể dễ dàng được sử dụng. Cuối cùng, nhiều lớp ConvS5 có thể được xếp chồng để tạo thành một mô hình chuỗi không gian-thời gian sâu.
+
+Bảng 1: Độ phức tạp tính toán của Transformer, ConvRNN và ConvS5 đối với độ dài chuỗi. Các chỉ số là chi phí suy luận (chi phí mỗi bước sinh tự hồi quy), chi phí mỗi bước huấn luyện, và khả năng song song hóa. ConvS5 kết hợp những điểm tốt nhất của Transformer và ConvRNN.
+
+Transformer ConvRNNs ConvS5
+Suy luận O(L) O(1) O(1)
+Huấn luyện O(L²) O(L) O(L)
+Có thể song song hóa Có Không Có
+
+3.5 Các Tính chất của ConvS5
+
+Tham khảo Bảng 1 để so sánh độ phức tạp tính toán cho Transformer, ConvRNN và ConvS5. Các phép quét song song cho phép ConvS5 được song song hóa qua chuỗi như một Transformer nhưng với chi phí chỉ tăng tuyến tính theo độ dài chuỗi. Ngoài ra, ConvS5 là một mô hình có trạng thái như ConvRNN, cho phép sinh tự hồi quy nhanh, ngoại suy sang các độ dài chuỗi khác nhau, và một cửa sổ ngữ cảnh không giới hạn. Kết nối với các SSM như S5 được suy ra trong Mục 3.3 cho phép chỉ định chính xác động lực học ban đầu để cho phép mô hình hóa các phụ thuộc tầm xa và nhận ra lợi ích từ ngữ cảnh không giới hạn. Cuối cùng, phép quét song song của ConvS5 có thể cho phép tận dụng tham số hóa thời gian liên tục để xử lý các chuỗi được lấy mẫu không đều đặn song song. S5 đạt được điều này bằng cách cung cấp khoảng cách phù hợp cho phép toán rời rạc hóa [20], một thủ tục mà ConvS5 cũng có thể sử dụng.
+
+Chúng tôi đã đề xuất một cấu trúc ConvSSM tổng quát có thể dễ dàng thích nghi với các đổi mới trong tương lai trong tài liệu SSM sâu. Phép quét song song của ConvS5 có thể được sử dụng để trang bị cho ConvS5 động lực học thay đổi theo thời gian như động lực học phụ thuộc đầu vào được chứng minh là có lợi trong công trình Liquid-S4 [43]. Nhiều công trình [51, 52, 50, 53] đề xuất thêm cổng nhân để cho phép các phương pháp dựa trên SSM vượt qua một số điểm yếu trong mô hình hóa ngôn ngữ. Các ý tưởng tương tự có thể hữu ích cho ConvSSM để suy luận trên các chuỗi không gian-thời gian dài.
+
+4 Công trình Liên quan
+
+Công trình này liên quan chặt chẽ nhất đến ConvRNN và các SSM sâu đã được thảo luận. Chúng tôi lưu ý ở đây rằng ConvRNN đã được sử dụng trong nhiều lĩnh vực, bao gồm y sinh, robot, mô hình hóa giao thông và dự báo thời tiết [70, 1, 71, 2, 3, 72-75, 4, 76, 77]. Ngoài ra, nhiều biến thể đã được đề xuất [78-84, 64]. SSM đã được xem xét trước đây cho phân loại video [46, 45, 85], tuy nhiên không có công trình nào giải quyết vấn đề đầy thách thức về sinh các chuỗi không gian-thời gian dài. S4ND [45] đề xuất áp dụng các lớp S4 riêng biệt cho mỗi trục của một hình ảnh hoặc video, tương tự như cách tiếp cận PixelRNN [86], và sau đó kết hợp các kết quả với một tích ngoài. Trong khi công trình đó chủ yếu tập trung vào hình ảnh, họ cũng cho thấy kết quả cho một nhiệm vụ phân loại video ngắn 30 khung hình. Chúng tôi lưu ý rằng cách tiếp cận này có thể bổ sung cho chúng tôi và các khối S42D có thể được sử dụng để thay thế một số khối ResNet được sử dụng làm kích hoạt trong mô hình của chúng tôi. Các kiến trúc mô hình khác được khám phá trong tài liệu cho mô hình hóa không gian-thời gian bao gồm các cách tiếp cận tích chập 3D [87-89], transformer, [9, 13, 14, 24-27] và RNN tiêu chuẩn [16, 90]. Các nỗ lực giải quyết vấn đề mô hình hóa các chuỗi không gian-thời gian dài đã liên quan đến các biểu diễn nén [9, 91, 10, 92, 27, 29], huấn luyện trên các tập con khung hình thưa thớt [15, 93, 8, 94, 95], các phân cấp thời gian [16], các biểu diễn neural thời gian liên tục [93, 95], huấn luyện trên các chuỗi có độ dài khác nhau ở các độ phân giải khác nhau [96] và lấy mẫu theo bước [14, 97]. Đặc biệt quan tâm, Yan et al. [13] giới thiệu Temporally Consistent (TECO) Video Transformer, đạt được hiệu suất tiên tiến trên các benchmark môi trường 3D đầy thách thức được thiết kế để chứa các phụ thuộc tầm xa [13]. Cách tiếp cận này kết hợp động lực học tiềm ẩn lượng tử hóa vector (VQ) với một prior động lực học MaskGit [98], và một số thủ thuật huấn luyện để mô hình hóa các video dài.
+
+5 Thí nghiệm
+
+Trong Mục 5.1, chúng tôi trình bày một thí nghiệm Moving-MNIST tầm xa dài để so sánh trực tiếp ConvRNN, Transformer và ConvS5. Trong Mục 5.2, chúng tôi đánh giá ConvS5 trên các benchmark môi trường 3D đầy thách thức được đề xuất trong Yan et al. [13]. Cuối cùng, trong Mục 5.3, chúng tôi thảo luận về các ablation làm nổi bật tầm quan trọng của tham số hóa ConvS5.
+
+5.1 Sinh Moving-MNIST Tầm xa Dài
+
+Có rất ít các benchmark hiện có để huấn luyện và sinh các chuỗi không gian-thời gian dài. Chúng tôi phát triển một nhiệm vụ dự đoán Moving-MNIST [54] tầm xa dài yêu cầu huấn luyện trên 300-600 khung hình và sinh chính xác lên đến 1200 khung hình. Điều này cho phép so sánh trực tiếp ConvS5, ConvRNN và Transformer cũng như một lựa chọn attention hiệu quả (Performer [33]) và CW-VAE [16], một phương pháp dựa trên RNN phân cấp thời gian. Đầu tiên chúng tôi huấn luyện tất cả các mô hình trên 300 khung hình và sau đó đánh giá bằng cách điều kiện trên 100 khung hình trước khi sinh 1200 khung. Chúng tôi lặp lại đánh giá sau khi huấn luyện trên 600 khung hình. Xem Phụ lục D để biết thêm chi tiết thí nghiệm. Chúng tôi trình bày các kết quả sau khi sinh 800 và 1200 khung hình trong Bảng 2. Xem Phụ lục C cho các quỹ đạo mẫu được chọn ngẫu nhiên. ConvS5 đạt được hiệu suất tổng thể tốt nhất. Khi chỉ được huấn luyện trên 300 khung hình, ConvLSTM và ConvS5 hoạt động tương tự khi sinh 1200 khung hình, và cả hai đều vượt trội hơn Transformer. Tất cả các phương pháp đều hưởng lợi từ việc huấn luyện trên chuỗi 600 khung hình dài hơn. Tuy nhiên, độ dài huấn luyện dài hơn cho phép ConvS5 vượt trội đáng kể so với các phương pháp khác trên các chỉ số khi sinh 1200 khung hình.
+
+Trong Bảng 2-dưới chúng tôi xem xét lại các tính chất lý thuyết của Bảng 1 và so sánh các chi phí tính toán thực nghiệm của Transformer, ConvLSTM và ConvS5 trên nhiệm vụ Moving-MNIST 600 khung hình. Mặc dù cấu hình ConvS5 cụ thể này yêu cầu thêm một vài FLOP do các tính toán tích chập, ConvS5 có thể song song hóa trong quá trình huấn luyện (không giống ConvLSTM) và có sinh tự hồi quy nhanh (không giống Transformer) - huấn luyện nhanh hơn 3 lần so với ConvLSTM và sinh mẫu nhanh hơn 400 lần so với Transformer.
+
+5.2 Các Benchmark Môi trường 3D Tầm xa
+
+Yan et al. [13] giới thiệu một benchmark dự đoán video đầy thách thức được thiết kế đặc biệt để chứa các phụ thuộc tầm xa. Đây là một trong những benchmark toàn diện đầu tiên cho mô hình hóa không gian-thời gian tầm xa và bao gồm các video 300 khung hình của các tác nhân ngẫu nhiên đi qua các môi trường 3D trong DMLab [99], Minecraft [100], và Habitat [101]. Xem Phụ lục C để biết thêm chi tiết thí nghiệm và Phụ lục E để biết thêm chi tiết về mỗi tập dữ liệu.
+
+Chúng tôi huấn luyện các mô hình bằng cách sử dụng cùng các mã VQ (lượng tử hóa vector) 16×16 từ các VQ-GAN [30] được huấn luyện trước được sử dụng cho TECO và các baseline khác trong Yan et al. [13]. Ngoài ConvS5 và các baseline hiện có, chúng tôi cũng huấn luyện một Transformer (không có framework TECO), Performer và S5. Baseline S5 phục vụ như một ablation trên cách tiếp cận có cấu trúc tensor tích chập của ConvS5. Cuối cùng, vì TECO về cơ bản là một framework huấn luyện (chuyên dụng cho Transformer), chúng tôi cũng sử dụng các lớp ConvS5 và S5 như một thay thế trực tiếp cho Transformer trong TECO. Do đó, chúng tôi gọi phiên bản gốc của TECO là TECO-Transformer, phiên bản ConvS5 là TECO-ConvS5 và phiên bản S5 là TECO-S5. Xem Phụ lục D để biết thông tin chi tiết về các thủ tục huấn luyện, kiến trúc và siêu tham số.
+
+DMLab Các kết quả cho DMLab được trình bày trong Bảng 3. Trong số các phương pháp được huấn luyện mà không có framework TECO trong phần trên của Bảng 3, ConvS5 vượt trội hơn tất cả các baseline, bao gồm các cách tiếp cận RNN [90, 16], attention hiệu quả [39, 33] và diffusion [15]. ConvS5 cũng có sinh tự hồi quy nhanh hơn nhiều so với Transformer. ConvS5 vượt trội đáng kể so với S5 trên tất cả các chỉ số, chỉ ra giá trị của cấu trúc tích chập của ConvS5.
+
+Đối với các mô hình được huấn luyện với framework TECO, chúng ta thấy rằng TECO-ConvS5 đạt được về cơ bản cùng FVD và LPIPS như TECO-Transformer, trong khi cải thiện đáng kể PSNR và SSIM. Lưu ý các so sánh tốc độ mẫu ít ấn tượng hơn trong cài đặt này vì thủ tục lấy mẫu MaskGit [98] tương đối chậm. Tuy nhiên, thông lượng mẫu của TECO-ConvS5 và TECO-S5 vẫn không đổi, trong khi thông lượng của TECO-Transformer giảm theo độ dài chuỗi.
+
+Minecraft và Habitat Bảng 4 trình bày các kết quả trên các benchmark Minecraft và Habitat. Trên Minecraft, TECO-ConvS5 đạt được FVD tốt nhất và hoạt động tương đương với TECO-Transformer trên các chỉ số khác, vượt trội hơn tất cả các baseline khác. Trên Habitat, TECO-ConvS5 là phương pháp duy nhất đạt được FVD tương đương với TECO-Transformer, trong khi vượt trội hơn nó về PSNR và SSIM.
+
+5.3 Các ablation ConvS5
+
+Trong Bảng 5 chúng tôi trình bày các ablation về cấu trúc tích chập của ConvS5. Chúng tôi so sánh các kích thước kernel đầu vào và đầu ra khác nhau cho ConvSSM và cũng so sánh các kích hoạt ResNet mặc định với một kích hoạt GLU [102] trộn kênh. Khi có thể, khi giảm kích thước của các kernel ConvSSM, chúng tôi phân phối lại các tham số cho các kernel ResNet hoặc kích thước GLU để so sánh các số lượng tham số tương tự. Các kết quả cho thấy cấu trúc tích chập nhiều hơn cải thiện hiệu suất.
+
+
+--- [Phan 10/11] ---
+
+Bảng 4: Đánh giá định lượng trên các benchmark tầm xa Minecraft và Habitat [13]. Kết quả
+từ Yan et al. [13] được đánh dấu bằng *. Xem Bảng 10 mở rộng với thanh lỗi trong Phụ lục C.
+Minecraft Habitat
+Phương pháp FVD ↓PSNR↑SSIM↑LPIPS↓FVD↓PSNR↑SSIM↑LPIPS↓
+FitVid* 956 13.0 0.343 0.519 - - - -
+CW-VAE* 397 13.4 0.338 0.441 - - - -
+Perceiver AR* 76 13.2 0.323 0.441 164 12.8 0.405 0.676
+Latent FDM* 167 13.4 0.349 0.429 433 12.5 0.311 0.582
+TECO-Transformer* 116 15.4 0.381 0.340 76 12.8 0.363 0.604
+TECO-ConvS5 71 14.8 0.374 0.355 95 12.9 0.390 0.632
+
+Bảng 5: Các thử nghiệm loại bỏ về cấu trúc tích chập ConvS5 cho tập dữ liệu benchmark tầm xa DMLab [13].
+Cấu trúc tích chập nhiều hơn cải thiện hiệu suất tổng thể. Xem Bảng 9 mở rộng trong Phụ lục.
+DMLab
+conv. Bkernel Ckernel phi tuyến FVD ↓PSNR↑SSIM↑LPIPS ↓
+x - - GLU 221 19.3 0.641 0.162
+o 1×1 1×1 GLU 187 21.0 0.689 0.112
+o 1×1 5×5 GLU 89 21.5 0.713 0.106
+o 3×3 3×3 GLU 96 22.7 0.762 0.088
+o 1×1 1×1 ResNet 81 23.0 0.767 0.083
+o 1×1 3×3 ResNet 68 22.8 0.756 0.085
+o 3×3 3×3 ResNet 67 23.2 0.769 0.079
+
+Chúng tôi cũng thực hiện các thử nghiệm loại bỏ để đánh giá tầm quan trọng của việc tham số hóa/khởi tạo lấy cảm hứng từ SSM sâu của ConvS5. Chúng tôi đánh giá hiệu suất của ConvSSM với state kernel được khởi tạo ngẫu nhiên trên cả Moving-Mnist và DMLab. Xem Bảng 6 và Bảng 8 trong Phụ lục C. Chúng tôi quan sát sự suy giảm hiệu suất trong tất cả các thiết lập cho thử nghiệm loại bỏ này. Điều này phản ánh các kết quả trước đây cho các SSM sâu [56, 19, 20, 57] và làm nổi bật tầm quan trọng của mối liên hệ được phát triển trong Mục 3.3.
+
+6 Thảo luận
+
+Công trình này giới thiệu ConvS5, một lớp mô hình hóa không gian-thời gian mới kết hợp khả năng sinh tự hồi quy có trạng thái, nhanh chóng của ConvRNN với khả năng được song song hóa qua chuỗi như Transformer. Chi phí tính toán của nó tỷ lệ tuyến tính với độ dài chuỗi, mang lại khả năng mở rộng tốt hơn cho các chuỗi không gian-thời gian dài hơn. ConvS5 cũng tận dụng các hiểu biết từ SSM sâu để mô hình hóa các phụ thuộc tầm xa một cách hiệu quả.
+
+Chúng tôi lưu ý rằng mặc dù ConvS5 có mở rộng dưới bậc hai, nó không cho thấy tốc độ huấn luyện nhanh hơn đáng kể so với Transformer cho độ dài chuỗi 300-600 khung hình. (Xem so sánh thời gian chạy chi tiết trong Phụ lục C.) Chúng tôi kỳ vọng ConvS5 sẽ xuất sắc về hiệu quả huấn luyện khi được áp dụng cho các chuỗi không gian-thời gian dài hơn nhiều, nơi mà mở rộng bậc hai của Transformer chiếm ưu thế. Chúng tôi hy vọng công trình này sẽ truyền cảm hứng cho việc tạo ra các tập dữ liệu và benchmark không gian-thời gian dài hơn. Ở độ dài chuỗi hiện tại, các tối ưu hóa trong tương lai của các triển khai parallel scan trong các framework học sâu phổ biến sẽ rất hữu ích. Ngoài ra, các khối ResNet được sử dụng làm hàm kích hoạt giữa các lớp ConvS5 có thể được thay thế bằng các hàm kích hoạt hiệu quả như tích chập thưa [103] hoặc S4ND [45].
+
+Một hướng đi thú vị trong tương lai là tận dụng thêm tham số hóa thời gian liên tục của ConvS5. Các SSM sâu cho thấy hiệu suất mạnh khi được huấn luyện ở một độ phân giải và đánh giá ở độ phân giải khác [19,41,42,20,43,45]. Ngoài ra, S5 có thể tận dụng parallel scan của nó để mô hình hóa hiệu quả các chuỗi được lấy mẫu không đều [20]. ConvS5 có thể được sử dụng cho các ứng dụng như vậy trong lĩnh vực không gian-thời gian [104,93,95].
+
+Cuối cùng, ConvS5 có tính mô-đun và linh hoạt. Chúng tôi đã chứng minh rằng ConvS5 hoạt động tốt như một thay thế trực tiếp trong framework huấn luyện TECO [13] được phát triển đặc biệt cho Transformer. Do các đặc tính thuận lợi của nó, chúng tôi kỳ vọng ConvS5 cũng sẽ phục vụ như một khối xây dựng của các phương pháp tiếp cận mới để mô hình hóa các chuỗi không gian-thời gian dài hơn nhiều và các ứng dụng đa phương thức.
+
+Tài liệu tham khảo
+
+[1]Chelsea Finn, Ian Goodfellow, và Sergey Levine. Unsupervised learning for physical interaction through video prediction. Advances in neural information processing systems, 29, 2016.
+
+[2]Yi Xu, Longwen Gao, Kai Tian, Shuigeng Zhou, và Huyang Sun. Non-local ConvLSTM for video compression artifact reduction. In Proceedings of the IEEE/CVF international conference on computer vision, trang 7043-7052, 2019.
+
+[3]He Huang, Zheni Zeng, Danya Yao, Xin Pei, và Yi Zhang. Spatial-temporal ConvLSTM for vehicle driving intention prediction. Tsinghua Science and Technology, 27(3):599-609, 2021.
+
+[4]Xiaoyu Chen, Xingsheng Xie, và Da Teng. Short-term traffic flow prediction based on ConvLSTM model. In 2020 IEEE 5th Information Technology and Mechatronics Engineering Conference (ITOEC), trang 846-850. IEEE, 2020.
+
+[5]Jaideep Pathak, Shashank Subramanian, Peter Harrington, Sanjeev Raja, Ashesh Chattopadhyay, Morteza Mardani, Thorsten Kurth, David Hall, Zongyi Li, Kamyar Azizzadenesheli, và cộng sự. Fourcastnet: A global data-driven high-resolution weather model using adaptive Fourier neural operators. arXiv preprint arXiv:2202.11214, 2022.
+
+[6]Jonathan A Weyn, Dale R Durran, Rich Caruana, và Nathaniel Cresswell-Clay. Sub-seasonal forecasting with a large ensemble of deep-learning weather prediction models. Journal of Advances in Modeling Earth Systems, 13(7):e2021MS002502, 2021.
+
+[7]Jonathan Ho, Tim Salimans, Alexey A. Gritsenko, William Chan, Mohammad Norouzi, và David J. Fleet. Video diffusion models. In Alice H. Oh, Alekh Agarwal, Danielle Belgrave, và Kyunghyun Cho, biên tập, Advances in Neural Information Processing Systems, 2022.
+
+[8]Aidan Clark, Jeff Donahue, và Karen Simonyan. Adversarial video generation on complex datasets. arXiv preprint arXiv:1907.06571, 2019.
+
+[9]Wilson Yan, Yunzhi Zhang, Pieter Abbeel, và Aravind Srinivas. Videogpt: Video generation using VQ-VAE and Transformers. arXiv preprint arXiv:2104.10157, 2021.
+
+[10] Guillaume Le Moing, Jean Ponce, và Cordelia Schmid. CCVS: context-aware controllable video synthesis. Advances in Neural Information Processing Systems, 34:14042-14055, 2021.
+
+[11] Yu Tian, Jian Ren, Menglei Chai, Kyle Olszewski, Xi Peng, Dimitris N. Metaxas, và Sergey Tulyakov. A good image generator is what you need for high-resolution video synthesis. In International Conference on Learning Representations, 2021.
+
+[12] Pauline Luc, Aidan Clark, Sander Dieleman, Diego de Las Casas, Yotam Doron, Albin Cassirer, và Karen Simonyan. Transformation-based adversarial video prediction on large-scale data. arXiv preprint arXiv:2003.04035, 2020.
+
+[13] Wilson Yan, Danijar Hafner, Stephen James, và Pieter Abbeel. Temporally consistent video Transformer for long-term video prediction. arXiv preprint arXiv:2210.02396, 2022.
+
+[14] Songwei Ge, Thomas Hayes, Harry Yang, Xi Yin, Guan Pang, David Jacobs, Jia-Bin Huang, và Devi Parikh. Long video generation with time-agnostic VQGAN and time-sensitive Transformer. In Computer Vision-ECCV 2022: 17th European Conference, Tel Aviv, Israel, October 23-27, 2022, Proceedings, Part XVII, trang 102-118. Springer, 2022.
+
+[15] William Harvey, Saeid Naderiparizi, Vaden Masrani, Christian Dietrich Weilbach, và Frank Wood. Flexible diffusion modeling of long videos. In Alice H. Oh, Alekh Agarwal, Danielle Belgrave, và Kyunghyun Cho, biên tập, Advances in Neural Information Processing Systems, 2022.
+
+[16] Vaibhav Saxena, Jimmy Ba, và Danijar Hafner. Clockwork variational autoencoders. Advances in Neural Information Processing Systems, 34:29246-29257, 2021.
+
+[17] Xingjian Shi, Zhourong Chen, Hao Wang, Dit-Yan Yeung, Wai-Kin Wong, và Wang-chun Woo. Convolutional LSTM network: A machine learning approach for precipitation nowcasting. Advances in neural information processing systems, 28, 2015.
+
+[18] Nicolas Ballas, Li Yao, Chris Pal, và Aaron Courville. Delving deeper into convolutional networks for learning video representations. arXiv preprint arXiv:1511.06432, 2015.
+
+[19] Albert Gu, Karan Goel, và Christopher Re. Efficiently modeling long sequences with structured state spaces. In International Conference on Learning Representations, 2021.
+
+[20] Jimmy T.H. Smith, Andrew Warrington, và Scott Linderman. Simplified state space layers for sequence modeling. In The Eleventh International Conference on Learning Representations, 2023.
+
+[21] Sepp Hochreiter và Jürgen Schmidhuber. Long short-term memory. Neural Computation, 9(8):1735-1780, 1997.
+
+[22] Kyunghyun Cho, Bart Van Merriënboer, Caglar Gulcehre, Dzmitry Bahdanau, Fethi Bougares, Holger Schwenk, và Yoshua Bengio. Learning phrase representations using rnn encoder-decoder for statistical machine translation. arXiv preprint arXiv:1406.1078, 2014.
+
+[23] Razvan Pascanu, Tomas Mikolov, và Yoshua Bengio. On the difficulty of training recurrent neural networks. In International Conference on Machine Learning, trang 1310-1318. PMLR, 2013.
+
+[24] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Łukasz Kaiser, và Illia Polosukhin. Attention is all you need. Advances in Neural Information Processing Systems, 30, 2017.
+
+[25] Alexey Dosovitskiy, Lucas Beyer, Alexander Kolesnikov, Dirk Weissenborn, Xiaohua Zhai, Thomas Unterthiner, Mostafa Dehghani, Matthias Minderer, Georg Heigold, Sylvain Gelly, Jakob Uszkoreit, và Neil Houlsby. An image is worth 16x16 words: Transformers for image recognition at scale. In International Conference on Learning Representations, 2021.
+
+[26] Anurag Arnab, Mostafa Dehghani, Georg Heigold, Chen Sun, Mario Lučić, và Cordelia Schmid. ViViT: A video vision Transformer. In Proceedings of the IEEE/CVF international conference on computer vision, trang 6836-6846, 2021.
+
+[27] Agrim Gupta, Stephen Tian, Yunzhi Zhang, Jiajun Wu, Roberto Martín-Martín, và Li Fei-Fei. Maskvit: Masked visual pre-training for video prediction. arXiv preprint arXiv:2206.11894, 2022.
+
+[28] Aaron Van Den Oord, Oriol Vinyals, và cộng sự. Neural discrete representation learning. Advances in neural information processing systems, 30, 2017.
+
+[29] Jacob Walker, Ali Razavi, và Aäron van den Oord. Predicting video with VQVAE. arXiv preprint arXiv:2103.01950, 2021.
+
+[30] Patrick Esser, Robin Rombach, và Bjorn Ommer. Taming Transformers for high-resolution image synthesis. In Proceedings of the IEEE/CVF conference on computer vision and pattern recognition, trang 12873-12883, 2021.
+
+[31] Reiner Pope, Sholto Douglas, Aakanksha Chowdhery, Jacob Devlin, James Bradbury, Anselm Levskaya, Jonathan Heek, Kefan Xiao, Shivani Agrawal, và Jeff Dean. Efficiently scaling Transformer inference. arXiv preprint arXiv:2211.05102, 2022.
+
+[32] Tri Dao, Dan Fu, Stefano Ermon, Atri Rudra, và Christopher Ré. FlashAttention: Fast and memory-efficient exact attention with IO-awareness. Advances in Neural Information Processing Systems, 35:16344-16359, 2022.
+
+[33] Krzysztof Marcin Choromanski, Valerii Likhosherstov, David Dohan, Xingyou Song, Andreea Gane, Tamas Sarlos, Peter Hawkins, Jared Quincy Davis, Afroz Mohiuddin, Lukasz Kaiser, David Benjamin Belanger, Lucy Colwell, và Adrian Weller. Rethinking attention with Performers. In International Conference on Learning Representations, 2021.
+
+[34] Angelos Katharopoulos, Apoorv Vyas, Nikolaos Pappas, và François Fleuret. Transformers are RNNs: Fast autoregressive Transformers with linear attention. In International Conference on Machine Learning, trang 5156-5165. PMLR, 2020.
+
+[35] Nikita Kitaev, Lukasz Kaiser, và Anselm Levskaya. Reformer: The efficient Transformer. In International Conference on Learning Representations, 2020.
+
+[36] Iz Beltagy, Matthew Peters, và Arman Cohan. Longformer: The long-document Transformer. arXiv preprint arXiv:2004.05150, 2020.
+
+[37] Ankit Gupta và Jonathan Berant. Gmat: Global memory augmentation for Transformers, 2020.
+
+[38] Sinong Wang, Belinda Li, Madian Khabsa, Han Fang, và Hao Ma. Linformer: Self-attention with linear complexity. arXiv preprint arXiv:2006.04768, 2020.
+
+[39] Andrew Jaegle, Felix Gimeno, Andy Brock, Oriol Vinyals, Andrew Zisserman, và Joao Carreira. Perceiver: General perception with iterative attention. In International conference on machine learning, trang 4651-4664. PMLR, 2021.
+
+[40] Yi Tay, Mostafa Dehghani, Samira Abnar, Yikang Shen, Dara Bahri, Philip Pham, Jinfeng Rao, Liu Yang, Sebastian Ruder, và Donald Metzler. Long Range Arena: A benchmark for efficient Transformers. In International Conference on Learning Representations, 2021.
+
+[41] Ankit Gupta, Albert Gu, và Jonathan Berant. Diagonal state spaces are as effective as structured state spaces. In Advances in Neural Information Processing Systems, 2022.
+
+[42] Albert Gu, Karan Goel, Ankit Gupta, và Christopher Ré. On the parameterization and initialization of diagonal state space models. In Advances in Neural Information Processing Systems, 2022.
+
+[43] Ramin Hasani, Mathias Lechner, Tsun-Hsuan Wang, Makram Chahine, Alexander Amini, và Daniela Rus. Liquid structural state-space models. In International Conference on Learning Representations, 2023.
+
+[44] Karan Goel, Albert Gu, Chris Donahue, và Christopher Re. It's raw! Audio generation with state-space models. In Proceedings of the 39th International Conference on Machine Learning, tập 162 của Proceedings of Machine Learning Research, trang 7616-7633. PMLR, 17-23 Jul 2022.
+
+[45] Eric Nguyen, Karan Goel, Albert Gu, Gordon Downs, Preey Shah, Tri Dao, Stephen Baccus, và Christopher Ré. S4ND: Modeling images and videos as multidimensional signals with state spaces. In Advances in Neural Information Processing Systems, 2022.
+
+[46] Md Mohaiminul Islam và Gedas Bertasius. Long movie clip classification with state-space video models. In Computer Vision-ECCV 2022: 17th European Conference, Tel Aviv, Israel, October 23-27, 2022, Proceedings, Part XXXV, trang 87-104, 2022.
+
+[47] Shmuel Bar David, Itamar Zimerman, Eliya Nachmani, và Lior Wolf. Decision S4: Efficient sequence-based RL via state spaces layers. In The Eleventh International Conference on Learning Representations, 2023.
+
+[48] Chris Lu, Yannick Schroecker, Albert Gu, Emilio Parisotto, Jakob Foerster, Satinder Singh, và Feryal Behbahani. Structured state space models for in-context reinforcement learning. arXiv preprint arXiv:2303.03982, 2023.
+
+[49] Linqi Zhou, Michael Poli, Winnie Xu, Stefano Massaroli, và Stefano Ermon. Deep latent state space models for time-series generation. arXiv preprint arXiv:2212.12749, 2022.
+
+[50] Daniel Y Fu, Tri Dao, Khaled Kamal Saab, Armin W Thomas, Atri Rudra, và Christopher Re. Hungry hungry hippos: Towards language modeling with state space models. In The Eleventh International Conference on Learning Representations, 2023.
+
+[51] Harsh Mehta, Ankit Gupta, Ashok Cutkosky, và Behnam Neyshabur. Long range language modeling via gated state spaces. In The Eleventh International Conference on Learning Representations, 2023.
+
+[52] Junxiong Wang, Jing Nathan Yan, Albert Gu, và Alexander M Rush. Pretraining without attention. arXiv preprint arXiv:2212.10544, 2022.
+
+[53] Michael Poli, Stefano Massaroli, Eric Nguyen, Daniel Y Fu, Tri Dao, Stephen Baccus, Yoshua Bengio, Stefano Ermon, và Christopher Ré. Hyena hierarchy: Towards larger convolutional language models. arXiv preprint arXiv:2302.10866, 2023.
+
+[54] Nitish Srivastava, Elman Mansimov, và Ruslan Salakhudinov. Unsupervised learning of video representations using LSTMs. In International conference on machine learning, trang 843-852. PMLR, 2015.
+
+[55] Arieh Iserles. A first course in the numerical analysis of differential equations. 44. Cambridge university press, 2009.
+
+[56] Albert Gu, Isys Johnson, Karan Goel, Khaled Saab, Tri Dao, Atri Rudra, và Christopher Ré. Combining recurrent, convolutional, and continuous-time models with linear state space layers. Advances in Neural Information Processing Systems, 34, 2021.
+
+[57] Antonio Orvieto, Samuel L Smith, Albert Gu, Anushan Fernando, Caglar Gulcehre, Razvan Pascanu, và Soham De. Resurrecting recurrent neural networks for long sequences. arXiv preprint arXiv:2303.06349, 2023.
+
+[58] Antonio Orvieto, Soham De, Caglar Gulcehre, Razvan Pascanu, và Samuel L Smith. On the universality of linear recurrences followed by nonlinear projections. arXiv preprint arXiv:2307.11888, 2023.
+
+[59] Eric Martin và Chris Cundy. Parallelizing linear recurrent neural nets over sequence length. In International Conference on Learning Representations, 2018.
+
+[60] James Bradbury, Stephen Merity, Caiming Xiong, và Richard Socher. Quasi-recurrent neural networks. In International Conference on Learning Representations, 2017.
+
+[61] Tao Lei, Yu Zhang, Sida Wang, Hui Dai, và Yoav Artzi. Simple recurrent units for highly parallelizable recurrence. In Proceedings of the 2018 Conference on Empirical Methods in Natural Language Processing, trang 4470-4481, 2018.
+
+[62] Albert Gu, Tri Dao, Stefano Ermon, Atri Rudra, và Christopher Ré. HiPPO: Recurrent memory with optimal polynomial projections. Advances in Neural Information Processing Systems, 33:1474-1487, 2020.
+
+[63] Guy Blelloch. Prefix sums and their applications. Báo cáo kỹ thuật, Tech. rept. CMU-CS-90-190. School of Computer Science, Carnegie Mellon, 1990.
+
+[64] Wonmin Byeon, Qin Wang, Rupesh Kumar Srivastava, và Petros Koumoutsakos. ContextVP: Fully context-aware video prediction. In Proceedings of the European Conference on Computer Vision (ECCV), trang 753-769, 2018.
+
+[65] Vincent Dumoulin và Francesco Visin. A guide to convolution arithmetic for deep learning. arXiv preprint arXiv:1603.07285, 2016.
+
+[66] Kumar Chellapilla, Sidd Puri, và Patrice Simard. High performance convolutional neural networks for document processing. In Tenth international workshop on frontiers in handwriting recognition. Suvisoft, 2006.
+
+[67] Yangqing Jia. Learning semantic image representations at a large scale. 2014.
+
+[68] Kaiming He, Xiangyu Zhang, Shaoqing Ren, và Jian Sun. Deep residual learning for image recognition. In Proceedings of the IEEE conference on computer vision and pattern recognition, trang 770-778, 2016.
+
+[69] Zhuang Liu, Hanzi Mao, Chao-Yuan Wu, Christoph Feichtenhofer, Trevor Darrell, và Saining Xie. A Convnet for the 2020s. In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition, trang 11976-11986, 2022.
+
+[70] Marijn F Stollenga, Wonmin Byeon, Marcus Liwicki, và Juergen Schmidhuber. Parallel multi-dimensional LSTM, with application to fast biomedical volumetric image segmentation. Advances in neural information processing systems, 28, 2015.
+
+[71] Reza Azad, Maryam Asadi-Aghbolaghi, Mahmood Fathy, và Sergio Escalera. Bi-directional ConvLSTM U-net with densely connected convolutions. In Proceedings of the IEEE/CVF international conference on computer vision workshops, trang 0-0, 2019.
+
+[72] Si Woon Lee và Ha Young Kim. Stock market forecasting with super-high dimensional time-series data using ConvLSTM, trend sampling, and specialized data augmentation. expert systems with applications, 161:113704, 2020.
+
+[73] Qingqing Wang, Ye Huang, Wenjing Jia, Xiangjian He, Michael Blumenstein, Shujing Lyu, và Yue Lu. FACLSTM: ConvLSTM with focused attention for scene text recognition. Science China Information Sciences, 63:1-14, 2020.
+
+[74] Mohamadreza Bakhtyari và Sayeh Mirzaei. ADHD detection using dynamic connectivity patterns of EEG data and ConvLSTM with attention framework. Biomedical Signal Processing and Control, 76:103708, 2022.
+
+[75] Li Kang, Ziqi Zhou, Jianjun Huang, Wenzhong Han, và IEEE Member. Renal tumors segmentation in abdomen CT images using 3D-CNN and ConvLSTM. Biomedical Signal Processing and Control, 72:103334, 2022.
+
+[76] Tie Liu, Mai Xu, và Zulin Wang. Removing rain in videos: a large-scale database and a two-stream ConvLSTM approach. In 2019 IEEE International Conference on Multimedia and Expo (ICME), trang 664-669. IEEE, 2019.
+
+[77] Xiaofang Xia, Jian Lin, Qiannan Jia, Xiaoluan Wang, Chaofan Ma, Jiangtao Cui, và Wei Liang. ETD-ConvLSTM: A deep learning approach for electricity theft detection in smart grids. IEEE Transactions on Information Forensics and Security, 2023.
+
+[78] Xingjian Shi, Zhihan Gao, Leonard Lausen, Hao Wang, Dit-Yan Yeung, Wai-kin Wong, và Wang-chun Woo. Deep learning for precipitation nowcasting: A benchmark and a new model. Advances in neural information processing systems, 30, 2017.
+
+[79] Mohammad Babaeizadeh, Chelsea Finn, Dumitru Erhan, Roy H. Campbell, và Sergey Levine. Stochastic variational video prediction. In International Conference on Learning Representations, 2018.
+
+[80] Yunbo Wang, Haixu Wu, Jianjin Zhang, Zhifeng Gao, Jianmin Wang, S Yu Philip, và Mingsheng Long. PredRNN: A recurrent neural network for spatiotemporal predictive learning. IEEE Transactions on Pattern Analysis and Machine Intelligence, 45(2):2208-2225, 2022.
+
+[81] Yunbo Wang, Zhifeng Gao, Mingsheng Long, Jianmin Wang, và S Yu Philip. PredRNN++: Towards a resolution of the deep-in-time dilemma in spatiotemporal predictive learning. In International Conference on Machine Learning, trang 5123-5132. PMLR, 2018.
+
+[82] Yunbo Wang, Lu Jiang, Ming-Hsuan Yang, Li-Jia Li, Mingsheng Long, và Li Fei-Fei. Eidetic 3D LSTM: A model for video prediction and beyond. In International conference on learning representations, 2019.
+
+[83] Wei Yu, Yichao Lu, Steve Easterbrook, và Sanja Fidler. Efficient and information-preserving future frame prediction and beyond. In International Conference on Learning Representations, 2020.
+
+[84] Jiahao Su, Wonmin Byeon, Jean Kossaifi, Furong Huang, Jan Kautz, và Anima Anandkumar. Convolutional tensor-train LSTM for spatio-temporal learning. Advances in Neural Information Processing Systems, 33:13714-13726, 2020.
+
+[85] Jue Wang, Wentao Zhu, Pichao Wang, Xiang Yu, Linda Liu, Mohamed Omar, và Raffay Hamid. Selective structured state-spaces for long-form video understanding. arXiv preprint arXiv:2303.14526, 2023.
+
+[86] Aäron Van Den Oord, Nal Kalchbrenner, và Koray Kavukcuoglu. Pixel recurrent neural networks. In International conference on machine learning, trang 1747-1756. PMLR, 2016.
+
+[87] Olaf Ronneberger, Philipp Fischer, và Thomas Brox. U-net: Convolutional networks for biomedical image segmentation. In Medical Image Computing and Computer-Assisted Intervention-MICCAI 2015: 18th International Conference, Munich, Germany, October 5-9, 2015, Proceedings, Part III 18, trang 234-241. Springer, 2015.
+
+[88] Özgün Çiçek, Ahmed Abdulkadir, Soeren S Lienkamp, Thomas Brox, và Olaf Ronneberger. 3D U-net: learning dense volumetric segmentation from sparse annotation. In Medical Image Computing and Computer-Assisted Intervention-MICCAI 2016: 19th International Conference, Athens, Greece, October 17-21, 2016, Proceedings, Part II 19, trang 424-432. Springer, 2016.
+
+[89] Tobias Höppe, Arash Mehrjou, Stefan Bauer, Didrik Nielsen, và Andrea Dittadi. Diffusion models for video prediction and infilling. Transactions on Machine Learning Research.
+
+[90] Mohammad Babaeizadeh, Mohammad Taghi Saffar, Suraj Nair, Sergey Levine, Chelsea Finn, và Dumitru Erhan. FitVid: Overfitting in pixel-level video prediction. arXiv preprint arXiv:2106.13195, 2021.
+
+[91] Ruslan Rakhimov, Denis Volkhonskiy, Alexey Artemov, Denis Zorin, và Evgeny Burnaev. Latent video Transformer. arXiv preprint arXiv:2006.10704, 2020.
+
+[92] Younggyo Seo, Kimin Lee, Fangchen Liu, Stephen James, và Pieter Abbeel. HARP: Autoregressive latent video prediction with high-fidelity image generator. In 2022 IEEE International Conference on Image Processing (ICIP), trang 3943-3947. IEEE, 2022.
+
+[93] Ivan Skorokhodov, Sergey Tulyakov, và Mohamed Elhoseiny. StyleGAN-V: A continuous video generator with the price, image quality and perks of StyleGAN2. In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition, trang 3626-3636, 2022.
+
+[94] Masaki Saito và Shunta Saito. TGANv2: Efficient training of large models for video generation with multiple subsampling layers. arXiv preprint arXiv:1811.09245, 2(6), 2018.
+
+[95] Sihyun Yu, Jihoon Tack, Sangwoo Mo, Hyunsu Kim, Junho Kim, Jung-Woo Ha, và Jinwoo Shin. Generating videos with dynamics-aware implicit generative adversarial networks. In International Conference on Learning Representations, 2022.
+
+[96] Tim Brooks, Janne Hellsten, Miika Aittala, Ting-Chun Wang, Timo Aila, Jaakko Lehtinen, Ming-Yu Liu, Alexei Efros, và Tero Karras. Generating long videos of dynamic scenes. Advances in Neural Information Processing Systems, 35:31769-31781, 2022.
+
+[97] Wenyi Hong, Ming Ding, Wendi Zheng, Xinghan Liu, và Jie Tang. Cogvideo: Large-scale pretraining for text-to-video generation via Transformers. arXiv preprint arXiv:2205.15868, 2022.
+
+[98] Huiwen Chang, Han Zhang, Lu Jiang, Ce Liu, và William T Freeman. MaskGit: Masked generative image Transformer. In Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition, trang 11315-11325, 2022.
+
+[99] Charles Beattie, Joel Z Leibo, Denis Teplyashin, Tom Ward, Marcus Wainwright, Heinrich Küttler, Andrew Lefrancq, Simon Green, Víctor Valdés, Amir Sadik, và cộng sự. Deepmind Lab. arXiv preprint arXiv:1612.03801, 2016.
+
+[100] William H Guss, Brandon Houghton, Nicholay Topin, Phillip Wang, Cayden Codel, Manuela Veloso, và Ruslan Salakhutdinov. MineRL: A large-scale dataset of Minecraft demonstrations. arXiv preprint arXiv:1907.13440, 2019.
+
+[101] Manolis Savva, Abhishek Kadian, Oleksandr Maksymets, Yili Zhao, Erik Wijmans, Bhavana Jain, Julian Straub, Jia Liu, Vladlen Koltun, Jitendra Malik, và cộng sự. Habitat: A platform for embodied AI research. In Proceedings of the IEEE/CVF international conference on computer vision, trang 9339-9347, 2019.
+
+[102] Yann Dauphin, Angela Fan, Michael Auli, và David Grangier. Language modeling with gated convolutional networks. In International Conference on Machine Learning, trang 933-941. PMLR, 2017.
+
+[103] Keyu Tian, Yi Jiang, Qishuai Diao, Chen Lin, Liwei Wang, và Zehuan Yuan. Designing BERT for convolutional networks: Sparse and hierarchical masked modeling. arXiv preprint arXiv:2301.03580, 2023.
+
+[104] Sunghyun Park, Kangyeol Kim, Junsoo Lee, Jaegul Choo, Joonseok Lee, Sookyung Kim, và Edward Choi. Vid-ODE: Continuous-time video generation with neural ordinary differential equation. In Proceedings of the AAAI Conference on Artificial Intelligence, tập 35, trang 2412-2422, 2021.
+
+[105] Mark Harris, Shubhabrata Sengupta, và John D Owens. Parallel prefix sum (scan) with CUDA. GPU gems, 3(39):851-876, 2007.
+
+[106] Albert Gu, Isys Johnson, Aman Timalsina, Atri Rudra, và Christopher Re. How to train your HIPPO: State space models with generalized orthogonal basis projections. In International Conference on Learning Representations, 2023.
+
+[107] Jimmy Lei Ba, Jamie Ryan Kiros, và Geoffrey E Hinton. Layer normalization. arXiv preprint arXiv:1607.06450, 2016.
+
+[108] Thomas Unterthiner, Sjoerd Van Steenkiste, Karol Kurach, Raphael Marinier, Marcin Michalski, và Sylvain Gelly. Towards accurate generative models of video: A new metric & challenges. arXiv preprint arXiv:1812.01717, 2018.
+
+[109] Zhou Wang, Alan C Bovik, Hamid R Sheikh, và Eero P Simoncelli. Image quality assessment: from error visibility to structural similarity. IEEE transactions on image processing, 13(4):600-612, 2004.
+
+[110] Richard Zhang, Phillip Isola, Alexei A Efros, Eli Shechtman, và Oliver Wang. The unreasonable effectiveness of deep features as a perceptual metric. In CVPR, 2018.
+
+[111] Yann LeCun. The MNIST database of handwritten digits. http://yann. lecun. com/exdb/mnist/, 1998.
+
+[112] Santhosh K Ramakrishnan, Aaron Gokaslan, Erik Wijmans, Oleksandr Maksymets, Alex Clegg, John Turner, Eric Undersander, Wojciech Galuba, Andrew Westbury, Angel X Chang, và cộng sự. Habitat-Matterport 3D dataset (HM3D): 1000 large-scale 3D environments for embodied AI. arXiv preprint arXiv:2109.08238, 2021.
+
+[113] Angel Chang, Angela Dai, Thomas Funkhouser, Maciej Halber, Matthias Niessner, Manolis Savva, Shuran Song, Andy Zeng, và Yinda Zhang. Matterport3D: Learning from RGB-D data in indoor environments. arXiv preprint arXiv:1709.06158, 2017.
+
+[114] Fei Xia, Amir R Zamir, Zhiyang He, Alexander Sax, Jitendra Malik, và Silvio Savarese. Gibson env: Real-world perception for embodied agents. In Proceedings of the IEEE conference on computer vision and pattern recognition, trang 9068-9079, 2018.
+
+Phụ lục cho: Các Mô hình Không gian Trạng thái Tích chập cho Mô hình hóa Không gian-Thời gian Tầm xa
+
+Nội dung:
+• Phụ lục A: Các mệnh đề
+• Phụ lục B: Chi tiết ConvS5: Tham số hóa, Khởi tạo, Rời rạc hóa
+• Phụ lục C: Các kết quả bổ sung
+• Phụ lục D: Cấu hình thí nghiệm
+• Phụ lục E: Các tập dữ liệu
+
+A Các mệnh đề
+A.1 Parallel Scan cho Các hồi quy tích chập
+
+Mệnh đề 1. Xét một hồi quy tích chập như trong (7) và định nghĩa các phần tử parallel scan ban đầu
+ck = (ck,a, ck,b) := (A,B*Uk). Toán tử nhị phân ⊛, được định nghĩa bên dưới, có tính kết hợp.
+ci⊛cj := (cj,a◦ci,a, cj,a*ci,b+cj,b), (14)
+trong đó ◦ ký hiệu phép tích chập của hai kernel, * ký hiệu phép tích chập giữa một kernel và đầu vào, và + là phép cộng theo từng phần tử.
+
+Chứng minh. Sử dụng tính kết hợp của ◦ và toán tử đồng hành của *, tức là (d◦e)*f=d*(e*f)(xem Blelloch [63], Mục 1.4), chúng ta có:
+(ci⊛cj)⊛ck = (cj,a◦ci,a, cj,a*ci,b+cj,b)⊛(ck,a, ck,b) (15)
+= (ck,a◦(cj,a◦ci,a), ck,a*(cj,a*ci,b+cj,b) +ck,b) (16)
+= ((ck,a◦cj,a)◦ci,a, ck,a*(cj,a*ci,b) +ck,a*cj,b+ck,b) (17)
+= ((ck,a◦cj,a)◦ci,a,(ck,a◦cj,a)*ci,b+ck,a*cj,b+ck,b) (18)
+= ci⊛(ck,a◦cj,a, ck,a*cj,b+ck,b) (19)
+= ci⊛(cj⊛ck) (20)
+
+A.2 Chi phí tính toán của Parallel Scan cho Các hồi quy tích chập
+
+Mệnh đề 2. Cho các đầu vào hiệu quả B*U1:L trong RL×H×W×P và một state kernel theo điểm A trong RP×P×1×1, chi phí tính toán để tính hồi quy tích chập trong Phương trình 7 với parallel scan là O(L(P³+P²HW)).
+
+Chứng minh. Theo Blelloch [63], với một bộ xử lý duy nhất, chi phí tính toán hồi quy tuần tự bằng toán tử nhị phân ⊛ được định nghĩa trong Mệnh đề 1 là O(L(T◦+T*+T+)) trong đó T◦ là chi phí tích chập hai kernel, T* là chi phí tích chập giữa một kernel và đầu vào và T+ là chi phí cộng theo từng phần tử. Chi phí cộng theo từng phần tử là T+=O(PHW).
+Đối với các state kernel có độ phân giải kA, T◦=O(P³k⁴A) và T*=O(P²k²AHW). Đối với các tích chập theo điểm, điều này trở thành T◦=O(P³) và T*=O(P²HW). Do đó, chi phí tính toán hồi quy tuần tự bằng ⊛ là O(L(P³+P²HW)). Vì có các thuật toán hiệu quả công việc cho parallel scan [105], chi phí tổng thể của parallel scan cũng là O(L(P³+P²HW)).
+
+Lưu ý rằng tham số hóa đường chéo hóa của ConvS5 được thảo luận trong Mục 3.4 và Phụ lục B dẫn đến T◦=O(P) và T*=O(PHW). Do đó chi phí áp dụng parallel scan với ConvS5 là O(LPHW).
+
+A.3 Mối liên hệ giữa ConvSSM và SSM
+
+Mệnh đề 3. Xét một cập nhật trạng thái ConvSSM như trong (5) với state kernel theo điểm A trong RP×P×1×1, input kernel B trong RP×U×kB×kB, và đầu vào U(t) trong RH'×W'×U. Gọi Uim2col(t) trong RH×W×Uk²B là kết quả đã được định hình lại của việc áp dụng phép toán Image to Column (im2col) [66,67] trên đầu vào U(t). Khi đó động lực học của mỗi pixel trạng thái của (5), X(t)i,j trong RP, phát triển theo phương trình vi phân sau
+X'(t)i,j=ASSMX(t)i,j+BSSMUim2col(t)i,j (21)
+trong đó ma trận trạng thái, ASSM trong RP×P, và ma trận đầu vào, BSSM trong RP×(Uk²B), có thể được tạo thành bằng cách định hình lại state kernel, A, và input kernel, B, tương ứng.
+
+Chứng minh. Gọi Uim2col trong RUk²b×HW ký hiệu kết quả của việc thực hiện phép toán im2col trên đầu vào U(t) để tích chập với kernel B. Định hình lại ma trận này thành tensor Uim2col(t) trong RH×W×Uk²b. Định hình lại Uim2col(t) một lần nữa thành tensor V(t) trong RH×W×U×kB×kB.
+
+Bây giờ, chúng ta có thể viết sự phát triển cho các kênh riêng lẻ của mỗi pixel, X'(t)i,j,k, trong (5) như
+X'(t)i,j,k=∑ᴾ⁻¹ₗ₌₀Ak,l,0,0X(t)i,j,l+∑ᵁ⁻¹ᵧ₌₀∑ᵏᴮ⁻¹ₘ₌₀∑ᵏᴮ⁻¹ₙ₌₀Bk,q,m,nV(t)i,j,q,m,n . (22)
+
+Gọi ASSM trong RP×P là một ma trận với các hàng, ASSM,i trong RP, tương ứng với một phiên bản được làm phẳng của các output feature của A, tức là Ai trong RP×1×1. Tương tự, định hình lại B thành một ma trận BSSM trong RP×(Uk²B) trong đó các hàng, BSSM,i trong RUk²B tương ứng với một phiên bản được làm phẳng của các output feature của B, tức là Bi trong RU×kB×kB.
+
+Khi đó chúng ta có thể viết lại (22) tương đương như
+X'(t)i,j,k=∑ᴾ⁻¹ₗ₌₀Ak,l,0,0X(t)i,j,l+∑ᵁ⁻¹ᵧ₌₀∑ᵏᴮ⁻¹ₘ₌₀∑ᵏᴮ⁻¹ₙ₌₀Bk,q,m,nV(t)i,j,q,m,n (23)
+= ∑ᴾ⁻¹ₗ₌₀ASSM,k,lX(t)i,j,l+∑ᵁᵏ²ᴮ⁻¹ᵥ₌₀BSSM,k,vUim2col(t)i,j,v (24)
+= AᵀSSM,kX(t)i,j+BᵀSSM,kUim2col(t)i,j (25)
+
+
+--- [Phan 11/11] ---
+
+--- TRANG 21 ---
+B Chi tiết ConvS5: Tham số hóa, Rời rạc hóa, Khởi tạo
+B.1 Bối cảnh: S5
+Tham số hóa và Rời rạc hóa S5 S5 [20] sử dụng tham số hóa đường chéo hóa của
+SSM tổng quát trong (3).
+Cho AS5=VΛ S5V−1 trong RP×P trong đó ΛS5 trong CP×P là ma trận đường chéo có giá trị phức và
+V trong CP×P tương ứng với các vector riêng. Định nghĩa ˜x(t) =V−1x(t),˜B=V−1B, và ˜C=CV
+ta có thể tham số hóa lại SSM của (3) thành hệ đường chéo hóa:
+d˜x(t)
+dt=ΛS5˜x(t) +˜Bu(t),y(t) =˜C˜x(t) +Du(t). (26)
+S5 sử dụng các tham số thang thời gian có thể học ∆ trong RP và rời rạc hóa zero-order hold (ZOH) sau đây:
+ΛS5= DISCRETIZE A(ΛS5,∆) :=eΛS5∆(27)
+BS5= DISCRETIZE B(ΛS5,˜B,∆) :=Λ−1
+S5(ΛS5−I)˜B (28)
+Khởi tạo S5 S5 khởi tạo ma trận trạng thái của nó bằng cách đường chéo hóa AS5 như được định nghĩa ở đây:
+AS5nk=−
+
+(n+1
+2)1/2(k+1
+2)1/2, n > k
+1
+2, n =k
+(n+1
+2)1/2(k+1
+2)1/2, n < k. (29)
+Ma trận này là phần chuẩn của ma trận HiPPO-LegS chuẩn cộng hạng thấp từ framework HiPPO [62] cho xấp xỉ hàm trực tuyến. S4 ban đầu khởi tạo các SSM đầu vào đơn, đầu ra đơn
+(SISO) của nó với biểu diễn của ma trận HiPPO-LegS đầy đủ. Điều này được chứng minh là xấp xỉ
+các phụ thuộc tầm xa tại thời điểm khởi tạo đối với độ đo suy giảm theo hàm mũ, dài vô hạn [106]. Gupta et al. [41] đã chứng minh thực nghiệm rằng các số hạng hạng thấp có thể được loại bỏ mà không ảnh hưởng đến hiệu suất. Gu et al. [42] chỉ ra rằng trong giới hạn chiều trạng thái vô hạn, ODE tuyến tính, đầu vào đơn với xấp xỉ chuẩn này của ma trận HiPPO-LegS tạo ra
+động lực học giống như ODE tuyến tính, đầu vào đơn với ma trận HiPPO-LegS đầy đủ. Công trình S5
+mở rộng những phát hiện này sang thiết lập SSM đa đầu vào [20].
+Tầm quan trọng của Tham số hóa, Rời rạc hóa và Khởi tạo SSM Nghiên cứu trước đây đã
+nhấn mạnh tầm quan trọng của các lựa chọn tham số hóa, rời rạc hóa và khởi tạo của các phương pháp
+SSM sâu thông qua các nghiên cứu loại bỏ và phân tích [56,19,42,20,57]. Công trình đồng thời từ Orvieto
+et al. [57] cung cấp cái nhìn sâu sắc đặc biệt về phân phối trị riêng ban đầu thuận lợi được cung cấp bởi
+khởi tạo với các ma trận lấy cảm hứng từ HiPPO cũng như hiệu ứng chuẩn hóa quan trọng được cung cấp bởi
+thủ tục rời rạc hóa tường minh. Họ cũng giới thiệu một tham số hóa thuần thời gian rời rạc có thể
+hoạt động tương tự như rời rạc hóa thời gian liên tục của S4 và S5. Tuy nhiên, tham số hóa của họ
+trên thực tế khá giống với các phương trình (27-28). Chúng tôi chọn sử dụng tham số hóa thời gian liên tục
+của S5 cho tham số hóa ngầm của ConvS5 vì nó cũng có thể được tận dụng
+cho các thay đổi độ phân giải không cần huấn luyện lại [19,20,45] và xử lý chuỗi thời gian lấy mẫu không đều song song [20]. Tuy nhiên, do Mệnh đề 3, các chiến lược tham số hóa SSM tầm xa khác cũng có thể
+được sử dụng, chẳng hạn như trong Orvieto et al. [57] hoặc các đổi mới tiềm năng trong tương lai.
+B.2 Đường chéo hóa ConvS5
+Chúng tôi tận dụng tham số hóa đường chéo hóa của S5 để giảm chi phí quét song song của ConvS5.
+Cụ thể, chúng tôi khởi tạo AS5 như trong (29) và đường chéo hóa là AS5=VΛ S5V−1. Để áp dụng ConvS5,
+chúng tôi tính ΛS5 và BS5 sử dụng (27-28), và sau đó hình thành các kernel trạng thái và đầu vào ConvS5:
+ΛS5 trong RP×P reshape− − − − − → AConvS5 trong RP×P×1×1(30)
+BS5 trong RP×(Uk2
+B)reshape− − − − − → BConvS5 trong RP×U×kB×kB. (31)
+Xem Listing 1 cho ví dụ về triển khai cốt lõi. Lưu ý, kernel trạng thái AConvS5 được "đường chéo hóa" theo nghĩa rằng tất cả các mục trong kernel trạng thái đều bằng không ngoại trừ AConvS5 ,i,i=ΛS5,i,i cho tất cả i trong [P].
+21
+
+--- TRANG 22 ---
+Điều này có nghĩa là các tích chập theo điểm giảm xuống thành các phép nhân theo kênh. Tuy nhiên, điều này
+không làm giảm khả năng biểu đạt so với tích chập theo điểm đầy đủ. Điều này là do, cho tương đương
+ConvSSM với SSM của Mệnh đề 3 và việc sử dụng các kernel có giá trị phức, đường chéo hóa duy trì khả năng biểu đạt vì hầu như tất cả các SSM đều có thể đường chéo hóa [41,42], điều này xuất phát từ
+sự thật nổi tiếng rằng hầu như tất cả các ma trận vuông đều đường chéo hóa trên mặt phẳng phức.
+22
+
+--- TRANG 23 ---
+1import jax
+2import jax.numpy as np
+3from ConvSSM_helpers import discretize, Conv2D, ResNet_Block
+4parallel_scan = jax.lax.associative_scan
+5
+6def apply_ConvS5_layer(A, B, B_shape, C_kernel, log_Delta, resnet_params, us, x0):
+7 """Tính các đầu ra của lớp ConvS5 cho chuỗi đầu vào.
+8 Args:
+9 A (complex64): ma trận trạng thái S5 (P,)
+10 B (complex64): ma trận đầu vào S5 (P,Uk_B^2)
+11 B_shape (tuple): hình dạng của B_kernel
+12 C_kernel (complex64) kernel đầu ra (U,P,k_C,k_C)
+13 log_Delta (float32): tham số thang thời gian có thể học (P,)
+14 resnet_params (dict): tham số khối ResNet
+15 us (float32): chuỗi đầu vào của các đặc trưng (L,bsz,H,W,U)
+16 x0 (complex64): trạng thái ban đầu (bsz,H,W,P)
+17 Returns:
+18 outputs (float32): các đầu ra lớp ConvS5 (L,bsz,H,W,U)
+19 x_L (complex64): trạng thái cuối cùng của ConvSSM (bsz,H,W,P)
+20 """
+21 # Rời rạc hóa và reshape các kernel trạng thái và đầu vào ConvS5
+22 P, U, k_B = B_shape
+23 A_bar, B_bar = discretize(A, B, np.exp(log_Delta))
+24 A_kernel = A_bar # đã đúng hình dạng do đường chéo hóa
+25 B_kernel = B_bar.reshape(P, U, k_B, k_B)
+26
+27 # Áp dụng ConvS5
+28 ys, xs = apply_ConvS5(A_kernel, B_kernel, C_kernel, us, x0)
+29
+30 # Áp dụng hàm kích hoạt ResNet
+31 outputs = jax.vmap(ResNet_Block, axis=(None,0))(resnet_params, ys)
+32 return outputs, xs[-1]
+33
+34def apply_ConvS5(A_kernel, B_kernel, C_kernel, us, x0):
+35 """Tính chuỗi đầu ra của SSM tích chập
+36 cho chuỗi đầu vào sử dụng quét song song.
+37 Tính x_k = A *x_{k-1} + B *u_k
+38 y_k = C *x_k
+39 trong đó * là toán tử tích chập.
+40 Args:
+41 A_kernel (complex64): kernel trạng thái (P,)
+42 B_kernel (complex64): kernel đầu vào (P,U,k_B,k_B)
+43 C_kernel (complex64): kernel đầu ra (U,P,k_C,k_C)
+44 us (float32): chuỗi đầu vào (L,bsz,H,W,U)
+45 x0 (complex64): trạng thái ban đầu (bsz,H,W,P)
+46 Returns:
+47 ys (float32): các đầu ra convS5 (L,bsz,H,W,U)
+48 x_L (complex64): trạng thái cuối cùng (bsz,H,W,P)
+49 """
+50 # Tính các phần tử quét ban đầu
+51 As = np.repeat(A_kernel[None, ...], us.shape[0], axis=0)
+52 Bus = jax.vmap(Conv2D)(B_kernel, np.complex64(us))
+53 Bus = Bus.at[0].add(np.expand_dims(A_bar, (0, 1, 2)) *x0)
+54
+55 # Đệ quy tích chập với quét song song
+56 _, xs = parallel_scan(conv_binary_operator, (As, Bus))
+57
+58 # Tính đầu ra ConvS5
+59 ys = jax.vmap(Conv2D)(C_kernel, xs).real
+60 return ys, xs
+61
+62def conv_binary_operator(q_i, q_j):
+63 """Toán tử nhị phân cho đệ quy tích chập
+64 với các kernel trạng thái 1X1 "đường chéo hóa".
+65 Args:
+66 q_i, q_j (tuples): các phần tử quét q_i=(A_i, BU_i) trong đó
+67 A_i (complex64) là kernel trạng thái (P,)
+68 BU_i (complex64) là đầu vào hiệu quả (bsz,H,W,P)
+69 Returns:
+70 tuple đầu ra q_i \circledast q_j
+71 """
+72 A_i, BU_i = q_i
+73 A_j, BU_j = q_j
+74 # Tích chập các kernel 1X1 "đường chéo"
+75 AA = A_j *A_i
+76 # Tích chập A_j "đường chéo" với BU_i
+77 A_jBU_i = np.expand_dims(A_j, (0, 1, 2)) *BU_i
+78 return AA, A_jBU_i + BU_j
+Listing 1: Triển khai JAX của mã lõi để áp dụng một lớp ConvS5 cho một batch các
+chuỗi đầu vào không gian-thời gian.
+23
+
+--- TRANG 24 ---
+C Kết quả Bổ sung
+Chúng tôi bao gồm các bảng mở rộng và các quỹ đạo mẫu từ các thí nghiệm trong bài báo chính. Các video mẫu có thể được tìm thấy tại:
+https://sites.google.com/view/convssm .
+C.1 Moving-MNIST
+Bảng 6: Kết quả đầy đủ trên tập dữ liệu Moving-MNIST [54]. Đối với bảng trên, tất cả các mô hình được huấn luyện trên
+300 khung hình. Đối với bảng dưới, tất cả các mô hình được huấn luyện trên 600 khung hình. Nhiệm vụ đánh giá là
+điều kiện hóa trên 100 khung hình, và sau đó sinh ra 400, 800 và 1200 khung hình tiếp theo. ConvSSM (ablation)
+được thực hiện bằng cách khởi tạo ngẫu nhiên kernel trạng thái (xem Mục 5.3 và Phụ lục D.4).
+Huấn luyện trên 300 khung hình
+100→400 100 →800 100 →1200
+Phương pháp Tham số FVD ↓ PSNR↑ SSIM↑ LPIPS↓ FVD↓ PSNR↑ SSIM↑ LPIPS↓ FVD↓ PSNR↑ SSIM↑ LPIPS↓
+Transformer 164M 73±3 13 .5±0.1 0 .669±0.002 0 .213±0.003 159 ±7 12 .6±0.1 0 .609±0.002 0 .287±0.001 265 ±8 12 .4±0.1 0 .591±0.002 0 .321±0.002
+Performer 164M 111±9 13 .4±0.1 0 .653±0.002 0 .288±0.001 234 ±1 13 .4±0.1 0 .652±0.006 0 .379±0.002 275 ±5 13 .2±0.1 0 .592±0.001 0 .393±0.001
+CW-V AE 20M 78±1 12 .7±0.1 0 .611±0.002 0 .254±0.001 104 ±2 12 .4±0.1 0 .592±0.002 0 .277±0.002 117±212.3±0.1 0 .585±0.002 0 .286±0.001
+ConvLSTM 20M 57±316.9±0.20.796±0.004 0.113±0.002 128±415.0±0.10.737±0.003 0.169±0.001 187±614.1±0.10.706±0.003 0 .203±0.001
+ConvSSM (ablation) 20M 67±3 15 .5±0.1 0 .742±0.001 0 .168±0.001 287 ±5 13 .6±0.1 0 .577±0.001 0 .293±0.001 511 ±8 13 .3±0.1 0 .515±0.001 0 .348±0.001
+ConvS5 20M 26±1 18 .1±0.1 0 .830±0.003 0 .094±0.002 72 ±3 16 .0±0.1 0 .761±0.005 0 .156±0.003 187±514.5±0.10.678±0.003 0.230±0.004
+Huấn luyện trên 600 khung hình
+100→400 100 →800 100 →1200
+Phương pháp Tham số FVD ↓ PSNR↑ SSIM↑ LPIPS↓ FVD↓ PSNR↑ SSIM↑ LPIPS↓ FVD↓ PSNR↑ SSIM↑ LPIPS↓
+Transformer 164M 21±115.0±0.1 0 .741±0.002 0 .138±0.001 42±213.7±0.1 0 .672±0.002 0 .207±0.003 91 ±613.1±0.1 0 .631±0.004 0 .252±0.002
+Performer 164M 27±1 13 .1±0.1 0 .654±0.004 0 .206±0.001 93 ±5 12 .4±0.1 0 .616±0.002 0 .274±0.001 243 ±7 12 .2±0.1 0 .608±0.001 0 .312±0.002
+CW-V AE 20M 73±2 12 .9±0.1 0 .621±0.004 0 .242±0.001 94 ±3 12 .5±0.9 0 .598±0.004 0 .269±0.001 107 ±2 12 .3±0.1 0 .590±0.004 0 .280±0.002
+ConvLSTM 20M 39±5 17 .3±0.20.812±0.005 0.100±0.003 91±7 15 .5±0.20.757±0.005 0.149±0.003 137±9 14 .6±0.10.727±0.004 0.180±0.003
+ConvSSM (ablation) 20M 81±6 15 .5±0.1 0 .743±0.002 0 .163±0.003 145 ±8 14 .3±0.1 0 .696±0.002 0 .218±0.002 215 ±9 13 .4±0.1 0 .614±0.001 0 .287±0.001
+ConvS5 20M 23±318.1±0.1 0 .832±0.003 0 .092±0.003 47±716.4±0.1 0 .788±0.002 0 .134±0.003 71 ±9 15 .6±0.1 0 .763±0.002 0 .162±0.003
+Bảng 7: So sánh thời gian chạy của mô hình cho kết quả Moving-MNIST trong Bảng 6. ConvS5 có thể được song song hóa
+như Transformer nhưng duy trì chi phí không đổi theo bước sinh tự hồi quy của ConvRNN.
+100→400 100 →800 100 →1200
+Phương pháp Song song hóa được Thời gian Bước Huấn luyện (s) ↓Thông lượng Mẫu (khung hình/s) ↑Thông lượng Mẫu (khung hình/s) ↑Thông lượng Mẫu (khung hình/s) ↑
+Transformer CÓ 0.77(1.0×) 1 .1 (1.0×) 0 .34 (1.0×) 0 .21 (1.0×)
+ConvLSTM KHÔNG 3.0 (3.9×) 117 (106×) 117 (345×) 117 (557×)
+ConvS5 CÓ 0.93 (1.2×) 90 (82×) 90 (265 ×) 90 (429 ×)
+24
+
+--- TRANG 25 ---
+t=0 50 99 100 250 400 550 700 850 1000 1150 1299Thực tế
+Transformer
+ConvLSTM
+ConvS5          Điều kiện                                                   Khung hình Dự đoán(a) Ví dụ 1
+t=0 50 99 100 250 400 550 700 850 1000 1150 1299Thực tế
+Transformer
+ConvLSTM
+ConvS5          Điều kiện                                                   Khung hình Dự đoán
+(b) Ví dụ 2
+t=0 50 99 100 250 400 550 700 850 1000 1150 1299Thực tế
+Transformer
+ConvLSTM
+ConvS5          Điều kiện                                                   Khung hình Dự đoán
+(c) Ví dụ 3
+Hình 3: Mẫu Moving-MNIST: 1200 khung hình được tạo ra với điều kiện trên 100.
+25
+
+--- TRANG 26 ---
+C.2 Môi trường 3D
+Bảng 8: Kết quả đầy đủ cho tập dữ liệu benchmark tầm xa DMLab [13]. Kết quả từ Yan et al. [13] được
+ký hiệu với *. Chúng tôi tách riêng các phương pháp được huấn luyện sử dụng framework huấn luyện TECO [13] ở
+phần dưới của bảng. TECO-ConvSSM (ablation) đề cập đến ablation được thực hiện bằng cách khởi tạo ngẫu nhiên kernel trạng thái (xem Mục 5.3 và Phụ lục D.5).
+DMLab
+Phương pháp Tham số FVD ↓ PSNR↑ SSIM↑ LPIPS ↓
+FitVid* 165M 176±4.86 12 .0±0.013 0 .356±0.00171 0 .491±0.00108
+CW-V AE* 111M 125±7.95 12 .6±0.059 0 .372±0.00033 0 .465±0.00156
+Perceiver AR * 30M 96.3±3.64 11 .2±0.004 0 .304±0.00004 0 .487±0.00123
+Latent FDM* 31M 181±2.20 17 .8±0.111 0 .588±0.00453 0 .222±0.00493
+Transformer 152M 97.0±5.98 19 .9±0.108 0.619±0.00506 0 .123±0.00191
+Performer 152M 80.3±3.21 17.3±0.074 0 .513±0.00492 0 .205±0.00315
+S5 140M 221±13.1 19 .3±0.128 0 .641±0.00400 0.162±0.04510
+ConvS5 100M 66.6±4.81 23 .2±0.053 0 .769±0.01020 0 .079±0.00073
+TECO-Transformer* 173M 27.5±1.77 22.4±0.368 0.709±0.0119 0.155±0.00958
+TECO-Transformer (chạy của chúng tôi) 173M 28.2±0.66 21.6±0.079 0 .696±0.02640 0.082±0.00119
+TECO-S5 180M 34.6±0.26 20 .1±0.037 0 .687±0.00132 0 .143±0.00049
+TECO-ConvSSM (ablation) 175M 44.3±2.69 21 .0±0.106 0 .691±0.00004 0 .010±0.00267
+TECO-ConvS5 175M 31.2±0.2323.8±0.056 0 .803±0.0020 0.085±0.00179
+Bảng 9: Kết quả đầy đủ cho ablation tích chập ConvS5 cho tập dữ liệu benchmark tầm xa DMLab [13]. Để làm cho số lượng tham số có thể so sánh được cho các cấu hình khác nhau,
+khi có thể, chúng tôi điều chỉnh tham số trong các khối kích hoạt, ví dụ: tăng kích thước của các kernel tích chập ResNet hoặc tăng các đặc trưng của kích hoạt GLU. Với những điều chỉnh này, các mô hình cũng
+có tốc độ huấn luyện tương tự. Lưu ý mục cuối cùng là lần chạy S5 đóng vai trò như một ablation bổ sung
+của cấu trúc tích chập.
+DMLab
+Bkernel Ckernel Kích hoạt Tham số FVD ↓ PSNR↑ SSIM↑ LPIPS ↓ Thời gian Bước Huấn luyện (s) ↓
+3×3 3 ×3 ResNet 100M 66.6±4.81 23 .2±0.053 0 .769±0.00043 0 .079±0.00073 2.31
+1×1 3 ×3 ResNet 85M 67.5±0.73 22 .8±0.041 0 .756±0.00039 0 .085±0.00124 2.52
+1×1 1 ×1 ResNet 100M 81.1±6.06 23 .0±0.074 0 .767±0.00186 0 .083±0.00139 2 .21
+3×3 3 ×3 GLU 71M 96.1±5.20 22 .7±0.157 0 .762±0.00363 0 .088±0.00287 2.75
+1×1 5 ×5 GLU 83M 89.1±0.61 21 .5±0.072 0 .713±0.00290 0 .106±0.00289 2.58
+1×1 1 ×1 GLU 30M 187±2.77 21 .0±0.064 0 .689±0.00007 0 .112±0.00183 1 .73
+- - GLU 140M 221±13.1 19 .3±0.128 0 .641±0.00400 0 .162±0.04510 1.34
+26
+
+--- TRANG 27 ---
+t=0 73 143 144 163 182 202 221 240 260 279 299Thực tế
+Transformer
+S5
+ConvS5
+TECO-Transformer
+TECO-S5
+TECO-ConvS5          Điều kiện                                                   Khung hình Dự đoán(a) 156 khung hình được tạo ra với điều kiện trên 144 (có điều kiện hành động).
+t=0 17 35 36 68 101 134 167 200 233 266 299Thực tế
+Transformer
+S5
+ConvS5
+TECO-Transformer
+TECO-S5
+TECO-ConvS5          Điều kiện                                                   Khung hình Dự đoán
+(b) 264 khung hình được tạo ra với điều kiện trên 36 (không có điều kiện hành động).
+Hình 4: Mẫu DMLab
+27
+
+--- TRANG 28 ---
+t=0 73 143 144 163 182 202 221 240 260 279 299Thực tế
+TECO-Transformer
+TECO-ConvS5          Điều kiện                                                   Khung hình Dự đoán(a) 156 khung hình được tạo ra với điều kiện trên 144 (có điều kiện hành động).
+t=0 17 35 36 68 101 134 167 200 233 266 299Thực tế
+TECO-Transformer
+TECO-ConvS5          Điều kiện                                                   Khung hình Dự đoán
+(b) 264 khung hình được tạo ra với điều kiện trên 36 (có điều kiện hành động).
+Hình 5: Mẫu Minecraft
+t=0 73 143 144 163 182 202 221 240 260 279 299Thực tế
+TECO-Transformer
+TECO-ConvS5          Điều kiện                                                   Khung hình Dự đoán
+(a) 156 khung hình được tạo ra với điều kiện trên 144 (có điều kiện hành động).
+t=0 17 35 36 68 101 134 167 200 233 266 299Thực tế
+TECO-Transformer
+TECO-ConvS5          Điều kiện                                                   Khung hình Dự đoán
+(b) 264 khung hình được tạo ra với điều kiện trên 36 (không có điều kiện hành động).
+Hình 6: Mẫu Habitat
+28
+
+--- TRANG 29 ---
+Bảng 10: Kết quả đầy đủ trên các tập dữ liệu benchmark tầm xa Minecraft và Habitat [13]. Kết quả từ
+Yan et al. [13] được ký hiệu với *. Lưu ý rằng Yan et al. [13] không đánh giá FitVid hoặc CW-V AE trên
+Habitat do chi phí.
+Minecraft
+Phương pháp Tham số FVD ↓ PSNR↑ SSIM↑ LPIPS ↓
+FitVid* 176M 956±15.8 13 .0±0.0089 0 .343±0.00380 0 .519±0.00367
+CW-V AE* 140M 397±15.5 13 .4±0.0610 0 .338±0.00274 0 .441±0.00367
+Perceiver AR* 166M 76.3±1.72 13.2±0.0711 0 .323±0.00336 0 .441±0.00207
+Latent FDM* 33M 167±6.26 13 .4±0.0904 0 .349±0.00327 0 .429±0.00284
+TECO-Transformer* 274M 116±5.0815.4±0.0603 0 .381±0.00192 0 .340±0.00264
+TECO-ConvS5 214M 70.7±3.05 14.8±0.0984 0.374±0.00414 0.355±0.00467
+Habitat
+Phương pháp Tham số FVD ↓ PSNR↑ SSIM↑ LPIPS ↓
+Perceiver AR* 200M 164±12.6 12 .8±0.0423 0.405±0.00248 0.676±0.00282
+Latent FDM* 87M 433±2.67 12 .5±0.0121 0 .311±0.00083 0.582±0.00049
+TECO-Transformer* 386M 76.3±1.72 12.8±0.0139 0.363±0.00122 0 .604±0.00451
+TECO-ConvS5 351M 95.1±3.7412.9±0.212 0.390±0.01238 0.632±0.00823
+Bảng 11: So sánh thời gian chạy của mô hình cho kết quả Môi trường 3D trong Bảng 8-10. Các triển khai
+của các baseline FitVid, CW-V AE, Perceiver AR và Latent FDM được sử dụng trong công trình TECO [13] không
+có sẵn công khai trong kho lưu trữ TECO, vì vậy chúng tôi không thể bao gồm so sánh thời gian chạy trực tiếp
+cho các phương pháp đó.
+DMLab
+Phương pháp Thời gian Bước Huấn luyện (s) ↓Tốc độ Lấy mẫu (khung hình/s)
+Transformer 1.25(1.0×) 9 .1 (1.0×)
+Performer 1.25 (1.0×) 7.6(0.8×)
+S5 1.34 (1.1×) 28 (3 .1×)
+ConvS5 2.31 (1.8×) 56(6.2×)
+TECO-Transformer 0.75(0.6×) 16 (1 .8×)
+TECO-S5 0.81 (0.7×) 21(2.3×)
+TECO-ConvS5 1.17 (0.9×) 18 (2 .0×)
+Minecraft
+Phương pháp Thời gian Bước Huấn luyện (s) ↓Tốc độ Lấy mẫu (khung hình/s)
+TECO-Transformer 1.91(1.0×) 8 .1 (1.0×)
+TECO-ConvS5 2.53 (1.3×) 14(1.7×)
+Habitat
+Phương pháp Thời gian Bước Huấn luyện (s) ↓Tốc độ Lấy mẫu (khung hình/s)
+TECO-Transformer 2.71(1.0×) 6 .8 (1.0×)
+TECO-ConvS5 3.10 (1.1×) 11(1.6×)
+29
+
+--- TRANG 30 ---
+D Cấu hình Thí nghiệm
+Mã nguồn của chúng tôi sửa đổi mã nguồn TECO từ Yan et al. [13] và chúng tôi tái sử dụng các triển khai framework Transformer và TECO cốt lõi của họ. Các chi tiết kiến trúc bổ sung và chi tiết cụ thể về tập dữ liệu được
+mô tả bên dưới.
+D.1 Kiến trúc Mô hình Chuỗi Không gian-Thời gian
+Các mô hình ConvS5, ConvLSTM và S5 được hình thành bằng cách xếp chồng nhiều lớp ConvS5, ConvLSTM hoặc S5,
+tương ứng. Đối với mỗi mô hình này, chuẩn hóa lớp [107] với thiết lập post-norm được
+sử dụng cùng với các kết nối dư. Đối với Transformer, chúng tôi sử dụng triển khai Transformer
+từ Yan et al. [13] bao gồm một chồng các lớp attention đa đầu.
+ConvS5 và ConvLSTM được áp dụng trực tiếp cho các chuỗi khung hình có hình dạng [độ dài chuỗi, chiều cao ẩn, chiều rộng ẩn, đặc trưng ẩn], trong đó dữ liệu gốc đã được tích chập đến độ phân giải ẩn và số lượng đặc trưng ẩn. Vì S5 và Transformer tác động lên các chuỗi giá trị vector, các
+mô hình này yêu cầu một phép toán tích chập downsampling bổ sung để chiếu các khung hình ẩn thành
+một token và một phép toán tích chập chuyển vị upsampling để chiếu các token đầu ra backbone Transformer
+trở lại thành các khung hình ẩn. Chúng tôi sử dụng cùng chuỗi các phép toán nén cho điều này
+như trong Yan et al. [13]. Encoder và Decoder được đề cập cho tất cả các mô hình trong các bảng siêu tham số
+dưới đây bao gồm các Khối ResNet với kernel 3×3 như được triển khai trong Yan et al. [13].
+D.2 Các Chỉ số Đánh giá
+Chúng tôi tuân theo Yan et al. [13] và đánh giá các phương pháp bằng cách tính Fréchet Video Distance (FVD) [108],
+peak signal-to-noise ratio (PSNR), structural similarity index measure [109] và Learned Perceptual
+Image Patch Similarity (LPIPS) [110] giữa các quỹ đạo được lấy mẫu và quỹ đạo thực tế.
+Xem Yan et al. [13] để thảo luận chuyên sâu hơn về việc sử dụng các chỉ số này cho các benchmark môi trường 3D.
+D.3 Tính toán
+Tất cả các mô hình được huấn luyện với GPU NVIDIA V100 32GB. Đối với Moving-MNIST, các mô hình được huấn luyện
+với 8 V100. Đối với tất cả các thí nghiệm khác, các mô hình được huấn luyện với 16 V100. Chúng tôi liệt kê ngày V100 trong
+các siêu tham số, ký hiệu số ngày cần để huấn luyện trên một V100 duy nhất.
+D.4 Moving-MNIST
+Tất cả các mô hình được huấn luyện để tối thiểu hóa mất mát L1+L2 trên các khung hình trực tiếp trong không gian pixel, như trong Su et al.
+[84]. Chúng tôi huấn luyện các mô hình trên 300 khung hình. Sau đó chúng tôi lặp lại thí nghiệm và huấn luyện các mô hình trên 600
+khung hình. Đối với ConvS5 và ConvLSTM, chúng tôi cố định các chiều ẩn (đặc trưng đầu vào/đầu ra của lớp)
+và kích thước trạng thái là 256, và chúng tôi quét qua các tốc độ học sau [1×10−4,5×10−4,
+1×10−3] và chọn mô hình tốt nhất. Đối với Transformer, chúng tôi quét qua kích thước mô hình, xem xét các chiều ẩn
+của [512, 2014] và tốc độ học [1×10−4,5×10−4,1×10−3] và chọn mô hình tốt nhất.
+Chúng tôi cũng quan sát hiệu suất tốt hơn cho Transformer bằng cách tích chập các khung hình xuống độ phân giải ẩn 8×8 (thay vì 16×16 được sử dụng bởi ConvS5 và ConvLSTM) trước khi downsampling thành
+một token. Tất cả các tham số huấn luyện liên quan khác được giữ giống nhau giữa ba phương pháp. Xem Bảng 12-14 cho cấu hình thí nghiệm chi tiết.
+Mỗi mô hình được đánh giá bằng cách thu thập 1024 quỹ đạo sử dụng quy trình sau: điều kiện
+trên 100 khung hình từ tập kiểm tra thực tế, sau đó sinh ra 1200 khung hình tiếp theo. Các mẫu này được
+so sánh với thực tế để tính FVD, PSNR, SSIM và LPIPS.
+Ablation ConvSSM được thực hiện sử dụng các thiết lập chính xác như ConvS5, ngoại trừ kernel trạng thái
+được khởi tạo bằng phân phối Gaussian và chúng tôi quét qua các tốc độ học sau [1×10−4,5×10−4,
+1×10−3].
+30
+
+--- TRANG 31 ---
+Bảng 12: Cấu hình Thí nghiệm cho ConvS5 trên các thí nghiệm Moving-MNIST
+Siêu tham số Moving-MNIST-300 Moving-MNIST-600
+Ngày V100 25 50
+Tham số 20M 20M
+Độ phân giải Đầu vào 64×64 64 ×64
+Độ phân giải Ẩn 16×16 16 ×16
+Kích thước Batch 8 8
+Độ dài Chuỗi 300 600
+LR 1×10−31×10−3
+Lịch LR cosine cosine
+Bước Khởi động 5k 5k
+Bước Huấn luyện Tối đa 300K 300K
+Suy giảm Trọng số 1×10−51×10−5
+Độ sâu Encoder 64, 128, 256 64, 128, 256
+Khối 1 1
+Độ sâu Decoder 64, 128, 256 64, 128, 256
+Khối 1 1
+ConvS5Chiều Ẩn (U) 256 256
+Kích thước Trạng thái (P) 256 256
+Kích thước Kernel B 3×3 3 ×3
+Kích thước Kernel C 3×3 3 ×3
+Lớp 8 8
+Dropout 0 0
+Kích hoạt ResNet ResNet
+Bảng 13: Cấu hình Thí nghiệm cho ConvLSTM trên các thí nghiệm Moving-MNIST
+Siêu tham số Moving-MNIST-300 Moving-MNIST-600
+Ngày V100 75 150
+Tham số 20M 20M
+Độ phân giải Đầu vào 64×64 64 ×64
+Độ phân giải Ẩn 16×16 16 ×16
+Kích thước Batch 8 8
+Độ dài Chuỗi 300 600
+LR 5×10−45×10−4
+Lịch LR cosine cosine
+Bước Khởi động 5k 5k
+Bước Huấn luyện Tối đa 300K 300K
+Suy giảm Trọng số 1×10−51×10−5
+Độ sâu Encoder 64, 128, 256 64, 128, 256
+Khối 1 1
+Độ sâu Decoder 64, 128, 256 64, 128, 256
+Khối 1 1
+ConvLSTMChiều Ẩn 256 256
+Kích thước Trạng thái 256 256
+Kích thước Kernel 3×3 3 ×3
+Lớp 8 8
+Dropout 0 0
+31
+
+--- TRANG 32 ---
+Bảng 14: Cấu hình Thí nghiệm cho Transformer trên các thí nghiệm Moving-MNIST
+Siêu tham số Moving-MNIST-300 Moving-MNIST-600
+Ngày V100 25 50
+Tham số 164M 164M
+Độ phân giải Đầu vào 64×64 64 ×64
+Độ phân giải Ẩn 8×8 8 ×8
+Kích thước Batch 8 8
+Độ dài Chuỗi 300 600
+LR 5×10−41×10−4
+Lịch LR cosine cosine
+Bước Khởi động 5k 5k
+Bước Huấn luyện Tối đa 300K 300K
+Suy giảm Trọng số 1×10−51×10−5
+Độ sâu Encoder 64, 128, 256, 512 64, 128, 256, 512
+Khối 1 1
+Độ sâu Decoder 64, 128, 256, 512 64, 128, 256, 512
+Khối 1 1
+Temporal
+TransformerHệ số Downsample 8 8
+Chiều Ẩn 1024 1024
+Chiều Feedforward 4096 4096
+Đầu 16 16
+Lớp 8 8
+Dropout 0 0
+32
+
+--- TRANG 33 ---
+D.5 Các Benchmark Môi trường 3D Tầm xa
+Chúng tôi tuân theo các quy trình từ Yan et al. [13] và huấn luyện các mô hình trên cùng các mã được lượng tử hóa vector (VQ) 16×16 được huấn luyện trước được sử dụng bởi các baseline được đánh giá trong công trình đó. Các mô hình được huấn luyện
+để tối ưu hóa mất mát tái tạo entropy chéo giữa các dự đoán và mã VQ thực.
+Đánh giá DMLab và Habitat bao gồm cả thiết lập có điều kiện hành động và không có điều kiện.
+Do đó, như trong Yan et al. [13], các hành động được bỏ qua ngẫu nhiên một nửa thời gian trong quá trình huấn luyện
+trên các tập dữ liệu này.
+Sau khi huấn luyện, chúng tôi tuân theo quy trình từ Yan et al. [13] để đánh giá trong hai thiết lập khác nhau.
+Thiết lập đầu tiên bao gồm tính PSNR, SSIM và LPIPS từ 1024 mẫu được tạo ra bằng cách
+điều kiện hóa trên 144 khung hình đầu tiên và sau đó tạo ra 156 khung hình tiếp theo trong khi cung cấp
+cho mô hình các hành động quá khứ và tương lai. Thiết lập thứ hai không cung cấp hành động làm đầu vào (trừ
+Minecraft, cũng cung cấp hành động trong thiết lập này). Nó bao gồm tính FVD sử dụng
+1024 mẫu được tạo ra bằng cách điều kiện hóa trên 36 khung hình đầu tiên và sau đó dự đoán 264
+khung hình còn lại.
+Tất cả các mô hình chuỗi mà chúng tôi huấn luyện sử dụng cùng số lượng lớp như Transformer được sử dụng trong
+TECO-Transformer được huấn luyện bởi Yan et al. [13]. Ngoài ra, các mô hình TECO-Transformer, TECO-S5
+và TECO-ConvS5 mà chúng tôi huấn luyện sử dụng chính xác cấu hình encoder/decoder và cấu hình MaskGit
+như trong Yan et al. [13]. Các mô hình Transformer, S5 và ConvS5 mà chúng tôi huấn luyện mà không
+có framework TECO đều được huấn luyện sử dụng cùng cấu hình encoder/decoder. Xem Bảng
+15-21 để biết chi tiết cấu hình thí nghiệm chi tiết hơn. Xem các đoạn văn cụ thể về tập dữ liệu bên dưới để biết
+thông tin điều chỉnh siêu tham số.
+Framework Huấn luyện TECO Yan et al. [13] đã đề xuất framework huấn luyện TECO để huấn luyện
+Transformer trên dữ liệu video dài. Đối với một số thí nghiệm của chúng tôi, chúng tôi sử dụng các lớp ConvS5 và lớp S5
+như một thay thế trực tiếp cho Transformer trong framework này. Chúng tôi giới thiệu độc giả đến Yan et al. [13]
+để biết chi tiết đầy đủ. Tóm lại, cho các mã VQ gốc, TECO huấn luyện một encoder/decoder bổ sung
+nén các khung hình xuống độ phân giải ẩn thấp hơn (ví dụ: từ 16×16 xuống 8×8) bằng cách huấn luyện một
+encoder/decoder bổ sung với mất mát codebook, LVQ. Ngoài ra, mất mát tiên nghiệm động lực học MaskGit [98],
+Lprior, được sử dụng cho các chuyển đổi ẩn. Mô hình chuỗi (ví dụ: Transformer, S5, ConvS5)
+lấy các khung hình ẩn (được nén thành token trong trường hợp Transformer và S5) và tạo ra một
+đầu ra được sử dụng cùng với các ẩn bởi decoder để tạo ra các dự đoán và mất mát tái tạo,
+Lrecon. Các mô hình được huấn luyện để tối thiểu hóa tổng mất mát sau:
+LTECO =LVQ+Lrecon+Lprior. (32)
+Ngoài ra, TECO bao gồm việc sử dụng DropLoss [13], loại bỏ một phần trăm các bước thời gian ngẫu nhiên
+không được giải mã và do đó không yêu cầu tính các số hạng Lrecon và
+Lprior tốn kém.
+DMLab Như đã đề cập ở trên, các hành động được bỏ qua ngẫu nhiên khỏi các chuỗi một nửa thời gian
+(do hai kịch bản đánh giá, có điều kiện hành động và không có điều kiện). Chúng tôi quan sát thấy rằng đối với
+DMLab, khi được cung cấp các hành động quá khứ và tương lai, các mô hình hội tụ nhanh hơn bằng cách sử dụng chiến lược che
+đơn giản được thảo luận trong Gu et al. [19] che các đầu vào tương lai thay vì cung cấp các
+đầu vào dự đoán (hoặc đầu vào thực trong quá trình huấn luyện) một cách tự hồi quy. Do đó chúng tôi huấn luyện tất cả các mô hình (Transformer,
+Performer, S5, ConvS5, Teco-Transformer, TECO-S5, TECO-ConvS5) bằng cách sử dụng chiến lược này khi
+các hành động được cung cấp, và sử dụng chiến lược tự hồi quy khi không cung cấp hành động. Chúng tôi
+quan sát điều này cải thiện đáng kể LPIPS của các baseline Transformer. Lưu ý, trong các lần chạy thử nghiệm cho
+Minecraft và Habitat, chúng tôi quan sát thấy chiến lược này dẫn đến các khung hình chất lượng thấp hơn và không sử dụng nó cho các
+kết quả được báo cáo cho các tập dữ liệu đó.
+Chúng tôi huấn luyện mỗi mô hình, Transformer, Performer, S5, ConvS5, Teco-Transformer, TECO-S5, TECO-
+ConvS5, với ba tốc độ học khác nhau [1×10−4,5×10−4,1×10−3] và chọn lần chạy tốt nhất
+cho mỗi mô hình. Xem Bảng 15-20 để biết thêm chi tiết cấu hình thí nghiệm.
+Ablation TECO-ConvSSM sử dụng chính xác cùng thiết lập như TECO-ConvS5, ngoại trừ kernel trạng thái
+được khởi tạo bằng phân phối Gaussian ngẫu nhiên và tốc độ học thấp hơn là 1×10−5 được yêu cầu để huấn luyện
+ổn định.
+33
+
+--- TRANG 34 ---
+Bảng 15: Cấu hình Thí nghiệm cho ConvS5 trên DMLab
+Siêu tham số DMLab
+Ngày V100 150
+Tham số 101M
+Độ phân giải Đầu vào 64×64
+Độ phân giải Ẩn 16×16
+Kích thước Batch 16
+Độ dài Chuỗi 300
+LR 5×10−4
+Lịch LR cosine
+Bước Khởi động 5k
+Bước Huấn luyện Tối đa 500K
+Suy giảm Trọng số 1×10−5
+Độ sâu Encoder 256
+Khối 1
+Độ sâu Decoder 256
+Khối 4
+ConvS5Chiều Ẩn (U) 512
+Kích thước Trạng thái (P) 512
+Kích thước Kernel B 3×3
+Kích thước Kernel C 3×3
+Lớp 8
+Dropout 0
+Kích hoạt ResNet
+Bảng 16: Cấu hình Thí nghiệm cho S5 trên DMLab
+Siêu tham số DMLab
+Ngày V100 125
+Tham số 140M
+Độ phân giải Đầu vào 64×64
+Độ phân giải Ẩn 16×16
+Kích thước Batch 16
+Độ dài Chuỗi 300
+LR 1×10−3
+Lịch LR cosine
+Bước Khởi động 5k
+Bước Huấn luyện Tối đa 500K
+Suy giảm Trọng số 1×10−5
+Độ sâu Encoder 256
+Khối 1
+Độ sâu Decoder 256
+Khối 4
+S5Hệ số Downsample 16
+Chiều Ẩn (U) 1024
+Kích thước Trạng thái (P) 1024
+Lớp 8
+Dropout 0
+Kích hoạt GLU (một nửa)
+34
+
+--- TRANG 35 ---
+Bảng 17: Cấu hình Thí nghiệm cho Transformer trên DMLab
+Siêu tham số DMLab
+Ngày V100 125
+Tham số 152M
+Độ phân giải Đầu vào 64×64
+Độ phân giải Ẩn 16×16
+Kích thước Batch 16
+Độ dài Chuỗi 300
+LR 5×10−4
+Lịch LR cosine
+Bước Khởi động 5k
+Bước Huấn luyện Tối đa 500K
+Suy giảm Trọng số 1×10−5
+Độ sâu Encoder 256
+Khối 1
+Độ sâu Decoder 256
+Khối 4
+Temporal
+TransformerHệ số Downsample 16
+Chiều Ẩn 512
+Chiều Feedforward 2048
+Đầu 16
+Lớp 8
+Dropout 0
+35
+
+--- TRANG 36 ---
+Bảng 18: Cấu hình Thí nghiệm cho TECO-ConvS5 trên DMLab
+Siêu tham số DMLab
+Ngày V100 110
+Tham số 175M
+Độ phân giải Đầu vào 64×64
+Độ phân giải Ẩn 8×8
+Kích thước Batch 16
+Độ dài Chuỗi 300
+LR 5×10−4
+Lịch LR cosine
+Bước Khởi động 5k
+Bước Huấn luyện Tối đa 500K
+Suy giảm Trọng số 1×10−5
+Tỷ lệ DropLoss 0.9
+Độ sâu Encoder 256, 512
+Khối 2
+Kích thước Codebook 1024
+Chiều Embedding 32
+Độ sâu Decoder 256, 512
+Khối 4
+ConvS5Chiều Ẩn (U) 512
+Kích thước Trạng thái (P) 1024
+Kích thước Kernel B 3×3
+Kích thước Kernel C 3×3
+Lớp 8
+Dropout 0
+Kích hoạt ResNet
+MaskGitLịch Mask cosine
+Chiều Ẩn 512
+Chiều Feedforward 2048
+Đầu 8
+Lớp 8
+Dropout 0
+36
+
+--- TRANG 37 ---
+Bảng 19: Cấu hình Thí nghiệm cho TECO-S5 trên DMLab
+Siêu tham số DMLab
+Ngày V100 80
+Tham số 180M
+Độ phân giải Đầu vào 64×64
+Độ phân giải Ẩn 8×8
+Kích thước Batch 16
+Độ dài Chuỗi 300
+LR 1×10−3
+Lịch LR cosine
+Bước Khởi động 5k
+Bước Huấn luyện Tối đa 500K
+Suy giảm Trọng số 1×10−5
+Tỷ lệ DropLoss 0.9
+Độ sâu Encoder 256, 512
+Khối 2
+Kích thước Codebook 1024
+Chiều Embedding 32
+Độ sâu Decoder 256, 512
+Khối 4
+S5Hệ số Downsample 8
+Chiều Ẩn (U) 2048
+Kích thước Trạng thái (P) 2048
+Lớp 8
+Dropout 0
+Kích hoạt GLU (một nửa)
+MaskGitLịch Mask cosine
+Chiều Ẩn 512
+Chiều Feedforward 2048
+Đầu 8
+Lớp 8
+Dropout 0
+37
+
+--- TRANG 38 ---
+Bảng 20: Cấu hình Thí nghiệm cho TECO-Transformer trên DMLab
+Siêu tham số DMLab
+Ngày V100 80
+Tham số 173M
+Độ phân giải Đầu vào 64×64
+Độ phân giải Ẩn 8×8
+Kích thước Batch 16
+Độ dài Chuỗi 300
+LR 1×10−4
+Lịch LR cosine
+Bước Khởi động 5k
+Bước Huấn luyện Tối đa 500K
+Suy giảm Trọng số 1×10−5
+Tỷ lệ DropLoss 0.9
+Độ sâu Encoder 256, 512
+Khối 2
+Kích thước Codebook 1024
+Chiều Embedding 32
+Độ sâu Decoder 256, 512
+Khối 4
+Temporal
+TransformerHệ số Downsample 8
+Chiều Ẩn 1024
+Chiều Feedforward 4096
+Đầu 16
+Lớp 8
+Dropout 0
+MaskGitLịch Mask cosine
+Chiều Ẩn 512
+Chiều Feedforward 2048
+Đầu 8
+Lớp 8
+Dropout 0
+38
+
+--- TRANG 39 ---
+Minecraft và Habitat Đối với Minecraft và Habitat, chúng tôi chỉ huấn luyện TECO-ConvS5 do chi phí
+huấn luyện trên các tập dữ liệu này. Xem chi tiết tập dữ liệu trong Phụ lục E và chi phí tính toán được báo cáo trong Yan
+et al. [13]. Đối với Minecraft, chúng tôi đánh giá hai tốc độ học khác nhau [1×10−4,5×10−4] và chọn
+tốt nhất. Đối với Habitat, chúng tôi chỉ thực hiện một lần chạy mà không điều chỉnh thêm. Xem Bảng 21 để biết thêm
+chi tiết cấu hình thí nghiệm.
+Bảng 21: Cấu hình Thí nghiệm cho TECO-ConvS5 trên Minecraft và Habitat
+Siêu tham số Minecraft Habitat
+Ngày V100 470 575
+Tham số 214M 351M
+Độ phân giải Đầu vào 128×128 128 ×128
+Độ phân giải Ẩn 8×8 8 ×8
+Kích thước Batch 16 16
+Độ dài Chuỗi 300 300
+LR 5×10−41×10−4
+Lịch LR cosine cosine
+Bước Khởi động 5k 5k
+Bước Huấn luyện Tối đa 1M 1M
+Tỷ lệ DropLoss 0.9 0.9
+Độ sâu Encoder 256, 512 256, 512
+Khối 4 4
+Kích thước Codebook 1024 1024
+Chiều Embedding 32 32
+Độ sâu Decoder 256, 512 256, 512
+Khối 8 8
+ConvS5Chiều Ẩn (U) 512 512
+Kích thước Trạng thái (P) 512 512
+Kích thước Kernel B 3×3 3 ×3
+Kích thước Kernel C 3×3 3 ×3
+Lớp 12 8
+Dropout 0 0
+Kích hoạt ResNet ResNet
+MaskGitLịch Mask cosine cosine
+Chiều Ẩn 768 1024
+Chiều Feedforward 3072 4096
+Đầu 12 16
+Lớp 6 16
+Dropout 0 0
+39
+
+--- TRANG 40 ---
+E Tập dữ liệu
+E.1 Moving-MNIST
+Tập dữ liệu Moving-MNIST [54] được tạo ra bằng cách di chuyển hai chữ số MNIST kích thước 28×28 từ
+tập dữ liệu MNIST [111] bên trong nền đen 64×64. Các chữ số bắt đầu từ một vị trí ban đầu ngẫu nhiên,
+và di chuyển với vận tốc không đổi, nảy khi chúng chạm đến ranh giới. Đối với mỗi độ dài chuỗi
+mà chúng tôi xem xét, 300 và 600, chúng tôi tuân theo Wang et al. [81] và Su et al. [84] và tạo ra 10.000
+chuỗi để huấn luyện.
+E.2 DMLab
+Chúng tôi sử dụng benchmark tầm xa DMLab được thiết kế bởi Yan et al. [13] sử dụng trình mô phỏng DeepMind Lab
+(DMLab) [99]. Trình mô phỏng tạo ra các mê cung 3D ngẫu nhiên với kết cấu sàn và tường ngẫu nhiên.
+Benchmark bao gồm 40K video 300 khung hình có điều kiện hành động với độ phân giải 64×64.
+Các video là của một tác nhân điều hướng ngẫu nhiên trong mê cung 7×7 bằng cách chọn các điểm ngẫu nhiên trong
+mê cung và điều hướng đến chúng qua đường đi ngắn nhất.
+E.3 Minecraft
+Chúng tôi sử dụng benchmark tầm xa Minecraft [100] được thiết kế bởi Yan et al. [13]. Trò chơi có
+các thế giới 3D chứa các địa hình phức tạp như đồi, rừng, sông và hồ. Benchmark được
+xây dựng bằng cách thu thập 200K video 300 khung hình có điều kiện hành động với độ phân giải 128×128. Các
+video ở biome đầm lầy của Minecraft và tác nhân lặp đi lặp lại việc đi thẳng trong một số
+bước ngẫu nhiên và xoay ngẫu nhiên sang trái hoặc phải. Điều này dẫn đến các phần của cảnh ra khỏi tầm nhìn và
+quay trở lại tầm nhìn sau đó.
+E.4 Habitat
+Chúng tôi sử dụng benchmark tầm xa Habitat được thiết kế bởi Yan et al. [13] sử dụng trình mô phỏng Habitat [101].
+Trình mô phỏng render các quỹ đạo sử dụng các bản quét của các cảnh 3D thực. Yan et al. [13] đã biên soạn 1400
+bản quét trong nhà từ HM3D [112], Matterport3D [113] và Gibson [114] để tạo ra 200K video 300 khung hình có điều kiện hành động
+với độ phân giải 128×128. Yan et al. [13] đã sử dụng thuật toán duyệt đường đi tích hợp của Habitat
+để xây dựng các quỹ đạo hành động di chuyển tác nhân giữa các vị trí được lấy mẫu ngẫu nhiên.
+40

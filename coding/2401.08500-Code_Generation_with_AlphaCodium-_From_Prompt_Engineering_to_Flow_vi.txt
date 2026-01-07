@@ -1,0 +1,234 @@
+# Tạo Mã với AlphaCodium: Từ Kỹ Thuật Prompt Đến Kỹ Thuật Luồng
+
+Tal Ridnik, Dedy Kredo, Itamar Friedman
+CodiumAI
+{tal.r, dedy.k, itamar.f }@codium.ai
+
+Tóm tắt
+
+Các bài toán tạo mã khác với các bài toán ngôn ngữ tự nhiên thông thường - chúng yêu cầu khớp chính xác cú pháp của ngôn ngữ đích, xác định các đường đi thuận lợi và các trường hợp biên, chú ý đến nhiều chi tiết nhỏ trong đặc tả bài toán, và giải quyết các vấn đề và yêu cầu đặc thù khác của mã. Do đó, nhiều tối ưu hóa và thủ thuật đã thành công trong tạo ngôn ngữ tự nhiên có thể không hiệu quả cho các tác vụ liên quan đến mã. Trong nghiên cứu này, chúng tôi đề xuất một phương pháp mới để tạo mã bằng LLM, mà chúng tôi gọi là AlphaCodium - một luồng lặp đa giai đoạn, hướng mã, dựa trên kiểm thử, giúp cải thiện hiệu suất của LLM trên các bài toán mã. Chúng tôi đã thử nghiệm AlphaCodium trên một tập dữ liệu tạo mã khó gọi là CodeContests, bao gồm các bài toán lập trình thi đấu từ các nền tảng như Codeforces. Luồng được đề xuất cải thiện kết quả một cách nhất quán và đáng kể. Trên tập validation, ví dụ, độ chính xác (pass@5) của GPT-4 tăng từ 19% với một prompt trực tiếp được thiết kế tốt lên 44% với luồng AlphaCodium. Nhiều nguyên tắc và thực tiễn tốt nhất thu được trong nghiên cứu này, chúng tôi tin rằng, có thể áp dụng rộng rãi cho các tác vụ tạo mã nói chung.
+
+Triển khai đầy đủ có sẵn tại: https://github.com/Codium-ai/AlphaCodium
+
+1. Giới thiệu
+
+Với tín hiệu phần thưởng thưa thớt, các tác vụ tạo mã yêu cầu tìm kiếm trong không gian có cấu trúc khổng lồ của các chương trình có thể có. Các giải pháp đúng cho cùng một bài toán có thể trông rất khác nhau, và việc đánh giá xem một giải pháp một phần hoặc không đúng có hữu ích hay không là một thách thức khó khăn - một thay đổi đơn lẻ một ký tự có thể thay đổi hoàn toàn hành vi của giải pháp. Do bản chất độc đáo của các tác vụ tạo mã, các kỹ thuật prompting phổ biến đã được tối ưu hóa cho các tác vụ ngôn ngữ tự nhiên [4, 13, 10], có thể không hiệu quả khi áp dụng cho tạo mã.
+
+Các mô hình ngôn ngữ quy mô lớn dựa trên transformer gần đây [12] đã tạo mã thành công để giải quyết các tác vụ lập trình đơn giản [2, 1]. Tuy nhiên, các bài toán mã trong thực tế thường có bản chất khác - chúng tinh tế hơn và có thể được định nghĩa bằng một mô tả tác vụ bằng ngôn ngữ tự nhiên dài (tức là đặc tả), chứa nhiều chi tiết và quy tắc mà mã giải pháp phải đáp ứng.
+
+Sự ra đời của CodeContests [8], một tập dữ liệu được tuyển chọn từ các nền tảng lập trình thi đấu như Codeforces [9], đã cho phép đánh giá các mô hình và luồng trên các bài toán mã khó hơn, thường bao gồm một mô tả bài toán dài. Một tập kiểm thử riêng tư, với hơn 200 bài kiểm thử chưa thấy cho mỗi bài toán, cho phép đánh giá mã được tạo một cách toàn diện và giảm tỷ lệ dương tính giả xuống mức tối thiểu.
+
+Công trình chính giải quyết tập dữ liệu CodeContests là AlphaCode [8], một hệ thống tạo mã được phát triển bởi DeepMind, sử dụng một mạng được tinh chỉnh đặc biệt cho các tác vụ lập trình thi đấu. AlphaCode tạo ra một số lượng rất lớn các giải pháp có thể (lên đến 1 triệu), sau đó được xử lý và phân cụm, và trong số đó một số lượng nhỏ (~10) được chọn và gửi. Mặc dù kết quả của AlphaCode ấn tượng, nhưng nhu cầu tinh chỉnh một mô hình đặc biệt cho các tác vụ hướng mã, và khối lượng tính toán nặng kiểu brute-force, khiến nó không thực tế cho hầu hết các trường hợp sử dụng thực tế. CodeChain [7] là một công trình khác để giải quyết các tác vụ lập trình thi đấu, đã giới thiệu một khung suy luận mới để cải thiện tạo mã trong LLM thông qua một chuỗi các tự sửa đổi dựa trên mô-đun con.
+
+Trong bài báo này, chúng tôi trình bày AlphaCodium, một luồng hướng mã xoay quanh một quá trình lặp trong đó chúng tôi lặp đi lặp lại chạy và sửa một mã được tạo ra so với các bài kiểm thử đầu vào-đầu ra. Hai yếu tố chính cho luồng AlphaCodium là (a) tạo dữ liệu bổ sung, chẳng hạn như phản ánh bài toán và lý luận kiểm thử, để hỗ trợ quá trình lặp, và (b) làm phong phú các bài kiểm thử công khai với các bài kiểm thử bổ sung do AI tạo ra. Luồng được đề xuất, được mô tả trong Hình 1, được chia thành hai giai đoạn chính: một giai đoạn tiền xử lý trong đó chúng tôi lý luận về bài toán bằng ngôn ngữ tự nhiên, và một giai đoạn tạo mã lặp trong đó chúng tôi tạo, chạy và sửa một giải pháp mã so với các bài kiểm thử công khai và do AI tạo ra.
+
+Một quan sát quan trọng khi thiết kế luồng AlphaCodium là việc tạo ra các bài kiểm thử bổ sung hữu ích dễ hơn việc tạo ra một giải pháp mã đúng. Việc thêm các bài kiểm thử cụ thể chủ yếu yêu cầu hiểu bài toán, có chút hiểu biết và lý luận brute-force hoặc logic cơ bản. Không cần phải "giải" hoàn toàn bài toán khi tạo các bài kiểm thử bổ sung.
+
+Luồng AlphaCodium cũng sử dụng các khái niệm thiết kế hướng mã mới, thủ thuật và thực tiễn tốt nhất, chẳng hạn như: (1) đầu ra có cấu trúc YAML; (2) phân tích dấu đầu dòng để khuyến khích lý luận ngữ nghĩa; (3) tạo mã mô-đun; (4) quyết định mềm với xác thực kép; (5) khuyến khích khám phá và trì hoãn quyết định trực tiếp; (6) neo kiểm thử.
+
+Luồng của AlphaCodium, khi so sánh với một prompt đơn được thiết kế tốt, liên tục và đáng kể cải thiện hiệu suất của LLM trên các bài toán CodeContests. Điều này đúng cho cả các mô hình mã nguồn mở (DeepSeek [3]) và các mô hình mã nguồn đóng (GPT [5]). Ví dụ, đối với GPT-4 trên tập validation, độ chính xác pass@5 cải thiện từ 19% lên 44%. AlphaCodium cũng vượt trội hơn các công trình trước đây, trong khi có ngân sách tính toán nhỏ hơn đáng kể - nó đạt được kết quả vượt trội hơn AlphaCode, ví dụ, với ít hơn bốn bậc độ lớn số lần gọi LLM.
+
+Chúng tôi tin rằng nhiều nguyên tắc và thực tiễn tốt nhất được sử dụng trong nghiên cứu này áp dụng rộng rãi cho các tác vụ tạo mã nói chung. Ngoài ra, chúng tôi cho rằng việc sử dụng các benchmark khó hơn và phức tạp hơn như tập dữ liệu CodeContests sẽ cho phép cộng đồng đánh giá LLM tốt hơn, so với các benchmark đơn giản hơn, phổ biến ngày nay, như HumanEval [2].
+
+2. Tập Dữ Liệu CodeContests
+
+CodeContests [8] là một tập dữ liệu tạo mã khó được giới thiệu bởi DeepMind của Google, bao gồm các bài toán được tuyển chọn từ các nền tảng lập trình thi đấu như Codeforces [9]. Tập dữ liệu chứa 10 nghìn bài toán mã có thể được sử dụng để huấn luyện LLM, cũng như một tập validation và test để đánh giá khả năng của LLM trong việc giải quyết các bài toán mã khó.
+
+Trong nghiên cứu này, thay vì huấn luyện một mô hình chuyên dụng, chúng tôi tập trung vào việc phát triển một luồng hướng mã, có thể được áp dụng cho bất kỳ LLM nào được huấn luyện trước để hỗ trợ các tác vụ coding, chẳng hạn như GPT [5] hoặc DeepSeek [3]. Do đó, chúng tôi chọn bỏ qua tập train và tập trung vào các tập validation và test của CodeContests, chứa lần lượt 107 và 165 bài toán. Hình 2(a) mô tả một ví dụ về một bài toán điển hình từ tập dữ liệu CodeContests. Mỗi bài toán bao gồm một mô tả và các bài kiểm thử công khai, có sẵn làm đầu vào cho mô hình. Mục tiêu là tạo một giải pháp mã tạo ra đầu ra đúng cho bất kỳ đầu vào (hợp lệ) nào. Một tập kiểm thử riêng tư, không có sẵn cho mô hình hoặc người thi đấu, được sử dụng để đánh giá các giải pháp mã được gửi.
+
+Điều gì làm cho CodeContests trở thành một tập dữ liệu tốt để đánh giá LLM trên các tác vụ tạo mã:
+
+1) CodeContests, không giống như nhiều tập dữ liệu lập trình thi đấu khác [6, 2], sử dụng một tập các bài kiểm thử riêng tư toàn diện để tránh dương tính giả - mỗi bài toán chứa ~200 bài kiểm thử đầu vào-đầu ra riêng tư mà giải pháp mã được tạo ra phải vượt qua.
+
+2) LLM thường không xuất sắc trong việc chú ý đến các chi tiết nhỏ, bởi vì chúng thường chuyển đổi mô tả bài toán thành một mô tả "trung bình" nào đó, tương tự như các trường hợp phổ biến mà chúng đã được huấn luyện. Ngược lại, các bài toán mã trong thế giới thực thường chứa các chi tiết nhỏ quan trọng cho việc giải quyết đúng đắn của chúng. Một đặc điểm chính của tập dữ liệu CodeContests là các mô tả bài toán, theo thiết kế, phức tạp và dài, với các chi tiết nhỏ và sắc thái (xem mô tả điển hình trong Hình 2(a)). Chúng tôi cảm thấy rằng việc thêm bậc tự do này của việc hiểu bài toán là có lợi vì nó mô phỏng các bài toán thực tế, thường phức tạp và liên quan đến nhiều yếu tố và cân nhắc. Điều này trái ngược với các tập dữ liệu mã phổ biến hơn như HumanEval [2], trong đó các bài toán dễ hơn và được trình bày một cách súc tích. Một ví dụ về một bài toán HumanEval điển hình xuất hiện trong phụ lục A.
+
+Hình 2(b) mô tả sự tự phản ánh của mô hình về bài toán được trình bày trong Hình 2(a). Lưu ý rằng sự tự phản ánh đúng đắn làm cho bài toán rõ ràng hơn và mạch lạc hơn. Điều này minh họa tầm quan trọng của việc hiểu bài toán như một phần của luồng có thể dẫn đến, với xác suất cao, việc tạo ra một giải pháp mã đúng.
+
+3. Luồng Được Đề Xuất
+
+3.1. Tổng quan
+
+Do bản chất phức tạp của các bài toán tạo mã, chúng tôi quan sát thấy rằng các tối ưu hóa prompt đơn, hoặc thậm chí các prompt chuỗi suy nghĩ, đã không dẫn đến cải thiện có ý nghĩa trong độ chính xác của LLM trên CodeContests. Mô hình gặp khó khăn trong việc hiểu và nắm bắt bài toán, và liên tục tạo ra mã sai, hoặc một mã vượt qua các bài kiểm thử công khai nhưng không thể tổng quát hóa cho các bài kiểm thử riêng tư chưa thấy. Các luồng phổ biến, phù hợp cho các tác vụ ngôn ngữ tự nhiên, có thể không tối ưu cho các tác vụ tạo mã, bao gồm một tiềm năng chưa được khai thác - lặp đi lặp lại chạy mã được tạo ra và xác thực nó với các ví dụ đã biết.
+
+Thay vì các kỹ thuật kỹ thuật prompt phổ biến được sử dụng trong NLP, chúng tôi nhận thấy rằng để giải quyết các bài toán CodeContest, sẽ có lợi hơn khi sử dụng một luồng tạo và kiểm thử mã chuyên dụng, xoay quanh một quá trình lặp trong đó chúng tôi lặp đi lặp lại chạy và sửa mã được tạo ra so với các bài kiểm thử đầu vào-đầu ra (xem Hình 2(a) cho các ví dụ về các bài kiểm thử như vậy). Hai yếu tố chính cho luồng hướng mã này là (a) tạo dữ liệu bổ sung trong giai đoạn tiền xử lý, chẳng hạn như tự phản ánh và lý luận kiểm thử công khai, để hỗ trợ quá trình lặp, và (b) làm phong phú các bài kiểm thử công khai với các bài kiểm thử bổ sung do AI tạo ra.
+
+Trong Hình 1(a) chúng tôi trình bày luồng AlphaCodium để giải quyết các bài toán lập trình thi đấu. Luồng được chia thành hai giai đoạn chính:
+
+• Giai đoạn tiền xử lý đại diện cho một luồng tuyến tính trong đó AlphaCodium lý luận về bài toán, bằng ngôn ngữ tự nhiên,
+
+• Giai đoạn lặp mã bao gồm các giai đoạn lặp trong đó AlphaCodium tạo, chạy và sửa một giải pháp mã so với các bài kiểm thử nhất định.
+
+3.2. Các giai đoạn của luồng
+
+Trong phần này, chúng tôi sẽ xem xét các giai đoạn khác nhau được sử dụng trong luồng AlphaCodium (Hình 1(a)):
+
+Phản ánh bài toán Mô tả bài toán, dưới dạng dấu đầu dòng, trong khi đề cập đến mục tiêu bài toán, đầu vào, đầu ra, quy tắc, ràng buộc và các chi tiết liên quan khác xuất hiện trong mô tả bài toán.
+
+Lý luận kiểm thử công khai Giải thích tại sao mỗi đầu vào kiểm thử dẫn đến đầu ra.
+
+Tạo các giải pháp có thể Tạo một danh sách 2-3 giải pháp có thể cho bài toán, được mô tả bằng ngôn ngữ tự nhiên.
+
+Xếp hạng các giải pháp Xếp hạng các giải pháp có thể và chọn "giải pháp tốt nhất", về mặt tính đúng đắn, đơn giản và độ bền vững. (không nhất thiết phải lấy giải pháp "hiệu quả nhất").
+
+Tạo các bài kiểm thử AI bổ sung Tạo thêm 6-8 bài kiểm thử đầu vào-đầu ra đa dạng cho bài toán. Cố gắng bao gồm các trường hợp và khía cạnh không được bao gồm bởi các bài kiểm thử công khai ban đầu.
+
+Giải pháp mã ban đầu Mục tiêu của giai đoạn này là tạo một giải pháp mã ban đầu cho bài toán. Điều quan trọng là mã này phải hợp lý "gần" với mã đúng, để các lặp chạy-sửa ở các giai đoạn tiếp theo có cơ hội thành công tốt hơn. Luồng giai đoạn:
+
+• Chọn một giải pháp tiềm năng. Tạo một mã tương ứng, và chạy nó trên các bài kiểm thử công khai và AI được chọn.
+
+• Lặp lại quá trình này cho đến khi các bài kiểm thử vượt qua, hoặc cho đến khi đạt đến giới hạn thử.
+
+• Mã đầu tiên vượt qua các bài kiểm thử, hoặc mã có đầu ra gần nhất (xem phụ lục D), sẽ được sử dụng làm mã cơ sở cho các bước tiếp theo.
+
+Lặp trên các bài kiểm thử công khai Bắt đầu từ mã cơ sở. Lặp đi lặp lại chạy nó trên các bài kiểm thử công khai. Nếu mã thất bại trên một bài kiểm thử cụ thể, hãy cố gắng sửa nó, với thông báo lỗi.
+
+Lặp trên các Bài kiểm thử do AI tạo ra Tiếp tục các lặp chạy-sửa trên các bài kiểm thử do AI tạo ra. Sử dụng "neo kiểm thử" (xem phần 4).
+
+3.3. Các hiểu biết bổ sung
+
+Trong phần này, chúng tôi sẽ đưa ra các hiểu biết bổ sung và chia sẻ trực giác về luồng được đề xuất.
+
+Thứ nhất, luồng dựa trên tích lũy kiến thức - cố gắng tiến triển từ dễ đến khó, thu được kiến thức và hiểu biết trên đường đi để giúp với các giai đoạn khó hơn. Ví dụ, đầu ra của bước đầu tiên, phản ánh bài toán, có thể được sử dụng làm đầu vào prompt cho các bước khó hơn như tạo các giải pháp có thể. Các đầu ra của giai đoạn tiền xử lý được sử dụng để hỗ trợ giai đoạn khó khăn và quan trọng nhất, lặp mã, trong đó chúng tôi cố gắng tạo mã giải quyết đúng bài toán.
+
+Một quan sát quan trọng khác trong việc thiết kế AlphaCodium là đối với AI, việc tạo thêm các bài kiểm thử dễ hơn việc tạo một mã giải pháp đầy đủ. Việc tạo các bài kiểm thử bổ sung chủ yếu yêu cầu hiểu bài toán và lý luận brute-force hoặc logic cơ bản. Không cần phải "giải" hoàn toàn bài toán để tạo ra các cặp bài kiểm thử đầu vào-đầu ra bổ sung hữu ích. Điều này trái ngược với việc tạo một mã giải pháp đúng, yêu cầu một giải pháp thuật toán hoàn chỉnh, tương đương với việc giải quyết đúng bất kỳ cặp bài kiểm thử đầu vào-đầu ra nào có thể. Kết quả là, chúng tôi có thể tạo thêm các bài kiểm thử AI, và sau đó tận dụng chúng để cải thiện giai đoạn tạo mã, như được mô tả trong Hình 1(b). Chúng tôi khuếch đại thêm đóng góp của các bài kiểm thử bổ sung này bằng cách yêu cầu mô hình tập trung vào các khía cạnh không được giải quyết bởi các bài kiểm thử công khai ban đầu, chẳng hạn như các đầu vào lớn, các trường hợp biên, v.v.
+
+Cũng lưu ý rằng một số bước có thể được kết hợp thành một lần gọi LLM duy nhất, và luồng trong Hình 2(a) là một luồng khái niệm, nhấn mạnh các bước cấp cao của quá trình. Trong thực tế, đầu ra có cấu trúc (xem phần 4) cho phép kết hợp nhiều giai đoạn thành một lần gọi LLM duy nhất, để tiết kiệm tài nguyên, hoặc vì một mô hình hoạt động tốt hơn khi thực hiện các tác vụ cụ thể đồng thời.
+
+4. Các Khái Niệm Thiết Kế Hướng Mã
+
+Trong phần này, chúng tôi sẽ trình bày các khái niệm thiết kế, thủ thuật và thực tiễn tốt nhất bổ sung mà chúng tôi thấy có lợi khi cố gắng giải quyết các bài toán tạo mã. Luồng AlphaCodium được đề xuất trong Hình 1 sử dụng rộng rãi các khái niệm thiết kế này.
+
+Đầu ra có cấu trúc YAML: việc sử dụng đầu ra có cấu trúc - yêu cầu mô hình tạo một đầu ra ở định dạng YAML, tương đương với một lớp Pydantic đã cho - là một thành phần chính trong luồng được đề xuất của chúng tôi. Một ví dụ về hướng dẫn như vậy (giai đoạn các giải pháp có thể) xuất hiện trong Hình 3.
+
+Đầu ra có cấu trúc loại bỏ phần lớn rắc rối và kiến thức ngầm cần thiết cho "kỹ thuật prompt" và thay vào đó cho phép các tác vụ phức tạp được trình bày theo cách đơn giản, giống như mã. Nó cũng cho phép nhận được các câu trả lời phức tạp liên quan đến nhiều giai đoạn, đại diện cho một quá trình suy nghĩ logic và có phương pháp.
+
+Trong khi các phiên bản mới hơn của các mô hình GPT [5] có hỗ trợ tích hợp cho đầu ra kiểu JSON, chúng tôi cho rằng đầu ra YAML phù hợp hơn nhiều đặc biệt cho các tác vụ tạo mã, xem phụ lục B.
+
+Lý luận ngữ nghĩa thông qua phân tích dấu đầu dòng: khi yêu cầu một LLM lý luận về một vấn đề, kết quả tốt hơn được thu được khi yêu cầu đầu ra ở định dạng dấu đầu dòng. Dấu đầu dòng khuyến khích sự hiểu biết sâu sắc về bài toán và buộc mô hình chia đầu ra thành các phần ngữ nghĩa logic, dẫn đến kết quả được cải thiện. Ví dụ, với tự phản ánh về một bài toán dưới dạng dấu đầu dòng (Hình 2 (b)), mỗi dấu đầu dòng đại diện cho một sự hiểu biết ngữ nghĩa về một phần khác nhau của bài toán - mô tả chung, mục tiêu và quy tắc, cấu trúc đầu vào và cấu trúc đầu ra.
+
+LLM hoạt động tốt hơn khi tạo một mã mô-đun: khi LLM được yêu cầu tạo một hàm dài duy nhất, chúng tôi quan sát kết quả kém - mã thường chứa lỗi hoặc sai lầm logic. Tệ hơn nữa, một mã nguyên khối duy nhất làm tổn hại đến khả năng thực hiện sửa chữa lặp - mô hình gặp khó khăn trong việc xác định chính xác và sửa các vấn đề, ngay cả khi được cung cấp thông báo lỗi. Khi rõ ràng yêu cầu mô hình: "chia mã được tạo thành các hàm con nhỏ, với tên và chức năng có ý nghĩa", chúng tôi quan sát một mã được tạo ra tốt hơn, với ít lỗi hơn và tỷ lệ thành công cao hơn cho các giai đoạn sửa chữa lặp.
+
+Quyết định mềm với xác thực kép: LLM có xu hướng gặp khó khăn với các tác vụ mã yêu cầu chúng suy nghĩ, lý luận và đưa ra các quyết định chặt chẽ, không tầm thường. Hãy lấy ví dụ về tác vụ tạo các bài kiểm thử bổ sung cho một bài toán. Khá thường xuyên, một số bài kiểm thử mà mô hình tạo ra sẽ hoàn toàn sai. Với một quy trình xác thực kép, chúng tôi thêm một bước bổ sung trong đó, với đầu ra được tạo, mô hình được yêu cầu tạo lại cùng một đầu ra, nhưng sửa nó nếu cần. Ví dụ, với các bài kiểm thử AI được tạo làm đầu vào, mô hình được yêu cầu tạo lại các bài kiểm thử tương tự, trong khi sửa đầu ra sai, nếu có. Chúng tôi nhận thấy rằng bước xác thực kép này, trong khi khuyến khích mô hình phản biện và lý luận, hiệu quả hơn việc đặt một câu hỏi trực tiếp có\không: "bài kiểm thử này có đúng không?"
+
+Trì hoãn các quyết định, cố gắng tránh các câu hỏi trực tiếp và để lại chỗ cho khám phá: khi chúng tôi đặt câu hỏi trực tiếp cho mô hình về các vấn đề phức tạp, chúng tôi liên tục thấy ảo giác và câu trả lời sai. Để chống lại điều này, chúng tôi áp dụng một luồng tích lũy dữ liệu dần dần, từ các tác vụ dễ hơn đến các tác vụ khó hơn:
+
+• Bắt đầu với các tác vụ dễ nhất - tự phản ánh về bài toán, và lý luận về các bài kiểm thử công khai.
+
+• Chuyển sang tạo các bài kiểm thử AI bổ sung và các giải pháp có thể cho bài toán
+
+• Chỉ sau khi chúng tôi có được các câu trả lời của mô hình cho các tác vụ trên, chúng tôi chuyển sang tạo mã thực tế và các lặp chạy-sửa.
+
+Như một ví dụ khác, thay vì chọn một giải pháp thuật toán duy nhất cho bài toán, chúng tôi thích xếp hạng một số giải pháp có thể, và ưu tiên, nhưng không độc quyền, cho giải pháp được xếp hạng cao nhất khi tạo mã ban đầu. Vì mô hình có thể sai, tốt hơn là tránh các quyết định không thể đảo ngược và để lại chỗ cho khám phá và các lặp mã với các giải pháp có thể khác nhau.
+
+Neo kiểm thử: ngay cả với xác thực kép, một số bài kiểm thử do AI tạo ra sẽ sai. Điều này làm cho các lặp trên chúng trở nên khó khăn - khi một bài kiểm thử thất bại, làm sao chúng ta có thể biết nếu đó là vì mã sai, hay vì bài kiểm thử sai? Khi chúng tôi hỏi mô hình trực tiếp "ai sai", chúng tôi thường thấy ảo giác, và có thể kết thúc với một mã được sửa sai. Để giải quyết vấn đề này, chúng tôi đã sử dụng một kỹ thuật neo kiểm thử:
+
+• Lặp đầu tiên trên các bài kiểm thử công khai, mà chúng tôi biết là đúng. Khi hoàn tất, đặt tất cả các bài kiểm thử đã vượt qua làm bài kiểm thử neo.
+
+• Bây giờ lặp trên các bài kiểm thử do AI tạo ra, từng cái một. Nếu một bài kiểm thử vượt qua, thêm nó vào danh sách các neo kiểm thử
+
+• Nếu một bài kiểm thử thất bại, giả định rằng đó là do mã không đúng, và cố gắng sửa mã. Tuy nhiên, yêu cầu rằng mã được sửa cũng sẽ vượt qua tất cả các neo kiểm thử đã được thu thập. Kết quả là, các neo kiểm thử sẽ bảo vệ chúng tôi khỏi một mã được sửa không chính xác.
+
+Một tối ưu hóa khác cho neo kiểm thử là sắp xếp các bài kiểm thử do AI tạo ra từ dễ đến khó. Theo cách đó, có nhiều cơ hội hơn là quá trình lặp sẽ thu được các neo ở đầu quá trình, có thể được sử dụng làm bảo vệ sau này khi lặp trên các bài kiểm thử AI phức tạp hơn.
+
+Những gì không hiệu quả với chúng tôi: Trong phụ lục C chúng tôi trình bày các thủ thuật và phương pháp bổ sung mà chúng tôi đã thử, nhưng không dẫn đến kết quả được cải thiện.
+
+5. Kết quả
+
+5.1. Prompt trực tiếp so với luồng AlphaCodium
+
+Trong Bảng 1 chúng tôi so sánh kết quả AlphaCodium với các kết quả thu được với một prompt trực tiếp đơn được thiết kế tốt. Chỉ số được sử dụng là pass@k, được định nghĩa là tỷ lệ phần trăm các bài toán được giải quyết bằng cách sử dụng k giải pháp được tạo ra cho mỗi bài toán. Như có thể thấy, luồng AlphaCodium liên tục và đáng kể cải thiện hiệu suất của LLM trên các bài toán CodeContests. Điều này đúng cho cả các mô hình mã nguồn mở (DeepSeek) và mã nguồn đóng (GPT), và cho cả các tập validation và test. Ví dụ, đối với GPT-4 trên tập validation, điểm pass@5 cải thiện từ 19% lên 44% - cải thiện x2.3.
+
+5.2. So sánh với các công trình trước đây
+
+Trong Bảng 2 chúng tôi so sánh kết quả AlphaCodium với các phương pháp khác từ tài liệu. Như có thể thấy, khi so sánh AlphaCodium với CodeChain với cùng mô hình (GPT-3.5) và cùng chỉ số (pass@5), AlphaCodium liên tục hoạt động tốt hơn.
+
+Khi so sánh AlphaCodium với công trình AlphaCode, chúng ta cần tính đến rằng AlphaCode sử dụng một phương pháp tạo khác - tinh chỉnh một mô hình (không xác định) đặc biệt cho các bài toán mã, tạo một số lượng rất lớn các giải pháp mã, phân cụm chúng và gửi K giải pháp từ các cụm hàng đầu. pass@10@100K, ví dụ, có nghĩa là 100 nghìn (!) giải pháp đã được tạo ra và phân cụm, và 10 giải pháp cuối cùng được chọn và gửi. AlphaCode đã sử dụng một mô hình được tinh chỉnh và sử dụng một phương pháp kiểu brute-force với số lượng lần gọi LLM cao hơn đáng kể. Tuy nhiên, kết quả hàng đầu đạt được bởi AlphaCodium tốt hơn
+
+Lưu ý rằng cả các bài báo AlphaCode và CodeChain [8, 7] đều không phát hành một giải pháp mã nguồn mở có thể tái tạo cho CodeContests, bao gồm các script tạo và đánh giá end-to-end. Có những sắc thái khi đánh giá kết quả. Ví dụ - cách xử lý các bài toán có nhiều giải pháp, cách giải quyết các vấn đề dung sai, timeout, và hơn thế nữa. Chúng tôi so sánh với các con số được báo cáo trong các bài báo, nhưng phát hành một mã và script đánh giá có thể tái tạo đầy đủ của AlphaCodium, để cho phép các so sánh trong tương lai đáng tin cậy và nhất quán hơn.
+
+5.3. Nỗ lực tính toán và so sánh với AlphaCode và AlphaCode2
+
+Với luồng AlphaCodium, chúng tôi thực hiện ~15-20 lần gọi LLM cho mỗi giải pháp, vì vậy một bài gửi pass@5 liên quan đến ~100 lần gọi LLM.
+
+AlphaCode không báo cáo bao nhiêu lần gọi LLM đã được thực hiện cho mỗi lần chạy [8]. Hãy giả định một lần gọi cho mỗi lần chạy đã được thực hiện (không xác định, có thể nhiều hơn), thì một pass@10@100K (tức là mười bài gửi, được tuyển chọn từ 100.000 giải pháp được tạo ra) liên quan đến 1 triệu lần gọi LLM, cao hơn bốn bậc độ lớn so với AlphaCodium. Tuy nhiên, kết quả hàng đầu thu được bởi AlphaCodium tốt hơn.
+
+Gần đây, một công trình mới có tên AlphaCode2 [11] đã được công bố, trong đó một mô hình Gemini-Pro đã được tinh chỉnh và đánh giá trên các bài toán lập trình mã. Bài báo cũng báo cáo kết quả trên một benchmark CodeContests, nhưng trên một biến thể được cập nhật mà họ không công bố cho công chúng. Theo báo cáo của AlphaCode2: "AlphaCode2 yêu cầu khoảng 100 mẫu để đạt được mức hiệu suất của AlphaCode với một triệu mẫu, khiến nó hiệu quả hơn 10000× về mẫu." Do đó cả AlphaCode2 và AlphaCodium đều hiệu quả hơn bốn bậc độ lớn so với AlphaCode, về mặt lần gọi LLM. Nhưng, AlphaCode2 đã sử dụng một mô hình nền tảng hiện đại (Gemini-Pro) được tinh chỉnh nặng đặc biệt cho cuộc thi CodeContests, trong khi AlphaCodium sử dụng các mô hình mục đích chung nguyên bản và cải thiện hiệu suất của chúng mà không cần dữ liệu bổ sung và một giai đoạn huấn luyện tốn kém.
+
+6. Kết luận
+
+Trong bài báo này, chúng tôi đã giới thiệu AlphaCodium, một luồng hướng mã lặp đi lặp lại chạy và sửa một mã được tạo ra so với các bài kiểm thử đầu vào-đầu ra. Luồng được chia thành hai giai đoạn chính: một giai đoạn tiền xử lý, trong đó AlphaCodium lý luận về bài toán bằng ngôn ngữ tự nhiên, và một giai đoạn lặp mã, trong đó AlphaCodium lặp trên các bài kiểm thử công khai và do AI tạo ra.
+
+AlphaCodium cũng sử dụng các khái niệm thiết kế, thủ thuật và thực tiễn tốt nhất bổ sung mà chúng tôi thấy có lợi cho việc tạo mã: đầu ra có cấu trúc ở định dạng YAML, tạo mã mô-đun, lý luận ngữ nghĩa thông qua phân tích dấu đầu dòng, quyết định mềm với xác thực kép, khuyến khích khám phá và neo kiểm thử.
+
+Chúng tôi đã thử nghiệm AlphaCodium trên một tập dữ liệu tạo mã khó gọi là CodeContests. Luồng được đề xuất liên tục và đáng kể cải thiện kết quả của các mô hình mã nguồn đóng và mã nguồn mở khác nhau. AlphaCodium cũng vượt trội hơn các công trình trước đây từ tài liệu, trong khi có ngân sách tính toán nhỏ hơn đáng kể.
+
+Tài liệu tham khảo
+
+[1] Jacob Austin, Augustus Odena, Maxwell Nye, Maarten Bosma, Henryk Michalewski, David Dohan, Ellen Jiang, Carrie Cai, Michael Terry, Quoc Le, et al. Program synthesis with large language models. arXiv preprint arXiv:2108.07732, 2021. 1
+
+[2] Mark Chen, Jerry Tworek, Heewoo Jun, Qiming Yuan, Henrique Ponde de Oliveira Pinto, Jared Kaplan, Harri Edwards, Yuri Burda, Nicholas Joseph, Greg Brockman, et al. Evaluating large language models trained on code. arXiv preprint arXiv:2107.03374, 2021. 1, 3
+
+[3] DeepSeek. Deepseek coder: Let the code write itself, 2023. 2, 3, 7
+
+[4] Shehzaad Dhuliawala, Mojtaba Komeili, Jing Xu, Roberta Raileanu, Xian Li, Asli Celikyilmaz, and Jason Weston. Chain-of-verification reduces hallucination in large language models. arXiv preprint arXiv:2309.11495, 2023. 1
+
+[5] Luciano Floridi and Massimo Chiriatti. Gpt-3: Its nature, scope, limits, and consequences. Minds and Machines, 30:681-694, 2020. 2, 3, 5
+
+[6] Dan Hendrycks, Steven Basart, Saurav Kadavath, Mantas Mazeika, Akul Arora, Ethan Guo, Collin Burns, Samir Puranik, Horace He, Dawn Song, et al. Measuring coding challenge competence with apps. arXiv preprint arXiv:2105.09938, 2021. 3
+
+[7] Hung Le, Hailin Chen, Amrita Saha, Akash Gokul, Doyen Sahoo, and Shafiq Joty. Codechain: Towards modular code generation through chain of self-revisions with representative sub-modules. arXiv preprint arXiv:2310.08992, 2023. 1, 7
+
+[8] Yujia Li, David Choi, Junyoung Chung, Nate Kushman, Julian Schrittwieser, Rémi Leblond, Tom Eccles, James Keeling, Felix Gimeno, Agustin Dal Lago, et al. Competition-level code generation with alphacode. Science, 378(6624):1092-1097, 2022. 1, 3, 7
+
+[9] Mike Mirzayanov, Oksana Pavlova, Pavel MA VRIN, Roman Melnikov, Andrew Plotnikov, Vladimir Parfenov, and Andrew Stankevich. Codeforces as an educational platform for learning programming in digitalization. Olympiads in Informatics, 14(133-142):14, 2020. 1, 3
+
+[10] Harsha Nori, Yin Tat Lee, Sheng Zhang, Dean Carignan, Richard Edgar, Nicolo Fusi, Nicholas King, Jonathan Larson, Yuanzhi Li, Weishung Liu, et al. Can generalist foundation models outcompete special-purpose tuning? case study in medicine. arXiv preprint arXiv:2311.16452, 2023. 1
+
+[11] Gemini Team, Rohan Anil, Sebastian Borgeaud, Yonghui Wu, Jean-Baptiste Alayrac, Jiahui Yu, Radu Soricut, Johan Schalkwyk, Andrew M Dai, Anja Hauth, et al. Gemini: a family of highly capable multimodal models. arXiv preprint arXiv:2312.11805, 2023. 7
+
+[12] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Łukasz Kaiser, and Illia Polosukhin. Attention is all you need. Advances in neural information processing systems, 30, 2017. 1
+
+[13] Xuezhi Wang, Jason Wei, Dale Schuurmans, Quoc Le, Ed Chi, Sharan Narang, Aakanksha Chowdhery, and Denny Zhou. Self-consistency improves chain of thought reasoning in language models. arXiv preprint arXiv:2203.11171, 2022. 1
+
+Phụ lục
+
+A. Bài toán mã HumanEval điển hình
+
+/*
+Kiểm tra xem trong vector số đã cho, có hai số nào gần nhau hơn ngưỡng đã cho không. >>>
+has_close_elements({1.0, 2.0, 3.0}, 0.5) false >>>
+has_close_elements({1.0, 2.8, 3.0, 4.0, 5.0, 2.0}, 0.3) true
+*/
+#include<stdio.h>
+#include<vector>
+#include<math.h>
+using namespace std;
+bool has_close_elements(vector<float> numbers, float threshold){
+
+B. Tại sao đầu ra YAML phù hợp hơn cho các tác vụ tạo mã so với đầu ra JSON
+
+Mặc dù các phiên bản GPT mới hơn¹ có hỗ trợ vốn có cho đầu ra kiểu JSON, chúng tôi cho rằng đầu ra YAML tốt hơn nhiều cho việc tạo mã. Tại sao - mã được tạo thường chứa dấu nháy đơn, dấu nháy kép, ký tự đặc biệt, v.v. LLM sẽ gặp khó khăn trong việc đặt các ký tự này một cách hợp lệ bên trong định dạng JSON, vì đầu ra JSON cần được bao quanh bởi dấu nháy kép ban đầu (xem Hình 4 (a)). Ngược lại, đầu ra YAML với block scaler² chỉ phải tuân theo thụt lề. Bất kỳ văn bản hoặc mã nào với thụt lề đúng sẽ là hợp lệ (xem Hình 4 (b)).
+
+Ngoài ra, như có thể thấy trong Hình 4, vì định dạng YAML không cần dấu ngoặc nhọn, dấu ngoặc kép hoặc ký tự thoát, đầu ra của nó có ít token hơn JSON, do đó giảm chi phí và thời gian suy luận, và dẫn đến chất lượng tăng lên vì mô hình cần chú ý đến ít token hơn không cần thiết.
+
+C. Những gì không hiệu quả với chúng tôi
+
+1. Đưa trace thực thi thất bại vào prompt: Ngoài việc cung cấp cho mô hình thông báo lỗi khi thực hiện sửa chữa lặp, chúng tôi cũng thử cung cấp cho nó trace của X (50) dòng cuối cùng được thực thi. Chúng tôi không quan sát thấy cải thiện từ điều này.
+
+2. Đưa K giải pháp mã thất bại cuối cùng vào prompt: Khi thực hiện sửa chữa lặp, chúng tôi thử đưa K giải pháp mã thất bại cuối cùng vào prompt, để định hướng mô hình theo các hướng khác nhau. Chúng tôi không quan sát thấy cải thiện từ điều này.
+
+3. Đưa patch diff git cuối cùng vào prompt: Khi thực hiện sửa chữa lặp, chúng tôi cũng thử cung cấp patch diff mã cuối cùng được áp dụng cho prompt. Không thấy cải thiện.
+
+4. Các prompt một giai đoạn phức tạp: chúng tôi không quan sát thấy bất kỳ cải thiện đáng kể nào trong kết quả khi cố gắng thao tác và tối ưu hóa một prompt một giai đoạn, hoặc một chuỗi các prompt không lặp. Mô hình vẫn gặp khó khăn trong việc hiểu mô tả bài toán dài, có xu hướng bỏ qua các chi tiết cụ thể và liên tục tạo ra mã sai.
+
+D. Ước tính khoảng cách giữa các đầu ra kiểm thử
+
+Khi chúng tôi chạy một mã giải pháp so với một bài kiểm thử đầu vào, mã tạo ra một đầu ra. Chúng tôi so sánh đầu ra này với đầu ra mong đợi, và kết thúc với một câu trả lời boolean: vượt qua hoặc thất bại. Tuy nhiên, cũng có lợi khi cố gắng ước tính theo một nghĩa nào đó khoảng cách giữa đầu ra được tạo và đầu ra đúng. Đối với vấn đề này, chúng tôi đã sử dụng logic sau:
+
+• Nếu đầu ra kiểm thử là một số, tính khoảng cách L2.
+
+• Nếu đầu ra kiểm thử là một mảng số, tính tổng khoảng cách L2 giữa các ô mảng tương ứng.
+
+• Nếu đầu ra kiểm thử là một mảng chuỗi, so sánh từng ô riêng biệt (so sánh boolean), và trả về số lượng các ô không giống nhau.
+
+Phương pháp này cho phép chúng tôi tạo ra một khoảng cách giữa mỗi đầu ra được tạo và đầu ra đúng trên CodeContests.
