@@ -1,6 +1,6 @@
 # Document Conflict Detection in RAG Systems
 
-> Collection of 37 papers on knowledge conflict detection, contradiction resolution, and NLP techniques for RAG systems.
+> Collection of 65+ papers on knowledge conflict detection, contradiction resolution, and NLP techniques for RAG systems.
 
 ## Table of Contents
 - [Section 1: Core Conflict Detection in RAG](#section-1-core-conflict-detection-in-rag)
@@ -11,6 +11,8 @@
 - [Section 6: Document-level Claim Extraction & Fact-Checking](#section-6-document-level-claim-extraction--fact-checking)
 - [Section 7: Multi-Document Summarization & Conflict](#section-7-multi-document-summarization--conflict)
 - [Section 8: RAG Surveys & Benchmarks](#section-8-rag-surveys--benchmarks)
+- [Section 9: Temporal Knowledge Conflict & Versioning](#section-9-temporal-knowledge-conflict--versioning)
+- [Section 10: Knowledge Conflicts Survey (EMNLP 2024)](#section-10-knowledge-conflicts-survey-emnlp-2024)
 - [NLP Pipeline Overview](#nlp-pipeline-overview)
 - [Key Techniques Summary](#key-techniques-summary)
 
@@ -563,6 +565,150 @@ Refuted → Contradiction
 
 ---
 
+## Section 9: Temporal Knowledge Conflict & Versioning
+
+> Papers on handling conflicts from outdated documents, temporal knowledge, and version differences.
+
+### 9.1 Knowledge Conflicts for LLMs: A Survey (EMNLP 2024)
+**Xu et al. - Defines the taxonomy of knowledge conflicts**
+
+| Field | Value |
+|-------|-------|
+| ArXiv | [2403.08319](https://arxiv.org/abs/2403.08319) |
+| Venue | EMNLP 2024 Main |
+
+**Conflict Taxonomy:**
+- **Context-Memory Conflict**: Contextual info vs LLM parametric knowledge
+- **Inter-Context Conflict**: Disagreements among multiple sources (including outdated data)
+- **Intra-Memory Conflict**: Inconsistent responses from model's internal knowledge
+
+---
+
+### 9.2 Resolving Knowledge Conflicts in LLMs (COLM 2024)
+**Wang et al. - Framework for conflict resolution**
+
+| Field | Value |
+|-------|-------|
+| ArXiv | [2310.00935](https://arxiv.org/abs/2310.00935) |
+| Venue | COLM 2024 |
+
+**Framework:**
+```
+1. Identify conflicts between sources
+2. Pinpoint conflicting segments
+3. Provide distinct viewpoints to user
+```
+
+---
+
+### 9.3 T-GRAG: Dynamic GraphRAG for Temporal Conflicts (Aug 2025)
+**Li et al. - Temporal Knowledge Graph Generator**
+
+| Field | Value |
+|-------|-------|
+| ArXiv | [2508.01680](https://arxiv.org/abs/2508.01680) |
+
+**Method:** Temporal Knowledge Graph Generator with time-stamped structures
+
+---
+
+### 9.4 TruthfulRAG: Resolving Factual-level Conflicts with KGs (AAAI 2026)
+**Liu et al. - KG-based conflict resolution**
+
+| Field | Value |
+|-------|-------|
+| ArXiv | [2511.10375](https://arxiv.org/abs/2511.10375) |
+| Venue | AAAI 2026 |
+
+**Use Case:** Resolves conflicts between dynamic sources vs static parametric knowledge
+
+---
+
+### 9.5 Question Answering under Temporal Conflict (June 2025)
+**Özer & Yıldız - Temporal Wiki benchmark**
+
+| Field | Value |
+|-------|-------|
+| ArXiv | [2506.07270](https://arxiv.org/abs/2506.07270) |
+
+**Contribution:** Temporal Wiki benchmark, external structured memory for time-specific filtering
+
+---
+
+### 9.6 Astute RAG: Overcoming Imperfect Retrieval (Oct 2024)
+
+| Field | Value |
+|-------|-------|
+| ArXiv | [2410.07176](https://arxiv.org/abs/2410.07176) |
+
+**Problem Solved:** Conflicts between retrieved info and model's internal knowledge
+
+---
+
+## Section 10: Knowledge Conflicts Survey (EMNLP 2024)
+
+> Papers from the [Knowledge Conflicts Survey](https://github.com/pillowsofwind/Knowledge-Conflicts-Survey) accompanying the EMNLP 2024 main paper.
+
+### Type I: Context-Memory Conflict
+
+| ArXiv ID | Title | Year | Category |
+|----------|-------|------|----------|
+| [2110.03215](https://arxiv.org/abs/2110.03215) | Towards Continual Knowledge Learning of Language Models | Oct 2021 | Temporal |
+| [2305.13300](https://arxiv.org/abs/2305.13300) | Adaptive Chameleon or Stubborn Sloth: LLM Behavior in Knowledge Conflicts | May 2023 | Analysis |
+| [2306.05499](https://arxiv.org/abs/2306.05499) | Prompt Injection Attack Against LLM-integrated Applications | June 2023 | Security |
+| [2312.14197](https://arxiv.org/abs/2312.14197) | Benchmarking and Defending Against Indirect Prompt Injection | Dec 2023 | Security |
+| [2309.13788](https://arxiv.org/abs/2309.13788) | Can LLM-generated Misinformation Be Detected? | Sept 2023 | Detection |
+| [2401.11911](https://arxiv.org/abs/2401.11911) | Blinded by Generated Contexts: How LMs Merge Generated and Retrieved Contexts | Jan 2024 | Analysis |
+| [2309.17415](https://arxiv.org/abs/2309.17415) | Intuitive or Dependent? Investigating LLMs' Behavior to Conflicting Prompts | Sept 2023 | Analysis |
+| [2309.08594](https://arxiv.org/abs/2309.08594) | Merge Conflicts! Exploring Impacts of External Distractors to Parametric KGs | Sept 2023 | KG |
+| [2404.16032](https://arxiv.org/abs/2404.16032) | Studying Large Language Model Behaviors Under Realistic Knowledge Conflicts | April 2024 | Analysis |
+| [2310.15910](https://arxiv.org/abs/2310.15910) | Characterizing Mechanisms for Factual Recall in Language Models | Oct 2023 | Mechanism |
+| [2404.04633](https://arxiv.org/abs/2404.04633) | Context versus Prior Knowledge in Language Models | April 2024 | Analysis |
+| [2402.18154](https://arxiv.org/abs/2402.18154) | Cutting Off the Head Ends the Conflict: Mechanism for Knowledge Conflicts | Feb 2024 | Mechanism |
+| [2408.12076](https://arxiv.org/abs/2408.12076) | **ConflictBank**: A Benchmark for Evaluating Knowledge Conflicts in LLM | Aug 2024 | Benchmark |
+
+### Type I Solutions: Decoding
+
+| ArXiv ID | Title | Year | Category |
+|----------|-------|------|----------|
+| [2402.14409](https://arxiv.org/abs/2402.14409) | **Tug-of-War Between Knowledge**: Exploring Knowledge Conflicts in RALMs (LREC-COLING 2024) | Feb 2024 | Decoding |
+
+### Type II: Inter-Context Conflict
+
+| ArXiv ID | Title | Year | Category |
+|----------|-------|------|----------|
+| [2401.06920](https://arxiv.org/abs/2401.06920) | Comparing GPT-4 and Open-Source LMs in Misinformation Mitigation | Jan 2024 | Comparison |
+| [2311.09182](https://arxiv.org/abs/2311.09182) | **ContraDoc**: Understanding Self-Contradictions in Documents with LLMs | Nov 2023 | Detection |
+| [2402.11782](https://arxiv.org/abs/2402.11782) | What Evidence Do Language Models Find Convincing? | Feb 2024 | Analysis |
+
+### Type II Solutions: Eliminating Conflict
+
+| ArXiv ID | Title | Year | Category |
+|----------|-------|------|----------|
+| [2307.13528](https://arxiv.org/abs/2307.13528) | **FACTOOL**: Factuality Detection in Generative AI | July 2023 | Detection |
+| [2309.07601](https://arxiv.org/abs/2309.07601) | Detecting Misinformation with LLM-Predicted Credibility Signals | Sept 2023 | Detection |
+| [2305.01579](https://arxiv.org/abs/2305.01579) | Why So Gullible? Enhancing Robustness of RAG Against Counterfactual Noise | May 2023 | Robustness |
+
+### Type III: Intra-Memory Conflict
+
+| ArXiv ID | Title | Year | Category |
+|----------|-------|------|----------|
+| [2112.04359](https://arxiv.org/abs/2112.04359) | Ethical and Social Risks of Harm from Language Models | Dec 2021 | Ethics |
+| [2207.14251](https://arxiv.org/abs/2207.14251) | Measuring Causal Effects of Data Statistics on LM's Factual Predictions | July 2022 | Causality |
+| [2308.03296](https://arxiv.org/abs/2308.03296) | Studying LLM Generalization with Influence Functions | Aug 2023 | Analysis |
+| [2311.05232](https://arxiv.org/abs/2311.05232) | A Survey on Hallucination in Large Language Models | Nov 2023 | Survey |
+| [2310.02129](https://arxiv.org/abs/2310.02129) | Unveiling the Pitfalls of Knowledge Editing for LLMs | Oct 2023 | Editing |
+| [2309.08952](https://arxiv.org/abs/2309.08952) | Cross-lingual Knowledge Editing in Large Language Models | Sept 2023 | Editing |
+
+### Type III Solutions: Improving Factuality
+
+| ArXiv ID | Title | Year | Category |
+|----------|-------|------|----------|
+| [2309.03883](https://arxiv.org/abs/2309.03883) | **DoLa**: Decoding by Contrasting Layers Improves Factuality | Sept 2023 | Decoding |
+| [2306.03341](https://arxiv.org/abs/2306.03341) | **ITI**: Inference-Time Intervention for Eliciting Truthful Answers | June 2023 | Intervention |
+
+---
+
 ## NLP Pipeline Overview
 
 ```
@@ -612,6 +758,18 @@ Refuted → Contradiction
 | **NLI Classification** | AMREx, FactCG | Entailment/Contradiction/ConflictingEvidence |
 | **Information Bottleneck** | Swin-VIB | Filter noise, preserve relevant signal |
 | **Decontextualization** | Doc-level Claim Extraction | Make claims standalone for verification |
+| **Temporal Knowledge Graphs** | T-GRAG, TruthfulRAG | Time-stamped conflict resolution |
+| **Contrastive Decoding** | DoLa, ITI | Improve factuality via layer contrasting |
+| **Context-Memory Analysis** | ConflictBank, Tug-of-War | Benchmark and analyze context vs parametric conflicts |
+
+## Conflict Taxonomy (EMNLP 2024)
+
+| Conflict Type | Description | Example Papers |
+|---------------|-------------|----------------|
+| **Context-Memory** | Contextual info vs LLM parametric knowledge | ConflictBank, Adaptive Chameleon |
+| **Inter-Context** | Disagreements among multiple retrieved sources | ContraDoc, MADAM-RAG |
+| **Intra-Memory** | Inconsistent responses from model's internal knowledge | DoLa, ITI |
+| **Temporal** | Outdated vs current information conflicts | T-GRAG, TruthfulRAG, Astute RAG |
 
 ---
 
